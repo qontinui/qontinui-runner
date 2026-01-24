@@ -45,11 +45,23 @@
       "js": ["content-scripts/ui-bridge-bridge.js"],
       "run_at": "document_idle",
       "world": "ISOLATED"
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content-scripts/ui-bridge-recorder.js"],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content-scripts/ui-bridge-recorder-bridge.js"],
+      "run_at": "document_idle",
+      "world": "ISOLATED"
     }
   ],
   "web_accessible_resources": [
     {
-      "resources": ["request-interceptor.js", "content-scripts/ui-bridge-inspector.js"],
+      "resources": ["request-interceptor.js", "content-scripts/ui-bridge-inspector.js", "content-scripts/ui-bridge-recorder.js"],
       "matches": ["<all_urls>"]
     }
   ]

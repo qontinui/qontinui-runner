@@ -22,6 +22,43 @@ use crate::AppState;
 use super::types::{AgenticOutcome, LoopConfig};
 
 // =============================================================================
+// Helper Functions
+// =============================================================================
+
+/// Strip [TASK_COMPLETE] and similar completion marker instructions from prompts.
+///
+/// In unified workflows, verification determines completion, not the AI.
+/// This removes any instructions telling the AI to output completion markers.
+fn strip_completion_marker_instructions(prompt: &str) -> String {
+    // Common patterns that instruct AI to output completion markers
+    let patterns_to_remove = [
+        // Full sentences with marker instructions
+        "When you complete the task, include a summary line starting with [TASK_COMPLETE] followed by a brief summary.",
+        "When complete, print [TASK_COMPLETE].",
+        "When the goal is VERIFIED achieved, print [TASK_COMPLETE].",
+        "Continue the task. When complete, print [TASK_COMPLETE].",
+        "Continue the task. When the goal is VERIFIED achieved, print [TASK_COMPLETE].",
+        "Continue the task from where you left off. When complete, print [TASK_COMPLETE].",
+        // Shorter variations
+        "print [TASK_COMPLETE]",
+        "output [TASK_COMPLETE]",
+        "[TASK_COMPLETE]",
+    ];
+
+    let mut result = prompt.to_string();
+    for pattern in patterns_to_remove {
+        result = result.replace(pattern, "");
+    }
+
+    // Clean up any resulting double newlines
+    while result.contains("\n\n\n") {
+        result = result.replace("\n\n\n", "\n\n");
+    }
+
+    result.trim().to_string()
+}
+
+// =============================================================================
 // Setup Phase Executor
 // =============================================================================
 
@@ -137,10 +174,7 @@ impl SetupExecutor {
         if automation_steps.is_empty() && prompt_steps.is_empty() {
             info!("SETUP-PHASE: No setup steps to execute");
         } else {
-            info!(
-                "SETUP-PHASE: Completed with success={}",
-                overall_success
-            );
+            info!("SETUP-PHASE: Completed with success={}", overall_success);
         }
 
         (overall_success, all_results)
@@ -176,10 +210,7 @@ impl SetupExecutor {
             session_num: 0, // Setup is session 0
         });
 
-        info!(
-            "SETUP-PHASE: Running setup AI (session: {})",
-            session_id
-        );
+        info!("SETUP-PHASE: Running setup AI (session: {})", session_id);
 
         // Create metadata and builder for consistent events
         let metadata = StepMetadata::setup(StepType::Prompt, step_name, 0);
@@ -194,7 +225,8 @@ impl SetupExecutor {
             warn!("Failed to log setup AI start event: {}", e);
         }
 
-        let prompt_for_claude = prompt.to_string();
+        // Strip completion marker instructions - verification determines completion
+        let prompt_for_claude = strip_completion_marker_instructions(prompt);
         let workspace_for_claude = workspace_root;
         let sid_for_claude = session_id.clone();
 
@@ -264,13 +296,13 @@ impl SetupExecutor {
             Err(e) => {
                 error!("SETUP-PHASE: Task join error: {}", e);
 
-                let details =
-                    StepDetails::ai_session(session_id.clone()).with_error(e.to_string());
+                let details = StepDetails::ai_session(session_id.clone()).with_error(e.to_string());
                 let builder = StepEventBuilder::new(execution_id, metadata)
                     .with_details(details)
                     .with_workflow_name(workflow_name);
 
-                let event = builder.build_error(duration_ms, Some(&format!("Task join error: {}", e)));
+                let event =
+                    builder.build_error(duration_ms, Some(&format!("Task join error: {}", e)));
 
                 if let Err(log_err) = self.checkpoint_db.create_task_run_event(&event) {
                     warn!("Failed to log setup AI error event: {}", log_err);
@@ -374,8 +406,8 @@ impl VerificationExecutor {
 
         // Log step_execution completion events for each verification step for Timeline widget
         for step_result in &result.step_results {
-            let step_type = StepType::from_str_compat(&step_result.step_type)
-                .unwrap_or(StepType::Playwright);
+            let step_type =
+                StepType::from_str_compat(&step_result.step_type).unwrap_or(StepType::Playwright);
             let metadata = StepMetadata::verification(
                 step_type,
                 &step_result.step_name,
@@ -398,10 +430,7 @@ impl VerificationExecutor {
             let event = if step_result.success {
                 builder.build_complete(step_result.duration_ms as i64)
             } else {
-                builder.build_error(
-                    step_result.duration_ms as i64,
-                    step_result.error.as_deref(),
-                )
+                builder.build_error(step_result.duration_ms as i64, step_result.error.as_deref())
             };
 
             if let Err(e) = self.checkpoint_db.create_task_run_event(&event) {
@@ -457,12 +486,16 @@ impl AgenticExecutor {
         }
 
         // Build enhanced prompt with failure context
+        // Strip any [TASK_COMPLETE] instructions from the base prompt since
+        // in unified workflows, VERIFICATION determines completion, not the AI.
+        let clean_base_prompt = strip_completion_marker_instructions(&config.base_prompt);
+
         let enhanced_prompt = if failure_context.is_empty() {
             warn!(
                 "AGENTIC-PHASE: No failure context provided for iteration {} - AI won't know what to fix!",
                 iteration
             );
-            config.base_prompt.clone()
+            clean_base_prompt
         } else {
             info!(
                 "AGENTIC-PHASE: Building prompt with {} chars of failure context (iteration {})",
@@ -471,7 +504,7 @@ impl AgenticExecutor {
             );
             format!(
                 "{}\n\n---\n\nThe following verification checks FAILED. Please fix these issues:\n\n{}\n\nFix the issues above and ensure all checks pass.",
-                config.base_prompt, failure_context
+                clean_base_prompt, failure_context
             )
         };
 
@@ -490,7 +523,10 @@ impl AgenticExecutor {
         // Create context for output grouping
         let session_ctx = Some(crate::mcp_api::AiOutputSessionContext {
             session_id: Some(session_id.clone()),
-            session_name: Some(format!("{} - Iteration {}", config.workflow_name, iteration)),
+            session_name: Some(format!(
+                "{} - Iteration {}",
+                config.workflow_name, iteration
+            )),
             phase: Some("agentic".to_string()),
         });
 
@@ -507,7 +543,12 @@ impl AgenticExecutor {
 
         // Create metadata and builder for consistent events
         // Use iteration as step_index for agentic AI steps
-        let metadata = StepMetadata::agentic(StepType::AiSession, &step_name, iteration as usize, iteration);
+        let metadata = StepMetadata::agentic(
+            StepType::AiSession,
+            &step_name,
+            iteration as usize,
+            iteration,
+        );
         let details = StepDetails::ai_session(session_id.clone());
         let builder = StepEventBuilder::new(&config.execution_id, metadata.clone())
             .with_details(details)
@@ -602,13 +643,13 @@ impl AgenticExecutor {
                     iteration, e
                 );
 
-                let details =
-                    StepDetails::ai_session(session_id.clone()).with_error(e.to_string());
+                let details = StepDetails::ai_session(session_id.clone()).with_error(e.to_string());
                 let builder = StepEventBuilder::new(&config.execution_id, metadata)
                     .with_details(details)
                     .with_workflow_name(&config.workflow_name);
 
-                let event = builder.build_error(duration_ms, Some(&format!("Task join error: {}", e)));
+                let event =
+                    builder.build_error(duration_ms, Some(&format!("Task join error: {}", e)));
 
                 if let Err(log_err) = self.checkpoint_db.create_task_run_event(&event) {
                     warn!("Failed to log agentic AI error event: {}", log_err);
@@ -779,7 +820,9 @@ impl CompletionExecutor {
             warn!("Failed to log completion AI start event: {}", e);
         }
 
-        let prompt_for_claude = prompt.to_string();
+        // Strip completion marker instructions for consistency, even though
+        // the completion phase runs after verification passed
+        let prompt_for_claude = strip_completion_marker_instructions(prompt);
         let workspace_for_claude = workspace_root;
         let sid_for_claude = session_id.clone();
 
@@ -825,6 +868,24 @@ impl CompletionExecutor {
                     warn!("Failed to log completion AI complete event: {}", e);
                 }
 
+                // Save the AI output as the task summary
+                // The completion AI output should be the summary shown in the recap page
+                if success && !output.is_empty() {
+                    if let Err(e) = self.checkpoint_db.update_task_summary(
+                        execution_id,
+                        &output,
+                        true, // goal_achieved = true since verification passed
+                        None, // remaining_work = None since task is complete
+                    ) {
+                        warn!("Failed to save completion AI output as summary: {}", e);
+                    } else {
+                        info!(
+                            "Saved completion AI output ({} chars) as task summary",
+                            output.len()
+                        );
+                    }
+                }
+
                 success
             }
             Ok(Err(e)) => {
@@ -846,13 +907,13 @@ impl CompletionExecutor {
             Err(e) => {
                 error!("COMPLETION-PHASE: Task join error: {}", e);
 
-                let details =
-                    StepDetails::ai_session(session_id.clone()).with_error(e.to_string());
+                let details = StepDetails::ai_session(session_id.clone()).with_error(e.to_string());
                 let builder = StepEventBuilder::new(execution_id, metadata)
                     .with_details(details)
                     .with_workflow_name(workflow_name);
 
-                let event = builder.build_error(duration_ms, Some(&format!("Task join error: {}", e)));
+                let event =
+                    builder.build_error(duration_ms, Some(&format!("Task join error: {}", e)));
 
                 if let Err(log_err) = self.checkpoint_db.create_task_run_event(&event) {
                     warn!("Failed to log completion AI error event: {}", log_err);

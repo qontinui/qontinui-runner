@@ -1546,6 +1546,9 @@ class QontinuiExecutor:
         elif cmd_type == "generate_test_and_agentic_step":
             return self._handle_generate_test_and_agentic_step(params)
 
+        elif cmd_type == "explore_flow_step":
+            return self._handle_explore_flow_step(params)
+
         # Pattern matching commands
         elif cmd_type == "pattern_find":
             return self._handle_pattern_find(params)
@@ -2571,17 +2574,34 @@ class QontinuiExecutor:
         """Handle AI test and agentic step generation."""
         user_prompt = params.get("user_prompt", "")
         page_context = params.get("page_context")
+        context_ids = params.get("context_ids")  # Context IDs from context library
         ai_provider = params.get("ai_provider", "claude_cli")
         ai_settings = params.get("ai_settings", {})
 
         if not user_prompt:
             return {"success": False, "error": "user_prompt is required"}
 
+        # Fetch contexts if context_ids provided
+        contexts_content = None
+        if context_ids and len(context_ids) > 0:
+            try:
+                contexts_content = self._fetch_contexts_content(context_ids)
+                self.event_manager.emit_log(
+                    "info",
+                    f"[GENERATE_TEST] Fetched {len(context_ids)} contexts for AI prompt",
+                )
+            except Exception as e:
+                self.event_manager.emit_log(
+                    "warning",
+                    f"[GENERATE_TEST] Failed to fetch contexts: {e}",
+                )
+
         try:
             service = self._get_ai_builder_generator_service()
             return service.generate_test_and_agentic_step(
                 user_prompt=user_prompt,
                 page_context=page_context,
+                contexts_content=contexts_content,
                 ai_provider=ai_provider,
                 ai_settings=ai_settings,
             )
@@ -2593,6 +2613,83 @@ class QontinuiExecutor:
                 "error": f"Test and agentic step generation failed: {e}",
                 "traceback": traceback.format_exc(),
             }
+
+    def _handle_explore_flow_step(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle AI-driven flow exploration step.
+
+        The AI analyzes current page elements and user's goal to determine
+        what action to take next (click, type, wait, or done).
+        """
+        user_prompt = params.get("user_prompt", "")
+        current_elements = params.get("current_elements", [])
+        current_url = params.get("current_url", "")
+        current_title = params.get("current_title", "")
+        captured_pages = params.get("captured_pages", [])
+        step_number = params.get("step_number", 1)
+        ai_provider = params.get("ai_provider", "claude_cli")
+        ai_settings = params.get("ai_settings", {})
+
+        if not user_prompt:
+            return {"success": False, "error": "user_prompt is required"}
+
+        if not current_elements:
+            return {"success": False, "error": "current_elements is required"}
+
+        try:
+            service = self._get_ai_builder_generator_service()
+            return service.explore_flow_step(
+                user_prompt=user_prompt,
+                current_elements=current_elements,
+                current_url=current_url,
+                current_title=current_title,
+                captured_pages=captured_pages,
+                step_number=step_number,
+                ai_provider=ai_provider,
+                ai_settings=ai_settings,
+            )
+        except Exception as e:
+            import traceback
+
+            return {
+                "success": False,
+                "error": f"Flow exploration step failed: {e}",
+                "traceback": traceback.format_exc(),
+            }
+
+    def _fetch_contexts_content(self, context_ids: list[str]) -> str | None:
+        """Fetch context content from the runner HTTP API."""
+        import requests
+
+        contexts_parts = []
+        for ctx_id in context_ids:
+            try:
+                response = requests.get(
+                    f"http://localhost:9876/contexts/{ctx_id}",
+                    timeout=5,
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get("success") and data.get("data"):
+                        ctx = data["data"]
+                        name = ctx.get("name", "Unknown")
+                        category = ctx.get("category", "")
+                        content = ctx.get("content", "")
+                        if content:
+                            # Format as XML block (same as context injection elsewhere)
+                            ctx_block = f'<context name="{name}"'
+                            if category:
+                                ctx_block += f' category="{category}"'
+                            ctx_block += f">\n{content}\n</context>"
+                            contexts_parts.append(ctx_block)
+            except Exception as e:
+                self.event_manager.emit_log(
+                    "warning",
+                    f"[FETCH_CONTEXT] Failed to fetch context {ctx_id}: {e}",
+                )
+
+        if contexts_parts:
+            return "## Relevant Context\n\n" + "\n\n".join(contexts_parts)
+        return None
 
     def _handle_run_vision_extraction(self, params: dict[str, Any]) -> dict[str, Any]:
         """

@@ -21,6 +21,9 @@ let wsPendingRequests = new Map(); // requestId -> { resolve, reject, timeout }
 // Selected tab for exploration (null = use active tab)
 let selectedExplorationTabId = null;
 
+// Recording state
+let activeRecordingSession = null; // { tabId, startTime, snapshots: [] }
+
 /**
  * Connect to the runner's WebSocket endpoint
  * Only call this after verifying the runner is available via health check
@@ -220,6 +223,167 @@ async function executeExplorationCommand(action, params) {
         }
       }
       return { selectedTabId: null };
+
+    // =========================================================================
+    // Recording Actions - Manual navigation capture
+    // =========================================================================
+
+    case "startRecording": {
+      // Start recording on a specific tab
+      const targetTabId = params.tabId || selectedExplorationTabId;
+      if (!targetTabId) {
+        // Try to get active tab
+        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (!activeTab?.id) {
+          throw new Error("No tab specified and no active tab found");
+        }
+        params.tabId = activeTab.id;
+      }
+      const tabId = params.tabId || targetTabId;
+
+      if (activeRecordingSession) {
+        throw new Error(`Recording already in progress on tab ${activeRecordingSession.tabId}`);
+      }
+
+      // Inject recorder scripts if not already there
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId: tabId },
+          files: ["content-scripts/ui-bridge-recorder.js"],
+          world: "MAIN"
+        });
+        await chrome.scripting.executeScript({
+          target: { tabId: tabId },
+          files: ["content-scripts/ui-bridge-recorder-bridge.js"],
+          world: "ISOLATED"
+        });
+      } catch (e) {
+        console.log("[Qontinui] Could not inject recorder scripts:", e.message);
+      }
+
+      // Small delay for scripts to initialize
+      await new Promise(r => setTimeout(r, 100));
+
+      // Send start command to content script
+      return new Promise((resolve, reject) => {
+        chrome.tabs.sendMessage(
+          tabId,
+          { type: "RECORDER_COMMAND", action: "startRecording", params: params },
+          (response) => {
+            if (chrome.runtime.lastError) {
+              reject(new Error(chrome.runtime.lastError.message || "Failed to start recording"));
+              return;
+            }
+            if (response?.success && response.data?.success) {
+              // Initialize recording session
+              activeRecordingSession = {
+                tabId: tabId,
+                startTime: Date.now(),
+                snapshots: [],
+                options: params,
+              };
+              // Store initial snapshot if provided
+              if (response.data.initialSnapshot) {
+                activeRecordingSession.snapshots.push(response.data.initialSnapshot);
+              }
+              console.log("[Qontinui] Recording started on tab", tabId);
+              resolve({
+                success: true,
+                tabId: tabId,
+                message: "Recording started",
+                initialSnapshot: response.data.initialSnapshot,
+              });
+            } else {
+              reject(new Error(response?.data?.error || response?.error || "Failed to start recording"));
+            }
+          }
+        );
+      });
+    }
+
+    case "stopRecording": {
+      if (!activeRecordingSession) {
+        throw new Error("No recording in progress");
+      }
+
+      const tabId = activeRecordingSession.tabId;
+      const session = activeRecordingSession;
+
+      return new Promise((resolve, reject) => {
+        chrome.tabs.sendMessage(
+          tabId,
+          { type: "RECORDER_COMMAND", action: "stopRecording", params: {} },
+          (response) => {
+            if (chrome.runtime.lastError) {
+              // Tab might be closed, still return what we have
+              console.warn("[Qontinui] Could not stop recording cleanly:", chrome.runtime.lastError.message);
+            }
+
+            const result = {
+              success: true,
+              tabId: tabId,
+              duration: Date.now() - session.startTime,
+              snapshotCount: session.snapshots.length,
+              snapshots: session.snapshots,
+            };
+
+            // Clear recording session
+            activeRecordingSession = null;
+            console.log("[Qontinui] Recording stopped. Captured", result.snapshotCount, "snapshots");
+            resolve(result);
+          }
+        );
+      });
+    }
+
+    case "getRecordingStatus": {
+      if (!activeRecordingSession) {
+        return {
+          isRecording: false,
+          tabId: null,
+          snapshotCount: 0,
+        };
+      }
+      return {
+        isRecording: true,
+        tabId: activeRecordingSession.tabId,
+        snapshotCount: activeRecordingSession.snapshots.length,
+        duration: Date.now() - activeRecordingSession.startTime,
+      };
+    }
+
+    case "getRecordingSnapshots": {
+      if (!activeRecordingSession) {
+        throw new Error("No recording in progress");
+      }
+      return {
+        tabId: activeRecordingSession.tabId,
+        snapshotCount: activeRecordingSession.snapshots.length,
+        snapshots: activeRecordingSession.snapshots,
+      };
+    }
+
+    case "captureNow": {
+      // Manually trigger a capture during recording
+      if (!activeRecordingSession) {
+        throw new Error("No recording in progress");
+      }
+
+      const tabId = activeRecordingSession.tabId;
+      return new Promise((resolve, reject) => {
+        chrome.tabs.sendMessage(
+          tabId,
+          { type: "RECORDER_COMMAND", action: "captureNow", params: {} },
+          (response) => {
+            if (chrome.runtime.lastError) {
+              reject(new Error(chrome.runtime.lastError.message));
+              return;
+            }
+            resolve(response?.data || { success: false });
+          }
+        );
+      });
+    }
   }
 
   // For other actions, get the target tab
@@ -1225,6 +1389,34 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "UI_BRIDGE_BRIDGE_READY") {
     // Content script bridge is ready
     console.log("[Qontinui] UI Bridge bridge ready on:", message.url);
+    return false;
+  }
+
+  // =============================================================================
+  // Recording Events (from content script to background)
+  // =============================================================================
+
+  if (message.type === "RECORDER_SNAPSHOT") {
+    // Accumulate snapshot from recording
+    if (activeRecordingSession && message.snapshot) {
+      activeRecordingSession.snapshots.push(message.snapshot);
+      console.log("[Qontinui] Recorded snapshot", activeRecordingSession.snapshots.length, ":", message.snapshot.trigger);
+
+      // Forward to runner via WebSocket for real-time updates
+      if (wsConnected) {
+        sendWebSocketMessage({
+          type: "RECORDING_SNAPSHOT",
+          snapshot: message.snapshot,
+          sessionTabId: activeRecordingSession.tabId,
+          totalSnapshots: activeRecordingSession.snapshots.length,
+        });
+      }
+    }
+    return false;
+  }
+
+  if (message.type === "RECORDER_BRIDGE_READY") {
+    console.log("[Qontinui] Recorder bridge ready on:", message.url);
     return false;
   }
 });

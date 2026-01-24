@@ -46,8 +46,8 @@ mod secure_storage;
 mod session;
 mod settings;
 mod state_explorer;
-mod step_executor;
 mod step_event_builder;
+mod step_executor;
 mod step_metadata;
 mod step_types;
 mod steps;
@@ -656,6 +656,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::ai_generation::generate_task_prompt_with_ai,
             commands::ai_generation::suggest_exploration_strategy_with_ai,
             commands::ai_generation::generate_test_and_agentic_step,
+            commands::ai_generation::explore_flow_step,
             // MCP client management commands
             commands::mcp::list_mcp_servers,
             commands::mcp::get_mcp_server,

@@ -100,11 +100,11 @@ use crate::rag::{ImportResult, QontinuiConfig, RAGConfigSummary};
 use crate::scriptlets;
 use crate::session::SessionManager;
 use crate::settings;
+use crate::step_event_builder::categorize_steps;
 use crate::summary_generator;
 use crate::task_monitor::TaskMonitor;
 use crate::task_recorder::{TaskConfig, TaskRecorder};
 use crate::tiered_info::{self, RunDetails};
-use crate::step_event_builder::categorize_steps;
 use crate::workflow_generation;
 // WorkflowManager import removed - using unified SessionManager instead
 use axum::routing::{delete, put};
@@ -1104,9 +1104,8 @@ pub struct ApiState {
         >,
     >,
     /// Chrome extension WebSocket connection sender
-    pub extension_ws_sender: Arc<
-        tokio::sync::Mutex<Option<futures_util::stream::SplitSink<WebSocket, Message>>>,
-    >,
+    pub extension_ws_sender:
+        Arc<tokio::sync::Mutex<Option<futures_util::stream::SplitSink<WebSocket, Message>>>>,
     /// Pending extension command requests (requestId -> oneshot sender for response)
     pub extension_pending_requests: Arc<
         tokio::sync::Mutex<
@@ -1478,16 +1477,14 @@ async fn handle_extension_ws(socket: WebSocket, state: Arc<ApiState>) {
     // Handle incoming messages from extension
     while let Some(result) = receiver.next().await {
         match result {
-            Ok(Message::Text(text)) => {
-                match serde_json::from_str::<serde_json::Value>(&text) {
-                    Ok(msg) => {
-                        handle_extension_message(msg, state.clone()).await;
-                    }
-                    Err(e) => {
-                        warn!("Failed to parse extension message: {}", e);
-                    }
+            Ok(Message::Text(text)) => match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(msg) => {
+                    handle_extension_message(msg, state.clone()).await;
                 }
-            }
+                Err(e) => {
+                    warn!("Failed to parse extension message: {}", e);
+                }
+            },
             Ok(Message::Ping(_)) => {
                 debug!("Received ping from extension");
             }
@@ -1518,7 +1515,10 @@ async fn handle_extension_ws(socket: WebSocket, state: Arc<ApiState>) {
                 "success": false,
                 "error": "Extension disconnected"
             }));
-            debug!("Rejected pending extension request {} due to disconnect", request_id);
+            debug!(
+                "Rejected pending extension request {} due to disconnect",
+                request_id
+            );
         }
     }
 
@@ -1569,7 +1569,11 @@ async fn send_extension_command(
     }
 
     // Generate request ID
-    let request_id = format!("runner-{}-{}", chrono::Utc::now().timestamp_millis(), uuid::Uuid::new_v4());
+    let request_id = format!(
+        "runner-{}-{}",
+        chrono::Utc::now().timestamp_millis(),
+        uuid::Uuid::new_v4()
+    );
 
     // Create command message
     let command = serde_json::json!({
@@ -1617,22 +1621,32 @@ async fn send_extension_command(
     // Wait for response with timeout
     match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
         Ok(Ok(response)) => {
-            let success = response.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
+            let success = response
+                .get("success")
+                .and_then(|s| s.as_bool())
+                .unwrap_or(false);
             if success {
-                Ok(response.get("data").cloned().unwrap_or(serde_json::Value::Null))
+                Ok(response
+                    .get("data")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null))
             } else {
-                let error = response.get("error").and_then(|e| e.as_str()).unwrap_or("Unknown error");
+                let error = response
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("Unknown error");
                 Err(error.to_string())
             }
         }
-        Ok(Err(_)) => {
-            Err("Response channel closed".to_string())
-        }
+        Ok(Err(_)) => Err("Response channel closed".to_string()),
         Err(_) => {
             // Timeout - clean up pending request
             let mut pending = state.extension_pending_requests.lock().await;
             pending.remove(&request_id);
-            Err(format!("Extension command timed out after {}s", timeout_secs))
+            Err(format!(
+                "Extension command timed out after {}s",
+                timeout_secs
+            ))
         }
     }
 }
@@ -1674,17 +1688,14 @@ async fn send_extension_command_handler(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<ExtensionCommandRequest>,
 ) -> Json<ApiResponse<serde_json::Value>> {
-    info!("Extension command request: action={}, params={:?}", request.action, request.params);
+    info!(
+        "Extension command request: action={}, params={:?}",
+        request.action, request.params
+    );
 
-    match send_extension_command(
-        state,
-        &request.action,
-        request.params,
-        request.timeout_secs,
-    ).await {
-        Ok(data) => {
-            Json(ApiResponse::success(data))
-        }
+    match send_extension_command(state, &request.action, request.params, request.timeout_secs).await
+    {
+        Ok(data) => Json(ApiResponse::success(data)),
         Err(e) => {
             warn!("Extension command failed: {}", e);
             Json(ApiResponse {
@@ -7194,8 +7205,14 @@ async fn start_ui_bridge_exploration(
                 let error_msg = response
                     .error
                     .unwrap_or_else(|| "Failed to start UI Bridge exploration".to_string());
-                error!("MCP API: Failed to start UI Bridge exploration: {}", error_msg);
-                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(error_msg))))
+                error!(
+                    "MCP API: Failed to start UI Bridge exploration: {}",
+                    error_msg
+                );
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(error_msg)),
+                ))
             }
         }
         Err(e) => {
@@ -7262,7 +7279,10 @@ async fn get_ui_bridge_exploration_status(
                 let error_msg = response
                     .error
                     .unwrap_or_else(|| "Failed to get exploration status".to_string());
-                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(error_msg))))
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(error_msg)),
+                ))
             }
         }
         Err(e) => {
@@ -7323,11 +7343,17 @@ async fn get_ui_bridge_exploration_results(
                 let error_msg = response
                     .error
                     .unwrap_or_else(|| "Failed to get exploration results".to_string());
-                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(error_msg))))
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(error_msg)),
+                ))
             }
         }
         Err(e) => {
-            error!("MCP API: Failed to get UI Bridge exploration results: {}", e);
+            error!(
+                "MCP API: Failed to get UI Bridge exploration results: {}",
+                e
+            );
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
         }
     }
@@ -7378,7 +7404,10 @@ async fn stop_ui_bridge_exploration(
                 let error_msg = response
                     .error
                     .unwrap_or_else(|| "Failed to stop exploration".to_string());
-                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(error_msg))))
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(error_msg)),
+                ))
             }
         }
         Err(e) => {
@@ -7460,7 +7489,10 @@ async fn discover_states_from_renders(
                     .error
                     .unwrap_or_else(|| "Failed to discover states from renders".to_string());
                 error!("MCP API: Failed to discover states: {}", error_msg);
-                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(error_msg))))
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(error_msg)),
+                ))
             }
         }
         Err(e) => {
@@ -12029,20 +12061,21 @@ async fn run_workflow_verification_for_task(
     use crate::step_executor::{ExecutionStepConfig, StepExecutor};
 
     // Try to get verification steps from the task's execution_steps_json
-    let verification_steps: Vec<ExecutionStepConfig> = match app_state.checkpoint_db.get_task_run(db_task_id) {
-        Ok(Some(task)) => {
-            task.execution_steps_json
+    let verification_steps: Vec<ExecutionStepConfig> =
+        match app_state.checkpoint_db.get_task_run(db_task_id) {
+            Ok(Some(task)) => task
+                .execution_steps_json
                 .as_ref()
                 .and_then(|json| serde_json::from_str::<Vec<ExecutionStepConfig>>(json).ok())
                 .map(|steps| {
-                    steps.into_iter()
+                    steps
+                        .into_iter()
                         .filter(|s| s.phase.as_deref() == Some("verification"))
                         .collect()
                 })
-                .unwrap_or_default()
-        }
-        _ => Vec::new(),
-    };
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
 
     // If no verification steps defined, fall back to basic deterministic verification
     if verification_steps.is_empty() {
@@ -12055,7 +12088,8 @@ async fn run_workflow_verification_for_task(
 
     info!(
         "WORKFLOW-VERIFICATION: Running {} verification_steps for task {}",
-        verification_steps.len(), db_task_id
+        verification_steps.len(),
+        db_task_id
     );
 
     // Create a StepExecutor to run the verification steps
@@ -14234,13 +14268,14 @@ async fn run_unified_session_loop(
 
                                             // IMPORTANT: Also run the workflow's verification_steps (check groups)
                                             // The orchestrator's verification uses a different system than check groups
-                                            let workflow_verification = run_workflow_verification_for_task(
-                                                &state.app_state,
-                                                &state.config_storage,
-                                                &db_task_id,
-                                                &workspace_root,
-                                            )
-                                            .await;
+                                            let workflow_verification =
+                                                run_workflow_verification_for_task(
+                                                    &state.app_state,
+                                                    &state.config_storage,
+                                                    &db_task_id,
+                                                    &workspace_root,
+                                                )
+                                                .await;
 
                                             if !workflow_verification.all_passed {
                                                 // Workflow verification_steps failed - don't complete
@@ -14251,7 +14286,8 @@ async fn run_unified_session_loop(
 
                                                 s.status = SessionStatus::Completed;
                                                 s.checkpoint.completed = false;
-                                                s.checkpoint.status = "workflow_verification_failed".to_string();
+                                                s.checkpoint.status =
+                                                    "workflow_verification_failed".to_string();
                                                 let _ = state.session.update_session(s).await;
 
                                                 emit_ai_output(
@@ -15703,7 +15739,11 @@ async fn get_current_execution_steps(
                 step_name,
                 status,
                 phase,
-                step_index: if step_index >= 0 { Some(step_index) } else { None },
+                step_index: if step_index >= 0 {
+                    Some(step_index)
+                } else {
+                    None
+                },
                 start_time: event_timestamp,
                 end_time: data
                     .as_ref()
@@ -19231,24 +19271,37 @@ async fn run_unified_workflow(
             ));
         }
 
-        // Check if workflow has verification steps
-        let has_verification_steps = !workflow.verification_steps.is_empty();
-
         // =====================================================================
-        // NEW VERIFICATION-AGENTIC LOOP for workflows with verification_steps
+        // UNIFIED VERIFICATION-AGENTIC LOOP (required for all AI workflows)
         // =====================================================================
-        // When the workflow has explicit verification_steps (tests, checks),
-        // use the new verification-agentic loop that:
+        // All AI workflows must have verification steps. The loop:
         // 1. Runs verification FIRST to tell the agentic phase what to work on
         // 2. Builds failure context from verification results
         // 3. Loops: verification -> agentic until pass or max_iterations
         // 4. Cannot be bypassed by AI claiming [TASK_COMPLETE]
-        if has_verification_steps {
-            info!(
-                "Unified workflow '{}' has {} verification steps - using verification-agentic loop",
-                workflow.name,
-                workflow.verification_steps.len()
-            );
+        //
+        // Verification steps can be:
+        // - Automated tests (Playwright, shell commands)
+        // - AI-based verification (prompt steps that check work quality)
+        //
+        // If you want a simple AI task, add a verification step like:
+        // "Review the changes and verify the task was completed correctly"
+        if workflow.verification_steps.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error(
+                    "AI workflows require at least one verification step. \
+                     Verification can be automated (tests) or AI-based (a prompt that checks work quality). \
+                     This ensures the AI's work is verified before marking the task complete.".to_string(),
+                )),
+            ));
+        }
+
+        info!(
+            "Unified workflow '{}' has {} verification steps - using verification-agentic loop",
+            workflow.name,
+            workflow.verification_steps.len()
+        );
 
             // Separate steps by phase for the new loop function
             // Setup automation steps (shell commands, workflows, etc.)
@@ -19356,92 +19409,6 @@ async fn run_unified_workflow(
                 .await;
 
             return Ok(Json(ApiResponse::success(result.to_execution_result())));
-        }
-
-        // =====================================================================
-        // LEGACY SESSION-BASED EXECUTION (for workflows without verification_steps)
-        // =====================================================================
-        // When the workflow has NO verification_steps, use the original
-        // session-based execution which relies on AI to self-report completion.
-
-        // Build session config
-        let session_config = SessionConfig {
-            prompt: combined_prompt.clone(),
-            continuation_prompt: None,
-            total_phases: workflow.max_iterations,
-            uses_gui: false,
-            timeout_seconds: request.timeout_seconds.unwrap_or(1800),
-            stall_threshold_seconds: 300,
-            name: workflow.name.clone(),
-            description: workflow.description.clone(),
-            custom_config: serde_json::json!({
-                "workflow_id": id,
-                "automation_steps": automation_steps,
-                "context_ids": workflow.context_ids,
-                "disabled_context_ids": workflow.disabled_context_ids,
-                "auto_include_contexts": workflow.auto_include_contexts,
-                "prompt_template": workflow.prompt_template,
-            }),
-            provider: workflow.provider.clone(),
-            model: workflow.model.clone(),
-        };
-
-        // Create task_run for tracking
-        let execution_steps_json = serde_json::to_string(&automation_steps).ok();
-        if let Err(e) = state.app_state.checkpoint_db.create_task_run_with_config(
-            &execution_id,
-            &workflow.name,
-            Some(&combined_prompt),
-            "ai",
-            None,
-            Some(&workflow.name),
-            Some(workflow.max_iterations),
-            Some(true),
-            execution_steps_json,
-            None,
-        ) {
-            warn!(
-                "Failed to create task_run for unified workflow {}: {}",
-                execution_id, e
-            );
-        }
-
-        // Start session via session manager
-        match state.session.start_session(session_config).await {
-            Ok(session) => {
-                info!(
-                    "Started AI session {} for unified workflow '{}'",
-                    session.id, workflow.name
-                );
-
-                // Return a result indicating the session was started
-                // The actual execution happens asynchronously
-                return Ok(Json(ApiResponse::success(
-                    crate::step_executor::ExecutionResult {
-                        success: true,
-                        total_steps: prompt_steps.len(),
-                        successful_steps: 0, // Will be updated as session progresses
-                        failed_steps: 0,
-                        total_duration_ms: 0,
-                        steps: vec![],
-                        captured_logs: None,
-                        captured_runner_logs: None,
-                    },
-                )));
-            }
-            Err(e) => {
-                error!("Failed to start session for unified workflow: {}", e);
-                // Mark task as failed
-                let _ = state
-                    .app_state
-                    .checkpoint_db
-                    .fail_task_run(&execution_id, &e);
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(api_error(format!("Failed to start AI session: {}", e))),
-                ));
-            }
-        }
     }
 
     // No prompt steps - use step_executor for automation-only workflow
@@ -19660,7 +19627,9 @@ pub fn create_router(
         resuming_task_ids: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         ui_bridge_pending: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         extension_ws_sender: Arc::new(tokio::sync::Mutex::new(None)),
-        extension_pending_requests: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        extension_pending_requests: Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
         extension_connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
 
@@ -20169,10 +20138,7 @@ pub fn create_router(
             "/ui-bridge/explore/results",
             get(get_ui_bridge_exploration_results),
         )
-        .route(
-            "/ui-bridge/explore/stop",
-            post(stop_ui_bridge_exploration),
-        )
+        .route("/ui-bridge/explore/stop", post(stop_ui_bridge_exploration))
         // UI Bridge state discovery from render logs (separate from exploration)
         .route(
             "/ui-bridge/discover-states",

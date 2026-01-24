@@ -1,6 +1,23 @@
 //! Command Builder
 //!
 //! Builds shell commands for different check tools.
+//!
+//! ## Project-Local Tool Resolution
+//!
+//! All tools are wrapped with ecosystem-specific runners to ensure project-local
+//! versions are used:
+//!
+//! - **Node.js** (eslint, prettier, tsc, biome): Uses `npx` which finds tools in
+//!   `node_modules/.bin` and respects project `package.json` versions.
+//!
+//! - **Python** (black, isort, ruff, mypy): Uses `python -m <tool>` which runs
+//!   the tool as a module from the active Python environment (venv/poetry/etc).
+//!
+//! - **Rust** (clippy, rustfmt, cargo-check): Uses `cargo` which is inherently
+//!   project-aware via `Cargo.toml`.
+//!
+//! - **Pyright**: Uses `npx` because pyright is distributed as an npm package
+//!   (even when installed via pip, it downloads the Node.js version).
 
 use super::types::{CheckDefinition, CheckTool, CheckType};
 use std::error::Error;
@@ -91,7 +108,8 @@ fn parse_command_string(cmd: &str) -> Result<(String, Vec<String>), Box<dyn Erro
 fn build_black_command(
     check_def: &CheckDefinition,
 ) -> Result<(String, Vec<String>), Box<dyn Error>> {
-    let mut args = vec![];
+    // Use python -m to run from active environment (venv/poetry/etc)
+    let mut args = vec!["-m".to_string(), "black".to_string()];
 
     if !check_def.auto_fix {
         args.push("--check".to_string());
@@ -104,13 +122,14 @@ fn build_black_command(
 
     args.push(".".to_string());
 
-    Ok(("black".to_string(), args))
+    Ok(("python".to_string(), args))
 }
 
 fn build_isort_command(
     check_def: &CheckDefinition,
 ) -> Result<(String, Vec<String>), Box<dyn Error>> {
-    let mut args = vec![];
+    // Use python -m to run from active environment (venv/poetry/etc)
+    let mut args = vec!["-m".to_string(), "isort".to_string()];
 
     if !check_def.auto_fix {
         args.push("--check-only".to_string());
@@ -123,13 +142,14 @@ fn build_isort_command(
 
     args.push(".".to_string());
 
-    Ok(("isort".to_string(), args))
+    Ok(("python".to_string(), args))
 }
 
 fn build_ruff_command(
     check_def: &CheckDefinition,
 ) -> Result<(String, Vec<String>), Box<dyn Error>> {
-    let mut args = vec!["check".to_string()];
+    // Use python -m to run from active environment (venv/poetry/etc)
+    let mut args = vec!["-m".to_string(), "ruff".to_string(), "check".to_string()];
 
     if check_def.auto_fix {
         args.push("--fix".to_string());
@@ -146,13 +166,14 @@ fn build_ruff_command(
 
     args.push(".".to_string());
 
-    Ok(("ruff".to_string(), args))
+    Ok(("python".to_string(), args))
 }
 
 fn build_mypy_command(
     check_def: &CheckDefinition,
 ) -> Result<(String, Vec<String>), Box<dyn Error>> {
-    let mut args = vec![];
+    // Use python -m to run from active environment (venv/poetry/etc)
+    let mut args = vec!["-m".to_string(), "mypy".to_string()];
 
     if let Some(ref config) = check_def.config_path {
         args.push("--config-file".to_string());
@@ -164,13 +185,15 @@ fn build_mypy_command(
 
     args.push(".".to_string());
 
-    Ok(("mypy".to_string(), args))
+    Ok(("python".to_string(), args))
 }
 
 fn build_pyright_command(
     check_def: &CheckDefinition,
 ) -> Result<(String, Vec<String>), Box<dyn Error>> {
-    let mut args = vec![];
+    // Pyright is distributed as an npm package - use npx for project-local resolution
+    // (even when installed via pip, it downloads and runs the Node.js version)
+    let mut args = vec!["pyright".to_string()];
 
     // Pyright outputs JSON by default with this flag
     args.push("--outputjson".to_string());
@@ -180,7 +203,7 @@ fn build_pyright_command(
         args.push(config.clone());
     }
 
-    Ok(("pyright".to_string(), args))
+    Ok(("npx".to_string(), args))
 }
 
 // ============================================================================
@@ -190,7 +213,8 @@ fn build_pyright_command(
 fn build_eslint_command(
     check_def: &CheckDefinition,
 ) -> Result<(String, Vec<String>), Box<dyn Error>> {
-    let mut args = vec![];
+    // Use npx to run from node_modules/.bin (project-local version)
+    let mut args = vec!["eslint".to_string()];
 
     if check_def.auto_fix {
         args.push("--fix".to_string());
@@ -207,13 +231,14 @@ fn build_eslint_command(
 
     args.push(".".to_string());
 
-    Ok(("eslint".to_string(), args))
+    Ok(("npx".to_string(), args))
 }
 
 fn build_prettier_command(
     check_def: &CheckDefinition,
 ) -> Result<(String, Vec<String>), Box<dyn Error>> {
-    let mut args = vec![];
+    // Use npx to run from node_modules/.bin (project-local version)
+    let mut args = vec!["prettier".to_string()];
 
     if check_def.auto_fix {
         args.push("--write".to_string());
@@ -228,24 +253,26 @@ fn build_prettier_command(
 
     args.push(".".to_string());
 
-    Ok(("prettier".to_string(), args))
+    Ok(("npx".to_string(), args))
 }
 
 fn build_tsc_command(check_def: &CheckDefinition) -> Result<(String, Vec<String>), Box<dyn Error>> {
-    let mut args = vec!["--noEmit".to_string()];
+    // Use npx to run from node_modules/.bin (project-local version)
+    let mut args = vec!["tsc".to_string(), "--noEmit".to_string()];
 
     if let Some(ref config) = check_def.config_path {
         args.push("--project".to_string());
         args.push(config.clone());
     }
 
-    Ok(("tsc".to_string(), args))
+    Ok(("npx".to_string(), args))
 }
 
 fn build_biome_command(
     check_def: &CheckDefinition,
 ) -> Result<(String, Vec<String>), Box<dyn Error>> {
-    let mut args = vec![];
+    // Use npx to run from node_modules/.bin (project-local version)
+    let mut args = vec!["biome".to_string()];
 
     if check_def.auto_fix {
         args.push("check".to_string());
@@ -265,7 +292,7 @@ fn build_biome_command(
 
     args.push(".".to_string());
 
-    Ok(("biome".to_string(), args))
+    Ok(("npx".to_string(), args))
 }
 
 // ============================================================================
@@ -329,6 +356,8 @@ fn build_devtools_command(
     analyzer: &str,
     check_def: &CheckDefinition,
 ) -> Result<(String, Vec<String>), Box<dyn Error>> {
+    // qontinui-devtools is a system tool (not a project dependency), so we run it directly.
+    // It should be installed globally or in the runner's own environment.
     let mut args = vec!["run".to_string(), analyzer.to_string()];
 
     // Add working directory as the target path
@@ -469,7 +498,10 @@ mod tests {
     fn test_black_check_mode() {
         let check = make_check_def(CheckTool::Black, false);
         let (program, args) = build_command(&check).unwrap();
-        assert_eq!(program, "black");
+        // Uses python -m for project-local resolution
+        assert_eq!(program, "python");
+        assert!(args.contains(&"-m".to_string()));
+        assert!(args.contains(&"black".to_string()));
         assert!(args.contains(&"--check".to_string()));
     }
 
@@ -477,7 +509,8 @@ mod tests {
     fn test_black_fix_mode() {
         let check = make_check_def(CheckTool::Black, true);
         let (program, args) = build_command(&check).unwrap();
-        assert_eq!(program, "black");
+        assert_eq!(program, "python");
+        assert!(args.contains(&"black".to_string()));
         assert!(!args.contains(&"--check".to_string()));
     }
 
@@ -485,7 +518,10 @@ mod tests {
     fn test_ruff_check_mode() {
         let check = make_check_def(CheckTool::Ruff, false);
         let (program, args) = build_command(&check).unwrap();
-        assert_eq!(program, "ruff");
+        // Uses python -m for project-local resolution
+        assert_eq!(program, "python");
+        assert!(args.contains(&"-m".to_string()));
+        assert!(args.contains(&"ruff".to_string()));
         assert!(args.contains(&"check".to_string()));
         assert!(!args.contains(&"--fix".to_string()));
     }
@@ -494,8 +530,54 @@ mod tests {
     fn test_ruff_fix_mode() {
         let check = make_check_def(CheckTool::Ruff, true);
         let (program, args) = build_command(&check).unwrap();
-        assert_eq!(program, "ruff");
+        assert_eq!(program, "python");
+        assert!(args.contains(&"ruff".to_string()));
         assert!(args.contains(&"--fix".to_string()));
+    }
+
+    #[test]
+    fn test_eslint_uses_npx() {
+        let check = make_check_def(CheckTool::Eslint, false);
+        let (program, args) = build_command(&check).unwrap();
+        // Uses npx for project-local resolution
+        assert_eq!(program, "npx");
+        assert_eq!(args[0], "eslint");
+    }
+
+    #[test]
+    fn test_tsc_uses_npx() {
+        let check = make_check_def(CheckTool::Tsc, false);
+        let (program, args) = build_command(&check).unwrap();
+        // Uses npx for project-local resolution
+        assert_eq!(program, "npx");
+        assert_eq!(args[0], "tsc");
+        assert!(args.contains(&"--noEmit".to_string()));
+    }
+
+    #[test]
+    fn test_prettier_uses_npx() {
+        let check = make_check_def(CheckTool::Prettier, false);
+        let (program, args) = build_command(&check).unwrap();
+        assert_eq!(program, "npx");
+        assert_eq!(args[0], "prettier");
+        assert!(args.contains(&"--check".to_string()));
+    }
+
+    #[test]
+    fn test_biome_uses_npx() {
+        let check = make_check_def(CheckTool::Biome, false);
+        let (program, args) = build_command(&check).unwrap();
+        assert_eq!(program, "npx");
+        assert_eq!(args[0], "biome");
+    }
+
+    #[test]
+    fn test_pyright_uses_npx() {
+        // Pyright is distributed as npm package
+        let check = make_check_def(CheckTool::Pyright, false);
+        let (program, args) = build_command(&check).unwrap();
+        assert_eq!(program, "npx");
+        assert_eq!(args[0], "pyright");
     }
 
     #[test]
@@ -509,9 +591,18 @@ mod tests {
 
     #[test]
     fn test_cargo_clippy() {
+        // Rust tools use cargo which is already project-aware
         let check = make_check_def(CheckTool::Clippy, false);
         let (program, args) = build_command(&check).unwrap();
         assert_eq!(program, "cargo");
         assert!(args.contains(&"clippy".to_string()));
+    }
+
+    #[test]
+    fn test_cargo_fmt() {
+        let check = make_check_def(CheckTool::Rustfmt, false);
+        let (program, args) = build_command(&check).unwrap();
+        assert_eq!(program, "cargo");
+        assert!(args.contains(&"fmt".to_string()));
     }
 }

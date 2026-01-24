@@ -255,45 +255,111 @@ Return a JSON object with exactly these fields:
 Return ONLY the JSON object, no explanations or markdown code blocks."""
 
 
+def _format_elements_list(elements: list[dict]) -> str:
+    """Format a list of elements into a readable string."""
+    if not elements:
+        return ""
+
+    element_lines = []
+    for el in elements:
+        el_type = el.get("type", "")
+        el_text = el.get("text", "") or el.get("label", "")
+        el_id = el.get("id", "")
+        tag_name = el.get("tagName", "element")
+        visible = "visible" if el.get("visible", True) else "hidden"
+        enabled = "enabled" if el.get("enabled", True) else "disabled"
+
+        # Build a detailed element description
+        parts = [f"  - `{tag_name}`"]
+        if el_id:
+            parts.append(f'id="{el_id}"')
+        if el_type:
+            parts.append(f'type="{el_type}"')
+        if el_text:
+            # Truncate very long text but include reasonable amount
+            parts.append(f'text="{el_text[:150]}"')
+        parts.append(f"({visible}, {enabled})")
+        element_lines.append(" ".join(parts))
+
+    return "\n".join(element_lines)
+
+
 def build_test_and_agentic_prompt(
     user_prompt: str,
     page_context: dict | None = None,
+    contexts_content: str | None = None,
 ) -> str:
     """Build prompt for test and agentic step generation."""
     context_section = ""
+    selector_instructions = ""
+    knowledge_context = ""
+
+    # Include knowledge contexts if provided
+    if contexts_content:
+        knowledge_context = f"\n{contexts_content}\n"
+
     if page_context:
-        url = page_context.get("url", "Unknown URL")
-        title = page_context.get("title", "Unknown Title")
-        elements = page_context.get("elements", [])
+        # Check if this is multi-page context (has 'pages' array) or single page
+        pages = page_context.get("pages")
 
-        elements_text = ""
-        if elements:
-            element_lines = []
-            for el in elements[:30]:  # Limit to avoid token overflow
-                el_type = el.get("type", "")
-                el_text = el.get("text", "") or el.get("label", "")
-                el_id = el.get("id", "")
-                visible = "visible" if el.get("visible", True) else "hidden"
-                enabled = "enabled" if el.get("enabled", True) else "disabled"
-                line = f"  - {el.get('tagName', 'element')}"
-                if el_id:
-                    line += f" (id: {el_id})"
-                if el_type:
-                    line += f" [{el_type}]"
-                if el_text:
-                    line += f": {el_text[:50]}"
-                line += f" ({visible}, {enabled})"
-                element_lines.append(line)
-            elements_text = "\n".join(element_lines)
-            if len(elements) > 30:
-                elements_text += f"\n  ... and {len(elements) - 30} more elements"
+        if pages and isinstance(pages, list) and len(pages) > 0:
+            # Multi-page context from flow capture
+            total_elements = sum(len(p.get("elements", [])) for p in pages)
 
-        context_section = f"""
-## Current Page Context
+            pages_text_parts = []
+            for i, page in enumerate(pages, 1):
+                page_url = page.get("url", "Unknown URL")
+                page_title = page.get("title", "Unknown Title")
+                page_elements = page.get("elements", [])
+                elements_text = _format_elements_list(page_elements)
+
+                page_section = f"""### Page {i}: {page_title}
+- **URL**: {page_url}
+- **Elements** ({len(page_elements)} total):
+{elements_text}
+"""
+                pages_text_parts.append(page_section)
+
+            context_section = f"""
+## Multi-Page Context (from UI Bridge Flow Capture - REAL DOM)
+This test involves navigation across {len(pages)} page(s) with {total_elements} total elements.
+
+{"".join(pages_text_parts)}
+"""
+            selector_instructions = f"""
+**CRITICAL: This is a MULTI-PAGE test. Use the EXACT element IDs from each page above.**
+- The test navigates through {len(pages)} page(s) - use elements from the correct page for each step
+- When an element has an `id` attribute, use `#element-id` as the selector
+- These IDs are from the REAL page DOM captured via UI Bridge at each step
+- Do NOT invent or guess selectors - use only what's provided above
+- After navigation actions, the page context changes - use elements from the subsequent page section
+"""
+        else:
+            # Single page context
+            url = page_context.get("url", "Unknown URL")
+            title = page_context.get("title", "Unknown Title")
+            elements = page_context.get("elements", [])
+            elements_text = _format_elements_list(elements)
+
+            context_section = f"""
+## Current Page Context (from UI Bridge - REAL DOM)
 - **URL**: {url}
 - **Title**: {title}
-- **Elements on page** ({len(elements)} total):
+- **Elements discovered** ({len(elements)} total):
 {elements_text}
+"""
+            selector_instructions = """
+**CRITICAL: Use the EXACT element IDs from the UI Bridge context above.**
+- When an element has an `id` attribute, use `#element-id` as the selector
+- These IDs are from the REAL page DOM captured via UI Bridge
+- Do NOT invent or guess selectors - use only what's provided above
+- If the needed element isn't in the list, use the closest available element
+"""
+    else:
+        context_section = """
+## No Page Context Available
+No UI Bridge connection - generating generic test structure.
+You will need to replace placeholder selectors with actual element selectors.
 """
 
     return f"""## Task
@@ -301,7 +367,7 @@ Generate BOTH a Python verification test AND an agentic step prompt based on the
 
 ## User Instructions
 {user_prompt}
-{context_section}
+{knowledge_context}{context_section}
 ## Requirements
 
 ### 1. Verification Test (Python)
@@ -311,11 +377,11 @@ Create a Python test that:
 - Includes appropriate waits for dynamic content
 - Has meaningful assertions that verify the expected outcomes
 - Uses descriptive function and variable names
-
+{selector_instructions}
 ### 2. Agentic Step (AI Prompt)
 Create a prompt for an AI agent that:
 - Clearly describes the task objective
-- Provides context from the page if available
+- References the specific elements by their IDs when available
 - Specifies expected outcomes
 - Includes guidance for handling edge cases
 - Is optimized for AI understanding
@@ -324,14 +390,14 @@ Create a prompt for an AI agent that:
 Return a JSON object with exactly these fields:
 ```json
 {{
-  "verification_test": "import pytest\\nfrom playwright.sync_api import Page\\n\\n\\ndef test_example(page: Page):\\n    # Test implementation\\n    page.goto('...')\\n    # Actions and assertions",
+  "verification_test": "import pytest\\nfrom playwright.sync_api import Page\\n\\n\\ndef test_example(page: Page):\\n    # Test implementation using REAL selectors from UI Bridge\\n    page.goto('...')\\n    # Use exact IDs like page.locator('#actual-element-id')",
   "agentic_step": "Your task is to...\\n\\n## Context\\n...\\n\\n## Expected Outcome\\n...\\n\\n## Guidelines\\n...",
   "test_name": "test_descriptive_name",
   "agentic_name": "Descriptive Task Name"
 }}
 ```
 
-- `verification_test`: Complete Python test code using Playwright (properly escaped for JSON)
+- `verification_test`: Complete Python test code using Playwright with REAL selectors from UI Bridge
 - `agentic_step`: Complete AI prompt for the agentic step
 - `test_name`: Python function name for the test (snake_case, starts with test_)
 - `agentic_name`: Human-readable name for the agentic task (Title Case)
@@ -638,13 +704,18 @@ class AiBuilderGeneratorService:
         self,
         user_prompt: str,
         page_context: dict | None = None,
+        contexts_content: str | None = None,
         ai_provider: str = "claude_cli",
         ai_settings: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Generate a verification test and agentic step from user instructions."""
         self._log("info", f"Generating test and agentic step using {ai_provider}")
+        if contexts_content:
+            self._log(
+                "info", f"Including {contexts_content.count('<context')} context(s) in prompt"
+            )
 
-        prompt = build_test_and_agentic_prompt(user_prompt, page_context)
+        prompt = build_test_and_agentic_prompt(user_prompt, page_context, contexts_content)
         result = self._generate(prompt, ai_provider, ai_settings or {})
 
         if result["success"]:
@@ -658,3 +729,172 @@ class AiBuilderGeneratorService:
             self._log("error", f"Test and agentic step generation failed: {result['error']}")
 
         return result
+
+    def explore_flow_step(
+        self,
+        user_prompt: str,
+        current_elements: list[dict],
+        current_url: str,
+        current_title: str,
+        captured_pages: list[dict],
+        step_number: int,
+        ai_provider: str = "claude_cli",
+        ai_settings: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Determine the next action in an AI-driven flow exploration.
+
+        The AI analyzes current page elements and user's goal to decide what
+        action to take next: click, type, wait, or done.
+        """
+        self._log("info", f"Flow exploration step {step_number} using {ai_provider}")
+
+        prompt = build_flow_exploration_prompt(
+            user_prompt=user_prompt,
+            current_elements=current_elements,
+            current_url=current_url,
+            current_title=current_title,
+            captured_pages=captured_pages,
+            step_number=step_number,
+        )
+        result = self._generate(prompt, ai_provider, ai_settings or {})
+
+        if result["success"]:
+            action = result["data"].get("action", "unknown")
+            reason = result["data"].get("reason", "")
+            self._log("info", f"AI decided: {action} - {reason[:50]}...")
+        else:
+            self._log("error", f"Flow exploration step failed: {result['error']}")
+
+        return result
+
+
+def build_flow_exploration_prompt(
+    user_prompt: str,
+    current_elements: list[dict],
+    current_url: str,
+    current_title: str,
+    captured_pages: list[dict],
+    step_number: int,
+) -> str:
+    """Build prompt for AI to decide the next flow exploration action."""
+
+    # Format current page elements - focus on interactive ones
+    interactive_elements = []
+    all_elements = []
+
+    for el in current_elements:
+        tag = el.get("tagName", "").lower()
+        el_type = el.get("type", "")
+        el_id = el.get("id", "")
+        el_text = (el.get("text") or el.get("label") or "")[:80]
+        visible = el.get("visible", True)
+        enabled = el.get("enabled", True)
+
+        if not visible:
+            continue
+
+        # Build element description
+        desc_parts = [f"`{tag}`"]
+        if el_id:
+            desc_parts.append(f'id="{el_id}"')
+        if el_type:
+            desc_parts.append(f'type="{el_type}"')
+        if el_text:
+            desc_parts.append(f'text="{el_text}"')
+        if not enabled:
+            desc_parts.append("(disabled)")
+
+        el_desc = " ".join(desc_parts)
+        all_elements.append(f"  - {el_desc}")
+
+        # Track interactive elements separately
+        if tag in ("button", "a", "input", "select", "textarea") or el.get("role") in (
+            "button",
+            "link",
+            "menuitem",
+            "tab",
+        ):
+            interactive_elements.append(f"  - {el_desc}")
+
+    # Show interactive elements prominently, then others
+    elements_section = ""
+    if interactive_elements:
+        elements_section += "### Interactive Elements (buttons, links, inputs)\n"
+        elements_section += "\n".join(interactive_elements[:30])  # Limit for token efficiency
+        elements_section += "\n"
+
+    if all_elements:
+        elements_section += f"\n### All Visible Elements ({len(all_elements)} total)\n"
+        elements_section += "\n".join(all_elements[:50])  # Limit
+
+    # Format captured pages summary
+    captured_summary = ""
+    if captured_pages:
+        captured_lines = [
+            f"  - Page {i+1}: {p.get('title', 'Unknown')} ({p.get('element_count', 0)} elements)"
+            for i, p in enumerate(captured_pages)
+        ]
+        captured_summary = f"""
+### Already Captured Pages
+{chr(10).join(captured_lines)}
+"""
+
+    return f"""## Task
+You are helping navigate a web application to capture elements from multiple pages.
+The user wants to explore a flow and capture page elements along the way.
+
+## User's Goal
+{user_prompt}
+
+## Current State
+- **Step Number**: {step_number}
+- **Current Page**: {current_title}
+- **Current URL**: {current_url}
+{captured_summary}
+## Current Page Elements
+{elements_section}
+
+## Your Task
+Decide what action to take next to help achieve the user's goal.
+
+**Available Actions:**
+1. `click` - Click an element (provide element_id)
+2. `type` - Type text into an input (provide element_id and text)
+3. `wait` - Wait for content to load (provide wait_ms)
+4. `done` - Goal achieved, exploration complete
+
+**Guidelines:**
+- If the current page is the target destination mentioned in the goal, return `done`
+- If you need to click a button or link to navigate, use `click` with the exact element ID
+- Use `should_capture_after: true` if clicking will navigate to a new page you want to capture
+- Match elements by their text content, ID, or role to find what the user described
+- If you can't find the element the user described, explain why in `reason`
+
+## Output Format
+Return a JSON object with exactly these fields:
+```json
+{{
+  "action": "click",
+  "element_id": "actual-element-id-from-above",
+  "element_description": "Description of what element you're clicking",
+  "text": null,
+  "wait_ms": null,
+  "reason": "Clicking this button to navigate to the results page",
+  "should_capture_after": true
+}}
+```
+
+For `done`:
+```json
+{{
+  "action": "done",
+  "element_id": null,
+  "element_description": null,
+  "text": null,
+  "wait_ms": null,
+  "reason": "Successfully reached the results page, goal achieved",
+  "should_capture_after": false
+}}
+```
+
+Return ONLY the JSON object, no explanations or markdown code blocks."""

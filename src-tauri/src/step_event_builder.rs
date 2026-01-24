@@ -117,7 +117,10 @@ impl StepEventBuilder {
                 phase, step_type, self.task_run_id, iteration, step_index
             )
         } else {
-            format!("{}-{}-{}-{}", phase, step_type, self.task_run_id, step_index)
+            format!(
+                "{}-{}-{}-{}",
+                phase, step_type, self.task_run_id, step_index
+            )
         }
     }
 
@@ -204,7 +207,11 @@ impl StepEventBuilder {
     }
 
     /// Build an "error" event for when a step fails.
-    pub fn build_error(&self, duration_ms: i64, error_message: Option<&str>) -> CreateTaskRunEventInput {
+    pub fn build_error(
+        &self,
+        duration_ms: i64,
+        error_message: Option<&str>,
+    ) -> CreateTaskRunEventInput {
         // Update details with duration and error for the event data
         let mut details = self.details.clone();
         details.duration_ms = Some(duration_ms);

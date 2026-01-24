@@ -4201,13 +4201,6 @@ impl StepExecutor {
         let working_directory = step.shell_command_working_directory.clone();
         let fail_on_error = step.shell_command_fail_on_error.unwrap_or(true);
 
-        // Store template info for later use in event logging
-        let template_info = if has_variables {
-            Some((template_command.clone(), resolved_variables.clone()))
-        } else {
-            None
-        };
-
         // Detect if command uses PowerShell syntax
         let is_powershell = command.contains("Get-")
             || command.contains("Set-")
@@ -4284,39 +4277,9 @@ impl StepExecutor {
         // Emit to Tauri frontend for action log refresh
         self.emit_tree_event("action_started", &action_node, timestamp, sequence);
 
-        // Log start event to database (so shell commands show as "running" in the Active page)
-        if let Some(ref task_run_id) = self.task_run_id {
-            let start_data = json!({
-                "step_type": "shell_command",
-                "step_name": step_name,
-                "phase": step.phase,
-                "command": &command_display,
-                "working_directory": working_directory.as_deref(),
-                "shell_type": shell_type,
-                "start_time": (timestamp * 1000.0) as i64,
-            });
-
-            let start_event_input = CreateTaskRunEventInput {
-                task_run_id: task_run_id.clone(),
-                event_type: "shell_command".to_string(),
-                event_subtype: Some("start".to_string()),
-                message: format!("Shell command '{}' started", step_name),
-                data: Some(serde_json::to_string(&start_data).unwrap_or_default()),
-                workflow_name: None,
-                state_name: None,
-                action_id: Some(action_id.clone()),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                duration_ms: None,
-            };
-
-            if let Err(e) = self
-                .app_state
-                .checkpoint_db
-                .create_task_run_event(&start_event_input)
-            {
-                warn!("Failed to log shell command start event: {}", e);
-            }
-        }
+        // NOTE: Database event logging is handled by the unified workflow executor
+        // (execute_steps_with_log_sources -> log_step_event) to avoid duplicates.
+        // Tree events above are still emitted for the Session/Actions page.
 
         // Build the command - use PowerShell for PowerShell syntax on Windows
         let mut cmd = if cfg!(target_os = "windows") {
@@ -4493,73 +4456,9 @@ impl StepExecutor {
         // Emit to Tauri frontend for action log refresh
         self.emit_tree_event(event_type, &completed_node, end_timestamp, sequence);
 
-        // Log detailed shell command event to database (if task_run_id is set)
-        if let Some(ref task_run_id) = self.task_run_id {
-            // Truncate stdout/stderr for database storage (limit to 10KB each)
-            let stdout_db = if stdout.len() > 10240 {
-                format!("{}... (truncated)", &stdout[..10240])
-            } else {
-                stdout.clone()
-            };
-            let stderr_db = if stderr.len() > 10240 {
-                format!("{}... (truncated)", &stderr[..10240])
-            } else {
-                stderr.clone()
-            };
-
-            // Build shell_data with optional template info
-            let mut shell_data = json!({
-                "step_type": "shell_command",
-                "step_name": step_name,
-                "phase": step.phase,
-                "command": &command,
-                "working_directory": working_directory.as_deref(),
-                "shell_type": shell_type,
-                "exit_code": exit_code,
-                "stdout": stdout_db,
-                "stderr": stderr_db,
-                "duration_ms": duration_ms,
-                "end_time": (end_timestamp * 1000.0) as i64,
-                "success": final_success,
-            });
-
-            // Add template info if variables were used
-            if let Some((ref template_cmd, ref vars)) = template_info {
-                if let Some(obj) = shell_data.as_object_mut() {
-                    obj.insert("template_command".to_string(), json!(template_cmd));
-                    if let Some(resolved_vars) = vars {
-                        obj.insert("resolved_variables".to_string(), json!(resolved_vars));
-                    }
-                }
-            }
-
-            let event_input = CreateTaskRunEventInput {
-                task_run_id: task_run_id.clone(),
-                event_type: "shell_command".to_string(),
-                event_subtype: Some(if final_success { "complete" } else { "error" }.to_string()),
-                message: format!(
-                    "Shell command '{}' {} (exit code: {:?}, {}ms)",
-                    step_name,
-                    if final_success { "completed" } else { "failed" },
-                    exit_code,
-                    duration_ms
-                ),
-                data: Some(serde_json::to_string(&shell_data).unwrap_or_default()),
-                workflow_name: None,
-                state_name: None,
-                action_id: Some(action_id.clone()),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                duration_ms: Some(duration_ms as i64),
-            };
-
-            if let Err(e) = self
-                .app_state
-                .checkpoint_db
-                .create_task_run_event(&event_input)
-            {
-                warn!("Failed to log shell command event: {}", e);
-            }
-        }
+        // NOTE: Database event logging is handled by the unified workflow executor
+        // (execute_steps_with_log_sources -> log_step_event) to avoid duplicates.
+        // Tree events above are still emitted for the Session/Actions page.
 
         (final_success, error_msg, output_data)
     }
@@ -5117,7 +5016,11 @@ impl StepExecutor {
                     };
                     (
                         false,
-                        Some(format!("Check failed (exit code {:?}): {}", exit_code, error_summary.trim())),
+                        Some(format!(
+                            "Check failed (exit code {:?}): {}",
+                            exit_code,
+                            error_summary.trim()
+                        )),
                         Some(combined_output), // Return full output for AI context
                     )
                 }

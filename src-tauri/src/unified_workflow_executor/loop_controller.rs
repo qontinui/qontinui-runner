@@ -167,10 +167,7 @@ impl LoopController {
             )
             .await;
 
-        info!(
-            "Loop completed: {}",
-            loop_result.summary()
-        );
+        info!("Loop completed: {}", loop_result.summary());
 
         // =====================================================================
         // PHASE 3: COMPLETION (only if verification passed!)
@@ -279,7 +276,10 @@ impl LoopController {
             // not the [TASK_COMPLETE] marker from the AI
             let _ = self.checkpoint_db.append_task_output_ex(
                 &config.execution_id,
-                &format!("\n\n=== Verification-Agentic Loop: Iteration {} ===\n", iteration),
+                &format!(
+                    "\n\n=== Verification-Agentic Loop: Iteration {} ===\n",
+                    iteration
+                ),
                 false,
                 false, // Don't check for completion marker - verification is the authority
             );
@@ -298,7 +298,12 @@ impl LoopController {
 
             let (verification_result, step_results) = self
                 .verification_executor
-                .execute(verification_steps, &config.execution_id, iteration, &config.workflow_name)
+                .execute(
+                    verification_steps,
+                    &config.execution_id,
+                    iteration,
+                    &config.workflow_name,
+                )
                 .await;
 
             // Add step results to overall results
@@ -315,10 +320,7 @@ impl LoopController {
 
             // Check verification outcome
             if verification_result.all_passed {
-                info!(
-                    "*** VERIFICATION PASSED on iteration {} ***",
-                    iteration
-                );
+                info!("*** VERIFICATION PASSED on iteration {} ***", iteration);
 
                 let iter_result = IterationResult {
                     iteration,
@@ -405,7 +407,10 @@ impl LoopController {
             if let Some(output) = agentic_outcome.output() {
                 let _ = self.checkpoint_db.append_task_output_ex(
                     &config.execution_id,
-                    &format!("\n--- AI Output (Iteration {}) ---\n{}\n", iteration, output),
+                    &format!(
+                        "\n--- AI Output (Iteration {}) ---\n{}\n",
+                        iteration, output
+                    ),
                     true,  // increment session count
                     false, // Don't check for completion marker - verification is the authority
                 );

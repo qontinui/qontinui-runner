@@ -88,7 +88,11 @@ impl StepMetadata {
     }
 
     /// Create step metadata for a completion phase step.
-    pub fn completion(step_type: StepType, step_name: impl Into<String>, step_index: usize) -> Self {
+    pub fn completion(
+        step_type: StepType,
+        step_name: impl Into<String>,
+        step_index: usize,
+    ) -> Self {
         Self::new(step_type, step_name, step_index, WorkflowPhase::Completion)
     }
 

@@ -184,15 +184,13 @@ impl StepType {
 
         // Handle camelCase by inserting underscores before uppercase letters
         // This is a simple approach that works for most cases
-        let snake_case = normalized
-            .chars()
-            .fold(String::new(), |mut acc, c| {
-                if c.is_uppercase() && !acc.is_empty() {
-                    acc.push('_');
-                }
-                acc.push(c.to_ascii_lowercase());
-                acc
-            });
+        let snake_case = normalized.chars().fold(String::new(), |mut acc, c| {
+            if c.is_uppercase() && !acc.is_empty() {
+                acc.push('_');
+            }
+            acc.push(c.to_ascii_lowercase());
+            acc
+        });
 
         match snake_case.as_str() {
             // GUI Automation

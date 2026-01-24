@@ -469,6 +469,8 @@ pub struct ElementInfo {
 pub struct GenerateTestAndAgenticInput {
     pub user_prompt: String,
     pub page_context: Option<PageContext>,
+    /// Context IDs from the context library to inject into the AI prompt
+    pub context_ids: Option<Vec<String>>,
 }
 
 /// Generate a verification test and agentic step using AI.
@@ -499,6 +501,7 @@ pub async fn generate_test_and_agentic_step(
     let app_state = state.inner().clone();
     let user_prompt = input.user_prompt;
     let page_context = input.page_context;
+    let context_ids = input.context_ids;
 
     let result = tokio::task::spawn_blocking(move || {
         let mut guard = match app_state.python_bridge.lock() {
@@ -513,6 +516,7 @@ pub async fn generate_test_and_agentic_step(
             let params = serde_json::json!({
                 "user_prompt": user_prompt,
                 "page_context": page_context,
+                "context_ids": context_ids,
                 "ai_provider": ai_provider,
                 "ai_settings": provider_settings,
             });
@@ -526,7 +530,9 @@ pub async fn generate_test_and_agentic_step(
                     if response.success {
                         Ok(CommandResponse {
                             success: true,
-                            message: Some("Test and agentic step generated successfully".to_string()),
+                            message: Some(
+                                "Test and agentic step generated successfully".to_string(),
+                            ),
                             data: response.data,
                         })
                     } else {
@@ -536,6 +542,128 @@ pub async fn generate_test_and_agentic_step(
                                 response
                                     .error
                                     .unwrap_or_else(|| "Generation failed".to_string()),
+                            ),
+                            data: None,
+                        })
+                    }
+                }
+                Err(e) => Ok(CommandResponse {
+                    success: false,
+                    message: Some(format!("Command failed: {}", e)),
+                    data: None,
+                }),
+            }
+        } else {
+            Ok(CommandResponse {
+                success: false,
+                message: Some("Python executor not initialized".to_string()),
+                data: None,
+            })
+        }
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking error: {}", e))?;
+
+    result
+}
+
+// ============================================================================
+// AI-Driven Flow Exploration
+// ============================================================================
+
+/// Information about a previously captured page during flow exploration
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CapturedPageInfo {
+    pub url: String,
+    pub title: String,
+    pub element_count: i32,
+}
+
+/// Input for a single AI-driven flow exploration step
+#[derive(Debug, Deserialize)]
+pub struct ExploreFlowStepInput {
+    /// User's natural language description of the navigation flow
+    pub user_prompt: String,
+    /// Current page elements
+    pub current_elements: Vec<ElementInfo>,
+    /// Current page URL
+    pub current_url: String,
+    /// Current page title
+    pub current_title: String,
+    /// Pages already captured during this exploration
+    pub captured_pages: Vec<CapturedPageInfo>,
+    /// Current step number in the exploration
+    pub step_number: i32,
+}
+
+/// Ask AI to decide the next action in a flow exploration.
+///
+/// The AI analyzes the current page elements and user's goal to determine
+/// what action to take next (click, type, wait, or done).
+#[tauri::command]
+pub async fn explore_flow_step(
+    input: ExploreFlowStepInput,
+    state: State<'_, Arc<AppState>>,
+) -> Result<CommandResponse, String> {
+    use crate::settings;
+
+    info!(
+        "Explore flow step {}: {}",
+        input.step_number,
+        input.user_prompt.chars().take(50).collect::<String>()
+    );
+
+    let ai_settings = settings::get_ai_settings();
+    let ai_provider = match ai_settings.provider {
+        settings::AiProvider::ClaudeCli => "claude_cli",
+        settings::AiProvider::ClaudeApi => "claude_api",
+        settings::AiProvider::GeminiCli => "gemini_cli",
+        settings::AiProvider::GeminiApi => "gemini_api",
+    };
+
+    let provider_settings = build_provider_settings(&ai_settings);
+    let app_state = state.inner().clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut guard = match app_state.python_bridge.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                tracing::warn!("Python bridge mutex was poisoned, recovering...");
+                poisoned.into_inner()
+            }
+        };
+
+        if let Some(ref mut bridge) = *guard {
+            let params = serde_json::json!({
+                "user_prompt": input.user_prompt,
+                "current_elements": input.current_elements,
+                "current_url": input.current_url,
+                "current_title": input.current_title,
+                "captured_pages": input.captured_pages,
+                "step_number": input.step_number,
+                "ai_provider": ai_provider,
+                "ai_settings": provider_settings,
+            });
+
+            match bridge.send_command_and_wait(
+                "explore_flow_step",
+                Some(params),
+                std::time::Duration::from_secs(60), // Shorter timeout for single decision
+            ) {
+                Ok(response) => {
+                    if response.success {
+                        Ok(CommandResponse {
+                            success: true,
+                            message: Some("Flow step decided".to_string()),
+                            data: response.data,
+                        })
+                    } else {
+                        Ok(CommandResponse {
+                            success: false,
+                            message: Some(
+                                response
+                                    .error
+                                    .unwrap_or_else(|| "Flow exploration failed".to_string()),
                             ),
                             data: None,
                         })
