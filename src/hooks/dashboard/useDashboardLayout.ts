@@ -108,11 +108,13 @@ export function useDashboardLayout(
   }, []);
 
   // Initialize on mount if task info provided
+  // Use taskId as dependency to avoid resetting on every poll (object reference changes)
   useEffect(() => {
     if (initialTaskInfo) {
       resetLayoutForTask(initialTaskInfo);
     }
-  }, [initialTaskInfo, resetLayoutForTask]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialTaskInfo?.taskId]);
 
   /**
    * Auto-switch is DISABLED to prevent flickering.

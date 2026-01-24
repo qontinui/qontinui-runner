@@ -106,15 +106,9 @@ export function useDashboardState(): UseDashboardStateResult {
   } = useTaskDetection();
 
   // Layout management - pass isRunning to avoid false idle detection
-  const { layout, setActiveWidget, updateActivityState, resetLayoutForTask, getWidgetConfig } =
+  // Note: useDashboardLayout handles reset internally when taskId changes
+  const { layout, setActiveWidget, updateActivityState, getWidgetConfig } =
     useDashboardLayout(taskInfo, isRunning);
-
-  // Reset layout when task changes
-  useEffect(() => {
-    if (taskInfo) {
-      resetLayoutForTask(taskInfo);
-    }
-  }, [taskInfo?.taskId, resetLayoutForTask]);
 
   // Phase tracking
   const { currentPhase, showPhaseBadge } = usePhaseTracking({
