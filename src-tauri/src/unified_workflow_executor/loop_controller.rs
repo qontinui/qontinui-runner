@@ -274,10 +274,14 @@ impl LoopController {
             }
 
             // Log iteration start to database
-            let _ = self.checkpoint_db.append_task_output(
+            // Use append_task_output_ex with check_completion_marker=false
+            // because in unified workflows, VERIFICATION is the authority on completion,
+            // not the [TASK_COMPLETE] marker from the AI
+            let _ = self.checkpoint_db.append_task_output_ex(
                 &config.execution_id,
                 &format!("\n\n=== Verification-Agentic Loop: Iteration {} ===\n", iteration),
                 false,
+                false, // Don't check for completion marker - verification is the authority
             );
 
             // -----------------------------------------------------------------
@@ -366,9 +370,14 @@ impl LoopController {
             }
 
             // Verification failed (non-critical) - run agentic phase
+            // LOOP CONTINUES: This is the expected path when verification fails
             info!(
-                "Verification FAILED (passed={}, failed={}) - running agentic phase",
-                verification_result.passed_steps, verification_result.failed_steps
+                "LOOP-CONTINUE: Verification FAILED (passed={}, failed={}) on iteration {} - will run agentic phase then loop back",
+                verification_result.passed_steps, verification_result.failed_steps, iteration
+            );
+            info!(
+                "LOOP-DEBUG: all_passed={}, critical_failure={}, iteration={}/{} - loop will continue",
+                verification_result.all_passed, verification_result.critical_failure, iteration, config.max_iterations
             );
 
             let failure_context = verification_result.build_failure_context();
@@ -390,11 +399,15 @@ impl LoopController {
                 .await;
 
             // Log agentic output to database
+            // CRITICAL: Use append_task_output_ex with check_completion_marker=false
+            // The AI may output [TASK_COMPLETE] but that does NOT mean verification passed!
+            // In unified workflows, only verification passing can mark the task complete.
             if let Some(output) = agentic_outcome.output() {
-                let _ = self.checkpoint_db.append_task_output(
+                let _ = self.checkpoint_db.append_task_output_ex(
                     &config.execution_id,
                     &format!("\n--- AI Output (Iteration {}) ---\n{}\n", iteration, output),
-                    true, // increment session count
+                    true,  // increment session count
+                    false, // Don't check for completion marker - verification is the authority
                 );
             }
 
@@ -411,9 +424,11 @@ impl LoopController {
             iteration_results.push(iter_result);
 
             info!(
-                "Iteration {} complete - continuing to next iteration",
-                iteration
+                "LOOP-CONTINUE: Iteration {} complete - looping back to verification (next iteration: {})",
+                iteration, iteration + 1
             );
+            // The loop continues here naturally - no return statement
+            // Control flows back to the top of the loop for the next iteration
         }
     }
 

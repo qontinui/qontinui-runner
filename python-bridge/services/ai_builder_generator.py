@@ -353,6 +353,7 @@ def generate_via_claude_cli(
     """Generate content using Claude CLI."""
     import tempfile
 
+    logger.debug(f"[generate_via_claude_cli] Starting, prompt_len={len(prompt)}")
     result = {"success": False, "data": None, "error": ""}
 
     # Run from temp directory to avoid CLAUDE.md context
@@ -366,16 +367,27 @@ def generate_via_claude_cli(
         working_directory=temp_dir,
     )
 
+    logger.debug(
+        f"[generate_via_claude_cli] CLI result: success={cli_result['success']}, output_len={len(cli_result.get('output', ''))}"
+    )
+
     if cli_result["success"]:
         parsed = _parse_json_output(cli_result["output"])
+        logger.debug(f"[generate_via_claude_cli] Parsed result: success={parsed['success']}")
         if parsed["success"]:
             result["success"] = True
             result["data"] = parsed["data"]
+            logger.debug(
+                f"[generate_via_claude_cli] Data keys: {list(parsed['data'].keys()) if isinstance(parsed['data'], dict) else type(parsed['data'])}"
+            )
         else:
             result["error"] = parsed["error"]
+            logger.error(f"[generate_via_claude_cli] Parse error: {parsed['error']}")
     else:
         result["error"] = cli_result["error"]
+        logger.error(f"[generate_via_claude_cli] CLI error: {cli_result['error']}")
 
+    logger.debug(f"[generate_via_claude_cli] Returning: success={result['success']}")
     return result
 
 
@@ -431,20 +443,47 @@ def generate_via_claude_api(
 
 def _parse_json_output(output: str) -> dict[str, Any]:
     """Parse AI output as JSON."""
+    logger.debug(f"[_parse_json_output] Input length: {len(output)}")
+    logger.debug(f"[_parse_json_output] First 300 chars: {output[:300]!r}")
+
     output = output.strip()
 
     # Remove markdown code blocks if present
     if output.startswith("```"):
         lines = output.split("\n")
+        # First line is ```json or similar
         lines = lines[1:]
+        # Last line might be ```
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
         output = "\n".join(lines).strip()
+        logger.debug(f"[_parse_json_output] After removing code blocks, length: {len(output)}")
+        logger.debug(
+            f"[_parse_json_output] After removing code blocks, first 300 chars: {output[:300]!r}"
+        )
 
     try:
         data = json.loads(output)
+        logger.debug(
+            f"[_parse_json_output] JSON parsed successfully, keys: {list(data.keys()) if isinstance(data, dict) else type(data)}"
+        )
+        if isinstance(data, dict):
+            # Log presence and length of key fields
+            for key in ["verification_test", "agentic_step", "test_name", "agentic_name"]:
+                if key in data:
+                    val = data[key]
+                    if isinstance(val, str):
+                        logger.debug(
+                            f"[_parse_json_output] {key}: length={len(val)}, first 100 chars: {val[:100]!r}"
+                        )
+                    else:
+                        logger.debug(f"[_parse_json_output] {key}: {val!r}")
+                else:
+                    logger.debug(f"[_parse_json_output] {key}: MISSING")
         return {"success": True, "data": data, "error": ""}
     except json.JSONDecodeError as e:
+        logger.error(f"[_parse_json_output] JSON decode error: {e}")
+        logger.error(f"[_parse_json_output] Raw output (first 1000 chars): {output[:1000]!r}")
         return {
             "success": False,
             "data": None,

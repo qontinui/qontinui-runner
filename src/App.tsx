@@ -161,8 +161,8 @@ import { ConnectedUIBridgeInspector } from "./components/ui-bridge";
 import { LearningDashboard } from "./components/learning-dashboard";
 import { CheckpointBrowser } from "./components/checkpoint-browser";
 import { FlowDesigner } from "./components/flow-designer";
-// AI Test Builder
-import { AITestBuilderTab } from "./components/ai-test-builder";
+// Live Page Generator
+import { LivePageGeneratorTab } from "./components/live-page-generator";
 // Configure components
 import { ExternalLogsTab } from "./components/ExternalLogsTab";
 import { CategoryManager } from "./components/findings/CategoryManager";
@@ -217,7 +217,7 @@ type MainTabId =
   | "test-builder"
   | "check-builder"
   | "shell-command-builder"
-  | "ai-test-builder"
+  | "live-page-generator"
   | "capture"
   | "config-log-sources"
   | "config-findings"
@@ -282,7 +282,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "test-builder",
   "check-builder",
   "shell-command-builder",
-  "ai-test-builder",
+  "live-page-generator",
   "capture",
   "config-log-sources",
   "config-findings",
@@ -1176,10 +1176,10 @@ function AppContent() {
           </div>
         );
 
-      case "ai-test-builder":
+      case "live-page-generator":
         return (
           <div className="h-full overflow-hidden">
-            <AITestBuilderTab
+            <LivePageGeneratorTab
               onLog={addLog}
               onNavigateToLibrary={() => setActiveTab("library")}
             />

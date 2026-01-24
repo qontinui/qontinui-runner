@@ -5157,13 +5157,42 @@ def main():
                 result = executor.handle_command(command)
                 # Wrap response data in the format expected by Rust:
                 # { type: "response", id: "...", success: bool, data: {...}, error: Option<String> }
+                #
+                # The result from handlers can be in two formats:
+                # 1. {"success": True, "data": {...}, "error": ""}  - from AI generator services
+                # 2. {"success": True, "some_field": ..., "error": None}  - from other handlers
+                #
+                # For format 1, we extract the nested "data" field directly.
+                # For format 2, we build a data dict from non-success/error fields.
+                if "data" in result and isinstance(result.get("data"), dict):
+                    # AI generator format - extract the nested data directly
+                    response_data = result.get("data")
+                else:
+                    # Legacy format - build data from remaining fields
+                    response_data = {
+                        k: v for k, v in result.items() if k not in ("success", "error")
+                    }
+
                 response = {
                     "type": "response",
                     "id": command.get("id"),
                     "success": result.get("success", False),
-                    "data": {k: v for k, v in result.items() if k not in ("success", "error")},
+                    "data": response_data,
                     "error": result.get("error"),
                 }
+
+                # Debug log for AI generation responses
+                if cmd_name in (
+                    "generate_test_and_agentic_step",
+                    "generate_context_with_ai",
+                    "generate_api_request_with_ai",
+                    "generate_task_prompt_with_ai",
+                ):
+                    logger.debug(f"[RESPONSE] {cmd_name}: success={response['success']}")
+                    if response_data:
+                        logger.debug(
+                            f"[RESPONSE] data keys: {list(response_data.keys()) if isinstance(response_data, dict) else type(response_data)}"
+                        )
 
                 with executor.event_manager._output_lock:
                     sys.stdout.write(json.dumps(response) + "\n")

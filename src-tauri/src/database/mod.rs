@@ -3918,12 +3918,20 @@ impl CheckpointDb {
     /// Uses O(1) chunk insertion instead of O(n) string concatenation.
     /// Output is stored in the task_run_output_chunks table for efficient appending.
     ///
+    /// # Arguments
+    /// * `id` - Task run ID
+    /// * `output` - Output text to append
+    /// * `increment_session` - Whether to increment the session count
+    /// * `check_completion_marker` - Whether to check for [TASK_COMPLETE] marker and mark task complete.
+    ///   Set to `false` for unified workflows where verification is the authority on completion.
+    ///
     /// NOTE: This method handles task completion inline to avoid multiple connection acquisitions.
-    pub fn append_task_output(
+    pub fn append_task_output_ex(
         &self,
         id: &str,
         output: &str,
         increment_session: bool,
+        check_completion_marker: bool,
     ) -> Result<bool, String> {
         let conn = self.get_conn()?;
         let now = Utc::now().to_rfc3339();
@@ -3957,11 +3965,12 @@ impl CheckpointDb {
         )
         .map_err(|e| format!("Failed to update task run metadata: {}", e))?;
 
-        // Check if task is complete - marker must be on its own line (not embedded in text)
-        // This prevents false positives like "I should NOT output [TASK_COMPLETE] yet"
-        let is_complete = output
-            .lines()
-            .any(|line| line.trim() == TASK_COMPLETE_MARKER);
+        // Only check for completion marker if requested
+        // Unified workflows set check_completion_marker=false because verification is the authority
+        let is_complete = check_completion_marker
+            && output
+                .lines()
+                .any(|line| line.trim() == TASK_COMPLETE_MARKER);
         if is_complete {
             // IMPORTANT: Inline the completion logic here instead of calling complete_task_run()
             // to avoid nested lock acquisition (we already hold the conn lock above).
@@ -3981,6 +3990,19 @@ impl CheckpointDb {
         }
 
         Ok(is_complete)
+    }
+
+    /// Append output to a task run (legacy wrapper - checks for completion marker).
+    ///
+    /// This is the backward-compatible version that always checks for [TASK_COMPLETE].
+    /// For unified workflows, use `append_task_output_ex` with `check_completion_marker=false`.
+    pub fn append_task_output(
+        &self,
+        id: &str,
+        output: &str,
+        increment_session: bool,
+    ) -> Result<bool, String> {
+        self.append_task_output_ex(id, output, increment_session, true)
     }
 
     /// Mark a task run as complete.

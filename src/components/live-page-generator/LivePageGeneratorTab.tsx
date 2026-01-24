@@ -1,14 +1,16 @@
 /**
- * AITestBuilderTab.tsx
+ * LivePageGeneratorTab.tsx
  *
- * Dedicated page for AI-powered test and agentic step generation.
- * Connects to live browser pages/apps, captures UI Bridge context,
- * and uses AI to generate:
+ * Connects to live browser pages/apps via UI Bridge and uses AI to generate:
  *   - Python verification test code
  *   - Agentic step prompts
  *
- * No element selection required - AI interprets user's natural language
- * instructions along with the current page context.
+ * Key features:
+ *   - Real-time connection to browser tabs (via Qontinui DevTools extension)
+ *   - Mobile device support (via ADB)
+ *   - UI Bridge element context capture
+ *   - Natural language instructions
+ *   - Save to Test and Task libraries
  */
 
 import { useState, useCallback, useEffect } from "react";
@@ -55,14 +57,14 @@ interface UIBridgeContext {
   pageSnapshot?: string;
 }
 
-interface AITestBuilderTabProps {
+interface LivePageGeneratorTabProps {
   onLog?: (level: string, message: string) => void;
   onNavigateToLibrary?: () => void;
 }
 
 type TargetType = "browser" | "mobile" | "none";
 
-export function AITestBuilderTab({ onLog, onNavigateToLibrary }: AITestBuilderTabProps) {
+export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGeneratorTabProps) {
   // Target selection state
   const [selectedTargetType, setSelectedTargetType] = useState<TargetType>("none");
   const [selectedTabId, setSelectedTabId] = useState<number | null>(null);
@@ -224,6 +226,7 @@ ${expectedResults ? `Expected Results:\n${expectedResults}` : ""}
 ${contextDescription}`;
 
       // Call the AI generation endpoint
+      console.log("[LivePageGenerator] Calling generate_test_and_agentic_step...");
       const result = await invoke<{
         success: boolean;
         message?: string;
@@ -246,16 +249,22 @@ ${contextDescription}`;
         },
       });
 
+      console.log("[LivePageGenerator] Result:", JSON.stringify(result, null, 2));
+
       if (result.success && result.data) {
-        setGeneratedContent({
-          verificationTest: result.data.verification_test,
-          agenticStep: result.data.agentic_step,
-          testName: result.data.test_name,
-          agenticName: result.data.agentic_name,
-        });
+        const content = {
+          verificationTest: result.data.verification_test || "",
+          agenticStep: result.data.agentic_step || "",
+          testName: result.data.test_name || "generated_test",
+          agenticName: result.data.agentic_name || "Generated Task",
+        };
+        console.log("[LivePageGenerator] Setting generated content:", content);
+        setGeneratedContent(content);
         onLog?.("success", "Successfully generated test and agentic step");
       } else {
-        throw new Error(result.message || "Generation failed");
+        const errMsg = result.message || "Generation failed - no data returned";
+        console.error("[LivePageGenerator] Generation failed:", errMsg, result);
+        throw new Error(errMsg);
       }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
@@ -348,13 +357,13 @@ ${contextDescription}`;
       {/* Header */}
       <div className="flex-shrink-0 px-6 py-4 border-b border-neutral-700">
         <div className="flex items-center gap-3">
-          <div className="p-2 rounded-lg bg-gradient-to-br from-purple-500/20 to-blue-500/20">
-            <Sparkles className="w-6 h-6 text-purple-400" />
+          <div className="p-2 rounded-lg bg-gradient-to-br from-cyan-500/20 to-blue-500/20">
+            <Globe className="w-6 h-6 text-cyan-400" />
           </div>
           <div>
-            <h1 className="text-xl font-semibold">AI Test Builder</h1>
+            <h1 className="text-xl font-semibold">Live Page Generator</h1>
             <p className="text-sm text-neutral-400">
-              Generate verification tests and agentic steps from natural language
+              Connect to live pages via UI Bridge to generate tests and tasks
             </p>
           </div>
         </div>
@@ -648,9 +657,11 @@ ${contextDescription}`;
                     </button>
                   </div>
                 </div>
-                <pre className="p-4 text-sm font-mono overflow-x-auto max-h-80 overflow-y-auto">
-                  <code>{generatedContent.verificationTest}</code>
-                </pre>
+                <div className="p-4 max-h-96 overflow-auto bg-neutral-900">
+                  <pre className="text-sm font-mono text-green-300 whitespace-pre-wrap break-words">
+                    {generatedContent.verificationTest || "(No test code generated)"}
+                  </pre>
+                </div>
               </div>
 
               {/* Agentic Step */}
@@ -693,9 +704,11 @@ ${contextDescription}`;
                     </button>
                   </div>
                 </div>
-                <pre className="p-4 text-sm whitespace-pre-wrap max-h-80 overflow-y-auto">
-                  {generatedContent.agenticStep}
-                </pre>
+                <div className="p-4 max-h-96 overflow-auto bg-neutral-900">
+                  <pre className="text-sm whitespace-pre-wrap break-words text-purple-300">
+                    {generatedContent.agenticStep || "(No agentic step generated)"}
+                  </pre>
+                </div>
               </div>
 
               {/* Actions */}
@@ -720,4 +733,4 @@ ${contextDescription}`;
   );
 }
 
-export default AITestBuilderTab;
+export default LivePageGeneratorTab;
