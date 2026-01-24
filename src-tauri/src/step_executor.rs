@@ -4284,6 +4284,40 @@ impl StepExecutor {
         // Emit to Tauri frontend for action log refresh
         self.emit_tree_event("action_started", &action_node, timestamp, sequence);
 
+        // Log start event to database (so shell commands show as "running" in the Active page)
+        if let Some(ref task_run_id) = self.task_run_id {
+            let start_data = json!({
+                "step_type": "shell_command",
+                "step_name": step_name,
+                "phase": step.phase,
+                "command": &command_display,
+                "working_directory": working_directory.as_deref(),
+                "shell_type": shell_type,
+                "start_time": (timestamp * 1000.0) as i64,
+            });
+
+            let start_event_input = CreateTaskRunEventInput {
+                task_run_id: task_run_id.clone(),
+                event_type: "shell_command".to_string(),
+                event_subtype: Some("start".to_string()),
+                message: format!("Shell command '{}' started", step_name),
+                data: Some(serde_json::to_string(&start_data).unwrap_or_default()),
+                workflow_name: None,
+                state_name: None,
+                action_id: Some(action_id.clone()),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                duration_ms: None,
+            };
+
+            if let Err(e) = self
+                .app_state
+                .checkpoint_db
+                .create_task_run_event(&start_event_input)
+            {
+                warn!("Failed to log shell command start event: {}", e);
+            }
+        }
+
         // Build the command - use PowerShell for PowerShell syntax on Windows
         let mut cmd = if cfg!(target_os = "windows") {
             if is_powershell {
@@ -4477,6 +4511,7 @@ impl StepExecutor {
             let mut shell_data = json!({
                 "step_type": "shell_command",
                 "step_name": step_name,
+                "phase": step.phase,
                 "command": &command,
                 "working_directory": working_directory.as_deref(),
                 "shell_type": shell_type,
@@ -4484,6 +4519,7 @@ impl StepExecutor {
                 "stdout": stdout_db,
                 "stderr": stderr_db,
                 "duration_ms": duration_ms,
+                "end_time": (end_timestamp * 1000.0) as i64,
                 "success": final_success,
             });
 

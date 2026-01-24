@@ -55,6 +55,7 @@ mod task_recorder;
 mod test_executor;
 mod test_orchestrator;
 mod tiered_info;
+mod unified_workflow_executor;
 mod unified_workflows;
 mod video_recorder;
 mod workflow_generation;

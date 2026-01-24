@@ -993,6 +993,18 @@ impl Orchestrator {
         state.started_at = Some(Instant::now());
         state.started_at_iso = Some(chrono::Utc::now().to_rfc3339());
 
+        // Record initial "setup" stage transition for recap timeline
+        // (state.current_stage is already "setup", but we need to record it explicitly)
+        let initial_transition = StageTransition {
+            from: "init".to_string(),
+            to: "setup".to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            iteration: 0,
+        };
+        state.transition_history.push(initial_transition);
+        state.current_stage = "setup".to_string();
+        self.persist_transition_history(&state);
+
         // Execute pre-execution hooks
         self.execute_hooks(HookTrigger::PreExecution, &state);
 
@@ -1574,6 +1586,10 @@ impl Orchestrator {
         state: &mut OrchestratorState,
         screenshot_base64: Option<&str>,
     ) -> Result<IterationVerificationResults, String> {
+        // Record stage transition to verification (if not already in verification)
+        state.record_stage_transition("verification");
+        self.persist_transition_history(state);
+
         let plan = state
             .plan
             .as_ref()
@@ -2813,12 +2829,18 @@ pub async fn run_orchestrated_task(
                         orchestrator.complete_task(&mut state, result.clone());
                         return Ok(result);
                     }
+                    // Transition to agentic phase for next iteration
+                    state.record_stage_transition("agentic");
+                    orchestrator.persist_transition_history(&state);
                     // Continue to next iteration with verification feedback
                     continue;
                 }
             }
             WorkerOutputAction::Replan { reason } => {
                 orchestrator.handle_replan(&mut state, &reason)?;
+                // Transition to agentic phase for re-planning
+                state.record_stage_transition("agentic");
+                orchestrator.persist_transition_history(&state);
                 // Continue with new plan
                 continue;
             }

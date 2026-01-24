@@ -274,41 +274,11 @@ pub fn build_ai_session_steps(
                 children: Vec::new(),
             });
         }
-    } else if task_run.sessions_count > 0 {
-        for i in 1..=task_run.sessions_count {
-            let is_last = i == task_run.sessions_count;
-            let status = if is_last && task_run.status == "failed" {
-                "failed"
-            } else {
-                "success"
-            };
-
-            let session_name = if task_run.sessions_count > 1 {
-                format!("{} (session {})", base_step_name, i)
-            } else {
-                base_step_name.clone()
-            };
-
-            let summary = Some(generate_ai_session_summary("", i, status));
-
-            steps.push(RecapStep {
-                name: session_name,
-                step_type: "ai_session".to_string(),
-                status: status.to_string(),
-                phase: Some("agentic".to_string()),
-                icon_type: Some("prompt".to_string()),
-                work_summary: None,
-                summary,
-                duration_ms: None,
-                error: if status == "failed" {
-                    task_run.error_message.clone()
-                } else {
-                    None
-                },
-                children: Vec::new(),
-            });
-        }
     }
+    // NOTE: We intentionally do NOT fall back to creating AI steps based purely on sessions_count.
+    // The sessions_count can be incremented even when no actual AI session ran (e.g., during
+    // workflow setup before verification fails). Only create AI session steps when there's
+    // actual evidence: session events or [SESSION_START:] markers in the output.
 
     steps
 }

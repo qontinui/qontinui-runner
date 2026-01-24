@@ -961,7 +961,7 @@ fn run_claude_session_inline(
 /// # Returns
 /// * `(bool, String, Option<RetryState>)` - (success, output, retry_state if retries occurred)
 #[allow(clippy::too_many_arguments)]
-fn run_claude_session_with_retry(
+pub fn run_claude_session_with_retry(
     working_dir: &str,
     prompt: &str,
     session_id: &str,
@@ -7118,6 +7118,88 @@ async fn stop_ui_bridge_exploration(
         }
         Err(e) => {
             error!("MCP API: Failed to stop UI Bridge exploration: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Request for discovering states from render logs
+#[derive(Debug, Deserialize)]
+pub struct DiscoverStatesRequest {
+    /// Array of DOM snapshot render log entries
+    pub render_logs: Vec<serde_json::Value>,
+}
+
+/// Discover states from render logs using co-occurrence analysis
+/// This endpoint runs state discovery on existing render logs without exploration
+async fn discover_states_from_renders(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<DiscoverStatesRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!(
+        "MCP API: Discovering states from {} render logs",
+        request.render_logs.len()
+    );
+
+    let app_state = state.app_state.clone();
+
+    // Build parameters for Python command
+    let params = serde_json::json!({
+        "render_logs": request.render_logs,
+    });
+
+    // Allow more time for analysis of large render logs
+    let timeout = std::time::Duration::from_secs(60);
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            warn!("MCP API: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+            bridge.send_command_and_wait("discover_states_from_renders", Some(params), timeout)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if response.success {
+                info!("MCP API: State discovery completed successfully");
+                if let Some(data) = response.data {
+                    Ok(Json(ApiResponse::success(data)))
+                } else {
+                    Ok(Json(ApiResponse::success(serde_json::json!({
+                        "states": [],
+                        "elements": [],
+                        "elementToRenders": {},
+                        "renderCount": 0,
+                        "uniqueElementCount": 0
+                    }))))
+                }
+            } else {
+                let error_msg = response
+                    .error
+                    .unwrap_or_else(|| "Failed to discover states from renders".to_string());
+                error!("MCP API: Failed to discover states: {}", error_msg);
+                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(error_msg))))
+            }
+        }
+        Err(e) => {
+            error!("MCP API: Failed to discover states from renders: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
         }
     }
@@ -15176,6 +15258,10 @@ struct StepExecutionData {
     step_type: String,
     step_name: String,
     status: String, // "pending", "running", "success", "failed"
+    /// Workflow phase: "setup", "verification", "agentic", or "completion"
+    phase: Option<String>,
+    /// Step index within the phase
+    step_index: Option<i64>,
     start_time: Option<i64>,
     end_time: Option<i64>,
     duration_ms: Option<i64>,
@@ -15309,6 +15395,12 @@ async fn get_current_execution_steps(
 
             // Update fields that are typically only in complete events
             if let Some(d) = &data {
+                // Update phase if not already set
+                if existing.phase.is_none() {
+                    if let Some(v) = d.get("phase").and_then(|v| v.as_str()) {
+                        existing.phase = Some(v.to_string());
+                    }
+                }
                 if let Some(v) = d.get("duration_ms").and_then(|v| v.as_i64()) {
                     existing.duration_ms = Some(v);
                 }
@@ -15332,12 +15424,21 @@ async fn get_current_execution_steps(
                 }
             }
         } else {
+            // Extract phase from event data
+            let phase = data
+                .as_ref()
+                .and_then(|d| d.get("phase"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
             // Create new entry
             let step_data = StepExecutionData {
                 id: event.id.to_string(),
                 step_type: step_type_str,
                 step_name,
                 status,
+                phase,
+                step_index: if step_index >= 0 { Some(step_index) } else { None },
                 start_time: event_timestamp,
                 end_time: data
                     .as_ref()
@@ -18496,495 +18597,11 @@ async fn generate_unified_workflow_handler(
     }
 }
 
-/// Run a unified workflow with the verification-agentic loop.
-///
-/// This implements the proper verification-agentic loop:
-/// 1. SETUP (once) - Run setup_steps via step_executor
-/// 2. VERIFICATION-AGENTIC LOOP (until pass or max_iterations):
-///    - VERIFICATION PHASE: Run verification_steps via step_executor
-///    - IF all pass → exit loop
-///    - AGENTIC PHASE: Build prompt with failure context, run AI session
-/// 3. COMPLETION (once) - Run completion_steps
-///
-/// This function integrates the workflow's explicit verification_steps with the
-/// orchestrator system, ensuring the AI cannot self-declare [TASK_COMPLETE]
-/// to bypass actual verification tests.
-async fn run_unified_workflow_with_verification_loop(
-    state: Arc<ApiState>,
-    workflow: crate::unified_workflows::UnifiedWorkflow,
-    execution_id: String,
-    setup_steps: Vec<crate::step_executor::ExecutionStepConfig>,
-    verification_steps: Vec<crate::step_executor::ExecutionStepConfig>,
-    agentic_steps: Vec<crate::step_executor::ExecutionStepConfig>,
-    completion_steps: Vec<crate::step_executor::ExecutionStepConfig>,
-    combined_prompt: String,
-    timeout_seconds: u64,
-) -> crate::step_executor::ExecutionResult {
-    use crate::step_executor::{
-        ExecutionResult, LogSourceConfig, StepExecutor, VerificationPhaseResult,
-    };
-
-    let max_iterations = workflow.max_iterations;
-    let mut all_step_results = Vec::new();
-    let mut total_duration_ms = 0u64;
-    let start = std::time::Instant::now();
-
-    // Create step executor
-    let executor = StepExecutor::with_app_handle(
-        state.app_state.clone(),
-        state.config_storage.clone(),
-        state.app_handle.clone(),
-    );
-
-    // Empty log sources for now (can be configured via workflow later)
-    let log_sources: Vec<LogSourceConfig> = vec![];
-
-    // =========================================================================
-    // PHASE 1: SETUP (once)
-    // =========================================================================
-    if !setup_steps.is_empty() {
-        info!(
-            "Executing {} setup steps for workflow '{}'",
-            setup_steps.len(),
-            workflow.name
-        );
-
-        let (setup_result, setup_complete) = executor
-            .execute_setup_phase(&setup_steps, &execution_id, &log_sources)
-            .await;
-
-        all_step_results.extend(setup_result.steps.clone());
-
-        if !setup_complete {
-            warn!("Setup phase failed for workflow '{}'", workflow.name);
-            // Update task status
-            let _ = state
-                .app_state
-                .checkpoint_db
-                .fail_task_run(&execution_id, "Setup phase failed");
-            return ExecutionResult {
-                success: false,
-                total_steps: setup_result.total_steps,
-                successful_steps: setup_result.successful_steps,
-                failed_steps: setup_result.failed_steps,
-                total_duration_ms: start.elapsed().as_millis() as u64,
-                steps: all_step_results,
-                captured_logs: setup_result.captured_logs,
-                captured_runner_logs: setup_result.captured_runner_logs,
-            };
-        }
-
-        info!("Setup phase completed successfully");
-    }
-
-    // =========================================================================
-    // PHASE 2: VERIFICATION-AGENTIC LOOP
-    // =========================================================================
-    let mut iteration = 0u32;
-    let mut last_verification_result: Option<VerificationPhaseResult> = None;
-
-    loop {
-        iteration += 1;
-
-        info!(
-            "VERIFICATION-AGENTIC LOOP: Starting iteration {} (max={}) for workflow '{}'",
-            iteration, max_iterations, workflow.name
-        );
-
-        if iteration > max_iterations {
-            warn!(
-                "VERIFICATION-AGENTIC LOOP: Max iterations ({}) reached for workflow '{}' - stopping loop. Last verification passed: {:?}",
-                max_iterations, workflow.name, last_verification_result.as_ref().map(|r| r.all_passed)
-            );
-            break;
-        }
-
-        info!(
-            "VERIFICATION-AGENTIC LOOP: Iteration {} of {} for workflow '{}' - running verification phase",
-            iteration, max_iterations, workflow.name
-        );
-
-        // ---------------------------------------------------------------------
-        // VERIFICATION PHASE: Run verification_steps
-        // ---------------------------------------------------------------------
-        if !verification_steps.is_empty() {
-            info!(
-                "Running {} verification steps (iteration {})",
-                verification_steps.len(),
-                iteration
-            );
-
-            let verification_result = executor
-                .execute_verification_steps(&verification_steps, &execution_id, iteration)
-                .await;
-
-            info!("{}", verification_result.summary());
-
-            // Store verification result for database and Recap page
-            if let Ok(result_json) = serde_json::to_value(&verification_result) {
-                if let Err(e) = state
-                    .app_state
-                    .checkpoint_db
-                    .store_verification_phase_result(&execution_id, iteration, &result_json)
-                {
-                    warn!("Failed to store verification result: {}", e);
-                }
-            }
-
-            // Add step results to overall results
-            let step_offset = all_step_results.len();
-            all_step_results.extend(verification_result.step_results.iter().cloned().map(
-                |mut r| {
-                    // Adjust step index to account for setup steps
-                    r.step_index += step_offset;
-                    r
-                },
-            ));
-
-            // Check if all verification passed
-            info!(
-                "VERIFICATION-AGENTIC LOOP: Iteration {} verification result: all_passed={}, critical_failure={}, passed={}/{}, failed={}",
-                iteration, verification_result.all_passed, verification_result.critical_failure,
-                verification_result.passed_steps, verification_result.total_steps, verification_result.failed_steps
-            );
-
-            if verification_result.all_passed {
-                info!(
-                    "VERIFICATION-AGENTIC LOOP: All verification steps PASSED on iteration {} - exiting loop successfully",
-                    iteration
-                );
-                last_verification_result = Some(verification_result);
-                break;
-            }
-
-            // Check for critical failure
-            if verification_result.critical_failure {
-                warn!(
-                    "VERIFICATION-AGENTIC LOOP: Critical verification failure on iteration {} - stopping execution",
-                    iteration
-                );
-                let _ = state
-                    .app_state
-                    .checkpoint_db
-                    .fail_task_run(&execution_id, "Critical verification step failed");
-                return ExecutionResult {
-                    success: false,
-                    total_steps: all_step_results.len(),
-                    successful_steps: all_step_results.iter().filter(|r| r.success).count(),
-                    failed_steps: all_step_results.iter().filter(|r| !r.success).count(),
-                    total_duration_ms: start.elapsed().as_millis() as u64,
-                    steps: all_step_results,
-                    captured_logs: None,
-                    captured_runner_logs: None,
-                };
-            }
-
-            last_verification_result = Some(verification_result);
-        }
-
-        // ---------------------------------------------------------------------
-        // AGENTIC PHASE: Run AI session with verification failure context
-        // ---------------------------------------------------------------------
-        if !agentic_steps.is_empty() {
-            info!("Running agentic phase (iteration {})", iteration);
-
-            // Build context from verification failures
-            let failure_context = last_verification_result
-                .as_ref()
-                .map(|r| r.build_failure_context())
-                .unwrap_or_default();
-
-            // Log what we're passing to the AI
-            if failure_context.is_empty() {
-                warn!(
-                    "VERIFICATION-AGENTIC LOOP: failure_context is EMPTY for iteration {} - AI won't know what to fix!",
-                    iteration
-                );
-            } else {
-                info!(
-                    "VERIFICATION-AGENTIC LOOP: Passing {} chars of failure context to AI for iteration {}",
-                    failure_context.len(), iteration
-                );
-                // Log first 500 chars for debugging
-                let preview = if failure_context.len() > 500 {
-                    format!("{}...[truncated]", &failure_context[..500])
-                } else {
-                    failure_context.clone()
-                };
-                info!("VERIFICATION-AGENTIC LOOP: Failure context preview:\n{}", preview);
-            }
-
-            // Combine prompt with failure context
-            let enhanced_prompt = if failure_context.is_empty() {
-                warn!("VERIFICATION-AGENTIC LOOP: Using original prompt without failure context");
-                combined_prompt.clone()
-            } else {
-                info!("VERIFICATION-AGENTIC LOOP: Enhanced prompt with failure context ({} + {} = {} chars)",
-                    combined_prompt.len(), failure_context.len(), combined_prompt.len() + failure_context.len() + 50);
-                format!(
-                    "{}\n\n---\n\n{}\n\nPlease fix the issues identified above.",
-                    combined_prompt, failure_context
-                )
-            };
-
-            // Build session config
-            let session_config = SessionConfig {
-                prompt: enhanced_prompt.clone(),
-                continuation_prompt: None,
-                total_phases: 1, // Single phase per agentic iteration
-                uses_gui: false,
-                timeout_seconds,
-                stall_threshold_seconds: 300,
-                name: format!("{} - Iteration {}", workflow.name, iteration),
-                description: workflow.description.clone(),
-                custom_config: serde_json::json!({
-                    "workflow_id": workflow.id,
-                    "iteration": iteration,
-                    "verification_failed": last_verification_result.as_ref().map(|r| !r.all_passed).unwrap_or(false),
-                }),
-                provider: workflow.provider.clone(),
-                model: workflow.model.clone(),
-            };
-
-            // Update task status to indicate agentic phase
-            let _ = state.app_state.checkpoint_db.append_task_output(
-                &execution_id,
-                &format!("\n\n=== Agentic Phase Iteration {} ===\n", iteration),
-                true, // increment session count
-            );
-
-            // Start AI session
-            match state.session.start_session(session_config).await {
-                Ok(session) => {
-                    info!(
-                        "Started AI session {} for agentic phase iteration {}",
-                        session.id, iteration
-                    );
-
-                    // Wait for session to complete
-                    // Note: In production, this should be more sophisticated
-                    // with proper session monitoring and timeout handling
-                    let session_id = session.id.clone();
-                    let mut attempts = 0;
-                    let max_attempts = (timeout_seconds / 5) as u32 + 1;
-
-                    loop {
-                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                        attempts += 1;
-
-                        if let Some(s) = state.session.get_session(&session_id).await {
-                            match s.status {
-                                SessionStatus::Completed => {
-                                    info!("AI session {} completed", session_id);
-                                    break;
-                                }
-                                SessionStatus::Failed => {
-                                    warn!("AI session {} failed", session_id);
-                                    break;
-                                }
-                                _ => {
-                                    if attempts >= max_attempts {
-                                        warn!("AI session {} timed out", session_id);
-                                        break;
-                                    }
-                                }
-                            }
-                        } else {
-                            warn!("Session {} not found", session_id);
-                            break;
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to start AI session for iteration {}: {}",
-                        iteration, e
-                    );
-                    // Continue to next iteration - don't fail entire workflow
-                }
-            }
-
-            info!(
-                "VERIFICATION-AGENTIC LOOP: Agentic phase completed for iteration {}. Continuing to next iteration.",
-                iteration
-            );
-        } else {
-            info!(
-                "VERIFICATION-AGENTIC LOOP: No agentic steps defined, skipping agentic phase for iteration {}",
-                iteration
-            );
-        }
-
-        info!(
-            "VERIFICATION-AGENTIC LOOP: Iteration {} complete, looping back to verification phase",
-            iteration
-        );
-    }
-
-    info!(
-        "VERIFICATION-AGENTIC LOOP: Exited after {} iterations. Last verification all_passed: {:?}",
-        iteration.min(max_iterations),
-        last_verification_result.as_ref().map(|r| r.all_passed)
-    );
-
-    // =========================================================================
-    // PHASE 3: COMPLETION (once)
-    // =========================================================================
-    if !completion_steps.is_empty() {
-        info!(
-            "Executing {} completion steps for workflow '{}'",
-            completion_steps.len(),
-            workflow.name
-        );
-
-        // Separate completion steps into automation (non-prompt) and prompt steps
-        let (completion_automation_steps, completion_prompt_steps): (Vec<_>, Vec<_>) =
-            completion_steps
-                .into_iter()
-                .partition(|s| s.step_type != "prompt");
-
-        // Run non-prompt completion steps through the executor
-        if !completion_automation_steps.is_empty() {
-            let completion_result = executor
-                .execute_completion_phase(&completion_automation_steps, &execution_id, &log_sources)
-                .await;
-
-            all_step_results.extend(completion_result.steps.clone());
-
-            if !completion_result.success {
-                warn!(
-                    "Completion automation steps failed for workflow '{}'",
-                    workflow.name
-                );
-            }
-        }
-
-        // Run prompt completion steps (e.g., AI summary) as an AI session
-        if !completion_prompt_steps.is_empty() {
-            info!(
-                "Running {} completion prompt steps (AI summary)",
-                completion_prompt_steps.len()
-            );
-
-            // Combine all completion prompts into one
-            let completion_prompt = completion_prompt_steps
-                .iter()
-                .filter_map(|s| s.prompt_content.as_ref())
-                .map(|content| content.as_str())
-                .collect::<Vec<_>>()
-                .join("\n\n---\n\n");
-
-            if !completion_prompt.is_empty() {
-                // Build session config for completion
-                let session_config = SessionConfig {
-                    prompt: completion_prompt.clone(),
-                    continuation_prompt: None,
-                    total_phases: 1,
-                    uses_gui: false,
-                    timeout_seconds,
-                    stall_threshold_seconds: 300,
-                    name: format!("{} - Completion", workflow.name),
-                    description: "Completion phase summary".to_string(),
-                    custom_config: serde_json::json!({
-                        "workflow_id": workflow.id,
-                        "phase": "completion",
-                    }),
-                    provider: workflow.provider.clone(),
-                    model: workflow.model.clone(),
-                };
-
-                // Start AI session for completion
-                match state.session.start_session(session_config).await {
-                    Ok(session) => {
-                        info!("Started AI session {} for completion phase", session.id);
-
-                        // Wait for session to complete
-                        let session_id = session.id.clone();
-                        let mut attempts = 0;
-                        let max_attempts = (timeout_seconds / 5) as u32 + 1;
-
-                        loop {
-                            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                            attempts += 1;
-
-                            if let Some(s) = state.session.get_session(&session_id).await {
-                                match s.status {
-                                    SessionStatus::Completed => {
-                                        info!("Completion AI session {} completed", session_id);
-                                        break;
-                                    }
-                                    SessionStatus::Failed => {
-                                        warn!("Completion AI session {} failed", session_id);
-                                        break;
-                                    }
-                                    _ => {
-                                        if attempts >= max_attempts {
-                                            warn!("Completion AI session {} timed out", session_id);
-                                            break;
-                                        }
-                                    }
-                                }
-                            } else {
-                                warn!("Completion session {} not found", session_id);
-                                break;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to start completion AI session: {}", e);
-                    }
-                }
-            }
-        }
-    }
-
-    // =========================================================================
-    // FINAL RESULT
-    // =========================================================================
-    total_duration_ms = start.elapsed().as_millis() as u64;
-
-    let verification_passed = last_verification_result
-        .as_ref()
-        .map(|r| r.all_passed)
-        .unwrap_or(true); // If no verification steps, consider passed
-
-    let success = verification_passed && all_step_results.iter().all(|r| r.success);
-
-    // Update task status
-    if success {
-        let _ = state
-            .app_state
-            .checkpoint_db
-            .complete_task_run(&execution_id);
-    } else if !verification_passed {
-        let _ = state.app_state.checkpoint_db.fail_task_run(
-            &execution_id,
-            &format!(
-                "Verification failed after {} iterations",
-                iteration.min(max_iterations)
-            ),
-        );
-    }
-
-    info!(
-        "Unified workflow '{}' completed: success={}, iterations={}, total_steps={}",
-        workflow.name,
-        success,
-        iteration.min(max_iterations),
-        all_step_results.len()
-    );
-
-    ExecutionResult {
-        success,
-        total_steps: all_step_results.len(),
-        successful_steps: all_step_results.iter().filter(|r| r.success).count(),
-        failed_steps: all_step_results.iter().filter(|r| !r.success).count(),
-        total_duration_ms,
-        steps: all_step_results,
-        captured_logs: None,
-        captured_runner_logs: None,
-    }
-}
+// =============================================================================
+// NOTE: run_unified_workflow_with_verification_loop was removed and replaced
+// with the modular unified_workflow_executor module.
+// See: src/unified_workflow_executor/
+// =============================================================================
 
 /// Request body for running a unified workflow
 #[derive(Debug, Deserialize)]
@@ -19371,7 +18988,14 @@ async fn run_unified_workflow(
             );
 
             // Separate steps by phase for the new loop function
-            let setup_steps: Vec<_> = automation_steps
+            // Setup automation steps (shell commands, workflows, etc.)
+            let setup_automation_steps: Vec<_> = automation_steps
+                .iter()
+                .filter(|s| s.phase.as_deref() == Some("setup"))
+                .cloned()
+                .collect();
+            // Setup prompt steps (AI tasks during setup)
+            let setup_prompt_steps: Vec<_> = prompt_steps
                 .iter()
                 .filter(|s| s.phase.as_deref() == Some("setup"))
                 .cloned()
@@ -19421,22 +19045,44 @@ async fn run_unified_workflow(
                 );
             }
 
-            // Run the verification-agentic loop
-            let timeout_seconds = request.timeout_seconds.unwrap_or(1800);
-            let result = run_unified_workflow_with_verification_loop(
-                state.clone(),
-                workflow,
-                execution_id,
-                setup_steps,
-                verification_steps,
-                agentic_steps,
-                completion_steps,
-                combined_prompt,
-                timeout_seconds,
-            )
-            .await;
+            // Separate completion steps into automation and prompt steps
+            let (completion_automation_steps, completion_prompt_steps): (Vec<_>, Vec<_>) =
+                completion_steps
+                    .into_iter()
+                    .partition(|s| s.step_type != "prompt");
 
-            return Ok(Json(ApiResponse::success(result)));
+            // Run the verification-agentic loop using the new modular architecture
+            let timeout_seconds = request.timeout_seconds.unwrap_or(1800);
+
+            let loop_config = crate::unified_workflow_executor::LoopConfig {
+                max_iterations: workflow.max_iterations,
+                timeout_seconds,
+                base_prompt: combined_prompt,
+                workflow_name: workflow.name.clone(),
+                workflow_id: workflow.id.clone(),
+                execution_id: execution_id.clone(),
+            };
+
+            let controller = crate::unified_workflow_executor::LoopController::new(
+                state.app_state.clone(),
+                state.config_storage.clone(),
+                state.app_handle.clone(),
+                state.current_ai_pids.clone(),
+            );
+
+            let result = controller
+                .run(
+                    loop_config,
+                    setup_automation_steps,
+                    setup_prompt_steps,
+                    verification_steps,
+                    agentic_steps,
+                    completion_automation_steps,
+                    completion_prompt_steps,
+                )
+                .await;
+
+            return Ok(Json(ApiResponse::success(result.to_execution_result())));
         }
 
         // =====================================================================
@@ -20245,6 +19891,11 @@ pub fn create_router(
         .route(
             "/ui-bridge/explore/stop",
             post(stop_ui_bridge_exploration),
+        )
+        // UI Bridge state discovery from render logs (separate from exploration)
+        .route(
+            "/ui-bridge/discover-states",
+            post(discover_states_from_renders),
         )
         .layer(cors)
         // Allow up to 100MB request bodies for configs with embedded images
