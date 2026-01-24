@@ -193,31 +193,36 @@ class PlaywrightCollectorService:
             risk_level = config.get("max_risk_level", "safe")
             if risk_level == "dry_run":
                 safety_kwargs["dry_run"] = True
-                safety_kwargs["max_risk"] = ActionRisk.SAFE  # type: ignore[union-attr]
+                safety_kwargs["max_auto_click_risk"] = ActionRisk.SAFE  # type: ignore[union-attr]
             elif risk_level == "caution":
-                safety_kwargs["max_risk"] = ActionRisk.CAUTION  # type: ignore[union-attr]
+                safety_kwargs["max_auto_click_risk"] = ActionRisk.CAUTION  # type: ignore[union-attr]
             else:
-                safety_kwargs["max_risk"] = ActionRisk.SAFE  # type: ignore[union-attr]
+                safety_kwargs["max_auto_click_risk"] = ActionRisk.SAFE  # type: ignore[union-attr]
 
             # Handle dry_run flag (explicit override)
             if config.get("dry_run", False):
                 safety_kwargs["dry_run"] = True
 
-            # Handle blocked keywords
-            if config.get("additional_blocked_keywords"):
-                safety_kwargs["additional_dangerous_keywords"] = config[
-                    "additional_blocked_keywords"
-                ]
-
-            # Handle safe keywords
-            if config.get("additional_safe_keywords"):
-                safety_kwargs["additional_safe_keywords"] = config["additional_safe_keywords"]
-
-            # Handle blocked selectors
-            if config.get("blocked_selectors"):
-                safety_kwargs["blocked_selectors"] = config["blocked_selectors"]
-
+            # Create base config
             safety_config = SafetyConfig(**safety_kwargs)  # type: ignore[misc]
+
+            # Add additional blocked keywords to the existing list
+            if config.get("additional_blocked_keywords"):
+                safety_config.dangerous_keywords = (
+                    safety_config.dangerous_keywords + config["additional_blocked_keywords"]
+                )
+
+            # Add additional safe keywords to the existing list
+            if config.get("additional_safe_keywords"):
+                safety_config.safe_keywords = (
+                    safety_config.safe_keywords + config["additional_safe_keywords"]
+                )
+
+            # Add blocked selectors to the existing list
+            if config.get("blocked_selectors"):
+                safety_config.blocked_selectors = (
+                    safety_config.blocked_selectors + config["blocked_selectors"]
+                )
 
             # Create collector
             collector = SafePlaywrightStateCollector(
