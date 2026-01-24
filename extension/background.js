@@ -7,6 +7,321 @@
  */
 
 const RUNNER_API = "http://localhost:9876";
+const RUNNER_WS_URL = "ws://localhost:9876/ws/extension";
+
+// =============================================================================
+// WebSocket Connection to Runner (for exploration commands)
+// =============================================================================
+
+let wsConnection = null;
+let wsReconnectTimeout = null;
+let wsConnected = false;
+let wsPendingRequests = new Map(); // requestId -> { resolve, reject, timeout }
+
+/**
+ * Connect to the runner's WebSocket endpoint
+ * Only call this after verifying the runner is available via health check
+ */
+function connectWebSocket() {
+  if (wsConnection && (wsConnection.readyState === WebSocket.CONNECTING || wsConnection.readyState === WebSocket.OPEN)) {
+    return;
+  }
+
+  console.log("[Qontinui] Connecting to runner WebSocket:", RUNNER_WS_URL);
+
+  try {
+    wsConnection = new WebSocket(RUNNER_WS_URL);
+
+    wsConnection.onopen = () => {
+      console.log("[Qontinui] WebSocket connected to runner");
+      wsConnected = true;
+      // Clear any pending reconnect
+      if (wsReconnectTimeout) {
+        clearTimeout(wsReconnectTimeout);
+        wsReconnectTimeout = null;
+      }
+    };
+
+    wsConnection.onclose = (event) => {
+      console.log("[Qontinui] WebSocket disconnected:", event.code, event.reason);
+      wsConnected = false;
+      wsConnection = null;
+      // Reject all pending requests
+      for (const [requestId, pending] of wsPendingRequests.entries()) {
+        clearTimeout(pending.timeout);
+        pending.reject(new Error("WebSocket disconnected"));
+      }
+      wsPendingRequests.clear();
+      // Schedule reconnection (will check health first)
+      scheduleReconnect();
+    };
+
+    wsConnection.onerror = () => {
+      // Don't log - Chrome already logs WebSocket errors
+      // This is expected when runner disconnects
+      wsConnected = false;
+    };
+
+    wsConnection.onmessage = (event) => {
+      try {
+        const message = JSON.parse(event.data);
+        handleWebSocketMessage(message);
+      } catch (e) {
+        console.error("[Qontinui] Failed to parse WebSocket message:", e);
+      }
+    };
+  } catch (e) {
+    // Silently schedule reconnect - don't log errors for expected failures
+    scheduleReconnect();
+  }
+}
+
+/**
+ * Schedule WebSocket reconnection
+ * Checks if runner is available before attempting to connect
+ */
+function scheduleReconnect() {
+  if (wsReconnectTimeout) {
+    return; // Already scheduled
+  }
+  wsReconnectTimeout = setTimeout(() => {
+    wsReconnectTimeout = null;
+    // Check if runner is available before trying to connect
+    fetch(`${RUNNER_API}/health`, { method: "GET" })
+      .then((response) => {
+        if (response.ok) {
+          connectWebSocket();
+        } else {
+          scheduleReconnect();
+        }
+      })
+      .catch(() => {
+        // Runner not available, try again later
+        scheduleReconnect();
+      });
+  }, 5000);
+}
+
+/**
+ * Handle incoming WebSocket messages from runner
+ */
+async function handleWebSocketMessage(message) {
+  const { type, requestId, action, params } = message;
+
+  if (type === "EXPLORATION_COMMAND") {
+    // Runner is sending an exploration command to execute via the extension
+    console.log("[Qontinui] Received exploration command:", action, requestId);
+    try {
+      const result = await executeExplorationCommand(action, params || {});
+      sendWebSocketResponse(requestId, true, result);
+    } catch (error) {
+      console.error("[Qontinui] Exploration command failed:", error);
+      sendWebSocketResponse(requestId, false, null, error.message);
+    }
+  } else if (type === "EXPLORATION_RESPONSE") {
+    // Response to a request we sent to the runner
+    const pending = wsPendingRequests.get(requestId);
+    if (pending) {
+      clearTimeout(pending.timeout);
+      wsPendingRequests.delete(requestId);
+      if (message.success) {
+        pending.resolve(message.data);
+      } else {
+        pending.reject(new Error(message.error || "Unknown error"));
+      }
+    }
+  } else if (type === "PING") {
+    // Respond to ping with pong
+    sendWebSocketMessage({ type: "PONG", requestId });
+  }
+}
+
+/**
+ * Execute an exploration command by forwarding to the active tab's content script
+ */
+async function executeExplorationCommand(action, params) {
+  // Get the active tab
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab || !tab.id) {
+    throw new Error("No active tab found");
+  }
+
+  // Handle different actions
+  switch (action) {
+    case "ping":
+      return { available: true, tabId: tab.id, url: tab.url, title: tab.title };
+
+    case "connect":
+      // Connect to the tab (verify UI Bridge is available)
+      return new Promise((resolve, reject) => {
+        chrome.tabs.sendMessage(
+          tab.id,
+          { type: "UI_BRIDGE_COMMAND", action: "ping", params: {} },
+          (response) => {
+            if (chrome.runtime.lastError) {
+              reject(new Error(chrome.runtime.lastError.message || "Failed to communicate with content script"));
+              return;
+            }
+            if (response && response.success) {
+              resolve({ tabId: tab.id, url: tab.url, title: tab.title });
+            } else {
+              reject(new Error(response?.error || "UI Bridge not available on this page"));
+            }
+          }
+        );
+      });
+
+    case "getElements":
+      // Get all elements with data-ui-id from the page
+      return new Promise((resolve, reject) => {
+        chrome.tabs.sendMessage(
+          tab.id,
+          { type: "UI_BRIDGE_COMMAND", action: "getElements", params: params || {} },
+          (response) => {
+            if (chrome.runtime.lastError) {
+              reject(new Error(chrome.runtime.lastError.message));
+              return;
+            }
+            if (response && response.success) {
+              resolve(response.data);
+            } else {
+              reject(new Error(response?.error || "Failed to get elements"));
+            }
+          }
+        );
+      });
+
+    case "executeAction":
+      // Execute an action on an element
+      return new Promise((resolve, reject) => {
+        chrome.tabs.sendMessage(
+          tab.id,
+          { type: "UI_BRIDGE_COMMAND", action: "executeAction", params },
+          (response) => {
+            if (chrome.runtime.lastError) {
+              reject(new Error(chrome.runtime.lastError.message));
+              return;
+            }
+            if (response && response.success) {
+              resolve(response.data);
+            } else {
+              reject(new Error(response?.error || "Failed to execute action"));
+            }
+          }
+        );
+      });
+
+    case "captureSnapshot":
+      // Capture a DOM snapshot
+      return new Promise((resolve, reject) => {
+        chrome.tabs.sendMessage(
+          tab.id,
+          { type: "UI_BRIDGE_COMMAND", action: "getStateSnapshot", params: params || {} },
+          (response) => {
+            if (chrome.runtime.lastError) {
+              reject(new Error(chrome.runtime.lastError.message));
+              return;
+            }
+            if (response && response.success) {
+              // Add URL and title to the snapshot
+              const snapshot = response.data || {};
+              snapshot.url = tab.url;
+              snapshot.title = tab.title;
+              resolve(snapshot);
+            } else {
+              reject(new Error(response?.error || "Failed to capture snapshot"));
+            }
+          }
+        );
+      });
+
+    default:
+      throw new Error(`Unknown action: ${action}`);
+  }
+}
+
+/**
+ * Send a response back to the runner via WebSocket
+ */
+function sendWebSocketResponse(requestId, success, data, error = null) {
+  sendWebSocketMessage({
+    type: "EXPLORATION_RESPONSE",
+    requestId,
+    success,
+    data,
+    error,
+  });
+}
+
+/**
+ * Send a message to the runner via WebSocket
+ */
+function sendWebSocketMessage(message) {
+  if (wsConnection && wsConnection.readyState === WebSocket.OPEN) {
+    wsConnection.send(JSON.stringify(message));
+  } else {
+    console.warn("[Qontinui] Cannot send WebSocket message - not connected");
+  }
+}
+
+/**
+ * Send a request to the runner and wait for response
+ */
+function sendWebSocketRequest(action, params = {}) {
+  return new Promise((resolve, reject) => {
+    if (!wsConnection || wsConnection.readyState !== WebSocket.OPEN) {
+      reject(new Error("WebSocket not connected"));
+      return;
+    }
+
+    const requestId = `ext-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const timeout = setTimeout(() => {
+      wsPendingRequests.delete(requestId);
+      reject(new Error(`Request timed out: ${action}`));
+    }, 30000); // 30 second timeout
+
+    wsPendingRequests.set(requestId, { resolve, reject, timeout });
+
+    sendWebSocketMessage({
+      type: "EXTENSION_REQUEST",
+      requestId,
+      action,
+      params,
+    });
+  });
+}
+
+/**
+ * Check if WebSocket is connected to runner
+ */
+function isWebSocketConnected() {
+  return wsConnected && wsConnection && wsConnection.readyState === WebSocket.OPEN;
+}
+
+/**
+ * Initialize WebSocket connection after a delay
+ * This is called at the end of the file after all functions are defined
+ */
+function initializeWebSocket() {
+  // Delay to allow service worker to fully initialize
+  setTimeout(() => {
+    // Check if runner is available before trying to connect
+    fetch(`${RUNNER_API}/health`, { method: "GET" })
+      .then((response) => {
+        if (response.ok) {
+          console.log("[Qontinui] Runner available, connecting WebSocket");
+          connectWebSocket();
+        } else {
+          console.log("[Qontinui] Runner returned non-OK status, scheduling reconnect");
+          scheduleReconnect();
+        }
+      })
+      .catch(() => {
+        console.log("[Qontinui] Runner not available, scheduling WebSocket reconnect");
+        scheduleReconnect();
+      });
+  }, 1000);
+}
 
 // =============================================================================
 // Request Recording State (persisted via chrome.storage.session)
@@ -532,9 +847,37 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.action === "checkStatus") {
     checkRunnerStatus().then((available) => {
-      sendResponse({ available });
+      sendResponse({ available, wsConnected: isWebSocketConnected() });
     });
     return true; // Keep channel open for async response
+  }
+
+  // =============================================================================
+  // WebSocket Connection Commands
+  // =============================================================================
+
+  if (message.action === "getWebSocketStatus") {
+    sendResponse({
+      connected: isWebSocketConnected(),
+      url: RUNNER_WS_URL,
+    });
+    return true;
+  }
+
+  if (message.action === "reconnectWebSocket") {
+    // Force reconnection
+    if (wsConnection) {
+      wsConnection.close();
+    }
+    wsConnection = null;
+    wsConnected = false;
+    if (wsReconnectTimeout) {
+      clearTimeout(wsReconnectTimeout);
+      wsReconnectTimeout = null;
+    }
+    connectWebSocket();
+    sendResponse({ success: true });
+    return true;
   }
 
   if (message.action === "capture") {
@@ -763,3 +1106,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
 });
+
+// Initialize WebSocket connection to runner (delayed to allow service worker startup)
+initializeWebSocket();

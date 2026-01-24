@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::config_storage::ConfigStorage;
+use crate::database::{CheckpointDb, CreateTaskRunEventInput};
 use crate::step_executor::{ExecutionStepConfig, StepExecutionResult, StepExecutor, VerificationPhaseResult};
 use crate::AppState;
 
@@ -26,6 +27,7 @@ pub struct SetupExecutor {
     executor: StepExecutor,
     app_handle: tauri::AppHandle,
     pid_tracker: Arc<std::sync::Mutex<Vec<u32>>>,
+    checkpoint_db: Arc<CheckpointDb>,
 }
 
 impl SetupExecutor {
@@ -37,12 +39,13 @@ impl SetupExecutor {
     ) -> Self {
         Self {
             executor: StepExecutor::with_app_handle(
-                app_state,
+                app_state.clone(),
                 config_storage,
                 app_handle.clone(),
             ),
             app_handle,
             pid_tracker,
+            checkpoint_db: app_state.checkpoint_db.clone(),
         }
     }
 
@@ -88,6 +91,19 @@ impl SetupExecutor {
                 prompt_steps.len()
             );
 
+            // Get the combined step name for display
+            let step_name = prompt_steps
+                .iter()
+                .filter_map(|s| s.name.as_ref())
+                .map(|n| n.as_str())
+                .collect::<Vec<_>>()
+                .join(" + ");
+            let step_name = if step_name.is_empty() {
+                "Setup AI Task".to_string()
+            } else {
+                step_name
+            };
+
             let setup_prompt: String = prompt_steps
                 .iter()
                 .filter_map(|s| s.prompt_content.as_ref())
@@ -97,7 +113,7 @@ impl SetupExecutor {
 
             if !setup_prompt.is_empty() {
                 let success = self
-                    .run_setup_ai(&setup_prompt, execution_id, workflow_name, timeout_seconds)
+                    .run_setup_ai(&setup_prompt, execution_id, workflow_name, timeout_seconds, &step_name)
                     .await;
                 overall_success = overall_success && success;
 
@@ -125,8 +141,10 @@ impl SetupExecutor {
         execution_id: &str,
         workflow_name: &str,
         timeout_seconds: u64,
+        step_name: &str,
     ) -> bool {
         let session_id = format!("{}-setup", execution_id);
+        let start_time = std::time::Instant::now();
 
         let workspace_root = crate::mcp_api::get_workspace_paths_internal()
             .map(|(root, _, _)| root.to_string_lossy().to_string())
@@ -152,9 +170,35 @@ impl SetupExecutor {
             session_id
         );
 
+        // Log start event for Timeline widget
+        let start_data = serde_json::json!({
+            "step_type": "prompt",
+            "step_name": step_name,
+            "phase": "setup",
+            "session_id": session_id,
+            "type": "ai_prompt",
+        });
+
+        let start_event = CreateTaskRunEventInput {
+            task_run_id: execution_id.to_string(),
+            event_type: "step_execution".to_string(),
+            event_subtype: Some("start".to_string()),
+            message: format!("Setup AI '{}' started", step_name),
+            data: Some(serde_json::to_string(&start_data).unwrap_or_default()),
+            workflow_name: Some(workflow_name.to_string()),
+            state_name: None,
+            action_id: Some(format!("setup-ai-{}", execution_id)),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            duration_ms: None,
+        };
+
+        if let Err(e) = self.checkpoint_db.create_task_run_event(&start_event) {
+            warn!("Failed to log setup AI start event: {}", e);
+        }
+
         let prompt_for_claude = prompt.to_string();
         let workspace_for_claude = workspace_root;
-        let sid_for_claude = session_id;
+        let sid_for_claude = session_id.clone();
 
         let result = tokio::task::spawn_blocking(move || {
             crate::mcp_api::run_claude_session_with_retry(
@@ -171,21 +215,111 @@ impl SetupExecutor {
         })
         .await;
 
+        let duration_ms = start_time.elapsed().as_millis() as i64;
+
         match result {
             Ok(Ok((success, output, _))) => {
                 info!(
-                    "SETUP-PHASE: AI completed (success={}, output={} chars)",
+                    "SETUP-PHASE: AI completed (success={}, output={} chars, duration={}ms)",
                     success,
-                    output.len()
+                    output.len(),
+                    duration_ms
                 );
+
+                // Log complete event for Timeline widget
+                let complete_data = serde_json::json!({
+                    "step_type": "prompt",
+                    "step_name": step_name,
+                    "phase": "setup",
+                    "session_id": session_id,
+                    "type": "ai_prompt",
+                    "duration_ms": duration_ms,
+                    "output_length": output.len(),
+                });
+
+                let complete_event = CreateTaskRunEventInput {
+                    task_run_id: execution_id.to_string(),
+                    event_type: "step_execution".to_string(),
+                    event_subtype: Some(if success { "complete" } else { "error" }.to_string()),
+                    message: format!("Setup AI '{}' {} ({}ms)", step_name, if success { "completed" } else { "failed" }, duration_ms),
+                    data: Some(serde_json::to_string(&complete_data).unwrap_or_default()),
+                    workflow_name: Some(workflow_name.to_string()),
+                    state_name: None,
+                    action_id: Some(format!("setup-ai-{}", execution_id)),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    duration_ms: Some(duration_ms),
+                };
+
+                if let Err(e) = self.checkpoint_db.create_task_run_event(&complete_event) {
+                    warn!("Failed to log setup AI complete event: {}", e);
+                }
+
                 success
             }
             Ok(Err(e)) => {
                 error!("SETUP-PHASE: AI failed: {}", e);
+
+                // Log error event for Timeline widget
+                let error_data = serde_json::json!({
+                    "step_type": "prompt",
+                    "step_name": step_name,
+                    "phase": "setup",
+                    "session_id": session_id,
+                    "type": "ai_prompt",
+                    "duration_ms": duration_ms,
+                    "error": e.to_string(),
+                });
+
+                let error_event = CreateTaskRunEventInput {
+                    task_run_id: execution_id.to_string(),
+                    event_type: "step_execution".to_string(),
+                    event_subtype: Some("error".to_string()),
+                    message: format!("Setup AI '{}' failed: {}", step_name, e),
+                    data: Some(serde_json::to_string(&error_data).unwrap_or_default()),
+                    workflow_name: Some(workflow_name.to_string()),
+                    state_name: None,
+                    action_id: Some(format!("setup-ai-{}", execution_id)),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    duration_ms: Some(duration_ms),
+                };
+
+                if let Err(log_err) = self.checkpoint_db.create_task_run_event(&error_event) {
+                    warn!("Failed to log setup AI error event: {}", log_err);
+                }
+
                 false
             }
             Err(e) => {
                 error!("SETUP-PHASE: Task join error: {}", e);
+
+                // Log error event for Timeline widget
+                let error_data = serde_json::json!({
+                    "step_type": "prompt",
+                    "step_name": step_name,
+                    "phase": "setup",
+                    "session_id": session_id,
+                    "type": "ai_prompt",
+                    "duration_ms": duration_ms,
+                    "error": e.to_string(),
+                });
+
+                let error_event = CreateTaskRunEventInput {
+                    task_run_id: execution_id.to_string(),
+                    event_type: "step_execution".to_string(),
+                    event_subtype: Some("error".to_string()),
+                    message: format!("Setup AI '{}' task error: {}", step_name, e),
+                    data: Some(serde_json::to_string(&error_data).unwrap_or_default()),
+                    workflow_name: Some(workflow_name.to_string()),
+                    state_name: None,
+                    action_id: Some(format!("setup-ai-{}", execution_id)),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    duration_ms: Some(duration_ms),
+                };
+
+                if let Err(log_err) = self.checkpoint_db.create_task_run_event(&error_event) {
+                    warn!("Failed to log setup AI error event: {}", log_err);
+                }
+
                 false
             }
         }

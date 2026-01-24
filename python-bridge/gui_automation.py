@@ -82,6 +82,8 @@ class GUIAutomation:
         self.get_image_name = get_image_name_fn
         self.get_action_definition = get_action_definition_fn
         self.is_running = False
+        self._is_paused = False
+        self._pause_event = None  # Will be set by executor
         self._last_find_location = None
 
         # Initialize AI prompt executors for AI_PROMPT and RUN_PROMPT_SEQUENCE actions
@@ -592,6 +594,21 @@ class GUIAutomation:
                 if not self.is_running:
                     break
 
+                # Check for pause - wait until resumed or stopped
+                while self._is_paused and self.is_running:
+                    if self._pause_event:
+                        # Wait on the event with a timeout so we can check is_running
+                        self._pause_event.wait(timeout=0.5)
+                    else:
+                        # Fallback: poll if no event is set
+                        import time as time_module
+
+                        time_module.sleep(0.1)
+
+                # Check again after pause in case stop was called
+                if not self.is_running:
+                    break
+
                 # Execute action and track success, but always continue
                 action_success = await self.execute_action(action)
 
@@ -753,3 +770,21 @@ class GUIAutomation:
             is_running: True to set running, False to stop
         """
         self.is_running = is_running
+
+    def set_paused(self, is_paused: bool):
+        """
+        Set paused state.
+
+        Args:
+            is_paused: True to pause, False to resume
+        """
+        self._is_paused = is_paused
+
+    def set_pause_event(self, pause_event):
+        """
+        Set the pause event for synchronization.
+
+        Args:
+            pause_event: threading.Event object from executor
+        """
+        self._pause_event = pause_event

@@ -250,6 +250,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Execution commands - workflow_execution
             commands::execution::workflow_execution::start_execution,
             commands::execution::workflow_execution::stop_execution,
+            commands::execution::workflow_execution::pause_execution,
+            commands::execution::workflow_execution::resume_execution,
             commands::execution::workflow_execution::get_resolved_initial_states,
             commands::execution::workflow_execution::get_workflow_required_screens,
             // Execution commands - executor_status

@@ -5,7 +5,7 @@
  * Orchestrates the dynamic widget-based layout based on task activities.
  */
 
-import { useCallback } from "react";
+import { useCallback, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useDashboardState } from "../../hooks/dashboard";
 import { TaskProvider } from "../../contexts";
@@ -51,6 +51,9 @@ export function DashboardPage({
   // Get dashboard state
   const { state, setActiveWidget, navigateToDetail } = useDashboardState();
 
+  // Track paused state locally
+  const [isPaused, setIsPaused] = useState(false);
+
   // Handle widget click (switch active widget)
   const handleWidgetClick = useCallback(
     (type: ActivityType) => {
@@ -74,6 +77,7 @@ export function DashboardPage({
       const result = await invoke<CommandResponse>("stop_execution");
       if (result.success) {
         console.log("[DASHBOARD] Execution stopped successfully");
+        setIsPaused(false); // Reset pause state on stop
         // Restore window if it was auto-minimized
         await windowManager.restoreIfMinimized();
       }
@@ -81,6 +85,29 @@ export function DashboardPage({
       console.error("[DASHBOARD] Failed to stop execution:", error);
     }
   }, []);
+
+  // Handle play/pause toggle
+  const handlePlayPause = useCallback(async () => {
+    try {
+      if (isPaused) {
+        console.log("[DASHBOARD] Resume execution called");
+        const result = await invoke<CommandResponse>("resume_execution");
+        if (result.success) {
+          console.log("[DASHBOARD] Execution resumed successfully");
+          setIsPaused(false);
+        }
+      } else {
+        console.log("[DASHBOARD] Pause execution called");
+        const result = await invoke<CommandResponse>("pause_execution");
+        if (result.success) {
+          console.log("[DASHBOARD] Execution paused successfully");
+          setIsPaused(true);
+        }
+      }
+    } catch (error) {
+      console.error("[DASHBOARD] Failed to toggle pause:", error);
+    }
+  }, [isPaused]);
 
   // Get current action text for bottom bar
   const _currentAction = state.layout.activeWidget
@@ -95,13 +122,14 @@ export function DashboardPage({
           taskName={state.taskInfo?.taskName ?? null}
           phase={state.currentPhase}
           showPhaseBadge={state.showPhaseBadge}
-          status={state.status}
+          status={isPaused && state.status === "running" ? "paused" : state.status}
           workflowStage={state.workflowStage}
           isOrchestrated={state.isOrchestrated}
           isComplete={state.status === "completed"}
           isFailed={state.status === "failed"}
           iteration={state.isOrchestrated ? state.iteration : undefined}
           maxIterations={state.isOrchestrated ? state.maxIterations : undefined}
+          onPlayPause={handlePlayPause}
           onStop={handleStop}
         />
 

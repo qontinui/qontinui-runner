@@ -1102,6 +1102,18 @@ pub struct ApiState {
             std::collections::HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>,
         >,
     >,
+    /// Chrome extension WebSocket connection sender
+    pub extension_ws_sender: Arc<
+        tokio::sync::Mutex<Option<futures_util::stream::SplitSink<WebSocket, Message>>>,
+    >,
+    /// Pending extension command requests (requestId -> oneshot sender for response)
+    pub extension_pending_requests: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>,
+        >,
+    >,
+    /// Extension connection status
+    pub extension_connected: Arc<std::sync::atomic::AtomicBool>,
     /// Orchestrator states by task_run_id (for agentic task orchestration)
     pub orchestrator_states:
         Arc<tokio::sync::Mutex<std::collections::HashMap<String, OrchestratorState>>>,
@@ -1429,6 +1441,258 @@ async fn handle_ws_events(socket: WebSocket, state: Arc<ApiState>) {
     // Clean up send task
     send_task.abort();
     info!("WebSocket client disconnected from event streaming");
+}
+
+// =============================================================================
+// Chrome Extension WebSocket Handlers
+// =============================================================================
+
+/// WebSocket handler for Chrome extension connection
+///
+/// The Chrome extension connects to /ws/extension to enable bidirectional
+/// communication for UI Bridge exploration. The runner can send exploration
+/// commands to the extension, which forwards them to the active browser tab.
+async fn ws_extension_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<ApiState>>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_extension_ws(socket, state))
+}
+
+/// Handle WebSocket connection from Chrome extension
+async fn handle_extension_ws(socket: WebSocket, state: Arc<ApiState>) {
+    use std::sync::atomic::Ordering;
+
+    let (sender, mut receiver) = socket.split();
+
+    // Store the sender for sending commands to extension
+    {
+        let mut ws_sender = state.extension_ws_sender.lock().await;
+        *ws_sender = Some(sender);
+    }
+    state.extension_connected.store(true, Ordering::SeqCst);
+
+    info!("Chrome extension WebSocket connected");
+
+    // Handle incoming messages from extension
+    while let Some(result) = receiver.next().await {
+        match result {
+            Ok(Message::Text(text)) => {
+                match serde_json::from_str::<serde_json::Value>(&text) {
+                    Ok(msg) => {
+                        handle_extension_message(msg, state.clone()).await;
+                    }
+                    Err(e) => {
+                        warn!("Failed to parse extension message: {}", e);
+                    }
+                }
+            }
+            Ok(Message::Ping(_)) => {
+                debug!("Received ping from extension");
+            }
+            Ok(Message::Close(_)) => {
+                info!("Extension WebSocket closed");
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!("Extension WebSocket error: {}", e);
+                break;
+            }
+        }
+    }
+
+    // Clean up on disconnect
+    {
+        let mut ws_sender = state.extension_ws_sender.lock().await;
+        *ws_sender = None;
+    }
+    state.extension_connected.store(false, Ordering::SeqCst);
+
+    // Reject all pending requests
+    {
+        let mut pending = state.extension_pending_requests.lock().await;
+        for (request_id, sender) in pending.drain() {
+            let _ = sender.send(serde_json::json!({
+                "success": false,
+                "error": "Extension disconnected"
+            }));
+            debug!("Rejected pending extension request {} due to disconnect", request_id);
+        }
+    }
+
+    info!("Chrome extension WebSocket disconnected");
+}
+
+/// Handle a message from the Chrome extension
+async fn handle_extension_message(msg: serde_json::Value, state: Arc<ApiState>) {
+    let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    let request_id = msg.get("requestId").and_then(|r| r.as_str()).unwrap_or("");
+
+    match msg_type {
+        "EXPLORATION_RESPONSE" => {
+            // Response to a command we sent to the extension
+            let mut pending = state.extension_pending_requests.lock().await;
+            if let Some(sender) = pending.remove(request_id) {
+                let _ = sender.send(msg.clone());
+                debug!("Delivered extension response for request {}", request_id);
+            } else {
+                warn!("No pending request found for response {}", request_id);
+            }
+        }
+        "PONG" => {
+            debug!("Received pong from extension");
+        }
+        "EXTENSION_REQUEST" => {
+            // Extension is sending a request to the runner (future use)
+            debug!("Received extension request: {:?}", msg);
+        }
+        _ => {
+            debug!("Unknown extension message type: {}", msg_type);
+        }
+    }
+}
+
+/// Send a command to the extension and wait for response
+async fn send_extension_command(
+    state: Arc<ApiState>,
+    action: &str,
+    params: serde_json::Value,
+    timeout_secs: u64,
+) -> Result<serde_json::Value, String> {
+    use std::sync::atomic::Ordering;
+
+    // Check if extension is connected
+    if !state.extension_connected.load(Ordering::SeqCst) {
+        return Err("Chrome extension not connected".to_string());
+    }
+
+    // Generate request ID
+    let request_id = format!("runner-{}-{}", chrono::Utc::now().timestamp_millis(), uuid::Uuid::new_v4());
+
+    // Create command message
+    let command = serde_json::json!({
+        "type": "EXPLORATION_COMMAND",
+        "requestId": request_id,
+        "action": action,
+        "params": params
+    });
+
+    // Create oneshot channel for response
+    let (tx, rx) = tokio::sync::oneshot::channel();
+
+    // Register pending request
+    {
+        let mut pending = state.extension_pending_requests.lock().await;
+        pending.insert(request_id.clone(), tx);
+    }
+
+    // Send command to extension
+    {
+        let mut ws_sender = state.extension_ws_sender.lock().await;
+        if let Some(ref mut sender) = *ws_sender {
+            match serde_json::to_string(&command) {
+                Ok(json_str) => {
+                    if let Err(e) = sender.send(Message::Text(json_str)).await {
+                        // Clean up pending request
+                        let mut pending = state.extension_pending_requests.lock().await;
+                        pending.remove(&request_id);
+                        return Err(format!("Failed to send command to extension: {}", e));
+                    }
+                }
+                Err(e) => {
+                    let mut pending = state.extension_pending_requests.lock().await;
+                    pending.remove(&request_id);
+                    return Err(format!("Failed to serialize command: {}", e));
+                }
+            }
+        } else {
+            let mut pending = state.extension_pending_requests.lock().await;
+            pending.remove(&request_id);
+            return Err("Extension WebSocket sender not available".to_string());
+        }
+    }
+
+    // Wait for response with timeout
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
+        Ok(Ok(response)) => {
+            let success = response.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
+            if success {
+                Ok(response.get("data").cloned().unwrap_or(serde_json::Value::Null))
+            } else {
+                let error = response.get("error").and_then(|e| e.as_str()).unwrap_or("Unknown error");
+                Err(error.to_string())
+            }
+        }
+        Ok(Err(_)) => {
+            Err("Response channel closed".to_string())
+        }
+        Err(_) => {
+            // Timeout - clean up pending request
+            let mut pending = state.extension_pending_requests.lock().await;
+            pending.remove(&request_id);
+            Err(format!("Extension command timed out after {}s", timeout_secs))
+        }
+    }
+}
+
+// =============================================================================
+// Extension HTTP Endpoints (for Python bridge)
+// =============================================================================
+
+/// Request body for extension command
+#[derive(Debug, Deserialize)]
+struct ExtensionCommandRequest {
+    action: String,
+    #[serde(default)]
+    params: serde_json::Value,
+    #[serde(default = "default_extension_timeout")]
+    timeout_secs: u64,
+}
+
+fn default_extension_timeout() -> u64 {
+    30
+}
+
+/// Get extension connection status
+async fn get_extension_status(
+    State(state): State<Arc<ApiState>>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    use std::sync::atomic::Ordering;
+
+    let connected = state.extension_connected.load(Ordering::SeqCst);
+
+    Json(ApiResponse::success(serde_json::json!({
+        "connected": connected,
+        "websocket_url": "ws://localhost:9876/ws/extension"
+    })))
+}
+
+/// Send a command to the extension and wait for response
+async fn send_extension_command_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<ExtensionCommandRequest>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    info!("Extension command request: action={}, params={:?}", request.action, request.params);
+
+    match send_extension_command(
+        state,
+        &request.action,
+        request.params,
+        request.timeout_secs,
+    ).await {
+        Ok(data) => {
+            Json(ApiResponse::success(data))
+        }
+        Err(e) => {
+            warn!("Extension command failed: {}", e);
+            Json(ApiResponse {
+                success: false,
+                data: None::<serde_json::Value>,
+                error: Some(e.to_string()),
+            })
+        }
+    }
 }
 
 /// SSE events handler for MCP notification streaming
@@ -19386,6 +19650,9 @@ pub fn create_router(
         extraction_state: Arc::new(ExtractionState::new()),
         resuming_task_ids: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         ui_bridge_pending: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        extension_ws_sender: Arc::new(tokio::sync::Mutex::new(None)),
+        extension_pending_requests: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        extension_connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
 
     // Set up UI Bridge response listener
@@ -19495,8 +19762,13 @@ pub fn create_router(
     Router::new()
         // WebSocket endpoint for live execution event streaming
         .route("/ws/events", get(ws_events_handler))
+        // WebSocket endpoint for Chrome extension connection (UI Bridge exploration)
+        .route("/ws/extension", get(ws_extension_handler))
         // SSE endpoint for MCP notification streaming (alternative to WebSocket)
         .route("/sse/events", get(sse_events_handler))
+        // Chrome extension status and command endpoints (for Python bridge)
+        .route("/extension/status", get(get_extension_status))
+        .route("/extension/command", post(send_extension_command_handler))
         .route("/health", get(health))
         // Debug endpoints for AI sessions
         .route("/debug/app/errors", get(get_debug_errors))

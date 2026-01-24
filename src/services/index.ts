@@ -139,4 +139,6 @@ export type {
   GeneratorContext,
   GeneratorConfig,
   GeneratorOptions,
+  SingleStateGeneratorOptions,
+  SingleStateAgenticOptions,
 } from "./WorkflowGeneratorService";

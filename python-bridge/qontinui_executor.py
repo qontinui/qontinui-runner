@@ -163,6 +163,9 @@ class QontinuiExecutor:
         """Initialize executor and all modules."""
         self.config = None
         self.is_running = False
+        self._is_paused = False
+        self._pause_event = threading.Event()
+        self._pause_event.set()  # Start in unpaused state (event is set = not waiting)
         self._navigation_sequence = 0
         self.target_monitor: int | None = None  # Monitor index for execution
 
@@ -560,6 +563,8 @@ class QontinuiExecutor:
                 get_image_name_fn=self._get_image_name,
                 get_action_definition_fn=get_action_definition,
             )
+            # Set pause event for synchronization
+            self.gui_automation.set_pause_event(self._pause_event)
 
             # Inject self as workflow executor for navigation
             if QONTINUI_AVAILABLE:
@@ -932,11 +937,16 @@ class QontinuiExecutor:
             self.event_manager.emit_log("info", "Stopping execution...")
             self.is_running = False
 
+            # Reset pause state
+            self._is_paused = False
+            self._pause_event.set()  # Unblock any waiting threads
+
             # Stop input capture for coordinate validation
             self._stop_input_capture_for_execution()
 
             if self.gui_automation:
                 self.gui_automation.set_running(False)
+                self.gui_automation.set_paused(False)
 
             self.event_manager.emit_event(
                 EventType.EXECUTION_COMPLETED, {"success": False, "reason": "User stopped"}
@@ -946,6 +956,30 @@ class QontinuiExecutor:
             if self.training_export.is_enabled():
                 self.event_manager.emit_log("info", "Exporting training data on stop...")
                 self.training_export.export_data()
+
+    def pause_execution(self):
+        """Pause the current execution."""
+        if self.is_running and not self._is_paused:
+            self.event_manager.emit_log("info", "Pausing execution...")
+            self._is_paused = True
+            self._pause_event.clear()  # Block waiting threads
+
+            if self.gui_automation:
+                self.gui_automation.set_paused(True)
+
+            self.event_manager.emit_event(EventType.EXECUTION_PAUSED, {"paused": True})
+
+    def resume_execution(self):
+        """Resume a paused execution."""
+        if self.is_running and self._is_paused:
+            self.event_manager.emit_log("info", "Resuming execution...")
+            self._is_paused = False
+            self._pause_event.set()  # Unblock waiting threads
+
+            if self.gui_automation:
+                self.gui_automation.set_paused(False)
+
+            self.event_manager.emit_event(EventType.EXECUTION_RESUMED, {"paused": False})
 
     def navigate_to_state(self, target_state_id: str) -> dict[str, Any]:
         """Navigate to a target state via navigation API."""
@@ -1176,6 +1210,14 @@ class QontinuiExecutor:
 
         elif cmd_type == "stop":
             self.stop_execution()
+            return {"success": True}
+
+        elif cmd_type == "pause":
+            self.pause_execution()
+            return {"success": True}
+
+        elif cmd_type == "resume":
+            self.resume_execution()
             return {"success": True}
 
         elif cmd_type == "execute_action":

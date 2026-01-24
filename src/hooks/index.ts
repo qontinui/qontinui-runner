@@ -133,3 +133,10 @@ export { useUIBridgeEventHandler, UIBridgeEventHandler } from "./useUIBridgeEven
 
 export { useWorkflowGenerator } from "./useWorkflowGenerator";
 export type { UseWorkflowGeneratorReturn, GeneratorResult } from "./useWorkflowGenerator";
+
+export { useStateToWorkflow } from "./useStateToWorkflow";
+export type {
+  UseStateToWorkflowReturn,
+  AddStateToWorkflowOptions,
+  AddStateToWorkflowResult,
+} from "./useStateToWorkflow";

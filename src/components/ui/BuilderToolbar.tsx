@@ -6,7 +6,7 @@
  */
 
 import { useRef } from "react";
-import { Sparkles, Plus, Upload, Download, Trash2, GitBranch } from "lucide-react";
+import { Sparkles, Plus, Upload, Download, Trash2, GitBranch, Layers } from "lucide-react";
 
 export interface BuilderToolbarAction {
   /** Unique key for the action */
@@ -155,6 +155,17 @@ export const toolbarActions = {
     disabled,
     className: "text-emerald-400 hover:text-emerald-300 hover:bg-neutral-800",
     title: "Generate from loaded state machine",
+  }),
+
+  /** Add steps from a single state action */
+  addFromState: (onClick: () => void, disabled = false): BuilderToolbarAction => ({
+    key: "add-from-state",
+    icon: Layers,
+    label: "+State",
+    onClick,
+    disabled,
+    className: "text-purple-400 hover:text-purple-300 hover:bg-neutral-800",
+    title: "Add verification and agentic steps from a state",
   }),
 
   /** New item action */

@@ -55,6 +55,7 @@ import { StateLibraryPicker } from "./StateLibraryPicker";
 import { McpServerToolPicker } from "./McpServerToolPicker";
 import { AiGenerateWorkflowModal } from "./AiGenerateWorkflowModal";
 import { GenerateFromStatesModal } from "./GenerateFromStatesModal";
+import { AddStateStepsModal } from "./AddStateStepsModal";
 import { PromptTemplateEditor } from "./PromptTemplateEditor";
 import { ContextManagement } from "./ContextManagement";
 import { PageTutorialMenu } from "../tutorial";
@@ -483,6 +484,9 @@ function WorkflowBuilderContent({
 
   // Generate from states modal state
   const [generateFromStatesModalOpen, setGenerateFromStatesModalOpen] = useState(false);
+
+  // Add state steps modal state
+  const [addStateStepsModalOpen, setAddStateStepsModalOpen] = useState(false);
 
   // Ref for focusing the name input when creating new workflow
   const nameInputRef = useRef<HTMLInputElement | null>(null);
@@ -1284,6 +1288,7 @@ function WorkflowBuilderContent({
             actions={[
               toolbarActions.ai(() => setAiGenerateModalOpen(true)),
               toolbarActions.stateMachine(() => setGenerateFromStatesModalOpen(true)),
+              toolbarActions.addFromState(() => setAddStateStepsModalOpen(true)),
               toolbarActions.new(handleNewWorkflow, "New"),
               toolbarActions.import(handleImportWorkflow, ".json", workflowsLoading),
               toolbarActions.delete(
@@ -1706,6 +1711,21 @@ function WorkflowBuilderContent({
               isOpen={generateFromStatesModalOpen}
               onClose={() => setGenerateFromStatesModalOpen(false)}
               onWorkflowGenerated={handleAiWorkflowGenerated}
+            />
+
+            {/* Add Steps from State Modal */}
+            <AddStateStepsModal
+              isOpen={addStateStepsModalOpen}
+              onClose={() => setAddStateStepsModalOpen(false)}
+              addStep={addStep}
+              onStepsAdded={(result) => {
+                console.log(
+                  "[WorkflowBuilder] Added steps from state:",
+                  result.verificationSteps.length,
+                  "verification,",
+                  result.agenticStep ? "1 agentic" : "0 agentic"
+                );
+              }}
             />
 
             {/* Batch Delete Workflows Dialog */}

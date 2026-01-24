@@ -27,6 +27,8 @@ class EventType(Enum):
     WORKFLOW_STARTED = "workflow_started"
     WORKFLOW_COMPLETED = "workflow_completed"
     EXECUTION_COMPLETED = "execution_completed"
+    EXECUTION_PAUSED = "execution_paused"
+    EXECUTION_RESUMED = "execution_resumed"
     ERROR = "error"
     LOG = "log"
     MATCH_FOUND = "match_found"

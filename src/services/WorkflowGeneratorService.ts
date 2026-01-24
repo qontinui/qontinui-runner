@@ -378,6 +378,409 @@ Fix any navigation issues to successfully reach all expected states.`;
       errors,
     };
   }
+
+  // ===========================================================================
+  // Single State Generation Methods
+  // ===========================================================================
+
+  /**
+   * Options for generating steps for a single state
+   */
+  // (Defined as interface below)
+
+  /**
+   * Generate verification steps for a single state.
+   *
+   * Creates multiple verification approaches based on the state's properties:
+   * - StateStep: Navigate to and verify the state is active
+   * - TestStep (qontinui_vision): Visual verification using state images
+   * - TestStep (playwright): Browser-based verification for web states
+   *
+   * @param state - The state to generate verification for
+   * @param options - Generation options
+   * @returns Array of verification steps
+   */
+  generateVerificationForState(
+    state: GeneratorState,
+    options: SingleStateGeneratorOptions = {},
+  ): VerificationStep[] {
+    const {
+      includeStateStep = true,
+      includeVisionTest = true,
+      includePlaywrightTest = false,
+      timeoutSeconds = 30,
+      isBlocking = true,
+    } = options;
+
+    const steps: VerificationStep[] = [];
+
+    // 1. StateStep - Basic state navigation/verification
+    if (includeStateStep) {
+      steps.push({
+        id: generateStepId(),
+        type: "state",
+        phase: "verification",
+        name: `Verify: ${state.name}`,
+        state_id: state.id,
+        state_name: state.name,
+        timeout_seconds: timeoutSeconds,
+        is_blocking: isBlocking,
+      } as StateStep);
+    }
+
+    // 2. Vision Test - Visual verification using state images
+    if (includeVisionTest && state.stateImages && state.stateImages.length > 0) {
+      steps.push({
+        id: generateStepId(),
+        type: "test",
+        phase: "verification",
+        name: `Vision Test: ${state.name}`,
+        test_type: "qontinui_vision",
+        is_blocking: isBlocking,
+        // The vision test will use state images from the loaded config
+      } as VerificationStep);
+    }
+
+    // 3. Playwright Test - Browser-based verification
+    if (includePlaywrightTest) {
+      const playwrightCode = this.generatePlaywrightTestForState(state);
+      steps.push({
+        id: generateStepId(),
+        type: "test",
+        phase: "verification",
+        name: `Playwright Test: ${state.name}`,
+        test_type: "playwright",
+        code: playwrightCode,
+        is_blocking: isBlocking,
+      } as VerificationStep);
+    }
+
+    return steps;
+  }
+
+  /**
+   * Generate agentic instruction (prompt) for a single state.
+   *
+   * Creates an AI prompt with semantic context to help the AI understand
+   * how to navigate to or interact with the state.
+   *
+   * @param state - The state to generate instruction for
+   * @param options - Generation options
+   * @returns A PromptStep with semantic context
+   */
+  generateAgenticInstructionForState(
+    state: GeneratorState,
+    options: SingleStateAgenticOptions = {},
+  ): PromptStep {
+    const {
+      taskDescription,
+      includeNavigationGuidance = true,
+      includeInteractionGuidance = true,
+      includeErrorHandling = true,
+      additionalContext,
+    } = options;
+
+    const semanticContext = this.buildSemanticContextForSingleState(state);
+
+    let content = `You are working with a specific application state.
+
+## Target State: ${state.name}
+${state.description ? `\n**Description:** ${state.description}\n` : ""}
+${taskDescription ? `\n## Task\n${taskDescription}\n` : ""}
+## State Details
+${semanticContext}
+`;
+
+    if (includeNavigationGuidance) {
+      content += `
+## Navigation Guidance
+${this.generateNavigationGuidance(state)}
+`;
+    }
+
+    if (includeInteractionGuidance && this.hasInteractiveElements(state)) {
+      content += `
+## Interaction Guidance
+${this.generateInteractionGuidance(state)}
+`;
+    }
+
+    if (includeErrorHandling) {
+      content += `
+## Error Handling
+- If the expected visual elements are not found, check if a loading screen or modal is blocking
+- If text verification fails, the page content may have changed - take a screenshot and analyze
+- If navigation fails, try alternative paths or wait for animations to complete
+`;
+    }
+
+    if (additionalContext) {
+      content += `
+## Additional Context
+${additionalContext}
+`;
+    }
+
+    return {
+      id: generateStepId(),
+      type: "prompt",
+      phase: "agentic",
+      name: `Navigate to: ${state.name}`,
+      content,
+    };
+  }
+
+  /**
+   * Generate both verification steps and agentic instruction for a single state.
+   *
+   * This is a convenience method that combines generateVerificationForState
+   * and generateAgenticInstructionForState.
+   *
+   * @param state - The state to generate steps for
+   * @param options - Combined generation options
+   * @returns Object containing verification steps and agentic prompt
+   */
+  generateStepsForState(
+    state: GeneratorState,
+    options: SingleStateGeneratorOptions & SingleStateAgenticOptions = {},
+  ): {
+    verificationSteps: VerificationStep[];
+    agenticStep: PromptStep;
+  } {
+    return {
+      verificationSteps: this.generateVerificationForState(state, options),
+      agenticStep: this.generateAgenticInstructionForState(state, options),
+    };
+  }
+
+  /**
+   * Build semantic context for a single state (more detailed than multi-state).
+   */
+  private buildSemanticContextForSingleState(state: GeneratorState): string {
+    const sections: string[] = [];
+
+    // Visual Elements with full details
+    if (state.stateImages && state.stateImages.length > 0) {
+      sections.push("### Visual Elements");
+      state.stateImages.forEach((img, idx) => {
+        const details: string[] = [`**${idx + 1}. ${img.name}**`];
+        if (img.ocrText) {
+          details.push(`   - Text content: "${img.ocrText}"`);
+        }
+        if (img.patterns && img.patterns.length > 0) {
+          details.push(`   - Patterns: ${img.patterns.length} variation(s)`);
+          img.patterns.forEach((p) => {
+            if (p.name) details.push(`     - ${p.name}`);
+          });
+        }
+        if (img.searchMode) {
+          details.push(`   - Search mode: ${img.searchMode}`);
+        }
+        sections.push(details.join("\n"));
+      });
+    }
+
+    // Regions with descriptions
+    if (state.regions && state.regions.length > 0) {
+      sections.push("\n### Screen Regions");
+      state.regions.forEach((region) => {
+        const regionType = region.isSearchRegion ? " (search region)" : "";
+        sections.push(
+          `- **${region.name}**${regionType}: ${region.width}x${region.height} pixels at position (${region.x}, ${region.y})`,
+        );
+      });
+    }
+
+    // Locations (click targets)
+    if (state.locations && state.locations.length > 0) {
+      sections.push("\n### Click Targets");
+      state.locations.forEach((loc) => {
+        sections.push(`- **${loc.name}**: Click at coordinates (${loc.x}, ${loc.y})`);
+      });
+    }
+
+    // Strings with semantic meaning
+    if (state.strings && state.strings.length > 0) {
+      sections.push("\n### Text Elements");
+      state.strings.forEach((str) => {
+        const purposes: string[] = [];
+        if (str.identifier) purposes.push("identifies this state");
+        if (str.inputText) purposes.push("text to enter");
+        if (str.expectedText) purposes.push("expected on screen");
+        const purposeStr = purposes.length > 0 ? ` (${purposes.join(", ")})` : "";
+        sections.push(`- **${str.name}**${purposeStr}: "${str.value}"`);
+      });
+    }
+
+    // State flags
+    const flags: string[] = [];
+    if (state.isInitial) flags.push("This is an **initial state** (starting point)");
+    if (state.isFinal) flags.push("This is a **final state** (goal/end state)");
+    if (flags.length > 0) {
+      sections.push("\n### State Properties");
+      flags.forEach((f) => sections.push(`- ${f}`));
+    }
+
+    return sections.join("\n");
+  }
+
+  /**
+   * Generate navigation guidance based on state properties.
+   */
+  private generateNavigationGuidance(state: GeneratorState): string {
+    const guidance: string[] = [];
+
+    if (state.stateImages && state.stateImages.length > 0) {
+      guidance.push(
+        `- Look for these visual elements to confirm you're in the "${state.name}" state:`,
+      );
+      state.stateImages.slice(0, 3).forEach((img) => {
+        guidance.push(`  - ${img.name}${img.ocrText ? ` (contains "${img.ocrText}")` : ""}`);
+      });
+      if (state.stateImages.length > 3) {
+        guidance.push(`  - ...and ${state.stateImages.length - 3} more elements`);
+      }
+    }
+
+    if (state.strings) {
+      const identifiers = state.strings.filter((s) => s.identifier);
+      if (identifiers.length > 0) {
+        guidance.push("- Verify these text identifiers are visible:");
+        identifiers.forEach((s) => guidance.push(`  - "${s.value}"`));
+      }
+    }
+
+    if (state.isInitial) {
+      guidance.push("- This is the starting state - it should be visible after app launch");
+    }
+
+    if (state.isFinal) {
+      guidance.push("- This is a goal state - reaching it indicates success");
+    }
+
+    return guidance.length > 0 ? guidance.join("\n") : "- Navigate to this state using the application's UI";
+  }
+
+  /**
+   * Generate interaction guidance for states with interactive elements.
+   */
+  private generateInteractionGuidance(state: GeneratorState): string {
+    const guidance: string[] = [];
+
+    // Input fields
+    const inputStrings = state.strings?.filter((s) => s.inputText) || [];
+    if (inputStrings.length > 0) {
+      guidance.push("**Input Fields:**");
+      inputStrings.forEach((s) => {
+        guidance.push(`- Enter "${s.value}" in the ${s.name} field`);
+      });
+    }
+
+    // Click targets
+    if (state.locations && state.locations.length > 0) {
+      guidance.push("\n**Clickable Elements:**");
+      state.locations.forEach((loc) => {
+        guidance.push(`- Click on "${loc.name}" at position (${loc.x}, ${loc.y})`);
+      });
+    }
+
+    // Regions that might be interactive
+    const interactiveRegions = state.regions?.filter((r) => !r.isSearchRegion) || [];
+    if (interactiveRegions.length > 0) {
+      guidance.push("\n**Interactive Regions:**");
+      interactiveRegions.forEach((r) => {
+        guidance.push(`- "${r.name}" area at (${r.x}, ${r.y})`);
+      });
+    }
+
+    return guidance.join("\n");
+  }
+
+  /**
+   * Check if a state has interactive elements.
+   */
+  private hasInteractiveElements(state: GeneratorState): boolean {
+    return (
+      (state.locations && state.locations.length > 0) ||
+      (state.strings && state.strings.some((s) => s.inputText)) ||
+      (state.regions && state.regions.some((r) => !r.isSearchRegion))
+    );
+  }
+
+  /**
+   * Generate Playwright test code for verifying a state.
+   */
+  private generatePlaywrightTestForState(state: GeneratorState): string {
+    const assertions: string[] = [];
+
+    // Add text assertions for identifier strings
+    const identifiers = state.strings?.filter((s) => s.identifier || s.expectedText) || [];
+    identifiers.forEach((str) => {
+      assertions.push(
+        `  // Verify "${str.name}" text is visible`,
+        `  await expect(page.getByText('${str.value.replace(/'/g, "\\'")}')).toBeVisible();`,
+      );
+    });
+
+    // Add assertions for state images with OCR text
+    const ocrImages = state.stateImages?.filter((img) => img.ocrText) || [];
+    ocrImages.forEach((img) => {
+      assertions.push(
+        `  // Verify "${img.name}" element is visible`,
+        `  await expect(page.getByText('${img.ocrText!.replace(/'/g, "\\'")}')).toBeVisible();`,
+      );
+    });
+
+    // If no specific assertions, add a basic page check
+    if (assertions.length === 0) {
+      assertions.push(
+        `  // Basic page verification`,
+        `  await expect(page).toHaveTitle(/.*/);`,
+        `  // TODO: Add specific assertions for "${state.name}" state`,
+      );
+    }
+
+    return `// Auto-generated Playwright test for state: ${state.name}
+// ${state.description || "Verifies the state is correctly displayed"}
+
+import { test, expect } from '@playwright/test';
+
+test('verify ${state.name} state', async ({ page }) => {
+${assertions.join("\n")}
+});`;
+  }
+}
+
+/**
+ * Options for generating steps for a single state
+ */
+export interface SingleStateGeneratorOptions {
+  /** Include a StateStep for navigation/verification (default: true) */
+  includeStateStep?: boolean;
+  /** Include a qontinui_vision test step (default: true) */
+  includeVisionTest?: boolean;
+  /** Include a Playwright test step (default: false) */
+  includePlaywrightTest?: boolean;
+  /** Timeout for verification in seconds (default: 30) */
+  timeoutSeconds?: number;
+  /** Whether steps are blocking (default: true) */
+  isBlocking?: boolean;
+}
+
+/**
+ * Options for generating agentic instructions for a single state
+ */
+export interface SingleStateAgenticOptions {
+  /** Custom task description to include in the prompt */
+  taskDescription?: string;
+  /** Include navigation guidance (default: true) */
+  includeNavigationGuidance?: boolean;
+  /** Include interaction guidance for interactive elements (default: true) */
+  includeInteractionGuidance?: boolean;
+  /** Include error handling tips (default: true) */
+  includeErrorHandling?: boolean;
+  /** Additional context to append to the prompt */
+  additionalContext?: string;
 }
 
 /**

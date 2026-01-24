@@ -285,6 +285,14 @@ impl PythonBridge {
         self.send_command("stop", None)
     }
 
+    pub fn pause_execution(&mut self) -> Result<(), String> {
+        self.send_command("pause", None)
+    }
+
+    pub fn resume_execution(&mut self) -> Result<(), String> {
+        self.send_command("resume", None)
+    }
+
     pub fn get_status(&mut self) -> Result<(), String> {
         self.send_command("status", None)
     }

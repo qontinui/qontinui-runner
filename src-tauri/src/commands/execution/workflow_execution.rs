@@ -134,6 +134,66 @@ pub fn stop_execution(state: State<Arc<AppState>>) -> Result<CommandResponse, St
     }
 }
 
+/// Pause the current workflow execution.
+///
+/// Pauses any running workflow. The workflow can be resumed later.
+///
+/// # Arguments
+/// * `state` - Application state containing the Python bridge
+///
+/// # Returns
+/// * `Ok(CommandResponse)` - Success message
+/// * `Err(String)` - Error if executor not initialized or pause fails
+#[tauri::command]
+pub fn pause_execution(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
+    let mut bridge_lock =
+        crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
+
+    if let Some(ref mut bridge) = *bridge_lock {
+        bridge
+            .pause_execution()
+            .map_err(|e| format!("Failed to pause execution: {}", e))?;
+
+        Ok(CommandResponse {
+            success: true,
+            message: Some("Execution paused".to_string()),
+            data: None,
+        })
+    } else {
+        Err("Python executor not initialized".to_string())
+    }
+}
+
+/// Resume a paused workflow execution.
+///
+/// Resumes a previously paused workflow.
+///
+/// # Arguments
+/// * `state` - Application state containing the Python bridge
+///
+/// # Returns
+/// * `Ok(CommandResponse)` - Success message
+/// * `Err(String)` - Error if executor not initialized or resume fails
+#[tauri::command]
+pub fn resume_execution(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
+    let mut bridge_lock =
+        crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
+
+    if let Some(ref mut bridge) = *bridge_lock {
+        bridge
+            .resume_execution()
+            .map_err(|e| format!("Failed to resume execution: {}", e))?;
+
+        Ok(CommandResponse {
+            success: true,
+            message: Some("Execution resumed".to_string()),
+            data: None,
+        })
+    } else {
+        Err("Python executor not initialized".to_string())
+    }
+}
+
 /// Resolve initial state IDs with priority system.
 ///
 /// Priority (highest to lowest):
