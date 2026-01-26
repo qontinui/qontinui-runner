@@ -110,7 +110,7 @@
         type: '__QONTINUI_REQUEST_BODY__',
         data: requestInfo
       }, '*');
-    } catch (e) {
+    } catch (_e) {
       // Ignore errors
     }
   }
@@ -163,7 +163,7 @@
         source: 'fetch'
       });
 
-    } catch (e) {
+    } catch (_e) {
       // Ignore capture errors - don't break the app
     }
 
@@ -211,7 +211,7 @@
             timestamp: this.__qontinui.timestamp,
             source: 'xhr'
           });
-        } catch (e) {
+        } catch (_e) {
           // Ignore capture errors
         }
       })();

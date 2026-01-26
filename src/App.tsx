@@ -27,7 +27,6 @@ import { listen } from "@tauri-apps/api/event";
 import {
   Zap,
   Image,
-  ClipboardList,
   ClipboardCheck,
   FileText,
   FileSearch,
@@ -139,6 +138,7 @@ import { AwasBuilderTab } from "./components/AwasBuilderTab";
 import { ActiveDashboardPage } from "./components/active-dashboard";
 import { HistoryTab } from "./components/HistoryTab";
 import { ExecuteTab } from "./components/ExecuteTab";
+import { WorkflowQueueTab } from "./components/workflow-queue";
 // Monitor/Observe components
 import { ExecutionReport } from "./components/findings";
 import { StateExplorerTab } from "./components/state-explorer";
@@ -164,7 +164,7 @@ import { FlowDesigner } from "./components/flow-designer";
 // Live Page Generator
 import { LivePageGeneratorTab } from "./components/live-page-generator";
 // Configure components
-import { ExternalLogsTab } from "./components/ExternalLogsTab";
+import { ExternalLogsTab as _ExternalLogsTab } from "./components/ExternalLogsTab";
 import { CategoryManager } from "./components/findings/CategoryManager";
 import { HooksManagerPanel } from "./components/hooks";
 
@@ -175,7 +175,8 @@ type LogSubTab = "general" | "image" | "actions";
 
 // Valid main tab IDs for the sidebar navigation
 type MainTabId =
-  | "run"
+  | "gui-automation"
+  | "workflow-queue"
   | "active"
   | "history"
   // Observe group - new structure
@@ -232,6 +233,7 @@ type MainTabId =
   | "settings-mobile"
   | "settings-mcp"
   | "settings-log-sources"
+  | "settings-execution-variables"
   | "settings-general"
   | "settings-storage"
   | "settings-backup"
@@ -240,7 +242,8 @@ type MainTabId =
   | "help";
 
 const VALID_TAB_IDS: MainTabId[] = [
-  "run",
+  "gui-automation",
+  "workflow-queue",
   "active",
   "history",
   // New observe tabs
@@ -297,6 +300,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "settings-mobile",
   "settings-mcp",
   "settings-log-sources",
+  "settings-execution-variables",
   "settings-general",
   "settings-storage",
   "settings-backup",
@@ -312,10 +316,11 @@ const SIDEBAR_COLLAPSED_KEY = "qontinui-sidebar-collapsed";
  * Maps old tab IDs to new tab IDs for localStorage migration
  */
 function migrateTabId(stored: string | null): MainTabId {
-  if (!stored) return "run";
+  if (!stored) return "gui-automation";
 
   // Map old tab names to new ones
   const migrations: Record<string, MainTabId> = {
+    run: "gui-automation", // Execute tab renamed to GUI Automation
     "ai-workflows": "run-ai-output",
     "ai-builder": "unified-workflow-builder",
     builder: "unified-workflow-builder",
@@ -362,7 +367,7 @@ function migrateTabId(stored: string | null): MainTabId {
     return stored as MainTabId;
   }
 
-  return "run";
+  return "gui-automation";
 }
 
 /**
@@ -394,7 +399,8 @@ function AppContent() {
     registerNavigate((page: string) => {
       // Map tutorial focus pages to actual tab IDs
       const pageToTab: Record<string, MainTabId> = {
-        run: "run",
+        run: "gui-automation",
+        "gui-automation": "gui-automation",
         active: "active",
         "unified-workflow-builder": "unified-workflow-builder",
         "macro-builder": "macro-builder",
@@ -429,7 +435,8 @@ function AppContent() {
 
         // Map page names to tab IDs (same mapping as tutorials)
         const pageToTab: Record<string, MainTabId> = {
-          "run": "run",
+          "run": "gui-automation",
+          "gui-automation": "gui-automation",
           "run-recap": "run-recap",
           "run-dashboard": "run-recap", // Dashboard merged into Summary
           "active": "active",
@@ -490,19 +497,19 @@ function AppContent() {
   const [editAwasConfigId, setEditAwasConfigId] = useState<string | null>(null);
 
   // Handle editing a script from Library
-  const handleEditScript = useCallback((scriptId: string) => {
+  const _handleEditScript = useCallback((scriptId: string) => {
     setEditScriptId(scriptId);
     setActiveTab("script-builder");
   }, []);
 
   // Handle editing a workflow from Library
-  const handleEditWorkflow = useCallback((workflowId: string) => {
+  const _handleEditWorkflow = useCallback((workflowId: string) => {
     setEditWorkflowId(workflowId);
     setActiveTab("unified-workflow-builder");
   }, []);
 
   // Handle editing a macro from Library
-  const handleEditMacro = useCallback((macroId: string) => {
+  const _handleEditMacro = useCallback((macroId: string) => {
     setEditMacroId(macroId);
     setActiveTab("macro-builder");
   }, []);
@@ -661,6 +668,7 @@ function AppContent() {
       console.log("[APP] User authenticated, loading projects");
       projectSelection.loadProjects();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [auth.authStatus?.authenticated, auth.loading]);
 
   // Load project logs config when a project is selected or on mount if already selected
@@ -672,6 +680,7 @@ function AppContent() {
         projectSelection.selectedProjectName,
       );
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectSelection.selectedProjectId, projectSelection.selectedProjectName]);
 
   // Setup event handlers on mount (ONCE only)
@@ -684,6 +693,7 @@ function AppContent() {
     });
 
     return cleanup;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []); // Empty deps - run only on mount to prevent duplicate event handlers
 
   // Refresh action log when switching to Actions sub-tab
@@ -802,13 +812,21 @@ function AppContent() {
    */
   const renderTabContent = () => {
     switch (activeTab) {
-      case "run":
+      case "gui-automation":
         return <ExecuteTab onLog={addLog} onNavigateToActive={() => setActiveTab("active")} />;
+
+      case "workflow-queue":
+        return (
+          <WorkflowQueueTab
+            onNavigateToActive={() => setActiveTab("active")}
+            onLog={addLog}
+          />
+        );
 
       case "active":
         return (
           <ActiveDashboardPage
-            onGoToExecute={() => setActiveTab("run")}
+            onGoToExecute={() => setActiveTab("gui-automation")}
             onGoToRecap={lastRun ? handleGoToRecap : undefined}
             lastRunWorkflowName={lastRunWorkflowName}
           />
@@ -817,7 +835,7 @@ function AppContent() {
       case "history":
         return (
           <HistoryTab
-            onNavigateToRun={() => setActiveTab("run")}
+            onNavigateToRun={() => setActiveTab("gui-automation")}
             onNavigateToAi={() => setActiveTab("ai")}
           />
         );
@@ -921,8 +939,11 @@ function AppContent() {
                     line.line,
                     line.source,
                     line.actionId,
+                    line.taskRunId,
                     line.sessionId,
                     line.sessionName,
+                    line.phase,
+                    line.phaseIteration,
                   )
                 }
                 onNavigateToLibrary={() => setActiveTab("library")}
@@ -1027,8 +1048,11 @@ function AppContent() {
                 line.line,
                 line.source,
                 line.actionId,
+                line.taskRunId,
                 line.sessionId,
                 line.sessionName,
+                line.phase,
+                line.phaseIteration,
               )
             }
             onNavigateToLibrary={() => setActiveTab("library")}
@@ -1077,7 +1101,7 @@ function AppContent() {
             <TaskBuilderTab
               onLog={addLog}
               editTaskId={editTaskId}
-              onNavigateToLibrary={() => setActiveTab("library")}
+              _onNavigateToLibrary={() => setActiveTab("library")}
             />
           </div>
         );
@@ -1095,7 +1119,7 @@ function AppContent() {
       case "macro-builder":
         return (
           <div className="h-full overflow-hidden">
-            <MacroBuilderTab editWorkflowId={editMacroId} />
+            <MacroBuilderTab editMacroId={editMacroId} />
           </div>
         );
 
@@ -1117,7 +1141,7 @@ function AppContent() {
             <ContextBuilderTab
               onLog={addLog}
               editContextId={editContextId}
-              onNavigateToLibrary={() => setActiveTab("library")}
+              _onNavigateToLibrary={() => setActiveTab("library")}
             />
           </div>
         );
@@ -1128,7 +1152,7 @@ function AppContent() {
             <StateExplorerBuilderTab
               onLog={addLog}
               editExplorationId={editExplorationId}
-              onNavigateToLibrary={() => setActiveTab("library")}
+              _onNavigateToLibrary={() => setActiveTab("library")}
             />
           </div>
         );
@@ -1139,7 +1163,7 @@ function AppContent() {
             <ApiRequestBuilderTab
               onLog={addLog}
               editRequestId={editApiRequestId}
-              onNavigateToLibrary={() => setActiveTab("library")}
+              _onNavigateToLibrary={() => setActiveTab("library")}
             />
           </div>
         );
@@ -1150,7 +1174,7 @@ function AppContent() {
             <AwasBuilderTab
               onLog={addLog}
               editConfigId={editAwasConfigId}
-              onNavigateToLibrary={() => setActiveTab("library")}
+              _onNavigateToLibrary={() => setActiveTab("library")}
             />
           </div>
         );

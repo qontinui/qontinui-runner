@@ -25,7 +25,8 @@
   "include": ["src", "../qontinui-schemas/generated/typescript"],
   "exclude": [
     "src/services/StateDetectionService.ts",
-    "src/examples/StateDetectionExample.ts"
+    "src/examples/StateDetectionExample.ts",
+    "src/**/*.test.ts"
   ],
   "references": [{ "path": "./tsconfig.node.json" }]
 }
