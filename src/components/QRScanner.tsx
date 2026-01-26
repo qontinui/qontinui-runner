@@ -19,6 +19,7 @@ export function QRScanner({ onScan, onError, onClose }: QRScannerProps) {
 
   const html5QrCodeRef = useRef<Html5Qrcode | null>(null);
   const scannerIdRef = useRef("qr-reader");
+  const scanningRef = useRef(false);
 
   // Initialize camera list
   useEffect(() => {
@@ -85,6 +86,7 @@ export function QRScanner({ onScan, onError, onClose }: QRScannerProps) {
             setScanSuccess(true);
             setStatusMessage("QR code detected!");
             setScanning(false);
+            scanningRef.current = false;
 
             // Stop scanner
             if (html5QrCodeRef.current) {
@@ -116,6 +118,7 @@ export function QRScanner({ onScan, onError, onClose }: QRScannerProps) {
         await html5QrCodeRef.current.start(selectedCamera, config, onScanSuccess, onScanFailure);
 
         setScanning(true);
+        scanningRef.current = true;
         setStatusMessage("Position QR code in front of camera");
         setError(null);
       } catch (err: unknown) {
@@ -133,6 +136,7 @@ export function QRScanner({ onScan, onError, onClose }: QRScannerProps) {
         setError(errorMsg);
         setStatusMessage(errorMsg);
         setScanning(false);
+        scanningRef.current = false;
         if (onError) onError(errorMsg);
       }
     };
@@ -141,7 +145,7 @@ export function QRScanner({ onScan, onError, onClose }: QRScannerProps) {
 
     // Cleanup on unmount or camera change
     return () => {
-      if (html5QrCodeRef.current && scanning) {
+      if (html5QrCodeRef.current && scanningRef.current) {
         html5QrCodeRef.current
           .stop()
           .then(() => {

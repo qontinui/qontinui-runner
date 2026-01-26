@@ -2,7 +2,6 @@ import { useState, useEffect, useCallback } from "react";
 import { logManager } from "../managers";
 import {
   BookOpen,
-  Plus,
   Search,
   Play,
   Pencil,
@@ -269,12 +268,62 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
   // Context hook for getting selected context content
   const { getSelectedContextsContent, recordUsage } = useContexts();
 
+  // Define loaders (must be before useEffect that uses them)
+  const loadPrompts = useCallback(async () => {
+    setLoading(true);
+    try {
+      const response = await fetch(`${API_BASE}/prompts`);
+      const result = await response.json();
+      if (result.success) {
+        setPrompts(result.data || []);
+      } else {
+        onLog("error", `Failed to load prompts: ${result.error}`);
+      }
+    } catch (error) {
+      onLog("error", `Failed to load prompts: ${error}`);
+    } finally {
+      setLoading(false);
+    }
+  }, [onLog]);
+
+  const loadCategories = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE}/prompts/categories`);
+      const result = await response.json();
+      if (result.success) {
+        setCategories(result.data || []);
+      }
+    } catch (error) {
+      console.error("Failed to load categories:", error);
+    }
+  }, []);
+
+  const loadTaskRuns = useCallback(async () => {
+    try {
+      // Use unified sessions API
+      const response = await fetch(`${API_BASE}/sessions`);
+      const result = await response.json();
+      if (result.success) {
+        // Get all running/active sessions and convert to TaskRun format
+        const sessions: Session[] = result.data || [];
+        const activeTasks = sessions
+          .filter((s: Session) =>
+            ["running", "starting", "waiting_for_continuation"].includes(s.status),
+          )
+          .map((s: Session) => sessionToTaskRun(s));
+        setTaskRuns(activeTasks);
+      }
+    } catch (error) {
+      console.error("Failed to load task runs:", error);
+    }
+  }, []);
+
   // Load prompts on mount
   useEffect(() => {
     loadPrompts();
     loadCategories();
     loadTaskRuns();
-  }, []);
+  }, [loadPrompts, loadCategories, loadTaskRuns]);
 
   // Periodically refresh task runs
   useEffect(() => {
@@ -282,7 +331,7 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
       const interval = setInterval(loadTaskRuns, 5000);
       return () => clearInterval(interval);
     }
-  }, [showTaskRuns]);
+  }, [showTaskRuns, loadTaskRuns]);
 
   // Persist create form state when in creating mode
   useEffect(() => {
@@ -314,55 +363,6 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
     formProvider,
     formModel,
   ]);
-
-  const loadPrompts = useCallback(async () => {
-    setLoading(true);
-    try {
-      const response = await fetch(`${API_BASE}/prompts`);
-      const result = await response.json();
-      if (result.success) {
-        setPrompts(result.data || []);
-      } else {
-        onLog("error", `Failed to load prompts: ${result.error}`);
-      }
-    } catch (error) {
-      onLog("error", `Failed to load prompts: ${error}`);
-    } finally {
-      setLoading(false);
-    }
-  }, [onLog]);
-
-  const loadCategories = async () => {
-    try {
-      const response = await fetch(`${API_BASE}/prompts/categories`);
-      const result = await response.json();
-      if (result.success) {
-        setCategories(result.data || []);
-      }
-    } catch (error) {
-      console.error("Failed to load categories:", error);
-    }
-  };
-
-  const loadTaskRuns = async () => {
-    try {
-      // Use unified sessions API
-      const response = await fetch(`${API_BASE}/sessions`);
-      const result = await response.json();
-      if (result.success) {
-        // Get all running/active sessions and convert to TaskRun format
-        const sessions: Session[] = result.data || [];
-        const activeTasks = sessions
-          .filter((s: Session) =>
-            ["running", "starting", "waiting_for_continuation"].includes(s.status),
-          )
-          .map((s: Session) => sessionToTaskRun(s));
-        setTaskRuns(activeTasks);
-      }
-    } catch (error) {
-      console.error("Failed to load task runs:", error);
-    }
-  };
 
   // Create a new prompt/task
   const createPrompt = async () => {

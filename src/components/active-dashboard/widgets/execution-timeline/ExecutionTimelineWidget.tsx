@@ -3,10 +3,11 @@
  *
  * Full widget view for execution timeline activity.
  * Displays all workflow steps chronologically, grouped by phase.
+ * For verification/agentic phases, steps are further grouped by iteration.
  * Provides a high-level overview of workflow execution progress.
  */
 
-import { useState } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import {
   Terminal,
   CheckCircle,
@@ -22,29 +23,51 @@ import {
   Loader2,
   Clock,
   AlertCircle,
+  Camera,
+  MousePointer,
+  Network,
+  Layers,
+  Repeat,
+  RotateCcw,
 } from "lucide-react";
 import { cn } from "../../../../lib/utils";
 import { Badge, ScrollArea } from "../../../ui";
-import { StepStatsBar, StepStatusBadge } from "../shared";
+import { StepStatusBadge } from "../shared";
+import { TimelineStatsBar } from "./TimelineStatsBar";
 import { getAccentColors, getStatusColors } from "@/design-system";
-import { WORKFLOW_STAGE_CONFIG } from "../../../../types/dashboard/activity-types";
-import type { ExecutionTimelineWidgetProps, TimelineStep, PhaseGroup, StepType } from "./types";
+import { WORKFLOW_STAGE_CONFIG, type WorkflowStage } from "../../../../types/dashboard/activity-types";
+import type { ExecutionTimelineWidgetProps, TimelineStep, PhaseGroup, IterationGroup, StepType } from "./types";
 
 /**
  * Get icon component for step type.
  */
 function getStepIcon(type: StepType) {
   const iconMap: Record<StepType, typeof Terminal> = {
-    shell: Terminal,
-    check_group: FlaskConical,
-    check: CheckCircle,
-    prompt: Bot,
-    api_request: Globe2,
-    script: FileCode,
-    workflow_ref: GitBranch,
-    mcp_call: Plug,
+    // GUI Automation
+    workflow: Layers,
+    state: Network,
+    action: MousePointer,
+    screenshot: Camera,
     gui_action: Monitor,
+    workflow_ref: GitBranch,
+    // Verification
     playwright: Globe2,
+    test: FlaskConical,
+    check: CheckCircle,
+    check_group: FlaskConical,
+    // Command
+    shell: Terminal,
+    api_request: Globe2,
+    mcp_call: Plug,
+    // AI
+    prompt: Bot,
+    ai_session: Bot,
+    // AWAS
+    awas: Network,
+    // Utility
+    macro: Repeat,
+    script: FileCode,
+    // Unknown
     unknown: FileCode,
   };
   return iconMap[type] || FileCode;
@@ -55,16 +78,31 @@ function getStepIcon(type: StepType) {
  */
 function getStepAccentColor(type: StepType): string {
   const colorMap: Record<StepType, string> = {
-    shell: "slate",
-    check_group: "teal",
-    check: "teal",
-    prompt: "green",
-    api_request: "orange",
-    script: "indigo",
-    workflow_ref: "pink",
-    mcp_call: "violet",
+    // GUI Automation
+    workflow: "blue",
+    state: "blue",
+    action: "blue",
+    screenshot: "sky",
     gui_action: "blue",
+    workflow_ref: "pink",
+    // Verification
     playwright: "purple",
+    test: "teal",
+    check: "teal",
+    check_group: "teal",
+    // Command
+    shell: "slate",
+    api_request: "orange",
+    mcp_call: "violet",
+    // AI
+    prompt: "green",
+    ai_session: "green",
+    // AWAS
+    awas: "cyan",
+    // Utility
+    macro: "amber",
+    script: "indigo",
+    // Unknown
     unknown: "zinc",
   };
   return colorMap[type] || "zinc";
@@ -135,27 +173,122 @@ function StepRow({ step }: { step: TimelineStep }) {
 
       {/* Error indicator */}
       {step.error && (
-        <AlertCircle className={cn("h-3.5 w-3.5", errorColors.text)} title={step.error} />
+        <span title={step.error}>
+          <AlertCircle className={cn("h-3.5 w-3.5", errorColors.text)} />
+        </span>
       )}
     </div>
   );
 }
 
 /**
- * Phase section component with collapsible steps.
+ * Iteration sub-section component for verification/agentic phases.
+ */
+function IterationSection({
+  iterationGroup,
+  phaseColor,
+  phase,
+  defaultExpanded = true,
+}: {
+  iterationGroup: IterationGroup;
+  phaseColor: string;
+  phase: WorkflowStage;
+  defaultExpanded?: boolean;
+}) {
+  const [expanded, setExpanded] = useState(defaultExpanded);
+  const colors = getAccentColors(phaseColor as Parameters<typeof getAccentColors>[0]);
+  const successColors = getStatusColors("success");
+  const errorColors = getStatusColors("error");
+
+  return (
+    <div className="border-l border-border/30 ml-4">
+      {/* Iteration header */}
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className={cn(
+          "w-full flex items-center gap-2 px-3 py-1.5 transition-colors",
+          "hover:bg-muted/20",
+          iterationGroup.isActive && cn(colors.bg, "border-l-2", colors.border),
+        )}
+      >
+        {/* Expand/collapse icon */}
+        {expanded ? (
+          <ChevronDown className="h-3 w-3 text-muted-foreground" />
+        ) : (
+          <ChevronRight className="h-3 w-3 text-muted-foreground" />
+        )}
+
+        {/* Iteration badge */}
+        <Badge
+          variant="muted"
+          className={cn(
+            "text-[10px] px-1.5 py-0 h-5 gap-1",
+            iterationGroup.isActive
+              ? cn(colors.text, colors.border)
+              : "text-muted-foreground border-border/50",
+          )}
+        >
+          <RotateCcw className="h-2.5 w-2.5" />
+          Iteration {iterationGroup.iteration}
+        </Badge>
+
+        {/* Running indicator */}
+        {iterationGroup.isActive && !iterationGroup.isComplete && (
+          <Loader2 className={cn("h-3 w-3 animate-spin", colors.text)} />
+        )}
+
+        {/* Step count */}
+        <span className="text-[10px] text-muted-foreground ml-auto">
+          {iterationGroup.stats.completed}/{iterationGroup.stats.total}
+        </span>
+
+        {/* Success/fail indicators - use different wording for agentic vs verification */}
+        {iterationGroup.stats.successful > 0 && (
+          <span className={cn("text-[10px]", successColors.text)}>
+            {iterationGroup.stats.successful} {phase === "agentic" ? "completed" : "passed"}
+          </span>
+        )}
+        {iterationGroup.stats.failed > 0 && (
+          <span className={cn("text-[10px]", errorColors.text)}>
+            {iterationGroup.stats.failed} {phase === "agentic" ? "incomplete" : "failed"}
+          </span>
+        )}
+      </button>
+
+      {/* Steps list */}
+      {expanded && (
+        <div className="bg-muted/5">
+          {iterationGroup.steps.map((step) => (
+            <StepRow key={step.id} step={step} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Phase section component with collapsible steps and iteration support.
  */
 function PhaseSection({
   group,
   defaultExpanded = true,
+  expandedIterations,
+  onIterationToggle,
 }: {
   group: PhaseGroup;
   defaultExpanded?: boolean;
+  expandedIterations: Set<string>;
+  onIterationToggle: (key: string, expanded: boolean) => void;
 }) {
   const [expanded, setExpanded] = useState(defaultExpanded || group.isActive);
   const config = WORKFLOW_STAGE_CONFIG[group.phase];
   const colors = getAccentColors(config.color as Parameters<typeof getAccentColors>[0]);
   const successColors = getStatusColors("success");
   const errorColors = getStatusColors("error");
+
+  // For phases without iterations, show flat list
+  const showFlatList = !group.hasIterations || group.iterationGroups.length === 0;
 
   return (
     <div className="border-b border-border/50 last:border-b-0">
@@ -194,34 +327,66 @@ function PhaseSection({
           <Loader2 className={cn("h-3.5 w-3.5 animate-spin", colors.text)} />
         )}
 
-        {/* Step count */}
-        <span className="text-xs text-muted-foreground ml-auto">
-          {group.stats.completed}/{group.stats.total} steps
-        </span>
-
-        {/* Success/fail indicators */}
-        {group.stats.successful > 0 && (
-          <Badge variant="muted" className={cn("text-[10px]", successColors.text)}>
-            {group.stats.successful} passed
+        {/* Iteration count for phases with iterations */}
+        {group.hasIterations && group.iterationGroups.length > 0 && (
+          <Badge variant="muted" className="text-[10px] px-1.5 py-0 h-5 gap-1 text-muted-foreground">
+            <RotateCcw className="h-2.5 w-2.5" />
+            {group.iterationGroups.length} iteration{group.iterationGroups.length !== 1 ? "s" : ""}
           </Badge>
         )}
-        {group.stats.failed > 0 && (
+
+        {/* Step count (for phases without iterations) */}
+        {!group.hasIterations && (
+          <span className="text-xs text-muted-foreground ml-auto">
+            {group.stats.completed}/{group.stats.total} steps
+          </span>
+        )}
+
+        {/* Success/fail indicators (for phases without iterations) - different wording for agentic */}
+        {!group.hasIterations && group.stats.successful > 0 && (
+          <Badge variant="muted" className={cn("text-[10px]", successColors.text)}>
+            {group.stats.successful} {group.phase === "agentic" ? "completed" : "passed"}
+          </Badge>
+        )}
+        {!group.hasIterations && group.stats.failed > 0 && (
           <Badge variant="muted" className={cn("text-[10px]", errorColors.text)}>
-            {group.stats.failed} failed
+            {group.stats.failed} {group.phase === "agentic" ? "incomplete" : "failed"}
           </Badge>
         )}
       </button>
 
-      {/* Steps list */}
+      {/* Content */}
       {expanded && (
         <div className="bg-muted/10">
-          {group.steps.map((step) => (
-            <StepRow key={step.id} step={step} />
-          ))}
-          {group.steps.length === 0 && (
-            <div className="px-4 py-3 text-sm text-muted-foreground text-center">
-              No steps in this phase yet
-            </div>
+          {showFlatList ? (
+            // Flat list for phases without iterations
+            <>
+              {group.steps.map((step) => (
+                <StepRow key={step.id} step={step} />
+              ))}
+              {group.steps.length === 0 && (
+                <div className="px-4 py-3 text-sm text-muted-foreground text-center">
+                  No steps in this phase yet
+                </div>
+              )}
+            </>
+          ) : (
+            // Iteration groups for verification/agentic phases
+            <>
+              {group.iterationGroups.map((iterGroup) => {
+                const iterKey = `${group.phase}-${iterGroup.iteration}`;
+                const isIterExpanded = expandedIterations.has(iterKey);
+                return (
+                  <IterationSection
+                    key={iterKey}
+                    iterationGroup={iterGroup}
+                    phaseColor={config.color}
+                    phase={group.phase}
+                    defaultExpanded={isIterExpanded}
+                  />
+                );
+              })}
+            </>
           )}
         </div>
       )}
@@ -237,12 +402,72 @@ export function ExecutionTimelineWidget({
   data,
   className,
 }: ExecutionTimelineWidgetProps) {
+  const { phaseGroups, stats, isLoading, workflowName, currentPhase } = data;
+
+  // Track which iterations are expanded
+  // By default, only the current/latest iteration in each phase is expanded
+  const [expandedIterations, setExpandedIterations] = useState<Set<string>>(new Set());
+
+  // Track the previous iteration counts to detect new iterations
+  const prevIterationCounts = useRef<Map<string, number>>(new Map());
+
+  // Update expanded iterations when new iterations are detected
+  useEffect(() => {
+    setExpandedIterations((prevExpanded) => {
+      const newExpandedSet = new Set<string>();
+
+      for (const group of phaseGroups) {
+        if (!group.hasIterations || group.iterationGroups.length === 0) continue;
+
+        const prevCount = prevIterationCounts.current.get(group.phase) ?? 0;
+        const currentCount = group.iterationGroups.length;
+        const maxIteration = Math.max(...group.iterationGroups.map((g) => g.iteration));
+
+        // If new iteration started, only expand the latest one
+        if (currentCount > prevCount) {
+          // Collapse all previous iterations, expand only the latest
+          const latestKey = `${group.phase}-${maxIteration}`;
+          newExpandedSet.add(latestKey);
+        } else {
+          // Preserve existing expanded state for this phase
+          for (const iterGroup of group.iterationGroups) {
+            const key = `${group.phase}-${iterGroup.iteration}`;
+            if (prevExpanded.has(key)) {
+              newExpandedSet.add(key);
+            }
+          }
+          // If nothing was expanded, expand the latest
+          const phaseHasExpanded = group.iterationGroups.some(
+            (g) => newExpandedSet.has(`${group.phase}-${g.iteration}`)
+          );
+          if (!phaseHasExpanded) {
+            newExpandedSet.add(`${group.phase}-${maxIteration}`);
+          }
+        }
+
+        prevIterationCounts.current.set(group.phase, currentCount);
+      }
+
+      return newExpandedSet;
+    });
+  }, [phaseGroups]);
+
+  const handleIterationToggle = useCallback((key: string, expanded: boolean) => {
+    setExpandedIterations((prev) => {
+      const next = new Set(prev);
+      if (expanded) {
+        next.add(key);
+      } else {
+        next.delete(key);
+      }
+      return next;
+    });
+  }, []);
+
   // If summary mode, don't render (use ExecutionTimelineSummary instead)
   if (isSummary) {
     return null;
   }
-
-  const { phaseGroups, stats, isLoading, workflowName, currentPhase } = data;
 
   if (isLoading) {
     return (
@@ -255,7 +480,7 @@ export function ExecutionTimelineWidget({
   return (
     <div className={cn("flex flex-col h-full overflow-hidden", className)}>
       {/* Stats Bar */}
-      <StepStatsBar stats={stats} />
+      <TimelineStatsBar stats={stats} />
 
       {/* Workflow name header */}
       {workflowName && (
@@ -280,6 +505,8 @@ export function ExecutionTimelineWidget({
               key={group.phase}
               group={group}
               defaultExpanded={group.isActive || group.steps.length < 10}
+              expandedIterations={expandedIterations}
+              onIterationToggle={handleIterationToggle}
             />
           ))}
           {phaseGroups.length === 0 && (

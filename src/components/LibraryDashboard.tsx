@@ -51,6 +51,39 @@ interface DashboardItem {
   createdAt: string;
 }
 
+// Raw API response item (flexible shape from various endpoints)
+interface ApiResponseItem {
+  id: string;
+  name: string;
+  description?: string;
+  content?: string;
+  category?: string;
+  tags?: string | string[];
+  modified_at?: string;
+  modifiedAt?: string;
+  created_at?: string;
+  createdAt?: string;
+  updated_at?: string;
+  method?: string;
+  url?: string;
+  target_url?: string;
+  enabled?: boolean;
+  check_type?: string;
+  tool?: string;
+}
+
+// Normalize tags from API response (can be JSON string or array)
+function normalizeTags(tags: string | string[] | undefined): string[] | undefined {
+  if (!tags) return undefined;
+  if (Array.isArray(tags)) return tags;
+  try {
+    const parsed = JSON.parse(tags);
+    return Array.isArray(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // Category configuration for display
 const CATEGORY_CONFIG: Record<
   ItemType,
@@ -154,21 +187,21 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
         fetch(`${API_BASE}/playwright-scripts`),
         fetch(`${API_BASE}/unified-workflows`),
         fetch(`${API_BASE}/macros`),
-        invoke<{ success: boolean; data?: any[] }>("list_checks", { enabledOnly: false }),
+        invoke<{ success: boolean; data?: ApiResponseItem[] }>("list_checks", { enabledOnly: false }),
       ]);
 
       // Process tasks
       if (tasksRes.status === "fulfilled" && tasksRes.value.ok) {
         const result = await tasksRes.value.json();
         const data = result.success ? result.data : Array.isArray(result) ? result : [];
-        data?.forEach((item: any) => {
+        data?.forEach((item: ApiResponseItem) => {
           allItems.push({
             id: item.id,
             type: "task",
             name: item.name,
             description: item.description,
             category: item.category,
-            tags: item.tags,
+            tags: normalizeTags(item.tags),
             modifiedAt: item.modified_at || item.modifiedAt || item.created_at,
             createdAt: item.created_at || item.createdAt,
           });
@@ -179,14 +212,14 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
       if (scriptletsRes.status === "fulfilled" && scriptletsRes.value.ok) {
         const result = await scriptletsRes.value.json();
         const data = result.success ? result.data : Array.isArray(result) ? result : [];
-        data?.forEach((item: any) => {
+        data?.forEach((item: ApiResponseItem) => {
           allItems.push({
             id: item.id,
             type: "scriptlet",
             name: item.name,
             description: item.content?.slice(0, 100),
             category: item.category,
-            tags: item.tags,
+            tags: normalizeTags(item.tags),
             modifiedAt: item.modified_at || item.modifiedAt || item.created_at,
             createdAt: item.created_at || item.createdAt,
           });
@@ -197,14 +230,14 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
       if (contextsRes.status === "fulfilled" && contextsRes.value.ok) {
         const result = await contextsRes.value.json();
         const data = result.success ? result.data : Array.isArray(result) ? result : [];
-        data?.forEach((item: any) => {
+        data?.forEach((item: ApiResponseItem) => {
           allItems.push({
             id: item.id,
             type: "context",
             name: item.name,
             description: item.content?.slice(0, 100),
             category: item.category,
-            tags: item.tags,
+            tags: normalizeTags(item.tags),
             modifiedAt: item.modifiedAt || item.modified_at || item.createdAt,
             createdAt: item.createdAt || item.created_at,
           });
@@ -215,13 +248,13 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
       if (verificationsRes.status === "fulfilled" && verificationsRes.value.ok) {
         const result = await verificationsRes.value.json();
         const data = result.success ? result.data : Array.isArray(result) ? result : [];
-        data?.forEach((item: any) => {
+        data?.forEach((item: ApiResponseItem) => {
           allItems.push({
             id: item.id,
             type: "verification",
             name: item.name,
             description: item.description,
-            tags: item.tags,
+            tags: normalizeTags(item.tags),
             modifiedAt: item.updated_at || item.modified_at || item.created_at,
             createdAt: item.created_at,
           });
@@ -232,14 +265,14 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
       if (apiRequestsRes.status === "fulfilled" && apiRequestsRes.value.ok) {
         const result = await apiRequestsRes.value.json();
         const data = result.success ? result.data : Array.isArray(result) ? result : [];
-        data?.forEach((item: any) => {
+        data?.forEach((item: ApiResponseItem) => {
           allItems.push({
             id: item.id,
             type: "api-request",
             name: item.name,
             description: `${item.method} ${item.url}`,
             category: item.category,
-            tags: item.tags,
+            tags: normalizeTags(item.tags),
             modifiedAt: item.updated_at || item.modified_at || item.created_at,
             createdAt: item.created_at,
           });
@@ -250,7 +283,7 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
       if (scriptsRes.status === "fulfilled" && scriptsRes.value.ok) {
         const result = await scriptsRes.value.json();
         const data = result.success ? result.data : Array.isArray(result) ? result : [];
-        data?.forEach((item: any) => {
+        data?.forEach((item: ApiResponseItem) => {
           allItems.push({
             id: item.id,
             type: "script",
@@ -266,14 +299,14 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
       if (unifiedWorkflowsRes.status === "fulfilled" && unifiedWorkflowsRes.value.ok) {
         const result = await unifiedWorkflowsRes.value.json();
         const data = result.success ? result.data : Array.isArray(result) ? result : [];
-        data?.forEach((item: any) => {
+        data?.forEach((item: ApiResponseItem) => {
           allItems.push({
             id: item.id,
             type: "unified-workflow",
             name: item.name,
             description: item.description,
             category: item.category,
-            tags: item.tags,
+            tags: normalizeTags(item.tags),
             modifiedAt: item.modified_at || item.updated_at || item.created_at,
             createdAt: item.created_at,
           });
@@ -284,7 +317,7 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
       if (macrosRes.status === "fulfilled" && macrosRes.value.ok) {
         const result = await macrosRes.value.json();
         const data = result.success ? result.data : Array.isArray(result) ? result : [];
-        data?.forEach((item: any) => {
+        data?.forEach((item: ApiResponseItem) => {
           allItems.push({
             id: item.id,
             type: "macro",
@@ -300,13 +333,13 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
       if (checksRes.status === "fulfilled") {
         const result = checksRes.value;
         const data = result.success ? result.data : [];
-        data?.forEach((item: any) => {
+        data?.forEach((item: ApiResponseItem) => {
           allItems.push({
             id: item.id,
             type: "check",
             name: item.name,
             description: item.description || `${item.check_type} - ${item.tool}`,
-            tags: item.tags ? JSON.parse(item.tags) : undefined,
+            tags: normalizeTags(item.tags),
             modifiedAt: item.updated_at || item.created_at,
             createdAt: item.created_at,
           });
@@ -487,7 +520,7 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
             {filteredItems.map((item) => {
               const config = CATEGORY_CONFIG[item.type];
               const Icon = config.icon;
-              const accentColors = getAccentColors(config.accentColor as any);
+              const accentColors = getAccentColors(config.accentColor);
 
               return (
                 <button

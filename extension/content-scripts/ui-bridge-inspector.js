@@ -16,9 +16,9 @@
 
   // State
   let pickerEnabled = false;
-  let overlayEnabled = false;
+  let _overlayEnabled = false;
   let hoveredElement = null;
-  let selectedElement = null;
+  let _selectedElement = null;
   let hoverOverlay = null;
   const overlayElements = new Map();
 
@@ -29,7 +29,7 @@
   const LABEL_BG = 'rgba(59, 130, 246, 0.9)';
 
   /**
-   * Get all registered UI Bridge elements
+   * Get all registered UI Bridge elements (with data-ui-id)
    */
   function getRegisteredElements() {
     const elements = document.querySelectorAll('[data-ui-id]');
@@ -61,6 +61,230 @@
         actions: inferActions(inferElementType(el)),
       };
     });
+  }
+
+  /**
+   * Generate a unique ID for an element that doesn't have data-ui-id.
+   * Uses multiple strategies to create a stable, unique identifier.
+   */
+  function generateElementId(el, index) {
+    // FIRST: Check for data-ui-id (highest priority - user-defined semantic ID)
+    const dataUiId = el.dataset?.uiId || el.getAttribute('data-ui-id');
+    if (dataUiId) {
+      return dataUiId;
+    }
+
+    // Prefer existing id attribute (but only if no data-ui-id)
+    if (el.id) {
+      return el.id;
+    }
+
+    // Use name attribute for form elements
+    if (el.name) {
+      return `name-${el.name}`;
+    }
+
+    // Use aria-label if available
+    const ariaLabel = el.getAttribute('aria-label');
+    if (ariaLabel) {
+      const sanitized = ariaLabel.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 30);
+      return `aria-${sanitized}`;
+    }
+
+    // Use text content for buttons/links (sanitized)
+    const text = el.textContent?.trim();
+    if (text && ['button', 'a'].includes(el.tagName.toLowerCase())) {
+      const sanitized = text.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 30);
+      return `${el.tagName.toLowerCase()}-${sanitized}`;
+    }
+
+    // Fallback: tag + index
+    return `${el.tagName.toLowerCase()}-${index}`;
+  }
+
+  /**
+   * Get all interactive elements on the page, including those without data-ui-id.
+   * This enables AI-driven flow exploration on any website.
+   */
+  function getAllInteractiveElements() {
+    // First get UI Bridge elements (with data-ui-id)
+    const uiBridgeElements = getRegisteredElements();
+
+    // If we have UI Bridge elements, just return those (instrumented app)
+    if (uiBridgeElements.length > 0) {
+      return uiBridgeElements;
+    }
+
+    // Otherwise, discover interactive elements on the page
+    // Selectors for common interactive elements
+    const interactiveSelectors = [
+      'button',
+      'a[href]',
+      'input:not([type="hidden"])',
+      'select',
+      'textarea',
+      '[role="button"]',
+      '[role="link"]',
+      '[role="tab"]',
+      '[role="menuitem"]',
+      '[role="checkbox"]',
+      '[role="radio"]',
+      '[role="switch"]',
+      '[role="option"]',
+      '[tabindex]:not([tabindex="-1"])',
+      '[onclick]',
+      '[data-action]',
+      '[data-click]',
+    ];
+
+    const selector = interactiveSelectors.join(', ');
+    const allElements = document.querySelectorAll(selector);
+
+    // Track which elements we've already processed (to avoid duplicates)
+    const seen = new Set();
+    const result = [];
+
+    Array.from(allElements).forEach((el, index) => {
+      // Skip hidden elements
+      if (!isElementVisible(el)) return;
+
+      // Skip elements we've already processed (e.g., element matching multiple selectors)
+      if (seen.has(el)) return;
+      seen.add(el);
+
+      const rect = el.getBoundingClientRect();
+      const generatedId = generateElementId(el, index);
+
+      result.push({
+        id: generatedId,
+        tagName: el.tagName.toLowerCase(),
+        type: inferElementType(el),
+        bounds: {
+          x: rect.x,
+          y: rect.y,
+          width: rect.width,
+          height: rect.height,
+          top: rect.top,
+          right: rect.right,
+          bottom: rect.bottom,
+          left: rect.left,
+        },
+        visible: true, // Already filtered above
+        enabled: !isElementDisabled(el),
+        focused: document.activeElement === el,
+        value: 'value' in el ? el.value : undefined,
+        checked: 'checked' in el ? el.checked : undefined,
+        text: el.textContent?.trim().slice(0, 100) || undefined,
+        label: getElementLabel(el),
+        href: el.href || undefined,
+        parent: null,
+        children: [],
+        actions: inferActions(inferElementType(el)),
+        // Flag to indicate this is a discovered element, not UI Bridge instrumented
+        _discovered: true,
+        // Store info to help find the element again
+        _selector: buildUniqueSelector(el),
+      });
+    });
+
+    return result;
+  }
+
+  /**
+   * Build a unique CSS selector for an element.
+   * Used to re-find discovered elements during executeAction.
+   */
+  function buildUniqueSelector(el) {
+    // If element has an ID, use it
+    if (el.id) {
+      return `#${CSS.escape(el.id)}`;
+    }
+
+    // Build a path selector
+    const parts = [];
+    let current = el;
+    while (current && current !== document.body) {
+      let selector = current.tagName.toLowerCase();
+
+      // Add classes if available (use first 2 classes to avoid overly specific selectors)
+      const classes = Array.from(current.classList).slice(0, 2);
+      if (classes.length > 0) {
+        selector += '.' + classes.map(c => CSS.escape(c)).join('.');
+      }
+
+      // Add nth-child if needed for uniqueness
+      const parent = current.parentElement;
+      if (parent) {
+        const siblings = Array.from(parent.children).filter(
+          s => s.tagName === current.tagName
+        );
+        if (siblings.length > 1) {
+          const index = siblings.indexOf(current) + 1;
+          selector += `:nth-of-type(${index})`;
+        }
+      }
+
+      parts.unshift(selector);
+      current = parent;
+
+      // Limit depth to avoid overly long selectors
+      if (parts.length >= 5) break;
+    }
+
+    return parts.join(' > ');
+  }
+
+  /**
+   * Find an element by its ID or selector.
+   * Works with both data-ui-id elements and discovered elements.
+   */
+  function findElementById(elementId) {
+    // First try data-ui-id
+    let el = document.querySelector(`[data-ui-id="${elementId}"]`);
+    if (el) return el;
+
+    // Try as native ID
+    el = document.getElementById(elementId);
+    if (el) return el;
+
+    // Try as selector (for discovered elements)
+    try {
+      // Handle special generated IDs
+      if (elementId.startsWith('name-')) {
+        const name = elementId.slice(5);
+        el = document.querySelector(`[name="${CSS.escape(name)}"]`);
+        if (el) return el;
+      }
+
+      if (elementId.startsWith('aria-')) {
+        // Search by aria-label prefix match
+        const searchText = elementId.slice(5).replace(/-/g, ' ').trim();
+        const elements = document.querySelectorAll('[aria-label]');
+        for (const candidate of elements) {
+          const label = candidate.getAttribute('aria-label')?.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+          if (label && label.startsWith(searchText.toLowerCase())) {
+            return candidate;
+          }
+        }
+      }
+
+      if (elementId.startsWith('button-') || elementId.startsWith('a-')) {
+        // Search by text content for buttons/links
+        const [tag, ...textParts] = elementId.split('-');
+        const searchText = textParts.join('-').replace(/-/g, ' ').trim();
+        const elements = document.querySelectorAll(tag);
+        for (const candidate of elements) {
+          const text = candidate.textContent?.trim().toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+          if (text && text.startsWith(searchText.toLowerCase())) {
+            return candidate;
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('[Qontinui] Error finding element by ID:', e);
+    }
+
+    return null;
   }
 
   /**
@@ -329,7 +553,7 @@
     hoverOverlay = createOverlay(target, HOVER_COLOR, true);
   }
 
-  function onPickerMouseOut(e) {
+  function onPickerMouseOut(_e) {
     // Keep overlay until we hover over something else
   }
 
@@ -340,7 +564,7 @@
     e.stopPropagation();
 
     const target = e.target.closest('[data-ui-id]') || e.target;
-    selectedElement = target;
+    _selectedElement = target;
 
     // Build element data
     const rect = target.getBoundingClientRect();
@@ -392,7 +616,7 @@
    */
   function showOverlays() {
     hideOverlays();
-    overlayEnabled = true;
+    _overlayEnabled = true;
 
     const elements = document.querySelectorAll('[data-ui-id]');
     elements.forEach((el) => {
@@ -405,7 +629,7 @@
    * Hide all overlays
    */
   function hideOverlays() {
-    overlayEnabled = false;
+    _overlayEnabled = false;
     overlayElements.forEach((overlay) => overlay.remove());
     overlayElements.clear();
   }
@@ -414,9 +638,9 @@
    * Highlight a specific element by ID
    */
   function highlightElement(elementId) {
-    const el = document.querySelector(`[data-ui-id="${elementId}"]`);
+    const el = findElementById(elementId);
     if (!el) {
-      return { success: false, error: 'Element not found' };
+      return { success: false, error: `Element not found: ${elementId}` };
     }
 
     // Remove existing highlight
@@ -445,15 +669,45 @@
    * Execute action on element
    */
   function executeAction(elementId, action, params = {}) {
-    const el = document.querySelector(`[data-ui-id="${elementId}"]`);
+    // Use the new findElementById that works with both UI Bridge and discovered elements
+    const el = findElementById(elementId);
     if (!el) {
-      return { success: false, error: 'Element not found' };
+      return { success: false, error: `Element not found: ${elementId}` };
     }
 
     try {
       switch (action) {
         case 'click':
-          el.click();
+          // Use proper mouse events for better compatibility with React/Radix UI components
+          // Simple el.click() doesn't always trigger React's synthetic event handlers
+          {
+            const rect = el.getBoundingClientRect();
+            const centerX = rect.left + rect.width / 2;
+            const centerY = rect.top + rect.height / 2;
+
+            // Focus the element first (important for keyboard-accessible components)
+            if (el.focus) el.focus();
+
+            // Dispatch mousedown, mouseup, then click (simulates real user interaction)
+            const mouseEventInit = {
+              bubbles: true,
+              cancelable: true,
+              view: window,
+              clientX: centerX,
+              clientY: centerY,
+              screenX: centerX,
+              screenY: centerY,
+              button: 0,
+              buttons: 1,
+            };
+
+            el.dispatchEvent(new MouseEvent('mousedown', mouseEventInit));
+            el.dispatchEvent(new MouseEvent('mouseup', mouseEventInit));
+            el.dispatchEvent(new MouseEvent('click', mouseEventInit));
+
+            // Also try el.click() as a fallback for elements that expect it
+            try { el.click(); } catch { /* ignore */ }
+          }
           break;
         case 'doubleClick':
           el.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
@@ -479,6 +733,7 @@
           }
           break;
         case 'type':
+        case 'fill': // Alias for 'type'
           if ('value' in el) {
             el.focus();
             if (params.clear) {
@@ -541,9 +796,9 @@
    * Get element state by ID
    */
   function getElementState(elementId) {
-    const el = document.querySelector(`[data-ui-id="${elementId}"]`);
+    const el = findElementById(elementId);
     if (!el) {
-      return { success: false, error: 'Element not found' };
+      return { success: false, error: `Element not found: ${elementId}` };
     }
 
     const rect = el.getBoundingClientRect();
@@ -626,13 +881,16 @@
         break;
       }
       case 'getElements': {
-        const elements = getRegisteredElements();
+        // Use getAllInteractiveElements which works with both UI Bridge and regular websites
+        const elements = getAllInteractiveElements();
         const snapshot = getStateSnapshot();
         response = {
           success: true,
           elements: elements,
           activeStatesCount: snapshot.activeStates?.length || 0,
           transitionsCount: snapshot.transitions?.length || 0,
+          // Indicate whether this is a UI Bridge instrumented page or discovered elements
+          isUIBridgeInstrumented: document.querySelector('[data-ui-id]') !== null,
         };
         break;
       }
