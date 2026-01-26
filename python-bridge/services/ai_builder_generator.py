@@ -9,6 +9,7 @@ Generates content for builder tabs using AI:
 
 import json
 import logging
+import re
 from typing import Any
 
 from .claude_cli_runner import run_claude_cli
@@ -255,10 +256,63 @@ Return a JSON object with exactly these fields:
 Return ONLY the JSON object, no explanations or markdown code blocks."""
 
 
-def _format_elements_list(elements: list[dict]) -> str:
-    """Format a list of elements into a readable string."""
+def _extract_valid_selectors(elements: list[dict] | None) -> list[str]:
+    """Extract all valid selectors from elements list."""
     if not elements:
-        return ""
+        return []
+    selectors = []
+    for el in elements:
+        el_id = el.get("id", "")
+        if el_id:
+            selectors.append(f'[data-ui-id="{el_id}"]')
+    return selectors
+
+
+def _extract_valid_ids(elements: list[dict] | None) -> set[str]:
+    """Extract all valid data-ui-id values from elements list."""
+    if not elements:
+        return set()
+    ids = set()
+    for el in elements:
+        el_id = el.get("id", "")
+        if el_id:
+            ids.add(el_id)
+    return ids
+
+
+def _validate_test_selectors(test_code: str, valid_ids: set[str]) -> tuple[bool, list[str]]:
+    """Validate that test code only uses valid data-ui-id selectors.
+
+    Returns:
+        tuple: (is_valid, list of invalid selectors found)
+    """
+    # Find all data-ui-id selectors in the test code
+    # Pattern matches [data-ui-id="..."] with various quote styles
+    pattern = r'\[data-ui-id=["\']([^"\']+)["\']\]'
+    found_ids = re.findall(pattern, test_code)
+
+    logger.info(f"[SELECTOR VALIDATION] Found {len(found_ids)} data-ui-id selectors in test code")
+    logger.info(f"[SELECTOR VALIDATION] All found IDs: {found_ids}")
+
+    invalid_ids = []
+    for found_id in found_ids:
+        if found_id not in valid_ids:
+            invalid_ids.append(found_id)
+            logger.info(f"[SELECTOR VALIDATION] INVALID ID: '{found_id}'")
+        else:
+            logger.info(f"[SELECTOR VALIDATION] Valid ID: '{found_id}'")
+
+    return len(invalid_ids) == 0, invalid_ids
+
+
+def _format_elements_list(elements: list[dict] | None) -> str:
+    """Format a list of elements into a readable string for AI prompt.
+
+    Elements from UI Bridge have data-ui-id attributes, not native id attributes.
+    The selector should be [data-ui-id="..."] not #id.
+    """
+    if not elements:
+        return "(no elements)"
 
     element_lines = []
     for el in elements:
@@ -269,17 +323,23 @@ def _format_elements_list(elements: list[dict]) -> str:
         visible = "visible" if el.get("visible", True) else "hidden"
         enabled = "enabled" if el.get("enabled", True) else "disabled"
 
-        # Build a detailed element description
-        parts = [f"  - `{tag_name}`"]
+        # Build a detailed element description with the EXACT selector to use
+        parts = []
         if el_id:
-            parts.append(f'id="{el_id}"')
-        if el_type:
-            parts.append(f'type="{el_type}"')
-        if el_text:
-            # Truncate very long text but include reasonable amount
-            parts.append(f'text="{el_text[:150]}"')
-        parts.append(f"({visible}, {enabled})")
-        element_lines.append(" ".join(parts))
+            # Make the Playwright selector very obvious - this is what the AI MUST use
+            parts.append(f'  - **USE THIS SELECTOR**: `[data-ui-id="{el_id}"]`')
+            parts.append(f'    `<{tag_name}>` type="{el_type}"')
+            if el_text:
+                parts.append(f'    text="{el_text[:100]}"')
+            parts.append(f"    ({visible}, {enabled})")
+        else:
+            parts.append(f"  - `<{tag_name}>` (no data-ui-id)")
+            if el_type:
+                parts.append(f'type="{el_type}"')
+            if el_text:
+                parts.append(f'text="{el_text[:100]}"')
+            parts.append(f"({visible}, {enabled})")
+        element_lines.append(" ".join(parts) if not el_id else "\n".join(parts))
 
     return "\n".join(element_lines)
 
@@ -304,14 +364,17 @@ def build_test_and_agentic_prompt(
 
         if pages and isinstance(pages, list) and len(pages) > 0:
             # Multi-page context from flow capture
-            total_elements = sum(len(p.get("elements", [])) for p in pages)
+            total_elements = sum(len(p.get("elements") or []) for p in pages)
 
+            # Collect all valid selectors for quick reference
+            all_selectors = []
             pages_text_parts = []
             for i, page in enumerate(pages, 1):
                 page_url = page.get("url", "Unknown URL")
                 page_title = page.get("title", "Unknown Title")
-                page_elements = page.get("elements", [])
+                page_elements = page.get("elements") or []
                 elements_text = _format_elements_list(page_elements)
+                all_selectors.extend(_extract_valid_selectors(page_elements))
 
                 page_section = f"""### Page {i}: {page_title}
 - **URL**: {page_url}
@@ -320,26 +383,43 @@ def build_test_and_agentic_prompt(
 """
                 pages_text_parts.append(page_section)
 
+            # Extract raw IDs for UI Bridge API
+            all_ids = []
+            for page in pages:
+                all_ids.extend([el.get("id") for el in page.get("elements", []) if el.get("id")])
+            id_cheat_sheet = "\n".join([f'  "{el_id}"' for el_id in sorted(set(all_ids))])
+
             context_section = f"""
 ## Multi-Page Context (from UI Bridge Flow Capture - REAL DOM)
 This test involves navigation across {len(pages)} page(s) with {total_elements} total elements.
 
 {"".join(pages_text_parts)}
+
+## VALID UI BRIDGE ELEMENT IDs - USE THESE EXACTLY
+These are the element IDs captured from the UI Bridge. Use them directly with the API:
+{id_cheat_sheet}
 """
             selector_instructions = f"""
-**CRITICAL: This is a MULTI-PAGE test. Use the EXACT element IDs from each page above.**
-- The test navigates through {len(pages)} page(s) - use elements from the correct page for each step
-- When an element has an `id` attribute, use `#element-id` as the selector
-- These IDs are from the REAL page DOM captured via UI Bridge at each step
-- Do NOT invent or guess selectors - use only what's provided above
-- After navigation actions, the page context changes - use elements from the subsequent page section
+**CRITICAL: This is a MULTI-PAGE test. You MUST use ONLY the element IDs from the "VALID UI BRIDGE ELEMENT IDs" list above.**
+
+UI BRIDGE API USAGE:
+1. Use element IDs directly with the UI Bridge API (NOT CSS selectors)
+2. Example: `click_element("my-button-id")` - use the ACTUAL ID string from the list above
+3. Example: `get_element_state("my-input-id")` - use the ACTUAL ID string from the list above
+4. COPY the exact ID string from the list - do NOT modify, abbreviate, or invent IDs
+5. The test navigates through {len(pages)} page(s) - use elements from the correct page
+6. If an element you need is not in the list, find the closest match from the list
+7. NEVER invent or guess IDs like "my-tab", "submit-btn", or "main-content" - always use IDs from the actual list above
 """
         else:
             # Single page context
             url = page_context.get("url", "Unknown URL")
             title = page_context.get("title", "Unknown Title")
-            elements = page_context.get("elements", [])
+            elements = page_context.get("elements") or []
             elements_text = _format_elements_list(elements)
+            # Extract raw IDs for UI Bridge API
+            valid_ids = [el.get("id") for el in elements if el.get("id")]
+            id_cheat_sheet = "\n".join([f'  "{el_id}"' for el_id in sorted(set(valid_ids))])
 
             context_section = f"""
 ## Current Page Context (from UI Bridge - REAL DOM)
@@ -347,13 +427,21 @@ This test involves navigation across {len(pages)} page(s) with {total_elements} 
 - **Title**: {title}
 - **Elements discovered** ({len(elements)} total):
 {elements_text}
+
+## VALID UI BRIDGE ELEMENT IDs - USE THESE EXACTLY
+These are the element IDs captured from the UI Bridge. Use them directly with the API:
+{id_cheat_sheet}
 """
             selector_instructions = """
-**CRITICAL: Use the EXACT element IDs from the UI Bridge context above.**
-- When an element has an `id` attribute, use `#element-id` as the selector
-- These IDs are from the REAL page DOM captured via UI Bridge
-- Do NOT invent or guess selectors - use only what's provided above
-- If the needed element isn't in the list, use the closest available element
+**CRITICAL: You MUST use ONLY the element IDs from the "VALID UI BRIDGE ELEMENT IDs" list above.**
+
+UI BRIDGE API USAGE:
+1. Use element IDs directly with the UI Bridge API (NOT CSS selectors)
+2. Example: `click_element("my-button-id")` - use the ACTUAL ID string from the list above
+3. Example: `get_element_state("my-input-id")` - use the ACTUAL ID string from the list above
+4. COPY the exact ID string from the list - do NOT modify, abbreviate, or invent IDs
+5. If the needed element isn't in the list, find the closest match from the list
+6. NEVER use placeholder IDs like "extraction-config-tab" - always use IDs from the actual list
 """
     else:
         context_section = """
@@ -371,36 +459,212 @@ Generate BOTH a Python verification test AND an agentic step prompt based on the
 ## Requirements
 
 ### 1. Verification Test (Python)
-Create a Python test that:
-- Uses Playwright for browser automation
-- Has clear setup, action, and assertion phases
-- Includes appropriate waits for dynamic content
-- Has meaningful assertions that verify the expected outcomes
-- Uses descriptive function and variable names
+Create a Python script that uses the UI Bridge HTTP API to automate the browser.
+
+**IMPORTANT: The script runs in a special wrapper with these helper functions:**
+- `assertion(name, passed, message=None, expected=None, actual=None)` - Record test result
+- `log(msg)` - Add a log message to output
+- `fail(message)` - Mark the test as failed with a message
+
+**The script must:**
+- Use the UI Bridge HTTP API on http://localhost:9876 to interact with browser elements
+- Use data-ui-id selectors to identify elements (these are the element IDs in UI Bridge)
+- Use `assertion()` calls instead of Python `assert` statements
+- Include appropriate waits for dynamic content
+- Use descriptive variable names
+
+**UI Bridge HTTP API (via Browser Extension):**
+The test uses the `/extension/command` endpoint to send commands to the browser extension.
+The extension must be connected to the runner and have a tab selected for automation.
+
+- Base URL: http://localhost:9876
+- GET /extension/status - Check if extension is connected
+- POST /extension/command - Send commands to the extension
+
+**Extension Commands:**
+- `{{"action": "getElements", "params": {{}}}}` - Get all elements with data-ui-id
+- `{{"action": "executeAction", "params": {{"elementId": "...", "action": "click", "params": {{}}}}}}` - Click element
+- `{{"action": "selectTab", "params": {{"tabId": ...}}}}` - Select a browser tab
+- `{{"action": "listTabs", "params": {{}}}}` - List available browser tabs
+
+**IMPORTANT: Extension Connection Required**
+The browser extension must be:
+1. Installed in Chrome/Chromium browser
+2. Connected via WebSocket (check with GET /extension/status)
+3. Have a tab selected (via selectTab or the extension popup)
+
+If `get_elements()` returns 0 elements, the extension is NOT connected.
+
+**Template structure:**
+```python
+import requests
+import time
+
+BASE_URL = "http://localhost:9876"
+
+def check_extension():
+    resp = requests.get(f"{{BASE_URL}}/extension/status")
+    data = resp.json()
+    return data.get("data", {{}}).get("connected", False)
+
+def send_command(action, params=None):
+    resp = requests.post(
+        f"{{BASE_URL}}/extension/command",
+        json={{"action": action, "params": params or {{}}}},
+        timeout=30
+    )
+    result = resp.json()
+    if not result.get("success"):
+        raise Exception(result.get("error", f"Command {{action}} failed"))
+    return result.get("data", {{}})
+
+def get_elements():
+    data = send_command("getElements")
+    return data.get("elements", [])
+
+def click_element(element_id):
+    return send_command("executeAction", {{
+        "elementId": element_id,
+        "action": "click",
+        "params": {{}}
+    }})
+
+def type_text(element_id, text):
+    return send_command("executeAction", {{
+        "elementId": element_id,
+        "action": "type",
+        "params": {{"text": text}}
+    }})
+
+def wait_for_element(element_id, timeout=30):
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            elements = get_elements()
+            for el in elements:
+                if el.get("id") == element_id and el.get("visible"):
+                    return True
+        except:
+            pass
+        time.sleep(0.5)
+    return False
+
+try:
+    # Check extension connection
+    if not check_extension():
+        fail("Browser extension not connected. Please ensure the Qontinui DevTools extension is installed and connected.")
+
+    log("Extension connected, checking elements...")
+
+    # Get all elements
+    elements = get_elements()
+    log(f"Found {{len(elements)}} elements")
+
+    if len(elements) == 0:
+        fail("No elements found. Make sure a browser tab is selected in the extension popup.")
+
+    # ================================================================
+    # IMPORTANT: Replace the placeholder IDs below with ACTUAL element
+    # IDs from the "VALID UI BRIDGE ELEMENT IDs" list above.
+    # Do NOT use these example IDs directly - they are placeholders!
+    # ================================================================
+
+    # Example: Click on a tab element (REPLACE with actual element ID)
+    # click_element("YOUR_TAB_ELEMENT_ID_HERE")
+    # time.sleep(1)
+
+    # Example: Click a button (REPLACE with actual element ID)
+    # click_element("YOUR_BUTTON_ELEMENT_ID_HERE")
+    # log("Clicked button")
+
+    # Example: Wait for a result element (REPLACE with actual element ID)
+    # found = wait_for_element("YOUR_RESULT_ELEMENT_ID_HERE", timeout=30)
+    # assertion("results_appeared", found, "Results should appear")
+
+    # Example: Count elements matching a pattern
+    # elements = get_elements()
+    # matching_elements = [e for e in elements if e.get("id", "").startswith("your-prefix-")]
+    # count = len(matching_elements)
+    # assertion("element_count", count > 0, f"Expected elements, got {{count}}", expected=">0", actual=count)
+
+    # YOUR TEST CODE HERE - use actual element IDs from the list above
+    assertion("test_implemented", False, "Replace this placeholder with actual test logic using element IDs from the list above")
+
+except Exception as e:
+    fail(f"Test failed: {{e}}")
+```
 {selector_instructions}
 ### 2. Agentic Step (AI Prompt)
-Create a prompt for an AI agent that:
-- Clearly describes the task objective
-- References the specific elements by their IDs when available
-- Specifies expected outcomes
-- Includes guidance for handling edge cases
-- Is optimized for AI understanding
+Create a prompt for an AI agent that MAKES CHANGES or FIXES ISSUES, NOT for running tests.
+
+**CRITICAL: THE VERIFICATION TEST USES UI BRIDGE, NOT PLAYWRIGHT**
+
+The agentic step prompt MUST include this context at the top:
+```
+## Test Technology
+This verification test uses the **UI Bridge HTTP API** (NOT Playwright).
+- The test calls HTTP endpoints on localhost:9876 to interact with browser elements
+- UI Bridge requires the browser extension to be connected
+- "Found 0 elements" means the UI Bridge extension is not connected to a browser tab
+- This is NOT a Playwright test - do not debug as if it were Playwright
+```
+
+**CRITICAL DISTINCTION:**
+- The **Verification Test** (above) is for TESTING and VALIDATING via UI Bridge HTTP API
+- The **Agentic Step** is for MAKING CHANGES to fix issues - it should NOT run tests
+
+The agentic step prompt should:
+- ALWAYS mention this is a UI Bridge test, NOT Playwright
+- Describe what CODE CHANGES or FIXES the AI should make
+- Reference specific files, functions, or components to modify
+- Explain what bug or issue needs to be fixed
+- Provide context about the expected behavior after the fix
+- Guide the AI to implement a solution, NOT to run tests or click buttons
+
+**DO NOT include in the agentic step:**
+- Instructions to run tests (that's what the verification test is for)
+- Instructions to click buttons or interact with UI (that's for automated tests)
+- Instructions to verify or assert outcomes (that's what the verification test does)
+- Instructions to wait for results (that's what the verification test does)
+- References to Playwright - this test does NOT use Playwright
+
+**GOOD agentic step example:**
+"## Test Technology
+This test uses UI Bridge HTTP API (NOT Playwright). If 'Found 0 elements' appears, the browser extension is not connected.
+
+## Task
+Fix the state extraction logic in qontinui/extraction.py. The current implementation only identifies 3 states because [reason]. Modify the clustering algorithm to correctly group co-occurring images into separate states."
+
+**BAD agentic step example (DO NOT generate this):**
+"The Playwright test is failing because the page isn't loading. Check the selectors..."
 
 ## Output Format
 Return a JSON object with exactly these fields:
 ```json
 {{
-  "verification_test": "import pytest\\nfrom playwright.sync_api import Page\\n\\n\\ndef test_example(page: Page):\\n    # Test implementation using REAL selectors from UI Bridge\\n    page.goto('...')\\n    # Use exact IDs like page.locator('#actual-element-id')",
-  "agentic_step": "Your task is to...\\n\\n## Context\\n...\\n\\n## Expected Outcome\\n...\\n\\n## Guidelines\\n...",
+  "verification_test": "import requests\\nimport time\\n\\nBASE_URL = 'http://localhost:9876'\\n\\ndef send_command(action, params=None):\\n    resp = requests.post(f'{{BASE_URL}}/extension/command', json={{'action': action, 'params': params or {{}}}}, timeout=30)\\n    result = resp.json()\\n    if not result.get('success'): raise Exception(result.get('error', 'Command failed'))\\n    return result.get('data', {{}})\\n\\ndef click_element(elem_id):\\n    return send_command('executeAction', {{'elementId': elem_id, 'action': 'click', 'params': {{}}}})\\n\\n# IMPORTANT: Replace element IDs below with ACTUAL IDs from the page analysis!\\ntry:\\n    # Use actual element IDs from the list provided above\\n    click_element('ACTUAL_ELEMENT_ID_FROM_LIST')\\n    time.sleep(1)\\n    # ... add your test logic using real element IDs\\n    assertion('test_completed', True, 'Test completed successfully')\\nexcept Exception as e:\\n    fail(f'Test failed: {{e}}')",
+  "agentic_step": "## Test Technology\\nThis test uses UI Bridge HTTP API via browser extension (NOT Playwright). If 'Found 0 elements' appears, check extension connection.\\n\\n## Task\\nFix the [specific component] in [file path].\\n\\n## Problem\\nDescribe the bug or issue that needs code changes.\\n\\n## Solution\\nExplain what code modifications to make.\\n\\n## Files to Modify\\n- path/to/file.py: Description of changes",
   "test_name": "test_descriptive_name",
-  "agentic_name": "Descriptive Task Name"
+  "agentic_name": "Fix Component Bug"
 }}
 ```
 
-- `verification_test`: Complete Python test code using Playwright with REAL selectors from UI Bridge
-- `agentic_step`: Complete AI prompt for the agentic step
-- `test_name`: Python function name for the test (snake_case, starts with test_)
-- `agentic_name`: Human-readable name for the agentic task (Title Case)
+- `verification_test`: Python script using UI Bridge HTTP API with `assertion()` helper calls
+- `agentic_step`: Prompt for an AI to MAKE CODE CHANGES - NOT for running tests or UI interactions
+- `test_name`: Descriptive name for the test (snake_case, starts with test_)
+- `agentic_name`: Human-readable name describing what CODE CHANGE to make (e.g., "Fix Extraction Algorithm")
+
+**CRITICAL - Test Format Rules:**
+- DO NOT use `import pytest` or Playwright
+- DO NOT use pytest-style function definitions
+- DO use `import requests` and call UI Bridge HTTP API on localhost:9876
+- DO use `assertion(name, passed, message)` instead of Python `assert` statements
+- DO use element IDs from the data-ui-id attributes (these are the UI Bridge element IDs)
+- The test runs as a standalone script, not under pytest
+
+**Remember:**
+- Verification test = calls UI Bridge API to click buttons, uses assertion() helper (runs in verification phase)
+- Agentic step = describes what code to fix/change (runs in agentic phase, AI writes code)
 
 Return ONLY the JSON object, no explanations or markdown code blocks."""
 
@@ -707,26 +971,111 @@ class AiBuilderGeneratorService:
         contexts_content: str | None = None,
         ai_provider: str = "claude_cli",
         ai_settings: dict[str, Any] | None = None,
+        max_retries: int = 2,
     ) -> dict[str, Any]:
-        """Generate a verification test and agentic step from user instructions."""
+        """Generate a verification test and agentic step from user instructions.
+
+        Validates that generated tests use only valid selectors from the page context.
+        Will retry up to max_retries times if invalid selectors are detected.
+        """
         self._log("info", f"Generating test and agentic step using {ai_provider}")
         if contexts_content:
             self._log(
                 "info", f"Including {contexts_content.count('<context')} context(s) in prompt"
             )
 
-        prompt = build_test_and_agentic_prompt(user_prompt, page_context, contexts_content)
-        result = self._generate(prompt, ai_provider, ai_settings or {})
+        # Log page context structure for debugging
+        if page_context:
+            has_pages = "pages" in page_context and page_context.get("pages")
+            has_elements = "elements" in page_context and page_context.get("elements")
+            self._log(
+                "info",
+                f"[SELECTOR VALIDATION] page_context structure: has_pages={has_pages}, has_elements={has_elements}, keys={list(page_context.keys())}",
+            )
 
-        if result["success"]:
+        # Extract valid IDs from page context for validation
+        valid_ids: set[str] = set()
+        if page_context:
+            pages = page_context.get("pages")
+            if pages and isinstance(pages, list):
+                self._log("info", f"[SELECTOR VALIDATION] Multi-page context with {len(pages)} pages")
+                for page in pages:
+                    page_elements = page.get("elements") or []
+                    page_ids = _extract_valid_ids(page_elements)
+                    self._log("info", f"[SELECTOR VALIDATION] Page '{page.get('title', 'Unknown')}': {len(page_ids)} IDs")
+                    valid_ids.update(page_ids)
+            else:
+                elements = page_context.get("elements") or []
+                valid_ids.update(_extract_valid_ids(elements))
+                self._log("info", f"[SELECTOR VALIDATION] Single page context: {len(valid_ids)} IDs")
+        else:
+            self._log("info", "[SELECTOR VALIDATION] No page context provided - skipping validation")
+
+        self._log("info", f"[SELECTOR VALIDATION] Total valid IDs: {len(valid_ids)}")
+        if valid_ids:
+            # Log a sample of valid IDs for debugging
+            sample_ids = sorted(valid_ids)[:10]
+            self._log("info", f"[SELECTOR VALIDATION] Sample valid IDs: {sample_ids}")
+
+        prompt = build_test_and_agentic_prompt(user_prompt, page_context, contexts_content)
+
+        for attempt in range(max_retries + 1):
+            result = self._generate(prompt, ai_provider, ai_settings or {})
+
+            if not result["success"]:
+                self._log("error", f"Test generation failed: {result['error']}")
+                return result
+
+            test_code = result["data"].get("verification_test", "")
             test_name = result["data"].get("test_name", "Unknown")
             agentic_name = result["data"].get("agentic_name", "Unknown")
+
+            # Validate selectors if we have valid IDs to check against
+            if valid_ids:
+                self._log("info", f"[SELECTOR VALIDATION] Validating test code (attempt {attempt + 1})")
+                is_valid, invalid_ids = _validate_test_selectors(test_code, valid_ids)
+                self._log("info", f"[SELECTOR VALIDATION] Validation result: is_valid={is_valid}, invalid_ids={invalid_ids}")
+
+                if not is_valid:
+                    self._log(
+                        "warning",
+                        f"[SELECTOR VALIDATION] Attempt {attempt + 1}/{max_retries + 1}: Invalid selectors detected: {invalid_ids}",
+                    )
+
+                    if attempt < max_retries:
+                        self._log("info", f"[SELECTOR VALIDATION] Triggering retry {attempt + 2}/{max_retries + 1}")
+                        # Build retry prompt with explicit correction
+                        valid_ids_list = "\n".join([f'  - "{el_id}"' for el_id in sorted(valid_ids)])
+                        correction_prompt = f"""## RETRY - Your previous attempt used INVALID selectors
+
+The following selectors you used do NOT exist and will cause test failure:
+{chr(10).join([f'  - "{inv_id}" (INVALID)' for inv_id in invalid_ids])}
+
+## VALID IDs you MUST use instead (copy-paste from this list):
+{valid_ids_list}
+
+Please regenerate the test using ONLY the valid IDs listed above.
+Replace each invalid selector with the closest matching valid ID.
+
+## Original request:
+{user_prompt}
+
+{build_test_and_agentic_prompt(user_prompt, page_context, contexts_content)}"""
+                        prompt = correction_prompt
+                        continue
+                    else:
+                        # Max retries reached, include warning in result
+                        result["data"]["_selector_warnings"] = invalid_ids
+                        self._log(
+                            "warning",
+                            f"Max retries reached. Test has invalid selectors: {invalid_ids}",
+                        )
+
             self._log(
                 "info",
                 f"Successfully generated test '{test_name}' and agentic step '{agentic_name}'",
             )
-        else:
-            self._log("error", f"Test and agentic step generation failed: {result['error']}")
+            return result
 
         return result
 
@@ -747,6 +1096,16 @@ class AiBuilderGeneratorService:
         action to take next: click, type, wait, or done.
         """
         self._log("info", f"Flow exploration step {step_number} using {ai_provider}")
+        self._log("debug", f"User prompt: {user_prompt}")
+        self._log("debug", f"Current page: {current_title} ({current_url})")
+        self._log("debug", f"Total elements: {len(current_elements)}")
+
+        # Log element IDs and text for debugging
+        for el in current_elements[:20]:  # First 20 elements
+            el_id = el.get("id", "")
+            el_text = (el.get("text") or el.get("label") or "")[:50]
+            el_tag = el.get("tagName", "")
+            self._log("debug", f"  Element: id={el_id!r} tag={el_tag} text={el_text!r}")
 
         prompt = build_flow_exploration_prompt(
             user_prompt=user_prompt,
@@ -760,8 +1119,13 @@ class AiBuilderGeneratorService:
 
         if result["success"]:
             action = result["data"].get("action", "unknown")
+            element_id = result["data"].get("element_id", "none")
+            element_desc = result["data"].get("element_description", "")
             reason = result["data"].get("reason", "")
-            self._log("info", f"AI decided: {action} - {reason[:50]}...")
+            self._log("info", f"AI decided: {action} element_id={element_id!r}")
+            self._log("info", f"AI reason: {reason}")
+            if element_desc:
+                self._log("info", f"AI element description: {element_desc}")
         else:
             self._log("error", f"Flow exploration step failed: {result['error']}")
 
@@ -827,16 +1191,34 @@ def build_flow_exploration_prompt(
         elements_section += f"\n### All Visible Elements ({len(all_elements)} total)\n"
         elements_section += "\n".join(all_elements[:50])  # Limit
 
-    # Format captured pages summary
+    # Format captured pages summary with URL to help detect same-URL tab navigation
     captured_summary = ""
     if captured_pages:
         captured_lines = [
-            f"  - Page {i+1}: {p.get('title', 'Unknown')} ({p.get('element_count', 0)} elements)"
+            f"  - Page {i+1}: {p.get('title', 'Unknown')} - {p.get('url', 'Unknown')} ({p.get('element_count', 0)} elements)"
             for i, p in enumerate(captured_pages)
         ]
         captured_summary = f"""
 ### Already Captured Pages
 {chr(10).join(captured_lines)}
+"""
+
+    # Check if current state matches any already captured (same URL + similar element count)
+    current_element_count = len(current_elements)
+    already_captured = False
+    for p in captured_pages:
+        if p.get("url") == current_url:
+            # Same URL - check if element count is similar (within 10% = same tab state)
+            prev_count = p.get("element_count", 0)
+            if prev_count > 0 and abs(current_element_count - prev_count) / prev_count < 0.1:
+                already_captured = True
+                break
+
+    already_captured_note = ""
+    if already_captured:
+        already_captured_note = """
+**IMPORTANT**: The current page state appears to have already been captured (same URL and similar element count).
+If you've already captured what the user asked for, return `done`. Do NOT click the same element again.
 """
 
     return f"""## Task
@@ -850,7 +1232,8 @@ The user wants to explore a flow and capture page elements along the way.
 - **Step Number**: {step_number}
 - **Current Page**: {current_title}
 - **Current URL**: {current_url}
-{captured_summary}
+- **Current Element Count**: {current_element_count}
+{captured_summary}{already_captured_note}
 ## Current Page Elements
 {elements_section}
 
@@ -869,6 +1252,8 @@ Decide what action to take next to help achieve the user's goal.
 - Use `should_capture_after: true` if clicking will navigate to a new page you want to capture
 - Match elements by their text content, ID, or role to find what the user described
 - If you can't find the element the user described, explain why in `reason`
+- **Tab Navigation**: When clicking tabs on a single-page app, the URL may stay the same but the content changes. If the element count changes significantly after clicking, the tab has switched successfully.
+- **Avoid Duplicates**: Check the "Already Captured Pages" list. If a page with the same URL and similar element count is already captured, don't capture it again.
 
 ## Output Format
 Return a JSON object with exactly these fields:
