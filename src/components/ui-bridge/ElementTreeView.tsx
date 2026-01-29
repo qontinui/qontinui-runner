@@ -20,7 +20,6 @@ import {
   MousePointer,
   List,
   Circle,
-  Eye,
   EyeOff,
   Lock,
   Search,
@@ -235,10 +234,14 @@ export function ElementTreeView({
 
           {/* State indicators */}
           {!element.visible && (
-            <EyeOff className="w-3 h-3 text-muted-foreground" title="Hidden" />
+            <span className="inline-flex" title="Hidden">
+              <EyeOff className="w-3 h-3 text-muted-foreground" />
+            </span>
           )}
           {!element.enabled && (
-            <Lock className="w-3 h-3 text-muted-foreground" title="Disabled" />
+            <span className="inline-flex" title="Disabled">
+              <Lock className="w-3 h-3 text-muted-foreground" />
+            </span>
           )}
           {element.focused && (
             <div
@@ -248,7 +251,7 @@ export function ElementTreeView({
           )}
 
           {/* Type badge */}
-          <Badge variant="outline" className="text-[10px] px-1 py-0">
+          <Badge variant="muted" className="text-[10px] px-1 py-0">
             {element.type}
           </Badge>
         </div>
@@ -378,7 +381,7 @@ function SelectedElementDetails({
               {states.map((state) => (
                 <Badge
                   key={state.id}
-                  variant={activeStates.includes(state.id) ? "default" : "secondary"}
+                  variant={activeStates.includes(state.id) ? "default" : "muted"}
                   className="text-[10px]"
                 >
                   {state.name || state.id}
@@ -392,7 +395,7 @@ function SelectedElementDetails({
             <div className="text-muted-foreground">Actions:</div>
             <div className="flex flex-wrap gap-1">
               {element.actions.map((action) => (
-                <Badge key={action} variant="outline" className="text-[10px]">
+                <Badge key={action} variant="muted" className="text-[10px]">
                   {action}
                 </Badge>
               ))}

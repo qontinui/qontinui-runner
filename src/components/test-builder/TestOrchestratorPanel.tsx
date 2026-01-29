@@ -77,14 +77,7 @@ export function TestOrchestratorPanel({
   // Auth context state
   const [authContext, setAuthContext] = useState<ResolvedExecutionContext | null>(null);
 
-  // Load saved requests and auth context on mount
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- Only load once on mount
-  useEffect(() => {
-    loadSavedRequests();
-    loadAuthContext();
-  }, []);
-
-  const loadAuthContext = async () => {
+  const loadAuthContext = useCallback(async () => {
     try {
       const response = await invoke<{ success: boolean; data?: ResolvedExecutionContext }>(
         "get_resolved_execution_context"
@@ -95,9 +88,9 @@ export function TestOrchestratorPanel({
     } catch (err) {
       console.error("Failed to load auth context:", err);
     }
-  };
+  }, []);
 
-  const loadSavedRequests = async () => {
+  const loadSavedRequests = useCallback(async () => {
     try {
       const response = await invoke<CommandResponse<SavedApiRequest[]>>(
         "get_saved_requests_for_orchestration"
@@ -110,7 +103,13 @@ export function TestOrchestratorPanel({
     } catch (err) {
       onLog?.("error", `Failed to load saved requests: ${err}`);
     }
-  };
+  }, [onLog]);
+
+  // Load saved requests and auth context on mount
+  useEffect(() => {
+    loadSavedRequests();
+    loadAuthContext();
+  }, [loadSavedRequests, loadAuthContext]);
 
   // Filter requests by search query
   const filteredRequests = availableRequests.filter(

@@ -57,7 +57,7 @@ export function TestPropertiesPanel({ code, onSave }: TestPropertiesPanelProps) 
       setEnabled(selectedTest.enabled);
       setTags(selectedTest.tags || []);
     }
-  }, [selectedTest?.id]);
+  }, [selectedTest]);
 
   // Handle name change
   const handleNameChange = (value: string) => {

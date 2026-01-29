@@ -78,7 +78,6 @@ function TestBuilderContent({ onLog }: TestBuilderTabProps) {
   const currentTestType: TestType = selectedTest?.test_type || selectedTestType;
 
   // Sync code with selected test (or draft)
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- Only re-sync when ID, type, or draft code changes, not on every object recreation
   useEffect(() => {
     if (isDraftSelected && state.draftTest) {
       // Restore code from draft
@@ -88,7 +87,7 @@ function TestBuilderContent({ onLog }: TestBuilderTabProps) {
     } else {
       setCode("");
     }
-  }, [selectedTest?.id, selectedTest?.test_type, isDraftSelected, state.draftTest?.code]);
+  }, [selectedTest, isDraftSelected, state.draftTest]);
 
   // Handle code changes from editor
   const handleCodeChange = useCallback(

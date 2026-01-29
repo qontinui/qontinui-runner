@@ -7,15 +7,10 @@
 
 import { useState, useCallback, useEffect, useRef } from "react";
 import { useUIBridge } from "ui-bridge";
-import type {
-  RegisteredElement,
-  RegisteredComponent,
-  ElementState,
-} from "ui-bridge";
+import type { RegisteredElement } from "ui-bridge";
 import {
   UIBridgeInspectorPanel,
   type UIBridgeElement,
-  type UIBridgeState,
   type UIBridgeEvent,
   type UIBridgeSnapshot,
 } from "./UIBridgeInspectorPanel";
@@ -144,7 +139,7 @@ export function ConnectedUIBridgeInspector() {
           elementId,
           action,
           params,
-          result: result as Record<string, unknown>,
+          result: result as unknown as Record<string, unknown>,
           durationMs: Date.now() - startTime,
           success: result.success,
           errorMessage: result.error,
