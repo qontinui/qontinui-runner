@@ -42,7 +42,7 @@ import {
 } from "lucide-react";
 import type { WorkflowPhase, UnifiedStep } from "../../types";
 import type { GuiActionType, TestType, CheckType } from "../../types/unified-workflow";
-import { PHASE_INFO, STEP_TYPES, GUI_ACTION_TYPES, generateStepId } from "../../types";
+import { STEP_TYPES, GUI_ACTION_TYPES, generateStepId } from "../../types";
 
 // =============================================================================
 // Types
@@ -364,7 +364,7 @@ export function AddStepDropdown({
       case "test_vision":
       case "test_python":
       case "test_repository":
-      case "test_custom":
+      case "test_custom": {
         const testTypeMap: Record<string, TestType> = {
           test_playwright: "playwright",
           test_vision: "qontinui_vision",
@@ -381,13 +381,14 @@ export function AddStepDropdown({
           is_critical: true,
         };
         break;
+      }
 
       case "check_lint":
       case "check_format":
       case "check_typecheck":
       case "check_analyze":
       case "check_security":
-      case "check_custom":
+      case "check_custom": {
         const checkTypeMap: Record<string, CheckType> = {
           check_lint: "lint",
           check_format: "format",
@@ -406,6 +407,7 @@ export function AddStepDropdown({
           is_blocking: true,
         };
         break;
+      }
 
       case "screenshot":
         step = {
@@ -434,7 +436,7 @@ export function AddStepDropdown({
         break;
       }
 
-      case "shell_command":
+      case "shell_command": {
         const shellCommandNames: Record<WorkflowPhase, string> = {
           setup: "Setup Command",
           verification: "Verification Command",
@@ -450,6 +452,7 @@ export function AddStepDropdown({
           fail_on_error: true,
         };
         break;
+      }
 
       case "mcp_call":
         step = {

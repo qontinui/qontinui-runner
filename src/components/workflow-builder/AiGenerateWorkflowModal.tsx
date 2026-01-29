@@ -137,13 +137,6 @@ export function AiGenerateWorkflowModal({
     }
   }, [description, category, tags, maxIterations, provider, model, skipAiSummary, logSourceSelection, autoIncludeContexts]);
 
-  const handleLoadWorkflow = useCallback(() => {
-    if (generatedWorkflow) {
-      onWorkflowGenerated(generatedWorkflow);
-      handleClose();
-    }
-  }, [generatedWorkflow, onWorkflowGenerated]);
-
   const handleClose = useCallback(() => {
     setDescription("");
     setCategory("");
@@ -162,6 +155,13 @@ export function AiGenerateWorkflowModal({
     setAutoIncludeContexts(true);
     onClose();
   }, [onClose]);
+
+  const handleLoadWorkflow = useCallback(() => {
+    if (generatedWorkflow) {
+      onWorkflowGenerated(generatedWorkflow);
+      handleClose();
+    }
+  }, [generatedWorkflow, onWorkflowGenerated, handleClose]);
 
   const handleRegenerate = useCallback(() => {
     setGeneratedWorkflow(null);

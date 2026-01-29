@@ -8,7 +8,7 @@
  * - Action executor
  */
 
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback } from "react";
 import { Card, CardHeader, CardTitle, CardContent } from "../ui/Card";
 import { Button } from "../ui/Button";
 import { Badge } from "../ui/Badge";
@@ -175,7 +175,7 @@ export function UIBridgeInspectorPanel({
             UI Bridge Inspector
           </CardTitle>
           <div className="flex items-center gap-2">
-            <Badge variant={connected ? "default" : "secondary"}>
+            <Badge variant={connected ? "success" : "muted"}>
               {connected ? "Connected" : "Disconnected"}
             </Badge>
           </div>

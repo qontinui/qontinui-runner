@@ -20,12 +20,10 @@ import {
   Eye,
   Zap,
   Target,
-  Hash,
   Tag,
   ChevronDown,
   ChevronRight,
   Sparkles,
-  AlertCircle,
 } from "lucide-react";
 import type { ExternalElement } from "../../hooks/useExternalUIBridge";
 
@@ -304,11 +302,6 @@ export function SearchComparisonPanel({
   const toggleStrategy = useCallback((strategyId: string) => {
     setExpandedStrategy((prev) => (prev === strategyId ? null : strategyId));
   }, []);
-
-  // Get result count for a strategy
-  const getResultCount = (strategyId: string) => {
-    return searchResults.get(strategyId)?.length ?? 0;
-  };
 
   // Render a search result
   const renderResult = (result: SearchResult, isRecommended: boolean = false) => (

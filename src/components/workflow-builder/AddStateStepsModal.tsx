@@ -75,7 +75,6 @@ function detectConfigType(states: Array<{
 }>): ConfigTypeInfo {
   let hasImagePatterns = false;
   let hasOcrTextWithoutPatterns = false;
-  let hasRegionsWithCoordinates = false;
 
   for (const state of states) {
     // Check for image patterns with imageId (Visual GUI indicator)
@@ -89,14 +88,6 @@ function detectConfigType(states: Array<{
         if (img.ocrText && !hasPatternWithImage) {
           hasOcrTextWithoutPatterns = true;
         }
-      }
-    }
-
-    // Regions with coordinates (Visual GUI indicator)
-    if (state.regions && state.regions.length > 0) {
-      const hasCoords = state.regions.some((r) => r.x > 0 || r.y > 0);
-      if (hasCoords) {
-        hasRegionsWithCoordinates = true;
       }
     }
   }
