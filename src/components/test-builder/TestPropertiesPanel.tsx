@@ -30,7 +30,7 @@ interface TestPropertiesPanelProps {
 }
 
 export function TestPropertiesPanel({ code, onSave }: TestPropertiesPanelProps) {
-  const { selectedTest, state, updateTest, setDirty, isDraftSelected, saveDraft, updateDraft } =
+  const { selectedTest, state, updateTest, setDirty, isDraftSelected, saveDraft } =
     useTestBuilder();
 
   // Local form state

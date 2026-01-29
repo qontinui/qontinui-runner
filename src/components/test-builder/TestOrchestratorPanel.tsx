@@ -15,7 +15,6 @@ import {
   AlertCircle,
   ChevronRight,
   RefreshCw,
-  Save,
   Trash2,
   FileCode,
   Search,
@@ -79,6 +78,7 @@ export function TestOrchestratorPanel({
   const [authContext, setAuthContext] = useState<ResolvedExecutionContext | null>(null);
 
   // Load saved requests and auth context on mount
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- Only load once on mount
   useEffect(() => {
     loadSavedRequests();
     loadAuthContext();
@@ -247,6 +247,7 @@ export function TestOrchestratorPanel({
     } finally {
       setIsLoading(false);
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- generateTest is defined below and causes circular dependency warning
   }, [plan, onLog]);
 
   // Generate test code
@@ -308,8 +309,8 @@ export function TestOrchestratorPanel({
     setCurrentStepIndex(0);
   };
 
-  // Get selected requests as array
-  const selectedRequests = availableRequests.filter((r) =>
+  // Get selected requests as array (currently unused but kept for future use)
+  const _selectedRequests = availableRequests.filter((r) =>
     selectedRequestIds.has(r.id)
   );
 

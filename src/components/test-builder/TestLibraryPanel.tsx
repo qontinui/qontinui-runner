@@ -24,7 +24,6 @@ import {
 } from "lucide-react";
 import { useTestBuilder } from "./TestBuilderContext";
 import { ImportExportDialog } from "./ImportExportDialog";
-import { BuilderToolbar, toolbarActions } from "../ui/BuilderToolbar";
 import { BatchDeleteDialog } from "../ui/BatchDeleteDialog";
 import type { TestType, VerificationTest } from "./types";
 

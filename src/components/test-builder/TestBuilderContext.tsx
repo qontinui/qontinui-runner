@@ -14,7 +14,6 @@ import type {
   TestType,
   CommandResponse,
   CollectedAnalysisSet,
-  CollectedAnalysis,
 } from "./types";
 import { getStepOutputFromAnalysis } from "./types";
 import { stepOutputRegistry } from "../../lib/step-output-handlers";
