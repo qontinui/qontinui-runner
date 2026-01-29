@@ -3,15 +3,17 @@
  *
  * Main page component for the Active Dashboard.
  * Orchestrates the dynamic widget-based layout based on task activities.
+ * Supports multi-run view with ActiveRunsBar for concurrent workflows.
  */
 
 import { useCallback, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useDashboardState } from "../../hooks/dashboard";
-import { TaskProvider } from "../../contexts";
+import { TaskProvider, useActiveRunsOptional } from "../../contexts";
 import { DashboardLayout } from "./DashboardLayout";
 import { ControlBar } from "./ControlBar";
 import { BottomBar } from "./BottomBar";
+import { ActiveRunsBar } from "./ActiveRunsBar";
 import { registerAllWidgets } from "./widgets";
 import { windowManager } from "../../managers";
 import type { ActivityType } from "../../types/dashboard/activity-types";
@@ -70,23 +72,52 @@ export function DashboardPage({
     [navigateToDetail],
   );
 
-  // Handle stop execution
+  // Handle stop execution - works for both unified workflows and GUI automation
   const handleStop = useCallback(async () => {
+    console.log("[DASHBOARD] Stop execution called");
+    const taskId = state.taskInfo?.taskId;
+    let stopped = false;
+
+    // 1. Stop unified workflow (AI task) via HTTP API if we have a task ID
+    if (taskId) {
+      try {
+        console.log(`[DASHBOARD] Stopping unified workflow: ${taskId}`);
+        const response = await fetch(`http://localhost:9876/task-runs/${taskId}/stop`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+        });
+        if (response.ok) {
+          const data = await response.json();
+          if (data.success) {
+            console.log("[DASHBOARD] Unified workflow stopped successfully");
+            stopped = true;
+          }
+        }
+      } catch (error) {
+        console.error("[DASHBOARD] Failed to stop unified workflow:", error);
+      }
+    }
+
+    // 2. Also try to stop GUI automation via Tauri command
     try {
-      console.log("[DASHBOARD] Stop execution called");
       const result = await invoke<CommandResponse>("stop_execution");
       if (result.success) {
-        console.log("[DASHBOARD] Execution stopped successfully");
-        setIsPaused(false); // Reset pause state on stop
-        // Restore window if it was auto-minimized
-        await windowManager.restoreIfMinimized();
+        console.log("[DASHBOARD] GUI execution stopped successfully");
+        stopped = true;
       }
-    } catch (error) {
-      console.error("[DASHBOARD] Failed to stop execution:", error);
+    } catch {
+      // This may fail if no GUI execution is running, which is fine
+      console.log("[DASHBOARD] No GUI execution to stop (or already stopped)");
     }
-  }, []);
 
-  // Handle play/pause toggle
+    if (stopped) {
+      setIsPaused(false); // Reset pause state on stop
+      // Restore window if it was auto-minimized
+      await windowManager.restoreIfMinimized();
+    }
+  }, [state.taskInfo?.taskId]);
+
+  // Handle play/pause toggle - only works for GUI automation, not unified workflows
   const handlePlayPause = useCallback(async () => {
     try {
       if (isPaused) {
@@ -104,8 +135,10 @@ export function DashboardPage({
           setIsPaused(true);
         }
       }
-    } catch (error) {
-      console.error("[DASHBOARD] Failed to toggle pause:", error);
+    } catch {
+      // Pause/resume only works for GUI automation via Python bridge
+      // Unified workflows (AI tasks) don't support pause yet
+      console.log("[DASHBOARD] Pause/resume not available for this workflow type");
     }
   }, [isPaused]);
 
@@ -113,6 +146,16 @@ export function DashboardPage({
   const _currentAction = state.layout.activeWidget
     ? state.layout.activities.get(state.layout.activeWidget)?.type
     : null;
+
+  // Access active runs context if available (for multi-run support)
+  const activeRunsContext = useActiveRunsOptional();
+  const hasMultipleRuns = activeRunsContext?.hasMultipleRuns ?? false;
+
+  // Handler for "New Run" button in ActiveRunsBar
+  const handleNewRun = useCallback(() => {
+    // Navigate to execute page to start a new run
+    onGoToExecute();
+  }, [onGoToExecute]);
 
   return (
     <TaskProvider taskInfo={state.taskInfo} isRunning={state.isRunning}>
@@ -144,6 +187,9 @@ export function DashboardPage({
             lastRunWorkflowName={lastRunWorkflowName}
           />
         </div>
+
+        {/* Active Runs Bar - shown when multiple runs are active */}
+        {hasMultipleRuns && <ActiveRunsBar onNewRun={handleNewRun} />}
 
         {/* Bottom Bar - always visible */}
         <BottomBar
