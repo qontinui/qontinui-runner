@@ -26,6 +26,18 @@ export function StateExplorerTab({ onShowAiPrompt }: StateExplorerTabProps) {
   const runSelection = useRunSelectionOptional();
   const selectedRun = runSelection?.selectedRun;
 
+  // Handle viewing a specific report
+  const handleViewReport = useCallback((runId: string) => {
+    setSelectedRunId(runId);
+    setActiveView("report");
+  }, []);
+
+  // Handle going back from report to history
+  const handleBackToHistory = useCallback(() => {
+    setSelectedRunId(null);
+    setActiveView("history");
+  }, []);
+
   // No run selected state (when context is present but no run selected)
   if (runSelection && !selectedRun) {
     return (
@@ -38,18 +50,6 @@ export function StateExplorerTab({ onShowAiPrompt }: StateExplorerTabProps) {
       </div>
     );
   }
-
-  // Handle viewing a specific report
-  const handleViewReport = useCallback((runId: string) => {
-    setSelectedRunId(runId);
-    setActiveView("report");
-  }, []);
-
-  // Handle going back from report to history
-  const handleBackToHistory = useCallback(() => {
-    setSelectedRunId(null);
-    setActiveView("history");
-  }, []);
 
   // If viewing a report, show the report view
   if (activeView === "report" && selectedRunId) {

@@ -228,8 +228,8 @@ export function AiTestGenerator({
   }, [selectedTaskRunId]);
 
 
-  // Check if we have any analysis data
-  const hasAnalysis = analysis || multiRequestAnalysis || collectedAnalyses;
+  // Check if we have any analysis data - used for conditional rendering below
+  const _hasAnalysis = analysis || multiRequestAnalysis || collectedAnalyses;
 
   // Handle file upload for reference documents
   const handleFileUpload = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -313,7 +313,7 @@ export function AiTestGenerator({
   }, [analysis]);
 
   // Build multi-request summary for display
-  const multiRequestSummary = useMemo(() => {
+  const _multiRequestSummary = useMemo(() => {
     if (!multiRequestAnalysis) return "";
 
     const successfulRequests = multiRequestAnalysis.requests.filter((r) => r.status === "complete");
@@ -755,10 +755,9 @@ export function AiTestGenerator({
                   <label className="text-xs text-neutral-400">
                     Assertable Fields ({assertableFields.length})
                   </label>
-                  <Info
-                    className="w-3 h-3 text-neutral-500"
-                    title="Click a field to insert it into your prompt"
-                  />
+                  <span title="Click a field to insert it into your prompt">
+                    <Info className="w-3 h-3 text-neutral-500" />
+                  </span>
                   <span className="text-xs text-neutral-600 ml-1">(click to insert)</span>
                 </div>
                 <div className="max-h-32 overflow-y-auto p-2 bg-neutral-800/50 rounded text-xs">

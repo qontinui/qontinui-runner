@@ -44,7 +44,6 @@ import {
   SHELL_COMMAND_CATEGORIES,
   getCategoryInfo,
   getCategoryColorClass,
-  getCategoryBgClass,
 } from "./types";
 
 interface ShellCommandBuilderTabProps {
@@ -562,7 +561,7 @@ function CommandEditorPanel() {
       setTags([]);
       setEnabled(true);
     }
-  }, [selectedCommand?.id]);
+  }, [selectedCommand]);
 
   const handleAddTag = () => {
     if (tagInput.trim() && !tags.includes(tagInput.trim())) {
@@ -968,7 +967,7 @@ function ExecutionResultPanel({
 }
 
 // Main content component
-function ShellCommandBuilderContent({ onLog }: ShellCommandBuilderTabProps) {
+function ShellCommandBuilderContent({ onLog: _onLog }: ShellCommandBuilderTabProps) {
   const { createCommand, selectCommand } = useShellCommandBuilder();
   const [showAiGenerator, setShowAiGenerator] = useState(false);
 

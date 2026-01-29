@@ -11,39 +11,59 @@
  *   - UI Bridge element context capture
  *   - Natural language instructions
  *   - Save to Test and Task libraries
+ *
+ * Design: Two-panel layout based on v0 design with qontinui design tokens
  */
 
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useMemo } from "react";
 import {
-  Bot,
-  Monitor,
+  Globe,
   Smartphone,
   RefreshCw,
-  Loader2,
-  Globe,
-  CheckCircle2,
-  AlertCircle,
-  Sparkles,
-  Save,
-  FileText,
-  Copy,
-  ExternalLink,
+  Plug,
   MousePointer,
   Camera,
-  Clock,
-  Navigation,
+  Sparkles,
+  Play,
+  Zap,
+  ChevronRight,
+  ChevronDown,
+  Layout,
   Type,
+  Workflow,
+  Layers,
+  Shield,
+  Wrench,
+  FileCode,
+  Copy,
+  Save,
+  FileText,
+  Code,
+  Loader2,
+  CheckCircle2,
+  AlertCircle,
+  Bot,
+  Clock,
+  ExternalLink,
+  ImageIcon,
+  Search,
+  MessageSquare,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { useLiveBrowser, type BrowserTab, type MobileDevice } from "@/hooks/useLiveBrowser";
+import { SearchComparisonPanel } from "@/components/ui-bridge/SearchComparisonPanel";
+import { ElementDescriptionPanel } from "@/components/ui-bridge/ElementDescriptionPanel";
+import { NaturalLanguagePanel } from "@/components/ui-bridge/NaturalLanguagePanel";
+import type { ExternalElement, PageContext, CommandResult } from "@/hooks/useExternalUIBridge";
 import { ContextSelector } from "@/components/contexts/ContextSelector";
 import type { ContextSelection } from "@/types/context";
+import { cn } from "@/lib/utils";
 
 // Use 127.0.0.1 instead of localhost to force IPv4 (runner only listens on IPv4)
 const API_BASE = "http://127.0.0.1:9876";
 
 // =============================================================================
-// Flow Capture Types
+// Types
 // =============================================================================
 
 interface PageCapture {
@@ -95,16 +115,108 @@ interface LivePageGeneratorTabProps {
 }
 
 type TargetType = "browser" | "mobile" | "none";
+type LeftPanelTab = "flow" | "context" | "search" | "describe" | "nl";
+type RightPanelTab = "definition" | "output";
+type OutputSubTab = "python" | "agentic";
+
+interface Target {
+  id: string;
+  type: "browser" | "mobile";
+  name: string;
+  connected: boolean;
+}
+
+interface FlowStep {
+  step: number;
+  action: string;
+  description: string;
+  status: "running" | "completed" | "error";
+  error?: string;
+}
+
+interface TreeNode {
+  id: string;
+  name: string;
+  type: "page" | "element";
+  icon?: "input" | "button" | "image" | "text";
+  elementCount?: number;
+  children?: TreeNode[];
+}
+
+// Storage key for persisting state
+const STORAGE_KEY = "live-page-generator-state";
+
+interface PersistedState {
+  flowPrompt: string;
+  instructions: string;
+  expectedResults: string;
+  agenticInstructions: string;
+  multiPageContext: MultiPageContext | null;
+  explorationLog: FlowStep[];
+  selectedPageIndex: number | null;
+}
+
+// Icon maps for flow steps and elements
+const flowIconMap = {
+  capture: Camera,
+  click: MousePointer,
+  type: Type,
+  wait: Clock,
+  ai_decision: Bot,
+  navigate: Play,
+  input: Zap,
+};
+
+const elementIconMap = {
+  input: Type,
+  button: MousePointer,
+  image: ImageIcon,
+  text: Layout,
+};
+
+// Load persisted state from localStorage
+function loadPersistedState(): Partial<PersistedState> {
+  try {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    if (stored) {
+      const parsed = JSON.parse(stored);
+      if (parsed.explorationLog && Array.isArray(parsed.explorationLog)) {
+        parsed.explorationLog = parsed.explorationLog.map((log: FlowStep) =>
+          log.status === "running"
+            ? { ...log, status: "error" as const, error: "Session was interrupted" }
+            : log
+        );
+      }
+      return parsed;
+    }
+  } catch (e) {
+    console.error("[LivePageGenerator] Failed to load persisted state:", e);
+  }
+  return {};
+}
+
+// =============================================================================
+// Main Component
+// =============================================================================
 
 export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGeneratorTabProps) {
+  // Load persisted state once on mount
+  const [persistedState] = useState<Partial<PersistedState>>(() => loadPersistedState());
+
+  // Tab state
+  const [leftPanelTab, setLeftPanelTab] = useState<LeftPanelTab>("flow");
+  const [rightPanelTab, setRightPanelTab] = useState<RightPanelTab>("definition");
+  const [outputSubTab, setOutputSubTab] = useState<OutputSubTab>("python");
+
   // Target selection state
-  const [selectedTargetType, setSelectedTargetType] = useState<TargetType>("none");
+  const [_selectedTargetType, setSelectedTargetType] = useState<TargetType>("none");
   const [selectedTabId, setSelectedTabId] = useState<number | null>(null);
   const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(null);
 
-  // Instructions state
-  const [instructions, setInstructions] = useState("");
-  const [expectedResults, setExpectedResults] = useState("");
+  // Instructions state (with persistence)
+  const [instructions, setInstructions] = useState(persistedState.instructions ?? "");
+  const [expectedResults, setExpectedResults] = useState(persistedState.expectedResults ?? "");
+  const [agenticInstructions, setAgenticInstructions] = useState(persistedState.agenticInstructions ?? "");
 
   // Generation state
   const [isGenerating, setIsGenerating] = useState(false);
@@ -119,7 +231,7 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
 
   // UI Bridge context
   const [uiBridgeContext, setUiBridgeContext] = useState<UIBridgeContext | null>(null);
-  const [isCapturingContext, setIsCapturingContext] = useState(false);
+  const [_isCapturingContext, setIsCapturingContext] = useState(false);
 
   // Context selection for AI
   const [contextSelection, setContextSelection] = useState<ContextSelection>({
@@ -127,18 +239,40 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
     selectedIds: [],
   });
 
-  // AI-driven flow exploration state
-  const [flowPrompt, setFlowPrompt] = useState("");
+  // AI-driven flow exploration state (with persistence)
+  const [flowPrompt, setFlowPrompt] = useState(persistedState.flowPrompt ?? "");
   const [isExploring, setIsExploring] = useState(false);
-  const [explorationLog, setExplorationLog] = useState<Array<{
-    step: number;
-    action: string;
-    description: string;
-    status: "running" | "completed" | "error";
-    error?: string;
-  }>>([]);
-  const [multiPageContext, setMultiPageContext] = useState<MultiPageContext | null>(null);
+  const [explorationLog, setExplorationLog] = useState<FlowStep[]>(
+    persistedState.explorationLog ?? []
+  );
+  const [multiPageContext, setMultiPageContext] = useState<MultiPageContext | null>(
+    persistedState.multiPageContext ?? null
+  );
   const [flowError, setFlowError] = useState<string | null>(null);
+  const [selectedPageIndex, setSelectedPageIndex] = useState<number | null>(
+    persistedState.selectedPageIndex ?? null
+  );
+
+  // Tree expansion state for captured pages
+  const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set(["page-0"]));
+
+  // Persist state to localStorage when values change
+  useEffect(() => {
+    const stateToSave: PersistedState = {
+      flowPrompt,
+      instructions,
+      expectedResults,
+      agenticInstructions,
+      multiPageContext,
+      explorationLog,
+      selectedPageIndex,
+    };
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(stateToSave));
+    } catch (e) {
+      console.error("[LivePageGenerator] Failed to persist state:", e);
+    }
+  }, [flowPrompt, instructions, expectedResults, agenticInstructions, multiPageContext, explorationLog, selectedPageIndex]);
 
   // Use the live browser hook
   const {
@@ -149,17 +283,92 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
     connectionStatus,
     connectedTarget,
     elements,
+    selectedElementId,
+    error: _connectionError,
     refreshTargets,
     connectToTab,
     connectToMobile,
-    disconnect,
+    disconnect: _disconnect,
     refreshElements,
+    selectElement,
+    highlightElement,
+    executeAction,
   } = useLiveBrowser();
+
+  // Convert elements to ExternalElement format for UI Bridge panels
+  // DiscoveredElement and ExternalElement are structurally compatible
+  const externalElements = useMemo(() =>
+    elements as unknown as ExternalElement[],
+    [elements]
+  );
+
+  // Get selected element for UI Bridge panels
+  const selectedElement = useMemo(() =>
+    selectedElementId
+      ? externalElements.find(el => el.id === selectedElementId) ?? null
+      : null,
+    [externalElements, selectedElementId]
+  );
+
+  // Create page context for ElementDescriptionPanel
+  const pageContext = useMemo((): PageContext | null => {
+    if (!connectedTarget || connectionStatus !== "connected") return null;
+    return {
+      url: connectedTarget.url || "",
+      title: connectedTarget.name || "",
+      elements: externalElements,
+      timestamp: Date.now(),
+    };
+  }, [connectedTarget, connectionStatus, externalElements]);
+
+  // Wrapper for executeAction that returns CommandResult
+  const handleExecuteActionWithResult = useCallback(
+    async (
+      elementId: string,
+      action: string,
+      params?: Record<string, unknown>
+    ): Promise<CommandResult> => {
+      try {
+        await executeAction(elementId, action, params);
+        return { success: true };
+      } catch (error) {
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : "Action failed"
+        };
+      }
+    },
+    [executeAction]
+  );
+
+  // Wrapper for selectElement that matches expected signature
+  const handleSelectElement = useCallback(
+    (elementId: string | null) => {
+      selectElement(elementId);
+    },
+    [selectElement]
+  );
 
   // Refresh targets on mount
   useEffect(() => {
     refreshTargets();
   }, [refreshTargets]);
+
+  // Build targets array for rendering
+  const targets: Target[] = [
+    ...browserTabs.map((tab) => ({
+      id: `browser-${tab.id}`,
+      type: "browser" as const,
+      name: tab.title || tab.url,
+      connected: selectedTabId === tab.id && connectionStatus === "connected",
+    })),
+    ...mobileDevices.map((device) => ({
+      id: `mobile-${device.device_id}`,
+      type: "mobile" as const,
+      name: device.model || device.device_id,
+      connected: selectedDeviceId === device.device_id && connectionStatus === "connected",
+    })),
+  ];
 
   // Handle tab selection
   const handleSelectTab = useCallback(
@@ -191,8 +400,24 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
     [connectToMobile, onLog]
   );
 
+  // Handle target click from unified list
+  const handleTargetClick = useCallback(
+    (target: Target) => {
+      if (target.type === "browser") {
+        const tabId = parseInt(target.id.replace("browser-", ""));
+        const tab = browserTabs.find((t) => t.id === tabId);
+        if (tab) handleSelectTab(tab);
+      } else {
+        const deviceId = target.id.replace("mobile-", "");
+        const device = mobileDevices.find((d) => d.device_id === deviceId);
+        if (device) handleSelectDevice(device);
+      }
+    },
+    [browserTabs, mobileDevices, handleSelectTab, handleSelectDevice]
+  );
+
   // Capture UI Bridge context from connected target
-  const captureContext = useCallback(async () => {
+  const _captureContext = useCallback(async () => {
     if (connectionStatus !== "connected") {
       onLog?.("warning", "Not connected to any target");
       return;
@@ -200,10 +425,7 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
 
     setIsCapturingContext(true);
     try {
-      // Get current elements and page info
       await refreshElements();
-
-      // Build context from elements
       const context: UIBridgeContext = {
         url: connectedTarget?.url,
         title: connectedTarget?.name,
@@ -217,7 +439,6 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
           enabled: el.enabled,
         })),
       };
-
       setUiBridgeContext(context);
       onLog?.("success", `Captured context: ${elements.length} elements from ${connectedTarget?.name}`);
     } catch (error) {
@@ -250,17 +471,15 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
   // AI-Driven Flow Exploration Functions
   // =============================================================================
 
-  // Clear exploration results
   const clearExploration = useCallback(() => {
     setExplorationLog([]);
     setMultiPageContext(null);
     setFlowError(null);
+    setSelectedPageIndex(null);
   }, []);
 
-  // Capture current page elements via UI Bridge
   const captureCurrentPage = useCallback(async (): Promise<PageCapture | null> => {
     try {
-      // Refresh elements first
       const response = await fetch(`${API_BASE}/extension/command`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -279,7 +498,6 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
         throw new Error(data.error || "Failed to capture elements");
       }
 
-      // Get current tab info
       const tabResponse = await fetch(`${API_BASE}/extension/command`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -304,7 +522,7 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
         url: tabInfo.url,
         title: tabInfo.title,
         capturedAt: new Date().toISOString(),
-        stepIndex: 0, // Will be set by caller
+        stepIndex: 0,
         elements: data.data?.elements || [],
       };
     } catch (error) {
@@ -313,7 +531,6 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
     }
   }, [connectedTarget]);
 
-  // Execute a click action via UI Bridge
   const executeClick = useCallback(async (elementId: string): Promise<void> => {
     const response = await fetch(`${API_BASE}/extension/command`, {
       method: "POST",
@@ -338,7 +555,6 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
     }
   }, []);
 
-  // Execute a type action via UI Bridge
   const executeType = useCallback(async (elementId: string, text: string): Promise<void> => {
     const response = await fetch(`${API_BASE}/extension/command`, {
       method: "POST",
@@ -363,12 +579,10 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
     }
   }, []);
 
-  // Wait for a specified duration
   const executeWait = useCallback(async (ms: number): Promise<void> => {
     await new Promise((resolve) => setTimeout(resolve, ms));
   }, []);
 
-  // AI-driven flow exploration - AI decides what to click based on the prompt
   const exploreFlow = useCallback(async () => {
     if (!flowPrompt.trim()) {
       onLog?.("warning", "Please describe the navigation flow");
@@ -376,7 +590,7 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
     }
 
     if (connectionStatus !== "connected") {
-      onLog?.("warning", "Not connected to a browser tab");
+      onLog?.("warning", `Not connected to a browser tab (status: ${connectionStatus})`);
       return;
     }
 
@@ -386,14 +600,12 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
     setExplorationLog([]);
 
     const captures: PageCapture[] = [];
-    const maxSteps = 10; // Safety limit
+    const maxSteps = 10;
 
     try {
-      // Initial capture
       onLog?.("info", "Starting AI-driven exploration...");
       let stepNum = 0;
 
-      // Capture initial page
       stepNum++;
       setExplorationLog((prev) => [
         ...prev,
@@ -416,12 +628,10 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
       );
       onLog?.("success", `Captured initial page: ${initialCapture.elements.length} elements`);
 
-      // AI exploration loop
       let done = false;
       while (!done && stepNum < maxSteps) {
         stepNum++;
 
-        // Get current page elements for AI decision
         const currentCapture = await captureCurrentPage();
         if (!currentCapture) {
           throw new Error("Failed to capture current page for AI decision");
@@ -432,7 +642,6 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
           { step: stepNum, action: "ai_decision", description: "AI analyzing page...", status: "running" },
         ]);
 
-        // Call AI to decide next action
         const aiResult = await invoke<{
           success: boolean;
           message?: string;
@@ -461,9 +670,7 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
         }
 
         const aiAction = aiResult.data;
-        console.log("[FlowExplore] AI decision:", aiAction);
 
-        // Update log with AI decision
         setExplorationLog((prev) =>
           prev.map((l) =>
             l.step === stepNum
@@ -478,7 +685,6 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
           break;
         }
 
-        // Execute the AI's chosen action
         stepNum++;
         const actionDesc =
           aiAction.action === "click"
@@ -496,14 +702,10 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
           if (aiAction.action === "click" && aiAction.element_id) {
             await executeClick(aiAction.element_id);
             onLog?.("success", `Clicked: ${aiAction.element_description || aiAction.element_id}`);
-
-            // Wait a bit for page to update
             await executeWait(1500);
-
           } else if (aiAction.action === "type" && aiAction.element_id && aiAction.text) {
             await executeType(aiAction.element_id, aiAction.text);
             onLog?.("success", `Typed: "${aiAction.text}"`);
-
           } else if (aiAction.action === "wait") {
             await executeWait(aiAction.wait_ms || 2000);
             onLog?.("success", `Waited ${aiAction.wait_ms || 2000}ms`);
@@ -513,7 +715,6 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
             prev.map((l) => (l.step === stepNum ? { ...l, status: "completed" } : l))
           );
 
-          // Capture after action if AI requested it
           if (aiAction.should_capture_after) {
             stepNum++;
             setExplorationLog((prev) => [
@@ -521,25 +722,40 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
               { step: stepNum, action: "capture", description: "Capturing page after action", status: "running" },
             ]);
 
-            // Wait a bit more for content to load
             await executeWait(1000);
 
             const newCapture = await captureCurrentPage();
             if (newCapture && newCapture.elements.length > 0) {
-              newCapture.stepIndex = captures.length;
-              captures.push(newCapture);
+              const isDuplicate = captures.some((c) => {
+                if (c.url !== newCapture.url) return false;
+                const countDiff = Math.abs(c.elements.length - newCapture.elements.length);
+                const threshold = Math.max(c.elements.length, newCapture.elements.length) * 0.1;
+                return countDiff <= threshold;
+              });
 
-              setExplorationLog((prev) =>
-                prev.map((l) =>
-                  l.step === stepNum
-                    ? { ...l, status: "completed", description: `Captured ${newCapture.elements.length} elements from ${newCapture.title}` }
-                    : l
-                )
-              );
-              onLog?.("success", `Captured page: ${newCapture.elements.length} elements from ${newCapture.title}`);
+              if (isDuplicate) {
+                setExplorationLog((prev) =>
+                  prev.map((l) =>
+                    l.step === stepNum
+                      ? { ...l, status: "completed", description: "Skipped duplicate capture" }
+                      : l
+                  )
+                );
+              } else {
+                newCapture.stepIndex = captures.length;
+                captures.push(newCapture);
+
+                setExplorationLog((prev) =>
+                  prev.map((l) =>
+                    l.step === stepNum
+                      ? { ...l, status: "completed", description: `Captured ${newCapture.elements.length} elements from ${newCapture.title}` }
+                      : l
+                  )
+                );
+                onLog?.("success", `Captured page: ${newCapture.elements.length} elements from ${newCapture.title}`);
+              }
             }
           }
-
         } catch (actionError) {
           const errorMsg = actionError instanceof Error ? actionError.message : String(actionError);
           setExplorationLog((prev) =>
@@ -549,7 +765,6 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
         }
       }
 
-      // Build multi-page context from captures
       if (captures.length > 0) {
         const totalElements = captures.reduce((sum, c) => sum + c.elements.length, 0);
         setMultiPageContext({
@@ -558,13 +773,26 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
         });
         onLog?.("success", `Exploration complete: ${captures.length} page(s), ${totalElements} elements`);
       }
-
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       setFlowError(errorMsg);
+      setExplorationLog((prev) =>
+        prev.map((l) =>
+          l.status === "running"
+            ? { ...l, status: "error", error: errorMsg }
+            : l
+        )
+      );
       onLog?.("error", `Exploration failed: ${errorMsg}`);
     } finally {
       setIsExploring(false);
+      setExplorationLog((prev) =>
+        prev.map((l) =>
+          l.status === "running"
+            ? { ...l, status: "completed" }
+            : l
+        )
+      );
     }
   }, [
     flowPrompt,
@@ -588,12 +816,15 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
     setGeneratedContent(null);
 
     try {
-      // Build the user prompt (page context is passed separately for proper formatting)
-      const fullPrompt = `${instructions}
+      const fullPrompt = `## Test Automation Instructions
+${instructions}
 
-${expectedResults ? `Expected Results:\n${expectedResults}` : ""}`;
+## Expected Results (Assertions)
+${expectedResults}
 
-      // Build page context - use multi-page context if available, otherwise single page
+## Agentic Step Instructions (Code Changes to Fix Issues)
+${agenticInstructions || "Fix any issues identified by the test failures."}`;
+
       let pageContextForAI: {
         url?: string;
         title?: string;
@@ -622,8 +853,6 @@ ${expectedResults ? `Expected Results:\n${expectedResults}` : ""}`;
       } | null = null;
 
       if (multiPageContext && multiPageContext.pages.length > 0) {
-        // Multi-page context from flow capture
-        console.log("[LivePageGenerator] Using multi-page context:", multiPageContext.pages.length, "pages");
         pageContextForAI = {
           pages: multiPageContext.pages.map((p) => ({
             url: p.url,
@@ -632,8 +861,6 @@ ${expectedResults ? `Expected Results:\n${expectedResults}` : ""}`;
           })),
         };
       } else if (uiBridgeContext) {
-        // Single page context
-        console.log("[LivePageGenerator] Using single page context");
         pageContextForAI = {
           url: uiBridgeContext.url,
           title: uiBridgeContext.title,
@@ -641,9 +868,6 @@ ${expectedResults ? `Expected Results:\n${expectedResults}` : ""}`;
         };
       }
 
-      // Call the AI generation endpoint
-      console.log("[LivePageGenerator] Calling generate_test_and_agentic_step...");
-      console.log("[LivePageGenerator] Context IDs:", contextSelection.selectedIds);
       const result = await invoke<{
         success: boolean;
         message?: string;
@@ -661,8 +885,6 @@ ${expectedResults ? `Expected Results:\n${expectedResults}` : ""}`;
         },
       });
 
-      console.log("[LivePageGenerator] Result:", JSON.stringify(result, null, 2));
-
       if (result.success && result.data) {
         const content = {
           verificationTest: result.data.verification_test || "",
@@ -670,12 +892,11 @@ ${expectedResults ? `Expected Results:\n${expectedResults}` : ""}`;
           testName: result.data.test_name || "generated_test",
           agenticName: result.data.agentic_name || "Generated Task",
         };
-        console.log("[LivePageGenerator] Setting generated content:", content);
         setGeneratedContent(content);
+        setRightPanelTab("output");
         onLog?.("success", "Successfully generated test and agentic step");
       } else {
         const errMsg = result.message || "Generation failed - no data returned";
-        console.error("[LivePageGenerator] Generation failed:", errMsg, result);
         throw new Error(errMsg);
       }
     } catch (error) {
@@ -685,7 +906,7 @@ ${expectedResults ? `Expected Results:\n${expectedResults}` : ""}`;
     } finally {
       setIsGenerating(false);
     }
-  }, [instructions, expectedResults, uiBridgeContext, multiPageContext, contextSelection.selectedIds, onLog]);
+  }, [instructions, expectedResults, agenticInstructions, uiBridgeContext, multiPageContext, contextSelection.selectedIds, onLog]);
 
   // Save verification test to library
   const handleSaveTest = useCallback(async () => {
@@ -699,9 +920,11 @@ ${expectedResults ? `Expected Results:\n${expectedResults}` : ""}`;
         body: JSON.stringify({
           name: generatedContent.testName,
           description: instructions.slice(0, 200),
-          content: generatedContent.verificationTest,
+          test_type: "python_script",
+          python_code: generatedContent.verificationTest,
           category: "ai-generated",
-          tags: ["ai-generated", "verification"],
+          ai_generated: true,
+          ai_generation_prompt: instructions,
         }),
       });
 
@@ -764,509 +987,705 @@ ${expectedResults ? `Expected Results:\n${expectedResults}` : ""}`;
     [onLog]
   );
 
+  // Build tree from multi-page context
+  const buildPageTree = useCallback((): TreeNode[] => {
+    if (!multiPageContext) return [];
+    return multiPageContext.pages.map((page, idx) => ({
+      id: `page-${idx}`,
+      name: `Page ${idx + 1}: ${page.title.slice(0, 30)}${page.title.length > 30 ? "..." : ""}`,
+      type: "page" as const,
+      elementCount: page.elements.length,
+      children: page.elements.slice(0, 10).map((el, elIdx) => ({
+        id: `page-${idx}-el-${elIdx}`,
+        name: el.text?.slice(0, 30) || el.label?.slice(0, 30) || el.id,
+        type: "element" as const,
+        icon: (el.tagName.toLowerCase() === "input" ? "input" :
+               el.tagName.toLowerCase() === "button" ? "button" :
+               el.tagName.toLowerCase() === "img" ? "image" : "text") as "input" | "button" | "image" | "text",
+      })),
+    }));
+  }, [multiPageContext]);
+
+  const toggleNode = useCallback((nodeId: string) => {
+    setExpandedNodes((prev) => {
+      const next = new Set(prev);
+      if (next.has(nodeId)) {
+        next.delete(nodeId);
+      } else {
+        next.add(nodeId);
+      }
+      return next;
+    });
+  }, []);
+
+  // =============================================================================
+  // Render
+  // =============================================================================
+
   return (
-    <div className="h-full flex flex-col bg-neutral-900">
-      {/* Header */}
-      <div className="flex-shrink-0 px-6 py-4 border-b border-neutral-700">
-        <div className="flex items-center gap-3">
-          <div className="p-2 rounded-lg bg-gradient-to-br from-cyan-500/20 to-blue-500/20">
-            <Globe className="w-6 h-6 text-cyan-400" />
-          </div>
-          <div>
-            <h1 className="text-xl font-semibold">Live Page Generator</h1>
-            <p className="text-sm text-neutral-400">
-              Connect to live pages via UI Bridge to generate tests and tasks
-            </p>
-          </div>
-        </div>
-      </div>
-
-      <div className="flex-1 flex overflow-hidden">
-        {/* Left Panel - Target Selection & Instructions */}
-        <div className="w-[400px] flex-shrink-0 border-r border-neutral-700 flex flex-col">
-          {/* Target Selection */}
-          <div className="p-4 border-b border-neutral-700">
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="font-medium flex items-center gap-2">
-                <Monitor className="w-4 h-4" />
-                Target Selection
-              </h2>
-              <button
-                onClick={refreshTargets}
-                disabled={isLoadingTargets}
-                className="p-1.5 rounded hover:bg-neutral-800 transition-colors"
-                title="Refresh targets"
-              >
-                <RefreshCw className={`w-4 h-4 ${isLoadingTargets ? "animate-spin" : ""}`} />
-              </button>
-            </div>
-
-            {/* Extension Status */}
-            <div
-              className={`flex items-center gap-2 text-xs mb-3 px-2 py-1.5 rounded ${
-                isExtensionConnected
-                  ? "bg-green-500/10 text-green-400"
-                  : "bg-yellow-500/10 text-yellow-400"
-              }`}
+    <div className="flex h-full bg-surface-canvas">
+      {/* =========================================
+          Left Panel - Exploration
+          ========================================= */}
+      <div className="flex w-[480px] flex-col border-r border-border bg-surface-raised">
+        {/* Connections Section */}
+        <div className="border-b border-border">
+          <div className="flex items-center justify-between px-4 py-3">
+            <h2 className="text-sm font-semibold text-text-primary">Connections</h2>
+            <button
+              onClick={refreshTargets}
+              disabled={isLoadingTargets}
+              className="flex h-7 w-7 items-center justify-center rounded text-text-muted hover:text-text-primary hover:bg-surface-hover transition-colors"
             >
-              {isExtensionConnected ? (
-                <>
-                  <CheckCircle2 className="w-3 h-3" />
-                  Extension connected
-                </>
+              <RefreshCw className={cn("h-4 w-4", isLoadingTargets && "animate-spin")} />
+            </button>
+          </div>
+          <div className="px-2 pb-2">
+            <div className="mb-2 px-2 text-xs font-medium uppercase tracking-wider text-text-muted">
+              Targets
+            </div>
+            <div className="max-h-[180px] space-y-1 overflow-y-auto scrollbar-dark">
+              {targets.length > 0 ? (
+                targets.map((target) => (
+                  <TargetItem
+                    key={target.id}
+                    target={target}
+                    onClick={() => handleTargetClick(target)}
+                  />
+                ))
+              ) : isLoadingTargets ? (
+                <div className="flex items-center justify-center py-4 text-text-muted text-xs">
+                  <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                  Scanning...
+                </div>
               ) : (
-                <>
-                  <AlertCircle className="w-3 h-3" />
-                  Extension not connected
-                </>
+                <div className="text-center py-4 text-text-muted text-xs">
+                  <p>No targets found.</p>
+                  <p className="text-[10px] mt-1">Install Qontinui DevTools extension</p>
+                </div>
               )}
             </div>
-
-            {/* Browser Tabs */}
-            {browserTabs.length > 0 && (
-              <div className="mb-3">
-                <h3 className="text-xs font-medium text-neutral-400 uppercase mb-2 flex items-center gap-1.5">
-                  <Globe className="w-3 h-3" />
-                  Browser Tabs
-                </h3>
-                <div className="space-y-1 max-h-40 overflow-y-auto">
-                  {browserTabs.map((tab) => (
-                    <button
-                      key={tab.id}
-                      onClick={() => handleSelectTab(tab)}
-                      className={`w-full text-left p-2 rounded-lg text-sm transition-colors flex items-center gap-2 ${
-                        selectedTabId === tab.id
-                          ? "bg-purple-500/20 border border-purple-500/50"
-                          : "bg-neutral-800 hover:bg-neutral-700"
-                      }`}
-                    >
-                      {tab.favIconUrl && (
-                        <img src={tab.favIconUrl} className="w-4 h-4 rounded" alt="" />
-                      )}
-                      <span className="truncate flex-1">{tab.title || tab.url}</span>
-                      {selectedTabId === tab.id && (
-                        <CheckCircle2 className="w-4 h-4 text-purple-400 flex-shrink-0" />
-                      )}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* Mobile Devices */}
-            {mobileDevices.length > 0 && (
-              <div>
-                <h3 className="text-xs font-medium text-neutral-400 uppercase mb-2 flex items-center gap-1.5">
-                  <Smartphone className="w-3 h-3" />
-                  Mobile Devices
-                </h3>
-                <div className="space-y-1 max-h-40 overflow-y-auto">
-                  {mobileDevices.map((device) => (
-                    <button
-                      key={device.device_id}
-                      onClick={() => handleSelectDevice(device)}
-                      className={`w-full text-left p-2 rounded-lg text-sm transition-colors flex items-center gap-2 ${
-                        selectedDeviceId === device.device_id
-                          ? "bg-purple-500/20 border border-purple-500/50"
-                          : "bg-neutral-800 hover:bg-neutral-700"
-                      }`}
-                    >
-                      <Smartphone className="w-4 h-4" />
-                      <span className="truncate flex-1">
-                        {device.model || device.device_id}
-                      </span>
-                      <span className="text-xs text-neutral-500">
-                        {device.device_type === "emulator" ? "Emulator" : "Physical"}
-                      </span>
-                      {selectedDeviceId === device.device_id && (
-                        <CheckCircle2 className="w-4 h-4 text-purple-400 flex-shrink-0" />
-                      )}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* No targets message */}
-            {browserTabs.length === 0 && mobileDevices.length === 0 && !isLoadingTargets && (
-              <div className="text-center py-4 text-neutral-400 text-sm">
-                <p>No targets found.</p>
-                <p className="text-xs mt-1">
-                  Install the Qontinui DevTools extension or connect a mobile device.
-                </p>
-              </div>
-            )}
-
-            {/* Connected Target Info */}
-            {connectionStatus === "connected" && connectedTarget && (
-              <div className="mt-3 p-2 bg-green-500/10 rounded-lg border border-green-500/30">
-                <div className="flex items-center gap-2 text-sm text-green-400">
-                  <CheckCircle2 className="w-4 h-4" />
-                  <span className="font-medium">Connected</span>
-                </div>
-                <p className="text-xs text-neutral-400 mt-1 truncate">
-                  {connectedTarget.name}
-                </p>
-                <button
-                  onClick={captureContext}
-                  disabled={isCapturingContext}
-                  className="mt-2 w-full flex items-center justify-center gap-2 px-3 py-1.5 bg-green-500/20 hover:bg-green-500/30 text-green-400 rounded text-xs transition-colors"
-                >
-                  {isCapturingContext ? (
-                    <Loader2 className="w-3 h-3 animate-spin" />
-                  ) : (
-                    <RefreshCw className="w-3 h-3" />
-                  )}
-                  Refresh Context
-                </button>
-              </div>
-            )}
           </div>
+          <div className="border-t border-border px-4 py-2">
+            <div className="flex items-center gap-2">
+              <span className={cn(
+                "h-2 w-2 rounded-full",
+                isExtensionConnected ? "bg-brand-success animate-pulse" : "bg-text-muted"
+              )} />
+              <span className="text-xs text-text-muted">
+                {isExtensionConnected ? "Extension Connected" : "Extension Not Connected"}
+              </span>
+              <Plug className={cn(
+                "ml-auto h-3 w-3",
+                isExtensionConnected ? "text-brand-success" : "text-text-muted"
+              )} />
+            </div>
+          </div>
+        </div>
 
-          {/* Instructions Input */}
-          <div className="flex-1 p-4 overflow-y-auto">
-            <div className="space-y-4">
-              <div>
-                <label className="block text-sm font-medium mb-2">
-                  What should the test do?
-                </label>
-                <textarea
-                  value={instructions}
-                  onChange={(e) => setInstructions(e.target.value)}
-                  placeholder="Example: Click the 'Start Extraction' button and wait for results to appear. The extraction should complete with more than 3 states..."
-                  rows={6}
-                  className="w-full px-3 py-2 bg-neutral-800 border border-neutral-700 rounded-lg focus:outline-none focus:border-purple-500 resize-y text-sm"
-                />
+        {/* Main Tabs */}
+        <div className="flex gap-1 border-b border-border px-3 py-2">
+          <button
+            onClick={() => setLeftPanelTab("flow")}
+            className={cn(
+              "flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
+              leftPanelTab === "flow"
+                ? "bg-brand-primary/10 text-brand-primary"
+                : "text-text-muted hover:bg-surface-hover hover:text-text-primary"
+            )}
+          >
+            <Workflow className="h-3.5 w-3.5" />
+            Flow Explorer
+          </button>
+          <button
+            onClick={() => setLeftPanelTab("context")}
+            className={cn(
+              "flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
+              leftPanelTab === "context"
+                ? "bg-brand-primary/10 text-brand-primary"
+                : "text-text-muted hover:bg-surface-hover hover:text-text-primary"
+            )}
+          >
+            <Layers className="h-3.5 w-3.5" />
+            Captured Pages
+          </button>
+          <button
+            onClick={() => setLeftPanelTab("search")}
+            className={cn(
+              "flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
+              leftPanelTab === "search"
+                ? "bg-brand-primary/10 text-brand-primary"
+                : "text-text-muted hover:bg-surface-hover hover:text-text-primary"
+            )}
+          >
+            <Search className="h-3.5 w-3.5" />
+            Search
+          </button>
+          <button
+            onClick={() => setLeftPanelTab("describe")}
+            className={cn(
+              "flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
+              leftPanelTab === "describe"
+                ? "bg-brand-primary/10 text-brand-primary"
+                : "text-text-muted hover:bg-surface-hover hover:text-text-primary"
+            )}
+          >
+            <Bot className="h-3.5 w-3.5" />
+            Describe
+          </button>
+          <button
+            onClick={() => setLeftPanelTab("nl")}
+            className={cn(
+              "flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
+              leftPanelTab === "nl"
+                ? "bg-brand-primary/10 text-brand-primary"
+                : "text-text-muted hover:bg-surface-hover hover:text-text-primary"
+            )}
+          >
+            <MessageSquare className="h-3.5 w-3.5" />
+            NL
+          </button>
+        </div>
+
+        {/* Tab Content */}
+        <div className="flex-1 overflow-y-auto scrollbar-dark">
+          {leftPanelTab === "flow" && (
+            <div className="p-4">
+              <div className="mb-3 flex items-center gap-2">
+                <div className="flex h-6 w-6 items-center justify-center rounded bg-brand-primary/10">
+                  <Sparkles className="h-3.5 w-3.5 text-brand-primary" />
+                </div>
+                <span className="rounded-full bg-brand-primary/10 px-2 py-0.5 text-xs text-brand-primary">
+                  AI-Powered
+                </span>
+                {(explorationLog.length > 0 || multiPageContext) && (
+                  <button
+                    onClick={clearExploration}
+                    className="ml-auto text-[10px] text-text-muted hover:text-error"
+                  >
+                    Clear
+                  </button>
+                )}
               </div>
 
-              <div>
-                <label className="block text-sm font-medium mb-2">
-                  Expected Results (optional)
-                </label>
+              {/* Timeline */}
+              {explorationLog.length > 0 && (
+                <div className="relative mb-4 rounded-lg border border-border bg-surface-canvas/50 p-3">
+                  <div className="absolute left-6 top-4 bottom-4 w-px bg-border" />
+                  <div className="space-y-2">
+                    {explorationLog.map((step) => {
+                      const IconComponent = flowIconMap[step.action as keyof typeof flowIconMap] || Bot;
+                      return (
+                        <div key={step.step} className="relative flex items-start gap-3 pl-2">
+                          <div className={cn(
+                            "relative z-10 flex h-6 w-6 items-center justify-center rounded-full border bg-surface-raised",
+                            step.status === "running" ? "border-brand-primary" :
+                            step.status === "completed" ? "border-brand-success" :
+                            "border-error"
+                          )}>
+                            {step.status === "running" ? (
+                              <Loader2 className="h-3 w-3 animate-spin text-brand-primary" />
+                            ) : (
+                              <IconComponent className={cn(
+                                "h-3 w-3",
+                                step.status === "completed" ? "text-brand-primary" : "text-error"
+                              )} />
+                            )}
+                          </div>
+                          <div className="flex flex-1 items-center justify-between">
+                            <div>
+                              <span className="mr-1.5 text-xs font-medium text-text-muted">
+                                {step.step}.
+                              </span>
+                              <span className={cn(
+                                "text-xs",
+                                step.status === "error" ? "text-error" : "text-text-secondary"
+                              )}>
+                                {step.description}
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {flowError && (
+                <div className="mb-4 p-2 bg-error/10 border border-error/30 rounded-lg">
+                  <div className="flex items-center gap-2 text-xs text-error">
+                    <AlertCircle className="h-3.5 w-3.5" />
+                    <span>{flowError}</span>
+                  </div>
+                </div>
+              )}
+
+              {/* Command Bar */}
+              <div className="flex flex-col gap-2">
                 <textarea
-                  value={expectedResults}
-                  onChange={(e) => setExpectedResults(e.target.value)}
-                  placeholder="Example: The results table should show at least 3 rows. Each row should have a state name and status..."
-                  rows={4}
-                  className="w-full px-3 py-2 bg-neutral-800 border border-neutral-700 rounded-lg focus:outline-none focus:border-purple-500 resize-y text-sm"
+                  value={flowPrompt}
+                  onChange={(e) => setFlowPrompt(e.target.value)}
+                  placeholder="Describe navigation flow..."
+                  rows={5}
+                  disabled={isExploring}
+                  className="w-full resize-none rounded-lg border border-border bg-surface-canvas px-3 py-2 text-sm text-text-primary placeholder:text-text-muted focus:border-brand-primary/50 focus:outline-none disabled:opacity-50"
                 />
+                <button
+                  onClick={exploreFlow}
+                  disabled={isExploring || connectionStatus !== "connected" || !flowPrompt.trim()}
+                  className="w-full flex items-center justify-center gap-1.5 rounded-lg bg-gradient-to-r from-brand-primary to-brand-primary/80 py-3 text-sm font-medium text-white hover:from-brand-primary/90 hover:to-brand-primary/70 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+                >
+                  {isExploring ? (
+                    <>
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      Exploring...
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="h-4 w-4" />
+                      Explore
+                    </>
+                  )}
+                </button>
+                {connectionStatus !== "connected" && !isExploring && (
+                  <p className="text-[10px] text-warning text-center">Connect to a tab first</p>
+                )}
               </div>
 
               {/* AI Context Selection */}
-              <div className="p-3 bg-neutral-800/50 rounded-lg border border-neutral-700">
+              <div className="mt-4 p-3 bg-surface-canvas/50 rounded-lg border border-border">
                 <ContextSelector
                   selection={contextSelection}
                   onSelectionChange={setContextSelection}
                   taskPrompt={instructions}
-                  compact={false}
+                  compact={true}
                   disabled={isGenerating}
                 />
               </div>
+            </div>
+          )}
 
-              {/* AI-Driven Flow Exploration */}
-              <div className="p-3 bg-neutral-800/50 rounded-lg border border-neutral-700">
-                <div className="flex items-center justify-between mb-3">
-                  <h3 className="text-xs font-medium text-neutral-400 uppercase flex items-center gap-2">
-                    <Navigation className="w-3 h-3" />
-                    Multi-Page Flow (AI-Driven)
-                  </h3>
-                  {(explorationLog.length > 0 || multiPageContext) && (
-                    <button
-                      onClick={clearExploration}
-                      className="text-xs text-neutral-500 hover:text-red-400 transition-colors"
-                    >
-                      Clear
-                    </button>
-                  )}
+          {leftPanelTab === "context" && (
+            <div className="p-3">
+              {multiPageContext && multiPageContext.pages.length > 0 ? (
+                <div className="space-y-1">
+                  {buildPageTree().map((node) => (
+                    <TreeItem
+                      key={node.id}
+                      node={node}
+                      expanded={expandedNodes.has(node.id)}
+                      onToggle={() => toggleNode(node.id)}
+                      onSelect={() => {
+                        const pageIdx = parseInt(node.id.replace("page-", ""));
+                        setSelectedPageIndex(pageIdx);
+                      }}
+                      isSelected={selectedPageIndex === parseInt(node.id.replace("page-", ""))}
+                    />
+                  ))}
                 </div>
+              ) : (
+                <div className="text-center py-8 text-text-muted">
+                  <Layers className="h-8 w-8 mx-auto mb-2 opacity-30" />
+                  <p className="text-sm">No pages captured yet</p>
+                  <p className="text-xs mt-1">Use Flow Explorer to capture pages</p>
+                </div>
+              )}
+            </div>
+          )}
 
-                <p className="text-xs text-neutral-500 mb-3">
-                  Describe the navigation in natural language. AI will explore the pages and capture elements automatically.
-                </p>
+          {leftPanelTab === "search" && (
+            <div className="h-full p-3">
+              <SearchComparisonPanel
+                elements={externalElements}
+                onSelectElement={handleSelectElement}
+                onHighlightElement={highlightElement}
+                disabled={connectionStatus !== "connected"}
+              />
+            </div>
+          )}
 
-                {/* Flow Prompt Input */}
-                <textarea
-                  value={flowPrompt}
-                  onChange={(e) => setFlowPrompt(e.target.value)}
-                  placeholder="Example: Click the 'Start Extraction' button, wait for the Results tab to load, then capture that page too"
-                  rows={3}
-                  disabled={isExploring}
-                  className="w-full px-3 py-2 bg-neutral-800 border border-neutral-600 rounded-lg focus:outline-none focus:border-cyan-500 resize-none text-sm mb-3"
-                />
+          {leftPanelTab === "describe" && (
+            <div className="h-full p-3">
+              <ElementDescriptionPanel
+                elements={externalElements}
+                selectedElement={selectedElement}
+                pageContext={pageContext}
+                onSelectElement={handleSelectElement}
+                disabled={connectionStatus !== "connected"}
+              />
+            </div>
+          )}
 
-                {/* Explore Button */}
-                <button
-                  onClick={exploreFlow}
-                  disabled={isExploring || connectionStatus !== "connected" || !flowPrompt.trim()}
-                  className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-cyan-500/20 hover:bg-cyan-500/30 disabled:opacity-50 disabled:cursor-not-allowed text-cyan-400 rounded-lg text-sm transition-colors"
-                >
-                  {isExploring ? (
-                    <>
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                      AI Exploring...
-                    </>
-                  ) : (
-                    <>
-                      <Sparkles className="w-4 h-4" />
-                      Explore with AI
-                    </>
-                  )}
-                </button>
+          {leftPanelTab === "nl" && (
+            <div className="h-full p-3">
+              <NaturalLanguagePanel
+                elements={externalElements}
+                onSelectElement={handleSelectElement}
+                onHighlightElement={highlightElement}
+                onExecuteAction={handleExecuteActionWithResult}
+                disabled={connectionStatus !== "connected"}
+              />
+            </div>
+          )}
+        </div>
+      </div>
 
-                {/* Exploration Log */}
-                {explorationLog.length > 0 && (
-                  <div className="mt-3 space-y-1 max-h-40 overflow-y-auto">
-                    {explorationLog.map((log) => (
-                      <div
-                        key={log.step}
-                        className={`flex items-center gap-2 p-2 rounded text-xs ${
-                          log.status === "running"
-                            ? "bg-blue-500/20 border border-blue-500/50"
-                            : log.status === "completed"
-                            ? "bg-green-500/10"
-                            : "bg-red-500/10"
-                        }`}
-                      >
-                        <span className="text-neutral-500 w-4">{log.step}.</span>
-                        {log.action === "capture" && <Camera className="w-3 h-3 text-cyan-400" />}
-                        {log.action === "click" && <MousePointer className="w-3 h-3 text-purple-400" />}
-                        {log.action === "type" && <Type className="w-3 h-3 text-green-400" />}
-                        {log.action === "wait" && <Clock className="w-3 h-3 text-yellow-400" />}
-                        {log.action === "ai_decision" && <Bot className="w-3 h-3 text-blue-400" />}
-                        <span className="flex-1 truncate">{log.description}</span>
-                        {log.status === "running" && <Loader2 className="w-3 h-3 animate-spin text-blue-400" />}
-                        {log.status === "completed" && <CheckCircle2 className="w-3 h-3 text-green-400" />}
-                        {log.status === "error" && <AlertCircle className="w-3 h-3 text-red-400" />}
-                      </div>
-                    ))}
-                  </div>
-                )}
+      {/* =========================================
+          Right Panel - Test Definition & Output
+          ========================================= */}
+      <div className="flex flex-1 flex-col overflow-hidden bg-surface-canvas">
+        {/* Main Tabs */}
+        <div className="flex gap-1 border-b border-border px-3 py-2">
+          <button
+            onClick={() => setRightPanelTab("definition")}
+            className={cn(
+              "flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
+              rightPanelTab === "definition"
+                ? "bg-brand-secondary/10 text-brand-secondary"
+                : "text-text-muted hover:bg-surface-hover hover:text-text-primary"
+            )}
+          >
+            <FileText className="h-3.5 w-3.5" />
+            Test Definition
+          </button>
+          <button
+            onClick={() => setRightPanelTab("output")}
+            className={cn(
+              "flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
+              rightPanelTab === "output"
+                ? "bg-brand-success/10 text-brand-success"
+                : "text-text-muted hover:bg-surface-hover hover:text-text-primary"
+            )}
+          >
+            <Code className="h-3.5 w-3.5" />
+            Output
+          </button>
+        </div>
 
-                {/* Flow Error */}
-                {flowError && (
-                  <div className="mt-3 p-2 bg-red-500/10 border border-red-500/30 rounded text-xs text-red-400">
-                    <p className="font-medium mb-1">Exploration failed</p>
-                    <p>{flowError}</p>
-                    <p className="mt-2 text-neutral-400">
-                      Try refining your prompt to be more specific about which elements to interact with.
-                    </p>
-                  </div>
-                )}
+        {/* Tab Content */}
+        <div className="flex-1 overflow-y-auto scrollbar-dark">
+          {rightPanelTab === "definition" ? (
+            <div className="p-4">
+              <div className="mb-4 flex items-center gap-2">
+                <div className="flex h-6 w-6 items-center justify-center rounded bg-brand-secondary/10">
+                  <Play className="h-3.5 w-3.5 text-brand-secondary" />
+                </div>
+                <h2 className="text-sm font-semibold text-text-primary">Define Your Test</h2>
               </div>
 
-              {/* Page Context Preview */}
-              {multiPageContext && multiPageContext.pages.length > 0 ? (
-                <div className="p-3 bg-green-500/10 rounded-lg border border-green-500/30">
-                  <h3 className="text-xs font-medium text-green-400 uppercase mb-2 flex items-center gap-2">
-                    <CheckCircle2 className="w-3 h-3" />
-                    Multi-Page Context Captured
-                  </h3>
-                  <div className="space-y-2">
-                    {multiPageContext.pages.map((page, i) => (
-                      <div key={i} className="text-xs">
-                        <p className="text-neutral-300 font-medium truncate">
-                          {i + 1}. {page.title}
-                        </p>
-                        <p className="text-neutral-500 truncate">{page.url}</p>
-                        <p className="text-green-400">{page.elements.length} elements</p>
-                      </div>
-                    ))}
+              <div className="rounded-xl border border-border bg-surface-raised/50 overflow-hidden">
+                {/* Instructions */}
+                <div className="border-l-2 border-brand-primary p-4">
+                  <div className="mb-2 flex items-center gap-2">
+                    <Zap className="h-4 w-4 text-brand-primary" />
+                    <label className="text-xs font-medium uppercase tracking-wider text-text-muted">
+                      Instructions
+                    </label>
                   </div>
-                  <p className="text-xs text-green-400 mt-2 font-medium">
-                    Total: {multiPageContext.totalElements} elements from {multiPageContext.pages.length} page(s)
-                  </p>
+                  <textarea
+                    value={instructions}
+                    onChange={(e) => setInstructions(e.target.value)}
+                    placeholder="Describe the test steps..."
+                    rows={6}
+                    className="w-full min-h-[140px] resize-none rounded-lg border border-border bg-surface-raised px-3 py-2 text-sm text-text-primary placeholder:text-text-muted focus:border-brand-primary/50 focus:outline-none"
+                  />
                 </div>
-              ) : uiBridgeContext ? (
-                <div className="p-3 bg-neutral-800/50 rounded-lg border border-neutral-700">
-                  <h3 className="text-xs font-medium text-neutral-400 uppercase mb-2">
-                    Current Page Context
-                  </h3>
-                  <p className="text-sm truncate">{uiBridgeContext.title}</p>
-                  <p className="text-xs text-neutral-500 truncate">{uiBridgeContext.url}</p>
-                  <p className="text-xs text-neutral-500 mt-1">
-                    {uiBridgeContext.elements?.length || 0} elements detected
-                  </p>
-                  <p className="text-xs text-yellow-400 mt-2">
-                    Tip: Use Flow Capture above to collect elements from multiple pages.
-                  </p>
+
+                {/* Assertions */}
+                <div className="border-l-2 border-brand-success border-t border-t-ds-default p-4">
+                  <div className="mb-2 flex items-center gap-2">
+                    <Shield className="h-4 w-4 text-brand-success" />
+                    <label className="text-xs font-medium uppercase tracking-wider text-text-muted">
+                      Assertions
+                    </label>
+                  </div>
+                  <textarea
+                    value={expectedResults}
+                    onChange={(e) => setExpectedResults(e.target.value)}
+                    placeholder="Define expected results..."
+                    rows={6}
+                    className="w-full min-h-[140px] resize-none rounded-lg border border-border bg-surface-raised px-3 py-2 text-sm text-text-primary placeholder:text-text-muted focus:border-brand-success/50 focus:outline-none"
+                  />
                 </div>
-              ) : null}
+
+                {/* Fix Logic */}
+                <div className="border-l-2 border-brand-secondary border-t border-t-ds-default p-4">
+                  <div className="mb-2 flex items-center gap-2">
+                    <Wrench className="h-4 w-4 text-brand-secondary" />
+                    <label className="text-xs font-medium uppercase tracking-wider text-text-muted">
+                      Fix Logic
+                    </label>
+                  </div>
+                  <textarea
+                    value={agenticInstructions}
+                    onChange={(e) => setAgenticInstructions(e.target.value)}
+                    placeholder="Self-healing instructions for test failures..."
+                    rows={6}
+                    className="w-full min-h-[140px] resize-none rounded-lg border border-border bg-surface-raised px-3 py-2 text-sm text-text-primary placeholder:text-text-muted focus:border-brand-secondary/50 focus:outline-none"
+                  />
+                </div>
+              </div>
 
               {/* Generate Button */}
               <button
                 onClick={handleGenerate}
                 disabled={isGenerating || !instructions.trim()}
-                className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-gradient-to-r from-purple-500 to-blue-500 hover:from-purple-600 hover:to-blue-600 disabled:from-neutral-600 disabled:to-neutral-600 disabled:cursor-not-allowed text-white font-medium rounded-lg transition-all"
+                className="mt-4 w-full flex items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-brand-secondary to-brand-primary py-3 text-sm font-medium text-white hover:from-brand-secondary/90 hover:to-brand-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
               >
                 {isGenerating ? (
                   <>
-                    <Loader2 className="w-5 h-5 animate-spin" />
-                    Generating with AI...
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Generating...
                   </>
                 ) : (
                   <>
-                    <Bot className="w-5 h-5" />
-                    Generate Test & Agentic Step
+                    <Sparkles className="h-4 w-4" />
+                    Generate Assets
                   </>
                 )}
               </button>
-            </div>
-          </div>
-        </div>
 
-        {/* Right Panel - Generated Content */}
-        <div className="flex-1 flex flex-col overflow-hidden">
-          {generationError && (
-            <div className="m-4 p-4 bg-red-500/10 border border-red-500/30 rounded-lg">
-              <div className="flex items-start gap-3">
-                <AlertCircle className="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" />
-                <div>
-                  <h3 className="font-medium text-red-400">Generation Failed</h3>
-                  <p className="text-sm text-neutral-400 mt-1">{generationError}</p>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {!generatedContent && !isGenerating && !generationError && (
-            <div className="flex-1 flex items-center justify-center">
-              <div className="text-center text-neutral-400 max-w-md">
-                <Bot className="w-16 h-16 mx-auto mb-4 opacity-30" />
-                <h3 className="text-lg font-medium mb-2">Ready to Generate</h3>
-                <p className="text-sm">
-                  Select a target, describe what your test should do, and let AI generate
-                  the verification test and agentic step for you.
-                </p>
-              </div>
-            </div>
-          )}
-
-          {isGenerating && (
-            <div className="flex-1 flex items-center justify-center">
-              <div className="text-center">
-                <Loader2 className="w-12 h-12 mx-auto mb-4 animate-spin text-purple-400" />
-                <h3 className="text-lg font-medium mb-2">Generating...</h3>
-                <p className="text-sm text-neutral-400">
-                  AI is creating your test and agentic step
-                </p>
-              </div>
-            </div>
-          )}
-
-          {generatedContent && (
-            <div className="flex-1 overflow-y-auto p-4 space-y-4">
-              {/* Verification Test */}
-              <div className="bg-neutral-800/50 rounded-lg border border-neutral-700">
-                <div className="flex items-center justify-between px-4 py-3 border-b border-neutral-700">
-                  <div className="flex items-center gap-2">
-                    <FileText className="w-4 h-4 text-green-400" />
-                    <h3 className="font-medium">Verification Test</h3>
-                    <span className="text-xs text-neutral-500">
-                      {generatedContent.testName}
-                    </span>
+              {generationError && (
+                <div className="mt-4 p-3 bg-error/10 border border-error/30 rounded-lg">
+                  <div className="flex items-start gap-2">
+                    <AlertCircle className="h-4 w-4 text-error flex-shrink-0 mt-0.5" />
+                    <div>
+                      <p className="text-sm font-medium text-error">Generation Failed</p>
+                      <p className="text-xs text-text-muted mt-1">{generationError}</p>
+                    </div>
                   </div>
-                  <div className="flex items-center gap-2">
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="flex flex-col h-full">
+              {generatedContent ? (
+                <>
+                  {/* Sub-tabs */}
+                  <div className="flex gap-1 border-b border-border px-3 py-2">
                     <button
-                      onClick={() =>
-                        copyToClipboard(generatedContent.verificationTest, "Test code")
-                      }
-                      className="p-1.5 rounded hover:bg-neutral-700 transition-colors"
-                      title="Copy to clipboard"
-                    >
-                      <Copy className="w-4 h-4" />
-                    </button>
-                    <button
-                      onClick={handleSaveTest}
-                      disabled={isSavingTest || !!savedTestId}
-                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-sm transition-colors ${
-                        savedTestId
-                          ? "bg-green-500/20 text-green-400"
-                          : "bg-neutral-700 hover:bg-neutral-600"
-                      }`}
-                    >
-                      {isSavingTest ? (
-                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      ) : savedTestId ? (
-                        <CheckCircle2 className="w-3.5 h-3.5" />
-                      ) : (
-                        <Save className="w-3.5 h-3.5" />
+                      onClick={() => setOutputSubTab("python")}
+                      className={cn(
+                        "flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
+                        outputSubTab === "python"
+                          ? "bg-brand-success/10 text-brand-success"
+                          : "text-text-muted hover:bg-surface-hover hover:text-text-primary"
                       )}
-                      {savedTestId ? "Saved" : "Save to Library"}
-                    </button>
-                  </div>
-                </div>
-                <div className="p-4 max-h-96 overflow-auto bg-neutral-900">
-                  <pre className="text-sm font-mono text-green-300 whitespace-pre-wrap break-words">
-                    {generatedContent.verificationTest || "(No test code generated)"}
-                  </pre>
-                </div>
-              </div>
-
-              {/* Agentic Step */}
-              <div className="bg-neutral-800/50 rounded-lg border border-neutral-700">
-                <div className="flex items-center justify-between px-4 py-3 border-b border-neutral-700">
-                  <div className="flex items-center gap-2">
-                    <Bot className="w-4 h-4 text-purple-400" />
-                    <h3 className="font-medium">Agentic Step</h3>
-                    <span className="text-xs text-neutral-500">
-                      {generatedContent.agenticName}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <button
-                      onClick={() =>
-                        copyToClipboard(generatedContent.agenticStep, "Agentic prompt")
-                      }
-                      className="p-1.5 rounded hover:bg-neutral-700 transition-colors"
-                      title="Copy to clipboard"
                     >
-                      <Copy className="w-4 h-4" />
+                      <FileCode className="h-3.5 w-3.5" />
+                      Python Test
                     </button>
                     <button
-                      onClick={handleSaveTask}
-                      disabled={isSavingTask || !!savedTaskId}
-                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-sm transition-colors ${
-                        savedTaskId
-                          ? "bg-green-500/20 text-green-400"
-                          : "bg-neutral-700 hover:bg-neutral-600"
-                      }`}
-                    >
-                      {isSavingTask ? (
-                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      ) : savedTaskId ? (
-                        <CheckCircle2 className="w-3.5 h-3.5" />
-                      ) : (
-                        <Save className="w-3.5 h-3.5" />
+                      onClick={() => setOutputSubTab("agentic")}
+                      className={cn(
+                        "flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
+                        outputSubTab === "agentic"
+                          ? "bg-brand-secondary/10 text-brand-secondary"
+                          : "text-text-muted hover:bg-surface-hover hover:text-text-primary"
                       )}
-                      {savedTaskId ? "Saved" : "Save to Library"}
+                    >
+                      <FileCode className="h-3.5 w-3.5" />
+                      Agentic Step
                     </button>
                   </div>
-                </div>
-                <div className="p-4 max-h-96 overflow-auto bg-neutral-900">
-                  <pre className="text-sm whitespace-pre-wrap break-words text-purple-300">
-                    {generatedContent.agenticStep || "(No agentic step generated)"}
-                  </pre>
-                </div>
-              </div>
 
-              {/* Actions */}
-              {(savedTestId || savedTaskId) && (
-                <div className="flex items-center justify-end gap-3">
-                  {onNavigateToLibrary && (
+                  {/* Code Block */}
+                  <div className="flex-1 overflow-auto p-3">
+                    <pre className="h-full rounded-lg border border-border bg-surface-raised p-4 text-xs leading-relaxed overflow-auto">
+                      <code className={cn(
+                        "font-mono",
+                        outputSubTab === "python" ? "text-brand-success" : "text-brand-secondary"
+                      )}>
+                        {outputSubTab === "python"
+                          ? generatedContent.verificationTest || "(No test code generated)"
+                          : generatedContent.agenticStep || "(No agentic step generated)"}
+                      </code>
+                    </pre>
+                  </div>
+
+                  {/* Actions */}
+                  <div className="flex gap-2 border-t border-border p-3">
                     <button
-                      onClick={onNavigateToLibrary}
-                      className="flex items-center gap-2 px-4 py-2 bg-neutral-700 hover:bg-neutral-600 rounded-lg text-sm transition-colors"
+                      onClick={outputSubTab === "python" ? handleSaveTest : handleSaveTask}
+                      disabled={outputSubTab === "python" ? (isSavingTest || !!savedTestId) : (isSavingTask || !!savedTaskId)}
+                      className={cn(
+                        "flex-1 flex items-center justify-center gap-2 rounded-lg py-2 text-sm font-medium transition-colors",
+                        (outputSubTab === "python" ? savedTestId : savedTaskId)
+                          ? "bg-brand-success/20 text-brand-success"
+                          : "bg-surface-hover text-text-primary hover:bg-surface-active"
+                      )}
                     >
-                      <ExternalLink className="w-4 h-4" />
-                      View in Library
+                      {(outputSubTab === "python" ? isSavingTest : isSavingTask) ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (outputSubTab === "python" ? savedTestId : savedTaskId) ? (
+                        <CheckCircle2 className="h-4 w-4" />
+                      ) : (
+                        <Save className="h-4 w-4" />
+                      )}
+                      {(outputSubTab === "python" ? savedTestId : savedTaskId) ? "Saved" : "Save to Library"}
                     </button>
+                    <button
+                      onClick={() => copyToClipboard(
+                        outputSubTab === "python"
+                          ? generatedContent.verificationTest
+                          : generatedContent.agenticStep,
+                        outputSubTab === "python" ? "Test code" : "Agentic prompt"
+                      )}
+                      className="flex items-center justify-center gap-2 px-4 rounded-lg bg-surface-hover text-text-primary hover:bg-surface-active transition-colors"
+                    >
+                      <Copy className="h-4 w-4" />
+                      Copy
+                    </button>
+                  </div>
+
+                  {/* View in Library */}
+                  {(savedTestId || savedTaskId) && onNavigateToLibrary && (
+                    <div className="px-3 pb-3">
+                      <button
+                        onClick={onNavigateToLibrary}
+                        className="w-full flex items-center justify-center gap-2 rounded-lg border border-border py-2 text-sm text-text-muted hover:text-text-primary hover:bg-surface-hover transition-colors"
+                      >
+                        <ExternalLink className="h-4 w-4" />
+                        View in Library
+                      </button>
+                    </div>
                   )}
+                </>
+              ) : (
+                <div className="flex-1 flex items-center justify-center">
+                  <div className="text-center text-text-muted max-w-md">
+                    <Bot className="w-12 h-12 mx-auto mb-3 opacity-30" />
+                    <h3 className="text-base font-medium mb-1">No Output Yet</h3>
+                    <p className="text-sm">
+                      Fill in the test definition and click "Generate Assets" to create test code and agentic steps.
+                    </p>
+                  </div>
                 </div>
               )}
             </div>
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+// =============================================================================
+// Sub-Components
+// =============================================================================
+
+interface TargetItemProps {
+  target: Target;
+  onClick: () => void;
+}
+
+function TargetItem({ target, onClick }: TargetItemProps) {
+  return (
+    <button
+      onClick={onClick}
+      className="w-full flex items-center gap-3 rounded-md px-2 py-1.5 transition-colors hover:bg-surface-hover cursor-pointer text-left"
+    >
+      <div className="flex h-7 w-7 items-center justify-center rounded-md bg-surface-hover">
+        {target.type === "browser" ? (
+          <Globe className="h-3.5 w-3.5 text-brand-primary" />
+        ) : (
+          <Smartphone className="h-3.5 w-3.5 text-brand-secondary" />
+        )}
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="truncate text-sm text-text-primary">{target.name}</div>
+        <div className="flex items-center gap-1.5 text-xs text-text-muted">
+          {target.connected ? (
+            <>
+              <span className="h-1.5 w-1.5 rounded-full bg-brand-success" />
+              <span className="text-brand-success">Connected</span>
+            </>
+          ) : (
+            <>
+              <span className="h-1.5 w-1.5 rounded-full bg-text-muted" />
+              <span>Disconnected</span>
+            </>
+          )}
+        </div>
+      </div>
+    </button>
+  );
+}
+
+interface TreeItemProps {
+  node: TreeNode;
+  expanded: boolean;
+  onToggle: () => void;
+  onSelect: () => void;
+  isSelected: boolean;
+  depth?: number;
+}
+
+function TreeItem({ node, expanded, onToggle, onSelect, isSelected, depth = 0 }: TreeItemProps) {
+  const hasChildren = node.children && node.children.length > 0;
+
+  return (
+    <div>
+      <button
+        onClick={() => {
+          if (hasChildren) onToggle();
+          if (node.type === "page") onSelect();
+        }}
+        className={cn(
+          "w-full flex items-center gap-2 rounded-md px-2 py-1.5 transition-colors hover:bg-surface-hover text-left",
+          depth > 0 && "ml-4",
+          isSelected && node.type === "page" && "bg-brand-primary/10"
+        )}
+      >
+        {hasChildren ? (
+          expanded ? (
+            <ChevronDown className="h-3.5 w-3.5 text-text-muted" />
+          ) : (
+            <ChevronRight className="h-3.5 w-3.5 text-text-muted" />
+          )
+        ) : (
+          <span className="w-3.5" />
+        )}
+
+        {node.type === "page" ? (
+          <Layout className="h-3.5 w-3.5 text-brand-primary" />
+        ) : node.icon ? (
+          (() => {
+            const Icon = elementIconMap[node.icon];
+            return <Icon className="h-3.5 w-3.5 text-text-muted" />;
+          })()
+        ) : null}
+
+        <span
+          className={cn(
+            "text-sm flex-1 truncate",
+            node.type === "page" ? "text-text-primary font-medium" : "text-text-muted"
+          )}
+        >
+          {node.name}
+        </span>
+
+        {node.type === "page" && node.elementCount !== undefined && (
+          <span className="text-xs text-brand-success">{node.elementCount} el</span>
+        )}
+      </button>
+
+      {expanded && hasChildren && (
+        <div>
+          {node.children!.map((child) => (
+            <TreeItem
+              key={child.id}
+              node={child}
+              expanded={false}
+              onToggle={() => {}}
+              onSelect={() => {}}
+              isSelected={false}
+              depth={depth + 1}
+            />
+          ))}
+        </div>
+      )}
     </div>
   );
 }

@@ -61,6 +61,23 @@ type SettingsTab =
 
 const STORAGE_KEY = "qontinui-settings-active-tab";
 
+const VALID_TABS = [
+  "account",
+  "ai",
+  "agentic",
+  "self-healing",
+  "playwright",
+  "mobile",
+  "mcp",
+  "log-sources",
+  "execution-variables",
+  "general",
+  "storage",
+  "backup",
+  "advanced",
+  "updates",
+] as const;
+
 export function Settings({
   defaultTab,
   onLog,
@@ -71,26 +88,10 @@ export function Settings({
   onLoadProjects,
   webSocketState,
 }: SettingsProps) {
-  const validTabs = [
-    "account",
-    "ai",
-    "agentic",
-    "self-healing",
-    "playwright",
-    "mobile",
-    "mcp",
-    "log-sources",
-    "execution-variables",
-    "general",
-    "storage",
-    "backup",
-    "advanced",
-    "updates",
-  ];
 
   const [activeTab, setActiveTab] = useState<SettingsTab>(() => {
     // If defaultTab is provided and valid, use it
-    if (defaultTab && validTabs.includes(defaultTab)) {
+    if (defaultTab && (VALID_TABS as readonly string[]).includes(defaultTab)) {
       return defaultTab as SettingsTab;
     }
     // Otherwise load persisted tab on mount
@@ -99,7 +100,7 @@ export function Settings({
     if (stored === "connection") {
       return "account";
     }
-    if (stored && validTabs.includes(stored)) {
+    if (stored && (VALID_TABS as readonly string[]).includes(stored)) {
       return stored as SettingsTab;
     }
     return "account";
@@ -107,7 +108,7 @@ export function Settings({
 
   // Sync with defaultTab prop when it changes (from navigation)
   useEffect(() => {
-    if (defaultTab && validTabs.includes(defaultTab)) {
+    if (defaultTab && (VALID_TABS as readonly string[]).includes(defaultTab)) {
       setActiveTab(defaultTab as SettingsTab);
     }
   }, [defaultTab]);

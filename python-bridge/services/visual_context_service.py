@@ -320,6 +320,9 @@ class VisualContextService:
 
         Returns:
             Numpy array in BGR format
+
+        Raises:
+            ValueError: If image type is unsupported or decoding fails
         """
         if isinstance(image, np.ndarray):
             return image
@@ -327,7 +330,10 @@ class VisualContextService:
         # Handle bytes
         if isinstance(image, bytes):
             nparr = np.frombuffer(image, np.uint8)
-            return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            decoded = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if decoded is None:
+                raise ValueError("Failed to decode image from bytes")
+            return decoded
 
         # Handle base64 string
         if isinstance(image, str):
@@ -338,7 +344,10 @@ class VisualContextService:
             # Decode base64
             image_bytes = base64.b64decode(image)
             nparr = np.frombuffer(image_bytes, np.uint8)
-            return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            decoded = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if decoded is None:
+                raise ValueError("Failed to decode image from base64 string")
+            return decoded
 
         raise ValueError(f"Unsupported image type: {type(image)}")
 
