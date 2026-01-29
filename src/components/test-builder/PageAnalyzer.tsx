@@ -35,11 +35,10 @@ import type {
   CommandResponse,
   CollectedAnalysis,
   CollectedAnalysisSet,
-  ApiRequestAnalysis,
   AnalysisData,
   StepOutput,
 } from "./types";
-import { createAnalysisFromStepOutput, isStepOutputAnalysis } from "./types";
+import { createAnalysisFromStepOutput } from "./types";
 import type { SavedApiRequest } from "../../types";
 import { stepOutputRegistry } from "../../lib/step-output-handlers";
 
@@ -66,7 +65,7 @@ interface PageAnalyzerProps {
   initialAnalyses?: CollectedAnalysis[];
 }
 
-export function PageAnalyzer({ onAnalysisComplete, onError, initialAnalyses }: PageAnalyzerProps) {
+export function PageAnalyzer({ onAnalysisComplete, initialAnalyses }: PageAnalyzerProps) {
   // Collected analyses - initialize from prop if provided
   const [analyses, setAnalyses] = useState<CollectedAnalysis[]>(initialAnalyses ?? []);
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -102,6 +101,7 @@ export function PageAnalyzer({ onAnalysisComplete, onError, initialAnalyses }: P
     if (addMode === "playwright" && playwrightScripts.length === 0) {
       loadPlaywrightScripts();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [addMode, playwrightScripts.length]);
 
   // Load step outputs and API requests when step_output mode changes
@@ -113,6 +113,7 @@ export function PageAnalyzer({ onAnalysisComplete, onError, initialAnalyses }: P
         loadSavedRequests();
       }
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [addMode, stepOutputMode, savedRequests.length]);
 
   const loadPlaywrightScripts = async () => {

@@ -9,7 +9,6 @@ import React, { useMemo } from "react";
 import {
   ArrowRight,
   Check,
-  Circle,
   Play,
   Link2,
   Variable,
@@ -36,14 +35,13 @@ export function PlanVisualization({
       map.set(mapping.source_step, existing);
     }
     return map;
-  }, [plan.variable_mappings]);
+  }, [plan]);
 
   return (
     <div className="space-y-3">
       {plan.steps.map((step, idx) => {
         const isComplete = idx < currentStepIndex;
         const isCurrent = idx === currentStepIndex && isExecuting;
-        const isPending = idx > currentStepIndex || !isExecuting;
         const variables = variablesByStep.get(idx) || [];
 
         return (
@@ -165,7 +163,7 @@ export function PlanVisualization({
 /**
  * Extract HTTP method from URL (assumes saved request has method in some form)
  */
-function extractMethod(url: string): string {
+function extractMethod(_url: string): string {
   // This is a placeholder - the actual method comes from the saved request
   return "API";
 }
