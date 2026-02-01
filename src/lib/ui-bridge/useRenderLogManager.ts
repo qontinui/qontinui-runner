@@ -115,6 +115,7 @@ export function useRenderLogManager(
     includeHidden,
     maxEntries,
     onEntry,
+    taskRunId,
   ]);
 
   // Update task run ID when it changes

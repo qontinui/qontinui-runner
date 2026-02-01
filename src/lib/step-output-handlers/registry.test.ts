@@ -21,7 +21,8 @@ describe("StepOutputHandlerRegistry", () => {
     });
 
     it("should return undefined for unregistered type", () => {
-      const handler = stepOutputRegistry.get("nonexistent_type" as any);
+      // @ts-expect-error Testing with invalid type
+      const handler = stepOutputRegistry.get("nonexistent_type");
       expect(handler).toBeUndefined();
     });
 
@@ -39,7 +40,7 @@ describe("StepOutputHandlerRegistry", () => {
       ];
 
       for (const type of expectedTypes) {
-        const handler = stepOutputRegistry.get(type as any);
+        const handler = stepOutputRegistry.get(type as Parameters<typeof stepOutputRegistry.get>[0]);
         expect(handler).toBeDefined();
         expect(handler?.stepType).toBe(type);
       }
@@ -54,7 +55,8 @@ describe("StepOutputHandlerRegistry", () => {
     });
 
     it("should return false for unregistered types", () => {
-      expect(stepOutputRegistry.has("unknown" as any)).toBe(false);
+      // @ts-expect-error Testing with invalid type
+      expect(stepOutputRegistry.has("unknown")).toBe(false);
     });
   });
 
@@ -165,7 +167,8 @@ describe("summarizeOutputsForAI", () => {
     const outputs = [
       {
         id: "1",
-        step_type: "unknown_type" as any,
+        // @ts-expect-error Testing with invalid step type
+        step_type: "unknown_type",
         step_name: "Unknown Step",
         executed_at: new Date().toISOString(),
         duration_ms: 100,
