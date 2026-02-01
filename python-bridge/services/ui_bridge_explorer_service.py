@@ -6,6 +6,7 @@ to provide UI Bridge exploration through the runner with progress streaming.
 """
 
 import asyncio
+import hashlib
 import logging
 import threading
 import uuid
@@ -354,6 +355,16 @@ class UIBridgeExplorerService:
 
         result = job.result
 
+        def compute_snapshot_hash(snapshot: Any) -> str | None:
+            """Compute a short hash from snapshot element IDs for state comparison."""
+            if not snapshot:
+                return None
+            try:
+                element_ids = sorted(e.id for e in snapshot.elements)
+                return hashlib.md5("|".join(element_ids).encode()).hexdigest()[:8]
+            except Exception:
+                return None
+
         # Convert result to dict
         response_data: dict[str, Any] = {
             "exploration_id": result.exploration_id,
@@ -368,6 +379,25 @@ class UIBridgeExplorerService:
                     "success": s.action_result.success if s.action_result else None,
                     "state_changed": (s.action_result.state_changed if s.action_result else None),
                     "depth": s.depth,
+                    # Enhanced fields for transition discovery
+                    "parent_step_id": s.parent_step_id,
+                    "action_result": (
+                        {
+                            "response_time_ms": s.action_result.response_time_ms,
+                            "new_elements": s.action_result.new_elements,
+                            "removed_elements": s.action_result.removed_elements,
+                        }
+                        if s.action_result
+                        else None
+                    ),
+                    "snapshot_before_hash": compute_snapshot_hash(s.snapshot_before),
+                    "snapshot_after_hash": compute_snapshot_hash(s.snapshot_after),
+                    "elements_before": (
+                        [e.id for e in s.snapshot_before.elements] if s.snapshot_before else []
+                    ),
+                    "elements_after": (
+                        [e.id for e in s.snapshot_after.elements] if s.snapshot_after else []
+                    ),
                 }
                 for s in result.steps
             ],

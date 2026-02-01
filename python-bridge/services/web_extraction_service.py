@@ -40,14 +40,9 @@ try:
     from qontinui.state_management.builders import build_state_machine_from_extraction_result
 
     HAS_STATE_MACHINE_BUILDER = True
-    print(
-        "[STATE_MACHINE_DEBUG] Successfully imported build_state_machine_from_extraction_result",
-        flush=True,
-    )
     logger.info("State machine builder imported successfully")
 except ImportError as e:
     HAS_STATE_MACHINE_BUILDER = False
-    print(f"[STATE_MACHINE_DEBUG] Failed to import state machine builder: {e}", flush=True)
     logger.warning(
         f"State machine builder not available - extraction results will not be transformed: {e}"
     )
@@ -479,22 +474,42 @@ class WebExtractionService:
                 logger.info(
                     f"[PERF_DEBUG] [{self._current_extraction_id}] Starting _build_and_upload_state_machine()"
                 )
-                await self._build_and_upload_state_machine(serialized_elements)
+                clustered_states, clustered_transitions = (
+                    await self._build_and_upload_state_machine(serialized_elements)
+                )
                 duration_build = time.time() - start_build
                 logger.info(
                     f"[PERF_DEBUG] [{self._current_extraction_id}] _build_and_upload_state_machine() finished in {duration_build:.2f}s"
                 )
 
+                # Update state_structure to use co-occurrence-based states if available
+                # This replaces the raw per-page states with properly clustered states
+                if clustered_states:
+                    logger.info(
+                        f"[STATE_STRUCTURE] Updating state_structure with {len(clustered_states)} "
+                        f"co-occurrence clustered states (replacing {len(state_structure['states'])} raw states)"
+                    )
+                    state_structure["states"] = clustered_states
+                    state_structure["transitions"] = clustered_transitions
+
                 # Update backend session to completed with stats
                 pages_extracted = (
                     result.runtime_extraction.pages_visited if result.runtime_extraction else 1
+                )
+                # Use clustered state count if available, otherwise fall back to raw states
+                final_states_count = (
+                    len(clustered_states) if clustered_states else len(result.states)
                 )
                 await self._update_backend_session(
                     status="completed",
                     stats={
                         "pages_extracted": pages_extracted,
-                        "states_found": len(result.states),
-                        "transitions_found": len(result.transitions),
+                        "states_found": final_states_count,
+                        "transitions_found": (
+                            len(clustered_transitions)
+                            if clustered_transitions
+                            else len(result.transitions)
+                        ),
                         "elements_found": (
                             len(result.runtime_extraction.elements)
                             if result.runtime_extraction
@@ -505,7 +520,7 @@ class WebExtractionService:
                     },
                 )
 
-                # Emit completion event with state_structure
+                # Emit completion event with state_structure (now containing clustered states)
                 await self._emit_event(
                     "extraction_completed",  # Use extraction_completed to match frontend handler
                     {
@@ -516,8 +531,12 @@ class WebExtractionService:
                         "mode": result.mode.value,
                         "state_structure": state_structure,
                         "summary": {
-                            "states": len(result.states),
-                            "transitions": len(result.transitions),
+                            "states": final_states_count,
+                            "transitions": (
+                                len(clustered_transitions)
+                                if clustered_transitions
+                                else len(result.transitions)
+                            ),
                             "errors": len(result.errors),
                             "warnings": len(result.warnings),
                         },
@@ -525,14 +544,19 @@ class WebExtractionService:
                 )
 
                 logger.info(
-                    f"Extraction complete: {len(result.states)} states, "
-                    f"{len(result.transitions)} transitions"
+                    f"Extraction complete: {final_states_count} clustered states "
+                    f"(from {len(result.states)} raw states), "
+                    f"{len(clustered_transitions) if clustered_transitions else len(result.transitions)} transitions"
                 )
 
                 # Notify Rust that extraction is complete
                 await self._notify_rust_extraction_complete(
-                    states_found=len(result.states),
-                    transitions_found=len(result.transitions),
+                    states_found=final_states_count,
+                    transitions_found=(
+                        len(clustered_transitions)
+                        if clustered_transitions
+                        else len(result.transitions)
+                    ),
                     pages_extracted=(
                         result.runtime_extraction.pages_visited if result.runtime_extraction else 0
                     ),
@@ -1583,14 +1607,13 @@ class WebExtractionService:
             return vision_data
 
         except Exception as e:
-            print(f"[VISION_DEBUG] Vision extraction EXCEPTION: {e}", flush=True)
             logger.warning(f"Vision extraction failed: {e}", exc_info=True)
             return None
 
     async def _build_and_upload_state_machine(
         self,
         serialized_elements: list[dict[str, Any]],
-    ) -> None:
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """
         Build the state machine from extraction results and upload to backend.
 
@@ -1606,10 +1629,13 @@ class WebExtractionService:
 
         Args:
             serialized_elements: List of serialized element dicts (unused, kept for API compat)
+
+        Returns:
+            Tuple of (states_config, transitions_config) - the co-occurrence-based state machine
         """
         if not self._backend_session_id or not self._backend_url:
             logger.debug("No backend session configured, skipping state machine upload")
-            return
+            return [], []
 
         import httpx
 
@@ -1617,28 +1643,20 @@ class WebExtractionService:
             extraction_id = self._current_extraction_id
             if not extraction_id or extraction_id not in self._extraction_results:
                 logger.warning("No extraction results available for state machine building")
-                return
+                return [], []
 
             result = self._extraction_results[extraction_id].get("result")
             if not result:
                 logger.warning("No extraction result available")
-                return
+                return [], []
 
             # Get the screenshots directory
             actual_extraction_id = result.extraction_id
             screenshots_dir = self.extractions_dir / actual_extraction_id / "screenshots"
 
-            print("[STATE_MACHINE_DEBUG] Building state machine with image matching", flush=True)
-            print(f"[STATE_MACHINE_DEBUG] Screenshots dir: {screenshots_dir}", flush=True)
-            print(
-                f"[STATE_MACHINE_DEBUG] Screenshots dir exists: {screenshots_dir.exists()}",
-                flush=True,
-            )
-            print(
-                f"[STATE_MACHINE_DEBUG] HAS_STATE_MACHINE_BUILDER: {HAS_STATE_MACHINE_BUILDER}",
-                flush=True,
-            )
             logger.info(f"Building state machine with image matching from {screenshots_dir}")
+            logger.debug(f"Screenshots dir exists: {screenshots_dir.exists()}")
+            logger.debug(f"HAS_STATE_MACHINE_BUILDER: {HAS_STATE_MACHINE_BUILDER}")
 
             # Use the new image-matching state machine builder from qontinui library
             if HAS_STATE_MACHINE_BUILDER:
@@ -1743,8 +1761,12 @@ class WebExtractionService:
                         f"Failed to upload state machine: {response.status_code} - {response.text}"
                     )
 
+            # Return the built state machine for use in the state_structure event
+            return states_config, transitions_config
+
         except Exception as e:
             logger.warning(f"Failed to build/upload state machine: {e}", exc_info=True)
+            return [], []
 
     async def _update_backend_session(
         self,
@@ -1883,10 +1905,6 @@ class WebExtractionService:
             transitions: List of serialized transition dicts
             elements: List of serialized element dicts (ExtractedElement format)
         """
-        print(
-            f"[ANNOTATION_DEBUG] _save_annotations_to_backend called with {len(states)} states, {len(transitions)} transitions",
-            flush=True,
-        )
         logger.info(
             f"[ANNOTATION_DEBUG] _save_annotations_to_backend called with {len(states)} states, {len(transitions)} transitions"
         )
@@ -1970,30 +1988,23 @@ class WebExtractionService:
 
                     # Build screenshot path for OCR and vision extraction
                     screenshot_path = None
-                    print(
-                        f"[VISION_DEBUG] extraction_id={extraction_id}, screenshot_id={screenshot_id}",
-                        flush=True,
-                    )
-                    logger.info(
+                    logger.debug(
                         f"[VISION_DEBUG] extraction_id={extraction_id}, screenshot_id={screenshot_id}"
                     )
                     if extraction_id:
-                        print("[VISION_DEBUG] Building screenshot path...", flush=True)
                         screenshot_path = (
                             self.extractions_dir
                             / extraction_id
                             / "screenshots"
                             / f"{screenshot_id}.png"
                         )
-                        print(f"[VISION_DEBUG] screenshot_path={screenshot_path}", flush=True)
                         try:
                             exists = screenshot_path.exists()
-                            print(f"[VISION_DEBUG] screenshot exists={exists}", flush=True)
+                            logger.debug(
+                                f"[VISION_DEBUG] screenshot_path={screenshot_path}, exists={exists}"
+                            )
                         except Exception as e:
-                            print(f"[VISION_DEBUG] exists() check failed: {e}", flush=True)
-                        logger.info(
-                            f"[VISION_DEBUG] screenshot_path={screenshot_path}, exists={screenshot_path.exists() if screenshot_path else 'N/A'}"
-                        )
+                            logger.debug(f"[VISION_DEBUG] exists() check failed: {e}")
 
                     # Apply OCR to elements if we can find the screenshot
                     if screenshot_elements and screenshot_path:
@@ -2003,20 +2014,18 @@ class WebExtractionService:
 
                     # Run vision extraction on the screenshot
                     vision_results = None
-                    print(
-                        f"[VISION_DEBUG] HAS_VISION_EXTRACTION={HAS_VISION_EXTRACTION}, screenshot_path set={screenshot_path is not None}",
-                        flush=True,
+                    logger.debug(
+                        f"[VISION_DEBUG] HAS_VISION_EXTRACTION={HAS_VISION_EXTRACTION}, screenshot_path set={screenshot_path is not None}"
                     )
                     if screenshot_path:
-                        print("[VISION_DEBUG] Calling _run_vision_extraction...", flush=True)
+                        logger.debug("[VISION_DEBUG] Calling _run_vision_extraction...")
                         vision_results = await self._run_vision_extraction(
                             screenshot_path=screenshot_path,
                             screenshot_id=screenshot_id,
                             source_url=source_url,
                         )
-                        print(
-                            f"[VISION_DEBUG] Vision results: {vision_results is not None}, techniques={vision_results.get('techniques_run') if vision_results else None}",
-                            flush=True,
+                        logger.debug(
+                            f"[VISION_DEBUG] Vision results: {vision_results is not None}, techniques={vision_results.get('techniques_run') if vision_results else None}"
                         )
 
                     annotation_data = {
