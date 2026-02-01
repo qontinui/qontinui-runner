@@ -5,7 +5,7 @@
  * Allows creating, editing, and running deterministic workflows.
  */
 
-import { useState, useCallback, useMemo, useEffect } from "react";
+import { useState, useCallback, useEffect } from "react";
 import {
   ReactFlow,
   MiniMap,
@@ -16,9 +16,6 @@ import {
   addEdge,
   type Node,
   type Edge,
-  type Connection,
-  type OnNodesChange,
-  type OnEdgesChange,
   type OnConnect,
   BackgroundVariant,
 } from "@xyflow/react";
@@ -27,20 +24,30 @@ import {
   GitBranch,
   Save,
   Play,
-  RefreshCw,
   AlertTriangle,
   CheckCircle,
   Plus,
-  Trash2,
   FlaskConical,
   FolderOpen,
   X,
+  Undo2,
+  Redo2,
+  Cloud,
+  CloudOff,
+  Loader2,
+  Download,
+  Upload,
+  CheckCircle2,
+  XCircle,
 } from "lucide-react";
-import { useFlowList, useFlow, flowActions } from "./useFlowDesigner";
+import { save, open } from "@tauri-apps/plugin-dialog";
+import { writeTextFile, readTextFile } from "@tauri-apps/plugin-fs";
+import { useFlowList, flowActions, useUndoRedo, useUndoRedoKeyboard, useAutosave } from "./useFlowDesigner";
 import { FlowStepNode } from "./FlowStepNode";
 import { FlowSidebar } from "./FlowSidebar";
-import type { Flow, FlowStep, StepType, FlowState, Condition } from "../../types/flow";
-import { STEP_TYPE_COLORS, createExpressionCondition, getStepTypeName } from "../../types/flow";
+import { FlowExecutionProvider, useFlowExecution } from "./FlowExecutionContext";
+import type { Flow, FlowStep, StepType } from "../../types/flow";
+import { STEP_TYPE_COLORS, getStepTypeName } from "../../types/flow";
 
 // Custom node types - use 'as const' to fix typing issues with React Flow
 const nodeTypes = {
@@ -225,15 +232,119 @@ function createEmptyFlow(): Flow {
   };
 }
 
-export function FlowDesigner() {
-  const { flows, isLoading: flowsLoading, refetch: refetchFlows } = useFlowList();
-  const [currentFlowId, setCurrentFlowId] = useState<string | null>(null);
-  const [flow, setFlow] = useState<Flow>(createEmptyFlow);
+/**
+ * Execution Status Indicator Component
+ * Shows current flow execution status in the toolbar
+ */
+function ExecutionStatusIndicator() {
+  const { isExecuting, flowSuccess, flowError, stepStatuses, reset } = useFlowExecution();
+
+  // Count completed and failed steps
+  const completedCount = Array.from(stepStatuses.values()).filter(s => s.status === "completed").length;
+  const failedCount = Array.from(stepStatuses.values()).filter(s => s.status === "failed").length;
+  const totalProcessed = completedCount + failedCount;
+
+  if (!isExecuting && flowSuccess === null && totalProcessed === 0) {
+    return null; // No execution in progress or completed
+  }
+
+  return (
+    <div className="flex items-center gap-2 px-3 py-1 bg-gray-800 rounded-lg">
+      {isExecuting ? (
+        <>
+          <Loader2 className="w-4 h-4 text-emerald-400 animate-spin" />
+          <span className="text-sm text-emerald-400">
+            Running... ({completedCount} steps)
+          </span>
+        </>
+      ) : flowSuccess === true ? (
+        <>
+          <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+          <span className="text-sm text-emerald-400">
+            Complete ({completedCount} steps)
+          </span>
+          <button
+            onClick={reset}
+            className="ml-2 text-xs text-gray-400 hover:text-white"
+            title="Clear execution status"
+          >
+            <X className="w-3 h-3" />
+          </button>
+        </>
+      ) : flowSuccess === false ? (
+        <>
+          <XCircle className="w-4 h-4 text-red-400" />
+          <span className="text-sm text-red-400">
+            Failed {flowError ? `: ${flowError.slice(0, 30)}...` : ""}
+          </span>
+          <button
+            onClick={reset}
+            className="ml-2 text-xs text-gray-400 hover:text-white"
+            title="Clear execution status"
+          >
+            <X className="w-3 h-3" />
+          </button>
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+function FlowDesignerInner() {
+  const { flows, isLoading: _flowsLoading, refetch: refetchFlows } = useFlowList();
+  const [_currentFlowId, setCurrentFlowId] = useState<string | null>(null);
+
+  // Use undo/redo hook for flow state
+  const {
+    value: flow,
+    setValue: setFlow,
+    undo,
+    redo,
+    canUndo,
+    canRedo,
+    reset: resetFlow,
+    undoCount,
+    redoCount,
+  } = useUndoRedo<Flow>(createEmptyFlow());
+
+  // Set up keyboard shortcuts for undo/redo
+  useUndoRedoKeyboard(undo, redo, canUndo, canRedo);
+
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
   const [validationErrors, setValidationErrors] = useState<string[]>([]);
   const [isSaving, setIsSaving] = useState(false);
   const [showFlowList, setShowFlowList] = useState(false);
   const [actionInProgress, setActionInProgress] = useState(false);
+  const [autosaveEnabled, setAutosaveEnabled] = useState(true);
+
+  // Autosave functionality
+  const {
+    isPending: autosavePending,
+    isSaving: autosaveInProgress,
+    lastSaved,
+    hasUnsavedChanges,
+    markSaved,
+  } = useAutosave(
+    flow,
+    async (flowToSave) => {
+      // Only autosave if flow has been saved before (has a valid ID and steps)
+      if (flowToSave.id && Object.keys(flowToSave.steps).length > 0) {
+        const errors = await flowActions.validateFlow(flowToSave);
+        // Only autosave valid flows
+        if (errors.length === 0) {
+          await flowActions.saveFlow(flowToSave);
+          await refetchFlows();
+        }
+      }
+    },
+    {
+      enabled: autosaveEnabled && _currentFlowId !== null,
+      delayMs: 5000,
+      onSaveStart: () => console.log("Autosaving..."),
+      onSaveSuccess: () => console.log("Autosaved successfully"),
+      onSaveError: (err) => console.error("Autosave failed:", err),
+    }
+  );
 
   // React Flow state
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
@@ -298,7 +409,7 @@ export function FlowDesigner() {
 
       setEdges((eds) => addEdge(params, eds));
     },
-    [setEdges],
+    [setEdges, setFlow],
   );
 
   const handleNodeClick = useCallback((event: React.MouseEvent, node: Node) => {
@@ -323,14 +434,14 @@ export function FlowDesigner() {
     });
 
     setSelectedStepId(id);
-  }, []);
+  }, [setFlow]);
 
   const handleUpdateStep = useCallback((updatedStep: FlowStep) => {
     setFlow((f) => ({
       ...f,
       steps: { ...f.steps, [updatedStep.id]: updatedStep },
     }));
-  }, []);
+  }, [setFlow]);
 
   const handleDeleteStep = useCallback((stepId: string) => {
     setFlow((f) => {
@@ -342,7 +453,7 @@ export function FlowDesigner() {
       };
     });
     setSelectedStepId(null);
-  }, []);
+  }, [setFlow]);
 
   const handleSave = async () => {
     setIsSaving(true);
@@ -353,6 +464,7 @@ export function FlowDesigner() {
       if (errors.length === 0) {
         await flowActions.saveFlow(flow);
         setCurrentFlowId(flow.id);
+        markSaved(); // Mark as saved to reset autosave timer
         await refetchFlows();
       }
     } catch (err) {
@@ -362,13 +474,24 @@ export function FlowDesigner() {
     }
   };
 
+  // Format last saved time
+  const formatLastSaved = (date: Date | null): string => {
+    if (!date) return "";
+    const now = new Date();
+    const diff = now.getTime() - date.getTime();
+    if (diff < 60000) return "just now";
+    if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
+    return date.toLocaleTimeString();
+  };
+
   const handleLoadFlow = async (flowId: string) => {
     try {
       const loadedFlow = await (
         await import("../../services/flow-service")
       ).flowService.getFlow(flowId);
       if (loadedFlow) {
-        setFlow(loadedFlow);
+        // Reset history when loading a new flow
+        resetFlow(loadedFlow);
         setCurrentFlowId(flowId);
         setSelectedStepId(null);
         setValidationErrors([]);
@@ -380,7 +503,8 @@ export function FlowDesigner() {
   };
 
   const handleNewFlow = () => {
-    setFlow(createEmptyFlow());
+    // Reset history when creating a new flow
+    resetFlow(createEmptyFlow());
     setCurrentFlowId(null);
     setSelectedStepId(null);
     setValidationErrors([]);
@@ -404,6 +528,92 @@ export function FlowDesigner() {
     } catch (err) {
       console.error("Run failed:", err);
       alert("Failed to start flow execution");
+    }
+  };
+
+  const handleExport = async () => {
+    try {
+      // Get the flow service
+      const { flowService } = await import("../../services/flow-service");
+
+      // Ask user to pick export format
+      const filePath = await save({
+        defaultPath: `${flow.name.replace(/[^a-zA-Z0-9]/g, "_")}.json`,
+        filters: [
+          { name: "JSON", extensions: ["json"] },
+          { name: "YAML", extensions: ["yaml", "yml"] },
+        ],
+      });
+
+      if (!filePath) return;
+
+      // Determine format from extension
+      const isYaml = filePath.toLowerCase().endsWith(".yaml") || filePath.toLowerCase().endsWith(".yml");
+
+      // Export based on format
+      let content: string;
+      if (flow.id && _currentFlowId) {
+        // Export saved flow from database
+        content = isYaml
+          ? await flowService.exportFlowYaml(flow.id)
+          : await flowService.exportFlowJson(flow.id);
+      } else {
+        // Export current unsaved flow
+        const exportData = {
+          format_version: "1.0.0",
+          exported_at: new Date().toISOString(),
+          flow: flow,
+        };
+        content = isYaml
+          ? JSON.stringify(exportData, null, 2) // Fallback to JSON for unsaved
+          : JSON.stringify(exportData, null, 2);
+      }
+
+      // Write to file
+      await writeTextFile(filePath, content);
+      console.log(`Flow exported to ${filePath}`);
+    } catch (err) {
+      console.error("Export failed:", err);
+      alert("Failed to export flow");
+    }
+  };
+
+  const handleImport = async () => {
+    try {
+      const { flowService } = await import("../../services/flow-service");
+
+      // Ask user to pick a file
+      const filePath = await open({
+        multiple: false,
+        filters: [
+          { name: "Flow Files", extensions: ["json", "yaml", "yml"] },
+        ],
+      });
+
+      if (!filePath || Array.isArray(filePath)) return;
+
+      // Read the file
+      const content = await readTextFile(filePath);
+
+      // Determine format from extension
+      const isYaml = filePath.toLowerCase().endsWith(".yaml") || filePath.toLowerCase().endsWith(".yml");
+
+      // Import based on format
+      const importedFlow = isYaml
+        ? await flowService.importFlowYaml(content, true)
+        : await flowService.importFlowJson(content, true);
+
+      // Reset history with the imported flow
+      resetFlow(importedFlow);
+      setCurrentFlowId(importedFlow.id);
+      setSelectedStepId(null);
+      setValidationErrors([]);
+      await refetchFlows();
+
+      console.log(`Flow imported: ${importedFlow.name}`);
+    } catch (err) {
+      console.error("Import failed:", err);
+      alert("Failed to import flow. Make sure the file is a valid flow export.");
     }
   };
 
@@ -437,9 +647,32 @@ export function FlowDesigner() {
               <span className="text-sm">Valid</span>
             </div>
           ) : null}
+
+          {/* Execution Status Indicator */}
+          <ExecutionStatusIndicator />
         </div>
 
         <div className="flex items-center gap-2">
+          {/* Undo/Redo buttons */}
+          <div className="flex items-center gap-1 mr-2">
+            <button
+              onClick={undo}
+              disabled={!canUndo}
+              title={`Undo (Ctrl+Z)${canUndo ? ` - ${undoCount} step${undoCount !== 1 ? "s" : ""}` : ""}`}
+              className="p-1.5 text-gray-400 hover:text-white hover:bg-gray-700 rounded disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+            >
+              <Undo2 className="w-4 h-4" />
+            </button>
+            <button
+              onClick={redo}
+              disabled={!canRedo}
+              title={`Redo (Ctrl+Shift+Z)${canRedo ? ` - ${redoCount} step${redoCount !== 1 ? "s" : ""}` : ""}`}
+              className="p-1.5 text-gray-400 hover:text-white hover:bg-gray-700 rounded disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+            >
+              <Redo2 className="w-4 h-4" />
+            </button>
+          </div>
+
           <button
             onClick={handleNewFlow}
             className="flex items-center gap-2 px-3 py-1.5 bg-gray-700 text-white rounded hover:bg-gray-600 transition-colors"
@@ -497,10 +730,72 @@ export function FlowDesigner() {
             )}
           </div>
 
+          {/* Import/Export buttons */}
+          <button
+            onClick={handleImport}
+            title="Import flow from file"
+            className="flex items-center gap-2 px-3 py-1.5 bg-gray-700 text-white rounded hover:bg-gray-600 transition-colors"
+          >
+            <Upload className="w-4 h-4" />
+            Import
+          </button>
+
+          <button
+            onClick={handleExport}
+            disabled={Object.keys(flow.steps).length === 0}
+            title="Export flow to file"
+            className="flex items-center gap-2 px-3 py-1.5 bg-gray-700 text-white rounded hover:bg-gray-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <Download className="w-4 h-4" />
+            Export
+          </button>
+
+          {/* Save status indicator */}
+          <div className="flex items-center gap-2 text-xs text-gray-400 mr-2">
+            {autosaveInProgress ? (
+              <>
+                <Loader2 className="w-3 h-3 animate-spin" />
+                <span>Saving...</span>
+              </>
+            ) : autosavePending ? (
+              <>
+                <Cloud className="w-3 h-3 text-yellow-400" />
+                <span>Unsaved</span>
+              </>
+            ) : lastSaved ? (
+              <>
+                <Cloud className="w-3 h-3 text-green-400" />
+                <span>Saved {formatLastSaved(lastSaved)}</span>
+              </>
+            ) : hasUnsavedChanges ? (
+              <>
+                <Cloud className="w-3 h-3 text-yellow-400" />
+                <span>Unsaved</span>
+              </>
+            ) : null}
+
+            {/* Autosave toggle */}
+            <button
+              onClick={() => setAutosaveEnabled(!autosaveEnabled)}
+              title={autosaveEnabled ? "Disable autosave" : "Enable autosave"}
+              className={`p-1 rounded transition-colors ${
+                autosaveEnabled
+                  ? "text-green-400 hover:text-green-300"
+                  : "text-gray-500 hover:text-gray-400"
+              }`}
+            >
+              {autosaveEnabled ? (
+                <Cloud className="w-3 h-3" />
+              ) : (
+                <CloudOff className="w-3 h-3" />
+              )}
+            </button>
+          </div>
+
           <button
             onClick={handleSave}
-            disabled={isSaving}
-            className="flex items-center gap-2 px-3 py-1.5 bg-blue-600 text-white rounded hover:bg-blue-500 transition-colors"
+            disabled={isSaving || autosaveInProgress}
+            className="flex items-center gap-2 px-3 py-1.5 bg-blue-600 text-white rounded hover:bg-blue-500 transition-colors disabled:opacity-50"
           >
             <Save className="w-4 h-4" />
             {isSaving ? "Saving..." : "Save"}
@@ -559,5 +854,17 @@ export function FlowDesigner() {
         />
       </div>
     </div>
+  );
+}
+
+/**
+ * FlowDesigner - Main exported component
+ * Wraps the inner component with the FlowExecutionProvider for execution state tracking.
+ */
+export function FlowDesigner() {
+  return (
+    <FlowExecutionProvider>
+      <FlowDesignerInner />
+    </FlowExecutionProvider>
   );
 }
