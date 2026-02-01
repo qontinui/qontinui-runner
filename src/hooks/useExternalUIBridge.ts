@@ -630,6 +630,7 @@ export function useExternalUIBridge(): UseExternalUIBridgeReturn {
         setConnectedTabInfo(null);
       }
     },
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- refreshElementsInternal is stable, including it causes infinite loops
     [browserTabs, sendCommand]
   );
 
@@ -746,6 +747,7 @@ export function useExternalUIBridge(): UseExternalUIBridgeReturn {
       return;
     }
     await refreshElementsInternal();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- refreshElementsInternal is stable
   }, [connectionStatus]);
 
   /**
@@ -883,6 +885,7 @@ export function useExternalUIBridge(): UseExternalUIBridgeReturn {
 
       return result;
     },
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- createActionCapture and refreshElementsInternal are stable
     [connectionStatus, sendCommand, captureSession.active, elements, connectedTabInfo]
   );
 

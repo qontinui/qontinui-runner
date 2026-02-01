@@ -163,6 +163,7 @@ export function useWebSocketAutoConnect({
     } finally {
       setConnecting(false);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- connecting state is checked via ref-like pattern
   }, [connectionInfo, selectedProjectId, runnerName, onConnected, onError, onLog]);
 
   const disconnect = useCallback(async () => {

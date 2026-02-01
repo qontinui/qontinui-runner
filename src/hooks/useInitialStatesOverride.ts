@@ -61,6 +61,7 @@ export function useInitialStatesOverride(
       console.log("[INITIAL_STATES_OVERRIDE] Clearing override due to workflow change");
       setOverrideStateIdsInternal(null);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- Only trigger on workflow change, not on overrideStateIds
   }, [selectedWorkflow]);
 
   // Clear override when config is reloaded
@@ -69,6 +70,7 @@ export function useInitialStatesOverride(
       console.log("[INITIAL_STATES_OVERRIDE] Clearing override due to config reload");
       setOverrideStateIdsInternal(null);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- Only trigger on config version change
   }, [configVersion]);
 
   /**

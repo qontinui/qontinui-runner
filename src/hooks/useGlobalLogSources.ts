@@ -202,6 +202,7 @@ export function useGlobalLogSources(): UseGlobalLogSourcesReturn {
     if (settings && settings.sources.length > 0) {
       refreshLogs();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- refreshLogs is stable, only trigger on settings change
   }, [settings]);
 
   return {

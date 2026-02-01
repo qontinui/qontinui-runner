@@ -112,6 +112,7 @@ export function useProjectSelection(): UseProjectSelectionReturn {
     } finally {
       setLoading(false);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- setSelectedProject is defined below and stable
   }, [selectedProjectId]);
 
   /**
