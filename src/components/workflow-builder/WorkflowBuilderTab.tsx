@@ -13,30 +13,28 @@ import {
   Square,
   Settings,
   FileText,
-  RotateCcw,
   Loader2,
-  FolderOpen,
   Search,
   Sparkles,
   Info,
   Trash2,
   Check,
   Download,
+  ChevronDown,
+  ChevronUp,
+  AlertCircle,
 } from "lucide-react";
 import type {
   WorkflowPhase,
   UnifiedStep,
-  SetupStep,
-  VerificationStep,
-  AgenticStep,
-  CompletionStep,
   UnifiedWorkflow,
   WorkflowExport,
   SavedPrompt,
   SavedShellCommand,
   LogSourceSelection,
+  HealthCheckUrl,
 } from "../../types";
-import { PHASE_INFO, generateStepId } from "../../types";
+import { generateStepId } from "../../types";
 import { useGlobalLogSources } from "../../hooks/useGlobalLogSources";
 import { WorkflowBuilderProvider, useWorkflowBuilder } from "./WorkflowBuilderContext";
 import { PhaseSection } from "./PhaseSection";
@@ -61,7 +59,7 @@ import { PromptTemplateEditor } from "./PromptTemplateEditor";
 import { ContextManagement } from "./ContextManagement";
 import { PageTutorialMenu } from "../tutorial";
 import { getAccentColors } from "@/design-system";
-import { BatchDeleteDialog } from "../ui/BatchDeleteDialog";
+import { BatchDeleteDialog, ConfirmDialog } from "../ui";
 import { BuilderToolbar, toolbarActions } from "../ui/BuilderToolbar";
 
 const API_BASE = "http://localhost:9876";
@@ -235,20 +233,64 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
 
       {/* Show iteration settings when there are agentic steps */}
       {features.showIterationSettings && (
-        <div>
-          <label className="block text-sm font-medium text-zinc-400 mb-1">Max Iterations</label>
-          <input
-            type="number"
-            value={workflow.max_iterations ?? 10}
-            onChange={(e) => updateWorkflow({ max_iterations: parseInt(e.target.value) || 10 })}
-            min={1}
-            max={100}
-            className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-            data-ui-id="workflow-builder-iterations-input"
-          />
-          <p className="text-xs text-zinc-500 mt-1">
-            Maximum number of verification {"<->"} agentic loops
-          </p>
+        <div className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium text-zinc-400 mb-1">Max Iterations</label>
+            <input
+              type="number"
+              value={workflow.max_iterations ?? 10}
+              onChange={(e) => updateWorkflow({ max_iterations: parseInt(e.target.value) || 10 })}
+              min={1}
+              max={100}
+              className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+              data-ui-id="workflow-builder-iterations-input"
+            />
+            <p className="text-xs text-zinc-500 mt-1">
+              Maximum number of verification {"<->"} agentic loops
+            </p>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-zinc-400 mb-1">AI Session Timeout</label>
+            <div className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                id="timeout-enabled"
+                checked={workflow.timeout_seconds != null}
+                onChange={(e) => {
+                  if (e.target.checked) {
+                    updateWorkflow({ timeout_seconds: 300 }); // Default 5 minutes
+                  } else {
+                    updateWorkflow({ timeout_seconds: null });
+                  }
+                }}
+                className="w-4 h-4 rounded border-zinc-600 bg-zinc-800 text-blue-500 focus:ring-blue-500/50"
+                data-ui-id="workflow-builder-timeout-checkbox"
+              />
+              <label htmlFor="timeout-enabled" className="text-sm text-zinc-400">
+                Enable timeout
+              </label>
+              {workflow.timeout_seconds != null && (
+                <input
+                  type="number"
+                  value={workflow.timeout_seconds}
+                  onChange={(e) => updateWorkflow({ timeout_seconds: Math.max(60, parseInt(e.target.value) || 300) })}
+                  min={60}
+                  max={7200}
+                  className="w-24 px-2 py-1 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm"
+                  data-ui-id="workflow-builder-timeout-input"
+                />
+              )}
+              {workflow.timeout_seconds != null && (
+                <span className="text-sm text-zinc-500">seconds</span>
+              )}
+            </div>
+            <p className="text-xs text-zinc-500 mt-1">
+              {workflow.timeout_seconds != null
+                ? `Kill AI session after ${workflow.timeout_seconds}s of inactivity`
+                : "No timeout - runs until completion or manual stop (recommended)"}
+            </p>
+          </div>
         </div>
       )}
 
@@ -336,6 +378,118 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
         </div>
       )}
 
+      {/* Health Check toggle - automatic server health checks */}
+      <div className="space-y-2">
+        <div className="flex items-center justify-between py-2 px-3 bg-zinc-800/50 rounded-md">
+          <div>
+            <label className="block text-sm font-medium text-zinc-300">Server Health Checks</label>
+            <p className="text-xs text-zinc-500">
+              Verify configured servers are running before verification
+            </p>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={workflow.health_check_enabled ?? true}
+            onClick={() => updateWorkflow({ health_check_enabled: !(workflow.health_check_enabled ?? true) })}
+            className={`
+              relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent
+              transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500/50
+              ${(workflow.health_check_enabled ?? true) ? "bg-blue-600" : "bg-zinc-600"}
+            `}
+            data-ui-id="workflow-builder-health-check-toggle"
+          >
+            <span
+              className={`
+                pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0
+                transition duration-200 ease-in-out
+                ${(workflow.health_check_enabled ?? true) ? "translate-x-5" : "translate-x-0"}
+              `}
+            />
+          </button>
+        </div>
+
+        {/* Health Check URLs - shown when health checks are enabled */}
+        {(workflow.health_check_enabled ?? true) && (
+          <div className="pl-3 space-y-2">
+            <div className="text-xs text-zinc-500">
+              {(workflow.health_check_urls ?? []).length === 0
+                ? "No health check URLs configured. Add URLs to check server availability."
+                : `${(workflow.health_check_urls ?? []).length} health check URL(s) configured`}
+            </div>
+
+            {/* List existing health check URLs with inline editing */}
+            {(workflow.health_check_urls ?? []).map((hc, index) => (
+              <HealthCheckUrlEditor
+                key={index}
+                healthCheck={hc}
+                onChange={(updated) => {
+                  const urls = [...(workflow.health_check_urls ?? [])];
+                  urls[index] = updated;
+                  updateWorkflow({ health_check_urls: urls });
+                }}
+                onDelete={() => {
+                  const urls = [...(workflow.health_check_urls ?? [])];
+                  urls.splice(index, 1);
+                  updateWorkflow({ health_check_urls: urls });
+                }}
+              />
+            ))}
+
+            {/* Add new health check URL */}
+            <button
+              type="button"
+              onClick={() => {
+                const newUrl: HealthCheckUrl = {
+                  name: "New Health Check",
+                  url: "http://localhost:8000/health",
+                  expected_status: 200,
+                  timeout_seconds: 5,
+                  is_critical: true,
+                };
+                updateWorkflow({
+                  health_check_urls: [...(workflow.health_check_urls ?? []), newUrl],
+                });
+              }}
+              className="flex items-center gap-1 text-xs text-blue-400 hover:text-blue-300 transition-colors"
+            >
+              <Plus className="w-3 h-3" />
+              Add Health Check URL
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* Log Watch toggle - automatic log error detection */}
+      <div className="flex items-center justify-between py-2 px-3 bg-zinc-800/50 rounded-md">
+        <div>
+          <label className="block text-sm font-medium text-zinc-300">Automatic Log Error Detection</label>
+          <p className="text-xs text-zinc-500">
+            Scan backend and frontend logs for errors before each verification
+          </p>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={workflow.log_watch_enabled ?? true}
+          onClick={() => updateWorkflow({ log_watch_enabled: !(workflow.log_watch_enabled ?? true) })}
+          className={`
+            relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent
+            transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500/50
+            ${(workflow.log_watch_enabled ?? true) ? "bg-blue-600" : "bg-zinc-600"}
+          `}
+          data-ui-id="workflow-builder-log-watch-toggle"
+        >
+          <span
+            className={`
+              pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0
+              transition duration-200 ease-in-out
+              ${(workflow.log_watch_enabled ?? true) ? "translate-x-5" : "translate-x-0"}
+            `}
+          />
+        </button>
+      </div>
+
       {/* Developer Prompt Template - show when workflow has agentic steps */}
       {features.showIterationSettings && (
         <PromptTemplateEditor
@@ -408,11 +562,167 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
 }
 
 // =============================================================================
+// Health Check URL Editor Component
+// =============================================================================
+
+interface HealthCheckUrlEditorProps {
+  healthCheck: HealthCheckUrl;
+  onChange: (updated: HealthCheckUrl) => void;
+  onDelete: () => void;
+}
+
+function HealthCheckUrlEditor({ healthCheck, onChange, onDelete }: HealthCheckUrlEditorProps) {
+  const [isExpanded, setIsExpanded] = useState(false);
+
+  const updateField = <K extends keyof HealthCheckUrl>(field: K, value: HealthCheckUrl[K]) => {
+    onChange({ ...healthCheck, [field]: value });
+  };
+
+  return (
+    <div className="bg-zinc-800 rounded border border-zinc-700 overflow-hidden">
+      {/* Collapsed view - clickable header */}
+      <div
+        className="flex items-center gap-2 p-2 cursor-pointer hover:bg-zinc-750 transition-colors"
+        onClick={() => setIsExpanded(!isExpanded)}
+      >
+        <button
+          type="button"
+          className="p-0.5 text-zinc-400 hover:text-zinc-300 transition-colors"
+          onClick={(e) => {
+            e.stopPropagation();
+            setIsExpanded(!isExpanded);
+          }}
+        >
+          {isExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+        </button>
+
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-medium text-zinc-300 truncate">{healthCheck.name}</span>
+            {(healthCheck.is_critical ?? true) && (
+              <span className="flex items-center gap-0.5 px-1.5 py-0.5 text-[10px] font-medium bg-red-500/20 text-red-400 rounded">
+                <AlertCircle className="w-3 h-3" />
+                Critical
+              </span>
+            )}
+          </div>
+          <div className="text-xs text-zinc-500 truncate">{healthCheck.url}</div>
+        </div>
+
+        <div className="flex items-center gap-1 text-xs text-zinc-500">
+          <span>{healthCheck.expected_status ?? 200}</span>
+          <span className="text-zinc-600">|</span>
+          <span>{healthCheck.timeout_seconds ?? 5}s</span>
+        </div>
+
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onDelete();
+          }}
+          className="p-1 text-zinc-500 hover:text-red-400 transition-colors"
+          title="Remove health check"
+        >
+          <Trash2 className="w-4 h-4" />
+        </button>
+      </div>
+
+      {/* Expanded view - inline editing */}
+      {isExpanded && (
+        <div className="p-3 pt-0 space-y-3 border-t border-zinc-700">
+          {/* Name field */}
+          <div>
+            <label className="block text-xs font-medium text-zinc-400 mb-1">Name</label>
+            <input
+              type="text"
+              value={healthCheck.name}
+              onChange={(e) => updateField("name", e.target.value)}
+              className="w-full px-2 py-1.5 text-sm bg-zinc-900 border border-zinc-600 rounded
+                         text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-blue-500"
+              placeholder="e.g., Backend Server"
+            />
+          </div>
+
+          {/* URL field */}
+          <div>
+            <label className="block text-xs font-medium text-zinc-400 mb-1">URL</label>
+            <input
+              type="text"
+              value={healthCheck.url}
+              onChange={(e) => updateField("url", e.target.value)}
+              className="w-full px-2 py-1.5 text-sm bg-zinc-900 border border-zinc-600 rounded
+                         text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-blue-500 font-mono"
+              placeholder="http://localhost:8000/health"
+            />
+          </div>
+
+          {/* Expected Status and Timeout - side by side */}
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-xs font-medium text-zinc-400 mb-1">Expected Status</label>
+              <input
+                type="number"
+                value={healthCheck.expected_status ?? 200}
+                onChange={(e) => updateField("expected_status", parseInt(e.target.value) || 200)}
+                className="w-full px-2 py-1.5 text-sm bg-zinc-900 border border-zinc-600 rounded
+                           text-zinc-200 focus:outline-none focus:border-blue-500"
+                min={100}
+                max={599}
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-zinc-400 mb-1">Timeout (seconds)</label>
+              <input
+                type="number"
+                value={healthCheck.timeout_seconds ?? 5}
+                onChange={(e) => updateField("timeout_seconds", parseInt(e.target.value) || 5)}
+                className="w-full px-2 py-1.5 text-sm bg-zinc-900 border border-zinc-600 rounded
+                           text-zinc-200 focus:outline-none focus:border-blue-500"
+                min={1}
+                max={300}
+              />
+            </div>
+          </div>
+
+          {/* Critical toggle */}
+          <div className="flex items-center justify-between py-1">
+            <div>
+              <label className="block text-xs font-medium text-zinc-400">Critical</label>
+              <p className="text-[10px] text-zinc-500">Stop workflow if this check fails</p>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={healthCheck.is_critical ?? true}
+              onClick={() => updateField("is_critical", !(healthCheck.is_critical ?? true))}
+              className={`
+                relative inline-flex h-5 w-9 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent
+                transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500/50
+                ${(healthCheck.is_critical ?? true) ? "bg-red-600" : "bg-zinc-600"}
+              `}
+            >
+              <span
+                className={`
+                  pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow ring-0
+                  transition duration-200 ease-in-out
+                  ${(healthCheck.is_critical ?? true) ? "translate-x-4" : "translate-x-0"}
+                `}
+              />
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// =============================================================================
 // Main Content Component
 // =============================================================================
 
 function WorkflowBuilderContent({
-  onOpenLibrary,
+  onOpenLibrary: _onOpenLibrary,
   onNavigateToActive,
 }: {
   onOpenLibrary?: () => void;
@@ -427,7 +737,7 @@ function WorkflowBuilderContent({
     moveStep,
     selectStep,
     getSelectedStep,
-    showAddDropdown,
+    showAddDropdown: _showAddDropdown,
     resetToNew,
     saveWorkflow,
     loadWorkflow,
@@ -719,6 +1029,64 @@ function WorkflowBuilderContent({
   const [isExecuting, setIsExecuting] = useState(false);
   const [executionError, setExecutionError] = useState<string | null>(null);
   const [executionSuccess, setExecutionSuccess] = useState<string | null>(null);
+  const [showSaveBeforeRunDialog, setShowSaveBeforeRunDialog] = useState(false);
+  const [isSavingBeforeRun, setIsSavingBeforeRun] = useState(false);
+
+  // Execute the workflow run (called after save confirmation)
+  const executeWorkflowRun = useCallback(async (workflowId: string) => {
+    setIsExecuting(true);
+    setExecutionError(null);
+    setExecutionSuccess(null);
+
+    try {
+      console.log("[WorkflowBuilder] Running workflow:", workflowId, state.workflow.name);
+
+      const runUrl = `${API_BASE}/unified-workflows/${workflowId}/run`;
+      const requestBody = JSON.stringify({
+        monitor_index: 0,
+        // No timeout_seconds - runs until completion or manual stop
+      });
+
+      fetch(runUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: requestBody,
+      }).then(response => {
+        console.log("[WorkflowBuilder] Workflow run response:", response.status);
+      }).catch(error => {
+        console.error("[WorkflowBuilder] Workflow run error:", error);
+      });
+
+      setTimeout(() => {
+        onNavigateToActive?.();
+      }, 100);
+
+      setExecutionSuccess("Workflow started! Check the Active tab to monitor progress.");
+      setTimeout(() => setExecutionSuccess(null), 5000);
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : "Failed to start workflow";
+      setExecutionError(errorMsg);
+    } finally {
+      setIsExecuting(false);
+    }
+  }, [state.workflow.name, onNavigateToActive]);
+
+  // Handle save and run (called from dialog confirmation)
+  const handleSaveAndRun = useCallback(async () => {
+    setIsSavingBeforeRun(true);
+    try {
+      const savedWorkflow = await saveWorkflow();
+      if (!savedWorkflow) {
+        setExecutionError("Failed to save workflow. Cannot run.");
+        setShowSaveBeforeRunDialog(false);
+        return;
+      }
+      setShowSaveBeforeRunDialog(false);
+      await executeWorkflowRun(savedWorkflow.id);
+    } finally {
+      setIsSavingBeforeRun(false);
+    }
+  }, [saveWorkflow, executeWorkflowRun]);
 
   // Handle run workflow
   const handleRun = useCallback(async () => {
@@ -730,79 +1098,20 @@ function WorkflowBuilderContent({
       return;
     }
 
-    // Determine workflow ID to use (may be updated after save)
-    let workflowIdToRun = state.workflow.id;
-
     // Check if workflow is saved (must have an ID to run)
     if (!state.workflow.id || hasUnsavedChanges) {
-      const shouldSave = confirm("Workflow must be saved before running. Save now?");
-      if (shouldSave) {
-        const savedWorkflow = await saveWorkflow();
-        if (!savedWorkflow) {
-          setExecutionError("Failed to save workflow. Cannot run.");
-          return;
-        }
-        // Use the newly saved workflow's ID (state.workflow.id is stale in this closure)
-        workflowIdToRun = savedWorkflow.id;
-      } else {
-        setExecutionError("Workflow must be saved before running.");
-        return;
-      }
+      setShowSaveBeforeRunDialog(true);
+      return;
     }
 
-    setIsExecuting(true);
-    setExecutionError(null);
-    setExecutionSuccess(null);
-
-    try {
-      console.log("[WorkflowBuilder] Running workflow:", workflowIdToRun, state.workflow.name);
-
-      // CRITICAL: Fire the fetch request using .then()/.catch() pattern.
-      // This ensures the request is sent before we navigate away.
-      // The workflow runs in the background - we don't wait for it to complete.
-      const runUrl = `${API_BASE}/unified-workflows/${workflowIdToRun}/run`;
-      const requestBody = JSON.stringify({
-        monitor_index: 0, // Default to primary monitor
-        timeout_seconds: 300, // 5 minute timeout
-      });
-
-      // Fire the request - don't await it, just let it run
-      fetch(runUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: requestBody,
-      }).then(response => {
-        console.log("[WorkflowBuilder] Workflow run response:", response.status);
-      }).catch(error => {
-        console.error("[WorkflowBuilder] Workflow run error:", error);
-      });
-
-      // Use a small delay to ensure the fetch request is sent before we navigate
-      // This gives the browser time to actually initiate the network request
-      setTimeout(() => {
-        onNavigateToActive?.();
-      }, 100);
-
-      // Don't wait for the response - the workflow runs in the background
-      // The Active page will show the running task
-      setExecutionSuccess("Workflow started! Check the Active tab to monitor progress.");
-      // Clear success message after 5 seconds
-      setTimeout(() => setExecutionSuccess(null), 5000);
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error);
-      setExecutionError(`Failed to run workflow: ${errorMsg}`);
-      console.error("[WorkflowBuilder] Failed to run workflow:", error);
-    } finally {
-      setIsExecuting(false);
-    }
+    // Workflow is already saved, run it directly
+    await executeWorkflowRun(state.workflow.id);
   }, [
-    state.workflow,
+    state.workflow.id,
     isEmpty,
     hasUnsavedChanges,
-    saveWorkflow,
     isExecuting,
-    onNavigateToActive,
-    updateWorkflow,
+    executeWorkflowRun,
   ]);
 
   // Handle stop execution
@@ -1757,6 +2066,20 @@ function WorkflowBuilderContent({
               isDeleting={isDeletingWorkflows}
               onClose={() => setShowBatchDeleteDialog(false)}
               onConfirm={deleteSelectedWorkflows}
+            />
+
+            {/* Save Before Run Confirmation Dialog */}
+            <ConfirmDialog
+              open={showSaveBeforeRunDialog}
+              title="Save Required"
+              message="To run a workflow, you need to save it first."
+              description="Would you like to save the workflow now and then run it?"
+              variant="info"
+              confirmText="Save & Run"
+              cancelText="Cancel"
+              isLoading={isSavingBeforeRun}
+              onClose={() => setShowSaveBeforeRunDialog(false)}
+              onConfirm={handleSaveAndRun}
             />
           </div>
 

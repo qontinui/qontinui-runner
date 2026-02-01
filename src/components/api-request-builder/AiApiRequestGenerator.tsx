@@ -7,7 +7,7 @@
 
 import { useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Sparkles, Loader2, RefreshCw, Check, X, Globe, Wand2 } from "lucide-react";
+import { Sparkles, Loader2, RefreshCw, Check, X, Wand2 } from "lucide-react";
 import type { HttpMethod, ApiContentType } from "../../types";
 
 interface GeneratedApiRequest {

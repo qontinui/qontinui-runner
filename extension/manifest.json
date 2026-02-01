@@ -3,7 +3,7 @@
   "name": "Qontinui DevTools",
   "version": "2.0.0",
   "description": "AI-powered debugging: DOM capture, API recording, and UI Bridge inspection",
-  "permissions": ["activeTab", "scripting", "webRequest", "storage"],
+  "permissions": ["activeTab", "scripting", "webRequest", "storage", "tabs"],
   "host_permissions": ["http://localhost:9876/*", "<all_urls>"],
   "action": {
     "default_popup": "popup.html",

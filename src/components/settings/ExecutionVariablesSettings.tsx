@@ -21,7 +21,7 @@ import type {
   CustomVariable,
   ExecutionVariablesSettings as ExecutionVariablesSettingsType,
 } from "@/types";
-import { DEFAULT_EXECUTION_VARIABLES, getAuthSourceLabel, getAuthSourceDescription } from "@/types";
+import { DEFAULT_EXECUTION_VARIABLES, getAuthSourceDescription } from "@/types";
 import type { LogFunction } from "./types";
 
 interface TauriResult<T> {
@@ -69,6 +69,7 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
 
   useEffect(() => {
     loadSettings();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const loadSettings = async () => {
@@ -82,13 +83,16 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
 
       if (result && result.success && result.data) {
         // Map snake_case from Rust to camelCase
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const rustData = result.data as any;
         setSettings({
-          authSource: result.data.auth_source as AuthSource,
-          authHeaderName: result.data.auth_header_name || "Authorization",
-          authToken: result.data.auth_token,
-          authEnvVar: result.data.auth_env_var || "API_AUTH_TOKEN",
+          authSource: rustData.auth_source as AuthSource,
+          authHeaderName: rustData.auth_header_name || "Authorization",
+          authToken: rustData.auth_token,
+          authEnvVar: rustData.auth_env_var || "API_AUTH_TOKEN",
           customVariables:
-            result.data.custom_variables?.map((v: any) => ({
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            rustData.custom_variables?.map((v: any) => ({
               name: v.name,
               source: v.source as VariableSource,
               value: v.value,

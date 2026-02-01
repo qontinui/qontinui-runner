@@ -14,7 +14,7 @@ export const workflowExecutionTutorial: Tutorial = {
   duration: "8 minutes",
   difficulty: "beginner",
   mode: "contextual",
-  focusPage: "run",
+  focusPage: "gui-automation",
   category: "Execution",
   tags: ["workflow", "execution", "config", "automation"],
   prerequisites: ["getting-started"],

@@ -273,6 +273,7 @@ export type {
 export type {
   WorkflowPhase,
   LogSourceSelection,
+  HealthCheckUrl,
   ScriptStep,
   StateStep,
   WorkflowRefStep,
@@ -502,3 +503,26 @@ export {
   getAuthSourceLabel,
   getAuthSourceDescription,
 } from "./execution-variables";
+
+// Performance Metrics Dashboard types
+export type {
+  PerformanceMetricsResponse,
+  ActionPerformanceMetrics,
+  StateTransitionMetrics,
+  ElementResolutionMetrics,
+  PerformanceSummary,
+  TimeSeriesDataPoint,
+  TimeRange,
+  PerformanceDashboardData,
+} from "./performance-metrics";
+
+export {
+  TIME_RANGE_LABELS,
+  formatDurationMs,
+  formatSuccessRate,
+  getSuccessRateColor,
+  getSuccessRateBgColor,
+  isFlaky,
+  formatTimestamp as formatPerfTimestamp,
+  formatChartTimestamp,
+} from "./performance-metrics";

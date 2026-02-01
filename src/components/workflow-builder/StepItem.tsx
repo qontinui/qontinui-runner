@@ -69,8 +69,8 @@ interface StepItemProps {
 
 export function StepItem({
   step,
-  phase,
-  index,
+  phase: _phase,
+  index: _index,
   isFirst,
   isLast,
   isSelected,

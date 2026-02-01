@@ -31,7 +31,6 @@ import {
   Focus,
   Type,
   Chrome,
-  FolderOpen,
   HelpCircle,
 } from "lucide-react";
 import { useAccessibilityTree } from "../../hooks/useAccessibilityTree";

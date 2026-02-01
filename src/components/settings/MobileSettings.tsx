@@ -54,6 +54,7 @@ export function MobileSettings({ onLog }: MobileSettingsProps) {
   useEffect(() => {
     loadSettings();
     refreshDevices();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const loadSettings = async () => {

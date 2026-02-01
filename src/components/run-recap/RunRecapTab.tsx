@@ -124,6 +124,8 @@ export function RunRecapTab() {
         duration={data.duration_ms}
         startTime={data.created_at}
         endTime={data.completed_at}
+        verificationPassed={selectedRun?.verification_passed}
+        loopResult={selectedRun?.loop_result}
       />
 
       {/* Session Stats Bar - Compact stats from former Dashboard */}
@@ -281,7 +283,7 @@ export function RunRecapTab() {
 
         {/* Tests Tab */}
         <TabsContent value="tests">
-          <TestsTab taskRunId={taskRunId} />
+          <TestsTab taskRunId={taskRunId} loopResult={selectedRun?.loop_result} />
         </TabsContent>
 
         {/* Context Tab */}

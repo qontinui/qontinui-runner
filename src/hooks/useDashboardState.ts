@@ -374,7 +374,7 @@ export function useDashboardState(options: UseDashboardStateOptions = {}): UseDa
 
   const handleGoToExecute = useCallback(() => {
     if (onNavigate) {
-      onNavigate("run"); // Navigate to the Run tab
+      onNavigate("gui-automation"); // Navigate to the GUI Automation tab
     }
   }, [onNavigate]);
 

@@ -39,7 +39,7 @@ function PhaseProgress({
               isComplete
                 ? "bg-green-500"
                 : isCurrent
-                  ? cn(colors.bg, "animate-pulse")
+                  ? cn(colors.bg, "animate-phase-fade")
                   : "bg-muted",
             )}
             title={`${config.label}: ${group.stats.completed}/${group.stats.total}`}
@@ -54,7 +54,7 @@ function PhaseProgress({
  * Summary component for execution timeline.
  */
 export function ExecutionTimelineSummary({ data, className }: ExecutionTimelineSummaryProps) {
-  const { phaseGroups, stats, currentPhase, currentStep, isLoading } = data;
+  const { phaseGroups, stepStats, currentPhase, currentStep, isLoading } = data;
   const successColors = getStatusColors("success");
   const errorColors = getStatusColors("error");
 
@@ -67,7 +67,7 @@ export function ExecutionTimelineSummary({ data, className }: ExecutionTimelineS
   }
 
   // No steps yet
-  if (stats.total === 0) {
+  if (stepStats.total === 0) {
     return (
       <div className={cn("text-center py-2", className)}>
         <Clock className="h-4 w-4 mx-auto mb-1 text-muted-foreground opacity-50" />
@@ -79,13 +79,19 @@ export function ExecutionTimelineSummary({ data, className }: ExecutionTimelineS
   return (
     <div className={cn("space-y-2", className)}>
       {/* Compact stats */}
-      <StepStatsBar stats={stats} compact />
+      <StepStatsBar stats={stepStats} compact />
 
       {/* Current step indicator */}
       {currentStep && (
         <div className="flex items-center gap-2 text-xs">
-          <Loader2 className="h-3 w-3 animate-spin text-blue-500" />
-          <span className="text-muted-foreground truncate">
+          <Loader2 className={cn(
+            "h-3 w-3 animate-spin",
+            currentStep.id === "_workflow_processing" ? "text-purple-500" : "text-blue-500"
+          )} />
+          <span className={cn(
+            "truncate",
+            currentStep.id === "_workflow_processing" ? "text-purple-500/70 italic" : "text-muted-foreground"
+          )}>
             {currentStep.name}
           </span>
         </div>
@@ -107,16 +113,16 @@ export function ExecutionTimelineSummary({ data, className }: ExecutionTimelineS
 
         {/* Pass/fail counts */}
         <div className="flex items-center gap-2">
-          {stats.successful > 0 && (
+          {stepStats.successful > 0 && (
             <div className="flex items-center gap-1">
               <CheckCircle2 className={cn("h-3 w-3", successColors.text)} />
-              <span className={successColors.text}>{stats.successful}</span>
+              <span className={successColors.text}>{stepStats.successful}</span>
             </div>
           )}
-          {stats.failed > 0 && (
+          {stepStats.failed > 0 && (
             <div className="flex items-center gap-1">
               <XCircle className={cn("h-3 w-3", errorColors.text)} />
-              <span className={errorColors.text}>{stats.failed}</span>
+              <span className={errorColors.text}>{stepStats.failed}</span>
             </div>
           )}
         </div>

@@ -155,6 +155,7 @@ export function ExecutionControlPanel({
     };
 
     calculateScreens();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- onMonitorSelectionChange is stable, including it causes infinite loops
   }, [selectedWorkflow, configLoaded, availableMonitors]);
 
   return (

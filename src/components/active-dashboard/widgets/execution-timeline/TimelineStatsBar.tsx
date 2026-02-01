@@ -1,0 +1,157 @@
+/**
+ * TimelineStatsBar Component
+ *
+ * Displays timeline-specific statistics:
+ * - Elapsed time
+ * - Current iteration
+ * - Average iteration duration
+ * - Improvement over last verification
+ */
+
+import { Clock, RotateCcw, Timer, TrendingUp, TrendingDown, Minus } from "lucide-react";
+import { cn } from "../../../../lib/utils";
+import { getStatusColors } from "@/design-system";
+import type { TimelineStats } from "./types";
+
+interface TimelineStatsBarProps {
+  stats: TimelineStats;
+  /** Additional CSS classes */
+  className?: string;
+}
+
+/**
+ * Format elapsed time as "Xm Ys" or "Xh Ym" string.
+ */
+function formatTime(seconds: number): string {
+  if (seconds < 60) {
+    return `${seconds}s`;
+  }
+  const mins = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  if (mins < 60) {
+    return `${mins}m ${secs}s`;
+  }
+  const hours = Math.floor(mins / 60);
+  const remainingMins = mins % 60;
+  return `${hours}h ${remainingMins}m`;
+}
+
+/**
+ * Format duration in ms to a readable string.
+ */
+function formatDuration(ms: number): string {
+  if (ms < 1000) {
+    return `${ms}ms`;
+  }
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) {
+    return `${seconds}s`;
+  }
+  const mins = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  if (mins < 60) {
+    return `${mins}m ${secs}s`;
+  }
+  const hours = Math.floor(mins / 60);
+  const remainingMins = mins % 60;
+  return `${hours}h ${remainingMins}m`;
+}
+
+/**
+ * Timeline-specific statistics bar component.
+ */
+export function TimelineStatsBar({ stats, className }: TimelineStatsBarProps) {
+  const successColors = getStatusColors("success");
+  const errorColors = getStatusColors("error");
+
+  // Determine improvement icon and color
+  let ImprovementIcon = Minus;
+  let improvementColorClass = "text-muted-foreground";
+  if (stats.improvement) {
+    if (stats.improvement.delta > 0) {
+      ImprovementIcon = TrendingUp;
+      improvementColorClass = successColors.text;
+    } else if (stats.improvement.delta < 0) {
+      ImprovementIcon = TrendingDown;
+      improvementColorClass = errorColors.text;
+    }
+  }
+
+  return (
+    <div
+      className={cn(
+        "flex items-center gap-6 border-b border-border px-4 py-3 bg-muted/20",
+        className,
+      )}
+    >
+      {/* Elapsed Time */}
+      <div className="flex items-center gap-2">
+        <Clock className="h-4 w-4 text-muted-foreground" />
+        <div>
+          <p className="text-xs text-muted-foreground">Elapsed</p>
+          <p className="font-mono text-sm text-foreground">{formatTime(stats.elapsedTime)}</p>
+        </div>
+      </div>
+
+      {/* Current Iteration */}
+      {stats.maxIteration > 0 && (
+        <div className="flex items-center gap-2">
+          <RotateCcw className="h-4 w-4 text-muted-foreground" />
+          <div>
+            <p className="text-xs text-muted-foreground">Iteration</p>
+            <p className="font-mono text-sm text-foreground">
+              {stats.currentIteration ?? stats.maxIteration}
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Average Iteration Duration */}
+      {stats.avgIterationDurationMs !== null && (
+        <div className="flex items-center gap-2">
+          <Timer className="h-4 w-4 text-muted-foreground" />
+          <div>
+            <p className="text-xs text-muted-foreground">Avg Iteration</p>
+            <p className="font-mono text-sm text-foreground">
+              {formatDuration(stats.avgIterationDurationMs)}
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Improvement over last iteration */}
+      {stats.improvement && (
+        <div className="flex items-center gap-2">
+          <ImprovementIcon className={cn("h-4 w-4", improvementColorClass)} />
+          <div>
+            <p className="text-xs text-muted-foreground">vs Last Iteration</p>
+            <p className={cn("font-mono text-sm", improvementColorClass)}>
+              {stats.improvement.delta > 0 ? "+" : ""}
+              {stats.improvement.delta}/{stats.improvement.total} tests
+              <span className="text-xs ml-1">
+                ({stats.improvement.percentage > 0 ? "+" : ""}
+                {stats.improvement.percentage.toFixed(1)}%)
+              </span>
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Show latest verification result if no improvement data yet */}
+      {!stats.improvement && stats.verificationResults.length > 0 && (
+        <div className="flex items-center gap-2">
+          <TrendingUp className="h-4 w-4 text-muted-foreground" />
+          <div>
+            <p className="text-xs text-muted-foreground">Verification</p>
+            <p className="font-mono text-sm text-foreground">
+              {stats.verificationResults[stats.verificationResults.length - 1].passed}/
+              {stats.verificationResults[stats.verificationResults.length - 1].total} passed
+            </p>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default TimelineStatsBar;

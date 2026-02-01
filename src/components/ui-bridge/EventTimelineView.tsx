@@ -44,6 +44,11 @@ const EVENT_TYPE_CONFIG: Record<
     color: "text-blue-400",
     label: "Element Discovered",
   },
+  element_selected: {
+    icon: <Eye className="w-3.5 h-3.5" />,
+    color: "text-blue-400",
+    label: "Element Selected",
+  },
   action_executed: {
     icon: <MousePointer className="w-3.5 h-3.5" />,
     color: "text-green-400",
@@ -73,6 +78,16 @@ const EVENT_TYPE_CONFIG: Record<
     icon: <Navigation className="w-3.5 h-3.5" />,
     color: "text-cyan-400",
     label: "Path Found",
+  },
+  picker_enabled: {
+    icon: <MousePointer className="w-3.5 h-3.5" />,
+    color: "text-amber-400",
+    label: "Picker Enabled",
+  },
+  picker_disabled: {
+    icon: <MousePointer className="w-3.5 h-3.5" />,
+    color: "text-muted-foreground",
+    label: "Picker Disabled",
   },
   error: {
     icon: <AlertCircle className="w-3.5 h-3.5" />,
@@ -120,7 +135,7 @@ export function EventTimelineView({
       minute: "2-digit",
       second: "2-digit",
       fractionalSecondDigits: 3,
-    });
+    } as Intl.DateTimeFormatOptions);
   };
 
   // Format duration

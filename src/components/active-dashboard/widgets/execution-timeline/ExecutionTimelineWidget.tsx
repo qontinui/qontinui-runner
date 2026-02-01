@@ -274,7 +274,7 @@ function PhaseSection({
   group,
   defaultExpanded = true,
   expandedIterations,
-  onIterationToggle,
+  onIterationToggle: _onIterationToggle,
 }: {
   group: PhaseGroup;
   defaultExpanded?: boolean;

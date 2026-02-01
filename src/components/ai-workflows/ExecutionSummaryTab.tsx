@@ -31,6 +31,7 @@ import {
   Target,
   AlertTriangle,
   Sparkles,
+  Repeat,
 } from "lucide-react";
 import type { Finding, FindingSeverity } from "../../types/findings";
 import { findingsTracker, getVisibleCategories, aiDataService } from "../../services";
@@ -388,6 +389,89 @@ export function ExecutionSummaryTab() {
               <p className="text-sm text-amber-300/90 whitespace-pre-wrap">
                 {selectedRun.remaining_work}
               </p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Loop Result Section (Unified Workflow) */}
+      {selectedRun?.loop_result && (
+        <div
+          className={`flex-shrink-0 border-b border-border p-4 space-y-3 ${
+            selectedRun.loop_result.verification_passed
+              ? "bg-green-500/5"
+              : selectedRun.loop_result.critical_failure
+                ? "bg-red-500/5"
+                : "bg-amber-500/5"
+          }`}
+        >
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Repeat className="w-4 h-4 text-primary" />
+              <h3 className="font-medium text-foreground">Execution Loop</h3>
+              <span
+                className={`px-2 py-0.5 text-xs rounded ${
+                  selectedRun.loop_result.verification_passed
+                    ? `${getStatusColors("success").bg} ${getStatusColors("success").text}`
+                    : selectedRun.loop_result.critical_failure
+                      ? `${getStatusColors("error").bg} ${getStatusColors("error").text}`
+                      : `${getAccentColors("amber").bg} ${getAccentColors("amber").text}`
+                }`}
+              >
+                {selectedRun.loop_result.verification_passed
+                  ? "Passed"
+                  : selectedRun.loop_result.critical_failure
+                    ? "Critical Failure"
+                    : selectedRun.loop_result.was_stopped
+                      ? "Stopped"
+                      : selectedRun.loop_result.max_iterations_reached
+                        ? "Max Iterations"
+                        : "Failed"}
+              </span>
+            </div>
+            <span className="text-sm text-muted-foreground">
+              Completed in {selectedRun.loop_result.iterations_run} iteration
+              {selectedRun.loop_result.iterations_run !== 1 ? "s" : ""}
+            </span>
+          </div>
+          {selectedRun.loop_result.summary && (
+            <p className="text-sm text-foreground/80">{selectedRun.loop_result.summary}</p>
+          )}
+          {/* Per-iteration breakdown */}
+          {selectedRun.loop_result.iteration_results.length > 0 && (
+            <div className="flex flex-wrap gap-2 pt-2">
+              {selectedRun.loop_result.iteration_results.map((iter) => (
+                <div
+                  key={iter.iteration}
+                  className={`flex items-center gap-2 px-2 py-1 rounded text-xs ${
+                    iter.verification_passed
+                      ? "bg-green-500/10 text-green-400"
+                      : iter.critical_failure
+                        ? "bg-red-500/10 text-red-400"
+                        : "bg-amber-500/10 text-amber-400"
+                  }`}
+                >
+                  {iter.verification_passed ? (
+                    <CheckCircle className="w-3 h-3" />
+                  ) : iter.critical_failure ? (
+                    <AlertTriangle className="w-3 h-3" />
+                  ) : (
+                    <XCircle className="w-3 h-3" />
+                  )}
+                  <span>
+                    #{iter.iteration}: {iter.passed_checks}/{iter.passed_checks + iter.failed_checks}
+                  </span>
+                  {iter.agentic_phase_ran && (
+                    <span className="opacity-75">
+                      {iter.agentic_phase_success === true
+                        ? "(AI ok)"
+                        : iter.agentic_phase_success === false
+                          ? "(AI failed)"
+                          : "(AI ran)"}
+                    </span>
+                  )}
+                </div>
+              ))}
             </div>
           )}
         </div>

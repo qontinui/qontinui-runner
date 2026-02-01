@@ -76,6 +76,7 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
 
   useEffect(() => {
     loadSettings();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Check for API key when provider changes

@@ -68,6 +68,9 @@ function mapCheckType(stepType: string): VerificationTestType {
   const typeMap: Record<string, VerificationTestType> = {
     check_group: "check_group",
     check: "check_group",
+    error_check: "check_group",
+    log_check: "check_group",
+    shell: "check_group",
     playwright: "playwright",
     gui_automation: "gui_automation",
     repo_test: "repo_test",

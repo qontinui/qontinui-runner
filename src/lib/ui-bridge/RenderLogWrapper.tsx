@@ -13,7 +13,7 @@ export interface RenderLogWrapperProps {
   /** Current active tab */
   activeTab: string;
   /** Task run ID */
-  taskRunId?: number;
+  taskRunId?: string | number;
   /** Enable on mount */
   enableOnMount?: boolean;
   /** Enable mutation observer */

@@ -74,19 +74,6 @@ export function ExecutionReport({
   const runSelection = useRunSelectionOptional();
   const selectedRun = runSelection?.selectedRun;
 
-  // No run selected state (when context is present but no run selected)
-  if (runSelection && !selectedRun) {
-    return (
-      <div className="h-full flex flex-col items-center justify-center text-muted-foreground p-8">
-        <Activity className="w-12 h-12 mb-4 opacity-50" />
-        <p className="text-lg font-medium">No Run Selected</p>
-        <p className="text-sm mt-2 text-center max-w-md">
-          Select a run from the Run Dashboard to view findings.
-        </p>
-      </div>
-    );
-  }
-
   // Subscribe to live findings updates
   useEffect(() => {
     const unsubscribe = findingsTracker.subscribe((event) => {
@@ -330,6 +317,19 @@ Work through ALL findings systematically. Fix each one and report your resolutio
 
   const statusInfo = report ? statusLabels[report.status] : null;
   const StatusIcon = statusInfo?.icon || FileText;
+
+  // No run selected state (when context is present but no run selected)
+  if (runSelection && !selectedRun) {
+    return (
+      <div className="h-full flex flex-col items-center justify-center text-muted-foreground p-8">
+        <Activity className="w-12 h-12 mb-4 opacity-50" />
+        <p className="text-lg font-medium">No Run Selected</p>
+        <p className="text-sm mt-2 text-center max-w-md">
+          Select a run from the Run Dashboard to view findings.
+        </p>
+      </div>
+    );
+  }
 
   // Empty state
   if (findings.length === 0) {

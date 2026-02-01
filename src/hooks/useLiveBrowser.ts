@@ -150,7 +150,7 @@ export function useLiveBrowser(): UseLiveBrowserReturn {
   const [isExtensionConnected, setIsExtensionConnected] = useState(false);
 
   // Picker state
-  const pickerResolveRef = useRef<((element: DiscoveredElement | null) => void) | null>(null);
+  const _pickerResolveRef = useRef<((element: DiscoveredElement | null) => void) | null>(null);
 
   /**
    * Check if the extension WebSocket is connected
@@ -228,11 +228,13 @@ export function useLiveBrowser(): UseLiveBrowserReturn {
    * Connect to a browser tab
    */
   const connectToTab = useCallback(async (tabId: number) => {
+    console.log("[useLiveBrowser] connectToTab called with tabId:", tabId);
     setConnectionStatus("connecting");
     setError(null);
 
     try {
       // Select the tab for exploration
+      console.log("[useLiveBrowser] Sending selectTab command...");
       const selectResponse = await fetch(`${RUNNER_API}/extension/command`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -243,15 +245,18 @@ export function useLiveBrowser(): UseLiveBrowserReturn {
       });
 
       if (!selectResponse.ok) {
+        console.error("[useLiveBrowser] selectTab response not ok:", selectResponse.status);
         throw new Error("Failed to select tab");
       }
 
       const selectData = await selectResponse.json();
+      console.log("[useLiveBrowser] selectTab response:", selectData);
       if (!selectData.success) {
         throw new Error(selectData.error || "Failed to select tab");
       }
 
       // Connect to verify UI Bridge availability
+      console.log("[useLiveBrowser] Sending connect command...");
       const connectResponse = await fetch(`${RUNNER_API}/extension/command`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -262,14 +267,17 @@ export function useLiveBrowser(): UseLiveBrowserReturn {
       });
 
       if (!connectResponse.ok) {
+        console.error("[useLiveBrowser] connect response not ok:", connectResponse.status);
         throw new Error("Failed to connect to tab");
       }
 
       const connectData = await connectResponse.json();
+      console.log("[useLiveBrowser] connect response:", connectData);
       if (!connectData.success) {
         throw new Error(connectData.error || "UI Bridge not available on this page");
       }
 
+      console.log("[useLiveBrowser] Connection successful! Setting connected status.");
       setConnectedTarget({
         type: "browser",
         id: tabId,
@@ -281,7 +289,9 @@ export function useLiveBrowser(): UseLiveBrowserReturn {
       // Auto-refresh elements
       await refreshElementsInternal();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to connect to tab");
+      const errorMessage = err instanceof Error ? err.message : "Failed to connect to tab";
+      console.error("[useLiveBrowser] Connection failed:", errorMessage, err);
+      setError(errorMessage);
       setConnectionStatus("error");
       setConnectedTarget(null);
     }

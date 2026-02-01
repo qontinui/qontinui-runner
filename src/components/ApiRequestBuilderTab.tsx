@@ -17,7 +17,6 @@ import {
   FolderOpen,
   Copy,
   X,
-  ChevronDown,
   Settings,
   Clock,
   Code,
@@ -29,8 +28,6 @@ import type {
   UpdateSavedApiRequestRequest,
   HttpMethod,
   ApiContentType,
-  ApiVariableExtraction,
-  ApiAssertion,
 } from "../types";
 import { getAccentColors } from "@/design-system";
 import { BuilderToolbar, toolbarActions } from "./ui/BuilderToolbar";
@@ -59,13 +56,13 @@ const METHOD_COLORS: Record<HttpMethod, string> = {
 interface ApiRequestBuilderTabProps {
   onLog?: (level: string, message: string) => void;
   editRequestId?: string | null;
-  onNavigateToLibrary?: () => void;
+  _onNavigateToLibrary?: () => void;
 }
 
 export function ApiRequestBuilderTab({
   onLog,
   editRequestId,
-  onNavigateToLibrary,
+  _onNavigateToLibrary,
 }: ApiRequestBuilderTabProps) {
   // State
   const [requests, setRequests] = useState<SavedApiRequest[]>([]);

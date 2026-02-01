@@ -123,8 +123,11 @@ export function EventManagerProvider({ children }: EventManagerProviderProps) {
               line?: string;
               source?: string;
               actionId?: string;
+              taskRunId?: string;
               sessionId?: string;
               sessionName?: string;
+              phase?: string;
+              phaseIteration?: number;
             }>,
           ) => {
             if (!isMounted) {
@@ -140,8 +143,11 @@ export function EventManagerProvider({ children }: EventManagerProviderProps) {
                 data.line,
                 data.source,
                 data.actionId,
+                data.taskRunId,
                 data.sessionId,
                 data.sessionName,
+                data.phase,
+                data.phaseIteration,
               );
             }
           },

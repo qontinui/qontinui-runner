@@ -10,7 +10,7 @@ import { FileCode, Hash, FolderOpen } from "lucide-react";
 import { cn } from "../../../../lib/utils";
 import { Badge, ScrollArea } from "../../../ui";
 import { StepStatsBar, StepStatusBadge, StepOutputPanel } from "../shared";
-import { getAccentColors, getStatusColors } from "@/design-system";
+import { getStatusColors } from "@/design-system";
 import type { ScriptWidgetProps } from "./types";
 import type { ScriptExecution } from "../shared/types";
 

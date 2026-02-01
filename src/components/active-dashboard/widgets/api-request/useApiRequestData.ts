@@ -47,7 +47,7 @@ interface StepExecutionResponse {
 export function useApiRequestData(): ApiRequestData {
   const [requests, setRequests] = useState<ApiRequestExecution[]>([]);
   const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [error, _setError] = useState<string | null>(null);
   const [startTime, setStartTime] = useState<number | null>(null);
   const [elapsedTime, setElapsedTime] = useState(0);
 

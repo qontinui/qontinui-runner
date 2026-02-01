@@ -6,8 +6,6 @@
 
 import { useState } from "react";
 import {
-  Hash,
-  Clock,
   Database,
   Lightbulb,
   Shield,
@@ -18,7 +16,7 @@ import {
   CheckCircle,
   XCircle,
 } from "lucide-react";
-import type { Checkpoint, StateSnapshot } from "../../types/checkpoint";
+import type { Checkpoint } from "../../types/checkpoint";
 import { formatDateTime, TRIGGER_TYPE_LABELS } from "../../types/checkpoint";
 
 interface StateSnapshotViewProps {

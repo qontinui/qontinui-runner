@@ -7,11 +7,20 @@
 
 import { useState, useEffect, useMemo } from "react";
 import { logManager } from "../../../../managers";
-import { useCurrentTaskRunId } from "../../../../contexts/TaskContext";
+import { useCurrentTaskRunId, useTaskStartTime } from "../../../../contexts/TaskContext";
 import type { AiConversationData, AiOutputEntry } from "./types";
 
 /** Threshold in milliseconds to consider AI as "thinking" based on recent activity */
 const THINKING_THRESHOLD_MS = 5000;
+
+/**
+ * Global session tracking to persist across component remounts.
+ * This ensures that when widgets move between containers, they don't lose their content.
+ */
+const sessionTracker = {
+  currentTaskId: null as string | null,
+  sessionStartTime: null as number | null,
+};
 
 /**
  * Filter entries to only show the most recent session.
@@ -76,19 +85,35 @@ const EMPTY_DATA: AiConversationData = {
  */
 export function useAiConversationData(): AiConversationData {
   const currentTaskRunId = useCurrentTaskRunId();
+  const taskStartTime = useTaskStartTime();
   const [allEntries, setAllEntries] = useState<AiOutputEntry[]>([]);
-  const [sessionStartTime, setSessionStartTime] = useState<number | null>(null);
+  // Initialize from global tracker to preserve state across remounts
+  const [sessionStartTime, setSessionStartTime] = useState<number | null>(
+    () => sessionTracker.sessionStartTime
+  );
 
   // Track when a new task starts (to filter out stale data)
+  // Only reset sessionStartTime when the task ID actually changes, not on remount
+  // Use the task's actual start time from the database instead of Date.now()
+  // to avoid race conditions where AI events arrive before we detect the task
   useEffect(() => {
     if (currentTaskRunId) {
-      // New task started - record the time to filter out older entries
-      setSessionStartTime(Date.now());
+      // Only set a new session start time if this is a different task
+      if (currentTaskRunId !== sessionTracker.currentTaskId) {
+        // Use task's actual start time from DB, fallback to Date.now() if not available
+        const newStartTime = taskStartTime ?? Date.now();
+        sessionTracker.currentTaskId = currentTaskRunId;
+        sessionTracker.sessionStartTime = newStartTime;
+        setSessionStartTime(newStartTime);
+      }
+      // If same task and we have a stored time, the useState initializer already handled it
     } else {
       // No task running - clear session start time
+      sessionTracker.currentTaskId = null;
+      sessionTracker.sessionStartTime = null;
       setSessionStartTime(null);
     }
-  }, [currentTaskRunId]);
+  }, [currentTaskRunId, taskStartTime]);
 
   // Subscribe to log changes
   useEffect(() => {

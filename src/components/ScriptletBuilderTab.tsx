@@ -37,7 +37,7 @@ interface ScriptletBuilderTabProps {
 export function ScriptletBuilderTab({
   onLog,
   editScriptletId,
-  onNavigateToLibrary,
+  onNavigateToLibrary: _onNavigateToLibrary,
 }: ScriptletBuilderTabProps) {
   // State
   const [scriptlets, setScriptlets] = useState<Scriptlet[]>([]);
@@ -96,6 +96,7 @@ export function ScriptletBuilderTab({
     } finally {
       setIsDeleting(false);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedIds, exitSelectionMode, onLog]);
 
   // Get names of selected scriptlets for dialog

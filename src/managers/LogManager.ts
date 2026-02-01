@@ -84,8 +84,11 @@ class LogManager {
         line: string;
         source: string;
         action_id?: string;
+        task_run_id?: string;
         session_id?: string;
         session_name?: string;
+        phase?: string;
+        phase_iteration?: number;
       }
 
       const result = await invoke<{
@@ -102,8 +105,11 @@ class LogManager {
           line: entry.line,
           source: entry.source,
           actionId: entry.action_id,
+          taskRunId: entry.task_run_id,
           sessionId: entry.session_id,
           sessionName: entry.session_name,
+          phase: entry.phase,
+          phaseIteration: entry.phase_iteration,
         }));
 
         this.logStore.loadAiOutputLogs(entries);
@@ -192,9 +198,11 @@ class LogManager {
     line: string,
     source: string,
     actionId?: string,
+    taskRunId?: string,
     sessionId?: string,
     sessionName?: string,
     phase?: string,
+    phaseIteration?: number,
   ): void {
     const entry: AiOutputEntry = {
       id: `ai-${Date.now()}-${Math.random()}`,
@@ -202,9 +210,11 @@ class LogManager {
       line,
       source,
       actionId,
+      taskRunId,
       sessionId,
       sessionName,
       phase,
+      phaseIteration,
     };
     this.logStore.addAiOutputLog(entry);
 
@@ -216,9 +226,11 @@ class LogManager {
         line: entry.line,
         source: entry.source,
         action_id: entry.actionId,
+        task_run_id: entry.taskRunId,
         session_id: entry.sessionId,
         session_name: entry.sessionName,
         phase: entry.phase,
+        phase_iteration: entry.phaseIteration,
       },
     }).catch((err) => {
       console.warn("[LogManager] Failed to persist AI output log:", err);

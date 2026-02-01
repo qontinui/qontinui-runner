@@ -34,6 +34,26 @@ export type WorkflowPhase = "setup" | "verification" | "agentic" | "completion";
 export type LogSourceSelection = "default" | "ai" | "all" | { profile_id: string };
 
 // =============================================================================
+// Health Check Configuration
+// =============================================================================
+
+/**
+ * Configuration for a health check URL
+ */
+export interface HealthCheckUrl {
+  /** Display name for the health check (e.g., "Backend Server") */
+  name: string;
+  /** URL to check (e.g., "http://localhost:8000/health") */
+  url: string;
+  /** Expected HTTP status code (default: 200) */
+  expected_status?: number;
+  /** Timeout in seconds (default: 5) */
+  timeout_seconds?: number;
+  /** Whether failure should stop the workflow (default: true) */
+  is_critical?: boolean;
+}
+
+// =============================================================================
 // Step Types
 // =============================================================================
 
@@ -310,6 +330,8 @@ export interface TestStep extends BaseStep {
   code?: string;
   /** Reference to saved test ID */
   test_id?: string;
+  /** Timeout in seconds */
+  timeout_seconds?: number;
   /**
    * Whether failure blocks the agentic loop.
    * - true (default): Failure causes agentic phase to fix the problem
@@ -327,6 +349,12 @@ export interface TestStep extends BaseStep {
   description?: string;
 
   // Playwright-specific configuration
+  /** Reference to saved Playwright script ID */
+  script_id?: string;
+  /** Inline Playwright script content */
+  script_content?: string;
+  /** Target URL for Playwright tests */
+  target_url?: string;
   /** Which setup script to fuse with (for Playwright tests) */
   fused_script_id?: string;
   /** Execution mode: fresh session or continue after previous test */
@@ -365,6 +393,8 @@ export interface CheckStep extends BaseStep {
   phase: "setup" | "verification" | "completion";
   /** Type of check to run */
   check_type: CheckType;
+  /** Tool name (UI helper, e.g., "eslint", "ruff", "mypy") */
+  tool?: string;
   /** Reference to saved check ID (from check library) */
   check_id?: string;
   /** Command to run (for custom_command or overrides) */
@@ -491,6 +521,8 @@ export interface McpCallStep extends BaseStep {
   server_name?: string;
   /** Tool name to call */
   tool_name: string;
+  /** Tool description (for display) */
+  tool_description?: string;
 
   /** Tool arguments (supports {{variables}}) */
   arguments?: Record<string, unknown>;
@@ -731,6 +763,13 @@ export interface UnifiedWorkflow {
   // Settings (shown when relevant steps present)
   /** Maximum iterations for agentic phase (when has agentic steps) */
   max_iterations?: number;
+  /**
+   * Optional inactivity timeout in seconds for AI sessions.
+   * - undefined/null: No timeout, runs until completion or manual stop (default)
+   * - number: Kill AI session after N seconds of no output
+   * Takes precedence over the global AI settings timeout.
+   */
+  timeout_seconds?: number | null;
   /** AI provider override */
   provider?: string;
   /** Model override */
@@ -773,6 +812,32 @@ export interface UnifiedWorkflow {
    * Note: Deterministic summary (test results, screenshots, etc.) is always collected.
    */
   skip_ai_summary?: boolean;
+
+  // Log watch settings
+  /**
+   * Whether to automatically include a log_watch step before verification.
+   * When enabled (default), a log_watch step is prepended to verification steps
+   * to detect runtime errors in backend/frontend logs.
+   * Default: true
+   */
+  log_watch_enabled?: boolean;
+
+  // Health check settings
+  /**
+   * Whether to automatically include health check steps before verification.
+   * When enabled (default) and health_check_urls is non-empty, health check steps
+   * are prepended to verification steps to verify configured servers are running.
+   * Health checks run BEFORE log_watch to catch server down before scanning logs.
+   * Default: true
+   */
+  health_check_enabled?: boolean;
+
+  /**
+   * URLs to health check before verification (user-configurable).
+   * Each entry specifies a URL to check, expected status, and timeout.
+   * If empty, no health checks are performed even if health_check_enabled is true.
+   */
+  health_check_urls?: HealthCheckUrl[];
 
   // Prompt template settings
   /**

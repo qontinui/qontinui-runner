@@ -741,6 +741,8 @@ export function WorkflowBuilderProvider({
         disabled_context_ids: workflow.disabled_context_ids,
         auto_include_contexts: workflow.auto_include_contexts,
         prompt_template: workflow.prompt_template,
+        log_watch_enabled: workflow.log_watch_enabled,
+        health_check_enabled: workflow.health_check_enabled,
       };
 
       const url = isNew

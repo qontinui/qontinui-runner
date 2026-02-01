@@ -35,6 +35,8 @@ export interface TaskActivityInfo {
   maxIterations: number;
   /** Explicitly detected activity types */
   activities: ActivityType[];
+  /** Task start time (ms since epoch) - used for filtering AI output to current task */
+  startTime: number | null;
 }
 
 /**
@@ -213,5 +215,9 @@ export const defaultDetectors: Record<ActivityType, (info: TaskActivityInfo) => 
   mcp_call: (info) => {
     // Show MCP call widget when MCP tool calls are being made
     return info.activities.includes("mcp_call");
+  },
+  flow_execution: (info) => {
+    // Show flow execution widget when a flow is running
+    return info.activities.includes("flow_execution");
   },
 };

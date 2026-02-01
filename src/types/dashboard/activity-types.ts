@@ -19,6 +19,7 @@
  * - script: Script execution (Python, JS, etc.) with output
  * - workflow_ref: Referenced sub-workflow execution status
  * - mcp_call: MCP (Model Context Protocol) tool calls to external servers
+ * - flow_execution: Flow Designer deterministic workflow execution
  */
 export type ActivityType =
   | "gui_automation"
@@ -32,7 +33,8 @@ export type ActivityType =
   | "script"
   | "workflow_ref"
   | "mcp_call"
-  | "execution_timeline";
+  | "execution_timeline"
+  | "flow_execution";
 
 /**
  * Status of an individual activity.
@@ -190,6 +192,12 @@ export const ACTIVITY_DISPLAY_CONFIG: Record<ActivityType, ActivityDisplayConfig
     accentColor: "violet",
     detailRoute: "/logs/mcp",
   },
+  flow_execution: {
+    displayName: "Flow Execution",
+    icon: "GitBranch",
+    accentColor: "emerald",
+    detailRoute: "/flow-designer",
+  },
 };
 
 /**
@@ -197,6 +205,7 @@ export const ACTIVITY_DISPLAY_CONFIG: Record<ActivityType, ActivityDisplayConfig
  */
 export const ACTIVITY_PRIORITIES: Record<ActivityType, number> = {
   execution_timeline: 5, // Highest priority - shows overview
+  flow_execution: 8, // Flow Designer executions - high priority
   gui_automation: 10,
   playwright: 15,
   shell_command: 18,

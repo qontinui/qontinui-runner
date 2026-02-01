@@ -18,7 +18,7 @@ import {
   Trash2,
   Radio,
 } from "lucide-react";
-import { Card, CardHeader, CardTitle, CardContent } from "../ui/Card";
+import { Card, CardHeader, CardTitle } from "../ui/Card";
 import { Badge } from "../ui/Badge";
 import { ScrollArea } from "../ui/ScrollArea";
 import { RoutingStatusSection } from "./RoutingStatusSection";

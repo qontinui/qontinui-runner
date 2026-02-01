@@ -153,6 +153,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
     loadSettings();
     checkApiKey();
     checkGeminiApiKey();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const loadSettings = async () => {

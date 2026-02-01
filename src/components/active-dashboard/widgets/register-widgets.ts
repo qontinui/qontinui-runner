@@ -55,6 +55,13 @@ import {
   useExecutionTimelineData,
 } from "./execution-timeline";
 
+// Import Flow Execution widget
+import {
+  FlowExecutionWidget,
+  FlowExecutionSummary,
+  useFlowExecutionData,
+} from "./flow-execution";
+
 /**
  * Register all dashboard widgets.
  * Call this once at app initialization.
@@ -77,6 +84,20 @@ export function registerAllWidgets(): void {
     detectActivity: defaultDetectors.execution_timeline,
     defaultPriority: 5, // Highest priority - shows first
     detailRoute: "/logs/timeline",
+  });
+
+  // Flow Execution - Flow Designer deterministic workflow execution
+  widgetRegistry.register({
+    id: "flow_execution",
+    displayName: "Flow Execution",
+    icon: "GitBranch",
+    accentColor: "emerald",
+    FullComponent: FlowExecutionWidget,
+    SummaryComponent: FlowExecutionSummary,
+    useData: useFlowExecutionData,
+    detectActivity: defaultDetectors.flow_execution,
+    defaultPriority: 8,
+    detailRoute: "/flow-designer",
   });
 
   // GUI Automation - primary widget for GUI automation setup/navigation

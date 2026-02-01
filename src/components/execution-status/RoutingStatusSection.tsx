@@ -13,7 +13,7 @@ import {
   type TaskComplexity,
   getComplexityDisplayName,
 } from "../../types/executionStatus";
-import { getStatusColors, getAccentColors } from "@/design-system";
+import { getAccentColors } from "@/design-system";
 
 interface RoutingStatusSectionProps {
   routing: RoutingStatus;

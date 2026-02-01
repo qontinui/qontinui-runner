@@ -187,8 +187,10 @@ function ScopeSection({
   onToggle,
   disabled,
 }: ScopeSectionProps) {
+  // Always call hooks unconditionally to satisfy React's Rules of Hooks
   const [isExpanded, setIsExpanded] = useState(true);
 
+  // Early return after all hooks are called
   if (contexts.length === 0) {
     return null;
   }
@@ -307,11 +309,13 @@ export function ContextSelector({
   }, [selection.autoDetect, autoDetectState.evaluated, autoDetectState.loading, runAutoDetection]);
 
   // Re-evaluate when task context changes
+  const actionTypesKey = actionTypes.join(",");
+  const recentErrorsKey = recentErrors.join(",");
   useEffect(() => {
     if (selection.autoDetect) {
       setAutoDetectState((prev) => ({ ...prev, evaluated: false }));
     }
-  }, [taskPrompt, actionTypes.join(","), recentErrors.join(",")]);
+  }, [selection.autoDetect, taskPrompt, actionTypesKey, recentErrorsKey]);
 
   /**
    * Toggle auto-detect mode

@@ -13,7 +13,7 @@ import {
   formatTokenCount,
   calculateCompressionSavings,
 } from "../../types/executionStatus";
-import { getStatusColors, getAccentColors } from "@/design-system";
+import { getAccentColors } from "@/design-system";
 
 interface CompressionStatusSectionProps {
   compression: CompressionStatus;

@@ -7,7 +7,7 @@
 
 import { useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Sparkles, Loader2, RefreshCw, Check, X, BookOpen, Wand2 } from "lucide-react";
+import { Sparkles, Loader2, RefreshCw, Check, X, Wand2 } from "lucide-react";
 
 interface GeneratedContext {
   name: string;

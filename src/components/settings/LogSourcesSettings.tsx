@@ -6,7 +6,7 @@
  * and AI-assisted selection.
  */
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   FileText,
@@ -39,6 +39,15 @@ interface GlobalLogSource {
   enabled: boolean;
   color?: string;
   keywords: string[];
+  // Error monitoring fields
+  format: string;
+  parser: string;
+  timestamp_pattern?: string;
+  timezone: string;
+  error_patterns: string[];
+  warning_patterns: string[];
+  ignore_patterns: string[];
+  poll_interval_ms: number;
 }
 
 interface GlobalLogSourceProfile {
@@ -104,6 +113,7 @@ export function LogSourcesSettings({ onLog }: LogSourcesSettingsProps) {
   // Load settings on mount
   useEffect(() => {
     loadSettings();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const loadSettings = async () => {
@@ -460,7 +470,13 @@ export function LogSourcesSettings({ onLog }: LogSourcesSettingsProps) {
       {(showAddSource || editingSource) && (
         <SourceEditor
           source={editingSource}
-          onSave={(source) => (editingSource ? updateSource(source) : addSource(source))}
+          onSave={(source) => {
+            if (editingSource) {
+              updateSource(source as GlobalLogSource);
+            } else {
+              addSource(source as Omit<GlobalLogSource, "id">);
+            }
+          }}
           onCancel={() => {
             setShowAddSource(false);
             setEditingSource(null);
@@ -473,7 +489,13 @@ export function LogSourcesSettings({ onLog }: LogSourcesSettingsProps) {
         <ProfileEditor
           profile={editingProfile}
           sources={settings.sources}
-          onSave={(profile) => (editingProfile ? updateProfile(profile) : addProfile(profile))}
+          onSave={(profile) => {
+            if (editingProfile) {
+              updateProfile(profile as GlobalLogSourceProfile);
+            } else {
+              addProfile(profile as Omit<GlobalLogSourceProfile, "id" | "created_at" | "updated_at">);
+            }
+          }}
           onCancel={() => {
             setShowAddProfile(false);
             setEditingProfile(null);
@@ -621,13 +643,22 @@ function SourceEditor({
     tail_lines: source?.tail_lines || 100,
     color: source?.color || "",
     keywords: source?.keywords?.join(", ") || "",
+    // Error monitoring fields
+    format: source?.format || "plaintext",
+    parser: source?.parser || "generic",
+    timestamp_pattern: source?.timestamp_pattern || "",
+    timezone: source?.timezone || "local",
+    error_patterns: source?.error_patterns?.join("\n") || "",
+    warning_patterns: source?.warning_patterns?.join("\n") || "",
+    ignore_patterns: source?.ignore_patterns?.join("\n") || "",
+    poll_interval_ms: source?.poll_interval_ms || 5000,
   });
+  const [showErrorMonitoring, setShowErrorMonitoring] = useState(false);
 
   const handleSubmit = () => {
     if (!form.name || !form.path) return;
 
-    const data = {
-      ...(source ? { id: source.id } : {}),
+    const baseData = {
       name: form.name,
       description: form.description,
       category: form.category,
@@ -641,14 +672,38 @@ function SourceEditor({
         .split(",")
         .map((k) => k.trim())
         .filter(Boolean),
+      // Error monitoring fields
+      format: form.format,
+      parser: form.parser,
+      timestamp_pattern: form.timestamp_pattern || undefined,
+      timezone: form.timezone,
+      error_patterns: form.error_patterns
+        .split("\n")
+        .map((p) => p.trim())
+        .filter(Boolean),
+      warning_patterns: form.warning_patterns
+        .split("\n")
+        .map((p) => p.trim())
+        .filter(Boolean),
+      ignore_patterns: form.ignore_patterns
+        .split("\n")
+        .map((p) => p.trim())
+        .filter(Boolean),
+      poll_interval_ms: form.poll_interval_ms,
     };
 
-    onSave(data as GlobalLogSource);
+    if (source) {
+      // Editing existing source - include id
+      onSave({ ...baseData, id: source.id } as GlobalLogSource);
+    } else {
+      // Creating new source - no id
+      onSave(baseData as Omit<GlobalLogSource, "id">);
+    }
   };
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div className="bg-background rounded-lg shadow-xl w-full max-w-md p-4 space-y-4">
+      <div className="bg-background rounded-lg shadow-xl w-full max-w-md p-4 space-y-4 max-h-[85vh] overflow-y-auto">
         <div className="flex items-center justify-between">
           <h3 className="font-medium">{source ? "Edit Source" : "Add Source"}</h3>
           <button onClick={onCancel} className="p-1 hover:bg-muted rounded">
@@ -783,6 +838,136 @@ function SourceEditor({
             <p className="text-[10px] text-muted-foreground mt-1">
               Keywords help AI identify when this source is relevant
             </p>
+          </div>
+
+          {/* Error Monitoring Section */}
+          <div className="border-t border-border pt-3 mt-3">
+            <button
+              type="button"
+              onClick={() => setShowErrorMonitoring(!showErrorMonitoring)}
+              className="flex items-center gap-1 text-xs font-medium text-muted-foreground hover:text-foreground"
+              data-ui-id="settings-logsources-source-error-monitoring-toggle"
+            >
+              {showErrorMonitoring ? (
+                <ChevronDown className="w-3 h-3" />
+              ) : (
+                <ChevronRight className="w-3 h-3" />
+              )}
+              Error Monitoring
+            </button>
+
+            {showErrorMonitoring && (
+              <div className="space-y-3 mt-3">
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-xs font-medium">Format</label>
+                    <select
+                      value={form.format}
+                      onChange={(e) => setForm((f) => ({ ...f, format: e.target.value }))}
+                      className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                      data-ui-id="settings-logsources-source-format-select"
+                    >
+                      <option value="plaintext">Plaintext</option>
+                      <option value="json">JSON</option>
+                      <option value="jsonl">JSONL</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs font-medium">Parser</label>
+                    <select
+                      value={form.parser}
+                      onChange={(e) => setForm((f) => ({ ...f, parser: e.target.value }))}
+                      className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                      data-ui-id="settings-logsources-source-parser-select"
+                    >
+                      <option value="generic">Generic</option>
+                      <option value="python">Python</option>
+                      <option value="javascript">JavaScript</option>
+                      <option value="rust">Rust</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="text-xs font-medium">Timestamp Pattern</label>
+                  <input
+                    type="text"
+                    value={form.timestamp_pattern}
+                    onChange={(e) => setForm((f) => ({ ...f, timestamp_pattern: e.target.value }))}
+                    placeholder="e.g. ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+                    className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                    data-ui-id="settings-logsources-source-timestamp-pattern-input"
+                  />
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-xs font-medium">Timezone</label>
+                    <input
+                      type="text"
+                      value={form.timezone}
+                      onChange={(e) => setForm((f) => ({ ...f, timezone: e.target.value }))}
+                      placeholder="local"
+                      className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                      data-ui-id="settings-logsources-source-timezone-input"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs font-medium">Poll Interval (ms)</label>
+                    <input
+                      type="number"
+                      value={form.poll_interval_ms}
+                      onChange={(e) =>
+                        setForm((f) => ({
+                          ...f,
+                          poll_interval_ms: parseInt(e.target.value) || 5000,
+                        }))
+                      }
+                      min={500}
+                      max={60000}
+                      className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                      data-ui-id="settings-logsources-source-poll-interval-input"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="text-xs font-medium">Error Patterns (one per line)</label>
+                  <textarea
+                    value={form.error_patterns}
+                    onChange={(e) => setForm((f) => ({ ...f, error_patterns: e.target.value }))}
+                    placeholder="Custom regex patterns to identify errors"
+                    rows={3}
+                    className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 font-mono"
+                    data-ui-id="settings-logsources-source-error-patterns-textarea"
+                  />
+                </div>
+
+                <div>
+                  <label className="text-xs font-medium">Warning Patterns (one per line)</label>
+                  <textarea
+                    value={form.warning_patterns}
+                    onChange={(e) => setForm((f) => ({ ...f, warning_patterns: e.target.value }))}
+                    placeholder="Custom regex patterns to identify warnings"
+                    rows={2}
+                    className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 font-mono"
+                    data-ui-id="settings-logsources-source-warning-patterns-textarea"
+                  />
+                </div>
+
+                <div>
+                  <label className="text-xs font-medium">Ignore Patterns (one per line)</label>
+                  <textarea
+                    value={form.ignore_patterns}
+                    onChange={(e) => setForm((f) => ({ ...f, ignore_patterns: e.target.value }))}
+                    placeholder="Patterns to suppress false positives"
+                    rows={2}
+                    className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 font-mono"
+                    data-ui-id="settings-logsources-source-ignore-patterns-textarea"
+                  />
+                </div>
+              </div>
+            )}
           </div>
         </div>
 

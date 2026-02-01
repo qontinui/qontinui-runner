@@ -6,7 +6,7 @@
  */
 
 import React, { useState, useCallback } from "react";
-import { ChevronDown, ChevronRight, Plus, Trash2, Check } from "lucide-react";
+import { ChevronDown, ChevronRight, Plus, Trash2 } from "lucide-react";
 import type { WorkflowPhase, UnifiedStep } from "../../types";
 import { PHASE_INFO } from "../../types";
 import { useWorkflowBuilder } from "./WorkflowBuilderContext";

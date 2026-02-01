@@ -58,8 +58,8 @@ export const aiDataService = {
   },
 
   /**
-   * Reopen a finished task run to add more iterations.
-   * This allows continuing a task that didn't achieve its goal.
+   * Resume a finished task run with additional iterations.
+   * This reopens the task and triggers workflow execution.
    * @param taskId - Task run ID
    * @param additionalSessions - Number of additional sessions to add
    */
@@ -67,7 +67,21 @@ export const aiDataService = {
     taskId: string,
     additionalSessions: number,
   ): Promise<AiDataResponse<TaskRun>> {
-    return invoke("reopen_task_run", { taskId, additionalSessions });
+    try {
+      const response = await fetch(`http://localhost:9876/task-runs/${taskId}/resume`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ additional_sessions: additionalSessions }),
+      });
+      const result = await response.json();
+      if (!result.success) {
+        return { success: false, error: result.error || "Failed to resume task run" };
+      }
+      // Fetch the updated task run to return
+      return invoke("get_task_run_for_viewer", { taskId });
+    } catch (error) {
+      return { success: false, error: String(error) };
+    }
   },
 
   /**

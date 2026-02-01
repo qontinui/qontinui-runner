@@ -2,21 +2,20 @@
  * useLogContent
  *
  * Hook for reading and refreshing log content from sources.
- * Handles communication with the Tauri backend for log reading.
+ * Sources are resolved from global settings by the backend.
  */
 
 import { useState, useCallback, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type {
   ProjectLogConfig,
-  LogSource,
   LogSourceContent,
   ProjectLogsState,
   CommandResponse,
   RawLogContent,
   UseLogContentReturn,
 } from "./types";
-import { convertRawContentToTypescript, convertSourcesToRust } from "./types";
+import { convertRawContentToTypescript } from "./types";
 
 interface UseLogContentProps {
   config: ProjectLogConfig | null;
@@ -43,14 +42,12 @@ export function useLogContent({ config }: UseLogContentProps): UseLogContentRetu
   }, [config?.projectId]);
 
   /**
-   * Read content from a single log source
+   * Read content from a single log source by global ID
    */
-  const readLogSource = useCallback(async (source: LogSource): Promise<LogSourceContent | null> => {
+  const readLogSource = useCallback(async (sourceId: string): Promise<LogSourceContent | null> => {
     try {
-      const rustSource = convertSourcesToRust([source])[0];
-
       const response = await invoke<CommandResponse>("read_log_source", {
-        source: rustSource,
+        sourceId,
       });
 
       if (response.success && response.data) {
@@ -65,10 +62,10 @@ export function useLogContent({ config }: UseLogContentProps): UseLogContentRetu
   }, []);
 
   /**
-   * Refresh log content from all enabled sources
+   * Refresh log content from all resolved sources for the project
    */
   const refreshLogs = useCallback(async () => {
-    if (!config || !config.logSources || config.logSources.length === 0) {
+    if (!config) {
       setLogsState((prev) => ({
         ...prev,
         sources: [],

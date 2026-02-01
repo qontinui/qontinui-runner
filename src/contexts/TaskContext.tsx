@@ -18,6 +18,8 @@ interface TaskContextValue {
   isRunning: boolean;
   /** Current task run ID (for filtering data to current run) */
   taskRunId: string | null;
+  /** Task start time (ms since epoch) - used for filtering AI output */
+  taskStartTime: number | null;
 }
 
 const TaskContext = createContext<TaskContextValue | null>(null);
@@ -39,6 +41,7 @@ export function TaskProvider({ children, taskInfo, isRunning }: TaskProviderProp
     taskInfo,
     isRunning,
     taskRunId: taskInfo?.taskId ?? null,
+    taskStartTime: taskInfo?.startTime ?? null,
   };
 
   return <TaskContext.Provider value={value}>{children}</TaskContext.Provider>;
@@ -67,4 +70,13 @@ export function useCurrentTaskRunId(): string | null {
 export function useIsTaskRunning(): boolean {
   const context = useContext(TaskContext);
   return context?.isRunning ?? false;
+}
+
+/**
+ * Hook to get the current task's start time.
+ * Returns the task's start time in ms since epoch, or null if no task is running.
+ */
+export function useTaskStartTime(): number | null {
+  const context = useContext(TaskContext);
+  return context?.isRunning ? context.taskStartTime : null;
 }

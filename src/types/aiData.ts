@@ -79,6 +79,56 @@ export interface TaskRun {
   created_at: string;
   updated_at: string;
   completed_at?: string | null;
+
+  // Unified workflow loop fields
+  /** Whether verification passed (from loop result) */
+  verification_passed?: boolean | null;
+  /** Loop execution result with per-iteration breakdown */
+  loop_result?: LoopResult | null;
+}
+
+// =============================================================================
+// Loop Result Types (Unified Workflow)
+// =============================================================================
+
+/**
+ * Result of a single iteration in the verification-agentic loop.
+ */
+export interface IterationResult {
+  /** Iteration number (1-based) */
+  iteration: number;
+  /** Whether all verification checks passed in this iteration */
+  verification_passed: boolean;
+  /** Whether a critical failure occurred */
+  critical_failure: boolean;
+  /** Number of verification checks that passed */
+  passed_checks: number;
+  /** Number of verification checks that failed */
+  failed_checks: number;
+  /** Whether the agentic phase ran in this iteration */
+  agentic_phase_ran: boolean;
+  /** Whether the agentic phase succeeded (null if not run) */
+  agentic_phase_success?: boolean | null;
+}
+
+/**
+ * Complete result of the verification-agentic loop execution.
+ */
+export interface LoopResult {
+  /** Total number of iterations executed */
+  iterations_run: number;
+  /** Whether verification ultimately passed */
+  verification_passed: boolean;
+  /** Whether the loop reached max iterations without passing */
+  max_iterations_reached: boolean;
+  /** Whether a critical failure stopped the loop */
+  critical_failure: boolean;
+  /** Whether the loop was manually stopped */
+  was_stopped: boolean;
+  /** Per-iteration results */
+  iteration_results: IterationResult[];
+  /** Human-readable summary of the loop execution */
+  summary: string;
 }
 
 // =============================================================================
@@ -788,6 +838,52 @@ export interface VerificationStepDetails {
   page_snapshot?: string | null;
   /** Exit code from command execution */
   exit_code?: number | null;
+  /** For check_group steps: individual check results with details */
+  check_results?: IndividualCheckResult[] | null;
+}
+
+/**
+ * Individual check result within a check group
+ */
+export interface IndividualCheckResult {
+  /** Check name */
+  name: string;
+  /** Status: "passed", "failed", "skipped" */
+  status: "passed" | "failed" | "skipped";
+  /** Duration in milliseconds */
+  duration_ms: number;
+  /** Number of issues found */
+  issues_found: number;
+  /** Number of issues fixed (if auto-fix is enabled) */
+  issues_fixed: number;
+  /** Number of files checked */
+  files_checked: number;
+  /** Error message if failed */
+  error_message?: string | null;
+  /** Raw output from the check tool */
+  output?: string | null;
+  /** Individual issues found (limited to avoid huge payloads) */
+  issues: CheckIssueDetail[];
+}
+
+/**
+ * Details of an individual issue found by a check
+ */
+export interface CheckIssueDetail {
+  /** File path where the issue was found */
+  file: string;
+  /** Line number (1-based) */
+  line?: number | null;
+  /** Column number (1-based) */
+  column?: number | null;
+  /** Rule code (e.g., "E501", "no-unused-vars") */
+  code?: string | null;
+  /** Issue message */
+  message: string;
+  /** Severity level: "error", "warning", "info" */
+  severity: "error" | "warning" | "info";
+  /** Whether this issue is fixable */
+  fixable: boolean;
 }
 
 /**

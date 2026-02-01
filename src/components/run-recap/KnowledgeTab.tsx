@@ -49,7 +49,7 @@ const SEVERITY_COLORS: Record<FindingSeverity, { bg: string; text: string; borde
   info: { bg: "bg-gray-500/10", text: "text-gray-400", border: "border-gray-500/30" },
 };
 
-interface KnowledgeEntry {
+interface _KnowledgeEntry {
   id: string;
   category: string;
   content: string;

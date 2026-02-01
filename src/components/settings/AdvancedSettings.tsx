@@ -40,6 +40,7 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
   useEffect(() => {
     loadSettings();
     loadDeviceInfo();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const loadSettings = async () => {

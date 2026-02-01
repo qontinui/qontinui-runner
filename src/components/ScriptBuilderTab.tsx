@@ -19,9 +19,8 @@ import {
   Info,
   ImageIcon,
   CheckSquare,
-  Search,
-  Trash2,
   Check,
+  Search,
 } from "lucide-react";
 import { BatchDeleteDialog } from "./ui/BatchDeleteDialog";
 import type {
@@ -62,13 +61,13 @@ test('example test', async ({ page }) => {
 export function ScriptBuilderTab({
   onLog,
   editScriptId,
-  onNavigateToLibrary,
+  onNavigateToLibrary: _onNavigateToLibrary,
 }: ScriptBuilderTabProps) {
   // State
   const [scripts, setScripts] = useState<PlaywrightScript[]>([]);
   const [_loading, setLoading] = useState(false);
-  const [searchQuery, _setSearchQuery] = useState("");
-  const [selectedCategory, _setSelectedCategory] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [_selectedCategory, _setSelectedCategory] = useState<string | null>(null);
   const [categories, setCategories] = useState<string[]>([]);
 
   // Bulk deletion state
@@ -479,6 +478,7 @@ export function ScriptBuilderTab({
   useEffect(() => {
     loadScripts();
     loadCategories();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Load script for editing when editScriptId is provided
@@ -516,6 +516,7 @@ export function ScriptBuilderTab({
       };
       loadScriptForEditing();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editScriptId]);
 
   // Load screenshot when execution result changes
@@ -1978,7 +1979,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
       s.target_url.toLowerCase().includes(searchQuery.toLowerCase()) ||
       s.tags.some((t) => t.toLowerCase().includes(searchQuery.toLowerCase()));
 
-    const matchesCategory = !selectedCategory || s.category === selectedCategory;
+    const matchesCategory = !_selectedCategory || s.category === _selectedCategory;
 
     return matchesSearch && matchesCategory;
   });
@@ -1989,6 +1990,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
     if (!editScriptId && !isCreating && !editingScript) {
       setIsCreating(true);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const accentColors = getAccentColors("purple");
@@ -2063,7 +2065,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
               type="text"
               placeholder="Search scripts..."
               value={searchQuery}
-              onChange={(e) => _setSearchQuery(e.target.value)}
+              onChange={(e) => setSearchQuery(e.target.value)}
               className="w-full pl-9 pr-3 py-2 bg-neutral-800 border border-neutral-700 rounded-lg text-sm focus:outline-none focus:border-neutral-600"
             />
           </div>

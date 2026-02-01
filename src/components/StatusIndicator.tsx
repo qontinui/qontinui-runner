@@ -14,6 +14,7 @@ import {
 import { listen } from "@tauri-apps/api/event";
 import type { BackgroundActivity, ActivityType } from "../hooks/useBackgroundActivities";
 import { getSeverityColors, getAccentColors } from "@/design-system";
+import { ErrorBadge } from "./error-monitor";
 
 const RUNNER_NAME_STORAGE_KEY = "qontinui-runner-name";
 const SELECTED_PROJECT_STORAGE_KEY = "qontinui-selected-project";
@@ -188,6 +189,13 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
             Config: {configLoaded ? "Loaded" : "Not Loaded"}
           </span>
         </div>
+
+        {/* Error Badge - Navigate to Error Monitor on click */}
+        <ErrorBadge
+          onClick={() => {
+            window.dispatchEvent(new CustomEvent("navigate-to-error-monitor"));
+          }}
+        />
 
         {/* Active Processes Section - Only shown when there is activity */}
         {(executionActive || backgroundActivities.length > 0) && (

@@ -44,6 +44,39 @@ export interface UIBridgeElement {
   parent?: string | null;
   children?: string[];
   actions?: string[];
+
+  // Accessibility object (matches what extension already collects)
+  accessibility?: {
+    role: string; // ARIA role (explicit or implicit)
+    accessibleName?: string; // Computed accessible name
+    accessibleDescription?: string; // aria-describedby content
+    ariaLabel?: string;
+    ariaLabelledBy?: string;
+    ariaDescribedBy?: string;
+    ariaExpanded?: boolean;
+    ariaSelected?: boolean;
+    ariaChecked?: boolean | "mixed";
+    ariaHidden?: boolean;
+    ariaDisabled?: boolean;
+    ariaRequired?: boolean;
+    ariaLive?: "off" | "polite" | "assertive";
+    tabIndex?: number;
+    isInTabOrder?: boolean;
+    isKeyboardAccessible?: boolean;
+    implicitRole?: string;
+    hasExplicitRole?: boolean;
+  };
+
+  // Top-level convenience properties (flattened from accessibility)
+  role?: string; // ARIA role
+  accessibleName?: string; // Computed accessible name
+  is_expanded?: boolean; // aria-expanded
+  is_pressed?: boolean; // aria-pressed
+  is_selected?: boolean; // aria-selected
+  is_required?: boolean; // required or aria-required
+  is_readonly?: boolean; // readonly or aria-readonly
+  is_interactive?: boolean; // Can be interacted with
+  ref?: string; // Auto-generated reference like @e1, @e2
 }
 
 export interface UIBridgeState {

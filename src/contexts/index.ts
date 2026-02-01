@@ -16,6 +16,7 @@ export {
   useTaskContext,
   useCurrentTaskRunId,
   useIsTaskRunning,
+  useTaskStartTime,
 } from "./TaskContext";
 
 export {
@@ -24,6 +25,15 @@ export {
   useRenderLogOptional,
 } from "./RenderLogContext";
 export type { RenderLogEntry } from "./RenderLogContext";
+
+export {
+  ActiveRunsProvider,
+  useActiveRuns,
+  useActiveRunsOptional,
+  useSelectedRunTaskInfo,
+  useSelectedRunHasGuiLock,
+} from "./ActiveRunsContext";
+export type { ActiveRun, GuiLockInfo } from "./ActiveRunsContext";
 
 // Re-export execution-related hooks for convenience
 export {

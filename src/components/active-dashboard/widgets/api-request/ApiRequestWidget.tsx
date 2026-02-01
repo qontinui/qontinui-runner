@@ -6,11 +6,11 @@
  */
 
 import { useState } from "react";
-import { Globe2, ArrowRight, ArrowLeft } from "lucide-react";
+import { ArrowRight, ArrowLeft } from "lucide-react";
 import { cn } from "../../../../lib/utils";
 import { Badge, ScrollArea, Tabs, TabsContent, TabsList, TabsTrigger } from "../../../ui";
 import { StepStatsBar, StepStatusBadge, StepOutputPanel } from "../shared";
-import { getAccentColors, getStatusColors } from "@/design-system";
+import { getStatusColors } from "@/design-system";
 import type { ApiRequestWidgetProps } from "./types";
 import type { ApiRequestExecution } from "../shared/types";
 

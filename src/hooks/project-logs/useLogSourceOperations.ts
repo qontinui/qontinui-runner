@@ -1,117 +1,67 @@
 /**
  * useLogSourceOperations
  *
- * Hook for CRUD operations on log sources.
- * Manages adding, updating, removing, and toggling log sources.
+ * Hook for selecting/deselecting global log sources for a project.
+ * No CRUD — sources are managed globally in Settings > Log Sources.
  */
 
 import { useCallback } from "react";
-import { createLogSource } from "../../types/projectLogs";
-import type { LogSource, ProjectLogConfig, UseLogSourceOperationsReturn } from "./types";
+import type { ProjectLogConfig, UseLogSourceOperationsReturn } from "./types";
 
 interface UseLogSourceOperationsProps {
   setConfig: React.Dispatch<React.SetStateAction<ProjectLogConfig | null>>;
-  markUnsavedChanges: () => void;
+  saveConfig: () => Promise<void>;
 }
 
 /**
- * Hook for managing log source CRUD operations.
+ * Hook for managing which global log sources are selected for a project.
  */
 export function useLogSourceOperations({
   setConfig,
-  markUnsavedChanges,
+  saveConfig,
 }: UseLogSourceOperationsProps): UseLogSourceOperationsReturn {
   /**
-   * Add a new log source
+   * Set the selected global source IDs for this project
    */
-  const addLogSource = useCallback(
-    (partial?: Partial<LogSource>) => {
+  const setSelectedSources = useCallback(
+    (sourceIds: string[]) => {
       setConfig((prev) => {
         if (!prev) return prev;
-        const newSource = createLogSource(partial);
-        markUnsavedChanges();
         return {
           ...prev,
-          logSources: [...prev.logSources, newSource],
+          selectedSourceIds: sourceIds,
+          // Clear profile when explicitly selecting sources
+          globalProfileId: undefined,
         };
       });
+      // Auto-save after update
+      setTimeout(() => saveConfig(), 0);
     },
-    [setConfig, markUnsavedChanges],
+    [setConfig, saveConfig],
   );
 
   /**
-   * Update an existing log source
+   * Set the global profile ID for this project
    */
-  const updateLogSource = useCallback(
-    (id: string, updates: Partial<LogSource>) => {
+  const setGlobalProfile = useCallback(
+    (profileId: string | undefined) => {
       setConfig((prev) => {
         if (!prev) return prev;
-        markUnsavedChanges();
         return {
           ...prev,
-          logSources: prev.logSources.map((s) => (s.id === id ? { ...s, ...updates } : s)),
+          globalProfileId: profileId,
+          // Clear explicit selections when using a profile
+          selectedSourceIds: [],
         };
       });
+      // Auto-save after update
+      setTimeout(() => saveConfig(), 0);
     },
-    [setConfig, markUnsavedChanges],
-  );
-
-  /**
-   * Remove a log source
-   */
-  const removeLogSource = useCallback(
-    (id: string) => {
-      setConfig((prev) => {
-        if (!prev) return prev;
-        markUnsavedChanges();
-        return {
-          ...prev,
-          logSources: prev.logSources.filter((s) => s.id !== id),
-        };
-      });
-    },
-    [setConfig, markUnsavedChanges],
-  );
-
-  /**
-   * Toggle a log source enabled/disabled
-   */
-  const toggleLogSource = useCallback(
-    (id: string) => {
-      setConfig((prev) => {
-        if (!prev) return prev;
-        markUnsavedChanges();
-        return {
-          ...prev,
-          logSources: prev.logSources.map((s) => (s.id === id ? { ...s, enabled: !s.enabled } : s)),
-        };
-      });
-    },
-    [setConfig, markUnsavedChanges],
-  );
-
-  /**
-   * Set all log sources at once
-   */
-  const setLogSources = useCallback(
-    (sources: LogSource[]) => {
-      setConfig((prev) => {
-        if (!prev) return prev;
-        markUnsavedChanges();
-        return {
-          ...prev,
-          logSources: sources,
-        };
-      });
-    },
-    [setConfig, markUnsavedChanges],
+    [setConfig, saveConfig],
   );
 
   return {
-    addLogSource,
-    updateLogSource,
-    removeLogSource,
-    toggleLogSource,
-    setLogSources,
+    setSelectedSources,
+    setGlobalProfile,
   };
 }

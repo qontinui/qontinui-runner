@@ -46,9 +46,11 @@ export interface UseLogManagerResult {
     line: string,
     source: string,
     actionId?: string,
+    taskRunId?: string,
     sessionId?: string,
     sessionName?: string,
     phase?: string,
+    phaseIteration?: number,
   ) => void;
 
   /** Get filtered logs by level */
@@ -125,11 +127,13 @@ export function useLogManager(): UseLogManagerResult {
       line: string,
       source: string,
       actionId?: string,
+      taskRunId?: string,
       sessionId?: string,
       sessionName?: string,
       phase?: string,
+      phaseIteration?: number,
     ) => {
-      logManager.addAiOutputLog(line, source, actionId, sessionId, sessionName, phase);
+      logManager.addAiOutputLog(line, source, actionId, taskRunId, sessionId, sessionName, phase, phaseIteration);
     },
     [],
   );

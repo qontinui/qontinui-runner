@@ -42,6 +42,26 @@ async function executeCommand<T>(
   }
 
   const result = await response.json();
+
+  // The HTTP API wraps responses in ApiResponse<ExecutePythonCommandResponse>
+  // Structure: { success: bool, data: { success: bool, data: {...}, error: ... } }
+  // We need to unwrap to get the actual command response data
+  if (result.data && typeof result.data === "object") {
+    // The actual command result fields are in result.data.data (for accessibility commands)
+    // or directly in result.data (for commands without nested data)
+    const cmdResponse = result.data;
+    if (cmdResponse.data && typeof cmdResponse.data === "object") {
+      // Merge the success/error from cmdResponse with the nested data fields
+      return {
+        success: cmdResponse.success,
+        error: cmdResponse.error,
+        ...cmdResponse.data,
+      } as T;
+    }
+    // If no nested data, return cmdResponse directly
+    return cmdResponse as T;
+  }
+
   return result as T;
 }
 

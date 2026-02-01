@@ -174,4 +174,123 @@ export const flowService = {
   async getFlowExecutionsCount(flowId?: string): Promise<number> {
     return invoke("get_flow_executions_count", { flowId });
   },
+
+  // ===========================================================================
+  // Flow Version History
+  // ===========================================================================
+
+  /**
+   * Create a new version snapshot of a flow.
+   * @param flowId - Flow ID.
+   * @param message - Optional version message.
+   * @param createdBy - Optional creator identifier.
+   * @returns The created version summary.
+   */
+  async createFlowVersion(
+    flowId: string,
+    message?: string,
+    createdBy?: string
+  ): Promise<{ id: string; version: number }> {
+    return invoke("create_flow_version", { flowId, message, createdBy });
+  },
+
+  /**
+   * List all versions of a flow.
+   * @param flowId - Flow ID.
+   * @returns Array of version summaries.
+   */
+  async listFlowVersions(
+    flowId: string
+  ): Promise<Array<{ id: string; version: number; message?: string; created_at: string }>> {
+    return invoke("list_flow_versions", { flowId });
+  },
+
+  /**
+   * Get a specific version of a flow.
+   * @param flowId - Flow ID.
+   * @param version - Version number.
+   * @returns The version data with full definition.
+   */
+  async getFlowVersion(
+    flowId: string,
+    version: number
+  ): Promise<{ definition: Flow; message?: string } | null> {
+    return invoke("get_flow_version", { flowId, version });
+  },
+
+  /**
+   * Restore a flow to a specific version.
+   * @param flowId - Flow ID.
+   * @param version - Version number to restore.
+   * @param createdBy - Optional creator identifier.
+   * @returns Result with restored flow info.
+   */
+  async restoreFlowVersion(
+    flowId: string,
+    version: number,
+    createdBy?: string
+  ): Promise<{ new_version: number }> {
+    return invoke("restore_flow_version", { flowId, version, createdBy });
+  },
+
+  // ===========================================================================
+  // Flow Import/Export
+  // ===========================================================================
+
+  /**
+   * Export a flow to JSON format.
+   * @param flowId - Flow ID to export.
+   * @returns JSON string of the flow export.
+   */
+  async exportFlowJson(flowId: string): Promise<string> {
+    return invoke("export_flow_json", { flowId });
+  },
+
+  /**
+   * Export a flow to YAML format.
+   * @param flowId - Flow ID to export.
+   * @returns YAML string of the flow export.
+   */
+  async exportFlowYaml(flowId: string): Promise<string> {
+    return invoke("export_flow_yaml", { flowId });
+  },
+
+  /**
+   * Import a flow from JSON format.
+   * @param content - JSON content to import.
+   * @param generateNewId - Whether to generate a new ID for the flow.
+   * @returns The imported flow.
+   */
+  async importFlowJson(content: string, generateNewId: boolean = false): Promise<Flow> {
+    return invoke("import_flow_json", { content, generateNewId });
+  },
+
+  /**
+   * Import a flow from YAML format.
+   * @param content - YAML content to import.
+   * @param generateNewId - Whether to generate a new ID for the flow.
+   * @returns The imported flow.
+   */
+  async importFlowYaml(content: string, generateNewId: boolean = false): Promise<Flow> {
+    return invoke("import_flow_yaml", { content, generateNewId });
+  },
+
+  /**
+   * Export multiple flows to a single JSON file.
+   * @param flowIds - Array of flow IDs to export.
+   * @returns JSON string of the bulk export.
+   */
+  async exportFlowsBulk(flowIds: string[]): Promise<string> {
+    return invoke("export_flows_bulk", { flowIds });
+  },
+
+  /**
+   * Import multiple flows from a bulk export.
+   * @param content - JSON content to import.
+   * @param generateNewIds - Whether to generate new IDs for the flows.
+   * @returns Array of imported flows.
+   */
+  async importFlowsBulk(content: string, generateNewIds: boolean = false): Promise<Flow[]> {
+    return invoke("import_flows_bulk", { content, generateNewIds });
+  },
 };

@@ -21,6 +21,15 @@ interface GlobalLogSource {
   enabled: boolean;
   color?: string;
   keywords: string[];
+  // Error monitoring fields
+  format: string;
+  parser: string;
+  timestamp_pattern?: string;
+  timezone: string;
+  error_patterns: string[];
+  warning_patterns: string[];
+  ignore_patterns: string[];
+  poll_interval_ms: number;
 }
 
 interface GlobalLogSourceProfile {

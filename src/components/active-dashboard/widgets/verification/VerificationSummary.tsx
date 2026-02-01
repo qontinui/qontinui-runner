@@ -5,14 +5,14 @@
  * Shows overall pass/fail status, check step counts, and progress.
  */
 
-import { CheckCircle, XCircle, Clock, Loader2, SkipForward, FlaskConical, CheckCircle2 } from "lucide-react";
+import { CheckCircle, XCircle, Clock, Loader2, SkipForward, CheckCircle2 } from "lucide-react";
 import { cn } from "../../../../lib/utils";
 import { Badge } from "../../../ui";
 import { StepStatsBar } from "../shared";
 import type { BaseWidgetProps } from "../../../../types/dashboard/widget-props";
 import type { VerificationStatus, VerificationData } from "./types";
 import { useVerificationDataWithStatus } from "./useVerificationData";
-import { getStatusColors, getAccentColors } from "@/design-system";
+import { getStatusColors } from "@/design-system";
 
 /**
  * Format duration for compact display.
@@ -73,10 +73,7 @@ function getStatusConfig(status: VerificationStatus) {
 /**
  * Compact check stats display.
  */
-function CheckStats({ data }: { data: VerificationData }) {
-  const successColors = getStatusColors("success");
-  const errorColors = getStatusColors("error");
-
+function _CheckStats({ data }: { data: VerificationData }) {
   if (data.checkSteps.length === 0) return null;
 
   return (
@@ -90,29 +87,15 @@ function CheckStats({ data }: { data: VerificationData }) {
  * VerificationSummary - Compact widget for dashboard summary row.
  */
 export function VerificationSummary({
-  isActive,
-  onRequestFocus,
-  onNavigateToDetail,
+  isActive: _isActive,
+  onRequestFocus: _onRequestFocus,
+  onNavigateToDetail: _onNavigateToDetail,
   className,
 }: BaseWidgetProps) {
   const { data, isLoading } = useVerificationDataWithStatus();
 
-  const handleClick = () => {
-    if (onRequestFocus) {
-      onRequestFocus();
-    }
-  };
-
-  const handleViewDetails = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (onNavigateToDetail) {
-      onNavigateToDetail();
-    }
-  };
-
   const statusConfig = getStatusConfig(data.status);
   const StatusIcon = statusConfig.icon;
-  const cyanColors = getAccentColors("cyan");
   const successColors = getStatusColors("success");
   const errorColors = getStatusColors("error");
 

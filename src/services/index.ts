@@ -107,6 +107,13 @@ export {
   getRunStatusColor,
 } from "./statistics-service";
 
+// Performance Metrics Service (Performance Metrics Dashboard)
+export {
+  performanceMetricsService,
+  isSuccess as isPerformanceSuccess,
+  unwrapResponse as unwrapPerformanceResponse,
+} from "./performance-metrics-service";
+
 // Discoveries Service (Discovery Push mechanism)
 export { discoveriesService } from "./discoveries-service";
 

@@ -26,12 +26,19 @@ import {
   SkipForward,
   FlaskConical,
   Repeat,
+  AlertTriangle,
+  StopCircle,
+  FileWarning,
+  Wrench,
 } from "lucide-react";
 import { useTaskRunPlaywrightResults, useTaskRunVerificationResults } from "@/hooks/useAiData";
 import { formatDuration } from "@/lib/formatting";
+import type { LoopResult, IndividualCheckResult, CheckIssueDetail } from "@/types/aiData";
 
 interface TestsTabProps {
   taskRunId: string;
+  /** Optional loop result for showing iteration summary */
+  loopResult?: LoopResult | null;
 }
 
 interface TestResult {
@@ -52,6 +59,8 @@ interface TestResult {
   step_type?: string;
   /** Test type for verification tests (e.g., 'python', 'repository') */
   test_type?: string;
+  /** For check_group steps: individual check results with detailed issues */
+  check_results?: IndividualCheckResult[];
 }
 
 interface IterationResults {
@@ -61,7 +70,7 @@ interface IterationResults {
   total_duration_ms: number;
 }
 
-export function TestsTab({ taskRunId }: TestsTabProps) {
+export function TestsTab({ taskRunId, loopResult }: TestsTabProps) {
   const { data: playwrightResults } = useTaskRunPlaywrightResults(taskRunId);
   const { data: verificationResults } = useTaskRunVerificationResults(taskRunId);
   const [expandedTests, setExpandedTests] = useState<Set<string>>(new Set());
@@ -139,6 +148,7 @@ export function TestsTab({ taskRunId }: TestsTabProps) {
           source: "verification" as const,
           step_type: step.step_type,
           test_type: step.config?.test_type ?? undefined,
+          check_results: vd?.check_results ?? undefined,
         };
       }) || [];
 
@@ -162,6 +172,80 @@ export function TestsTab({ taskRunId }: TestsTabProps) {
 
   return (
     <div className="space-y-4">
+      {/* Loop Result Summary (if available) */}
+      {loopResult && (
+        <div
+          data-ui-id="recap-loop-result-summary"
+          className={`rounded-lg p-4 ${
+            loopResult.verification_passed
+              ? "bg-green-500/10 text-green-500"
+              : loopResult.critical_failure
+                ? "bg-red-500/10 text-red-500"
+                : loopResult.was_stopped
+                  ? "bg-amber-500/10 text-amber-500"
+                  : "bg-amber-500/10 text-amber-500"
+          }`}
+        >
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-2">
+              {loopResult.verification_passed ? (
+                <CheckCircle2 className="w-5 h-5" />
+              ) : loopResult.critical_failure ? (
+                <AlertTriangle className="w-5 h-5" />
+              ) : loopResult.was_stopped ? (
+                <StopCircle className="w-5 h-5" />
+              ) : (
+                <XCircle className="w-5 h-5" />
+              )}
+              <span className="font-medium">
+                {loopResult.verification_passed
+                  ? "Verification Passed"
+                  : loopResult.critical_failure
+                    ? "Critical Failure"
+                    : loopResult.was_stopped
+                      ? "Run Stopped"
+                      : loopResult.max_iterations_reached
+                        ? "Max Iterations Reached"
+                        : "Verification Failed"}
+              </span>
+            </div>
+            <div className="flex items-center gap-1 text-sm">
+              <Repeat className="w-4 h-4" />
+              <span>
+                {loopResult.iterations_run} iteration{loopResult.iterations_run !== 1 ? "s" : ""}
+              </span>
+            </div>
+          </div>
+          {loopResult.summary && (
+            <p className="text-sm opacity-90">{loopResult.summary}</p>
+          )}
+          {/* Per-iteration quick summary */}
+          {loopResult.iteration_results.length > 0 && (
+            <div className="mt-3 flex flex-wrap gap-2">
+              {loopResult.iteration_results.map((iter) => (
+                <span
+                  key={iter.iteration}
+                  className={`text-xs px-2 py-1 rounded ${
+                    iter.verification_passed
+                      ? "bg-green-500/20 text-green-400"
+                      : iter.critical_failure
+                        ? "bg-red-500/20 text-red-400"
+                        : "bg-amber-500/20 text-amber-400"
+                  }`}
+                >
+                  #{iter.iteration}: {iter.passed_checks}/{iter.passed_checks + iter.failed_checks} checks
+                  {iter.agentic_phase_ran && (
+                    <span className="ml-1">
+                      {iter.agentic_phase_success ? "(AI ok)" : "(AI ran)"}
+                    </span>
+                  )}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Summary */}
       <div className="card p-4">
         <div className="flex items-center justify-between">
@@ -188,7 +272,7 @@ export function TestsTab({ taskRunId }: TestsTabProps) {
           {iterationResults.map((iteration) => {
             const isExpanded = expandedIterations.has(iteration.iteration);
             const iterationPassed = iteration.tests.filter((t) => t.status === "passed").length;
-            const iterationFailed = iteration.tests.filter((t) => t.status === "failed").length;
+            const _iterationFailed = iteration.tests.filter((t) => t.status === "failed").length;
 
             return (
               <div key={`iteration-${iteration.iteration}`} className="card overflow-hidden">
@@ -362,6 +446,21 @@ function TestResultCard({ test, isExpanded, onToggle }: TestResultCardProps) {
 
       {isExpanded && (
         <div className="border-t border-border p-4 space-y-4">
+          {/* Individual Check Results (for check_group steps) */}
+          {test.check_results && test.check_results.length > 0 && (
+            <div data-ui-id="recap-test-check-results">
+              <h4 className="text-sm font-medium mb-3 flex items-center gap-2">
+                <FlaskConical className="w-4 h-4" />
+                Individual Checks ({test.check_results.filter(c => c.status === "passed").length}/{test.check_results.length} passed)
+              </h4>
+              <div className="space-y-2">
+                {test.check_results.map((check, idx) => (
+                  <CheckResultCard key={idx} check={check} />
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* Console Output */}
           {test.console_output && (
             <div data-ui-id="recap-test-console">
@@ -425,7 +524,8 @@ function TestResultCard({ test, isExpanded, onToggle }: TestResultCardProps) {
           {!test.console_output &&
             !test.page_snapshot &&
             !test.error_message &&
-            !test.screenshot_path && (
+            !test.screenshot_path &&
+            (!test.check_results || test.check_results.length === 0) && (
               <p className="text-sm text-muted-foreground">
                 No additional details available for this test.
               </p>
@@ -433,6 +533,168 @@ function TestResultCard({ test, isExpanded, onToggle }: TestResultCardProps) {
         </div>
       )}
     </>
+  );
+}
+
+/**
+ * Displays an individual check result within a check group
+ */
+interface CheckResultCardProps {
+  check: IndividualCheckResult;
+}
+
+function CheckResultCard({ check }: CheckResultCardProps) {
+  const [isExpanded, setIsExpanded] = useState(false);
+  const isPassed = check.status === "passed";
+  const isSkipped = check.status === "skipped";
+  const hasIssues = check.issues && check.issues.length > 0;
+  const hasDetails = hasIssues || check.error_message || check.output;
+
+  return (
+    <div className={`rounded border ${isPassed ? "border-green-500/30 bg-green-500/5" : isSkipped ? "border-yellow-500/30 bg-yellow-500/5" : "border-red-500/30 bg-red-500/5"}`}>
+      <button
+        onClick={() => hasDetails && setIsExpanded(!isExpanded)}
+        className={`w-full px-3 py-2 flex items-center justify-between text-left ${hasDetails ? "hover:bg-muted/30 cursor-pointer" : "cursor-default"}`}
+        disabled={!hasDetails}
+      >
+        <div className="flex items-center gap-2">
+          {/* Status Icon */}
+          {isPassed ? (
+            <CheckCircle2 className="w-4 h-4 text-green-500 flex-shrink-0" />
+          ) : isSkipped ? (
+            <SkipForward className="w-4 h-4 text-yellow-500 flex-shrink-0" />
+          ) : (
+            <XCircle className="w-4 h-4 text-red-500 flex-shrink-0" />
+          )}
+
+          {/* Check Name */}
+          <span className="text-sm font-medium">{check.name}</span>
+
+          {/* Issues count badge */}
+          {check.issues_found > 0 && (
+            <span className={`text-xs px-1.5 py-0.5 rounded ${isPassed ? "bg-green-500/20 text-green-400" : "bg-red-500/20 text-red-400"}`}>
+              {check.issues_found} issue{check.issues_found !== 1 ? "s" : ""}
+              {check.issues_fixed > 0 && ` (${check.issues_fixed} fixed)`}
+            </span>
+          )}
+        </div>
+
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          {/* Duration */}
+          <span className="flex items-center gap-1">
+            <Clock className="w-3 h-3" />
+            {formatDuration(check.duration_ms)}
+          </span>
+
+          {/* Files checked */}
+          {check.files_checked > 0 && (
+            <span>{check.files_checked} file{check.files_checked !== 1 ? "s" : ""}</span>
+          )}
+
+          {/* Expand indicator */}
+          {hasDetails && (
+            isExpanded ? (
+              <ChevronDown className="w-4 h-4" />
+            ) : (
+              <ChevronRight className="w-4 h-4" />
+            )
+          )}
+        </div>
+      </button>
+
+      {/* Expanded details */}
+      {isExpanded && hasDetails && (
+        <div className="border-t border-border/50 px-3 py-2 space-y-3">
+          {/* Error message */}
+          {check.error_message && (
+            <div>
+              <h5 className="text-xs font-medium text-red-400 mb-1 flex items-center gap-1">
+                <AlertCircle className="w-3 h-3" />
+                Error
+              </h5>
+              <pre className="text-xs bg-red-500/10 p-2 rounded text-red-300 whitespace-pre-wrap overflow-x-auto max-h-24 overflow-y-auto">
+                {check.error_message}
+              </pre>
+            </div>
+          )}
+
+          {/* Individual issues */}
+          {hasIssues && (
+            <div>
+              <h5 className="text-xs font-medium text-muted-foreground mb-2 flex items-center gap-1">
+                <FileWarning className="w-3 h-3" />
+                Issues ({check.issues.length}{check.issues.length >= 50 ? "+" : ""})
+              </h5>
+              <div className="space-y-1 max-h-60 overflow-y-auto">
+                {check.issues.map((issue, idx) => (
+                  <IssueRow key={idx} issue={issue} />
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Raw output (collapsed by default if we have structured issues) */}
+          {check.output && !hasIssues && (
+            <div>
+              <h5 className="text-xs font-medium text-muted-foreground mb-1 flex items-center gap-1">
+                <Terminal className="w-3 h-3" />
+                Output
+              </h5>
+              <pre className="text-xs bg-muted/50 p-2 rounded whitespace-pre-wrap overflow-x-auto max-h-32 overflow-y-auto">
+                {check.output}
+              </pre>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Displays a single issue row
+ */
+interface IssueRowProps {
+  issue: CheckIssueDetail;
+}
+
+function IssueRow({ issue }: IssueRowProps) {
+  const severityColor = {
+    error: "text-red-400 bg-red-500/10 border-red-500/30",
+    warning: "text-yellow-400 bg-yellow-500/10 border-yellow-500/30",
+    info: "text-blue-400 bg-blue-500/10 border-blue-500/30",
+  }[issue.severity] || "text-muted-foreground bg-muted/30 border-muted";
+
+  return (
+    <div className={`text-xs p-2 rounded border ${severityColor}`}>
+      <div className="flex items-start justify-between gap-2">
+        <div className="flex-1 min-w-0">
+          {/* Location */}
+          <div className="font-mono text-muted-foreground truncate mb-1">
+            {issue.file}
+            {issue.line != null && `:${issue.line}`}
+            {issue.column != null && `:${issue.column}`}
+          </div>
+
+          {/* Message */}
+          <div className="whitespace-pre-wrap break-words">{issue.message}</div>
+        </div>
+
+        {/* Rule code and fixable indicator */}
+        <div className="flex items-center gap-1 flex-shrink-0">
+          {issue.code && (
+            <span className="font-mono px-1 py-0.5 rounded bg-muted/50 text-muted-foreground">
+              {issue.code}
+            </span>
+          )}
+          {issue.fixable && (
+            <span title="Auto-fixable" className="text-green-400">
+              <Wrench className="w-3 h-3" />
+            </span>
+          )}
+        </div>
+      </div>
+    </div>
   );
 }
 

@@ -11,7 +11,6 @@ import {
   Minus,
   CheckCircle,
   XCircle,
-  Lightbulb,
   Activity,
 } from "lucide-react";
 import type { LearningSummary, Trend } from "../../types/learning";

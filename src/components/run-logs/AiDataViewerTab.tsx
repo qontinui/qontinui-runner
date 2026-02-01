@@ -522,7 +522,8 @@ function ConsolidatedAiOutputDisplay({
 }
 
 // Map UI log types to SQLite event_type values
-function getEventTypeForLogType(logType: JsonlLogType): string | undefined {
+// Note: Currently unused but kept for future use when filtering events by log type
+function _getEventTypeForLogType(logType: JsonlLogType): string | undefined {
   switch (logType) {
     case "ai-output":
       return "ai_output";
@@ -1249,192 +1250,6 @@ function CollapsibleSection({
         {title}
       </button>
       {isOpen && children}
-    </div>
-  );
-}
-
-// JSONL Logs Section - uses SQLite for completed tasks, JSONL for running tasks
-function JsonlLogsSection() {
-  const { selectedRunId, selectedRun } = useRunSelection();
-  const [activeLogType, setActiveLogType] = useState<JsonlLogType>("ai-output");
-
-  // Determine if task is completed (logs migrated to SQLite)
-  const isCompleted = selectedRun?.completed_at != null;
-
-  // Get SQLite event type for current log type
-  const sqliteEventType = getEventTypeForLogType(activeLogType);
-
-  // SQLite queries for completed tasks
-  const {
-    data: sqliteEvents,
-    isLoading: sqliteLoading,
-    error: sqliteError,
-  } = useTaskRunEvents(isCompleted && sqliteEventType ? selectedRunId : null, sqliteEventType);
-  const { data: migratedSummary } = useTaskRunMigratedLogsSummary(
-    isCompleted ? selectedRunId : null,
-  );
-
-  // JSONL queries for running tasks (real-time)
-  const {
-    data: consolidatedOutput,
-    isLoading: consolidatedLoading,
-    error: consolidatedError,
-  } = useConsolidatedAiOutput(!isCompleted && activeLogType === "ai-output" ? selectedRunId : null);
-  const {
-    data: jsonlLogs,
-    isLoading: jsonlLoading,
-    error: jsonlError,
-  } = useJsonlLogsForTaskRun(
-    !isCompleted && activeLogType !== "ai-output" ? activeLogType : "general",
-    !isCompleted && activeLogType !== "ai-output" ? selectedRunId : null,
-  );
-
-  // Select appropriate loading/error state
-  const isLoading = isCompleted
-    ? sqliteLoading
-    : activeLogType === "ai-output"
-      ? consolidatedLoading
-      : jsonlLoading;
-  const error = isCompleted
-    ? sqliteError
-    : activeLogType === "ai-output"
-      ? consolidatedError
-      : jsonlError;
-
-  const logTypes: { type: JsonlLogType; label: string; count?: number }[] = [
-    {
-      type: "ai-output",
-      label: "AI Output",
-      count: migratedSummary?.events_by_type["ai_output"],
-    },
-    { type: "general", label: "General", count: migratedSummary?.events_by_type["general"] },
-    { type: "actions", label: "Actions", count: migratedSummary?.events_by_type["action"] },
-    {
-      type: "image-recognition",
-      label: "Image Recognition",
-      count: migratedSummary?.events_by_type["image_recognition"],
-    },
-    { type: "playwright", label: "Playwright" },
-    { type: "api-requests", label: "API Requests" },
-  ];
-
-  if (!selectedRunId) {
-    return (
-      <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
-        <FileJson className="w-8 h-8 mb-3 opacity-50" />
-        <p className="text-sm">Select a task run to view logs</p>
-      </div>
-    );
-  }
-
-  return (
-    <div className="space-y-4">
-      {/* Show data source info */}
-      {selectedRun && (
-        <div className="text-xs text-muted-foreground bg-muted/30 px-3 py-2 rounded-md">
-          <span className="font-medium">Time range:</span> {formatTimestamp(selectedRun.created_at)}
-          {selectedRun.completed_at
-            ? ` → ${formatTimestamp(selectedRun.completed_at)}`
-            : " → (still running)"}
-          <span className="ml-2 px-2 py-0.5 rounded bg-muted">
-            {isCompleted ? "📦 SQLite" : "📄 JSONL (real-time)"}
-          </span>
-        </div>
-      )}
-
-      {/* Log type tabs with counts for completed tasks */}
-      <div className="flex gap-2 flex-wrap">
-        {logTypes.map(({ type, label, count }) => (
-          <button
-            key={type}
-            onClick={() => setActiveLogType(type)}
-            className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
-              activeLogType === type
-                ? `${getAccentColors("blue").bg} ${getAccentColors("blue").text} border ${getAccentColors("blue").border}`
-                : "bg-muted text-muted-foreground hover:text-foreground"
-            }`}
-          >
-            {label}
-            {isCompleted && count !== undefined && count > 0 && (
-              <span className="ml-1.5 opacity-60">({count})</span>
-            )}
-          </button>
-        ))}
-      </div>
-
-      {/* Log content */}
-      {isLoading ? (
-        <div className="flex items-center justify-center py-8 text-muted-foreground">
-          <Loader2 className="w-5 h-5 animate-spin mr-2" />
-          Loading logs...
-        </div>
-      ) : error ? (
-        <div className={`flex items-center justify-center py-8 ${getStatusColors("error").text}`}>
-          <AlertCircle className="w-5 h-5 mr-2" />
-          Error: {error.message}
-        </div>
-      ) : isCompleted && sqliteEventType ? (
-        // Completed task: show SQLite events
-        sqliteEvents && sqliteEvents.events.length > 0 ? (
-          <div className="space-y-2">
-            <div className="text-xs text-muted-foreground mb-2">
-              Showing {sqliteEvents.count} events from database
-            </div>
-            <EventsDisplay events={sqliteEvents.events} />
-          </div>
-        ) : (
-          <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
-            <FileJson className="w-8 h-8 mb-3 opacity-50" />
-            <p className="text-sm">No {activeLogType} events for this task run</p>
-          </div>
-        )
-      ) : isCompleted && activeLogType === "playwright" ? (
-        // Completed task: show Playwright results from SQLite
-        <PlaywrightResultsDisplay taskRunId={selectedRunId} />
-      ) : isCompleted && activeLogType === "api-requests" ? (
-        // Completed task: show API requests from SQLite
-        <ApiRequestsDisplay taskRunId={selectedRunId} />
-      ) : isCompleted && !sqliteEventType ? (
-        // Completed task but unsupported log type
-        <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
-          <FileJson className="w-8 h-8 mb-3 opacity-50" />
-          <p className="text-sm">{activeLogType} logs are not yet migrated to SQLite</p>
-        </div>
-      ) : activeLogType === "ai-output" ? (
-        // Running task: Consolidated AI Output display
-        consolidatedOutput && consolidatedOutput.chunks.length > 0 ? (
-          <ConsolidatedAiOutputDisplay
-            chunks={consolidatedOutput.chunks}
-            totalEntries={consolidatedOutput.total_entries}
-          />
-        ) : (
-          <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
-            <FileJson className="w-8 h-8 mb-3 opacity-50" />
-            <p className="text-sm">No AI output during this task run</p>
-          </div>
-        )
-      ) : jsonlLogs && jsonlLogs.entries.length > 0 ? (
-        // Running task: Other log types - show raw JSONL entries
-        <div className="space-y-2">
-          <div className="text-xs text-muted-foreground mb-2">
-            Showing {jsonlLogs.count} entries (real-time from JSONL)
-          </div>
-          <div className="border border-border rounded-lg overflow-hidden">
-            <pre className="text-xs bg-background p-3 overflow-x-auto max-h-[500px] overflow-y-auto">
-              {jsonlLogs.entries.map((entry, i) => (
-                <div key={i} className="py-1 border-b border-border/50 last:border-0">
-                  {JSON.stringify(entry, null, 2)}
-                </div>
-              ))}
-            </pre>
-          </div>
-        </div>
-      ) : (
-        <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
-          <FileJson className="w-8 h-8 mb-3 opacity-50" />
-          <p className="text-sm">No {activeLogType} log entries during this task run</p>
-        </div>
-      )}
     </div>
   );
 }
@@ -2506,7 +2321,7 @@ function EventsSection() {
     error: generalError,
   } = useJsonlLogsForTaskRun("general", !isCompleted ? selectedRunId : null);
   const {
-    data: actionLogs,
+    data: _actionLogs,
     isLoading: actionLoading,
     error: actionError,
   } = useJsonlLogsForTaskRun(
@@ -2785,7 +2600,7 @@ function PlaywrightTestsSection() {
 
 // AWAS Steps Section - displays AWAS step execution results from SQLite
 function AwasStepsSection() {
-  const { selectedRunId, selectedRun } = useRunSelection();
+  const { selectedRunId, selectedRun: _selectedRun } = useRunSelection();
   const { data: awasData, isLoading, error } = useTaskRunAwasSteps(selectedRunId);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
 
@@ -3250,7 +3065,7 @@ import {
   useMobileDevices,
   useCaptureFeedback,
 } from "../../hooks/useMobileData";
-import type { MobileState, MobileLog } from "../../types/mobile";
+import type { MobileState as _MobileState, MobileLog as _MobileLog } from "../../types/mobile";
 
 // Mobile State Section - displays device/app state captures
 function MobileStateSection() {

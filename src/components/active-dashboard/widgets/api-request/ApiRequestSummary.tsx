@@ -5,7 +5,7 @@
  * Shows quick stats and the last few requests with status.
  */
 
-import { Globe2, Loader2 } from "lucide-react";
+import { Loader2 } from "lucide-react";
 import { cn } from "../../../../lib/utils";
 import { Badge } from "../../../ui";
 import { StepStatsBar, StepStatusBadge } from "../shared";

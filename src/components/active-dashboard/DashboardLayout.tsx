@@ -26,6 +26,7 @@ import { useScriptData } from "./widgets/script";
 import { useWorkflowRefData } from "./widgets/workflow-ref";
 import { useMcpCallData } from "./widgets/mcp-call";
 import { useExecutionTimelineData } from "./widgets/execution-timeline";
+import { useFlowExecutionData } from "./widgets/flow-execution";
 
 /**
  * Props for DashboardLayout.
@@ -93,6 +94,14 @@ function getWidgetBorderClasses(
     pink: {
       running: "border-pink-500 ring-2 ring-pink-500/20",
       idle: "border-pink-500/30",
+    },
+    emerald: {
+      running: "border-emerald-500 ring-2 ring-emerald-500/20",
+      idle: "border-emerald-500/30",
+    },
+    violet: {
+      running: "border-violet-500 ring-2 ring-violet-500/20",
+      idle: "border-violet-500/30",
     },
   };
 
@@ -618,6 +627,48 @@ const ExecutionTimelineRenderer = memo(function ExecutionTimelineRenderer({
 });
 
 /**
+ * Flow Execution widget renderer - calls useFlowExecutionData statically.
+ */
+const FlowExecutionRenderer = memo(function FlowExecutionRenderer({
+  status,
+  onNavigateToDetail,
+}: WidgetRendererProps) {
+  const config = widgetRegistry.get("flow_execution")!;
+  const data = useFlowExecutionData();
+  const FullComponent = config.FullComponent;
+  const borderClasses = getWidgetBorderClasses(config.accentColor, status, true);
+
+  return (
+    <div
+      className={cn(
+        "h-full rounded-xl border-2 overflow-hidden bg-background",
+        "transition-colors duration-200",
+        borderClasses,
+      )}
+    >
+      <WidgetHeader
+        title={config.displayName}
+        icon={config.icon}
+        accentColor={config.accentColor}
+        status={status}
+        isActive={true}
+        detailRoute={config.detailRoute}
+        onViewAll={onNavigateToDetail}
+      />
+      <div className="h-[calc(100%-48px)] overflow-hidden">
+        <FullComponent
+          isActive={true}
+          isSummary={false}
+          status={status}
+          data={data}
+          onNavigateToDetail={onNavigateToDetail}
+        />
+      </div>
+    </div>
+  );
+});
+
+/**
  * Active widget dispatcher - renders the correct type-specific component.
  * Each type has its own component with static hook calls.
  * Memoized to prevent unnecessary re-renders when parent state changes.
@@ -657,6 +708,8 @@ const ActiveWidget = memo(function ActiveWidget({
       return <McpCallRenderer status={status} onNavigateToDetail={onNavigateToDetail} />;
     case "execution_timeline":
       return <ExecutionTimelineRenderer status={status} onNavigateToDetail={onNavigateToDetail} />;
+    case "flow_execution":
+      return <FlowExecutionRenderer status={status} onNavigateToDetail={onNavigateToDetail} />;
     default:
       return (
         <div className="flex items-center justify-center h-full text-muted-foreground">
@@ -848,6 +901,17 @@ const ExecutionTimelineSummaryRenderer = memo(function ExecutionTimelineSummaryR
 });
 
 /**
+ * Flow Execution summary renderer.
+ */
+const FlowExecutionSummaryRenderer = memo(function FlowExecutionSummaryRenderer(
+  props: SummaryRendererProps,
+) {
+  const config = widgetRegistry.get("flow_execution")!;
+  const data = useFlowExecutionData();
+  return <SummaryContainer {...props} config={config} data={data} />;
+});
+
+/**
  * Summary widget dispatcher - renders the correct type-specific component.
  * Memoized to prevent unnecessary re-renders when parent state changes.
  */
@@ -954,6 +1018,14 @@ const SummaryWidget = memo(function SummaryWidget({
     case "execution_timeline":
       return (
         <ExecutionTimelineSummaryRenderer
+          status={status}
+          onClick={onClick}
+          onNavigateToDetail={onNavigateToDetail}
+        />
+      );
+    case "flow_execution":
+      return (
+        <FlowExecutionSummaryRenderer
           status={status}
           onClick={onClick}
           onNavigateToDetail={onNavigateToDetail}

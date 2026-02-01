@@ -276,7 +276,8 @@ export interface TutorialTriggers {
  * Page/tab identifiers that tutorials can navigate to
  */
 export type TutorialFocusPage =
-  | "run"
+  | "gui-automation"
+  | "run" // Legacy alias for gui-automation
   | "active"
   | "unified-workflow-builder"
   | "workflow-builder"

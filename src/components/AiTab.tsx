@@ -149,9 +149,12 @@ export function AiTab({
 
   // Filter AI output lines by selected run if available from RunSelectionContext
   const runFilteredAiOutputLines = useMemo(() => {
-    // If we have a selected run from RunSelectionContext, filter to only show that run's sessions
+    // If we have a selected run from RunSelectionContext, filter by taskRunId (exact match)
+    // Falls back to sessionId prefix matching for backward compatibility with old data
     if (selectedRun?.id) {
-      return aiOutputLines.filter((line) => line.sessionId === selectedRun.id);
+      return aiOutputLines.filter(
+        (line) => line.taskRunId === selectedRun.id || line.sessionId?.startsWith(selectedRun.id)
+      );
     }
     return aiOutputLines;
   }, [aiOutputLines, selectedRun?.id]);

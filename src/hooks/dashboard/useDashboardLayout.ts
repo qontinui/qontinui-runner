@@ -79,6 +79,18 @@ export function useDashboardLayout(
   // Minimum time an activity must be running before auto-switching (ms)
   const AUTO_SWITCH_DEBOUNCE_MS = 500;
 
+  // Track previous taskId to detect when it actually changes
+  const prevTaskIdRef = useRef<string | null | undefined>(undefined);
+
+  // Compute widgets synchronously to avoid race condition with isTaskRunning
+  // This ensures widgets are available in the same render cycle as isRunning changes
+  const derivedWidgets = useMemo(() => {
+    if (initialTaskInfo) {
+      return widgetRegistry.detectWidgets(initialTaskInfo);
+    }
+    return [];
+  }, [initialTaskInfo]);
+
   /**
    * Reset layout for a new task.
    */
@@ -107,14 +119,17 @@ export function useDashboardLayout(
     }
   }, []);
 
-  // Initialize on mount if task info provided
-  // Use taskId as dependency to avoid resetting on every poll (object reference changes)
+  // Sync state when taskId changes (after first render)
+  // This keeps detectedWidgets state in sync with derivedWidgets
   useEffect(() => {
-    if (initialTaskInfo) {
-      resetLayoutForTask(initialTaskInfo);
+    const currentTaskId = initialTaskInfo?.taskId ?? null;
+    if (currentTaskId !== prevTaskIdRef.current) {
+      prevTaskIdRef.current = currentTaskId;
+      if (initialTaskInfo) {
+        resetLayoutForTask(initialTaskInfo);
+      }
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [initialTaskInfo?.taskId]);
+  }, [initialTaskInfo, resetLayoutForTask]);
 
   /**
    * Auto-switch is DISABLED to prevent flickering.
@@ -124,23 +139,44 @@ export function useDashboardLayout(
    * Previously, auto-switching would occur when an activity's status changed to "running",
    * but this caused rapid flickering as different activities toggled status.
    */
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const _autoSwitchDisabled = { autoSwitchTimeoutRef, userSelectedRef, AUTO_SWITCH_DEBOUNCE_MS };
+
+  /**
+   * Effective widgets to use - prefer derivedWidgets for synchronous rendering.
+   */
+  const effectiveWidgets = useMemo(() => {
+    return derivedWidgets.length > 0 ? derivedWidgets : detectedWidgets;
+  }, [derivedWidgets, detectedWidgets]);
+
+  /**
+   * Effective active widget - use first effective widget if activeWidget isn't set yet.
+   */
+  const effectiveActiveWidget = useMemo(() => {
+    if (activeWidget && effectiveWidgets.includes(activeWidget)) {
+      return activeWidget;
+    }
+    return effectiveWidgets.length > 0 ? effectiveWidgets[0] : null;
+  }, [activeWidget, effectiveWidgets]);
 
   /**
    * Summary widgets are all detected widgets except the active one.
    */
   const summaryWidgets = useMemo(() => {
-    return detectedWidgets.filter((type) => type !== activeWidget);
-  }, [detectedWidgets, activeWidget]);
+    return effectiveWidgets.filter((type) => type !== effectiveActiveWidget);
+  }, [effectiveWidgets, effectiveActiveWidget]);
 
   /**
    * Check if dashboard is idle (no task running or no widgets detected).
-   * Uses the isTaskRunning flag from useTaskDetection for accurate state.
+   * Uses derivedWidgets for synchronous detection to prevent race conditions.
+   * Uses isTaskRunning flag from useTaskDetection for accurate running state.
    */
   const isIdle = useMemo(() => {
+    // Use derivedWidgets for synchronous check - prevents flash of idle state
+    // when isTaskRunning is true but detectedWidgets state hasn't updated yet
+    const widgetsToCheck = derivedWidgets.length > 0 ? derivedWidgets : detectedWidgets;
+
     // No widgets detected means idle
-    if (detectedWidgets.length === 0) return true;
+    if (widgetsToCheck.length === 0) return true;
     // If we have task running info, use it
     if (isTaskRunning !== undefined) {
       return !isTaskRunning;
@@ -150,7 +186,7 @@ export function useDashboardLayout(
       (state) =>
         state.status === "idle" || state.status === "completed" || state.status === "stopped",
     );
-  }, [activities, detectedWidgets, isTaskRunning]);
+  }, [activities, derivedWidgets, detectedWidgets, isTaskRunning]);
 
   /**
    * Set a specific widget as active.
@@ -158,12 +194,12 @@ export function useDashboardLayout(
    */
   const setActiveWidget = useCallback(
     (type: ActivityType) => {
-      if (detectedWidgets.includes(type)) {
+      if (effectiveWidgets.includes(type)) {
         userSelectedRef.current = true; // User has manually selected
         setActiveWidgetState(type);
       }
     },
-    [detectedWidgets],
+    [effectiveWidgets],
   );
 
   /**
@@ -195,15 +231,16 @@ export function useDashboardLayout(
   }, []);
 
   // Build layout state object
+  // Use effective values for synchronous rendering
   const layout: DashboardLayoutState = useMemo(
     () => ({
-      activeWidget,
+      activeWidget: effectiveActiveWidget,
       summaryWidgets,
       activities,
       isIdle,
-      detectedWidgets,
+      detectedWidgets: effectiveWidgets,
     }),
-    [activeWidget, summaryWidgets, activities, isIdle, detectedWidgets],
+    [effectiveActiveWidget, summaryWidgets, activities, isIdle, effectiveWidgets],
   );
 
   return {

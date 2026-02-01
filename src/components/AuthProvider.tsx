@@ -252,7 +252,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       console.log("[AUTH] useEffect[auto-refresh] cleanup - clearing token refresh timer");
       clearInterval(intervalId);
     };
-  }, [authStatus?.authenticated, refreshAuth]);
+  }, [authStatus, refreshAuth]);
 
   const contextValue: AuthContextValue = {
     authStatus,

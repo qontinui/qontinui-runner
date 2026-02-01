@@ -27,7 +27,7 @@
             // Silently ignore - this is expected when service worker is inactive
           }
         });
-      } catch (e) {
+      } catch {
         // Extension context may be invalidated (e.g., extension reloaded)
         // This is normal, just ignore
       }

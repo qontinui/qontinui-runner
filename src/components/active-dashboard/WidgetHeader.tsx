@@ -141,8 +141,8 @@ export function WidgetHeader({
           </span>
         )}
 
-        {/* View All link */}
-        {onViewAll && (
+        {/* View All link - hidden when widget is already active (in main container) */}
+        {onViewAll && !isActive && (
           <button
             data-ui-id="widget-view-all-btn"
             onClick={onViewAll}

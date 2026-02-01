@@ -15,6 +15,7 @@ import { ControlBar } from "./ControlBar";
 import { BottomBar } from "./BottomBar";
 import { ActiveRunsBar } from "./ActiveRunsBar";
 import { registerAllWidgets } from "./widgets";
+import { useFlowExecutionData } from "./widgets/flow-execution";
 import { windowManager } from "../../managers";
 import type { ActivityType } from "../../types/dashboard/activity-types";
 import type { CommandResponse } from "../../types/displayProfile";
@@ -53,8 +54,17 @@ export function DashboardPage({
   // Get dashboard state
   const { state, setActiveWidget, navigateToDetail } = useDashboardState();
 
-  // Track paused state locally
+  // Get flow execution data for flow-specific controls
+  const flowExecutionData = useFlowExecutionData();
+
+  // Track paused state locally (for GUI automation)
   const [isPaused, setIsPaused] = useState(false);
+
+  // Determine if a flow is currently active and should receive control commands
+  const isFlowActive =
+    flowExecutionData.isActive &&
+    flowExecutionData.instanceId !== null &&
+    state.layout.activeWidget === "flow_execution";
 
   // Handle widget click (switch active widget)
   const handleWidgetClick = useCallback(
@@ -72,13 +82,29 @@ export function DashboardPage({
     [navigateToDetail],
   );
 
-  // Handle stop execution - works for both unified workflows and GUI automation
+  // Handle stop execution - works for unified workflows, GUI automation, and flow execution
   const handleStop = useCallback(async () => {
     console.log("[DASHBOARD] Stop execution called");
     const taskId = state.taskInfo?.taskId;
     let stopped = false;
 
-    // 1. Stop unified workflow (AI task) via HTTP API if we have a task ID
+    // 1. If a flow is active, cancel it via Tauri command
+    if (isFlowActive && flowExecutionData.instanceId) {
+      try {
+        console.log(`[DASHBOARD] Cancelling flow execution: ${flowExecutionData.instanceId}`);
+        const result = await invoke<boolean>("cancel_flow_execution", {
+          instanceId: flowExecutionData.instanceId,
+        });
+        if (result) {
+          console.log("[DASHBOARD] Flow execution cancelled successfully");
+          stopped = true;
+        }
+      } catch (error) {
+        console.error("[DASHBOARD] Failed to cancel flow execution:", error);
+      }
+    }
+
+    // 2. Stop unified workflow (AI task) via HTTP API if we have a task ID
     if (taskId) {
       try {
         console.log(`[DASHBOARD] Stopping unified workflow: ${taskId}`);
@@ -98,7 +124,7 @@ export function DashboardPage({
       }
     }
 
-    // 2. Also try to stop GUI automation via Tauri command
+    // 3. Also try to stop GUI automation via Tauri command
     try {
       const result = await invoke<CommandResponse>("stop_execution");
       if (result.success) {
@@ -115,10 +141,38 @@ export function DashboardPage({
       // Restore window if it was auto-minimized
       await windowManager.restoreIfMinimized();
     }
-  }, [state.taskInfo?.taskId]);
+  }, [state.taskInfo?.taskId, isFlowActive, flowExecutionData.instanceId]);
 
-  // Handle play/pause toggle - only works for GUI automation, not unified workflows
+  // Handle play/pause toggle - works for GUI automation and flow execution
   const handlePlayPause = useCallback(async () => {
+    // Check if we should handle flow execution pause/resume
+    if (isFlowActive && flowExecutionData.instanceId) {
+      try {
+        const flowIsPaused = flowExecutionData.status === "paused" || flowExecutionData.status === "waiting_for_input";
+        if (flowIsPaused) {
+          console.log(`[DASHBOARD] Resume flow execution: ${flowExecutionData.instanceId}`);
+          const result = await invoke<boolean>("resume_flow_execution", {
+            instanceId: flowExecutionData.instanceId,
+          });
+          if (result) {
+            console.log("[DASHBOARD] Flow execution resumed successfully");
+          }
+        } else {
+          console.log(`[DASHBOARD] Pause flow execution: ${flowExecutionData.instanceId}`);
+          const result = await invoke<boolean>("pause_flow_execution", {
+            instanceId: flowExecutionData.instanceId,
+          });
+          if (result) {
+            console.log("[DASHBOARD] Flow execution paused successfully");
+          }
+        }
+      } catch (error) {
+        console.error("[DASHBOARD] Failed to pause/resume flow execution:", error);
+      }
+      return;
+    }
+
+    // Handle GUI automation pause/resume
     try {
       if (isPaused) {
         console.log("[DASHBOARD] Resume execution called");
@@ -140,7 +194,7 @@ export function DashboardPage({
       // Unified workflows (AI tasks) don't support pause yet
       console.log("[DASHBOARD] Pause/resume not available for this workflow type");
     }
-  }, [isPaused]);
+  }, [isPaused, isFlowActive, flowExecutionData.instanceId, flowExecutionData.status]);
 
   // Get current action text for bottom bar
   const _currentAction = state.layout.activeWidget
@@ -157,19 +211,43 @@ export function DashboardPage({
     onGoToExecute();
   }, [onGoToExecute]);
 
+  // Determine the display status - prioritize flow execution status when a flow is active
+  const displayStatus = (() => {
+    if (isFlowActive) {
+      // Map flow execution status to dashboard status
+      switch (flowExecutionData.status) {
+        case "running":
+          return "running";
+        case "paused":
+        case "waiting_for_input":
+          return "paused";
+        case "completed":
+          return "completed";
+        case "failed":
+          return "failed";
+        case "idle":
+        default:
+          return state.status;
+      }
+    }
+    // For GUI automation, use local isPaused state
+    if (isPaused && state.status === "running") {
+      return "paused";
+    }
+    return state.status;
+  })();
+
   return (
     <TaskProvider taskInfo={state.taskInfo} isRunning={state.isRunning}>
       <div className="flex h-full flex-col bg-background">
         {/* Control Bar - always visible */}
         <ControlBar
-          taskName={state.taskInfo?.taskName ?? null}
+          taskName={isFlowActive ? (flowExecutionData.flowName ?? state.taskInfo?.taskName ?? null) : (state.taskInfo?.taskName ?? null)}
           phase={state.currentPhase}
           showPhaseBadge={state.showPhaseBadge}
-          status={isPaused && state.status === "running" ? "paused" : state.status}
+          status={displayStatus}
           workflowStage={state.workflowStage}
           isOrchestrated={state.isOrchestrated}
-          isComplete={state.status === "completed"}
-          isFailed={state.status === "failed"}
           iteration={state.isOrchestrated ? state.iteration : undefined}
           maxIterations={state.isOrchestrated ? state.maxIterations : undefined}
           onPlayPause={handlePlayPause}

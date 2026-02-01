@@ -93,6 +93,14 @@ export {
   type ExecutionTimelineData,
 } from "./execution-timeline";
 
+// Flow Execution
+export {
+  FlowExecutionWidget,
+  FlowExecutionSummary,
+  useFlowExecutionData,
+  type FlowExecutionData,
+} from "./flow-execution";
+
 // Shared components
 export {
   StepStatusBadge,

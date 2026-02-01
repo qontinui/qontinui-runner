@@ -50,7 +50,7 @@ interface StepExecutionResponse {
 export function useWorkflowRefData(): WorkflowRefData {
   const [workflows, setWorkflows] = useState<WorkflowRefExecution[]>([]);
   const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [error, _setError] = useState<string | null>(null);
   const [startTime, setStartTime] = useState<number | null>(null);
   const [elapsedTime, setElapsedTime] = useState(0);
 

@@ -378,7 +378,7 @@ function GuiActionConfig({
   step: UnifiedStep & { type: "gui_action" };
   onUpdate: (updates: Partial<typeof step>) => void;
 }) {
-  const actionInfo = GUI_ACTION_TYPES.find((a) => a.type === step.action);
+  const _actionInfo = GUI_ACTION_TYPES.find((a) => a.type === step.action);
 
   return (
     <div className="space-y-4">
@@ -502,7 +502,7 @@ function TestConfig({
   step: UnifiedStep & { type: "test" };
   onUpdate: (updates: Partial<typeof step>) => void;
 }) {
-  const testTypes = STEP_TYPES.verification.filter((s) => s.type.startsWith("test_"));
+  const _testTypes = STEP_TYPES.verification.filter((s) => s.type.startsWith("test_"));
 
   return (
     <div className="space-y-4">
@@ -614,7 +614,7 @@ function CheckConfig({
   onUpdate: (updates: Partial<typeof step>) => void;
 }) {
   // Get tools for the current check type
-  const checkTypeMap: Record<CheckType, string> = {
+  const _checkTypeMap: Record<CheckType, string> = {
     lint: "lint",
     format: "format",
     typecheck: "typecheck",
@@ -625,8 +625,8 @@ function CheckConfig({
 
   // Filter tools by check type
   const availableTools = CHECK_TOOLS.filter((t) => t.check_type === step.check_type);
-  const selectedTool = CHECK_TOOLS.find((t) => t.tool === step.tool);
-  const checkTypeInfo = CHECK_TYPE_INFO.find((t) => t.type === step.check_type);
+  const _selectedTool = CHECK_TOOLS.find((t) => t.tool === step.tool);
+  const _checkTypeInfo = CHECK_TYPE_INFO.find((t) => t.type === step.check_type);
 
   return (
     <div className="space-y-4">

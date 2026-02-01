@@ -16,11 +16,10 @@ import {
   Repeat,
   Square,
   XSquare,
-  ChevronRight,
   Trash2,
 } from "lucide-react";
-import type { FlowStep, StepType, Condition } from "../../types/flow";
-import { STEP_TYPE_COLORS, STEP_TYPE_LABELS, createExpressionCondition } from "../../types/flow";
+import type { FlowStep, StepType } from "../../types/flow";
+import { STEP_TYPE_COLORS, STEP_TYPE_LABELS } from "../../types/flow";
 
 interface FlowSidebarProps {
   selectedStep: FlowStep | null;

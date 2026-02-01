@@ -120,6 +120,7 @@ export function ScriptletsTab({ onLog, aiOutputLines = [] }: ScriptletsTabProps)
   useEffect(() => {
     loadScriptlets();
     loadCategories();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const loadScriptlets = async () => {

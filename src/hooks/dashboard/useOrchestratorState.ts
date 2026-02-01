@@ -3,28 +3,51 @@
  *
  * Fetches and tracks the orchestrator state for a running task.
  * Provides the current workflow stage (Setup, Agentic, Verification, Completion).
+ *
+ * Uses real-time Tauri events for instant updates with polling as fallback.
  */
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { WorkflowStage } from "../../types/dashboard/activity-types";
 
 const API_BASE = "http://localhost:9876";
-const POLL_INTERVAL_MS = 1000;
+// Polling is now fallback only - real-time events provide instant updates
+const POLL_INTERVAL_MS = 5000;
+
+/**
+ * Event payload from backend orchestrator-state-change events.
+ */
+interface OrchestratorStateChangeEvent {
+  event_type: "OrchestratorStateChange";
+  data: {
+    task_run_id: string;
+    workflow_stage: string;
+    iteration: number;
+    phase: string;
+    state_data?: unknown;
+  };
+}
 
 /**
  * Response from the orchestrator state API endpoint.
  */
 export interface OrchestratorStateResponse {
   task_run_id: string;
+  workflow_type: string;
   current_state: string;
-  workflow_stage: WorkflowStage;
-  workflow_stage_display: string;
-  iteration: number;
-  max_iterations: number;
-  has_verification_plan: boolean;
+  phase: string | null;
+  iteration: number | null;
+  max_iterations: number | null;
   is_complete: boolean;
-  is_paused: boolean;
   is_stopped: boolean;
+  is_paused: boolean;
+  has_verification_plan: boolean;
+  workflow_start_time: string;
+  state_data: unknown;
+  // Mapped workflow stage for UI
+  workflow_stage: WorkflowStage | null;
+  workflow_stage_display: string | null;
 }
 
 /**
@@ -60,6 +83,8 @@ export interface OrchestratorStateResult {
 /**
  * Hook to fetch and track orchestrator state for a task.
  *
+ * Uses real-time Tauri events for instant updates with polling as fallback.
+ *
  * @param taskId - The ID of the task to track, or null if no task
  * @param isRunning - Whether the task is currently running
  */
@@ -70,6 +95,7 @@ export function useOrchestratorState(
   const [state, setState] = useState<OrchestratorStateResponse | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const unlistenRef = useRef<UnlistenFn | null>(null);
 
   const fetchState = useCallback(async () => {
     if (!taskId) {
@@ -90,6 +116,46 @@ export function useOrchestratorState(
     }
   }, [taskId]);
 
+  // Subscribe to real-time orchestrator state change events
+  useEffect(() => {
+    if (!taskId || !isRunning) return;
+
+    let mounted = true;
+
+    const setupListener = async () => {
+      try {
+        const unlisten = await listen<OrchestratorStateChangeEvent>(
+          "orchestrator-state-change",
+          (event) => {
+            if (!mounted) return;
+
+            const payload = event.payload;
+            // Only update if this event is for our task
+            if (payload.data?.task_run_id === taskId) {
+              // Update state with event data - trigger a full fetch for complete data
+              // The event gives us quick notification, fetch gives us full state
+              fetchState();
+            }
+          },
+        );
+        unlistenRef.current = unlisten;
+      } catch (e) {
+        // Tauri events not available (e.g., running in browser) - rely on polling
+        console.debug("Tauri events not available, using polling only:", e);
+      }
+    };
+
+    setupListener();
+
+    return () => {
+      mounted = false;
+      if (unlistenRef.current) {
+        unlistenRef.current();
+        unlistenRef.current = null;
+      }
+    };
+  }, [taskId, isRunning, fetchState]);
+
   // Initial fetch
   useEffect(() => {
     if (taskId) {
@@ -100,7 +166,7 @@ export function useOrchestratorState(
     }
   }, [taskId, fetchState]);
 
-  // Poll while running
+  // Fallback polling while running (reduced frequency since we have real-time events)
   useEffect(() => {
     if (!taskId || !isRunning) return;
 
@@ -111,13 +177,14 @@ export function useOrchestratorState(
   return {
     workflowStage: state?.workflow_stage ?? null,
     workflowStageDisplay: state?.workflow_stage_display ?? null,
-    iteration: state?.iteration ?? 0,
-    maxIterations: state?.max_iterations ?? 0,
+    iteration: state?.iteration ?? 1,
+    maxIterations: state?.max_iterations ?? 10,
     hasVerificationPlan: state?.has_verification_plan ?? false,
     isComplete: state?.is_complete ?? false,
     isPaused: state?.is_paused ?? false,
     isStopped: state?.is_stopped ?? false,
-    isOrchestrated: state !== null,
+    // Consider orchestrated if we have a valid response with workflow stage
+    isOrchestrated: state !== null && state.workflow_type === "unified",
     isLoading,
     error,
     refresh: fetchState,

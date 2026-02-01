@@ -28,7 +28,6 @@ import { Badge, ScrollArea } from "../../../ui";
 import { StepStatsBar, StepStatusBadge } from "../shared";
 import type { BaseWidgetProps } from "../../../../types/dashboard/widget-props";
 import type {
-  VerificationData,
   VerificationEvidence,
   VerificationTestType,
   VerificationStatus,
@@ -212,7 +211,9 @@ function CheckStepRow({
 
         {/* Error indicator */}
         {step.error && (
-          <AlertCircle className={cn("h-3.5 w-3.5", errorColors.text)} title={step.error} />
+          <span title={step.error}>
+            <AlertCircle className={cn("h-3.5 w-3.5", errorColors.text)} />
+          </span>
         )}
       </div>
 

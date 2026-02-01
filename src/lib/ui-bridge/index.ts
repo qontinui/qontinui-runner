@@ -14,3 +14,7 @@ export {
   RenderLogWrapper,
   type RenderLogWrapperProps,
 } from "./RenderLogWrapper";
+export {
+  generateAIContext,
+  type AIContextOptions,
+} from "./generateAIContext";

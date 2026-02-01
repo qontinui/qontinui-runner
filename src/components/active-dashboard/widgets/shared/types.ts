@@ -7,7 +7,7 @@
 /**
  * Status of a step execution.
  */
-export type StepExecutionStatus = "pending" | "running" | "success" | "failed" | "skipped";
+export type StepExecutionStatus = "pending" | "running" | "success" | "failed" | "skipped" | "unknown";
 
 /**
  * Base interface for step execution data.

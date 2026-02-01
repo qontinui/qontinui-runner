@@ -1,27 +1,27 @@
 /**
  * StatisticsTab.tsx
  *
- * Main statistics dashboard showing:
- * - Config health overview (success rate, runs, timing)
- * - Flaky items list (unreliable transitions/templates)
- * - Run history with trend
- * - Error patterns
- * - Run details slide-out panel
+ * Main statistics dashboard with two views:
+ * 1. Overview - Config health, flaky items, run history, error patterns
+ * 2. Performance - Action timing, success trends, transition reliability
  *
  * Note: This shows config-level automation statistics, not task run statistics.
  * Task runs and automation runs are different data sources.
  */
 
 import { useState } from "react";
-import { BarChart3, AlertTriangle, RefreshCw, Activity } from "lucide-react";
+import { BarChart3, AlertTriangle, RefreshCw, Activity, Timer } from "lucide-react";
 import { useConfigStatistics, useFlakyItems, useRecentRuns } from "../../hooks/useStatistics";
 import { ConfigHealthPanel } from "./ConfigHealthPanel";
 import { FlakyItemsList } from "./FlakyItemsList";
 import { RunHistoryPanel } from "./RunHistoryPanel";
 import { ErrorPatternsPanel } from "./ErrorPatternsPanel";
 import { RunDetailsPanel } from "./RunDetailsPanel";
+import { PerformanceDashboard } from "../performance-dashboard";
 import type { RunDetails } from "../../types/statistics";
 import { useRunSelectionOptional } from "../../contexts/RunSelectionContext";
+
+type ViewMode = "overview" | "performance";
 
 interface StatisticsTabProps {
   configId: string | null;
@@ -30,6 +30,7 @@ interface StatisticsTabProps {
 
 export function StatisticsTab({ configId, configName }: StatisticsTabProps) {
   const [selectedRun, setSelectedRun] = useState<RunDetails | null>(null);
+  const [viewMode, setViewMode] = useState<ViewMode>("overview");
 
   // Use RunSelectionContext to check if we're in a run selection context
   // Note: TaskRuns don't have config_id, so we just use the prop configId
@@ -76,31 +77,69 @@ export function StatisticsTab({ configId, configName }: StatisticsTabProps) {
     );
   }
 
-  if (error || !stats) {
+  // Show performance dashboard directly if no overview data
+  if ((error || !stats) && viewMode === "overview") {
+    // Try performance view instead of showing error
     return (
-      <div className="h-full flex items-center justify-center text-muted-foreground">
-        <div className="text-center">
-          <AlertTriangle className="w-12 h-12 mx-auto mb-4 opacity-50" />
-          <p>No statistics available for this config</p>
-          <p className="text-sm mt-2">Run some workflows to start collecting data</p>
+      <div className="h-full flex flex-col">
+        {/* View Toggle */}
+        <div className="flex items-center justify-between p-4 border-b border-border">
+          <div className="flex items-center gap-2">
+            <ViewModeToggle mode={viewMode} onChange={setViewMode} />
+          </div>
+          <p className="text-sm text-muted-foreground">
+            {effectiveConfigName || effectiveConfigId}
+          </p>
+        </div>
+        <div className="flex-1 flex items-center justify-center text-muted-foreground">
+          <div className="text-center">
+            <AlertTriangle className="w-12 h-12 mx-auto mb-4 opacity-50" />
+            <p>No statistics available for this config</p>
+            <p className="text-sm mt-2">Run some workflows to start collecting data</p>
+            <button
+              onClick={() => setViewMode("performance")}
+              className="mt-4 px-4 py-2 bg-muted rounded-md hover:bg-muted/80 transition-colors text-sm"
+            >
+              Try Performance View
+            </button>
+          </div>
         </div>
       </div>
     );
   }
 
+  // Performance Dashboard view
+  if (viewMode === "performance") {
+    return (
+      <div className="h-full flex flex-col">
+        {/* View Toggle */}
+        <div className="flex items-center gap-2 p-4 border-b border-border">
+          <ViewModeToggle mode={viewMode} onChange={setViewMode} />
+        </div>
+        <div className="flex-1 overflow-hidden">
+          <PerformanceDashboard configId={effectiveConfigId} configName={effectiveConfigName} />
+        </div>
+      </div>
+    );
+  }
+
+  // Overview view (existing layout)
   return (
     <div className="h-full flex overflow-hidden">
       {/* Main content */}
       <div
         className={`flex-1 overflow-auto p-4 space-y-4 transition-all ${selectedRun ? "pr-0" : ""}`}
       >
-        {/* Header */}
+        {/* Header with View Toggle */}
         <div className="flex items-center justify-between">
-          <div>
-            <h2 className="text-lg font-semibold">Statistics</h2>
-            <p className="text-sm text-muted-foreground">
-              {effectiveConfigName || effectiveConfigId}
-            </p>
+          <div className="flex items-center gap-4">
+            <div>
+              <h2 className="text-lg font-semibold">Statistics</h2>
+              <p className="text-sm text-muted-foreground">
+                {effectiveConfigName || effectiveConfigId}
+              </p>
+            </div>
+            <ViewModeToggle mode={viewMode} onChange={setViewMode} />
           </div>
           <button
             onClick={() => refetch()}
@@ -114,7 +153,7 @@ export function StatisticsTab({ configId, configName }: StatisticsTabProps) {
         {/* Grid layout */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
           {/* Config Health */}
-          <ConfigHealthPanel stats={stats} />
+          <ConfigHealthPanel stats={stats!} />
 
           {/* Flaky Items */}
           <FlakyItemsList items={flakyItems || []} />
@@ -123,7 +162,7 @@ export function StatisticsTab({ configId, configName }: StatisticsTabProps) {
           <RunHistoryPanel runs={recentRuns || []} onRunClick={setSelectedRun} />
 
           {/* Error Patterns */}
-          <ErrorPatternsPanel patterns={stats.error_patterns} />
+          <ErrorPatternsPanel patterns={stats!.error_patterns} />
         </div>
       </div>
 
@@ -133,6 +172,44 @@ export function StatisticsTab({ configId, configName }: StatisticsTabProps) {
           <RunDetailsPanel run={selectedRun} onClose={() => setSelectedRun(null)} />
         </div>
       )}
+    </div>
+  );
+}
+
+// =============================================================================
+// View Mode Toggle Component
+// =============================================================================
+
+interface ViewModeToggleProps {
+  mode: ViewMode;
+  onChange: (mode: ViewMode) => void;
+}
+
+function ViewModeToggle({ mode, onChange }: ViewModeToggleProps) {
+  return (
+    <div className="flex items-center bg-muted rounded-lg p-1">
+      <button
+        onClick={() => onChange("overview")}
+        className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm transition-colors ${
+          mode === "overview"
+            ? "bg-background shadow-sm text-foreground"
+            : "text-muted-foreground hover:text-foreground"
+        }`}
+      >
+        <BarChart3 className="w-4 h-4" />
+        Overview
+      </button>
+      <button
+        onClick={() => onChange("performance")}
+        className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm transition-colors ${
+          mode === "performance"
+            ? "bg-background shadow-sm text-foreground"
+            : "text-muted-foreground hover:text-foreground"
+        }`}
+      >
+        <Timer className="w-4 h-4" />
+        Performance
+      </button>
     </div>
   );
 }

@@ -239,7 +239,7 @@ function TreeConnections({ root }: { root: PositionedNode }) {
     const parentCenterX = node.x + NODE_WIDTH / 2;
     const parentBottomY = node.y + NODE_HEIGHT;
 
-    node.children.forEach((child, index) => {
+    node.children.forEach((child, _index) => {
       const childCenterX = child.x + NODE_WIDTH / 2;
       const childTopY = child.y;
 

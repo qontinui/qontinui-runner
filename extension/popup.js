@@ -64,6 +64,7 @@ const activeStatesCount = document.getElementById("activeStatesCount");
 const transitionsCount = document.getElementById("transitionsCount");
 const viewSnapshotBtn = document.getElementById("viewSnapshotBtn");
 
+
 // Sub-tab elements (for API section)
 const subTabs = document.querySelectorAll(".sub-tab");
 const recorderSubTab = document.getElementById("recorderSubTab");
@@ -278,28 +279,50 @@ setInterval(async () => {
 // Main Tab Switching (DOM / API)
 // =============================================================================
 
-mainTabs.forEach((tab) => {
-  tab.addEventListener("click", () => {
-    // Update tab buttons
-    mainTabs.forEach((t) => t.classList.remove("active"));
-    tab.classList.add("active");
-
-    // Show/hide content
-    const tabId = tab.dataset.mainTab;
-    domTabContent.classList.remove("active");
-    apiTabContent.classList.remove("active");
-    uibridgeTabContent.classList.remove("active");
-
-    if (tabId === "dom") {
-      domTabContent.classList.add("active");
-    } else if (tabId === "api") {
-      apiTabContent.classList.add("active");
-    } else if (tabId === "uibridge") {
-      uibridgeTabContent.classList.add("active");
-      // Check UI Bridge status when tab is opened
-      checkUIBridgeStatus();
+/**
+ * Switch to a specific main tab
+ */
+function switchToMainTab(tabId) {
+  // Update tab buttons
+  mainTabs.forEach((t) => {
+    if (t.dataset.mainTab === tabId) {
+      t.classList.add("active");
+    } else {
+      t.classList.remove("active");
     }
   });
+
+  // Show/hide content
+  domTabContent.classList.remove("active");
+  apiTabContent.classList.remove("active");
+  uibridgeTabContent.classList.remove("active");
+
+  if (tabId === "dom") {
+    domTabContent.classList.add("active");
+  } else if (tabId === "api") {
+    apiTabContent.classList.add("active");
+  } else if (tabId === "uibridge") {
+    uibridgeTabContent.classList.add("active");
+    // Check UI Bridge status when tab is opened
+    checkUIBridgeStatus();
+  }
+
+  // Persist the selected tab
+  chrome.storage.local.set({ selectedPopupTab: tabId });
+}
+
+mainTabs.forEach((tab) => {
+  tab.addEventListener("click", () => {
+    const tabId = tab.dataset.mainTab;
+    switchToMainTab(tabId);
+  });
+});
+
+// Restore the previously selected popup tab
+chrome.storage.local.get(['selectedPopupTab'], (result) => {
+  if (result.selectedPopupTab) {
+    switchToMainTab(result.selectedPopupTab);
+  }
 });
 
 // =============================================================================
@@ -506,7 +529,7 @@ async function copyRequestAsCurl(requestId) {
     try {
       await navigator.clipboard.writeText(response.curl);
       showResult(true, "cURL copied to clipboard!");
-    } catch (error) {
+    } catch {
       showResult(false, "Failed to copy to clipboard");
     }
   } else {
@@ -797,7 +820,7 @@ showOverlaysBtn.addEventListener("click", toggleOverlays);
 viewSnapshotBtn.addEventListener("click", viewStateSnapshot);
 
 // Listen for UI Bridge events from background
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
   if (message.type === "UI_BRIDGE_EVENT") {
     const { eventType, data } = message;
 

@@ -82,6 +82,15 @@ export {
 } from "./useStatistics";
 
 export {
+  performanceMetricsKeys,
+  usePerformanceDashboard,
+  useActionPerformance,
+  useTransitionReliability,
+  useElementResolution,
+  useSuccessRateTrend,
+} from "./usePerformanceMetrics";
+
+export {
   discoveryKeys,
   useDiscoverySummary,
   useSyncStatus,
@@ -151,3 +160,17 @@ export type {
   ConnectionStatus,
   ConnectedTarget,
 } from "./useLiveBrowser";
+
+export { useExternalUIBridge } from "./useExternalUIBridge";
+export type {
+  UseExternalUIBridgeReturn,
+  ExternalElement,
+  PageContext,
+  CommandResult,
+} from "./useExternalUIBridge";
+
+export { useGuiLock } from "./useGuiLock";
+export type { GuiLockState, UseGuiLockResult } from "./useGuiLock";
+
+export { useBridgeExecution } from "./useBridgeExecution";
+export type { BridgeInfo, UseBridgeExecutionResult } from "./useBridgeExecution";

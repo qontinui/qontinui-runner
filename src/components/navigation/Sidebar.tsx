@@ -11,6 +11,7 @@
  * - Persistent expanded/collapsed state in localStorage
  * - Keyboard navigation support
  * - Tooltips on hover when collapsed
+ * - Workflow Queue for sequencing workflows
  */
 
 import {
@@ -76,6 +77,7 @@ import {
   Webhook,
   Wifi,
   Terminal,
+  AlertCircle,
 } from "lucide-react";
 
 // Import shared navigation structure and state management
@@ -83,13 +85,13 @@ import {
   type NavigationItem as SharedNavigationItem,
   type NavigationGroup as SharedNavigationGroup,
   type IconName,
-  type NavigationState,
-  type NavigationAction,
+  type NavigationState as _NavigationState,
+  type NavigationAction as _NavigationAction,
   type AppMode,
-  getRunnerNavigation,
+  getRunnerNavigation as _getRunnerNavigation,
   getRunnerNavigationForMode,
   getChildrenForPlatformAndMode,
-  isItemAvailableForMode,
+  isItemAvailableForMode as _isItemAvailableForMode,
   findItemById,
   CHILDREN_MAP,
   STORAGE_KEYS,
@@ -97,7 +99,7 @@ import {
   navigationReducer,
   navigationActions,
   isGroupExpanded,
-  isSecondaryOpenFor,
+  isSecondaryOpenFor as _isSecondaryOpenFor,
   serializeState,
   deserializeState,
 } from "qontinui-navigation";
@@ -159,6 +161,7 @@ const ICON_MAP: Record<IconName, LucideIcon> = {
   Webhook,
   Wifi,
   Terminal,
+  AlertCircle,
 };
 
 function getIconComponent(iconName: IconName): LucideIcon {
@@ -183,6 +186,8 @@ interface ResolvedNavigationItem {
   description?: string;
   hasChildren?: boolean;
   selectsFirstChild?: boolean;
+  badge?: { type: string; value?: string | number; variant?: string };
+  hidden?: boolean; // For showing "HIDDEN" badge in dev mode
 }
 
 interface ResolvedNavigationGroup {
@@ -204,6 +209,7 @@ function transformItem(item: SharedNavigationItem): ResolvedNavigationItem {
     description: item.description,
     hasChildren: item.hasChildren,
     selectsFirstChild: item.selectsFirstChild,
+    hidden: item.hidden,
   };
 }
 
@@ -376,6 +382,11 @@ function NavItem({
       {!collapsed && (
         <>
           <span className="truncate flex-1 text-left">{item.label}</span>
+          {item.hidden && (
+            <span className="text-[9px] font-bold uppercase px-1 py-0.5 rounded bg-gray-500/20 text-gray-400 border border-gray-500/30">
+              hidden
+            </span>
+          )}
           {item.hasChildren && <ChevronRight className="w-3 h-3 opacity-50" />}
         </>
       )}
@@ -441,6 +452,11 @@ function FlyoutItem({ item, isActive, onClick, index }: FlyoutItemProps) {
           >
             {item.label}
           </span>
+          {item.hidden && (
+            <span className="text-[9px] font-bold uppercase px-1 py-0.5 rounded bg-gray-500/20 text-gray-400 border border-gray-500/30">
+              hidden
+            </span>
+          )}
         </div>
         {item.description && (
           <p className="text-xs text-muted-foreground/70 mt-0.5 line-clamp-2">{item.description}</p>

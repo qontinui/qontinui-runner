@@ -176,13 +176,17 @@ export function ConnectedUIBridgeInspector() {
     // In a full implementation, this would show/hide element highlight overlays
   }, []);
 
-  // Log connection status changes
+  // Track previous availability to only log once per connection
+  const prevAvailable = useRef(bridge.available);
+
+  // Log connection status changes - only when transitioning TO available
   useEffect(() => {
-    if (bridge.available) {
+    if (bridge.available && !prevAvailable.current) {
       addEvent("navigation_completed", {
         result: { elementCount: bridge.elements.length },
       });
     }
+    prevAvailable.current = bridge.available;
   }, [bridge.available, bridge.elements.length, addEvent]);
 
   return (

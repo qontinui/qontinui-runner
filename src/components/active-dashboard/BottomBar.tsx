@@ -8,6 +8,7 @@ import {
   Wifi,
   Monitor,
   Globe,
+  Globe2,
   Bot,
   CheckCircle,
   AlertTriangle,
@@ -16,6 +17,11 @@ import {
   BookOpen,
   Cog,
   Activity,
+  Terminal,
+  FileCode,
+  GitBranch,
+  Plug,
+  ListOrdered,
 } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { Badge } from "../ui";
@@ -53,6 +59,13 @@ const activityIcons: Record<ActivityType, React.ComponentType<{ className?: stri
   verification: CheckCircle,
   findings: AlertTriangle,
   execution_status: Activity,
+  shell_command: Terminal,
+  api_request: Globe2,
+  script: FileCode,
+  workflow_ref: GitBranch,
+  mcp_call: Plug,
+  execution_timeline: ListOrdered,
+  flow_execution: GitBranch,
 };
 
 /**

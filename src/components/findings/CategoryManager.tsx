@@ -111,11 +111,6 @@ export function CategoryManager({ onLog }: CategoryManagerProps) {
   const [formColor, setFormColor] = useState("blue");
   const [formActionType, setFormActionType] = useState<ActionType>("auto_fix");
 
-  // Load categories on mount
-  useEffect(() => {
-    loadCategories();
-  }, []);
-
   const loadCategories = useCallback(() => {
     const allCategories = getAllCategories();
     setCategories(allCategories);
@@ -131,6 +126,11 @@ export function CategoryManager({ onLog }: CategoryManagerProps) {
       }
     }
   }, []);
+
+  // Load categories on mount
+  useEffect(() => {
+    loadCategories();
+  }, [loadCategories]);
 
   const log = useCallback(
     (level: "info" | "warning" | "error" | "success", message: string) => {

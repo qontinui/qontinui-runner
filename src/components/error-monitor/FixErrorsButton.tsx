@@ -15,6 +15,8 @@ import {
 import { cn } from "../../lib/utils";
 import { useFixWorkflow } from "../../hooks/useErrorMonitor";
 
+const API_BASE = "http://localhost:9876";
+
 interface FixErrorsButtonProps {
   /** Task run ID to scope errors to */
   taskRunId?: string;
@@ -67,16 +69,22 @@ export function FixErrorsButton({
       setShowDropdown(false);
 
       const workflow = await generateWorkflow();
-      setSuccess(true);
-      setTimeout(() => setSuccess(false), 3000);
 
       if (onWorkflowGenerated) {
         onWorkflowGenerated(workflow);
+        setSuccess(true);
+        setTimeout(() => setSuccess(false), 3000);
       } else {
-        // Default behavior: emit event for unified workflow execution
+        // Save the workflow to the database
+        const savedWorkflow = await saveWorkflowToDatabase(workflow);
+        setSuccess(true);
+        setTimeout(() => setSuccess(false), 3000);
+
+        // Navigate to the workflow builder with the new workflow
+        // The workflow is now saved and can be edited/run from the Workflows tab
         window.dispatchEvent(
-          new CustomEvent("execute-unified-workflow", {
-            detail: { workflow, name: "Fix Application Errors" },
+          new CustomEvent("navigate-to-workflow", {
+            detail: { workflowId: savedWorkflow.id },
           }),
         );
       }
@@ -95,21 +103,83 @@ export function FixErrorsButton({
       setShowDropdown(false);
 
       const workflow = await generateWorkflow();
+
+      // Execute the workflow inline without saving to the library
+      // This prevents cluttering the workflow library with auto-generated fix workflows
+      const runResponse = await fetch(`${API_BASE}/unified-workflows/execute-inline`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: (workflow.name as string) || "Fix Application Errors",
+          description: (workflow.description as string) || "",
+          setup_steps: workflow.setup_steps || [],
+          verification_steps: workflow.verification_steps || [],
+          agentic_steps: workflow.agentic_steps || [],
+          completion_steps: workflow.completion_steps || [],
+          max_iterations: (workflow.settings as Record<string, unknown>)?.max_agentic_iterations || 10,
+          targeted_error_ids: workflow.targeted_error_ids || [],
+        }),
+      });
+
+      if (!runResponse.ok) {
+        const errorText = await runResponse.text();
+        let errorMessage = "Failed to run workflow";
+        try {
+          const errorData = JSON.parse(errorText);
+          errorMessage = errorData.error || errorMessage;
+        } catch {
+          errorMessage = errorText || errorMessage;
+        }
+        throw new Error(errorMessage);
+      }
+
       setSuccess(true);
       setTimeout(() => setSuccess(false), 3000);
-
-      // Emit event to start workflow immediately
-      window.dispatchEvent(
-        new CustomEvent("start-unified-workflow", {
-          detail: { workflow, name: "Fix Application Errors", autoStart: true },
-        }),
-      );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to start fix workflow");
       setTimeout(() => setError(null), 5000);
     } finally {
       setGenerating(false);
     }
+  };
+
+  /**
+   * Save the generated workflow JSON to the database.
+   */
+  const saveWorkflowToDatabase = async (workflowJson: Record<string, unknown>) => {
+    // Extract fields from the generated workflow JSON
+    const createRequest = {
+      name: (workflowJson.name as string) || "Fix Application Errors",
+      description: (workflowJson.description as string) || "",
+      category: "error-fix",
+      tags: ["auto-generated", "error-fix"],
+      setup_steps: workflowJson.setup_steps || [],
+      verification_steps: workflowJson.verification_steps || [],
+      agentic_steps: workflowJson.agentic_steps || [],
+      completion_steps: workflowJson.completion_steps || [],
+      max_iterations: (workflowJson.settings as Record<string, unknown>)?.max_agentic_iterations || 10,
+    };
+
+    const response = await fetch(`${API_BASE}/unified-workflows`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(createRequest),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      let errorMessage = "Failed to save workflow";
+      try {
+        const errorData = JSON.parse(errorText);
+        errorMessage = errorData.error || errorMessage;
+      } catch {
+        errorMessage = errorText || errorMessage;
+      }
+      throw new Error(errorMessage);
+    }
+
+    const result = await response.json();
+    return result.data;
   };
 
   // Determine button state and content

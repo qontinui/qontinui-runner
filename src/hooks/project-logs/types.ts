@@ -2,18 +2,17 @@
  * Project Logs Hook Types
  *
  * Shared interfaces and types for the project logs hooks.
+ * Projects reference global log sources — no embedded source types needed.
  */
 
 import type {
-  LogSource,
-  LogSourceProfile,
   ProjectLogConfig,
   LogSourceContent,
   ProjectLogsState,
 } from "../../types/projectLogs";
 
 // Re-export domain types for convenience
-export type { LogSource, LogSourceProfile, ProjectLogConfig, LogSourceContent, ProjectLogsState };
+export type { ProjectLogConfig, LogSourceContent, ProjectLogsState };
 
 /**
  * Response type from Tauri commands
@@ -35,44 +34,17 @@ export interface ProjectDirectories {
 }
 
 /**
- * Raw log source profile format from backend (snake_case)
- */
-export interface RawLogSourceProfile {
-  id: string;
-  name: string;
-  description?: string;
-  log_sources: RawLogSource[];
-  created_at?: string;
-  updated_at?: string;
-}
-
-/**
- * Raw backend config format (snake_case)
+ * Raw backend config format (snake_case) — slim format
  */
 export interface RawBackendConfig {
   project_id: string;
   project_name: string;
-  profiles?: RawLogSourceProfile[];
-  active_profile_id?: string;
-  log_sources?: RawLogSource[];
+  global_profile_id?: string;
+  selected_source_ids: string[];
   log_directory: string;
   screenshot_directory: string;
   ai_output_directory: string;
   updated_at?: string;
-}
-
-/**
- * Raw log source format from backend (snake_case)
- */
-export interface RawLogSource {
-  id: string;
-  name: string;
-  type: "file" | "directory";
-  path: string;
-  pattern?: string;
-  tail_lines?: number;
-  enabled: boolean;
-  color?: string;
 }
 
 /**
@@ -102,28 +74,20 @@ export interface UseLogConfigReturn {
   directories: ProjectDirectories | null;
   /** Load or create config for a project */
   loadConfig: (projectId: string, projectName: string) => Promise<void>;
-  /** Save the current configuration (optionally with override sources for async state handling) */
-  saveConfig: (overrideSources?: LogSource[]) => Promise<void>;
-  /** Set the config state directly (used by source operations) */
+  /** Save the current configuration */
+  saveConfig: () => Promise<void>;
+  /** Set the config state directly */
   setConfig: React.Dispatch<React.SetStateAction<ProjectLogConfig | null>>;
-  /** Mark that unsaved changes exist */
-  markUnsavedChanges: () => void;
 }
 
 /**
  * Return type for useLogSourceOperations hook
  */
 export interface UseLogSourceOperationsReturn {
-  /** Add a new log source */
-  addLogSource: (source?: Partial<LogSource>) => void;
-  /** Update an existing log source */
-  updateLogSource: (id: string, updates: Partial<LogSource>) => void;
-  /** Remove a log source */
-  removeLogSource: (id: string) => void;
-  /** Toggle a log source enabled/disabled */
-  toggleLogSource: (id: string) => void;
-  /** Set all log sources at once */
-  setLogSources: (sources: LogSource[]) => void;
+  /** Set selected global source IDs */
+  setSelectedSources: (sourceIds: string[]) => void;
+  /** Select a global profile */
+  setGlobalProfile: (profileId: string | undefined) => void;
 }
 
 /**
@@ -132,10 +96,10 @@ export interface UseLogSourceOperationsReturn {
 export interface UseLogContentReturn {
   /** Content from all enabled log sources */
   logsState: ProjectLogsState;
-  /** Refresh log content from all enabled sources */
+  /** Refresh log content from all resolved sources */
   refreshLogs: () => Promise<void>;
-  /** Read content from a single log source */
-  readLogSource: (source: LogSource) => Promise<LogSourceContent | null>;
+  /** Read content from a single log source by global ID */
+  readLogSource: (sourceId: string) => Promise<LogSourceContent | null>;
 }
 
 /**
@@ -155,52 +119,16 @@ export interface UseProjectLogsReturn {
 
   /** Load or create config for a project */
   loadConfig: (projectId: string, projectName: string) => Promise<void>;
-  /** Save the current configuration (optionally with override sources for async state handling) */
-  saveConfig: (overrideSources?: LogSource[]) => Promise<void>;
-  /** Add a new log source */
-  addLogSource: (source?: Partial<LogSource>) => void;
-  /** Update an existing log source */
-  updateLogSource: (id: string, updates: Partial<LogSource>) => void;
-  /** Remove a log source */
-  removeLogSource: (id: string) => void;
-  /** Toggle a log source enabled/disabled */
-  toggleLogSource: (id: string) => void;
-  /** Refresh log content from all enabled sources */
+  /** Save the current configuration */
+  saveConfig: () => Promise<void>;
+  /** Set selected global source IDs */
+  setSelectedSources: (sourceIds: string[]) => void;
+  /** Select a global profile */
+  setGlobalProfile: (profileId: string | undefined) => void;
+  /** Refresh log content from all resolved sources */
   refreshLogs: () => Promise<void>;
-  /** Read content from a single log source */
-  readLogSource: (source: LogSource) => Promise<LogSourceContent | null>;
-  /** Set all log sources at once */
-  setLogSources: (sources: LogSource[]) => void;
-}
-
-/**
- * Convert raw log source to TypeScript format
- */
-function convertRawSourceToTypescript(s: RawLogSource): LogSource {
-  return {
-    id: s.id,
-    name: s.name,
-    type: s.type,
-    path: s.path,
-    pattern: s.pattern,
-    tailLines: s.tail_lines,
-    enabled: s.enabled,
-    color: s.color,
-  };
-}
-
-/**
- * Convert raw profile to TypeScript format
- */
-function convertRawProfileToTypescript(p: RawLogSourceProfile): LogSourceProfile {
-  return {
-    id: p.id,
-    name: p.name,
-    description: p.description,
-    logSources: p.log_sources.map(convertRawSourceToTypescript),
-    createdAt: p.created_at,
-    updatedAt: p.updated_at,
-  };
+  /** Read content from a single log source by global ID */
+  readLogSource: (sourceId: string) => Promise<LogSourceContent | null>;
 }
 
 /**
@@ -210,30 +138,13 @@ export function convertRawConfigToTypescript(raw: RawBackendConfig): ProjectLogC
   return {
     projectId: raw.project_id,
     projectName: raw.project_name,
-    profiles: (raw.profiles || []).map(convertRawProfileToTypescript),
-    activeProfileId: raw.active_profile_id,
-    logSources: (raw.log_sources || []).map(convertRawSourceToTypescript),
+    globalProfileId: raw.global_profile_id,
+    selectedSourceIds: raw.selected_source_ids || [],
     logDirectory: raw.log_directory,
     screenshotDirectory: raw.screenshot_directory,
     aiOutputDirectory: raw.ai_output_directory,
     updatedAt: raw.updated_at,
   };
-}
-
-/**
- * Convert TypeScript camelCase sources to backend snake_case
- */
-export function convertSourcesToRust(sources: LogSource[]): RawLogSource[] {
-  return sources.map((s) => ({
-    id: s.id,
-    name: s.name,
-    type: s.type,
-    path: s.path,
-    pattern: s.pattern,
-    tail_lines: s.tailLines,
-    enabled: s.enabled,
-    color: s.color,
-  }));
 }
 
 /**

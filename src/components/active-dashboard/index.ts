@@ -23,6 +23,11 @@ export { IdleState } from "./IdleState";
 export { ExecutionStatsCard } from "./ExecutionStatsCard";
 export { TaskListWidget } from "./TaskListWidget";
 
+// Multi-run components
+export { ActiveRunsBar } from "./ActiveRunsBar";
+export { CompactRunCard } from "./CompactRunCard";
+export { NewRunDialog } from "./NewRunDialog";
+
 // Legacy components (may be deprecated in future)
 export { LiveExecutionView } from "./LiveExecutionView";
 export { ScreenshotView } from "./ScreenshotView";

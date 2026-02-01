@@ -8,7 +8,7 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import { checkpointService } from "../../services/checkpoint-service";
-import { useCheckpointUpdates, useTaskStatusUpdates } from "../../hooks/useRealtimeUpdates";
+import { useCheckpointUpdates } from "../../hooks/useRealtimeUpdates";
 import type {
   Checkpoint,
   CheckpointSummary,

@@ -6,7 +6,6 @@
  */
 
 import { useState, useEffect, useCallback } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   Compass,
@@ -23,7 +22,6 @@ import {
   Camera,
   AlertTriangle,
   FolderOpen,
-  X,
   Check,
 } from "lucide-react";
 import type {
@@ -86,13 +84,13 @@ interface ConfigTransitionInfo {
 interface StateExplorerBuilderTabProps {
   onLog?: (level: string, message: string) => void;
   editExplorationId?: string | null;
-  onNavigateToLibrary?: () => void;
+  _onNavigateToLibrary?: () => void;
 }
 
 export function StateExplorerBuilderTab({
   onLog,
   editExplorationId,
-  onNavigateToLibrary,
+  _onNavigateToLibrary,
 }: StateExplorerBuilderTabProps) {
   // State
   const [explorations, setExplorations] = useState<SavedExploration[]>([]);
@@ -263,6 +261,9 @@ export function StateExplorerBuilderTab({
         selectExploration(exploration);
       }
     }
+    // Note: selectExploration is intentionally excluded to avoid infinite loop
+    // as it modifies form state that would retrigger this effect
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editExplorationId, explorations]);
 
   // Select an exploration for editing

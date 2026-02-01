@@ -129,6 +129,7 @@ export function ScriptletSelector({
 
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen, filteredScriptlets, selectedIndex]);
 
   // Scroll selected item into view
@@ -160,6 +161,7 @@ export function ScriptletSelector({
 
     document.addEventListener("mousedown", handleClickOutside);
     return () => document.removeEventListener("mousedown", handleClickOutside);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);
 
   const handleSelect = (scriptlet: Scriptlet) => {

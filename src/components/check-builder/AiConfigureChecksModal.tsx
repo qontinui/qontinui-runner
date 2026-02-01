@@ -16,13 +16,12 @@ import {
   ChevronDown,
   ChevronUp,
   Folder,
-  FileCode,
   Settings2,
   CheckSquare,
   Square,
   MinusSquare,
 } from "lucide-react";
-import type { CreateCheckInput, CheckType, CheckTool, Check as CheckModel } from "./types";
+import type { CreateCheckInput } from "./types";
 import { getAccentColors } from "@/design-system";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useCheckBuilder } from "./CheckBuilderContext";
@@ -134,50 +133,7 @@ export function AiConfigureChecksModal({
     }
   }, []);
 
-  // Scan workspace
-  const handleScan = useCallback(async () => {
-    if (!baseDirectory) {
-      setError("Please select a directory to scan");
-      return;
-    }
-
-    setStep("scanning");
-    setError(null);
-
-    try {
-      const response = await fetch(`${API_BASE}/checks/scan-workspace`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          base_directory: baseDirectory,
-          max_depth: maxDepth,
-        }),
-      });
-
-      const result = await response.json();
-
-      if (!response.ok) {
-        throw new Error(result.error || `HTTP ${response.status}`);
-      }
-
-      const data: WorkspaceScanResult = result.data || result;
-      setScanResult(data);
-
-      if (data.projects.length === 0) {
-        setError("No projects found in the selected directory");
-        setStep("input");
-        return;
-      }
-
-      // Automatically generate checks
-      await handleGenerate(data);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to scan workspace");
-      setStep("input");
-    }
-  }, [baseDirectory, maxDepth]);
-
-  // Generate checks
+  // Generate checks (defined before handleScan since handleScan depends on it)
   const handleGenerate = useCallback(
     async (scan: WorkspaceScanResult) => {
       setStep("generating");
@@ -224,6 +180,49 @@ export function AiConfigureChecksModal({
     [preferAutoFix, includeSecurity, includeFormatting, includeTypeChecking],
   );
 
+  // Scan workspace
+  const handleScan = useCallback(async () => {
+    if (!baseDirectory) {
+      setError("Please select a directory to scan");
+      return;
+    }
+
+    setStep("scanning");
+    setError(null);
+
+    try {
+      const response = await fetch(`${API_BASE}/checks/scan-workspace`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          base_directory: baseDirectory,
+          max_depth: maxDepth,
+        }),
+      });
+
+      const result = await response.json();
+
+      if (!response.ok) {
+        throw new Error(result.error || `HTTP ${response.status}`);
+      }
+
+      const data: WorkspaceScanResult = result.data || result;
+      setScanResult(data);
+
+      if (data.projects.length === 0) {
+        setError("No projects found in the selected directory");
+        setStep("input");
+        return;
+      }
+
+      // Automatically generate checks
+      await handleGenerate(data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to scan workspace");
+      setStep("input");
+    }
+  }, [baseDirectory, maxDepth, handleGenerate]);
+
   // Toggle check selection
   const toggleCheckSelection = useCallback((index: number) => {
     setSelectedChecks((prev) => {
@@ -244,7 +243,7 @@ export function AiConfigureChecksModal({
     } else {
       setSelectedChecks(new Set(suggestedChecks.map((_, i) => i)));
     }
-  }, [selectedChecks.size, suggestedChecks.length]);
+  }, [selectedChecks.size, suggestedChecks]);
 
   // Group checks by project
   const checksByProject = useMemo(() => {
@@ -301,6 +300,19 @@ export function AiConfigureChecksModal({
     const selectedCount = projectInfo.indices.filter(i => selectedChecks.has(i)).length;
     return selectedCount > 0 && selectedCount < projectInfo.indices.length;
   }, [checksByProject, selectedChecks]);
+
+  // Reset and close (defined before handleCreateChecks since handleCreateChecks depends on it)
+  const handleClose = useCallback(() => {
+    setStep("input");
+    setError(null);
+    setBaseDirectory("");
+    setMaxDepth(2);
+    setScanResult(null);
+    setSuggestedChecks([]);
+    setSelectedChecks(new Set());
+    setShowAdvanced(false);
+    onClose();
+  }, [onClose]);
 
   // Create selected checks and groups
   const handleCreateChecks = useCallback(async () => {
@@ -378,20 +390,7 @@ export function AiConfigureChecksModal({
     } finally {
       setIsCreating(false);
     }
-  }, [suggestedChecks, selectedChecks, scanResult, createCheck, createCheckGroup, setChecksInGroup, loadChecks, loadCheckGroups]);
-
-  // Reset and close
-  const handleClose = useCallback(() => {
-    setStep("input");
-    setError(null);
-    setBaseDirectory("");
-    setMaxDepth(2);
-    setScanResult(null);
-    setSuggestedChecks([]);
-    setSelectedChecks(new Set());
-    setShowAdvanced(false);
-    onClose();
-  }, [onClose]);
+  }, [suggestedChecks, selectedChecks, scanResult, createCheck, createCheckGroup, setChecksInGroup, loadChecks, loadCheckGroups, handleClose]);
 
   // Go back
   const handleBack = useCallback(() => {
@@ -689,7 +688,7 @@ interface SuggestedCheckCardProps {
   onToggle: () => void;
 }
 
-function SuggestedCheckCard({ suggestion, isSelected, onToggle }: SuggestedCheckCardProps) {
+function _SuggestedCheckCard({ suggestion, isSelected, onToggle }: SuggestedCheckCardProps) {
   const { check, reason, project_path } = suggestion;
 
   // Get language color
@@ -786,7 +785,7 @@ interface ProjectCheckGroupProps {
 }
 
 function ProjectCheckGroup({
-  projectPath,
+  projectPath: _projectPath,
   projectName,
   languages,
   checks,
@@ -895,7 +894,7 @@ interface CompactCheckItemProps {
 }
 
 function CompactCheckItem({ suggestion, isSelected, onToggle }: CompactCheckItemProps) {
-  const { check, reason } = suggestion;
+  const { check, reason: _reason } = suggestion;
 
   // Get check type color
   const getTypeColor = (type: string) => {

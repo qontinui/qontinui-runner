@@ -14,7 +14,7 @@ export const gettingStartedTutorial: Tutorial = {
   duration: "5 minutes",
   difficulty: "beginner",
   mode: "contextual",
-  focusPage: "run",
+  focusPage: "gui-automation",
   category: "Getting Started",
   tags: ["basics", "introduction", "navigation"],
   learningObjectives: [

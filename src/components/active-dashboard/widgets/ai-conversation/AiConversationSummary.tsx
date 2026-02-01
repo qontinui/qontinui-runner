@@ -30,8 +30,8 @@ export function AiConversationSummary({
   const { entries, isThinking, messageCount } = useAiConversationData();
   const greenColors = getAccentColors("green");
 
-  // Get the last few messages for preview (enough to fill ~10 lines)
-  const recentEntries = entries.slice(-5);
+  // Get the last few messages for preview (enough to fill ~20 lines)
+  const recentEntries = entries.slice(-10);
 
   return (
     <div
@@ -83,15 +83,12 @@ export function AiConversationSummary({
         )}
       </div>
 
-      {/* Message content area - height for ~10 lines (10 * 20px line-height = 200px) */}
-      <ScrollArea className="h-[200px] w-full">
+      {/* Message content area - height for ~20 lines (20 * 20px line-height = 400px) */}
+      <ScrollArea className="h-[400px] w-full">
         <div className="space-y-2 pr-2">
           {recentEntries.length > 0 ? (
             recentEntries.map((entry, idx) => (
               <div key={idx} className="text-xs text-muted-foreground">
-                <span className={cn("font-medium", entry.source === "response" ? greenColors.text : "text-foreground")}>
-                  {entry.source === "response" ? "AI: " : "User: "}
-                </span>
                 <span className="whitespace-pre-wrap break-words">
                   {entry.line.slice(0, 500)}{entry.line.length > 500 ? "..." : ""}
                 </span>

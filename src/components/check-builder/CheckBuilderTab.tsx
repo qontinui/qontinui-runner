@@ -33,7 +33,6 @@ import {
   AlignLeft,
   FileType,
   FolderOpen,
-  Layers,
   Check as CheckIcon,
   X,
 } from "lucide-react";
@@ -533,6 +532,7 @@ function CheckEditorPanel({ showAiConfigureModal, onOpenAiModal, onCloseAiModal 
       setConfigPath("");
       setAutoFix(false);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally sync only on ID change
   }, [selectedCheck?.id]);
 
   const handleCommandChange = (value: string) => {
@@ -868,6 +868,7 @@ function CheckPropertiesPanel() {
       setEnabled(selectedCheck.enabled);
       setTags(selectedCheck.tags || []);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally sync only on ID change
   }, [selectedCheck?.id]);
 
   const handleAddTag = () => {
@@ -1179,7 +1180,7 @@ function TabSwitcher({ activeTab, onTabChange }: { activeTab: TabView; onTabChan
 }
 
 // Main content component
-function CheckBuilderContent({ onLog }: CheckBuilderTabProps) {
+function CheckBuilderContent({ onLog: _onLog }: CheckBuilderTabProps) {
   const [activeTab, setActiveTab] = useState<TabView>("checks");
   const [showAiConfigureModal, setShowAiConfigureModal] = useState(false);
 

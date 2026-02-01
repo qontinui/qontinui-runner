@@ -36,7 +36,7 @@ export interface TaskListWidgetProps {
 /**
  * All workflow stages in order.
  */
-const WORKFLOW_STAGES: WorkflowStage[] = ["setup", "agentic", "verification", "completion"];
+const WORKFLOW_STAGES: WorkflowStage[] = ["setup", "verification", "agentic", "completion"];
 
 /**
  * Get the stage status based on current state.

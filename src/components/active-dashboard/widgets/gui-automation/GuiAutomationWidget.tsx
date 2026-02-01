@@ -118,19 +118,19 @@ function ScreenshotView({ screenshots }: { screenshots?: ScreenshotInfo[] }) {
   const [imageSrc, setImageSrc] = useState<string | null>(null);
   const [imageError, setImageError] = useState(false);
 
-  // Ensure screenshots is always an array
-  const screenshotList = screenshots ?? [];
+  // Ensure screenshots is always an array - memoize to avoid dependency issues
+  const screenshotCount = screenshots?.length ?? 0;
 
   // Reset to latest screenshot when new ones arrive
   useEffect(() => {
-    if (screenshotList.length > 0) {
+    if (screenshotCount > 0) {
       setCurrentIndex(0); // Most recent is first (sorted by modified desc)
     }
-  }, [screenshotList.length]);
+  }, [screenshotCount]);
 
   // Convert file path to displayable URL
   useEffect(() => {
-    const currentScreenshot = screenshotList[currentIndex];
+    const currentScreenshot = screenshots?.[currentIndex];
     if (currentScreenshot?.path) {
       try {
         const src = convertFileSrc(currentScreenshot.path);
@@ -142,10 +142,10 @@ function ScreenshotView({ screenshots }: { screenshots?: ScreenshotInfo[] }) {
     } else {
       setImageSrc(null);
     }
-  }, [screenshotList, currentIndex]);
+  }, [screenshots, currentIndex]);
 
   const goNext = () => {
-    if (currentIndex < screenshotList.length - 1) {
+    if (currentIndex < screenshotCount - 1) {
       setCurrentIndex(currentIndex + 1);
     }
   };
@@ -156,9 +156,9 @@ function ScreenshotView({ screenshots }: { screenshots?: ScreenshotInfo[] }) {
     }
   };
 
-  const currentScreenshot = screenshotList[currentIndex];
+  const currentScreenshot = screenshots?.[currentIndex];
 
-  if (screenshotList.length === 0) {
+  if (screenshotCount === 0) {
     return (
       <div className="flex-1 border-b border-border bg-muted/10 flex items-center justify-center min-h-[200px]">
         <div className="text-center">
@@ -191,7 +191,7 @@ function ScreenshotView({ screenshots }: { screenshots?: ScreenshotInfo[] }) {
       </div>
 
       {/* Navigation controls */}
-      {screenshotList.length > 1 && (
+      {screenshotCount > 1 && (
         <div className="absolute bottom-2 left-1/2 -translate-x-1/2 flex items-center gap-2 bg-black/70 rounded-full px-3 py-1">
           <Button
             size="sm"
@@ -203,14 +203,14 @@ function ScreenshotView({ screenshots }: { screenshots?: ScreenshotInfo[] }) {
             <ChevronLeft className="h-4 w-4" />
           </Button>
           <span className="text-xs text-white/70 font-mono">
-            {currentIndex + 1} / {screenshotList.length}
+            {currentIndex + 1} / {screenshotCount}
           </span>
           <Button
             size="sm"
             variant="ghost"
             className="h-6 w-6 p-0 text-white/70 hover:text-white hover:bg-white/10"
             onClick={goNext}
-            disabled={currentIndex === screenshotList.length - 1}
+            disabled={currentIndex === screenshotCount - 1}
           >
             <ChevronRight className="h-4 w-4" />
           </Button>

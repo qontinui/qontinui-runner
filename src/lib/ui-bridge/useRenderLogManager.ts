@@ -15,7 +15,7 @@ export interface UseRenderLogManagerOptions {
   /** Current active tab/route (for metadata) */
   activeTab?: string;
   /** Task run ID (for backend association) */
-  taskRunId?: number;
+  taskRunId?: string | number;
   /** Capture on navigation changes */
   captureOnNavigation?: boolean;
   /** Capture DOM changes */

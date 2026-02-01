@@ -5,7 +5,7 @@
  * Shows logs from user-configured log sources (e.g., frontend/backend logs).
  */
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   RefreshCw,
   FolderOpen,
@@ -56,8 +56,8 @@ export function ExternalLogsTab({
   const logViewerRef = useRef<HTMLDivElement>(null);
   const refreshIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Safely access sources array
-  const safeSources = sources || [];
+  // Safely access sources array - memoize to prevent dependency changes on every render
+  const safeSources = useMemo(() => sources || [], [sources]);
 
   // Copy path to clipboard
   const handleCopyPath = async (path: string) => {
@@ -129,19 +129,19 @@ export function ExternalLogsTab({
     );
   }
 
-  // No sources configured
-  if (!config.logSources || config.logSources.length === 0) {
+  // No sources available (either none configured globally, or none selected for this project)
+  if (safeSources.length === 0 && !loading) {
     return (
       <div className="h-full flex flex-col items-center justify-center text-muted-foreground">
         <FileText className="w-12 h-12 mb-4 opacity-50" />
-        <p className="text-lg font-medium mb-2">No Log Sources Configured</p>
-        <p className="text-sm mb-4">Add external log files to monitor your project</p>
+        <p className="text-lg font-medium mb-2">No Log Sources Available</p>
+        <p className="text-sm mb-4">Select log sources for this project or configure them in Settings</p>
         <button
           onClick={onConfigureSources}
           className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-md hover:bg-primary/90 transition-colors"
         >
           <Settings className="w-4 h-4" />
-          Configure Log Sources
+          Select Log Sources
         </button>
       </div>
     );
@@ -155,7 +155,6 @@ export function ExternalLogsTab({
           {/* Source selector tabs */}
           <div className="flex gap-1">
             {safeSources.map((source) => {
-              const sourceConfig = config.logSources?.find((s) => s.id === source.sourceId);
               const hasError = !!source.error;
               return (
                 <button
@@ -170,11 +169,6 @@ export function ExternalLogsTab({
                     }
                     ${hasError ? "opacity-70" : ""}
                   `}
-                  style={
-                    selectedSourceId !== source.sourceId && sourceConfig?.color
-                      ? { borderLeft: `3px solid ${sourceConfig.color}` }
-                      : undefined
-                  }
                 >
                   {hasError && (
                     <AlertCircle className={`w-3 h-3 ${getStatusColors("warning").icon}`} />

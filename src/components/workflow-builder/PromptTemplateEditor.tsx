@@ -66,7 +66,7 @@ export function PromptTemplateEditor({
   const [hasChanges, setHasChanges] = useState(false);
 
   // Get the effective template being used
-  const getEffectiveTemplate = useCallback((): string => {
+  const _getEffectiveTemplate = useCallback((): string => {
     if (workflowTemplate) {
       return workflowTemplate;
     }

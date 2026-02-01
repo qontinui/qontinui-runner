@@ -3,11 +3,10 @@
  *
  * This module provides focused hooks for managing project log sources:
  * - useLogConfig: Configuration loading and saving
- * - useLogSourceOperations: CRUD operations on log sources
+ * - useLogSourceOperations: Selecting/deselecting global sources
  * - useLogContent: Reading and refreshing log content
  *
- * For backward compatibility, this module also exports a composed
- * useProjectLogs hook that combines all functionality.
+ * Also exports a composed useProjectLogs hook that combines all functionality.
  */
 
 // Export individual hooks
@@ -17,7 +16,6 @@ export { useLogContent } from "./useLogContent";
 
 // Export types
 export type {
-  LogSource,
   ProjectLogConfig,
   LogSourceContent,
   ProjectLogsState,
@@ -40,9 +38,6 @@ import type { UseProjectLogsReturn } from "./types";
  *
  * This hook combines useLogConfig, useLogSourceOperations, and useLogContent
  * to provide the complete API for managing project logs.
- *
- * For new code, consider using the individual hooks directly for better
- * separation of concerns.
  */
 export function useProjectLogs(): UseProjectLogsReturn {
   // Configuration management
@@ -54,15 +49,13 @@ export function useProjectLogs(): UseProjectLogsReturn {
     loadConfig,
     saveConfig,
     setConfig,
-    markUnsavedChanges,
   } = useLogConfig();
 
-  // Source CRUD operations
-  const { addLogSource, updateLogSource, removeLogSource, toggleLogSource, setLogSources } =
-    useLogSourceOperations({
-      setConfig,
-      markUnsavedChanges,
-    });
+  // Source selection operations
+  const { setSelectedSources, setGlobalProfile } = useLogSourceOperations({
+    setConfig,
+    saveConfig,
+  });
 
   // Log content reading
   const { logsState, refreshLogs, readLogSource } = useLogContent({ config });
@@ -80,11 +73,8 @@ export function useProjectLogs(): UseProjectLogsReturn {
     saveConfig,
 
     // Source operations
-    addLogSource,
-    updateLogSource,
-    removeLogSource,
-    toggleLogSource,
-    setLogSources,
+    setSelectedSources,
+    setGlobalProfile,
 
     // Content operations
     refreshLogs,

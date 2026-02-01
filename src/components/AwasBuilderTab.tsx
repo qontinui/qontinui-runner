@@ -28,7 +28,6 @@ import {
   AlertCircle,
   ChevronDown,
   ChevronRight,
-  ExternalLink,
   Zap,
   FileJson,
   List,
@@ -88,7 +87,7 @@ interface SavedAwasConfig {
 interface AwasBuilderTabProps {
   onLog?: (level: string, message: string) => void;
   editConfigId?: string | null;
-  onNavigateToLibrary?: () => void;
+  _onNavigateToLibrary?: () => void;
 }
 
 const METHOD_COLORS: Record<string, string> = {
@@ -99,7 +98,7 @@ const METHOD_COLORS: Record<string, string> = {
   DELETE: "bg-red-900/50 text-red-300",
 };
 
-export function AwasBuilderTab({ onLog, editConfigId, onNavigateToLibrary }: AwasBuilderTabProps) {
+export function AwasBuilderTab({ onLog, editConfigId, _onNavigateToLibrary }: AwasBuilderTabProps) {
   // State
   const [savedConfigs, setSavedConfigs] = useState<SavedAwasConfig[]>([]);
   const [loading, setLoading] = useState(true);

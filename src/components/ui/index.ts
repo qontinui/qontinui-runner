@@ -16,3 +16,5 @@ export { EmptyState, type EmptyStateProps } from "./EmptyState";
 export { ScrollArea, ScrollBar } from "./ScrollArea";
 export { Progress, type ProgressProps } from "./Progress";
 export { Tabs, TabsList, TabsTrigger, TabsContent } from "./Tabs";
+export { ConfirmDialog } from "./ConfirmDialog";
+export { BatchDeleteDialog } from "./BatchDeleteDialog";

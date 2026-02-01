@@ -10,6 +10,7 @@ import { useDashboardLayout, type DashboardLayoutState } from "./useDashboardLay
 import { useTaskDetection } from "./useTaskDetection";
 import { usePhaseTracking } from "./usePhaseTracking";
 import { useOrchestratorState } from "./useOrchestratorState";
+import { useActiveRunsOptional } from "../../contexts";
 import type {
   ActivityType,
   ActivityState,
@@ -36,8 +37,10 @@ export type DashboardStatus = "idle" | "running" | "completed" | "failed" | "sto
 export interface DashboardState {
   /** Layout state (active widget, summaries, activities) */
   layout: DashboardLayoutState;
-  /** Current task information */
+  /** Current task information (primary/selected task) */
   taskInfo: TaskActivityInfo | null;
+  /** All running tasks (for multi-run support) */
+  allTasks: TaskActivityInfo[];
   /** Whether any task is running */
   isRunning: boolean;
   /** Overall dashboard status */
@@ -96,14 +99,20 @@ export interface UseDashboardStateResult {
 export function useDashboardState(): UseDashboardStateResult {
   const [error, setError] = useState<string | null>(null);
 
+  // Get selected run ID from context (if available) for multi-run support
+  const activeRunsContext = useActiveRunsOptional();
+  const selectedRunId = activeRunsContext?.selectedRunId ?? null;
+
   // Detect current task and its activities
+  // Pass selectedRunId so the hook returns the selected task's info
   const {
     taskInfo,
+    allTasks,
     isRunning,
     isLoading: taskLoading,
     error: taskError,
     refresh: refreshTask,
-  } = useTaskDetection();
+  } = useTaskDetection({ selectedRunId });
 
   // Layout management - pass isRunning to avoid false idle detection
   // Note: useDashboardLayout handles reset internally when taskId changes
@@ -259,6 +268,7 @@ export function useDashboardState(): UseDashboardStateResult {
     () => ({
       layout,
       taskInfo,
+      allTasks,
       isRunning,
       status,
       currentPhase,
@@ -275,6 +285,7 @@ export function useDashboardState(): UseDashboardStateResult {
     [
       layout,
       taskInfo,
+      allTasks,
       isRunning,
       status,
       currentPhase,

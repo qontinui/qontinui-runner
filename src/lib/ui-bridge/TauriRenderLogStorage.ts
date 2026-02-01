@@ -61,17 +61,17 @@ export class TauriRenderLogStorage implements RenderLogStorage {
   private taskRunId?: number;
   private isDev: boolean;
 
-  constructor(options: { maxEntries?: number; taskRunId?: number } = {}) {
+  constructor(options: { maxEntries?: number; taskRunId?: string | number } = {}) {
     this.maxEntries = options.maxEntries ?? 1000;
-    this.taskRunId = options.taskRunId;
+    this.taskRunId = typeof options.taskRunId === "string" ? parseInt(options.taskRunId, 10) || undefined : options.taskRunId;
     this.isDev = import.meta.env.DEV;
   }
 
   /**
    * Set the current task run ID
    */
-  setTaskRunId(taskRunId: number | undefined): void {
-    this.taskRunId = taskRunId;
+  setTaskRunId(taskRunId: string | number | undefined): void {
+    this.taskRunId = typeof taskRunId === "string" ? parseInt(taskRunId, 10) || undefined : taskRunId;
   }
 
   async append(entry: RenderLogEntry): Promise<void> {

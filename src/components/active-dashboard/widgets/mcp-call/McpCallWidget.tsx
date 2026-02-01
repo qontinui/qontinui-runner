@@ -6,7 +6,7 @@
  */
 
 import { useState } from "react";
-import { Plug, ArrowRight, ArrowLeft } from "lucide-react";
+import { ArrowRight, ArrowLeft } from "lucide-react";
 import { cn } from "../../../../lib/utils";
 import { Badge, ScrollArea, Tabs, TabsContent, TabsList, TabsTrigger } from "../../../ui";
 import { StepStatsBar, StepStatusBadge, StepOutputPanel } from "../shared";

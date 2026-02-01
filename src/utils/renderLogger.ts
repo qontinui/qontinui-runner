@@ -21,10 +21,17 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
-import type { ComponentRenderLogEntry } from "@qontinui/shared-types";
 
-// Re-export the type for consumers
-export type { ComponentRenderLogEntry };
+// Type for component render log entries
+export interface ComponentRenderLogEntry {
+  id: string;
+  timestamp: number;
+  component: string;
+  trigger: string;
+  data: Record<string, unknown>;
+  visible_sections?: string[];
+  task_run_id?: number;
+}
 
 // Wire format for Tauri command (matches Rust struct field names)
 interface RenderLogEntryWire {

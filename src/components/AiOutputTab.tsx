@@ -25,12 +25,16 @@ export interface AiOutputLine {
   line: string;
   source: string; // "prompt" for user prompt, "claude" for AI response, "user_hint" for user hints
   actionId?: string;
-  /** Session/workflow ID for grouping loops by workflow */
+  /** Parent task run ID (matches task_runs.id in database) */
+  taskRunId?: string;
+  /** Session ID for grouping output (may include phase suffix like "-agentic-1") */
   sessionId?: string;
   /** Human-readable session/workflow name */
   sessionName?: string;
   /** Workflow phase: setup, verification, agentic, or completion */
   phase?: string;
+  /** Iteration number within the phase (1, 2, 3...) */
+  phaseIteration?: number;
 }
 
 interface AiOutputTabProps {
@@ -341,7 +345,7 @@ export function AiOutputTab({
     if (containerRef.current && currentLoop) {
       containerRef.current.scrollTop = containerRef.current.scrollHeight;
     }
-  }, [currentLoop?.entries.length]);
+  }, [currentLoop]);
 
   // Select a loop
   const handleSelectLoop = useCallback((loopId: string) => {

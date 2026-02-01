@@ -79,7 +79,7 @@ export function useExecutionStatus(): UseExecutionStatusReturn {
 
   // Handle retry attempt event
   const handleRetryAttempt = useCallback((event: RawRetryAttemptEvent) => {
-    const { task_run_id, timestamp, attempt, state, exhausted, next_retry_delay_ms } = event;
+    const { task_run_id, timestamp, attempt: _attempt, state, exhausted, next_retry_delay_ms } = event;
 
     const retryState: RetryState = {
       attempt: state.attempt,

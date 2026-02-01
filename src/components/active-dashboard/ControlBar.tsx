@@ -6,15 +6,14 @@
  * and execution statistics.
  */
 
-import { useState } from "react";
-import { Play, Pause, Square, Settings, ChevronDown, ChevronUp } from "lucide-react";
+import { Play, Pause, Square, Settings, RotateCcw, ToggleRight, ToggleLeft, Loader2 } from "lucide-react";
+import { useAutoContinue } from "../../contexts";
 import { Button, Badge } from "../ui";
 import type { ExecutionStatus } from "./types";
 import type { TaskPhase, WorkflowStage } from "../../types/dashboard/activity-types";
 import { PHASE_DISPLAY_CONFIG, WORKFLOW_STAGE_CONFIG } from "../../types/dashboard/activity-types";
 import type { DashboardStatus } from "../../hooks/dashboard/useDashboardState";
 import { getAccentColors } from "@/design-system";
-import { TaskListWidget } from "./TaskListWidget";
 import { ExecutionStatsCard } from "./ExecutionStatsCard";
 
 /**
@@ -49,10 +48,6 @@ export interface ControlBarProps {
   workflowStage?: WorkflowStage | null;
   /** Whether this is an orchestrated workflow */
   isOrchestrated?: boolean;
-  /** Whether the task is complete */
-  isComplete?: boolean;
-  /** Whether the task failed */
-  isFailed?: boolean;
   /** Current iteration */
   iteration?: number;
   /** Max iterations */
@@ -71,29 +66,6 @@ export interface ControlBarProps {
   onStop?: () => void;
 }
 
-// Status configuration using design system colors
-const getStatusConfig = (status: string): { label: string; className: string } => {
-  const configs: Record<string, { label: string; color: string; animate?: boolean }> = {
-    running: { label: "Running", color: "blue", animate: true },
-    paused: { label: "Paused", color: "amber" },
-    stopped: { label: "Stopped", color: "zinc" },
-    completed: { label: "Completed", color: "green" },
-    failed: { label: "Failed", color: "red" },
-    idle: { label: "Idle", color: "zinc" },
-    timeout: { label: "Timeout", color: "orange" },
-    cancelled: { label: "Cancelled", color: "zinc" },
-  };
-
-  const config = configs[status] || configs.idle;
-  const colors = getAccentColors(config.color as Parameters<typeof getAccentColors>[0]);
-  const animateClass = config.animate ? " animate-pulse" : "";
-
-  return {
-    label: config.label,
-    className: `${colors.bg} ${colors.text} ${colors.border}${animateClass}`,
-  };
-};
-
 // Phase configuration using design system colors
 const getPhaseConfig = (phase: TaskPhase): { className: string } => {
   const phaseColors: Record<TaskPhase, string> = {
@@ -110,7 +82,7 @@ const getPhaseConfig = (phase: TaskPhase): { className: string } => {
 };
 
 // Workflow stages in order
-const WORKFLOW_STAGES: WorkflowStage[] = ["setup", "agentic", "verification", "completion"];
+const WORKFLOW_STAGES: WorkflowStage[] = ["setup", "verification", "agentic", "completion"];
 
 /**
  * Step counts per phase for display.
@@ -119,70 +91,116 @@ export interface PhaseStepCounts {
   [key: string]: { total: number; completed: number };
 }
 
+// Iteration counter badge component
+function IterationBadge({
+  iteration,
+  maxIterations,
+  isRunning,
+}: {
+  iteration: number;
+  maxIterations: number;
+  isRunning: boolean;
+}) {
+  const colors = getAccentColors("orange");
+
+  return (
+    <div
+      className={`flex items-center gap-1.5 px-2 py-1 text-xs font-medium rounded-md ${colors.bg} ${colors.text} ${colors.border} border ${isRunning ? "animate-phase-glow" : ""}`}
+      title={`Iteration ${iteration} of ${maxIterations}`}
+    >
+      <span>Iteration</span>
+      <span className="font-mono">{iteration}</span>
+      <span className="opacity-60">/</span>
+      <span className="font-mono opacity-80">{maxIterations}</span>
+    </div>
+  );
+}
+
 // Enhanced workflow stage indicator component with step counts
 function WorkflowStageIndicator({
   currentStage,
   isRunning,
   phaseStepCounts,
   showStepCounts = false,
+  iteration,
+  maxIterations,
 }: {
   currentStage: WorkflowStage | null;
   isRunning: boolean;
   phaseStepCounts?: PhaseStepCounts;
   showStepCounts?: boolean;
+  iteration?: number;
+  maxIterations?: number;
 }) {
   return (
-    <div className="flex items-center gap-1.5">
-      {WORKFLOW_STAGES.map((stage, index) => {
-        const config = WORKFLOW_STAGE_CONFIG[stage];
-        const isCurrent = stage === currentStage;
-        const isPast =
-          currentStage && WORKFLOW_STAGES.indexOf(stage) < WORKFLOW_STAGES.indexOf(currentStage);
+    <div className="flex items-center gap-2">
+      {/* Iteration counter - show when in verification or agentic loop */}
+      {iteration !== undefined && maxIterations !== undefined && maxIterations > 1 && (
+        <>
+          <IterationBadge
+            iteration={iteration}
+            maxIterations={maxIterations}
+            isRunning={isRunning && (currentStage === "verification" || currentStage === "agentic")}
+          />
+          <span className="w-4" /> {/* Spacer to match arrow width */}
+        </>
+      )}
 
-        // Get color classes based on state
-        const colors = getAccentColors(
-          config.color as Parameters<typeof getAccentColors>[0],
-        );
+      {/* Workflow stage pills */}
+      <div className="flex items-center gap-1.5">
+        {WORKFLOW_STAGES.map((stage, index) => {
+          const config = WORKFLOW_STAGE_CONFIG[stage];
+          const isCurrent = stage === currentStage;
+          const isPast =
+            currentStage && WORKFLOW_STAGES.indexOf(stage) < WORKFLOW_STAGES.indexOf(currentStage);
 
-        // Get step counts for this phase
-        const stepCounts = phaseStepCounts?.[stage];
-        const hasSteps = stepCounts && stepCounts.total > 0;
-        const isPhaseComplete = hasSteps && stepCounts.completed === stepCounts.total;
+          // Get color classes based on state
+          const colors = getAccentColors(
+            config.color as Parameters<typeof getAccentColors>[0],
+          );
 
-        // Base classes - larger for better visibility
-        let stageClasses = "px-2.5 py-1 text-xs font-medium rounded-md transition-all duration-200 flex items-center gap-1.5";
+          // Get step counts for this phase
+          const stepCounts = phaseStepCounts?.[stage];
+          const hasSteps = stepCounts && stepCounts.total > 0;
+          const isPhaseComplete = hasSteps && stepCounts.completed === stepCounts.total;
 
-        if (isCurrent) {
-          // Current stage: fully colored with optional pulse animation
-          stageClasses += ` ${colors.bg} ${colors.text} ${colors.border} border-2`;
-          if (isRunning) {
-            stageClasses += " animate-pulse shadow-sm";
+          // Base classes - larger for better visibility
+          let stageClasses = "px-2.5 py-1 text-xs font-medium rounded-md transition-all duration-200 flex items-center gap-1.5";
+
+          if (isCurrent) {
+            // Current stage: fully colored with smooth glow animation
+            stageClasses += ` ${colors.bg} ${colors.text} ${colors.border} border-2`;
+            if (isRunning) {
+              stageClasses += " animate-phase-glow shadow-sm";
+            }
+          } else if (isPast || isPhaseComplete) {
+            // Past stage or completed: success indicator
+            stageClasses += " bg-green-500/10 text-green-600 border border-green-500/30";
+          } else {
+            // Future stage: muted
+            stageClasses += " bg-muted/30 text-muted-foreground/60 border border-transparent";
           }
-        } else if (isPast || isPhaseComplete) {
-          // Past stage or completed: success indicator
-          stageClasses += " bg-green-500/10 text-green-600 border border-green-500/30";
-        } else {
-          // Future stage: muted
-          stageClasses += " bg-muted/30 text-muted-foreground/60 border border-transparent";
-        }
 
-        return (
-          <div key={stage} className="flex items-center">
-            <div className={stageClasses} title={config.description}>
-              <span>{config.label}</span>
-              {/* Step count badge */}
-              {showStepCounts && hasSteps && (
-                <span className="text-[10px] opacity-80 font-mono">
-                  {stepCounts.completed}/{stepCounts.total}
+          return (
+            <div key={stage} className="flex items-center">
+              <div className={stageClasses} title={config.description}>
+                <span>{config.label}</span>
+                {/* Step count badge */}
+                {showStepCounts && hasSteps && (
+                  <span className="text-[10px] opacity-80 font-mono">
+                    {stepCounts.completed}/{stepCounts.total}
+                  </span>
+                )}
+              </div>
+              {index < WORKFLOW_STAGES.length - 1 && (
+                <span className="mx-1 text-muted-foreground/40 text-sm">
+                  {stage === "verification" ? "⇄" : "→"}
                 </span>
               )}
             </div>
-            {index < WORKFLOW_STAGES.length - 1 && (
-              <span className="mx-1 text-muted-foreground/40 text-sm">→</span>
-            )}
-          </div>
-        );
-      })}
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -194,8 +212,6 @@ export function ControlBar({
   status,
   workflowStage,
   isOrchestrated = false,
-  isComplete = false,
-  isFailed = false,
   iteration,
   maxIterations,
   statsData,
@@ -205,12 +221,17 @@ export function ControlBar({
   onPlayPause,
   onStop,
 }: ControlBarProps) {
-  const statusInfo = getStatusConfig(status);
   const phaseInfo = PHASE_DISPLAY_CONFIG[phase];
   const phaseStyle = getPhaseConfig(phase);
 
   const isRunning = status === "running";
-  const isPaused = status === "paused";
+
+  // Auto-continue toggle state
+  const {
+    enabled: autoContinueEnabled,
+    loading: autoContinueLoading,
+    toggle: toggleAutoContinue,
+  } = useAutoContinue();
 
   return (
     <div data-ui-id="dashboard-control-bar" className="flex h-14 items-center justify-between border-b border-border bg-card px-4">
@@ -230,6 +251,8 @@ export function ControlBar({
             isRunning={isRunning}
             phaseStepCounts={phaseStepCounts}
             showStepCounts={showPhaseStepCounts}
+            iteration={iteration}
+            maxIterations={maxIterations}
           />
         )}
         {/* Show phase badge for non-orchestrated workflows (fallback) */}
@@ -238,10 +261,6 @@ export function ControlBar({
             {phaseInfo.label}
           </Badge>
         )}
-        <Badge className={`px-4 py-1.5 text-sm font-medium ${statusInfo.className}`}>
-          {statusInfo.label}
-        </Badge>
-
         {/* Inline execution stats (compact mode) */}
         {showInlineStats && statsData && (isRunning || status === "completed") && (
           <ExecutionStatsCard
@@ -293,21 +312,30 @@ export function ControlBar({
           >
             <Settings className="h-4 w-4" />
           </Button>
+
+          {/* Auto-Continue Toggle */}
+          <button
+            data-ui-id="dashboard-auto-continue-toggle"
+            onClick={toggleAutoContinue}
+            disabled={autoContinueLoading}
+            className={`flex items-center gap-1.5 px-2 py-1 rounded text-xs transition-colors ml-2 ${
+              autoContinueEnabled
+                ? `${getAccentColors("orange").bg} ${getAccentColors("orange").text} hover:opacity-80`
+                : "bg-muted text-muted-foreground hover:bg-muted/80"
+            } ${autoContinueLoading ? "opacity-50" : ""}`}
+            title={autoContinueEnabled ? "Auto-continue enabled - workflow resumes on restart" : "Auto-continue disabled"}
+          >
+            <RotateCcw className="w-3 h-3" />
+            {autoContinueLoading ? (
+              <Loader2 className="w-3 h-3 animate-spin" />
+            ) : autoContinueEnabled ? (
+              <ToggleRight className="w-4 h-4" />
+            ) : (
+              <ToggleLeft className="w-4 h-4" />
+            )}
+          </button>
         </div>
 
-        {/* Task Progress Widget - fixed to top right */}
-        {isOrchestrated && (
-          <TaskListWidget
-            currentStage={workflowStage ?? null}
-            isRunning={isRunning}
-            isPaused={isPaused}
-            isComplete={isComplete}
-            isFailed={isFailed}
-            taskName={taskName}
-            iteration={iteration}
-            maxIterations={maxIterations}
-          />
-        )}
       </div>
     </div>
   );

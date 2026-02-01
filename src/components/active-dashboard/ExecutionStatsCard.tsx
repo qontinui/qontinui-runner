@@ -189,7 +189,7 @@ export function ExecutionStatsCard({
                 stageColors.bg,
                 stageColors.text,
                 stageColors.border,
-                isRunning && "animate-pulse",
+                isRunning && "animate-phase-glow",
               )}
             >
               {stageConfig?.label}

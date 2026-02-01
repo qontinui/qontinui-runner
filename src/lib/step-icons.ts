@@ -80,6 +80,11 @@ export const STEP_ICON_CONFIG: Record<string, StepIconConfig> = {
     bgClass: "bg-gray-500/10",
     textClass: "text-gray-400",
   },
+  shell: {
+    icon: Terminal,
+    bgClass: "bg-gray-500/10",
+    textClass: "text-gray-400",
+  },
   api_request: {
     icon: Globe,
     bgClass: "bg-cyan-500/10",
@@ -137,6 +142,16 @@ export const STEP_ICON_CONFIG: Record<string, StepIconConfig> = {
     bgClass: "bg-cyan-500/10",
     textClass: "text-cyan-400",
   },
+  error_check: {
+    icon: AlertTriangle,
+    bgClass: "bg-cyan-500/10",
+    textClass: "text-cyan-400",
+  },
+  log_check: {
+    icon: FileSearch,
+    bgClass: "bg-cyan-500/10",
+    textClass: "text-cyan-400",
+  },
 
   // AI steps - use MessageSquare (matching "prompt" in Workflows builder)
   prompt: {
@@ -145,6 +160,11 @@ export const STEP_ICON_CONFIG: Record<string, StepIconConfig> = {
     textClass: "text-amber-400",
   },
   ai_session: {
+    icon: MessageSquare,
+    bgClass: "bg-amber-500/10",
+    textClass: "text-amber-400",
+  },
+  ai_analysis: {
     icon: MessageSquare,
     bgClass: "bg-amber-500/10",
     textClass: "text-amber-400",

@@ -77,12 +77,18 @@ export function useAccessibilityTree(): UseAccessibilityTreeResult {
   });
   const [error, setError] = useState<string | null>(null);
 
-  // Query for current snapshot
+  // Local state for snapshot and AI context (to avoid query timing issues)
+  const [localSnapshot, setLocalSnapshot] = useState<AccessibilitySnapshot | null>(null);
+  const [localAIContext, setLocalAIContext] = useState<string | null>(null);
+
+  // Query for current snapshot (kept for refetch capability, but we also use local state)
   const snapshotQuery = useQuery({
     queryKey: accessibilityKeys.snapshot(),
     queryFn: async () => {
       const result = await accessibilityService.getCurrentSnapshot();
       if (result.success && result.snapshot) {
+        // Also update local state when query fetches
+        setLocalSnapshot(result.snapshot);
         return result.snapshot;
       }
       return null;
@@ -97,11 +103,12 @@ export function useAccessibilityTree(): UseAccessibilityTreeResult {
     queryFn: async () => {
       const result = await accessibilityService.getAIContext();
       if (result.success && result.ai_context) {
+        setLocalAIContext(result.ai_context);
         return result.ai_context;
       }
       return null;
     },
-    enabled: connection.isConnected && !!snapshotQuery.data,
+    enabled: connection.isConnected && (!!snapshotQuery.data || !!localSnapshot),
     staleTime: 30000,
   });
 
@@ -130,9 +137,15 @@ export function useAccessibilityTree(): UseAccessibilityTreeResult {
           isConnected: true,
         }));
         setError(null);
-        // Invalidate queries to refresh data
-        queryClient.invalidateQueries({ queryKey: accessibilityKeys.snapshot() });
-        queryClient.invalidateQueries({ queryKey: accessibilityKeys.aiContext() });
+        // Set both local state AND query cache for immediate display
+        if (result.snapshot) {
+          setLocalSnapshot(result.snapshot);
+          queryClient.setQueryData(accessibilityKeys.snapshot(), result.snapshot);
+        }
+        if (result.ai_context) {
+          setLocalAIContext(result.ai_context);
+          queryClient.setQueryData(accessibilityKeys.aiContext(), result.ai_context);
+        }
       } else {
         setError(result.error || "Failed to capture accessibility tree");
       }
@@ -156,9 +169,15 @@ export function useAccessibilityTree(): UseAccessibilityTreeResult {
           target: result.target,
         });
         setError(null);
-        // Invalidate queries to refresh data
-        queryClient.invalidateQueries({ queryKey: accessibilityKeys.snapshot() });
-        queryClient.invalidateQueries({ queryKey: accessibilityKeys.aiContext() });
+        // Set both local state AND query cache for immediate display
+        if (result.snapshot) {
+          setLocalSnapshot(result.snapshot);
+          queryClient.setQueryData(accessibilityKeys.snapshot(), result.snapshot);
+        }
+        if (result.ai_context) {
+          setLocalAIContext(result.ai_context);
+          queryClient.setQueryData(accessibilityKeys.aiContext(), result.ai_context);
+        }
       } else {
         setError(result.error || "Failed to auto-connect");
       }
@@ -175,7 +194,9 @@ export function useAccessibilityTree(): UseAccessibilityTreeResult {
     },
     onSuccess: () => {
       setConnection({ isConnected: false });
-      // Clear cached data
+      // Clear both local state AND query cache
+      setLocalSnapshot(null);
+      setLocalAIContext(null);
       queryClient.setQueryData(accessibilityKeys.snapshot(), null);
       queryClient.setQueryData(accessibilityKeys.aiContext(), null);
     },
@@ -247,9 +268,9 @@ export function useAccessibilityTree(): UseAccessibilityTreeResult {
   }, []);
 
   return {
-    // Data
-    snapshot: snapshotQuery.data ?? null,
-    aiContext: aiContextQuery.data ?? null,
+    // Data - use local state first (for immediate display), fall back to query data
+    snapshot: localSnapshot ?? snapshotQuery.data ?? null,
+    aiContext: localAIContext ?? aiContextQuery.data ?? null,
     isLoading:
       captureMutation.isPending || autoConnectMutation.isPending || snapshotQuery.isLoading,
     error,

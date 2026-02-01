@@ -118,7 +118,7 @@ import ActionDetailModal from "./components/ActionDetailModal";
 import ImageDetailModal from "./components/ImageDetailModal";
 import { Settings } from "./components/Settings";
 import { LoginScreen } from "./components/LoginScreen";
-import { LogSourceManager } from "./components/LogSourceManager";
+import { LogSourcePicker } from "./components/LogSourcePicker";
 import { AiTab } from "./components/AiTab";
 import { LibraryDashboard } from "./components/LibraryDashboard";
 import { HelpTab } from "./components/HelpTab";
@@ -156,7 +156,7 @@ import { useTaskRuns } from "./hooks/useAiData";
 // Accessibility components
 import { AccessibilityExplorerPanel } from "./components/accessibility";
 // UI Bridge Inspector
-import { ConnectedUIBridgeInspector } from "./components/ui-bridge";
+import { ExternalUIBridgeInspector } from "./components/ui-bridge";
 // New dashboard components
 import { LearningDashboard } from "./components/learning-dashboard";
 import { CheckpointBrowser } from "./components/checkpoint-browser";
@@ -167,6 +167,7 @@ import { LivePageGeneratorTab } from "./components/live-page-generator";
 import { ExternalLogsTab as _ExternalLogsTab } from "./components/ExternalLogsTab";
 import { CategoryManager } from "./components/findings/CategoryManager";
 import { HooksManagerPanel } from "./components/hooks";
+import { ErrorMonitorTab } from "./components/error-monitor";
 
 // Styles
 import "./index.css";
@@ -179,6 +180,7 @@ type MainTabId =
   | "workflow-queue"
   | "active"
   | "history"
+  | "error-monitor"
   // Observe group - new structure
   | "run-recap"
   | "run-actions"
@@ -246,6 +248,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "workflow-queue",
   "active",
   "history",
+  "error-monitor",
   // New observe tabs
   "run-recap",
   "run-actions",
@@ -447,6 +450,7 @@ function AppContent() {
           "settings": "settings",
           "test-builder": "test-builder",
           "unified-workflow-builder": "unified-workflow-builder",
+          "error-monitor": "error-monitor",
         };
 
         const tabId = pageToTab[page];
@@ -476,6 +480,20 @@ function AppContent() {
       if (unlisten) {
         unlisten();
       }
+    };
+  }, []);
+
+  // Listen for error badge click to navigate to error monitor tab
+  useEffect(() => {
+    const handleNavigateToErrorMonitor = () => {
+      console.log("[APP] Navigating to error-monitor tab from ErrorBadge click");
+      setActiveTab("error-monitor");
+    };
+
+    window.addEventListener("navigate-to-error-monitor", handleNavigateToErrorMonitor);
+
+    return () => {
+      window.removeEventListener("navigate-to-error-monitor", handleNavigateToErrorMonitor);
     };
   }, []);
 
@@ -659,8 +677,8 @@ function AppContent() {
     onLog: addLog,
   });
 
-  // Log source manager modal state
-  const [showLogSourceManager, setShowLogSourceManager] = useState(false);
+  // Log source picker modal state
+  const [showLogSourcePicker, setShowLogSourcePicker] = useState(false);
 
   // Auto-load projects when authenticated
   useEffect(() => {
@@ -758,6 +776,14 @@ function AppContent() {
    * NOTE: This hook must be defined before conditional returns to satisfy React's rules of hooks
    */
   const handleGoToRecap = useCallback(() => {
+    // Set the last run ID in localStorage so RunSelectionContext picks it up
+    if (lastRun?.id) {
+      try {
+        localStorage.setItem("qontinui-selected-task-run-id", JSON.stringify(lastRun.id));
+      } catch {
+        // Ignore storage errors
+      }
+    }
     // If we have a last run with a workflow name, try to select it
     if (lastRun?.workflow_name && execution.workflows.length > 0) {
       // Find matching workflow by name
@@ -838,6 +864,13 @@ function AppContent() {
             onNavigateToRun={() => setActiveTab("gui-automation")}
             onNavigateToAi={() => setActiveTab("ai")}
           />
+        );
+
+      case "error-monitor":
+        return (
+          <div className="h-full overflow-hidden">
+            <ErrorMonitorTab />
+          </div>
         );
 
       // ========== NEW OBSERVE TABS ==========
@@ -978,25 +1011,37 @@ function AppContent() {
         );
 
       case "run-accessibility":
+        // Accessibility Explorer is a standalone tool for inspecting web pages via CDP
+        // It doesn't require a task run to be selected
         return (
-          <RunSelectionProvider>
-            <RunPageLayout title="Accessibility Explorer" icon={Accessibility}>
-              <div className="h-full overflow-hidden">
-                <AccessibilityExplorerPanel />
+          <div className="h-full flex flex-col overflow-hidden">
+            <div className="flex-shrink-0 bg-background border-b border-border px-4 py-3">
+              <div className="flex items-center gap-2">
+                <Accessibility className="w-4 h-4 text-muted-foreground" />
+                <span className="text-sm font-medium">Accessibility Explorer</span>
               </div>
-            </RunPageLayout>
-          </RunSelectionProvider>
+            </div>
+            <div className="flex-1 min-h-0 overflow-hidden">
+              <AccessibilityExplorerPanel />
+            </div>
+          </div>
         );
 
       case "run-ui-bridge":
+        // UI Bridge Inspector is a standalone tool for inspecting web pages via browser extension
+        // It doesn't require a task run to be selected
         return (
-          <RunSelectionProvider>
-            <RunPageLayout title="UI Bridge Inspector" icon={Puzzle}>
-              <div className="h-full overflow-hidden p-4">
-                <ConnectedUIBridgeInspector />
+          <div className="h-full flex flex-col overflow-hidden">
+            <div className="flex-shrink-0 bg-background border-b border-border px-4 py-3">
+              <div className="flex items-center gap-2">
+                <Puzzle className="w-4 h-4 text-muted-foreground" />
+                <span className="text-sm font-medium">UI Bridge Inspector</span>
               </div>
-            </RunPageLayout>
-          </RunSelectionProvider>
+            </div>
+            <div className="flex-1 min-h-0 overflow-hidden p-4">
+              <ExternalUIBridgeInspector />
+            </div>
+          </div>
         );
 
       case "discoveries":
@@ -1479,18 +1524,21 @@ function AppContent() {
           onClose={modalState.closeImageModal}
         />
 
-        {/* Log Source Manager Modal */}
+        {/* Log Source Picker Modal */}
         {projectLogs.config && (
-          <LogSourceManager
-            config={projectLogs.config}
-            isOpen={showLogSourceManager}
-            onClose={() => setShowLogSourceManager(false)}
-            onSave={(sources) => {
-              projectLogs.setLogSources(sources);
-              projectLogs.saveConfig(sources); // Pass sources directly to avoid React async state issue
-              setShowLogSourceManager(false);
+          <LogSourcePicker
+            isOpen={showLogSourcePicker}
+            onClose={() => setShowLogSourcePicker(false)}
+            selectedSourceIds={projectLogs.config.selectedSourceIds}
+            globalProfileId={projectLogs.config.globalProfileId}
+            onSave={(sourceIds, profileId) => {
+              if (profileId) {
+                projectLogs.setGlobalProfile(profileId);
+              } else {
+                projectLogs.setSelectedSources(sourceIds);
+              }
+              setShowLogSourcePicker(false);
             }}
-            projectDirectory={projectLogs.directories?.base}
           />
         )}
       </div>

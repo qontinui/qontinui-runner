@@ -2,15 +2,20 @@
  * useTaskDetection Hook
  *
  * Detects the current running task and determines which activities it contains.
- * Polls the runner API for running task information.
+ * Uses real-time Tauri events with polling as fallback.
  */
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { ActivityType } from "../../types/dashboard/activity-types";
 import type { TaskActivityInfo } from "../../types/dashboard/widget-registry";
 
 const API_BASE = "http://localhost:9876";
-const POLL_INTERVAL_MS = 2000;
+// Polling is now fallback only - real-time events provide instant updates
+const POLL_INTERVAL_MS = 5000;
+// Number of consecutive empty polls required before declaring idle
+// This prevents flashing when polls temporarily return empty during workflow transitions
+const EMPTY_POLL_THRESHOLD = 2;
 
 /**
  * Running task data from the API.
@@ -33,9 +38,11 @@ interface RunningTaskData {
  * Result of task detection.
  */
 export interface UseTaskDetectionResult {
-  /** Detected task activity info */
+  /** Detected task activity info (first/primary task) */
   taskInfo: TaskActivityInfo | null;
-  /** Whether a task is currently running */
+  /** All running tasks info (for multi-run support) */
+  allTasks: TaskActivityInfo[];
+  /** Whether any task is currently running */
   isRunning: boolean;
   /** Whether detection is loading */
   isLoading: boolean;
@@ -43,6 +50,8 @@ export interface UseTaskDetectionResult {
   error: string | null;
   /** Manually refresh task detection */
   refresh: () => Promise<void>;
+  /** Get task info by ID */
+  getTaskById: (taskId: string) => TaskActivityInfo | undefined;
 }
 
 /**
@@ -264,6 +273,15 @@ function buildTaskActivityInfo(task: RunningTaskData): TaskActivityInfo {
     task.execution_steps_json,
   );
 
+  // Parse task start time from created_at (ISO date string to ms since epoch)
+  let startTime: number | null = null;
+  if (task.created_at) {
+    const parsed = new Date(task.created_at).getTime();
+    if (!isNaN(parsed)) {
+      startTime = parsed;
+    }
+  }
+
   return {
     taskId: task.id,
     taskType: task.task_type,
@@ -277,17 +295,33 @@ function buildTaskActivityInfo(task: RunningTaskData): TaskActivityInfo {
     iteration: task.current_iteration ?? 1,
     maxIterations: task.max_iterations ?? 1,
     activities,
+    startTime,
   };
 }
 
 /**
- * Hook for detecting the current running task and its activities.
+ * Options for useTaskDetection hook.
  */
-export function useTaskDetection(): UseTaskDetectionResult {
-  const [taskInfo, setTaskInfo] = useState<TaskActivityInfo | null>(null);
+export interface UseTaskDetectionOptions {
+  /** Selected run ID from ActiveRunsContext - if provided, taskInfo will be the selected task */
+  selectedRunId?: string | null;
+}
+
+/**
+ * Hook for detecting the current running task and its activities.
+ * Supports multi-run by returning all running tasks.
+ *
+ * @param options - Optional configuration including selectedRunId for multi-run support
+ */
+export function useTaskDetection(options?: UseTaskDetectionOptions): UseTaskDetectionResult {
+  const [allTasks, setAllTasks] = useState<TaskActivityInfo[]>([]);
   const [isRunning, setIsRunning] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Track consecutive empty polls to prevent flashing during workflow transitions
+  const emptyPollCountRef = useRef(0);
+
+  const selectedRunId = options?.selectedRunId;
 
   /**
    * Fetch running tasks from the API.
@@ -297,9 +331,12 @@ export function useTaskDetection(): UseTaskDetectionResult {
       const response = await fetch(`${API_BASE}/task-runs/running`);
 
       if (!response.ok) {
-        // API not available or no running tasks
-        setTaskInfo(null);
-        setIsRunning(false);
+        // API not available or no running tasks - increment empty counter
+        emptyPollCountRef.current++;
+        if (emptyPollCountRef.current >= EMPTY_POLL_THRESHOLD) {
+          setAllTasks([]);
+          setIsRunning(false);
+        }
         setError(null);
         return;
       }
@@ -307,23 +344,32 @@ export function useTaskDetection(): UseTaskDetectionResult {
       const tasks: RunningTaskData[] = await response.json();
 
       if (!Array.isArray(tasks) || tasks.length === 0) {
-        setTaskInfo(null);
-        setIsRunning(false);
+        // Empty response - increment counter and only declare idle after threshold
+        emptyPollCountRef.current++;
+        if (emptyPollCountRef.current >= EMPTY_POLL_THRESHOLD) {
+          setAllTasks([]);
+          setIsRunning(false);
+        }
         setError(null);
         return;
       }
 
-      // Use the first running task
-      const runningTask = tasks[0];
-      const info = buildTaskActivityInfo(runningTask);
+      // Tasks found - reset empty counter and update state
+      emptyPollCountRef.current = 0;
 
-      setTaskInfo(info);
+      // Build info for all tasks
+      const allTasksInfo = tasks.map(buildTaskActivityInfo);
+
+      setAllTasks(allTasksInfo);
       setIsRunning(true);
       setError(null);
     } catch (e) {
       // Silently handle errors - API may not be available
-      setTaskInfo(null);
-      setIsRunning(false);
+      emptyPollCountRef.current++;
+      if (emptyPollCountRef.current >= EMPTY_POLL_THRESHOLD) {
+        setAllTasks([]);
+        setIsRunning(false);
+      }
       // Only set error for unexpected failures, not connection issues
       if (e instanceof Error && !e.message.includes("fetch")) {
         setError(e.message);
@@ -333,19 +379,76 @@ export function useTaskDetection(): UseTaskDetectionResult {
     }
   }, []);
 
-  // Initial fetch and polling
+  // Subscribe to real-time orchestrator state change events
+  // These events indicate task state changes that should trigger a refresh
+  useEffect(() => {
+    let mounted = true;
+    let unlisten: UnlistenFn | null = null;
+
+    const setupListener = async () => {
+      try {
+        unlisten = await listen("orchestrator-state-change", () => {
+          if (mounted) {
+            // Task state changed - refresh the task list
+            refresh();
+          }
+        });
+      } catch (e) {
+        // Tauri events not available (e.g., running in browser) - rely on polling
+        console.debug("Tauri events not available, using polling only:", e);
+      }
+    };
+
+    setupListener();
+
+    return () => {
+      mounted = false;
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, [refresh]);
+
+  // Initial fetch and fallback polling (reduced frequency since we have real-time events)
   useEffect(() => {
     refresh();
     const interval = setInterval(refresh, POLL_INTERVAL_MS);
     return () => clearInterval(interval);
   }, [refresh]);
 
+  // Derive taskInfo based on selectedRunId or default to first task
+  // This allows the dashboard to show content for the selected run
+  const taskInfo = useMemo(() => {
+    if (allTasks.length === 0) return null;
+
+    // If a run is selected, find it in the list
+    if (selectedRunId) {
+      const selected = allTasks.find((t) => t.taskId === selectedRunId);
+      if (selected) return selected;
+    }
+
+    // Fall back to first task
+    return allTasks[0];
+  }, [allTasks, selectedRunId]);
+
+  /**
+   * Get task info by ID.
+   */
+  const getTaskById = useCallback(
+    (taskId: string) => {
+      return allTasks.find((t) => t.taskId === taskId);
+    },
+    [allTasks],
+  );
+
   return {
     taskInfo,
+    allTasks,
     isRunning,
     isLoading,
     error,
     refresh,
+    getTaskById,
   };
 }
 

@@ -33,7 +33,15 @@ export const errorMonitorService = {
    * Query error events with filters.
    */
   async queryErrorEvents(query: ErrorQuery): Promise<StoredErrorEvent[]> {
-    return invoke("query_error_events", { query });
+    console.log("[ERROR_MONITOR] Querying error events with:", query);
+    try {
+      const result = await invoke<StoredErrorEvent[]>("query_error_events", { query });
+      console.log("[ERROR_MONITOR] Query result:", result?.length, "events");
+      return result;
+    } catch (err) {
+      console.error("[ERROR_MONITOR] Query failed:", err);
+      throw err;
+    }
   },
 
   /**

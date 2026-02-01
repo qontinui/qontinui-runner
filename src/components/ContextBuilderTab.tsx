@@ -37,7 +37,7 @@ import { BatchDeleteDialog } from "./ui/BatchDeleteDialog";
 interface ContextBuilderTabProps {
   onLog?: (level: string, message: string) => void;
   editContextId?: string | null;
-  onNavigateToLibrary?: () => void;
+  _onNavigateToLibrary?: () => void;
 }
 
 const KNOWN_ACTION_TYPES = [
@@ -56,19 +56,19 @@ const KNOWN_ACTION_TYPES = [
 export function ContextBuilderTab({
   onLog,
   editContextId,
-  onNavigateToLibrary,
+  _onNavigateToLibrary,
 }: ContextBuilderTabProps) {
   const {
     contexts,
-    categories,
-    tags: existingTags,
+    categories: _categories,
+    tags: _existingTags,
     loading,
-    error,
+    error: _error,
     createContext,
     updateContext,
     deleteContext: deleteContextFn,
     duplicateContext,
-    refresh,
+    refresh: _refresh,
   } = useContexts();
 
   // State

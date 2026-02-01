@@ -48,12 +48,16 @@ export interface AiOutputEntry {
   line: string;
   source: string;
   actionId?: string;
-  /** Session/workflow ID for grouping loops by workflow */
+  /** Parent task run ID (matches task_runs.id in database) */
+  taskRunId?: string;
+  /** Session ID for grouping output (may include phase suffix like "-agentic-1") */
   sessionId?: string;
   /** Human-readable session/workflow name (the task title) */
   sessionName?: string;
   /** Workflow phase: setup, verification, agentic, or completion */
   phase?: string;
+  /** Iteration number within the phase (1, 2, 3...) */
+  phaseIteration?: number;
 }
 
 type StoreListener = () => void;

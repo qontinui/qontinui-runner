@@ -167,17 +167,6 @@ export function InsightList({ insights }: InsightListProps) {
     );
   }
 
-  // Group by category
-  const byCategory = insights.reduce(
-    (acc, insight) => {
-      const cat = insight.category;
-      if (!acc[cat]) acc[cat] = [];
-      acc[cat].push(insight);
-      return acc;
-    },
-    {} as Record<string, Insight[]>,
-  );
-
   return (
     <div className="space-y-2">
       {insights.map((insight) => (

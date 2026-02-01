@@ -15,10 +15,8 @@ import {
   Search,
   Tag,
   FolderOpen,
-  X,
   Copy,
   Clock,
-  Sparkles,
   Check,
 } from "lucide-react";
 import { getAccentColors } from "@/design-system";
@@ -43,10 +41,10 @@ interface SavedTask {
 interface TaskBuilderTabProps {
   onLog?: (level: string, message: string) => void;
   editTaskId?: string | null;
-  onNavigateToLibrary?: () => void;
+  _onNavigateToLibrary?: () => void;
 }
 
-export function TaskBuilderTab({ onLog, editTaskId, onNavigateToLibrary }: TaskBuilderTabProps) {
+export function TaskBuilderTab({ onLog, editTaskId, _onNavigateToLibrary }: TaskBuilderTabProps) {
   // State
   const [tasks, setTasks] = useState<SavedTask[]>([]);
   const [loading, setLoading] = useState(true);

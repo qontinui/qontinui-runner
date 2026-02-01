@@ -35,7 +35,7 @@ interface ActionExecutorViewProps {
     elementId: string,
     action: string,
     params?: Record<string, unknown>
-  ) => Promise<void>;
+  ) => Promise<unknown>;
   disabled?: boolean;
 }
 

@@ -40,7 +40,7 @@ interface RetryHistory {
   attempts: RetryAttempt[];
 }
 
-export function ContextTab({ taskRunId }: ContextTabProps) {
+export function ContextTab({ taskRunId: _taskRunId }: ContextTabProps) {
   const [expandedRetries, setExpandedRetries] = useState<Set<string>>(new Set());
 
   // In a real implementation, this would fetch data from an API

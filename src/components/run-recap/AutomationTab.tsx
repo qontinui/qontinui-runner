@@ -9,7 +9,7 @@
  * - Screenshots gallery
  */
 
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import {
   Activity,
   CheckCircle2,
@@ -33,8 +33,8 @@ interface ScreenshotInfo {
   description?: string;
 }
 
-export function AutomationTab({ taskRunId, stats }: AutomationTabProps) {
-  const [screenshots, setScreenshots] = useState<ScreenshotInfo[]>([]);
+export function AutomationTab({ taskRunId: _taskRunId, stats }: AutomationTabProps) {
+  const [screenshots, _setScreenshots] = useState<ScreenshotInfo[]>([]);
   const [selectedScreenshot, setSelectedScreenshot] = useState<string | null>(null);
 
   // Calculate percentages for the bar chart

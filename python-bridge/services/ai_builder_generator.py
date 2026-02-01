@@ -998,18 +998,27 @@ class AiBuilderGeneratorService:
         if page_context:
             pages = page_context.get("pages")
             if pages and isinstance(pages, list):
-                self._log("info", f"[SELECTOR VALIDATION] Multi-page context with {len(pages)} pages")
+                self._log(
+                    "info", f"[SELECTOR VALIDATION] Multi-page context with {len(pages)} pages"
+                )
                 for page in pages:
                     page_elements = page.get("elements") or []
                     page_ids = _extract_valid_ids(page_elements)
-                    self._log("info", f"[SELECTOR VALIDATION] Page '{page.get('title', 'Unknown')}': {len(page_ids)} IDs")
+                    self._log(
+                        "info",
+                        f"[SELECTOR VALIDATION] Page '{page.get('title', 'Unknown')}': {len(page_ids)} IDs",
+                    )
                     valid_ids.update(page_ids)
             else:
                 elements = page_context.get("elements") or []
                 valid_ids.update(_extract_valid_ids(elements))
-                self._log("info", f"[SELECTOR VALIDATION] Single page context: {len(valid_ids)} IDs")
+                self._log(
+                    "info", f"[SELECTOR VALIDATION] Single page context: {len(valid_ids)} IDs"
+                )
         else:
-            self._log("info", "[SELECTOR VALIDATION] No page context provided - skipping validation")
+            self._log(
+                "info", "[SELECTOR VALIDATION] No page context provided - skipping validation"
+            )
 
         self._log("info", f"[SELECTOR VALIDATION] Total valid IDs: {len(valid_ids)}")
         if valid_ids:
@@ -1032,9 +1041,14 @@ class AiBuilderGeneratorService:
 
             # Validate selectors if we have valid IDs to check against
             if valid_ids:
-                self._log("info", f"[SELECTOR VALIDATION] Validating test code (attempt {attempt + 1})")
+                self._log(
+                    "info", f"[SELECTOR VALIDATION] Validating test code (attempt {attempt + 1})"
+                )
                 is_valid, invalid_ids = _validate_test_selectors(test_code, valid_ids)
-                self._log("info", f"[SELECTOR VALIDATION] Validation result: is_valid={is_valid}, invalid_ids={invalid_ids}")
+                self._log(
+                    "info",
+                    f"[SELECTOR VALIDATION] Validation result: is_valid={is_valid}, invalid_ids={invalid_ids}",
+                )
 
                 if not is_valid:
                     self._log(
@@ -1043,9 +1057,14 @@ class AiBuilderGeneratorService:
                     )
 
                     if attempt < max_retries:
-                        self._log("info", f"[SELECTOR VALIDATION] Triggering retry {attempt + 2}/{max_retries + 1}")
+                        self._log(
+                            "info",
+                            f"[SELECTOR VALIDATION] Triggering retry {attempt + 2}/{max_retries + 1}",
+                        )
                         # Build retry prompt with explicit correction
-                        valid_ids_list = "\n".join([f'  - "{el_id}"' for el_id in sorted(valid_ids)])
+                        valid_ids_list = "\n".join(
+                            [f'  - "{el_id}"' for el_id in sorted(valid_ids)]
+                        )
                         correction_prompt = f"""## RETRY - Your previous attempt used INVALID selectors
 
 The following selectors you used do NOT exist and will cause test failure:

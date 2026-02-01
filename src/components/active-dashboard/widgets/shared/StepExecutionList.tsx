@@ -9,7 +9,7 @@ import { cn } from "../../../../lib/utils";
 import { ScrollArea, Badge } from "../../../ui";
 import { getStatusColors } from "@/design-system";
 import { StepStatusBadge } from "./StepStatusBadge";
-import type { StepExecution, StepExecutionStatus } from "./types";
+import type { StepExecution } from "./types";
 
 interface StepExecutionListProps<T extends StepExecution> {
   /** List of step executions */

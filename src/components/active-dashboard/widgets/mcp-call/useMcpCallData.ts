@@ -45,7 +45,7 @@ interface StepExecutionResponse {
 export function useMcpCallData(): McpCallData {
   const [calls, setCalls] = useState<McpCallExecution[]>([]);
   const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [error, _setError] = useState<string | null>(null);
   const [startTime, setStartTime] = useState<number | null>(null);
   const [elapsedTime, setElapsedTime] = useState(0);
 

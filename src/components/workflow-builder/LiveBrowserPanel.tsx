@@ -39,6 +39,7 @@ import {
 } from "lucide-react";
 import { useLiveBrowser, type DiscoveredElement } from "../../hooks/useLiveBrowser";
 import type { UnifiedStep, WorkflowPhase, VerificationStep, PromptStep } from "../../types/unified-workflow";
+import { generateStepId } from "../../types";
 
 // =============================================================================
 // Types
@@ -172,14 +173,14 @@ function generateVerificationSteps(
     );
 
     steps.push({
+      id: generateStepId(),
       type: "test",
+      phase: "verification",
       name: "Verify page elements",
       test_type: "playwright",
-      test_config: {
-        script: testCode,
-        timeout: 30000,
-      },
-    });
+      code: testCode,
+      is_critical: true,
+    } as UnifiedStep);
   }
 
   return steps;
@@ -220,12 +221,13 @@ If the verification fails:
 3. Report the discrepancy with screenshots`;
 
   return {
+    id: generateStepId(),
     type: "prompt",
     name: "Live Browser Agentic Task",
-    prompt,
+    phase: "agentic",
+    content: prompt,
     model: "claude-sonnet-4-20250514",
-    max_iterations: 3,
-  };
+  } as PromptStep;
 }
 
 // =============================================================================
@@ -253,7 +255,7 @@ export function LiveBrowserPanel({
     connectToMobile,
     disconnect,
     refreshElements,
-    selectElement,
+    selectElement: _selectElement,
     highlightElement,
     enablePicker,
     isExtensionConnected,
@@ -330,7 +332,7 @@ export function LiveBrowserPanel({
   }, []);
 
   // Update assertion for an element
-  const updateAssertion = useCallback(
+  const _updateAssertion = useCallback(
     (elementId: string, assertionType: string, updates: Partial<ElementAssertion>) => {
       setSelectedForTest((prev) =>
         prev.map((e) => {

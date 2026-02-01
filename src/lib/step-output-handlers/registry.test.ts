@@ -2,7 +2,7 @@
  * Unit tests for StepOutputHandlerRegistry and utility functions
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect } from "vitest";
 // Import from index to trigger handler registration
 import {
   stepOutputRegistry,
@@ -191,6 +191,13 @@ describe("collectAssertableFields", () => {
         duration_ms: 100,
         success: true,
         status_code: 200,
+        method: "GET",
+        url: "https://example.com/api",
+        response: { data: "test" },
+        source_config: {
+          method: "GET",
+          url: "https://example.com/api",
+        },
       },
       {
         id: "2",
@@ -233,6 +240,13 @@ describe("collectAssertableFields", () => {
         duration_ms: 100,
         success: true,
         status_code: 200,
+        method: "GET",
+        url: "https://example.com/api",
+        response: { data: "test" },
+        source_config: {
+          method: "GET",
+          url: "https://example.com/api",
+        },
       },
     ];
 

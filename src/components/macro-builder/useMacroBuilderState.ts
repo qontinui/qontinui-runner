@@ -126,7 +126,20 @@ export function useMacroBuilderState({
     if (editMacroId) {
       const macro = savedMacros.find((m) => m.id === editMacroId);
       if (macro) {
-        loadMacro(macro);
+        // Inline the loadMacro logic here to avoid dependency issues
+        setCurrentMacroId(macro.id);
+        setSteps(macro.steps);
+        setOriginalSteps(macro.steps);
+        const newFormState: MacroFormState = {
+          name: macro.name,
+          description: macro.description,
+          category: macro.category,
+          tags: macro.tags,
+        };
+        setFormState(newFormState);
+        setOriginalFormState(newFormState);
+        setEditingStepId(null);
+        setLastResult(null);
       }
     }
   }, [editMacroId, savedMacros]);
@@ -215,7 +228,20 @@ export function useMacroBuilderState({
         if (response.ok) {
           await refreshMacros();
           if (currentMacroId === macroId) {
-            handleNewMacro();
+            // Inline handleNewMacro logic to avoid circular dependency
+            setCurrentMacroId(null);
+            setSteps([]);
+            setOriginalSteps([]);
+            const emptyFormState: MacroFormState = {
+              name: "",
+              description: "",
+              category: "general",
+              tags: [],
+            };
+            setFormState(emptyFormState);
+            setOriginalFormState(emptyFormState);
+            setEditingStepId(null);
+            setLastResult(null);
           }
         } else {
           throw new Error("Failed to delete macro");

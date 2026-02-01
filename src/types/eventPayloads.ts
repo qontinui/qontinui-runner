@@ -123,12 +123,16 @@ export interface AiOutputStreamEventData {
   line?: string;
   source?: string;
   action_id?: string;
-  /** Session/workflow ID for grouping loops by workflow */
+  /** Parent task run ID (matches task_runs.id in database) */
+  task_run_id?: string;
+  /** Session ID for grouping output (may include phase suffix like "-agentic-1") */
   session_id?: string;
   /** Human-readable session/workflow name (the task title) */
   session_name?: string;
   /** Workflow phase: setup, verification, agentic, or completion */
   phase?: string;
+  /** Iteration number within the phase (1, 2, 3...) */
+  phase_iteration?: number;
   [key: string]: unknown;
 }
 

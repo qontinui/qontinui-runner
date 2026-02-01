@@ -10,9 +10,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { learningService } from "../../services/learning-service";
 import { useLearningUpdates, useTaskStatusUpdates } from "../../hooks/useRealtimeUpdates";
 import type {
-  LearningSummary,
   LearningDashboardData,
-  AnalysisResult,
   Pattern,
   Insight,
   Feedback,

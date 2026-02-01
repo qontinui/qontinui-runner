@@ -19,8 +19,6 @@ import {
   ChevronRight,
   Terminal,
   Globe,
-  Check,
-  X,
   Wrench,
 } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
@@ -87,6 +85,7 @@ export function McpSettings({ onLog }: McpSettingsProps) {
 
   useEffect(() => {
     loadServers();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const loadServers = async () => {

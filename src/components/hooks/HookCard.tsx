@@ -22,7 +22,7 @@ import {
 import { useState } from "react";
 import type { Hook, HookActionType, HookTrigger } from "../../types/hooks";
 import { HOOK_TRIGGER_DISPLAY_NAMES, HOOK_ACTION_TYPE_DISPLAY_NAMES } from "../../types/hooks";
-import { getAccentColors, getStatusColors } from "@/design-system";
+import { getAccentColors } from "@/design-system";
 
 interface HookCardProps {
   hook: Hook;

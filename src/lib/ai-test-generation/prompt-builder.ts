@@ -8,7 +8,6 @@
  */
 
 import type {
-  CollectedAnalysis,
   CollectedAnalysisSet,
   PageAnalysis,
   ApiRequestAnalysis,
@@ -16,7 +15,6 @@ import type {
 import { getStepOutputFromAnalysis } from "../../components/test-builder/types";
 import type { StepOutput } from "../../types/step-output";
 import {
-  stepOutputRegistry,
   summarizeOutputsForAI,
   collectAssertableFields,
   type AssertableField,
@@ -283,7 +281,7 @@ function formatSinglePageAnalysis(analysis: PageAnalysis, testType: TestType): s
  */
 function formatPageAnalyses(
   analyses: Array<{ name: string; data: PageAnalysis }>,
-  testType: TestType,
+  _testType: TestType,
 ): string {
   const lines: string[] = [];
 

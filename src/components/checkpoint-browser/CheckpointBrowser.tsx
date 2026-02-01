@@ -35,7 +35,7 @@ import { CheckpointDiffView } from "./CheckpointDiffView";
 import { LineageTreeView } from "./LineageTreeView";
 
 export function CheckpointBrowser() {
-  const { taskIds, isLoading: taskIdsLoading } = useCheckpointTaskIds();
+  const { taskIds, isLoading: _taskIdsLoading } = useCheckpointTaskIds();
   // Use auto-select hook to automatically select the most recent task with checkpoints
   const { selectedTaskId, setSelectedTaskId, isAutoSelected } = useAutoSelectTask(taskIds);
 
@@ -57,12 +57,12 @@ export function CheckpointBrowser() {
 
   // Get lineage for the selected task (from selected checkpoint or task filter)
   const lineageTaskId = selectedCheckpoint?.task_id || selectedTaskId;
-  const { lineage, isLoading: loadingLineage } = useLineageTree(
+  const { lineage, isLoading: _loadingLineage } = useLineageTree(
     showLineage && lineageTaskId ? lineageTaskId : null,
   );
 
   // Check if task has lineage (replayed task or has replay children)
-  const hasLineage =
+  const _hasLineage =
     lineage &&
     lineage.nodes.length > 0 &&
     (lineage.nodes.length > 1 || lineage.nodes.some((n) => n.checkpoint_id !== null));

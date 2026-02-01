@@ -213,6 +213,13 @@ class QontinuiExecutor:
         self._interaction_video_path: str | None = None
         self._interaction_fps: int = 30
 
+        # Click Capture state (for click-to-template extraction)
+        self._click_capture_active = False
+        self._click_capture_session_id: str | None = None
+        self._click_capture_start_time: float | None = None
+        self._click_capture_output_dir: str | None = None
+        self._click_capture_application_hint: str | None = None
+
         # GUIAutomation (initialized after config load)
         self.gui_automation = None
 
@@ -1697,6 +1704,27 @@ class QontinuiExecutor:
         elif cmd_type == "discover_states_from_renders":
             return self._handle_discover_states_from_renders(params)
 
+        # UI Bridge state discovery from fingerprint co-occurrence data
+        elif cmd_type == "discover_states_from_fingerprints":
+            return self._handle_discover_states_from_fingerprints(params)
+
+        # UI Bridge automatic exploration
+        elif cmd_type == "run_ui_bridge_exploration":
+            return self._handle_run_ui_bridge_exploration(params)
+
+        # Click-to-Template capture commands
+        elif cmd_type == "start_click_capture":
+            return self._handle_start_click_capture(params)
+
+        elif cmd_type == "stop_click_capture":
+            return self._handle_stop_click_capture(params)
+
+        elif cmd_type == "get_click_capture_status":
+            return self._handle_get_click_capture_status()
+
+        elif cmd_type == "process_click_capture":
+            return self._handle_process_click_capture(params)
+
         else:
             return {"success": False, "error": f"Unknown command: {cmd_type}"}
 
@@ -3168,6 +3196,357 @@ class QontinuiExecutor:
             traceback.print_exc(file=sys.stderr)
             return {"success": False, "error": str(e)}
 
+    def _handle_discover_states_from_fingerprints(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle discover states from fingerprint co-occurrence data.
+
+        Uses the FingerprintStateDiscovery class to analyze element fingerprints
+        collected across multiple page captures and discover states based on
+        which elements consistently appear together.
+
+        Args:
+            params: Command parameters:
+                - cooccurrence_export: CooccurrenceExport data from UI Bridge capture session
+                    - sessionId: Unique session identifier
+                    - presenceMatrix: Array of capture snapshots with fingerprint data
+                    - transitions: Array of action transitions between captures
+                    - fingerprintStats: Statistics for each fingerprint hash
+                    - stateCandidates: Pre-computed state candidates (optional)
+                - config: Optional discovery configuration
+                    - minCooccurrenceRate: Minimum co-occurrence rate (default: 0.95)
+
+        Returns:
+            Dictionary with:
+                - success: Whether discovery succeeded
+                - data: Discovered states and transitions
+                    - states: Array of DiscoveredFingerprintState objects
+                    - transitions: Array of state transitions
+                    - statistics: Discovery statistics
+                - error: Error message (if failed)
+        """
+        import sys
+
+        print(
+            "[info    ] EXECUTOR: _handle_discover_states_from_fingerprints called",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        try:
+            if not QONTINUI_AVAILABLE:
+                return {
+                    "success": False,
+                    "error": "Qontinui library not available",
+                }
+
+            # Get co-occurrence export from params (as raw dict)
+            cooccurrence_export = params.get("cooccurrence_export")
+
+            if not cooccurrence_export:
+                return {
+                    "success": False,
+                    "error": "No cooccurrence_export provided",
+                }
+
+            # Get optional config
+            user_config = params.get("config", {})
+            min_cooccurrence_rate = user_config.get("minCooccurrenceRate", 0.95)
+
+            self.event_manager.emit_log(
+                "info",
+                f"[UI Bridge] Starting fingerprint state discovery "
+                f"(min_cooccurrence_rate={min_cooccurrence_rate})",
+            )
+
+            # Import the FingerprintStateDiscovery class
+            from qontinui.state_machine.fingerprint_state_discovery import (
+                FingerprintStateDiscovery,
+                FingerprintStateDiscoveryConfig,
+            )
+
+            # Log input data summary
+            presence_matrix = cooccurrence_export.get("presenceMatrix", [])
+            transitions_data = cooccurrence_export.get("transitions", [])
+            fingerprint_stats = cooccurrence_export.get("fingerprintStats", {})
+
+            self.event_manager.emit_log(
+                "info",
+                f"[UI Bridge] Input data: "
+                f"{len(presence_matrix)} captures, "
+                f"{len(transitions_data)} transitions, "
+                f"{len(fingerprint_stats)} unique fingerprints",
+            )
+
+            # Create discovery config
+            config = FingerprintStateDiscoveryConfig(
+                min_cooccurrence_rate=min_cooccurrence_rate,
+            )
+
+            # Create discovery instance
+            discovery = FingerprintStateDiscovery(config=config)
+
+            # Load data from raw dict (the method handles parsing internally)
+            discovery.load_cooccurrence_export(cooccurrence_export)
+
+            # Run discovery
+            discovered_states = discovery.discover_states()
+
+            self.event_manager.emit_log(
+                "info",
+                f"[UI Bridge] Fingerprint state discovery complete: "
+                f"{len(discovered_states)} states discovered",
+            )
+
+            # Get raw transitions
+            raw_transitions = discovery.get_transitions()
+
+            # Map raw transitions to state transitions
+            # We need to find which state each transition's fingerprints belong to
+            state_transitions = self._map_transitions_to_states(raw_transitions, discovered_states)
+
+            # Get statistics
+            stats = discovery.get_statistics()
+
+            # Build result
+            result = {
+                "states": [
+                    {
+                        "stateId": state.state_id,
+                        "name": state.name,
+                        "fingerprintHashes": list(state.fingerprint_hashes),
+                        "elementIds": list(state.element_ids),
+                        "positionZone": state.position_zone,
+                        "landmarkContext": state.landmark_context,
+                        "isGlobal": state.is_global,
+                        "isModal": state.is_modal,
+                        "repeatPatternCount": state.repeat_pattern_count,
+                        "confidence": state.confidence,
+                        "observationCount": state.observation_count,
+                    }
+                    for state in discovered_states
+                ],
+                "transitions": state_transitions,
+                "statistics": {
+                    "totalCaptures": stats.get("total_captures", 0),
+                    "totalTransitions": stats.get("total_transitions", 0),
+                    "uniqueFingerprints": stats.get("total_fingerprints", 0),
+                    "discoveredStates": stats.get("discovered_states", 0),
+                    "globalStates": stats.get("global_states", 0),
+                    "modalStates": stats.get("modal_states", 0),
+                    "discoveredTransitions": len(state_transitions),
+                },
+            }
+
+            return {
+                "success": True,
+                "data": result,
+            }
+
+        except Exception as e:
+            import traceback
+
+            self.event_manager.emit_log(
+                "error", f"[UI Bridge] Discover states from fingerprints failed: {e}"
+            )
+            traceback.print_exc(file=sys.stderr)
+            return {"success": False, "error": str(e)}
+
+    def _map_transitions_to_states(
+        self,
+        raw_transitions: list[Any],
+        discovered_states: list[Any],
+    ) -> list[dict[str, Any]]:
+        """Map raw transitions to state transitions.
+
+        Args:
+            raw_transitions: List of TransitionRecord objects
+            discovered_states: List of DiscoveredFingerprintState objects
+
+        Returns:
+            List of state transition dictionaries
+        """
+        # Build a mapping from fingerprint hash to state
+        fp_to_state: dict[str, str] = {}
+        for state in discovered_states:
+            for fp_hash in state.fingerprint_hashes:
+                fp_to_state[fp_hash] = state.state_id
+
+        # Track unique state transitions
+        transition_counts: dict[tuple[str, str, str], int] = {}
+
+        for t in raw_transitions:
+            # Find which states the appeared/disappeared fingerprints belong to
+            from_states: set[str] = set()
+            to_states: set[str] = set()
+
+            for fp_hash in t.disappeared_fingerprints:
+                if fp_hash in fp_to_state:
+                    from_states.add(fp_to_state[fp_hash])
+
+            for fp_hash in t.appeared_fingerprints:
+                if fp_hash in fp_to_state:
+                    to_states.add(fp_to_state[fp_hash])
+
+            # Create transitions for each from/to state pair
+            for from_state in from_states:
+                for to_state in to_states:
+                    if from_state != to_state:
+                        key = (from_state, to_state, t.action_type)
+                        transition_counts[key] = transition_counts.get(key, 0) + 1
+
+        # Convert to result format
+        result = []
+        for (from_state, to_state, action_type), count in transition_counts.items():
+            result.append(
+                {
+                    "fromStateId": from_state,
+                    "toStateId": to_state,
+                    "actionType": action_type,
+                    "count": count,
+                }
+            )
+
+        return result
+
+    def _handle_run_ui_bridge_exploration(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle automatic UI Bridge exploration.
+
+        Uses the UIBridgeExplorer to systematically explore interactive elements
+        on a web page via the browser extension, building co-occurrence data
+        for fingerprint-based state discovery.
+
+        Args:
+            params: Command parameters:
+                - runner_url: URL of the qontinui-runner (default: http://localhost:9876)
+                - config: Optional exploration configuration
+                    - max_depth: Maximum navigation depth (default: 2)
+                    - max_elements_per_page: Max elements per page (default: 20)
+                    - max_total_elements: Max total elements (default: 100)
+                    - action_delay_ms: Delay between actions (default: 500)
+                    - blocked_keywords: Keywords to skip
+                    - safe_keywords: Safe keywords
+                    - capture_screenshots: Whether to capture screenshots
+
+        Returns:
+            Dictionary with:
+                - success: Whether exploration succeeded
+                - data: Exploration results
+                    - exploration_id: Unique ID
+                    - elements_discovered: Count of discovered elements
+                    - elements_explored: Count of explored elements
+                    - errors: List of errors
+                    - state_discovery_result: Discovered states
+                    - cooccurrence_export: Raw export data
+                - error: Error message (if failed)
+        """
+        import sys
+        import asyncio
+
+        print(
+            "[info    ] EXECUTOR: _handle_run_ui_bridge_exploration called",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        try:
+            if not QONTINUI_AVAILABLE:
+                return {
+                    "success": False,
+                    "error": "Qontinui library not available",
+                }
+
+            # Get parameters
+            runner_url = params.get("runner_url", "http://localhost:9876")
+            user_config = params.get("config", {})
+
+            self.event_manager.emit_log(
+                "info",
+                f"[UI Bridge] Starting automatic exploration (runner_url={runner_url})",
+            )
+
+            # Import explorer
+            from qontinui.discovery.ui_bridge_explorer import (
+                UIBridgeExplorer,
+            )
+            from qontinui.discovery.target_connection import ExplorationConfig
+
+            # Build exploration config
+            config = ExplorationConfig(
+                target_type="extension",  # Use extension connection
+                connection_url=runner_url,
+                max_depth=user_config.get("max_depth", 2),
+                max_elements_per_page=user_config.get("max_elements_per_page", 20),
+                max_total_elements=user_config.get("max_total_elements", 100),
+                action_delay_ms=user_config.get("action_delay_ms", 500),
+                blocked_keywords=user_config.get("blocked_keywords", []),
+                safe_keywords=user_config.get("safe_keywords", []),
+                capture_screenshots=user_config.get("capture_screenshots", False),
+                record_render_logs=True,
+            )
+
+            # Progress callback to emit events
+            def on_progress(
+                message: str,
+                elements_discovered: int,
+                elements_explored: int,
+                current_element: str | None,
+            ) -> bool:
+                self.event_manager.emit_log(
+                    "info",
+                    f"[Exploration] {message} "
+                    f"(discovered={elements_discovered}, explored={elements_explored})",
+                )
+                return True  # Continue exploration
+
+            # Run exploration in event loop
+            async def run_exploration():
+                async with UIBridgeExplorer(config, on_progress=on_progress) as explorer:
+                    return await explorer.explore()
+
+            # Get or create event loop
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+            result = loop.run_until_complete(run_exploration())
+
+            self.event_manager.emit_log(
+                "info",
+                f"[UI Bridge] Exploration complete: "
+                f"{result.elements_discovered} discovered, "
+                f"{result.elements_explored} explored, "
+                f"{len(result.errors)} errors",
+            )
+
+            # Build response
+            response_data: dict[str, Any] = {
+                "exploration_id": result.exploration_id,
+                "elements_discovered": result.elements_discovered,
+                "elements_explored": result.elements_explored,
+                "errors": result.errors,
+            }
+
+            # Include state discovery result if available
+            if result.state_discovery_result:
+                response_data["state_discovery_result"] = result.state_discovery_result.to_dict()
+
+            # Include cooccurrence export if available
+            if result.cooccurrence_export:
+                response_data["cooccurrence_export"] = result.cooccurrence_export
+
+            return {
+                "success": True,
+                "data": response_data,
+            }
+
+        except Exception as e:
+            import traceback
+
+            self.event_manager.emit_log("error", f"[UI Bridge] Exploration failed: {e}")
+            traceback.print_exc(file=sys.stderr)
+            return {"success": False, "error": str(e)}
+
     # =========================================================================
     # UI-TARS Extraction Handlers
     # =========================================================================
@@ -4014,6 +4393,403 @@ class QontinuiExecutor:
             "events_count": events_count,
             "fps": self._interaction_fps,
         }
+
+    # =========================================================================
+    # Click-to-Template Capture Commands
+    # =========================================================================
+
+    def _handle_start_click_capture(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Start click capture for template extraction.
+
+        This captures input events (clicks) that will later be processed
+        to extract template candidates using the qontinui library.
+
+        Args:
+            params: Command parameters:
+                - session_id: Optional session ID (auto-generated if not provided)
+                - output_dir: Optional output directory
+                - application_hint: Optional application name for profile lookup
+
+        Returns:
+            Dictionary with:
+                - success: Whether capture started
+                - session_id: The session ID being used
+                - output_dir: Directory where files will be saved
+                - error: Error message (if failed)
+        """
+        import uuid
+        from pathlib import Path
+
+        if self._click_capture_active:
+            return {
+                "success": False,
+                "error": "Click capture already active",
+                "session_id": self._click_capture_session_id,
+            }
+
+        try:
+            # Generate session ID if not provided
+            session_id = params.get("session_id") or f"click-capture-{uuid.uuid4().hex[:8]}"
+            output_dir = params.get("output_dir")
+            application_hint = params.get("application_hint")
+
+            # Set up output directory
+            if output_dir:
+                capture_dir = Path(output_dir)
+            else:
+                dev_logs_dir = Path(__file__).parent.parent.parent / ".dev-logs"
+                capture_dir = dev_logs_dir / "click-captures"
+
+            capture_dir.mkdir(parents=True, exist_ok=True)
+
+            # Initialize InputMonitorService if not already done
+            if self.input_monitor_service is None:
+                self.input_monitor_service = InputMonitorService(storage_dir=capture_dir)
+                self.event_manager.emit_log(
+                    "info", f"InputMonitorService initialized for click capture: {capture_dir}"
+                )
+
+            # Start input monitoring (captures clicks)
+            self.input_monitor_service.start_monitoring(session_id=session_id, fps=30)
+            self.event_manager.emit_log("info", f"Click capture started for session: {session_id}")
+
+            # Update state
+            self._click_capture_active = True
+            self._click_capture_session_id = session_id
+            self._click_capture_start_time = time.time()
+            self._click_capture_output_dir = str(capture_dir)
+            self._click_capture_application_hint = application_hint
+
+            # Emit capture started event
+            self.event_manager.emit_event_wrapper(
+                "click_capture_started",
+                {
+                    "session_id": session_id,
+                    "output_dir": str(capture_dir),
+                    "application_hint": application_hint,
+                },
+            )
+
+            return {
+                "success": True,
+                "session_id": session_id,
+                "output_dir": str(capture_dir),
+                "application_hint": application_hint,
+            }
+
+        except Exception as e:
+            self.event_manager.emit_log("error", f"Failed to start click capture: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return {"success": False, "error": str(e)}
+
+    def _handle_stop_click_capture(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Stop click capture and optionally process results.
+
+        Args:
+            params: Command parameters:
+                - process_immediately: Whether to process captures now (default: False)
+
+        Returns:
+            Dictionary with:
+                - success: Whether capture stopped successfully
+                - session_id: The session ID
+                - events_file: Path to the input events JSONL file
+                - events_count: Number of click events captured
+                - duration: Capture duration in seconds
+                - candidates: Template candidates (if process_immediately=True)
+                - error: Error message (if failed)
+        """
+        if not self._click_capture_active:
+            return {
+                "success": False,
+                "error": "No click capture active",
+            }
+
+        try:
+            session_id = self._click_capture_session_id
+            start_time = self._click_capture_start_time
+            output_dir = self._click_capture_output_dir
+            application_hint = self._click_capture_application_hint
+            process_immediately = params.get("process_immediately", False)
+
+            # Stop input monitoring
+            events_file = None
+            events_count = 0
+            if self.input_monitor_service:
+                events_file = self.input_monitor_service.stop_monitoring()
+                # Filter for click events only
+                all_events = self.input_monitor_service.get_events()
+                click_events = [e for e in all_events if e.get("event_type") == "mouse_click"]
+                events_count = len(click_events)
+
+            # Calculate duration
+            duration = time.time() - start_time if start_time else 0
+
+            # Reset state
+            self._click_capture_active = False
+            self._click_capture_session_id = None
+            self._click_capture_start_time = None
+            self._click_capture_output_dir = None
+            self._click_capture_application_hint = None
+
+            self.event_manager.emit_log(
+                "info",
+                f"Click capture stopped: {events_count} click events captured, "
+                f"duration={duration:.1f}s, file={events_file}",
+            )
+
+            result = {
+                "success": True,
+                "session_id": session_id,
+                "events_file": events_file,
+                "events_count": events_count,
+                "duration": duration,
+                "output_dir": output_dir,
+            }
+
+            # Process immediately if requested
+            if process_immediately and events_file:
+                process_result = self._process_click_capture_internal(
+                    events_file=events_file,
+                    session_id=session_id,
+                    application_hint=application_hint,
+                )
+                result["candidates"] = process_result.get("candidates", [])
+                result["candidates_count"] = process_result.get("candidates_count", 0)
+
+            # Emit capture stopped event
+            self.event_manager.emit_event_wrapper(
+                "click_capture_stopped",
+                {
+                    "session_id": session_id,
+                    "events_file": events_file,
+                    "events_count": events_count,
+                    "duration": duration,
+                },
+            )
+
+            return result
+
+        except Exception as e:
+            self.event_manager.emit_log("error", f"Failed to stop click capture: {e}")
+            import traceback
+
+            traceback.print_exc()
+            # Reset state even on error
+            self._click_capture_active = False
+            return {"success": False, "error": str(e)}
+
+    def _handle_get_click_capture_status(self) -> dict[str, Any]:
+        """Get current click capture status.
+
+        Returns:
+            Dictionary with:
+                - success: Always True
+                - is_capturing: Whether capture is active
+                - session_id: Current session ID (if capturing)
+                - duration: Current capture duration in seconds (if capturing)
+                - events_count: Number of click events captured so far (if capturing)
+        """
+        if not self._click_capture_active:
+            return {
+                "success": True,
+                "is_capturing": False,
+            }
+
+        duration = (
+            time.time() - self._click_capture_start_time if self._click_capture_start_time else 0
+        )
+        events_count = 0
+        if self.input_monitor_service:
+            all_events = self.input_monitor_service.get_events()
+            click_events = [e for e in all_events if e.get("event_type") == "mouse_click"]
+            events_count = len(click_events)
+
+        return {
+            "success": True,
+            "is_capturing": True,
+            "session_id": self._click_capture_session_id,
+            "duration": duration,
+            "events_count": events_count,
+            "output_dir": self._click_capture_output_dir,
+            "application_hint": self._click_capture_application_hint,
+        }
+
+    def _handle_process_click_capture(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Process a completed click capture session to extract template candidates.
+
+        Uses the qontinui library's CaptureProcessor to analyze screenshots
+        at click timestamps and detect element boundaries.
+
+        Args:
+            params: Command parameters:
+                - events_file: Path to the events JSONL file (required)
+                - video_path: Path to the video file (optional - uses screenshots if not provided)
+                - session_id: Session ID for the candidates
+                - application_hint: Optional application name for profile lookup
+                - send_to_web: Whether to send candidates to qontinui-web API (default: False)
+                - web_api_url: URL for qontinui-web API (required if send_to_web=True)
+
+        Returns:
+            Dictionary with:
+                - success: Whether processing succeeded
+                - candidates_count: Number of template candidates extracted
+                - candidates: List of candidate dictionaries
+                - error: Error message (if failed)
+        """
+        events_file = params.get("events_file")
+        if not events_file:
+            return {"success": False, "error": "events_file is required"}
+
+        return self._process_click_capture_internal(
+            events_file=events_file,
+            video_path=params.get("video_path"),
+            session_id=params.get("session_id"),
+            application_hint=params.get("application_hint"),
+            send_to_web=params.get("send_to_web", False),
+            web_api_url=params.get("web_api_url"),
+        )
+
+    def _process_click_capture_internal(
+        self,
+        events_file: str,
+        video_path: str | None = None,
+        session_id: str | None = None,
+        application_hint: str | None = None,
+        send_to_web: bool = False,
+        web_api_url: str | None = None,
+    ) -> dict[str, Any]:
+        """Internal method to process click capture.
+
+        If video_path is provided, extracts frames from video at click timestamps.
+        Otherwise, captures screenshots at the current time for each click location.
+        """
+        import json
+        import uuid
+        from pathlib import Path
+
+        try:
+            # Import qontinui library modules
+            from qontinui.discovery.click_analysis import CaptureProcessor, ClickTemplateCandidate
+
+            events_path = Path(events_file)
+            if not events_path.exists():
+                return {"success": False, "error": f"Events file not found: {events_file}"}
+
+            # Load click events from JSONL
+            click_events = []
+            with open(events_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                        if event.get("event_type") == "mouse_click":
+                            click_events.append(event)
+                    except json.JSONDecodeError:
+                        continue
+
+            if not click_events:
+                return {
+                    "success": True,
+                    "candidates_count": 0,
+                    "candidates": [],
+                    "message": "No click events found in file",
+                }
+
+            self.event_manager.emit_log(
+                "info", f"Processing {len(click_events)} click events from {events_file}"
+            )
+
+            processor = CaptureProcessor()
+            candidates: list[ClickTemplateCandidate] = []
+
+            if video_path and Path(video_path).exists():
+                # Process from video file
+                candidates = processor.process_capture_session(
+                    video_path=Path(video_path),
+                    events_file=events_path,
+                    session_id=session_id or str(uuid.uuid4()),
+                    application_hint=application_hint,
+                )
+            else:
+                # Process from current screenshots (for each click location)
+                # Take a screenshot now and process all clicks against it
+                screenshot = self._capture_screenshot_for_processing()
+                if screenshot is not None:
+                    click_locations = [(e.get("x", 0), e.get("y", 0)) for e in click_events]
+                    candidates = processor.process_screenshot_with_clicks(
+                        screenshot=screenshot,
+                        click_locations=click_locations,
+                        session_id=session_id or str(uuid.uuid4()),
+                        application_hint=application_hint,
+                    )
+
+            # Convert candidates to dictionaries
+            candidate_dicts = [c.to_dict() for c in candidates]
+
+            self.event_manager.emit_log("info", f"Extracted {len(candidates)} template candidates")
+
+            result = {
+                "success": True,
+                "candidates_count": len(candidates),
+                "candidates": candidate_dicts,
+            }
+
+            # Send to web API if requested
+            if send_to_web and web_api_url and candidates:
+                send_result = self._send_candidates_to_web(candidate_dicts, web_api_url)
+                result["web_send_success"] = send_result.get("success", False)
+                if not send_result.get("success"):
+                    result["web_send_error"] = send_result.get("error")
+
+            return result
+
+        except ImportError as e:
+            self.event_manager.emit_log("error", f"Failed to import qontinui library: {e}")
+            return {"success": False, "error": f"qontinui library not available: {e}"}
+        except Exception as e:
+            self.event_manager.emit_log("error", f"Failed to process click capture: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return {"success": False, "error": str(e)}
+
+    def _capture_screenshot_for_processing(self):
+        """Capture a screenshot for click capture processing."""
+        try:
+            if QONTINUI_AVAILABLE:
+                from qontinui.hal import create_default_hal
+
+                hal = create_default_hal()
+                screenshot = hal.capture_screen()
+                return screenshot
+        except Exception as e:
+            self.event_manager.emit_log(
+                "warning", f"Failed to capture screenshot for processing: {e}"
+            )
+        return None
+
+    def _send_candidates_to_web(
+        self, candidates: list[dict[str, Any]], web_api_url: str
+    ) -> dict[str, Any]:
+        """Send template candidates to qontinui-web API."""
+        import requests
+
+        try:
+            response = requests.post(
+                f"{web_api_url}/api/v1/template-capture/candidates",
+                json=candidates,
+                timeout=30,
+            )
+            response.raise_for_status()
+            return {"success": True}
+        except Exception as e:
+            self.event_manager.emit_log("error", f"Failed to send candidates to web API: {e}")
+            return {"success": False, "error": str(e)}
 
     def __del__(self):
         """Clean up resources on exit."""
