@@ -24,5 +24,6 @@ export function useAutoScroll({ enabled, containerRef, dependencies }: UseAutoSc
         scrollContainer.scrollTop = scrollContainer.scrollHeight;
       });
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- dependencies is intentionally a dynamic array passed by caller
   }, dependencies);
 }

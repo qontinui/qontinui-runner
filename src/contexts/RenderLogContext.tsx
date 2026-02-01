@@ -368,7 +368,8 @@ export function RenderLogProvider({
     }, 500);
 
     return () => clearTimeout(timeoutId);
-  }, [isDev]); // Only on mount, not on every enable change
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- Intentionally only run on mount, not when captureSnapshot/enableOnMount/isEnabled change
+  }, [isDev]);
 
   const value: RenderLogContextValue = {
     activeTab,

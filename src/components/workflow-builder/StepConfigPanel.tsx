@@ -625,7 +625,7 @@ function CheckConfig({
 
   // Filter tools by check type
   const availableTools = CHECK_TOOLS.filter((t) => t.check_type === step.check_type);
-  const _selectedTool = CHECK_TOOLS.find((t) => t.tool === step.tool);
+  const selectedTool = CHECK_TOOLS.find((t) => t.tool === step.tool);
   const _checkTypeInfo = CHECK_TYPE_INFO.find((t) => t.type === step.check_type);
 
   return (

@@ -106,9 +106,12 @@ export function useLogContent({ config }: UseLogContentProps): UseLogContentRetu
 
   // Clean up interval on unmount
   useEffect(() => {
+    // Copy ref value to local variable for cleanup - React recommends this pattern
+    // because ref.current may change by the time the cleanup function runs
+    const intervalId = refreshIntervalRef.current;
     return () => {
-      if (refreshIntervalRef.current) {
-        clearInterval(refreshIntervalRef.current);
+      if (intervalId) {
+        clearInterval(intervalId);
       }
     };
   }, []);
