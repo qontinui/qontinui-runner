@@ -42,6 +42,12 @@ class EventType(Enum):
     EXTRACTION_ELEMENT_DETECTED = "extraction_element_detected"
     EXTRACTION_COMPLETE = "extraction_complete"
     EXTRACTION_ERROR = "extraction_error"
+    # UI Bridge exploration events
+    UI_BRIDGE_EXPLORATION_STARTED = "ui_bridge_exploration_started"
+    UI_BRIDGE_EXPLORATION_PROGRESS = "ui_bridge_exploration_progress"
+    UI_BRIDGE_EXPLORATION_COMPLETED = "ui_bridge_exploration_completed"
+    UI_BRIDGE_EXPLORATION_FAILED = "ui_bridge_exploration_failed"
+    UI_BRIDGE_EXPLORATION_STOPPING = "ui_bridge_exploration_stopping"
 
 
 class EventManager:
@@ -188,6 +194,12 @@ class EventManager:
             # Raw event names from qontinui library (map to same EventType)
             "state_detected": EventType.EXTRACTION_STATE_DETECTED,
             "element_detected": EventType.EXTRACTION_ELEMENT_DETECTED,
+            # UI Bridge exploration events
+            "ui_bridge_exploration_started": EventType.UI_BRIDGE_EXPLORATION_STARTED,
+            "ui_bridge_exploration_progress": EventType.UI_BRIDGE_EXPLORATION_PROGRESS,
+            "ui_bridge_exploration_completed": EventType.UI_BRIDGE_EXPLORATION_COMPLETED,
+            "ui_bridge_exploration_failed": EventType.UI_BRIDGE_EXPLORATION_FAILED,
+            "ui_bridge_exploration_stopping": EventType.UI_BRIDGE_EXPLORATION_STOPPING,
         }
 
         # Get the EventType enum value, defaulting to LOG if not found

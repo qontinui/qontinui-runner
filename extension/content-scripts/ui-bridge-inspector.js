@@ -26,6 +26,98 @@
   let hoverOverlay = null;
   const overlayElements = new Map();
 
+  // ==========================================================================
+  // Cross-Origin Iframe Detection
+  // ==========================================================================
+
+  /**
+   * Check if an iframe is cross-origin (cannot access its content).
+   * @param {HTMLIFrameElement} iframe - The iframe element to check
+   * @returns {boolean} True if the iframe is cross-origin
+   */
+  function isCrossOriginIframe(iframe) {
+    try {
+      // Try to access the contentDocument - this will throw or return null for cross-origin
+      const doc = iframe.contentDocument || iframe.contentWindow?.document;
+      return !doc; // If we can't access it, it's cross-origin
+    } catch {
+      // SecurityError = cross-origin
+      return true;
+    }
+  }
+
+  /**
+   * Check if an element is inside a cross-origin iframe.
+   * Walks up the frame hierarchy to detect cross-origin boundaries.
+   * @param {Element} el - The element to check
+   * @returns {boolean} True if element is inside a cross-origin iframe
+   */
+  function isInsideCrossOriginIframe(el) {
+    try {
+      // Get the element's ownerDocument
+      const doc = el.ownerDocument;
+      if (!doc) return false;
+
+      // Get the window containing this document
+      const win = doc.defaultView;
+      if (!win) return false;
+
+      // Check if we're in the top window
+      if (win === window.top) {
+        return false;
+      }
+
+      // We're in a frame - check if parent can access us
+      // If the parent can't access this frame, it's cross-origin from parent's perspective
+      // But if we're running this script, we have access to the current frame
+      // So we need to check if the parent frame is cross-origin relative to top
+      try {
+        // Try to access parent window
+        const parentWin = win.parent;
+        if (!parentWin) return true;
+
+        // Try to access parent document - will throw if cross-origin
+        // Access the document to trigger cross-origin check (result intentionally unused)
+        void parentWin.document;
+        return false;
+      } catch {
+        // Can't access parent - we're in a cross-origin iframe
+        return true;
+      }
+    } catch {
+      // Any error suggests cross-origin restrictions
+      return true;
+    }
+  }
+
+  /**
+   * Find all iframes on the page and return information about cross-origin ones.
+   * @returns {Array<{element: HTMLIFrameElement, bounds: DOMRect, isCrossOrigin: boolean}>}
+   */
+  function getIframeInfo() {  // eslint-disable-line no-unused-vars
+    const iframes = document.querySelectorAll('iframe');
+    return Array.from(iframes).map(iframe => {
+      const rect = iframe.getBoundingClientRect();
+      return {
+        element: iframe,
+        bounds: {
+          x: rect.x,
+          y: rect.y,
+          width: rect.width,
+          height: rect.height,
+          top: rect.top,
+          right: rect.right,
+          bottom: rect.bottom,
+          left: rect.left,
+        },
+        isCrossOrigin: isCrossOriginIframe(iframe),
+        src: iframe.src || '',
+        name: iframe.name || '',
+        id: iframe.id || '',
+      };
+    });
+  }
+
   // Style constants
   const OVERLAY_COLOR = 'rgba(59, 130, 246, 0.3)';
   const OVERLAY_BORDER = 'rgba(59, 130, 246, 0.8)';
@@ -98,6 +190,9 @@
       const htmlReadonly = el.hasAttribute('readonly') || el.readOnly === true;
       const ariaReadonly = el.getAttribute('aria-readonly') === 'true';
 
+      // Check if element is inside a cross-origin iframe
+      const isCrossOrigin = isInsideCrossOriginIframe(el);
+
       return {
         id: el.dataset.uiId,
         tagName: el.tagName.toLowerCase(),
@@ -123,6 +218,8 @@
         children: getChildUiIds(el),
         actions: inferActions(inferElementType(el)),
         hasUiId: true,
+        // Cross-origin iframe detection
+        isCrossOrigin: isCrossOrigin || undefined,
         // Accessibility information
         accessibility: accessibility,
         // Interactive flag
@@ -256,6 +353,9 @@
       const htmlReadonly = el.hasAttribute('readonly') || el.readOnly === true;
       const ariaReadonly = el.getAttribute('aria-readonly') === 'true';
 
+      // Check if element is inside a cross-origin iframe
+      const isCrossOrigin = isInsideCrossOriginIframe(el);
+
       discoveredElements.push({
         id: generatedId,
         tagName: el.tagName.toLowerCase(),
@@ -281,6 +381,8 @@
         children: [],
         actions: inferActions(inferElementType(el)),
         hasUiId: false,
+        // Cross-origin iframe detection
+        isCrossOrigin: isCrossOrigin || undefined,
         // Accessibility information
         accessibility: accessibility,
         // Interactive flag

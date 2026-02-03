@@ -1725,6 +1725,9 @@ class QontinuiExecutor:
         elif cmd_type == "process_click_capture":
             return self._handle_process_click_capture(params)
 
+        elif cmd_type == "generate_state_machine":
+            return self._handle_generate_state_machine(params)
+
         else:
             return {"success": False, "error": f"Unknown command: {cmd_type}"}
 
@@ -4789,6 +4792,189 @@ class QontinuiExecutor:
             return {"success": True}
         except Exception as e:
             self.event_manager.emit_log("error", f"Failed to send candidates to web API: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_generate_state_machine(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Generate a state machine configuration from approved templates.
+
+        Uses the qontinui library's ClickToStateMachineBuilder to convert
+        user-approved template candidates into a state machine configuration.
+
+        Args:
+            params: Command parameters:
+                - approved_templates: List of approved template dictionaries (required)
+                - grouping_method: How to group templates into states. Options:
+                    - "state_hints": Use template's state_hint field (default)
+                    - "user_assignments": Use explicit state_assignments mapping
+                    - "co_occurrence": Group by which templates appear together
+                    - "single_state": Put all templates in one state
+                    - "one_per_template": Each template becomes its own state
+                - state_assignments: Dict mapping state_name to list of template IDs
+                    (required if grouping_method="user_assignments")
+                - session_id: Session ID for metadata (optional)
+                - video_path: Path to video file used for capture (optional, but
+                    REQUIRED for co_occurrence grouping to analyze which templates
+                    appear together)
+                - co_occurrence_sample_interval: For co_occurrence grouping, check
+                    every N frames (default: 30, ~1 per second at 30fps)
+                - output_path: Path to write the config JSON file (optional)
+
+        Returns:
+            Dictionary with:
+                - success: Whether generation succeeded
+                - state_machine: The generated state machine configuration dict
+                - states_count: Number of states in the generated config
+                - state_images_count: Total number of state images
+                - transitions_count: Number of transitions
+                - output_path: Path where config was saved (if output_path provided)
+                - error: Error message (if failed)
+        """
+        from pathlib import Path
+
+        approved_templates_data = params.get("approved_templates")
+        if not approved_templates_data:
+            return {"success": False, "error": "approved_templates is required"}
+
+        if not isinstance(approved_templates_data, list):
+            return {"success": False, "error": "approved_templates must be a list"}
+
+        grouping_method = params.get("grouping_method", "state_hints")
+        state_assignments = params.get("state_assignments")
+        session_id = params.get("session_id", "")
+        video_path = params.get("video_path")
+        output_path = params.get("output_path")
+        co_occurrence_sample_interval = params.get("co_occurrence_sample_interval", 30)
+
+        # Validate grouping method
+        valid_methods = [
+            "state_hints",
+            "user_assignments",
+            "co_occurrence",
+            "single_state",
+            "one_per_template",
+        ]
+        if grouping_method not in valid_methods:
+            return {
+                "success": False,
+                "error": f"Invalid grouping_method. Must be one of: {valid_methods}",
+            }
+
+        # Validate state_assignments if using user_assignments method
+        if grouping_method == "user_assignments" and not state_assignments:
+            return {
+                "success": False,
+                "error": "state_assignments is required when grouping_method='user_assignments'",
+            }
+
+        # Validate video_path if using co_occurrence method
+        if grouping_method == "co_occurrence" and not video_path:
+            return {
+                "success": False,
+                "error": "video_path is required when grouping_method='co_occurrence'. "
+                "The video is analyzed to determine which templates appear together.",
+            }
+
+        try:
+            # Import qontinui library modules
+            from qontinui.discovery.click_analysis import (
+                ApprovedTemplate,
+                ClickToStateMachineBuilder,
+            )
+
+            # Convert dictionaries to ApprovedTemplate objects
+            approved_templates: list[ApprovedTemplate] = []
+            for template_data in approved_templates_data:
+                try:
+                    template = ApprovedTemplate.from_dict(template_data)
+                    approved_templates.append(template)
+                except Exception as e:
+                    self.event_manager.emit_log(
+                        "warning",
+                        f"Failed to parse template {template_data.get('id', 'unknown')}: {e}",
+                    )
+                    continue
+
+            if not approved_templates:
+                return {
+                    "success": False,
+                    "error": "No valid templates could be parsed from approved_templates",
+                }
+
+            self.event_manager.emit_log(
+                "info",
+                f"Building state machine from {len(approved_templates)} approved templates "
+                f"using {grouping_method} grouping",
+            )
+
+            # Emit progress event
+            self.event_manager.emit_event_wrapper(
+                "state_machine_generation_started",
+                {
+                    "template_count": len(approved_templates),
+                    "grouping_method": grouping_method,
+                    "session_id": session_id,
+                },
+            )
+
+            # Build the state machine
+            builder = ClickToStateMachineBuilder()
+            result = builder.build_from_templates(
+                templates=approved_templates,
+                grouping_method=grouping_method,
+                state_assignments=state_assignments,
+                session_id=session_id,
+                video_path=Path(video_path) if video_path else None,
+                co_occurrence_sample_interval=co_occurrence_sample_interval,
+            )
+
+            # Convert to dictionary for JSON serialization
+            state_machine_dict = result.to_dict()
+
+            self.event_manager.emit_log(
+                "info",
+                f"Generated state machine: {result.state_count} states, "
+                f"{result.state_image_count} state images, {result.transition_count} transitions",
+            )
+
+            # Write to file if output_path provided
+            if output_path:
+                import json
+
+                output_file = Path(output_path)
+                output_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(output_file, "w") as f:
+                    json.dump(state_machine_dict, f, indent=2)
+                self.event_manager.emit_log("info", f"State machine config saved to: {output_path}")
+
+            # Emit completion event
+            self.event_manager.emit_event_wrapper(
+                "state_machine_generation_completed",
+                {
+                    "states_count": result.state_count,
+                    "state_images_count": result.state_image_count,
+                    "transitions_count": result.transition_count,
+                    "session_id": session_id,
+                    "output_path": output_path,
+                },
+            )
+
+            return {
+                "success": True,
+                "state_machine": state_machine_dict,
+                "states_count": result.state_count,
+                "state_images_count": result.state_image_count,
+                "transitions_count": result.transition_count,
+                "output_path": output_path,
+            }
+
+        except ImportError as e:
+            self.event_manager.emit_log("error", f"Failed to import qontinui library: {e}")
+            return {"success": False, "error": f"qontinui library not available: {e}"}
+        except Exception as e:
+            self.event_manager.emit_log("error", f"Failed to generate state machine: {e}")
+            import traceback
+
+            traceback.print_exc()
             return {"success": False, "error": str(e)}
 
     def __del__(self):

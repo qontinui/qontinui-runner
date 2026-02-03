@@ -12,9 +12,13 @@
 (function () {
   'use strict';
 
-  // Avoid double initialization
+  // Handle extension reinstall: remove old listeners and re-register
+  // The old extension context is invalidated on reinstall, so we need fresh listeners
   if (window.__QONTINUI_UI_BRIDGE_BRIDGE_INITIALIZED__) {
-    return;
+    // Clean up old listeners if they exist
+    if (window.__qontinuiUIBridgeBridgeCleanup) {
+      window.__qontinuiUIBridgeBridgeCleanup();
+    }
   }
   window.__QONTINUI_UI_BRIDGE_BRIDGE_INITIALIZED__ = true;
 
@@ -111,6 +115,40 @@
         tabId: null,
       });
     }
+  }
+
+  /**
+   * Handle runner commands from the webpage (for cloud qontinui.io)
+   * This allows qontinui.io to send commands to the local runner through the extension
+   */
+  function handleRunnerCommand(event) {
+    if (event.source !== window) return;
+    if (!event.data || event.data.type !== '__QONTINUI_RUNNER_COMMAND__') return;
+
+    const { requestId, action, params } = event.data;
+
+    // Forward to background script which will call the runner API
+    chrome.runtime.sendMessage(
+      {
+        type: 'RUNNER_COMMAND_FROM_PAGE',
+        requestId,
+        action,
+        params,
+      },
+      (response) => {
+        // Send response back to the page
+        window.postMessage(
+          {
+            type: '__QONTINUI_RUNNER_RESPONSE__',
+            requestId,
+            success: response?.success ?? false,
+            data: response?.data,
+            error: response?.error,
+          },
+          '*'
+        );
+      }
+    );
   }
 
   /**
@@ -215,7 +253,17 @@
   // Set up event listeners
   window.addEventListener('message', handleInspectorResponse);
   window.addEventListener('message', handleInspectorEvent);
+  window.addEventListener('message', handleRunnerCommand);
   chrome.runtime.onMessage.addListener(handleExtensionMessage);
+
+  // Store cleanup function for extension reinstall handling
+  window.__qontinuiUIBridgeBridgeCleanup = function() {
+    window.removeEventListener('message', handleInspectorResponse);
+    window.removeEventListener('message', handleInspectorEvent);
+    window.removeEventListener('message', handleRunnerCommand);
+    chrome.runtime.onMessage.removeListener(handleExtensionMessage);
+    console.log('[Qontinui UI Bridge] Old bridge listeners cleaned up for reinstall');
+  };
 
   // Expose bridge API for debugging (only in isolated world, not accessible from page)
   window.__qontinuiUIBridgeBridge = {

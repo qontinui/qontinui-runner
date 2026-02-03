@@ -481,7 +481,15 @@ async function executeExplorationCommand(action, params) {
     }
 
     case "capturePageScreenshot": {
-      // Capture visible tab screenshot for thumbnail generation
+      // Capture visible tab screenshot for thumbnail generation.
+      // Optionally scrolls an element into view before capturing.
+      //
+      // Parameters:
+      //   - scrollToElement: If true, scroll the element into view before capturing
+      //   - elementBounds: { x, y, width, height } - Bounds of the element to scroll into view
+      //   - viewportHeight: Current viewport height (used to determine if scroll is needed)
+      //   - restoreScroll: If true (default), restore original scroll position after capture
+      //
       const targetTab = await getTargetTab();
       if (!targetTab || !targetTab.id) {
         throw new Error("No target tab available for screenshot capture");
@@ -493,23 +501,366 @@ async function executeExplorationCommand(action, params) {
         // Small delay to ensure window is focused
         await new Promise(r => setTimeout(r, 50));
 
+        // If scroll-based capture is requested, scroll element into view
+        const scrollToElement = params?.scrollToElement === true;
+        const elementBounds = params?.elementBounds;
+        const restoreScroll = params?.restoreScroll !== false; // Default to true
+
+        let scrollInfo = null;
+
+        if (scrollToElement && elementBounds) {
+          // Execute scroll in content script
+          try {
+            const scrollResults = await chrome.scripting.executeScript({
+              target: { tabId: targetTab.id },
+              func: (bounds, _shouldRestore) => {
+                // Save current scroll position
+                const originalScrollX = window.scrollX;
+                const originalScrollY = window.scrollY;
+                const viewportHeight = window.innerHeight;
+                const viewportWidth = window.innerWidth;
+
+                // Calculate if element is outside viewport
+                const elementTop = bounds.y;
+                const elementBottom = bounds.y + bounds.height;
+                const elementLeft = bounds.x;
+                const elementRight = bounds.x + bounds.width;
+
+                const isAboveViewport = elementBottom < 0;
+                const isBelowViewport = elementTop > viewportHeight;
+                const isLeftOfViewport = elementRight < 0;
+                const isRightOfViewport = elementLeft > viewportWidth;
+
+                const needsScroll = isAboveViewport || isBelowViewport || isLeftOfViewport || isRightOfViewport;
+
+                if (needsScroll) {
+                  // Calculate scroll position to center the element in viewport
+                  const targetScrollY = Math.max(0, originalScrollY + elementTop - (viewportHeight / 2) + (bounds.height / 2));
+                  const targetScrollX = Math.max(0, originalScrollX + elementLeft - (viewportWidth / 2) + (bounds.width / 2));
+
+                  window.scrollTo({
+                    left: targetScrollX,
+                    top: targetScrollY,
+                    behavior: 'instant'
+                  });
+
+                  // Calculate new element position after scroll
+                  const scrollDeltaX = window.scrollX - originalScrollX;
+                  const scrollDeltaY = window.scrollY - originalScrollY;
+
+                  return {
+                    scrolled: true,
+                    originalScrollX,
+                    originalScrollY,
+                    newScrollX: window.scrollX,
+                    newScrollY: window.scrollY,
+                    scrollDeltaX,
+                    scrollDeltaY,
+                    // New bounds relative to the new scroll position
+                    newBounds: {
+                      x: bounds.x - scrollDeltaX,
+                      y: bounds.y - scrollDeltaY,
+                      width: bounds.width,
+                      height: bounds.height
+                    },
+                    viewportWidth,
+                    viewportHeight
+                  };
+                }
+
+                return {
+                  scrolled: false,
+                  originalScrollX,
+                  originalScrollY,
+                  viewportWidth,
+                  viewportHeight
+                };
+              },
+              args: [elementBounds, restoreScroll]
+            });
+
+            if (scrollResults && scrollResults[0]?.result) {
+              scrollInfo = scrollResults[0].result;
+
+              if (scrollInfo.scrolled) {
+                // Wait for scroll to complete and page to render
+                await new Promise(r => setTimeout(r, 100));
+              }
+            }
+          } catch (scrollError) {
+            console.warn("[Qontinui] Scroll failed, capturing anyway:", scrollError.message);
+          }
+        }
+
+        // Capture the screenshot
         const dataUrl = await chrome.tabs.captureVisibleTab(targetTab.windowId, { format: "png" });
         // Extract base64 from data URL (remove "data:image/png;base64," prefix)
         const base64 = dataUrl.split(",")[1];
+
+        // Restore scroll position if we scrolled and restoreScroll is true
+        if (scrollInfo?.scrolled && restoreScroll) {
+          try {
+            await chrome.scripting.executeScript({
+              target: { tabId: targetTab.id },
+              func: (originalX, originalY) => {
+                window.scrollTo({
+                  left: originalX,
+                  top: originalY,
+                  behavior: 'instant'
+                });
+              },
+              args: [scrollInfo.originalScrollX, scrollInfo.originalScrollY]
+            });
+          } catch (restoreError) {
+            console.warn("[Qontinui] Failed to restore scroll position:", restoreError.message);
+          }
+        }
 
         return {
           screenshot: base64,
           capturedAt: Date.now(),
           viewport: {
-            width: targetTab.width || 0,
-            height: targetTab.height || 0
+            width: scrollInfo?.viewportWidth || targetTab.width || 0,
+            height: scrollInfo?.viewportHeight || targetTab.height || 0
           },
           tabId: targetTab.id,
-          url: targetTab.url
+          url: targetTab.url,
+          // Include scroll info so caller knows if/how the element was scrolled
+          scrollInfo: scrollInfo ? {
+            scrolled: scrollInfo.scrolled,
+            newBounds: scrollInfo.newBounds || null
+          } : null
         };
       } catch (e) {
         console.error("[Qontinui] Screenshot capture failed:", e.message);
         throw new Error(`Screenshot capture failed: ${e.message}`);
+      }
+    }
+
+    case "captureFullPageScreenshot": {
+      // Capture the entire page by scrolling and capturing viewport-sized tiles.
+      // Returns an array of tile screenshots with their positions for client-side stitching.
+      //
+      // Parameters:
+      //   - tileDelay: Delay in ms between tile captures (default: 150)
+      //   - hideFixedElements: If true, hide fixed/sticky elements during capture (default: false)
+      //   - progressRequestId: Optional request ID for progress updates via WebSocket
+      //
+      // Returns:
+      //   - tiles: Array of { screenshot, x, y, width, height } tile data
+      //   - totalWidth: Full page width
+      //   - totalHeight: Full page height
+      //   - viewportWidth: Viewport width used for tiles
+      //   - viewportHeight: Viewport height used for tiles
+      //
+      const targetTab = await getTargetTab();
+      if (!targetTab || !targetTab.id) {
+        throw new Error("No target tab available for full page screenshot");
+      }
+
+      const tileDelay = params?.tileDelay ?? 150;
+      const hideFixedElements = params?.hideFixedElements ?? false;
+      const progressRequestId = params?.progressRequestId ?? null;
+
+      // Helper to send progress updates via WebSocket
+      const sendProgress = (currentTile, totalTiles, phase) => {
+        if (progressRequestId && wsConnected) {
+          sendWebSocketMessage({
+            type: "FULL_PAGE_CAPTURE_PROGRESS",
+            requestId: progressRequestId,
+            progress: {
+              currentTile,
+              totalTiles,
+              phase
+            }
+          });
+        }
+      };
+
+      try {
+        // Focus the tab's window
+        await chrome.windows.update(targetTab.windowId, { focused: true });
+        await new Promise(r => setTimeout(r, 50));
+
+        // Get page dimensions and initial scroll position
+        const dimensionResults = await chrome.scripting.executeScript({
+          target: { tabId: targetTab.id },
+          func: (shouldHideFixed) => {
+            // Get full page dimensions
+            const totalWidth = Math.max(
+              document.body.scrollWidth,
+              document.documentElement.scrollWidth,
+              document.body.offsetWidth,
+              document.documentElement.offsetWidth,
+              document.body.clientWidth,
+              document.documentElement.clientWidth
+            );
+            const totalHeight = Math.max(
+              document.body.scrollHeight,
+              document.documentElement.scrollHeight,
+              document.body.offsetHeight,
+              document.documentElement.offsetHeight,
+              document.body.clientHeight,
+              document.documentElement.clientHeight
+            );
+
+            const viewportWidth = window.innerWidth;
+            const viewportHeight = window.innerHeight;
+
+            // Save original scroll position
+            const originalScrollX = window.scrollX;
+            const originalScrollY = window.scrollY;
+
+            // Optionally hide fixed/sticky elements
+            let hiddenElements = [];
+            if (shouldHideFixed) {
+              const allElements = document.querySelectorAll('*');
+              allElements.forEach(el => {
+                const style = window.getComputedStyle(el);
+                if (style.position === 'fixed' || style.position === 'sticky') {
+                  hiddenElements.push({
+                    element: el,
+                    originalVisibility: el.style.visibility
+                  });
+                  el.style.visibility = 'hidden';
+                }
+              });
+            }
+
+            return {
+              totalWidth,
+              totalHeight,
+              viewportWidth,
+              viewportHeight,
+              originalScrollX,
+              originalScrollY,
+              hiddenCount: hiddenElements.length
+            };
+          },
+          args: [hideFixedElements]
+        });
+
+        if (!dimensionResults || !dimensionResults[0]?.result) {
+          throw new Error("Failed to get page dimensions");
+        }
+
+        const {
+          totalWidth,
+          totalHeight,
+          viewportWidth,
+          viewportHeight,
+          originalScrollX,
+          originalScrollY
+        } = dimensionResults[0].result;
+
+        console.log(`[Qontinui] Full page capture: ${totalWidth}x${totalHeight}, viewport: ${viewportWidth}x${viewportHeight}`);
+
+        // Calculate tile grid
+        const numCols = Math.ceil(totalWidth / viewportWidth);
+        const numRows = Math.ceil(totalHeight / viewportHeight);
+        const totalTiles = numCols * numRows;
+
+        console.log(`[Qontinui] Capturing ${totalTiles} tiles (${numCols}x${numRows})`);
+
+        // Send initial progress
+        sendProgress(0, totalTiles, 'capturing');
+
+        const tiles = [];
+
+        // Capture each tile
+        for (let row = 0; row < numRows; row++) {
+          for (let col = 0; col < numCols; col++) {
+            const scrollX = col * viewportWidth;
+            const scrollY = row * viewportHeight;
+
+            // Scroll to tile position
+            await chrome.scripting.executeScript({
+              target: { tabId: targetTab.id },
+              func: (x, y) => {
+                window.scrollTo({
+                  left: x,
+                  top: y,
+                  behavior: 'instant'
+                });
+              },
+              args: [scrollX, scrollY]
+            });
+
+            // Wait for scroll to complete and content to render
+            await new Promise(r => setTimeout(r, tileDelay));
+
+            // Get actual scroll position (may differ if we hit page boundaries)
+            const scrollPosResults = await chrome.scripting.executeScript({
+              target: { tabId: targetTab.id },
+              func: () => ({
+                actualScrollX: window.scrollX,
+                actualScrollY: window.scrollY
+              })
+            });
+
+            const actualScrollX = scrollPosResults?.[0]?.result?.actualScrollX ?? scrollX;
+            const actualScrollY = scrollPosResults?.[0]?.result?.actualScrollY ?? scrollY;
+
+            // Capture the visible viewport
+            const dataUrl = await chrome.tabs.captureVisibleTab(targetTab.windowId, { format: "png" });
+            const base64 = dataUrl.split(",")[1];
+
+            // Calculate tile dimensions (last tiles may be smaller)
+            const tileWidth = Math.min(viewportWidth, totalWidth - actualScrollX);
+            const tileHeight = Math.min(viewportHeight, totalHeight - actualScrollY);
+
+            tiles.push({
+              screenshot: base64,
+              x: actualScrollX,
+              y: actualScrollY,
+              width: tileWidth,
+              height: tileHeight,
+              row,
+              col
+            });
+
+            console.log(`[Qontinui] Captured tile ${tiles.length}/${totalTiles} at (${actualScrollX}, ${actualScrollY})`);
+
+            // Send progress update
+            sendProgress(tiles.length, totalTiles, 'capturing');
+          }
+        }
+
+        // Send stitching phase progress
+        sendProgress(totalTiles, totalTiles, 'stitching');
+
+        // Restore original scroll position and show fixed elements
+        await chrome.scripting.executeScript({
+          target: { tabId: targetTab.id },
+          func: (origX, origY, _shouldRestoreFixed) => {
+            window.scrollTo({
+              left: origX,
+              top: origY,
+              behavior: 'instant'
+            });
+
+            // Note: We can't restore the original elements since we don't have references
+            // In a future version, we could use a unique identifier system
+          },
+          args: [originalScrollX, originalScrollY, hideFixedElements]
+        });
+
+        // Send completion progress
+        sendProgress(totalTiles, totalTiles, 'complete');
+
+        return {
+          tiles,
+          totalWidth,
+          totalHeight,
+          viewportWidth,
+          viewportHeight,
+          capturedAt: Date.now(),
+          tabId: targetTab.id,
+          url: targetTab.url
+        };
+      } catch (e) {
+        console.error("[Qontinui] Full page screenshot capture failed:", e.message);
+        throw new Error(`Full page screenshot capture failed: ${e.message}`);
       }
     }
 

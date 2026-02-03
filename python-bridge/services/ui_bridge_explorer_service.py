@@ -9,8 +9,9 @@ import asyncio
 import hashlib
 import logging
 import threading
+import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,15 @@ except ImportError as e:
 
 
 @dataclass
+class CurrentElementInfo:
+    """Information about the element currently being explored."""
+
+    id: str
+    label: str
+    action: str
+
+
+@dataclass
 class UIBridgeExplorationJob:
     """Represents a running or completed UI Bridge exploration job."""
 
@@ -50,6 +60,14 @@ class UIBridgeExplorationJob:
     elements_discovered: int = 0
     elements_explored: int = 0
     current_element: str | None = None
+    # Enhanced progress tracking
+    phase: str = "connecting"  # connecting, discovering, exploring, analyzing, complete, stopped
+    current_depth: int = 0
+    max_depth: int = 2
+    states_found: int = 0
+    errors_count: int = 0
+    start_time: float = field(default_factory=time.time)
+    current_element_info: CurrentElementInfo | None = None
 
 
 class UIBridgeExplorerService:
@@ -166,11 +184,122 @@ class UIBridgeExplorerService:
             "job_id": job_id,
         }
 
+    def _parse_phase_from_message(self, message: str) -> tuple[str, int]:
+        """Parse the exploration phase and depth from a progress message.
+
+        Returns:
+            Tuple of (phase, depth)
+        """
+        message_lower = message.lower()
+
+        if (
+            "connecting" in message_lower
+            or "initializing" in message_lower
+            or "starting capture session" in message_lower
+        ):
+            return "connecting", 0
+        elif "capturing initial state" in message_lower or (
+            "found" in message_lower and "starting exploration" in message_lower
+        ):
+            return "discovering", 0
+        elif "exploring depth" in message_lower:
+            # Extract depth from message like "Exploring depth 2: 15 elements to check"
+            import re
+
+            match = re.search(r"depth\s*(\d+)", message_lower)
+            if match:
+                return "exploring", int(match.group(1))
+            return "exploring", 0
+        elif "exploring:" in message_lower:
+            return "exploring", 0
+        elif "exporting capture session" in message_lower:
+            return "analyzing", 0
+        elif "complete" in message_lower or "finished" in message_lower:
+            return "complete", 0
+        elif "stopping" in message_lower:
+            return "stopped", 0
+
+        return "exploring", 0
+
+    def _parse_current_element_info(
+        self, message: str, element_id: str | None
+    ) -> CurrentElementInfo | None:
+        """Parse current element info from progress message.
+
+        Returns:
+            CurrentElementInfo or None if not exploring an element
+        """
+        if not element_id:
+            return None
+
+        # Try to extract element name and action from message
+        # Message format is usually "Exploring: <element_name>..."
+        label = element_id
+        action = "click"
+
+        if message.startswith("Exploring:"):
+            # Extract label from "Exploring: Button Label..."
+            label_part = message[len("Exploring:") :].strip()
+            if label_part.endswith("..."):
+                label_part = label_part[:-3]
+            if label_part:
+                label = label_part
+
+        return CurrentElementInfo(id=element_id, label=label, action=action)
+
+    def _emit_detailed_progress(self, job: UIBridgeExplorationJob) -> None:
+        """Emit a detailed progress event with all tracking information."""
+        max_elements = job.config.get("max_total_elements", 100)
+        elapsed_ms = int((time.time() - job.start_time) * 1000)
+
+        # Estimate remaining time based on current progress
+        estimated_remaining_ms = -1
+        if job.elements_explored > 0 and max_elements > 0:
+            progress_ratio = job.elements_explored / max_elements
+            if progress_ratio > 0 and progress_ratio < 1:
+                estimated_total_ms = elapsed_ms / progress_ratio
+                estimated_remaining_ms = int(estimated_total_ms - elapsed_ms)
+
+        # Calculate remaining elements
+        elements_remaining = max(0, max_elements - job.elements_explored)
+
+        self._emit_event(
+            "ui_bridge_exploration_progress",
+            {
+                "job_id": job.job_id,
+                "phase": job.phase,
+                "currentDepth": job.current_depth,
+                "maxDepth": job.max_depth,
+                "elementsDiscovered": job.elements_discovered,
+                "elementsExplored": job.elements_explored,
+                "elementsRemaining": elements_remaining,
+                "currentElement": (
+                    {
+                        "id": job.current_element_info.id,
+                        "label": job.current_element_info.label,
+                        "action": job.current_element_info.action,
+                    }
+                    if job.current_element_info
+                    else None
+                ),
+                "statesFound": job.states_found,
+                "errorsCount": job.errors_count,
+                "elapsedTimeMs": elapsed_ms,
+                "estimatedRemainingMs": estimated_remaining_ms,
+                "message": job.progress_message,
+                # Legacy fields for backward compatibility
+                "percent": job.progress_percent,
+                "current_element": job.current_element,
+            },
+        )
+
     async def _run_exploration(self, job: UIBridgeExplorationJob) -> None:
         """Run the UI Bridge exploration."""
         job.status = "running"
         job.progress_message = "Initializing..."
         job.progress_percent = 0
+        job.phase = "connecting"
+        job.start_time = time.time()
 
         self._emit_event(
             "ui_bridge_exploration_started",
@@ -180,6 +309,9 @@ class UIBridgeExplorerService:
                 "target_type": job.target_type,
             },
         )
+
+        # Emit initial progress
+        self._emit_detailed_progress(job)
 
         try:
             config = job.config
@@ -201,6 +333,8 @@ class UIBridgeExplorerService:
                 record_render_logs=True,
             )
 
+            job.max_depth = exploration_config.max_depth
+
             # Create explorer with progress callback
             from qontinui.discovery.ui_bridge_explorer import UIBridgeExplorer
 
@@ -212,6 +346,9 @@ class UIBridgeExplorerService:
             ) -> bool:
                 """Progress callback - returns False to stop exploration."""
                 if self._stop_requested:
+                    job.phase = "stopped"
+                    job.progress_message = "Stopping..."
+                    self._emit_detailed_progress(job)
                     return False
 
                 job.progress_message = message
@@ -219,22 +356,23 @@ class UIBridgeExplorerService:
                 job.elements_explored = elements_explored
                 job.current_element = current_element
 
+                # Parse phase and depth from message
+                phase, depth = self._parse_phase_from_message(message)
+                job.phase = phase
+                job.current_depth = depth
+
+                # Parse current element info
+                job.current_element_info = self._parse_current_element_info(
+                    message, current_element
+                )
+
                 # Calculate progress percentage
                 max_elements = exploration_config.max_total_elements
                 if max_elements > 0:
                     job.progress_percent = min(int((elements_explored / max_elements) * 100), 99)
 
-                self._emit_event(
-                    "ui_bridge_exploration_progress",
-                    {
-                        "job_id": job.job_id,
-                        "message": message,
-                        "percent": job.progress_percent,
-                        "elements_discovered": elements_discovered,
-                        "elements_explored": elements_explored,
-                        "current_element": current_element,
-                    },
-                )
+                # Emit detailed progress
+                self._emit_detailed_progress(job)
                 return True
 
             explorer = UIBridgeExplorer(
@@ -243,7 +381,9 @@ class UIBridgeExplorerService:
             )
 
             # Connect to target
+            job.phase = "connecting"
             job.progress_message = "Connecting..."
+            self._emit_detailed_progress(job)
             await explorer.connect()
 
             # Run exploration
@@ -255,10 +395,18 @@ class UIBridgeExplorerService:
             # Store result
             job.result = result
             job.status = "completed"
+            job.phase = "complete"
             job.progress_message = "Complete"
             job.progress_percent = 100
             job.elements_discovered = result.elements_discovered
             job.elements_explored = result.elements_explored
+            job.errors_count = len(result.errors)
+            job.states_found = (
+                len(result.state_discovery_result.states) if result.state_discovery_result else 0
+            )
+
+            # Emit final progress
+            self._emit_detailed_progress(job)
 
             self._emit_event(
                 "ui_bridge_exploration_completed",
@@ -267,11 +415,7 @@ class UIBridgeExplorerService:
                     "elements_discovered": result.elements_discovered,
                     "elements_explored": result.elements_explored,
                     "render_logs_count": len(result.render_logs),
-                    "states_found": (
-                        len(result.state_discovery_result.states)
-                        if result.state_discovery_result
-                        else 0
-                    ),
+                    "states_found": job.states_found,
                 },
             )
 
@@ -285,6 +429,10 @@ class UIBridgeExplorerService:
             job.status = "failed"
             job.error = str(e)
             job.progress_message = f"Failed: {e}"
+            job.errors_count += 1
+
+            # Emit final progress with error
+            self._emit_detailed_progress(job)
 
             self._emit_event(
                 "ui_bridge_exploration_failed",
