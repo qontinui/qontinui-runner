@@ -104,3 +104,6 @@ test.spec.ts
 # Debug/test screenshots
 web-extraction*.png
 *.screenshot.png
+
+# SQLite databases
+*.db
