@@ -105,7 +105,10 @@ export function TestsTab({ taskRunId, loopResult }: TestsTabProps) {
     playwrightResults?.results?.map((r, i) => ({
       id: r.id || `playwright-${i}`,
       name: r.test_name || r.spec_file || `Playwright Test ${i + 1}`,
-      status: (r.status === "passed" ? "passed" : r.status === "skipped" ? "skipped" : "failed") as "passed" | "failed" | "skipped",
+      status: (r.status === "passed" ? "passed" : r.status === "skipped" ? "skipped" : "failed") as
+        | "passed"
+        | "failed"
+        | "skipped",
       duration_ms: r.duration_ms ?? undefined,
       assertions_passed: r.assertions_passed,
       assertions_total: r.assertions_passed + r.assertions_failed,
@@ -121,36 +124,41 @@ export function TestsTab({ taskRunId, loopResult }: TestsTabProps) {
   // Convert verification phase results to iteration groups
   const iterationResults: IterationResults[] =
     verificationResults?.results?.map((phase) => {
-      const tests: TestResult[] = phase.step_results?.map((step, i) => {
-        // Build console output from verification_details
-        // Priority: console_output > stdout+stderr combination
-        let consoleOutput: string | undefined;
-        const vd = step.verification_details;
-        if (vd?.console_output) {
-          consoleOutput = vd.console_output;
-        } else if (vd?.stdout || vd?.stderr) {
-          const parts: string[] = [];
-          if (vd.stdout) parts.push(vd.stdout);
-          if (vd.stderr) parts.push(`[stderr]\n${vd.stderr}`);
-          consoleOutput = parts.join("\n\n");
-        }
+      const tests: TestResult[] =
+        phase.step_results?.map((step, i) => {
+          // Build console output from verification_details
+          // Priority: console_output > stdout+stderr combination
+          let consoleOutput: string | undefined;
+          const vd = step.verification_details;
+          if (vd?.console_output) {
+            consoleOutput = vd.console_output;
+          } else if (vd?.stdout || vd?.stderr) {
+            const parts: string[] = [];
+            if (vd.stdout) parts.push(vd.stdout);
+            if (vd.stderr) parts.push(`[stderr]\n${vd.stderr}`);
+            consoleOutput = parts.join("\n\n");
+          }
 
-        return {
-          id: `verification-${phase.iteration}-${i}`,
-          name: step.step_name || `Verification Step ${i + 1}`,
-          status: step.success ? "passed" : step.error?.includes("Skipped") ? "skipped" : "failed",
-          duration_ms: step.duration_ms,
-          error_message: step.error ?? undefined,
-          console_output: consoleOutput,
-          page_snapshot: vd?.page_snapshot ?? undefined,
-          assertions_passed: vd?.assertions_passed ?? undefined,
-          assertions_total: vd?.assertions_total ?? undefined,
-          source: "verification" as const,
-          step_type: step.step_type,
-          test_type: step.config?.test_type ?? undefined,
-          check_results: vd?.check_results ?? undefined,
-        };
-      }) || [];
+          return {
+            id: `verification-${phase.iteration}-${i}`,
+            name: step.step_name || `Verification Step ${i + 1}`,
+            status: step.success
+              ? "passed"
+              : step.error?.includes("Skipped")
+                ? "skipped"
+                : "failed",
+            duration_ms: step.duration_ms,
+            error_message: step.error ?? undefined,
+            console_output: consoleOutput,
+            page_snapshot: vd?.page_snapshot ?? undefined,
+            assertions_passed: vd?.assertions_passed ?? undefined,
+            assertions_total: vd?.assertions_total ?? undefined,
+            source: "verification" as const,
+            step_type: step.step_type,
+            test_type: step.config?.test_type ?? undefined,
+            check_results: vd?.check_results ?? undefined,
+          };
+        }) || [];
 
       return {
         iteration: phase.iteration,
@@ -216,9 +224,7 @@ export function TestsTab({ taskRunId, loopResult }: TestsTabProps) {
               </span>
             </div>
           </div>
-          {loopResult.summary && (
-            <p className="text-sm opacity-90">{loopResult.summary}</p>
-          )}
+          {loopResult.summary && <p className="text-sm opacity-90">{loopResult.summary}</p>}
           {/* Per-iteration quick summary */}
           {loopResult.iteration_results.length > 0 && (
             <div className="mt-3 flex flex-wrap gap-2">
@@ -233,7 +239,8 @@ export function TestsTab({ taskRunId, loopResult }: TestsTabProps) {
                         : "bg-amber-500/20 text-amber-400"
                   }`}
                 >
-                  #{iter.iteration}: {iter.passed_checks}/{iter.passed_checks + iter.failed_checks} checks
+                  #{iter.iteration}: {iter.passed_checks}/{iter.passed_checks + iter.failed_checks}{" "}
+                  checks
                   {iter.agentic_phase_ran && (
                     <span className="ml-1">
                       {iter.agentic_phase_success ? "(AI ok)" : "(AI ran)"}
@@ -267,7 +274,8 @@ export function TestsTab({ taskRunId, loopResult }: TestsTabProps) {
         <div className="space-y-3">
           <h4 className="text-sm font-medium text-muted-foreground flex items-center gap-2">
             <Repeat className="w-4 h-4" />
-            Verification Results ({iterationResults.length} iteration{iterationResults.length !== 1 ? "s" : ""})
+            Verification Results ({iterationResults.length} iteration
+            {iterationResults.length !== 1 ? "s" : ""})
           </h4>
           {iterationResults.map((iteration) => {
             const isExpanded = expandedIterations.has(iteration.iteration);
@@ -286,9 +294,7 @@ export function TestsTab({ taskRunId, loopResult }: TestsTabProps) {
                     ) : (
                       <XCircle className="w-5 h-5 text-red-500" />
                     )}
-                    <span className="font-medium">
-                      Iteration {iteration.iteration}
-                    </span>
+                    <span className="font-medium">Iteration {iteration.iteration}</span>
                     <span className="text-xs text-muted-foreground">
                       ({iterationPassed}/{iteration.tests.length} passed)
                     </span>
@@ -351,10 +357,7 @@ export function TestsTab({ taskRunId, loopResult }: TestsTabProps) {
           <p data-ui-id="recap-test-name" className="text-muted-foreground">
             No test results available for this run.
           </p>
-          <p
-            data-ui-id="recap-test-status"
-            className="text-sm text-muted-foreground mt-1"
-          >
+          <p data-ui-id="recap-test-status" className="text-sm text-muted-foreground mt-1">
             Tests will appear here when a workflow includes verification or test execution steps.
           </p>
           {/* Placeholder elements for UI test compatibility - invisible but discoverable */}
@@ -415,10 +418,7 @@ function TestResultCard({ test, isExpanded, onToggle }: TestResultCardProps) {
 
           {/* Assertions */}
           {test.assertions_total !== undefined && test.assertions_total > 0 && (
-            <span
-              data-ui-id="recap-test-assertions"
-              className="text-xs text-muted-foreground"
-            >
+            <span data-ui-id="recap-test-assertions" className="text-xs text-muted-foreground">
               ({test.assertions_passed || 0}/{test.assertions_total} assertions)
             </span>
           )}
@@ -451,7 +451,8 @@ function TestResultCard({ test, isExpanded, onToggle }: TestResultCardProps) {
             <div data-ui-id="recap-test-check-results">
               <h4 className="text-sm font-medium mb-3 flex items-center gap-2">
                 <FlaskConical className="w-4 h-4" />
-                Individual Checks ({test.check_results.filter(c => c.status === "passed").length}/{test.check_results.length} passed)
+                Individual Checks ({test.check_results.filter((c) => c.status === "passed").length}/
+                {test.check_results.length} passed)
               </h4>
               <div className="space-y-2">
                 {test.check_results.map((check, idx) => (
@@ -495,7 +496,9 @@ function TestResultCard({ test, isExpanded, onToggle }: TestResultCardProps) {
                 Error Details
               </h4>
               {test.error_message && (
-                <pre className="text-sm text-red-400 mb-2 whitespace-pre-wrap">{test.error_message}</pre>
+                <pre className="text-sm text-red-400 mb-2 whitespace-pre-wrap">
+                  {test.error_message}
+                </pre>
               )}
               {test.stack_trace && (
                 <pre className="text-xs bg-red-500/10 p-3 rounded overflow-x-auto whitespace-pre-wrap text-red-300 max-h-40 overflow-y-auto">
@@ -551,7 +554,9 @@ function CheckResultCard({ check }: CheckResultCardProps) {
   const hasDetails = hasIssues || check.error_message || check.output;
 
   return (
-    <div className={`rounded border ${isPassed ? "border-green-500/30 bg-green-500/5" : isSkipped ? "border-yellow-500/30 bg-yellow-500/5" : "border-red-500/30 bg-red-500/5"}`}>
+    <div
+      className={`rounded border ${isPassed ? "border-green-500/30 bg-green-500/5" : isSkipped ? "border-yellow-500/30 bg-yellow-500/5" : "border-red-500/30 bg-red-500/5"}`}
+    >
       <button
         onClick={() => hasDetails && setIsExpanded(!isExpanded)}
         className={`w-full px-3 py-2 flex items-center justify-between text-left ${hasDetails ? "hover:bg-muted/30 cursor-pointer" : "cursor-default"}`}
@@ -572,7 +577,9 @@ function CheckResultCard({ check }: CheckResultCardProps) {
 
           {/* Issues count badge */}
           {check.issues_found > 0 && (
-            <span className={`text-xs px-1.5 py-0.5 rounded ${isPassed ? "bg-green-500/20 text-green-400" : "bg-red-500/20 text-red-400"}`}>
+            <span
+              className={`text-xs px-1.5 py-0.5 rounded ${isPassed ? "bg-green-500/20 text-green-400" : "bg-red-500/20 text-red-400"}`}
+            >
               {check.issues_found} issue{check.issues_found !== 1 ? "s" : ""}
               {check.issues_fixed > 0 && ` (${check.issues_fixed} fixed)`}
             </span>
@@ -588,17 +595,18 @@ function CheckResultCard({ check }: CheckResultCardProps) {
 
           {/* Files checked */}
           {check.files_checked > 0 && (
-            <span>{check.files_checked} file{check.files_checked !== 1 ? "s" : ""}</span>
+            <span>
+              {check.files_checked} file{check.files_checked !== 1 ? "s" : ""}
+            </span>
           )}
 
           {/* Expand indicator */}
-          {hasDetails && (
-            isExpanded ? (
+          {hasDetails &&
+            (isExpanded ? (
               <ChevronDown className="w-4 h-4" />
             ) : (
               <ChevronRight className="w-4 h-4" />
-            )
-          )}
+            ))}
         </div>
       </button>
 
@@ -623,7 +631,8 @@ function CheckResultCard({ check }: CheckResultCardProps) {
             <div>
               <h5 className="text-xs font-medium text-muted-foreground mb-2 flex items-center gap-1">
                 <FileWarning className="w-3 h-3" />
-                Issues ({check.issues.length}{check.issues.length >= 50 ? "+" : ""})
+                Issues ({check.issues.length}
+                {check.issues.length >= 50 ? "+" : ""})
               </h5>
               <div className="space-y-1 max-h-60 overflow-y-auto">
                 {check.issues.map((issue, idx) => (
@@ -659,11 +668,12 @@ interface IssueRowProps {
 }
 
 function IssueRow({ issue }: IssueRowProps) {
-  const severityColor = {
-    error: "text-red-400 bg-red-500/10 border-red-500/30",
-    warning: "text-yellow-400 bg-yellow-500/10 border-yellow-500/30",
-    info: "text-blue-400 bg-blue-500/10 border-blue-500/30",
-  }[issue.severity] || "text-muted-foreground bg-muted/30 border-muted";
+  const severityColor =
+    {
+      error: "text-red-400 bg-red-500/10 border-red-500/30",
+      warning: "text-yellow-400 bg-yellow-500/10 border-yellow-500/30",
+      info: "text-blue-400 bg-blue-500/10 border-blue-500/30",
+    }[issue.severity] || "text-muted-foreground bg-muted/30 border-muted";
 
   return (
     <div className={`text-xs p-2 rounded border ${severityColor}`}>

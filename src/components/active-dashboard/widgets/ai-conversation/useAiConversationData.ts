@@ -89,7 +89,7 @@ export function useAiConversationData(): AiConversationData {
   const [allEntries, setAllEntries] = useState<AiOutputEntry[]>([]);
   // Initialize from global tracker to preserve state across remounts
   const [sessionStartTime, setSessionStartTime] = useState<number | null>(
-    () => sessionTracker.sessionStartTime
+    () => sessionTracker.sessionStartTime,
   );
 
   // Track when a new task starts (to filter out stale data)

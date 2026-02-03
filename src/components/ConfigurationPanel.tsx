@@ -72,7 +72,10 @@ export function ConfigurationPanel({
           </button>
 
           {config && (
-            <div className={`p-3 rounded-lg ${getAccentColors("blue").bg}`} data-ui-id="config-info">
+            <div
+              className={`p-3 rounded-lg ${getAccentColors("blue").bg}`}
+              data-ui-id="config-info"
+            >
               <p className={`font-medium text-sm ${getAccentColors("blue").text} mb-1`}>
                 {config.name}
               </p>

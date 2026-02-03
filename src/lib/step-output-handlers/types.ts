@@ -77,11 +77,7 @@ export interface StepOutputHandler<T extends StepOutput = StepOutput> {
    * @param metadata - Additional metadata (step_id, step_name, etc.)
    * @returns Typed step output
    */
-  parseOutput(
-    rawOutput: unknown,
-    stepConfig?: unknown,
-    metadata?: StepOutputMetadata,
-  ): T;
+  parseOutput(rawOutput: unknown, stepConfig?: unknown, metadata?: StepOutputMetadata): T;
 
   /**
    * Generate a human-readable summary for AI prompts.
@@ -141,4 +137,5 @@ export interface StepOutputMetadata {
 /**
  * Type for handler constructor/factory function.
  */
-export type StepOutputHandlerFactory<T extends StepOutput = StepOutput> = () => StepOutputHandler<T>;
+export type StepOutputHandlerFactory<T extends StepOutput = StepOutput> =
+  () => StepOutputHandler<T>;

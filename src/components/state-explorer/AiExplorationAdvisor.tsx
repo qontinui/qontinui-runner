@@ -92,14 +92,14 @@ export function AiExplorationAdvisor({
       }>("suggest_exploration_strategy_with_ai", {
         input: {
           user_goal: goal,
-          available_states: availableStates.map(s => ({
+          available_states: availableStates.map((s) => ({
             id: s.id,
             name: s.name,
             description: s.description,
             is_initial: s.is_initial,
             is_final: s.is_final,
           })),
-          available_transitions: availableTransitions.map(t => ({
+          available_transitions: availableTransitions.map((t) => ({
             id: t.id,
             name: t.name,
             from_state: t.from_state,
@@ -160,7 +160,9 @@ export function AiExplorationAdvisor({
             ) : (
               <div className="flex items-center gap-2 text-xs text-amber-400">
                 <AlertTriangle className="w-3.5 h-3.5" />
-                <span>No configuration loaded. Load a config file first for targeted suggestions.</span>
+                <span>
+                  No configuration loaded. Load a config file first for targeted suggestions.
+                </span>
               </div>
             )}
           </div>
@@ -215,7 +217,9 @@ export function AiExplorationAdvisor({
               <div className="space-y-4">
                 {/* Strategy */}
                 <div>
-                  <label className="block text-xs text-neutral-400 mb-1">Recommended Strategy</label>
+                  <label className="block text-xs text-neutral-400 mb-1">
+                    Recommended Strategy
+                  </label>
                   <div className="p-3 bg-emerald-900/20 border border-emerald-700 rounded-lg">
                     <div className="flex items-center gap-2">
                       <Target className="w-4 h-4 text-emerald-400" />
@@ -245,7 +249,7 @@ export function AiExplorationAdvisor({
                     </label>
                     <div className="flex flex-wrap gap-1">
                       {suggestion.target_state_ids.map((stateId) => {
-                        const state = availableStates.find(s => s.id === stateId);
+                        const state = availableStates.find((s) => s.id === stateId);
                         return (
                           <span
                             key={stateId}
@@ -260,26 +264,29 @@ export function AiExplorationAdvisor({
                 )}
 
                 {/* Target transitions */}
-                {suggestion.strategy === "targeted" && suggestion.target_transition_ids.length > 0 && (
-                  <div>
-                    <label className="block text-xs text-neutral-400 mb-1">
-                      Target Transitions ({suggestion.target_transition_ids.length})
-                    </label>
-                    <div className="flex flex-wrap gap-1">
-                      {suggestion.target_transition_ids.map((transitionId) => {
-                        const transition = availableTransitions.find(t => t.id === transitionId);
-                        return (
-                          <span
-                            key={transitionId}
-                            className="px-2 py-1 text-xs bg-blue-900/30 text-blue-300 rounded"
-                          >
-                            {transition?.name || transitionId}
-                          </span>
-                        );
-                      })}
+                {suggestion.strategy === "targeted" &&
+                  suggestion.target_transition_ids.length > 0 && (
+                    <div>
+                      <label className="block text-xs text-neutral-400 mb-1">
+                        Target Transitions ({suggestion.target_transition_ids.length})
+                      </label>
+                      <div className="flex flex-wrap gap-1">
+                        {suggestion.target_transition_ids.map((transitionId) => {
+                          const transition = availableTransitions.find(
+                            (t) => t.id === transitionId,
+                          );
+                          return (
+                            <span
+                              key={transitionId}
+                              className="px-2 py-1 text-xs bg-blue-900/30 text-blue-300 rounded"
+                            >
+                              {transition?.name || transitionId}
+                            </span>
+                          );
+                        })}
+                      </div>
                     </div>
-                  </div>
-                )}
+                  )}
 
                 {/* Limits */}
                 <div className="grid grid-cols-2 gap-4">

@@ -280,7 +280,10 @@ export function ExecutionControlPanel({
 
         {/* Initial States Section */}
         {showInitialStates && (
-          <div className="rounded-lg bg-muted/30 overflow-hidden" data-ui-id="execution-initial-states">
+          <div
+            className="rounded-lg bg-muted/30 overflow-hidden"
+            data-ui-id="execution-initial-states"
+          >
             <button
               onClick={() => setInitialStatesExpanded(!initialStatesExpanded)}
               data-ui-id="execution-initial-states-toggle"

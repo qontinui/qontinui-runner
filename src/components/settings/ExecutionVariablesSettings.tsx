@@ -53,8 +53,9 @@ const AUTH_SOURCE_OPTIONS: { value: AuthSource; label: string; icon: React.React
 ];
 
 export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettingsProps) {
-  const [settings, setSettings] =
-    useState<ExecutionVariablesSettingsType>(DEFAULT_EXECUTION_VARIABLES);
+  const [settings, setSettings] = useState<ExecutionVariablesSettingsType>(
+    DEFAULT_EXECUTION_VARIABLES,
+  );
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
@@ -151,9 +152,12 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
 
   const testEnvVar = async (envVar: string) => {
     try {
-      const result = await invoke<TauriResult<{ env_var: string; exists: boolean }>>("test_env_var", {
-        envVar,
-      });
+      const result = await invoke<TauriResult<{ env_var: string; exists: boolean }>>(
+        "test_env_var",
+        {
+          envVar,
+        },
+      );
       if (result?.success && result.data) {
         setEnvVarStatus((prev) => ({ ...prev, [envVar]: result.data!.exists }));
       }
@@ -225,7 +229,10 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
       )}
 
       {/* Authentication Section */}
-      <div className="rounded-lg bg-card/50 overflow-hidden" data-ui-id="settings-executionvariables-auth-section">
+      <div
+        className="rounded-lg bg-card/50 overflow-hidden"
+        data-ui-id="settings-executionvariables-auth-section"
+      >
         <button
           onClick={() => setAuthExpanded(!authExpanded)}
           className="w-full p-4 flex items-center justify-between hover:bg-muted/30 transition-colors"
@@ -293,7 +300,9 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
                 <input
                   type="text"
                   value={settings.authHeaderName}
-                  onChange={(e) => setSettings((prev) => ({ ...prev, authHeaderName: e.target.value }))}
+                  onChange={(e) =>
+                    setSettings((prev) => ({ ...prev, authHeaderName: e.target.value }))
+                  }
                   placeholder="Authorization"
                   className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
                   data-ui-id="settings-executionvariables-auth-header-name-input"
@@ -313,7 +322,9 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
                   <input
                     type="password"
                     value={settings.authToken || ""}
-                    onChange={(e) => setSettings((prev) => ({ ...prev, authToken: e.target.value }))}
+                    onChange={(e) =>
+                      setSettings((prev) => ({ ...prev, authToken: e.target.value }))
+                    }
                     placeholder="Bearer eyJhbGciOiJIUzI1NiIs..."
                     className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 font-mono"
                     data-ui-id="settings-executionvariables-auth-token-input"
@@ -335,7 +346,9 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
                     <input
                       type="text"
                       value={settings.authEnvVar}
-                      onChange={(e) => setSettings((prev) => ({ ...prev, authEnvVar: e.target.value }))}
+                      onChange={(e) =>
+                        setSettings((prev) => ({ ...prev, authEnvVar: e.target.value }))
+                      }
                       placeholder="API_AUTH_TOKEN"
                       className="flex-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 font-mono"
                       data-ui-id="settings-executionvariables-auth-envvar-input"
@@ -379,7 +392,10 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
       </div>
 
       {/* Custom Variables Section */}
-      <div className="rounded-lg bg-card/50 overflow-hidden" data-ui-id="settings-executionvariables-custom-section">
+      <div
+        className="rounded-lg bg-card/50 overflow-hidden"
+        data-ui-id="settings-executionvariables-custom-section"
+      >
         <button
           onClick={() => setVariablesExpanded(!variablesExpanded)}
           className="w-full p-4 flex items-center justify-between hover:bg-muted/30 transition-colors"
@@ -424,9 +440,7 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
                           <input
                             type="text"
                             value={variable.name}
-                            onChange={(e) =>
-                              updateCustomVariable(index, { name: e.target.value })
-                            }
+                            onChange={(e) => updateCustomVariable(index, { name: e.target.value })}
                             placeholder="variableName"
                             className="flex-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 font-mono"
                           />
@@ -449,9 +463,7 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
                           <input
                             type="text"
                             value={variable.value || ""}
-                            onChange={(e) =>
-                              updateCustomVariable(index, { value: e.target.value })
-                            }
+                            onChange={(e) => updateCustomVariable(index, { value: e.target.value })}
                             placeholder="Value"
                             className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
                           />

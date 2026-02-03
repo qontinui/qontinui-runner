@@ -3,6 +3,7 @@
  *
  * Displays a hierarchical tree of UI Bridge registered elements.
  * Supports selection, filtering, and state indication.
+ * Uses lazy loading for thumbnails to improve performance with large element counts.
  */
 
 import { useState, useMemo, useCallback, useEffect } from "react";
@@ -27,10 +28,12 @@ import {
   Accessibility,
   Keyboard,
   Check,
+  Globe,
 } from "lucide-react";
 import type { UIBridgeElement, UIBridgeState } from "./UIBridgeInspectorPanel";
 import { ImageViewerModal } from "./ImageViewerModal";
 import { cropPreview } from "../../lib/thumbnail-cropper";
+import { LazyThumbnail } from "./LazyThumbnail";
 
 interface ElementTreeViewProps {
   elements: UIBridgeElement[];
@@ -39,12 +42,14 @@ interface ElementTreeViewProps {
   selectedElementId?: string | null;
   onSelectElement?: (elementId: string | null) => void;
   loading?: boolean;
-  /** Map of element ID to base64 thumbnail data */
+  /** Map of element ID to base64 thumbnail data (for eager mode or pre-loaded thumbnails) */
   thumbnails?: Map<string, string>;
-  /** Whether thumbnails are currently loading */
+  /** Whether thumbnails are currently loading (eager mode only) */
   isLoadingThumbnails?: boolean;
-  /** Base64 screenshot data for cropping larger previews */
+  /** Base64 screenshot data for cropping larger previews and lazy thumbnails */
   screenshotData?: string;
+  /** Shared thumbnail cache for lazy loading (passed from useElementThumbnails) */
+  thumbnailCache?: Map<string, string>;
 }
 
 interface TreeNode {
@@ -75,9 +80,27 @@ export function ElementTreeView({
   thumbnails,
   isLoadingThumbnails: _isLoadingThumbnails = false,
   screenshotData,
+  thumbnailCache,
 }: ElementTreeViewProps) {
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
   const [filter, setFilter] = useState("");
+
+  // Track loaded thumbnails for lazy loading mode
+  const [lazyThumbnails, setLazyThumbnails] = useState<Map<string, string>>(new Map());
+
+  // Handler for when a lazy thumbnail loads
+  const handleThumbnailLoad = useCallback((elementId: string, thumbnail: string) => {
+    setLazyThumbnails((prev) => {
+      const next = new Map(prev);
+      next.set(elementId, thumbnail);
+      return next;
+    });
+  }, []);
+
+  // Clear lazy thumbnails when screenshot changes
+  useEffect(() => {
+    setLazyThumbnails(new Map());
+  }, [screenshotData]);
 
   // Build tree structure from flat elements
   const tree = useMemo(() => {
@@ -156,7 +179,7 @@ export function ElementTreeView({
     (elementId: string): UIBridgeState[] => {
       return states.filter((state) => state.elements.includes(elementId));
     },
-    [states]
+    [states],
   );
 
   // Toggle expand/collapse
@@ -197,9 +220,7 @@ export function ElementTreeView({
     const isSelected = selectedElementId === element.id;
     const hasChildren = children.length > 0;
     const elementStates = getElementStates(element.id);
-    const isInActiveState = elementStates.some((s) =>
-      activeStates.includes(s.id)
-    );
+    const isInActiveState = elementStates.some((s) => activeStates.includes(s.id));
 
     // Get role from element (either top-level or from accessibility object)
     const role = element.role || element.accessibility?.role;
@@ -212,7 +233,7 @@ export function ElementTreeView({
             "flex items-center gap-1 py-1 px-2 rounded-md cursor-pointer transition-colors",
             "hover:bg-muted/50",
             isSelected && "bg-primary/10 ring-1 ring-primary/30",
-            !element.visible && "opacity-50"
+            !element.visible && "opacity-50",
           )}
           style={{ paddingLeft: `${depth * 16 + 8}px` }}
           onClick={() => onSelectElement?.(isSelected ? null : element.id)}
@@ -221,7 +242,7 @@ export function ElementTreeView({
           <button
             className={cn(
               "w-4 h-4 flex items-center justify-center rounded hover:bg-muted",
-              !hasChildren && "invisible"
+              !hasChildren && "invisible",
             )}
             onClick={(e) => {
               e.stopPropagation();
@@ -235,10 +256,34 @@ export function ElementTreeView({
             )}
           </button>
 
-          {/* Thumbnail */}
-          {thumbnails?.get(element.id) ? (
+          {/* Thumbnail - uses lazy loading with IntersectionObserver */}
+          {/* Cross-origin elements show a placeholder instead of attempting to load */}
+          {element.isCrossOrigin ? (
+            <div
+              className="w-8 h-6 flex items-center justify-center border border-amber-500/30 rounded bg-amber-500/10 flex-shrink-0"
+              title="Thumbnail not available - cross-origin iframe content"
+            >
+              <Globe className="w-3 h-3 text-amber-600" />
+            </div>
+          ) : screenshotData && element.bounds ? (
+            <LazyThumbnail
+              elementId={element.id}
+              bounds={element.bounds}
+              screenshotBase64={screenshotData}
+              maxSize={40}
+              className="w-8 h-6"
+              thumbnailCache={thumbnailCache || thumbnails}
+              onLoad={handleThumbnailLoad}
+              isCrossOrigin={element.isCrossOrigin}
+              fallback={
+                <span className="text-muted-foreground">
+                  {ELEMENT_TYPE_ICONS[element.type] || ELEMENT_TYPE_ICONS.custom}
+                </span>
+              }
+            />
+          ) : thumbnails?.get(element.id) || lazyThumbnails.get(element.id) ? (
             <img
-              src={`data:image/png;base64,${thumbnails.get(element.id)}`}
+              src={`data:image/png;base64,${thumbnails?.get(element.id) || lazyThumbnails.get(element.id)}`}
               alt=""
               className="w-8 h-6 object-contain border border-border/50 rounded bg-white/50 flex-shrink-0"
             />
@@ -258,10 +303,7 @@ export function ElementTreeView({
 
           {/* Element ID */}
           <span
-            className={cn(
-              "flex-1 text-xs font-mono truncate",
-              isInActiveState && "text-accent"
-            )}
+            className={cn("flex-1 text-xs font-mono truncate", isInActiveState && "text-accent")}
             title={element.id}
           >
             {element.id}
@@ -275,6 +317,11 @@ export function ElementTreeView({
           )}
 
           {/* State indicators */}
+          {element.isCrossOrigin && (
+            <span className="inline-flex" title="Cross-origin iframe - thumbnail not available">
+              <Globe className="w-3 h-3 text-amber-600" />
+            </span>
+          )}
           {!element.visible && (
             <span className="inline-flex" title="Hidden">
               <EyeOff className="w-3 h-3 text-muted-foreground" />
@@ -285,16 +332,14 @@ export function ElementTreeView({
               <Lock className="w-3 h-3 text-muted-foreground" />
             </span>
           )}
-          {element.focused && (
-            <div
-              className="w-2 h-2 rounded-full bg-accent"
-              title="Focused"
-            />
-          )}
+          {element.focused && <div className="w-2 h-2 rounded-full bg-accent" title="Focused" />}
 
           {/* Role badge */}
           {role && (
-            <Badge variant="outline" className="text-[10px] px-1 py-0 border-primary/40 text-primary/80">
+            <Badge
+              variant="outline"
+              className="text-[10px] px-1 py-0 border-primary/40 text-primary/80"
+            >
               {role}
             </Badge>
           )}
@@ -306,9 +351,7 @@ export function ElementTreeView({
         </div>
 
         {/* Children */}
-        {hasChildren && isExpanded && (
-          <div>{children.map(renderNode)}</div>
-        )}
+        {hasChildren && isExpanded && <div>{children.map(renderNode)}</div>}
       </div>
     );
   };
@@ -326,9 +369,7 @@ export function ElementTreeView({
       <div className="flex flex-col items-center justify-center h-full text-muted-foreground text-sm gap-2">
         <Box className="w-8 h-8 opacity-50" />
         <p>No UI Bridge elements found</p>
-        <p className="text-xs">
-          Make sure the page uses UI Bridge with data-ui-id attributes
-        </p>
+        <p className="text-xs">Make sure the page uses UI Bridge with data-ui-id attributes</p>
       </div>
     );
   }
@@ -412,10 +453,7 @@ function StateFlagBadge({
   if (value === false && !showFalse) return null;
 
   return (
-    <Badge
-      variant={value ? "success" : "muted"}
-      className="text-[10px] px-1.5 py-0"
-    >
+    <Badge variant={value ? "success" : "muted"} className="text-[10px] px-1.5 py-0">
       {value ? <Check className="w-2.5 h-2.5 mr-0.5" /> : null}
       {label}
     </Badge>
@@ -508,11 +546,17 @@ function SelectedElementDetails({
   const isKeyboardAccessible = accessibility?.isKeyboardAccessible;
 
   const hasAccessibilityInfo =
-    role || accessibleName || accessibleDescription ||
-    isExpanded !== undefined || isPressed !== undefined ||
-    isSelected !== undefined || isRequired !== undefined ||
-    isReadonly !== undefined || tabIndex !== undefined ||
-    isInTabOrder !== undefined || isKeyboardAccessible !== undefined;
+    role ||
+    accessibleName ||
+    accessibleDescription ||
+    isExpanded !== undefined ||
+    isPressed !== undefined ||
+    isSelected !== undefined ||
+    isRequired !== undefined ||
+    isReadonly !== undefined ||
+    tabIndex !== undefined ||
+    isInTabOrder !== undefined ||
+    isKeyboardAccessible !== undefined;
 
   return (
     <div className="mt-2 p-2 bg-muted/30 rounded-md border border-border/50 space-y-3">
@@ -644,15 +688,21 @@ function SelectedElementDetails({
               <StateFlagBadge label="Selected" value={isSelected} />
               <StateFlagBadge label="Required" value={isRequired} />
               <StateFlagBadge label="Readonly" value={isReadonly} />
-              {!isInteractive && isExpanded === undefined && isPressed === undefined &&
-               isSelected === undefined && isRequired === undefined && isReadonly === undefined && (
-                <span className="text-[10px] text-muted-foreground italic">None</span>
-              )}
+              {!isInteractive &&
+                isExpanded === undefined &&
+                isPressed === undefined &&
+                isSelected === undefined &&
+                isRequired === undefined &&
+                isReadonly === undefined && (
+                  <span className="text-[10px] text-muted-foreground italic">None</span>
+                )}
             </div>
           </div>
 
           {/* Keyboard Accessibility */}
-          {(tabIndex !== undefined || isInTabOrder !== undefined || isKeyboardAccessible !== undefined) && (
+          {(tabIndex !== undefined ||
+            isInTabOrder !== undefined ||
+            isKeyboardAccessible !== undefined) && (
             <div className="mt-2">
               <div className="flex items-center gap-1 text-muted-foreground text-[10px] mb-1">
                 <Keyboard className="w-3 h-3" />

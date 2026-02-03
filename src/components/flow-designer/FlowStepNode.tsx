@@ -87,7 +87,8 @@ function FlowStepNodeComponent({ data, selected }: FlowStepNodeProps) {
   const hasError = executionStatus.hasError || data.hasError;
 
   // Determine container style based on execution status
-  let containerClasses = "bg-gray-800 rounded-lg shadow-lg min-w-[180px] max-w-[250px] transition-all duration-300";
+  let containerClasses =
+    "bg-gray-800 rounded-lg shadow-lg min-w-[180px] max-w-[250px] transition-all duration-300";
   let ringStyle = "";
   let glowStyle = "";
 
@@ -226,7 +227,10 @@ function FlowStepNodeComponent({ data, selected }: FlowStepNodeProps) {
               </div>
             )}
             {hasError && executionStatus.error && (
-              <p className="text-xs text-red-300/80 mt-1 line-clamp-2" title={executionStatus.error}>
+              <p
+                className="text-xs text-red-300/80 mt-1 line-clamp-2"
+                title={executionStatus.error}
+              >
                 {executionStatus.error}
               </p>
             )}

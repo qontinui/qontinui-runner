@@ -60,9 +60,7 @@ export function LogSourcePicker({
   const [loading, setLoading] = useState(true);
   const [localSelectedIds, setLocalSelectedIds] = useState<string[]>(selectedSourceIds);
   const [localProfileId, setLocalProfileId] = useState<string | undefined>(globalProfileId);
-  const [mode, setMode] = useState<"profile" | "custom">(
-    globalProfileId ? "profile" : "custom",
-  );
+  const [mode, setMode] = useState<"profile" | "custom">(globalProfileId ? "profile" : "custom");
 
   // Load global log source settings
   const loadSettings = useCallback(async () => {
@@ -137,7 +135,7 @@ export function LogSourcePicker({
   // Determine which source IDs are "active" for the checkboxes display
   const activeSourceIds =
     mode === "profile" && localProfileId
-      ? profiles.find((p) => p.id === localProfileId)?.source_ids ?? []
+      ? (profiles.find((p) => p.id === localProfileId)?.source_ids ?? [])
       : localSelectedIds;
 
   return (
@@ -146,10 +144,7 @@ export function LogSourcePicker({
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-border">
           <h2 className="text-lg font-semibold">Select Log Sources</h2>
-          <button
-            onClick={onClose}
-            className="p-1 hover:bg-muted rounded transition-colors"
-          >
+          <button onClick={onClose} className="p-1 hover:bg-muted rounded transition-colors">
             <X className="w-5 h-5" />
           </button>
         </div>
@@ -224,10 +219,7 @@ export function LogSourcePicker({
                   </label>
                   {mode === "custom" && (
                     <div className="flex gap-2 text-xs">
-                      <button
-                        onClick={selectAll}
-                        className="text-primary hover:underline"
-                      >
+                      <button onClick={selectAll} className="text-primary hover:underline">
                         Select All
                       </button>
                       <button
@@ -267,7 +259,9 @@ export function LogSourcePicker({
                             )}
                             <span className="text-sm font-medium truncate">{source.name}</span>
                           </div>
-                          <div className="text-xs text-muted-foreground truncate">{source.path}</div>
+                          <div className="text-xs text-muted-foreground truncate">
+                            {source.path}
+                          </div>
                         </div>
                         {isSelected && <Check className="w-4 h-4 text-primary flex-shrink-0" />}
                       </label>

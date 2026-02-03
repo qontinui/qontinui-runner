@@ -49,9 +49,7 @@ function convertElement(element: RegisteredElement): UIBridgeElement {
  */
 export function ConnectedUIBridgeInspector() {
   const bridge = useUIBridge();
-  const [selectedElementId, setSelectedElementId] = useState<string | null>(
-    null
-  );
+  const [selectedElementId, setSelectedElementId] = useState<string | null>(null);
   const [events, setEvents] = useState<UIBridgeEvent[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -74,7 +72,7 @@ export function ConnectedUIBridgeInspector() {
   const addEvent = useCallback(
     (
       eventType: string,
-      details: Partial<Omit<UIBridgeEvent, "id" | "timestamp" | "eventType">>
+      details: Partial<Omit<UIBridgeEvent, "id" | "timestamp" | "eventType">>,
     ) => {
       const newEvent: UIBridgeEvent = {
         id: ++eventIdRef.current,
@@ -85,7 +83,7 @@ export function ConnectedUIBridgeInspector() {
       };
       setEvents((prev) => [newEvent, ...prev].slice(0, 100)); // Keep last 100 events
     },
-    []
+    [],
   );
 
   // Handle refresh
@@ -118,16 +116,12 @@ export function ConnectedUIBridgeInspector() {
         addEvent("element_registered", { elementId });
       }
     },
-    [addEvent]
+    [addEvent],
   );
 
   // Handle action execution
   const handleExecuteAction = useCallback(
-    async (
-      elementId: string,
-      action: string,
-      params?: Record<string, unknown>
-    ) => {
+    async (elementId: string, action: string, params?: Record<string, unknown>) => {
       const startTime = Date.now();
       try {
         const result = await bridge.executeAction(elementId, {
@@ -160,7 +154,7 @@ export function ConnectedUIBridgeInspector() {
         throw err;
       }
     },
-    [bridge, addEvent]
+    [bridge, addEvent],
   );
 
   // Handle picker toggle (would need custom implementation)

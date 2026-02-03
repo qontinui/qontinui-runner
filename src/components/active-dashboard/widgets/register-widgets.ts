@@ -56,11 +56,7 @@ import {
 } from "./execution-timeline";
 
 // Import Flow Execution widget
-import {
-  FlowExecutionWidget,
-  FlowExecutionSummary,
-  useFlowExecutionData,
-} from "./flow-execution";
+import { FlowExecutionWidget, FlowExecutionSummary, useFlowExecutionData } from "./flow-execution";
 
 /**
  * Register all dashboard widgets.

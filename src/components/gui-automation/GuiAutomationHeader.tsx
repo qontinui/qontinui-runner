@@ -234,11 +234,7 @@ export function GuiAutomationHeader({
       </div>
 
       {/* RAG Project Modal */}
-      <RAGProjectModal
-        isOpen={showRAGModal}
-        onClose={() => setShowRAGModal(false)}
-        onLog={onLog}
-      />
+      <RAGProjectModal isOpen={showRAGModal} onClose={() => setShowRAGModal(false)} onLog={onLog} />
     </>
   );
 }

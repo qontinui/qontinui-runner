@@ -34,7 +34,8 @@ interface AiContextGeneratorProps {
 const PROMPT_TEMPLATES = [
   {
     label: "Error Handling",
-    prompt: "Create documentation for handling common errors and exceptions in automation workflows",
+    prompt:
+      "Create documentation for handling common errors and exceptions in automation workflows",
   },
   {
     label: "Playwright Tips",
@@ -58,10 +59,7 @@ const PROMPT_TEMPLATES = [
   },
 ];
 
-export function AiContextGenerator({
-  onContextGenerated,
-  onCancel,
-}: AiContextGeneratorProps) {
+export function AiContextGenerator({ onContextGenerated, onCancel }: AiContextGeneratorProps) {
   const [prompt, setPrompt] = useState("");
   const [isGenerating, setIsGenerating] = useState(false);
   const [generatedContext, setGeneratedContext] = useState<GeneratedContext | null>(null);
@@ -201,7 +199,9 @@ export function AiContextGenerator({
               <div className="mb-4">
                 <label className="block text-xs text-neutral-400 mb-1">Name</label>
                 <div className="p-2 bg-neutral-800 rounded border border-neutral-700">
-                  <span className="text-sm font-medium text-neutral-200">{generatedContext.name}</span>
+                  <span className="text-sm font-medium text-neutral-200">
+                    {generatedContext.name}
+                  </span>
                 </div>
               </div>
 
@@ -231,7 +231,10 @@ export function AiContextGenerator({
                   <label className="block text-xs text-neutral-400 mb-1">Tags</label>
                   <div className="flex flex-wrap gap-1">
                     {generatedContext.tags.map((tag) => (
-                      <span key={tag} className="px-2 py-0.5 text-xs bg-blue-900/30 text-blue-300 rounded">
+                      <span
+                        key={tag}
+                        className="px-2 py-0.5 text-xs bg-blue-900/30 text-blue-300 rounded"
+                      >
                         {tag}
                       </span>
                     ))}
@@ -242,10 +245,15 @@ export function AiContextGenerator({
               {/* Task mentions */}
               {generatedContext.taskMentions.length > 0 && (
                 <div className="mb-4">
-                  <label className="block text-xs text-neutral-400 mb-1">Auto-include Keywords</label>
+                  <label className="block text-xs text-neutral-400 mb-1">
+                    Auto-include Keywords
+                  </label>
                   <div className="flex flex-wrap gap-1">
                     {generatedContext.taskMentions.map((mention) => (
-                      <span key={mention} className="px-2 py-0.5 text-xs bg-green-900/30 text-green-300 rounded">
+                      <span
+                        key={mention}
+                        className="px-2 py-0.5 text-xs bg-green-900/30 text-green-300 rounded"
+                      >
                         {mention}
                       </span>
                     ))}

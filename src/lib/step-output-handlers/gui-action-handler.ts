@@ -273,9 +273,7 @@ export class GuiActionHandler implements StepOutputHandler<GuiActionStepOutput> 
   /**
    * Normalize action type string to valid enum value.
    */
-  private normalizeActionType(
-    action: string,
-  ): GuiActionStepOutput["action_type"] {
+  private normalizeActionType(action: string): GuiActionStepOutput["action_type"] {
     const normalized = action.toLowerCase().replace(/[_-]/g, "");
     switch (normalized) {
       case "click":

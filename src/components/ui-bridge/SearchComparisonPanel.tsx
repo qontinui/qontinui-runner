@@ -70,7 +70,7 @@ function levenshteinDistance(a: string, b: string): number {
         matrix[i][j] = Math.min(
           matrix[i - 1][j - 1] + 1, // substitution
           matrix[i][j - 1] + 1, // insertion
-          matrix[i - 1][j] + 1 // deletion
+          matrix[i - 1][j] + 1, // deletion
         );
       }
     }
@@ -323,9 +323,7 @@ export function SearchComparisonPanel({
           {result.element.type}
         </Badge>
         <span className="font-mono text-sm truncate flex-1">{result.element.id}</span>
-        <span className="text-xs text-muted-foreground">
-          {(result.score * 100).toFixed(0)}%
-        </span>
+        <span className="text-xs text-muted-foreground">{(result.score * 100).toFixed(0)}%</span>
       </div>
 
       <div className="text-xs text-muted-foreground mt-1">{result.matchDetails}</div>
@@ -435,10 +433,7 @@ export function SearchComparisonPanel({
             const hasResults = results.length > 0;
 
             return (
-              <div
-                key={strategy.id}
-                className="border border-border/50 rounded-lg overflow-hidden"
-              >
+              <div key={strategy.id} className="border border-border/50 rounded-lg overflow-hidden">
                 {/* Strategy header */}
                 <button
                   className="w-full flex items-center gap-2 p-3 bg-muted/20 hover:bg-muted/30 transition-colors"
@@ -486,9 +481,7 @@ export function SearchComparisonPanel({
           <div className="text-center py-8 text-muted-foreground">
             <Search className="w-8 h-8 mx-auto mb-2 opacity-50" />
             <p className="text-sm">Enter a search query to compare strategies</p>
-            <p className="text-xs mt-1">
-              Try searching for element IDs, labels, or text content
-            </p>
+            <p className="text-xs mt-1">Try searching for element IDs, labels, or text content</p>
           </div>
         )}
       </div>

@@ -3,9 +3,11 @@
  *
  * Dialog for configuring and running automatic UI Bridge exploration.
  * Allows users to customize exploration parameters and view results.
+ * Includes real-time progress updates during exploration.
  */
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import * as Dialog from "@radix-ui/react-dialog";
 import {
   X,
@@ -20,10 +22,17 @@ import {
   Download,
   Copy,
   Check,
+  Square,
+  StopCircle,
+  Clock,
+  Layers,
+  MousePointer2,
+  Network,
 } from "lucide-react";
 import { Button } from "../ui/Button";
 import { Badge } from "../ui/Badge";
 import type { FingerprintDiscoveryResult } from "./StateDiscoveryPanel";
+import type { ExplorationProgress, ExplorationPhase } from "../../types";
 
 export interface ExplorationConfig {
   maxDepth: number;
@@ -47,8 +56,12 @@ interface ExplorationConfigDialogProps {
   isOpen: boolean;
   onClose: () => void;
   onRunExploration: (config: ExplorationConfig) => Promise<ExplorationResult | null>;
+  onStopExploration?: () => Promise<void>;
   isExploring: boolean;
+  isStopping?: boolean;
   lastResult: ExplorationResult | null;
+  /** Whether the last result was from a stopped exploration (partial results) */
+  wasStopped?: boolean;
 }
 
 const DEFAULT_CONFIG: ExplorationConfig = {
@@ -61,24 +74,92 @@ const DEFAULT_CONFIG: ExplorationConfig = {
   captureScreenshots: false,
 };
 
+/** Phase display configuration */
+const PHASE_CONFIG: Record<
+  ExplorationPhase,
+  { label: string; icon: React.ComponentType<{ className?: string }>; color: string }
+> = {
+  connecting: { label: "Connecting", icon: Network, color: "text-blue-500" },
+  discovering: { label: "Discovering", icon: Layers, color: "text-purple-500" },
+  exploring: { label: "Exploring", icon: MousePointer2, color: "text-primary" },
+  analyzing: { label: "Analyzing", icon: Compass, color: "text-amber-500" },
+  complete: { label: "Complete", icon: CheckCircle, color: "text-green-500" },
+  stopped: { label: "Stopped", icon: StopCircle, color: "text-amber-500" },
+};
+
+/** Format milliseconds to human readable time */
+function formatTime(ms: number): string {
+  if (ms < 0) return "--";
+  if (ms < 1000) return "< 1s";
+  const seconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  if (minutes > 0) {
+    return `${minutes}m ${remainingSeconds}s`;
+  }
+  return `${seconds}s`;
+}
+
 export function ExplorationConfigDialog({
   isOpen,
   onClose,
   onRunExploration,
+  onStopExploration,
   isExploring,
+  isStopping = false,
   lastResult,
+  wasStopped = false,
 }: ExplorationConfigDialogProps) {
   const [config, setConfig] = useState<ExplorationConfig>(DEFAULT_CONFIG);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [blockedKeywordsInput, setBlockedKeywordsInput] = useState(
-    DEFAULT_CONFIG.blockedKeywords.join(", ")
+    DEFAULT_CONFIG.blockedKeywords.join(", "),
   );
   const [safeKeywordsInput, setSafeKeywordsInput] = useState(
-    DEFAULT_CONFIG.safeKeywords.join(", ")
+    DEFAULT_CONFIG.safeKeywords.join(", "),
   );
   const [showErrors, setShowErrors] = useState(false);
   const [showStates, setShowStates] = useState(false);
   const [copied, setCopied] = useState(false);
+
+  // Real-time progress state
+  const [progress, setProgress] = useState<ExplorationProgress | null>(null);
+
+  // Listen for exploration progress events
+  useEffect(() => {
+    let unlisten: UnlistenFn | null = null;
+
+    const setupListener = async () => {
+      unlisten = await listen<ExplorationProgress>("exploration-progress", (event) => {
+        setProgress(event.payload);
+      });
+    };
+
+    if (isExploring) {
+      setupListener();
+    }
+
+    return () => {
+      if (unlisten) {
+        unlisten();
+      }
+      // Reset progress when not exploring
+      if (!isExploring) {
+        setProgress(null);
+      }
+    };
+  }, [isExploring]);
+
+  // Reset progress when exploration stops
+  useEffect(() => {
+    if (!isExploring) {
+      // Keep progress for a moment after exploration ends to show final state
+      const timer = setTimeout(() => {
+        setProgress(null);
+      }, 2000);
+      return () => clearTimeout(timer);
+    }
+  }, [isExploring]);
 
   // Build state machine config from exploration results
   const buildStateConfig = useCallback(() => {
@@ -123,10 +204,10 @@ export function ExplorationConfigDialog({
 
   // Export states to JSON file
   const handleExportStates = useCallback(async () => {
-    const config = buildStateConfig();
-    if (!config) return;
+    const stateConfig = buildStateConfig();
+    if (!stateConfig) return;
 
-    const blob = new Blob([JSON.stringify(config, null, 2)], { type: "application/json" });
+    const blob = new Blob([JSON.stringify(stateConfig, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -139,11 +220,11 @@ export function ExplorationConfigDialog({
 
   // Copy states to clipboard
   const handleCopyStates = useCallback(async () => {
-    const config = buildStateConfig();
-    if (!config) return;
+    const stateConfig = buildStateConfig();
+    if (!stateConfig) return;
 
     try {
-      await navigator.clipboard.writeText(JSON.stringify(config, null, 2));
+      await navigator.clipboard.writeText(JSON.stringify(stateConfig, null, 2));
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch (err) {
@@ -169,6 +250,16 @@ export function ExplorationConfigDialog({
     });
   }, [config, blockedKeywordsInput, safeKeywordsInput, onRunExploration]);
 
+  // Calculate progress percentage
+  const progressPercent =
+    progress && config.maxTotalElements > 0
+      ? Math.min(Math.round((progress.elementsExplored / config.maxTotalElements) * 100), 100)
+      : 0;
+
+  // Get phase configuration
+  const phaseConfig = progress?.phase ? PHASE_CONFIG[progress.phase] : null;
+  const PhaseIcon = phaseConfig?.icon || Loader2;
+
   return (
     <Dialog.Root open={isOpen} onOpenChange={(open) => !open && onClose()}>
       <Dialog.Portal>
@@ -191,37 +282,136 @@ export function ExplorationConfigDialog({
 
           {/* Content */}
           <div className="flex-1 overflow-y-auto p-4 space-y-4">
-            {/* Description */}
-            {isExploring ? (
-              <div className="p-4 bg-primary/10 rounded-lg border border-primary/30">
-                <div className="flex items-center gap-3">
-                  <Loader2 className="w-6 h-6 animate-spin text-primary" />
-                  <div>
-                    <h3 className="font-medium text-primary">Exploration in Progress</h3>
-                    <p className="text-sm text-muted-foreground mt-1">
-                      The explorer is systematically clicking interactive elements and
-                      capturing fingerprints. This may take a while depending on the
-                      page complexity and your configuration.
-                    </p>
+            {/* Progress Display (when exploring) */}
+            {isExploring && (
+              <div
+                className={`p-4 rounded-lg border ${isStopping ? "bg-amber-500/10 border-amber-500/30" : "bg-primary/10 border-primary/30"}`}
+              >
+                {/* Phase Header with Stop Button */}
+                <div className="flex items-center justify-between mb-3">
+                  <div className="flex items-center gap-3">
+                    {isStopping ? (
+                      <StopCircle className="w-6 h-6 text-amber-500" />
+                    ) : (
+                      <PhaseIcon
+                        className={`w-6 h-6 ${phaseConfig?.color || "text-primary"} ${progress?.phase === "exploring" ? "animate-pulse" : ""}`}
+                      />
+                    )}
+                    <div>
+                      <h3
+                        className={`font-medium ${isStopping ? "text-amber-500" : phaseConfig?.color || "text-primary"}`}
+                      >
+                        {isStopping ? "Stopping..." : phaseConfig?.label || "Starting..."}
+                        {progress?.phase === "exploring" && progress.currentDepth > 0 && (
+                          <span className="ml-2 text-sm font-normal text-muted-foreground">
+                            (Depth {progress.currentDepth}/{progress.maxDepth})
+                          </span>
+                        )}
+                      </h3>
+                      <p className="text-sm text-muted-foreground mt-0.5">
+                        {progress?.message || "Initializing exploration..."}
+                      </p>
+                    </div>
+                  </div>
+                  {onStopExploration && !isStopping && (
+                    <Button
+                      variant="danger"
+                      size="sm"
+                      onClick={onStopExploration}
+                      className="flex-shrink-0 ml-4"
+                    >
+                      <Square className="w-3.5 h-3.5 mr-1.5 fill-current" />
+                      Stop
+                    </Button>
+                  )}
+                </div>
+
+                {/* Progress Bar */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between text-xs text-muted-foreground">
+                    <span>Progress</span>
+                    <span>{progressPercent}%</span>
+                  </div>
+                  <div className="h-2 bg-background rounded-full overflow-hidden">
+                    <div
+                      className={`h-full transition-all duration-300 rounded-full ${isStopping ? "bg-amber-500" : "bg-primary"}`}
+                      style={{ width: `${progressPercent}%` }}
+                    />
                   </div>
                 </div>
-                <div className="mt-3 flex flex-wrap gap-2 text-xs">
-                  <span className="px-2 py-1 bg-background rounded">
-                    Max depth: {config.maxDepth}
-                  </span>
-                  <span className="px-2 py-1 bg-background rounded">
-                    Max elements: {config.maxTotalElements}
-                  </span>
-                  <span className="px-2 py-1 bg-background rounded">
-                    Delay: {config.actionDelayMs}ms
-                  </span>
+
+                {/* Current Element */}
+                {progress?.currentElement && (
+                  <div className="mt-3 p-2 bg-background rounded text-sm">
+                    <span className="text-muted-foreground">Current: </span>
+                    <span className="font-medium">
+                      {progress.currentElement.action === "click" ? "Clicking" : "Focusing"}{" "}
+                    </span>
+                    <span className="text-primary truncate">
+                      "{progress.currentElement.label.slice(0, 40)}
+                      {progress.currentElement.label.length > 40 ? "..." : ""}"
+                    </span>
+                  </div>
+                )}
+
+                {/* Live Stats */}
+                <div className="mt-3 grid grid-cols-4 gap-2 text-center">
+                  <div className="p-2 bg-background rounded">
+                    <div className="text-lg font-semibold text-foreground">
+                      {progress?.elementsDiscovered ?? 0}
+                    </div>
+                    <div className="text-[10px] text-muted-foreground uppercase tracking-wider">
+                      Discovered
+                    </div>
+                  </div>
+                  <div className="p-2 bg-background rounded">
+                    <div className="text-lg font-semibold text-foreground">
+                      {progress?.elementsExplored ?? 0}
+                    </div>
+                    <div className="text-[10px] text-muted-foreground uppercase tracking-wider">
+                      Explored
+                    </div>
+                  </div>
+                  <div className="p-2 bg-background rounded">
+                    <div className="text-lg font-semibold text-primary">
+                      {progress?.statesFound ?? 0}
+                    </div>
+                    <div className="text-[10px] text-muted-foreground uppercase tracking-wider">
+                      States
+                    </div>
+                  </div>
+                  <div className="p-2 bg-background rounded">
+                    <div
+                      className={`text-lg font-semibold ${(progress?.errorsCount ?? 0) > 0 ? "text-destructive" : "text-foreground"}`}
+                    >
+                      {progress?.errorsCount ?? 0}
+                    </div>
+                    <div className="text-[10px] text-muted-foreground uppercase tracking-wider">
+                      Errors
+                    </div>
+                  </div>
+                </div>
+
+                {/* Time Display */}
+                <div className="mt-3 flex items-center justify-between text-xs text-muted-foreground">
+                  <div className="flex items-center gap-1">
+                    <Clock className="w-3 h-3" />
+                    <span>Elapsed: {formatTime(progress?.elapsedTimeMs ?? 0)}</span>
+                  </div>
+                  {(progress?.estimatedRemainingMs ?? -1) >= 0 && (
+                    <div className="flex items-center gap-1">
+                      <span>Remaining: ~{formatTime(progress?.estimatedRemainingMs ?? 0)}</span>
+                    </div>
+                  )}
                 </div>
               </div>
-            ) : (
+            )}
+
+            {/* Description (when not exploring) */}
+            {!isExploring && (
               <p className="text-sm text-muted-foreground">
-                Automatically explore interactive elements on the page, capturing
-                fingerprints and discovering application states through co-occurrence
-                analysis.
+                Automatically explore interactive elements on the page, capturing fingerprints and
+                discovering application states through co-occurrence analysis.
               </p>
             )}
 
@@ -369,16 +559,18 @@ export function ExplorationConfigDialog({
             </div>
 
             {/* Last Result */}
-            {lastResult && (
+            {lastResult && !isExploring && (
               <div className="p-3 bg-muted/30 rounded-lg border border-border space-y-2">
                 <div className="flex items-center justify-between">
                   <h3 className="text-sm font-medium flex items-center gap-2">
-                    {lastResult.errors.length === 0 ? (
+                    {wasStopped ? (
+                      <StopCircle className="w-4 h-4 text-amber-500" />
+                    ) : lastResult.errors.length === 0 ? (
                       <CheckCircle className="w-4 h-4 text-green-500" />
                     ) : (
                       <AlertCircle className="w-4 h-4 text-amber-500" />
                     )}
-                    Last Exploration Result
+                    {wasStopped ? "Partial Results (Stopped)" : "Last Exploration Result"}
                   </h3>
                   <span className="text-xs text-muted-foreground font-mono">
                     {lastResult.explorationId.slice(0, 8)}
@@ -403,36 +595,37 @@ export function ExplorationConfigDialog({
                 </div>
 
                 {/* Export Buttons */}
-                {lastResult.stateDiscoveryResult && lastResult.stateDiscoveryResult.states.length > 0 && (
-                  <div className="flex items-center gap-2 pt-2 border-t border-border/50">
-                    <span className="text-xs text-muted-foreground">Export:</span>
-                    <button
-                      onClick={handleCopyStates}
-                      className="flex items-center gap-1 px-2 py-1 text-xs bg-muted hover:bg-muted/80 rounded transition-colors"
-                      title="Copy state config to clipboard"
-                    >
-                      {copied ? (
-                        <>
-                          <Check className="w-3 h-3 text-green-500" />
-                          Copied!
-                        </>
-                      ) : (
-                        <>
-                          <Copy className="w-3 h-3" />
-                          Copy JSON
-                        </>
-                      )}
-                    </button>
-                    <button
-                      onClick={handleExportStates}
-                      className="flex items-center gap-1 px-2 py-1 text-xs bg-muted hover:bg-muted/80 rounded transition-colors"
-                      title="Download state config as JSON file"
-                    >
-                      <Download className="w-3 h-3" />
-                      Download
-                    </button>
-                  </div>
-                )}
+                {lastResult.stateDiscoveryResult &&
+                  lastResult.stateDiscoveryResult.states.length > 0 && (
+                    <div className="flex items-center gap-2 pt-2 border-t border-border/50">
+                      <span className="text-xs text-muted-foreground">Export:</span>
+                      <button
+                        onClick={handleCopyStates}
+                        className="flex items-center gap-1 px-2 py-1 text-xs bg-muted hover:bg-muted/80 rounded transition-colors"
+                        title="Copy state config to clipboard"
+                      >
+                        {copied ? (
+                          <>
+                            <Check className="w-3 h-3 text-green-500" />
+                            Copied!
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-3 h-3" />
+                            Copy JSON
+                          </>
+                        )}
+                      </button>
+                      <button
+                        onClick={handleExportStates}
+                        className="flex items-center gap-1 px-2 py-1 text-xs bg-muted hover:bg-muted/80 rounded transition-colors"
+                        title="Download state config as JSON file"
+                      >
+                        <Download className="w-3 h-3" />
+                        Download
+                      </button>
+                    </div>
+                  )}
 
                 {/* Discovered States */}
                 {lastResult.stateDiscoveryResult &&
@@ -456,7 +649,10 @@ export function ExplorationConfigDialog({
                               key={state.stateId}
                               className="flex items-center gap-2 text-xs p-1.5 bg-background rounded"
                             >
-                              <Badge variant={state.isGlobal ? "info" : "default"} className="text-[10px]">
+                              <Badge
+                                variant={state.isGlobal ? "info" : "default"}
+                                className="text-[10px]"
+                              >
                                 {state.isGlobal ? "Global" : state.isModal ? "Modal" : "Local"}
                               </Badge>
                               <span className="font-medium truncate">{state.name}</span>

@@ -82,9 +82,11 @@ function ActionButton({ action }: { action: BuilderToolbarAction }) {
       disabled={action.disabled}
       className={`flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg
         transition-colors text-xs disabled:opacity-50
-        ${action.active
-          ? "bg-red-500/20 text-red-400"
-          : action.className || "flex-1 hover:bg-neutral-800 text-neutral-400 hover:text-neutral-200"
+        ${
+          action.active
+            ? "bg-red-500/20 text-red-400"
+            : action.className ||
+              "flex-1 hover:bg-neutral-800 text-neutral-400 hover:text-neutral-200"
         }
         ${!showLabel ? "p-1.5 flex-none" : "flex-1"}`}
       title={action.title || action.label}
@@ -192,7 +194,7 @@ export const toolbarActions = {
   import: (
     onFileChange: (event: React.ChangeEvent<HTMLInputElement>) => void,
     accept = ".json",
-    disabled = false
+    disabled = false,
   ): BuilderToolbarAction => ({
     key: "import",
     icon: Upload,

@@ -40,11 +40,7 @@ import { BatchDeleteDialog } from "../ui/BatchDeleteDialog";
 import { ShellCommandBuilderProvider, useShellCommandBuilder } from "./ShellCommandBuilderContext";
 import { AiShellCommandGenerator } from "./AiShellCommandGenerator";
 import type { ShellCommand, ExecuteShellCommandResult, CreateShellCommandInput } from "./types";
-import {
-  SHELL_COMMAND_CATEGORIES,
-  getCategoryInfo,
-  getCategoryColorClass,
-} from "./types";
+import { SHELL_COMMAND_CATEGORIES, getCategoryInfo, getCategoryColorClass } from "./types";
 
 interface ShellCommandBuilderTabProps {
   onLog?: (level: string, message: string) => void;
@@ -83,7 +79,15 @@ interface CommandListItemProps {
   onToggleSelection: () => void;
 }
 
-function CommandListItem({ command, isSelected, isSelectionMode, isChecked, onSelect, onDelete, onToggleSelection }: CommandListItemProps) {
+function CommandListItem({
+  command,
+  isSelected,
+  isSelectionMode,
+  isChecked,
+  onSelect,
+  onDelete,
+  onToggleSelection,
+}: CommandListItemProps) {
   const [showMenu, setShowMenu] = useState(false);
 
   return (
@@ -104,9 +108,7 @@ function CommandListItem({ command, isSelected, isSelectionMode, isChecked, onSe
       {isSelectionMode && (
         <div
           className={`w-4 h-4 rounded border flex-shrink-0 flex items-center justify-center ${
-            isChecked
-              ? "bg-red-500 border-red-500"
-              : "border-neutral-500 hover:border-red-400"
+            isChecked ? "bg-red-500 border-red-500" : "border-neutral-500 hover:border-red-400"
           }`}
         >
           {isChecked && <Check className="w-3 h-3 text-white" />}
@@ -218,9 +220,7 @@ function CommandLibraryPanel({ onOpenAiGenerator }: { onOpenAiGenerator: () => v
 
   // Get names of selected commands for dialog
   const getSelectedNames = useCallback(() => {
-    return shellCommands
-      .filter((c) => selectedIds.has(c.id))
-      .map((c) => c.name);
+    return shellCommands.filter((c) => selectedIds.has(c.id)).map((c) => c.name);
   }, [shellCommands, selectedIds]);
 
   const filteredCommands = shellCommands.filter((command) => {
@@ -383,12 +383,10 @@ function CommandLibraryPanel({ onOpenAiGenerator }: { onOpenAiGenerator: () => v
       {/* Selection Mode Header */}
       {isSelectionMode && (
         <div className="flex items-center justify-between px-4 py-2 bg-red-500/10 border-b border-red-500/30">
-          <span className="text-sm text-red-400">
-            {selectedIds.size} selected
-          </span>
+          <span className="text-sm text-red-400">{selectedIds.size} selected</span>
           <div className="flex items-center gap-2">
             <button
-              onClick={() => setSelectedIds(new Set(filteredCommands.map(c => c.id)))}
+              onClick={() => setSelectedIds(new Set(filteredCommands.map((c) => c.id)))}
               className="px-2 py-1 text-xs bg-neutral-700 hover:bg-neutral-600 text-neutral-200 rounded"
               data-ui-id="shell-builder-select-all-btn"
             >

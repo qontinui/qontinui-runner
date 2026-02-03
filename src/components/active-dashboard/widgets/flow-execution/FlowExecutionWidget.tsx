@@ -71,7 +71,7 @@ function StepHistoryItem({
         "w-full flex items-center gap-2 p-2 rounded text-left text-sm transition-colors",
         isSelected
           ? "bg-emerald-500/10 border border-emerald-500/30"
-          : "bg-muted/50 hover:bg-muted"
+          : "bg-muted/50 hover:bg-muted",
       )}
     >
       {entry.success ? (
@@ -97,9 +97,7 @@ function StepOutputViewer({ entry }: { entry: FlowStepEntry }) {
 
   return (
     <div className="space-y-2">
-      <div className="text-sm font-medium text-muted-foreground">
-        Output: {entry.stepName}
-      </div>
+      <div className="text-sm font-medium text-muted-foreground">Output: {entry.stepName}</div>
       <div className="bg-muted/30 rounded p-3 text-sm">
         {hasOutputs ? (
           <pre className="text-foreground overflow-x-auto whitespace-pre-wrap font-mono text-xs">
@@ -170,8 +168,7 @@ export function FlowExecutionWidget({
     }));
   };
 
-  const selectedEntry =
-    selectedStepIndex !== null ? data.stepHistory[selectedStepIndex] : null;
+  const selectedEntry = selectedStepIndex !== null ? data.stepHistory[selectedStepIndex] : null;
 
   return (
     <div className={cn("flex flex-col h-full", className)}>
@@ -179,20 +176,14 @@ export function FlowExecutionWidget({
       <div className="flex items-center gap-4 px-4 py-3 border-b border-border/50">
         <div className="flex items-center gap-2">
           <StatusIcon status={data.status} />
-          <span className="text-sm font-medium capitalize">
-            {data.status.replace("_", " ")}
-          </span>
+          <span className="text-sm font-medium capitalize">{data.status.replace("_", " ")}</span>
         </div>
-        <div className="text-sm text-muted-foreground">
-          {formatDuration(data.elapsedMs)}
-        </div>
+        <div className="text-sm text-muted-foreground">{formatDuration(data.elapsedMs)}</div>
         <div className="text-sm text-muted-foreground">
           {data.stats.completedSteps} step{data.stats.completedSteps !== 1 ? "s" : ""} completed
         </div>
         {data.stats.failedSteps > 0 && (
-          <div className="text-sm text-red-400">
-            {data.stats.failedSteps} failed
-          </div>
+          <div className="text-sm text-red-400">{data.stats.failedSteps} failed</div>
         )}
       </div>
 
@@ -226,9 +217,7 @@ export function FlowExecutionWidget({
                 <ChevronRight className="w-4 h-4" />
               )}
               Step History
-              <span className="text-muted-foreground ml-auto">
-                {data.stepHistory.length}
-              </span>
+              <span className="text-muted-foreground ml-auto">{data.stepHistory.length}</span>
             </button>
 
             {expandedSections.history && (

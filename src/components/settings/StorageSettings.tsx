@@ -140,7 +140,10 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
         icon={<HardDrive className="w-6 h-6" />}
       />
 
-      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-storage-main-section">
+      <div
+        className="space-y-4 rounded-lg bg-card/50 p-4"
+        data-ui-id="settings-storage-main-section"
+      >
         <div className="flex items-center gap-2">
           <HardDrive className="w-4 h-4 text-primary" />
           <h4 className="font-medium text-sm">Local Storage</h4>

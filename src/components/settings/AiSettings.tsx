@@ -474,7 +474,10 @@ export function AiSettings({ onLog }: AiSettingsProps) {
       )}
 
       {/* Provider Selection */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-ai-provider-section">
+      <div
+        className="space-y-4 rounded-lg bg-card/50 p-4"
+        data-ui-id="settings-ai-provider-section"
+      >
         <h4 className="font-medium text-sm">Provider</h4>
 
         <div className="space-y-3">
@@ -508,7 +511,10 @@ export function AiSettings({ onLog }: AiSettingsProps) {
 
       {/* Claude CLI Settings */}
       {settings.provider === "claude_cli" && (
-        <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-ai-claude-cli-section">
+        <div
+          className="space-y-4 rounded-lg bg-card/50 p-4"
+          data-ui-id="settings-ai-claude-cli-section"
+        >
           <h4 className="font-medium text-sm flex items-center gap-2">
             <Terminal className="w-4 h-4 text-primary" />
             Claude Code CLI Settings
@@ -624,7 +630,10 @@ export function AiSettings({ onLog }: AiSettingsProps) {
 
       {/* Claude API Settings */}
       {settings.provider === "claude_api" && (
-        <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-ai-claude-api-section">
+        <div
+          className="space-y-4 rounded-lg bg-card/50 p-4"
+          data-ui-id="settings-ai-claude-api-section"
+        >
           <h4 className="font-medium text-sm flex items-center gap-2">
             <Zap className="w-4 h-4 text-primary" />
             Claude API Settings
@@ -753,7 +762,10 @@ export function AiSettings({ onLog }: AiSettingsProps) {
 
       {/* Gemini CLI Settings */}
       {settings.provider === "gemini_cli" && (
-        <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-ai-gemini-cli-section">
+        <div
+          className="space-y-4 rounded-lg bg-card/50 p-4"
+          data-ui-id="settings-ai-gemini-cli-section"
+        >
           <h4 className="font-medium text-sm flex items-center gap-2">
             <Sparkles className="w-4 h-4 text-primary" />
             Gemini CLI Settings
@@ -884,7 +896,10 @@ export function AiSettings({ onLog }: AiSettingsProps) {
 
       {/* Gemini API Settings */}
       {settings.provider === "gemini_api" && (
-        <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-ai-gemini-api-section">
+        <div
+          className="space-y-4 rounded-lg bg-card/50 p-4"
+          data-ui-id="settings-ai-gemini-api-section"
+        >
           <h4 className="font-medium text-sm flex items-center gap-2">
             <Sparkles className="w-4 h-4 text-primary" />
             Gemini API Settings
@@ -1037,7 +1052,10 @@ export function AiSettings({ onLog }: AiSettingsProps) {
       )}
 
       {/* Auto-Refine Defaults */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-ai-auto-refine-section">
+      <div
+        className="space-y-4 rounded-lg bg-card/50 p-4"
+        data-ui-id="settings-ai-auto-refine-section"
+      >
         <h4 className="font-medium text-sm flex items-center gap-2">
           <Video className="w-4 h-4 text-primary" />
           Auto-Refine Defaults
@@ -1079,7 +1097,10 @@ export function AiSettings({ onLog }: AiSettingsProps) {
       </div>
 
       {/* Test Connection */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-ai-test-connection-section">
+      <div
+        className="space-y-4 rounded-lg bg-card/50 p-4"
+        data-ui-id="settings-ai-test-connection-section"
+      >
         <h4 className="font-medium text-sm">Test Connection</h4>
         <p className="text-xs text-muted-foreground">
           Verify that your AI configuration is working correctly.

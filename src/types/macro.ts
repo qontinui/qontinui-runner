@@ -132,9 +132,7 @@ export interface MacroRunResult {
 /**
  * Get default values for a new macro step
  */
-export function getDefaultMacroStep(
-  actionType: MacroActionType = "click",
-): Omit<MacroStep, "id"> {
+export function getDefaultMacroStep(actionType: MacroActionType = "click"): Omit<MacroStep, "id"> {
   return {
     action_type: actionType,
     name: getDefaultStepName(actionType),
@@ -169,10 +167,7 @@ export function getDefaultStepName(actionType: MacroActionType): string {
 /**
  * Get default values for a new macro
  */
-export function getDefaultMacro(): Omit<
-  SavedMacro,
-  "id" | "created_at" | "modified_at"
-> {
+export function getDefaultMacro(): Omit<SavedMacro, "id" | "created_at" | "modified_at"> {
   return {
     name: "",
     description: "",
@@ -260,9 +255,7 @@ export function validateMacroStep(step: MacroStep): {
       break;
     case "go_to_state":
       if (!step.target_state_ids || step.target_state_ids.length === 0) {
-        errors.push(
-          "At least one target state is required for go_to_state action",
-        );
+        errors.push("At least one target state is required for go_to_state action");
       }
       break;
   }

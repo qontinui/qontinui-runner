@@ -251,7 +251,9 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
           </div>
 
           <div>
-            <label className="block text-sm font-medium text-zinc-400 mb-1">AI Session Timeout</label>
+            <label className="block text-sm font-medium text-zinc-400 mb-1">
+              AI Session Timeout
+            </label>
             <div className="flex items-center gap-2">
               <input
                 type="checkbox"
@@ -274,7 +276,11 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
                 <input
                   type="number"
                   value={workflow.timeout_seconds}
-                  onChange={(e) => updateWorkflow({ timeout_seconds: Math.max(60, parseInt(e.target.value) || 300) })}
+                  onChange={(e) =>
+                    updateWorkflow({
+                      timeout_seconds: Math.max(60, parseInt(e.target.value) || 300),
+                    })
+                  }
                   min={60}
                   max={7200}
                   className="w-24 px-2 py-1 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm"
@@ -391,7 +397,9 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
             type="button"
             role="switch"
             aria-checked={workflow.health_check_enabled ?? true}
-            onClick={() => updateWorkflow({ health_check_enabled: !(workflow.health_check_enabled ?? true) })}
+            onClick={() =>
+              updateWorkflow({ health_check_enabled: !(workflow.health_check_enabled ?? true) })
+            }
             className={`
               relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent
               transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500/50
@@ -463,7 +471,9 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
       {/* Log Watch toggle - automatic log error detection */}
       <div className="flex items-center justify-between py-2 px-3 bg-zinc-800/50 rounded-md">
         <div>
-          <label className="block text-sm font-medium text-zinc-300">Automatic Log Error Detection</label>
+          <label className="block text-sm font-medium text-zinc-300">
+            Automatic Log Error Detection
+          </label>
           <p className="text-xs text-zinc-500">
             Scan backend and frontend logs for errors before each verification
           </p>
@@ -472,7 +482,9 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
           type="button"
           role="switch"
           aria-checked={workflow.log_watch_enabled ?? true}
-          onClick={() => updateWorkflow({ log_watch_enabled: !(workflow.log_watch_enabled ?? true) })}
+          onClick={() =>
+            updateWorkflow({ log_watch_enabled: !(workflow.log_watch_enabled ?? true) })
+          }
           className={`
             relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent
             transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500/50
@@ -660,7 +672,9 @@ function HealthCheckUrlEditor({ healthCheck, onChange, onDelete }: HealthCheckUr
           {/* Expected Status and Timeout - side by side */}
           <div className="grid grid-cols-2 gap-3">
             <div>
-              <label className="block text-xs font-medium text-zinc-400 mb-1">Expected Status</label>
+              <label className="block text-xs font-medium text-zinc-400 mb-1">
+                Expected Status
+              </label>
               <input
                 type="number"
                 value={healthCheck.expected_status ?? 200}
@@ -672,7 +686,9 @@ function HealthCheckUrlEditor({ healthCheck, onChange, onDelete }: HealthCheckUr
               />
             </div>
             <div>
-              <label className="block text-xs font-medium text-zinc-400 mb-1">Timeout (seconds)</label>
+              <label className="block text-xs font-medium text-zinc-400 mb-1">
+                Timeout (seconds)
+              </label>
               <input
                 type="number"
                 value={healthCheck.timeout_seconds ?? 5}
@@ -776,7 +792,8 @@ function WorkflowBuilderContent({
 
   // Playwright script library picker state
   const [playwrightScriptPickerOpen, setPlaywrightScriptPickerOpen] = useState(false);
-  const [playwrightScriptPickerPhase, setPlaywrightScriptPickerPhase] = useState<WorkflowPhase>("verification");
+  const [playwrightScriptPickerPhase, setPlaywrightScriptPickerPhase] =
+    useState<WorkflowPhase>("verification");
 
   // Workflow library picker state
   const [workflowPickerOpen, setWorkflowPickerOpen] = useState(false);
@@ -890,7 +907,7 @@ function WorkflowBuilderContent({
     setIsDeletingWorkflows(true);
     try {
       const deletePromises = Array.from(selectedWorkflowIds).map((id) =>
-        fetch(`${API_BASE}/unified-workflows/${id}`, { method: "DELETE" })
+        fetch(`${API_BASE}/unified-workflows/${id}`, { method: "DELETE" }),
       );
       await Promise.all(deletePromises);
 
@@ -910,13 +927,17 @@ function WorkflowBuilderContent({
     } finally {
       setIsDeletingWorkflows(false);
     }
-  }, [selectedWorkflowIds, fetchWorkflows, state.workflow.id, resetToNew, exitWorkflowSelectionMode]);
+  }, [
+    selectedWorkflowIds,
+    fetchWorkflows,
+    state.workflow.id,
+    resetToNew,
+    exitWorkflowSelectionMode,
+  ]);
 
   // Get names of selected workflows for the delete dialog
   const getSelectedWorkflowNames = useCallback((): string[] => {
-    return savedWorkflows
-      .filter((w) => selectedWorkflowIds.has(w.id))
-      .map((w) => w.name);
+    return savedWorkflows.filter((w) => selectedWorkflowIds.has(w.id)).map((w) => w.name);
   }, [savedWorkflows, selectedWorkflowIds]);
 
   // Export the current workflow to JSON file
@@ -949,57 +970,60 @@ function WorkflowBuilderContent({
   }, [state.workflow.id]);
 
   // Import a workflow from JSON file
-  const handleImportWorkflow = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
+  const handleImportWorkflow = useCallback(
+    async (event: React.ChangeEvent<HTMLInputElement>) => {
+      const file = event.target.files?.[0];
+      if (!file) return;
 
-    setWorkflowImportError(null);
-    setWorkflowsLoading(true);
+      setWorkflowImportError(null);
+      setWorkflowsLoading(true);
 
-    try {
-      const text = await file.text();
-      const data = JSON.parse(text);
+      try {
+        const text = await file.text();
+        const data = JSON.parse(text);
 
-      // Validate the import format
-      let workflowData: UnifiedWorkflow;
-      if (data.manifest && data.workflow) {
-        // Full export format
-        workflowData = data.workflow;
-      } else if (data.setup_steps !== undefined) {
-        // Direct workflow object
-        workflowData = data;
-      } else {
-        throw new Error("Invalid workflow file format");
+        // Validate the import format
+        let workflowData: UnifiedWorkflow;
+        if (data.manifest && data.workflow) {
+          // Full export format
+          workflowData = data.workflow;
+        } else if (data.setup_steps !== undefined) {
+          // Direct workflow object
+          workflowData = data;
+        } else {
+          throw new Error("Invalid workflow file format");
+        }
+
+        // Call the import API
+        const response = await fetch(`${API_BASE}/unified-workflows/import`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            workflow: workflowData,
+            conflict_strategy: "generate",
+          }),
+        });
+
+        const result = await response.json();
+        if (result.success && result.data) {
+          // Refresh the list and select the imported workflow
+          await fetchWorkflows();
+          await loadWorkflow(result.data.workflow.id);
+        } else {
+          setWorkflowImportError(result.error || "Failed to import workflow");
+        }
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : "Failed to import workflow";
+        setWorkflowImportError(errorMsg);
+        console.error("Failed to import workflow:", error);
+      } finally {
+        setWorkflowsLoading(false);
+        // Reset the file input via event target
+        event.target.value = "";
       }
-
-      // Call the import API
-      const response = await fetch(`${API_BASE}/unified-workflows/import`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          workflow: workflowData,
-          conflict_strategy: "generate",
-        }),
-      });
-
-      const result = await response.json();
-      if (result.success && result.data) {
-        // Refresh the list and select the imported workflow
-        await fetchWorkflows();
-        await loadWorkflow(result.data.workflow.id);
-      } else {
-        setWorkflowImportError(result.error || "Failed to import workflow");
-      }
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : "Failed to import workflow";
-      setWorkflowImportError(errorMsg);
-      console.error("Failed to import workflow:", error);
-    } finally {
-      setWorkflowsLoading(false);
-      // Reset the file input via event target
-      event.target.value = "";
-    }
-  }, [fetchWorkflows, loadWorkflow]);
+    },
+    [fetchWorkflows, loadWorkflow],
+  );
 
   // Filter workflows
   const filteredWorkflows = savedWorkflows.filter((w) => {
@@ -1033,43 +1057,48 @@ function WorkflowBuilderContent({
   const [isSavingBeforeRun, setIsSavingBeforeRun] = useState(false);
 
   // Execute the workflow run (called after save confirmation)
-  const executeWorkflowRun = useCallback(async (workflowId: string) => {
-    setIsExecuting(true);
-    setExecutionError(null);
-    setExecutionSuccess(null);
+  const executeWorkflowRun = useCallback(
+    async (workflowId: string) => {
+      setIsExecuting(true);
+      setExecutionError(null);
+      setExecutionSuccess(null);
 
-    try {
-      console.log("[WorkflowBuilder] Running workflow:", workflowId, state.workflow.name);
+      try {
+        console.log("[WorkflowBuilder] Running workflow:", workflowId, state.workflow.name);
 
-      const runUrl = `${API_BASE}/unified-workflows/${workflowId}/run`;
-      const requestBody = JSON.stringify({
-        monitor_index: 0,
-        // No timeout_seconds - runs until completion or manual stop
-      });
+        const runUrl = `${API_BASE}/unified-workflows/${workflowId}/run`;
+        const requestBody = JSON.stringify({
+          monitor_index: 0,
+          // No timeout_seconds - runs until completion or manual stop
+        });
 
-      fetch(runUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: requestBody,
-      }).then(response => {
-        console.log("[WorkflowBuilder] Workflow run response:", response.status);
-      }).catch(error => {
-        console.error("[WorkflowBuilder] Workflow run error:", error);
-      });
+        fetch(runUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: requestBody,
+        })
+          .then((response) => {
+            console.log("[WorkflowBuilder] Workflow run response:", response.status);
+          })
+          .catch((error) => {
+            console.error("[WorkflowBuilder] Workflow run error:", error);
+          });
 
-      setTimeout(() => {
-        onNavigateToActive?.();
-      }, 100);
+        setTimeout(() => {
+          onNavigateToActive?.();
+        }, 100);
 
-      setExecutionSuccess("Workflow started! Check the Active tab to monitor progress.");
-      setTimeout(() => setExecutionSuccess(null), 5000);
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : "Failed to start workflow";
-      setExecutionError(errorMsg);
-    } finally {
-      setIsExecuting(false);
-    }
-  }, [state.workflow.name, onNavigateToActive]);
+        setExecutionSuccess("Workflow started! Check the Active tab to monitor progress.");
+        setTimeout(() => setExecutionSuccess(null), 5000);
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : "Failed to start workflow";
+        setExecutionError(errorMsg);
+      } finally {
+        setIsExecuting(false);
+      }
+    },
+    [state.workflow.name, onNavigateToActive],
+  );
 
   // Handle save and run (called from dialog confirmation)
   const handleSaveAndRun = useCallback(async () => {
@@ -1106,13 +1135,7 @@ function WorkflowBuilderContent({
 
     // Workflow is already saved, run it directly
     await executeWorkflowRun(state.workflow.id);
-  }, [
-    state.workflow.id,
-    isEmpty,
-    hasUnsavedChanges,
-    isExecuting,
-    executeWorkflowRun,
-  ]);
+  }, [state.workflow.id, isEmpty, hasUnsavedChanges, isExecuting, executeWorkflowRun]);
 
   // Handle stop execution
   const handleStop = useCallback(async () => {
@@ -1237,7 +1260,13 @@ function WorkflowBuilderContent({
         type: "check",
         phase: "verification",
         name: check.name,
-        check_type: check.check_type as "lint" | "format" | "typecheck" | "analyze" | "security" | "custom_command",
+        check_type: check.check_type as
+          | "lint"
+          | "format"
+          | "typecheck"
+          | "analyze"
+          | "security"
+          | "custom_command",
         check_id: check.id,
         command: check.command,
         working_directory: check.working_directory,
@@ -1277,7 +1306,10 @@ function WorkflowBuilderContent({
   const handleTestSelected = useCallback(
     (test: SavedTest, phase: WorkflowPhase) => {
       // Map test_type to the workflow step test_type format
-      const testTypeMap: Record<string, "playwright" | "qontinui_vision" | "python" | "repository" | "custom_command"> = {
+      const testTypeMap: Record<
+        string,
+        "playwright" | "qontinui_vision" | "python" | "repository" | "custom_command"
+      > = {
         playwright_cdp: "playwright",
         qontinui_vision: "qontinui_vision",
         python_script: "python",
@@ -1548,7 +1580,7 @@ function WorkflowBuilderContent({
       steps: UnifiedStep[],
       isSelectionMode: boolean = false,
       isSelectedForDelete: boolean = false,
-      onToggleSelect?: () => void
+      onToggleSelect?: () => void,
     ) => (
       <StepItem
         key={step.id}
@@ -1588,7 +1620,10 @@ function WorkflowBuilderContent({
         <div className="p-4 border-b border-neutral-700">
           {/* Title row */}
           <div className="flex items-center justify-between mb-2">
-            <h2 className="text-lg font-semibold flex items-center gap-2" data-ui-id="workflow-builder-title">
+            <h2
+              className="text-lg font-semibold flex items-center gap-2"
+              data-ui-id="workflow-builder-title"
+            >
               <Sparkles className="w-5 h-5" style={{ color: accentColors.bgSolid }} />
               Workflows
             </h2>
@@ -1607,7 +1642,7 @@ function WorkflowBuilderContent({
               toolbarActions.import(handleImportWorkflow, ".json", workflowsLoading),
               toolbarActions.delete(
                 () => setIsWorkflowSelectionMode(!isWorkflowSelectionMode),
-                isWorkflowSelectionMode
+                isWorkflowSelectionMode,
               ),
             ]}
           />
@@ -1642,9 +1677,7 @@ function WorkflowBuilderContent({
         {/* Selection Mode Header */}
         {isWorkflowSelectionMode && (
           <div className="flex items-center justify-between px-4 py-2 bg-red-500/10 border-b border-red-500/30">
-            <span className="text-sm text-red-400">
-              {selectedWorkflowIds.size} selected
-            </span>
+            <span className="text-sm text-red-400">{selectedWorkflowIds.size} selected</span>
             <div className="flex items-center gap-2">
               {selectedWorkflowIds.size > 0 && (
                 <button
@@ -1723,7 +1756,9 @@ function WorkflowBuilderContent({
                       </div>
                     )}
                     <div className="flex items-center gap-2 mt-1.5">
-                      <span className="text-xs text-neutral-500">{getStepCount(workflow)} steps</span>
+                      <span className="text-xs text-neutral-500">
+                        {getStepCount(workflow)} steps
+                      </span>
                       {workflow.category && (
                         <span className="text-xs px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400">
                           {workflow.category}
@@ -1864,7 +1899,15 @@ function WorkflowBuilderContent({
                   steps={state.workflow.setup_steps}
                   onAddStep={handleAddStep}
                   renderStep={(step, index, isSelectionMode, isSelectedForDelete, onToggleSelect) =>
-                    renderStep(step, index, "setup", state.workflow.setup_steps, isSelectionMode, isSelectedForDelete, onToggleSelect)
+                    renderStep(
+                      step,
+                      index,
+                      "setup",
+                      state.workflow.setup_steps,
+                      isSelectionMode,
+                      isSelectedForDelete,
+                      onToggleSelect,
+                    )
                   }
                 />
 
@@ -1874,7 +1917,15 @@ function WorkflowBuilderContent({
                   steps={state.workflow.verification_steps}
                   onAddStep={handleAddStep}
                   renderStep={(step, index, isSelectionMode, isSelectedForDelete, onToggleSelect) =>
-                    renderStep(step, index, "verification", state.workflow.verification_steps, isSelectionMode, isSelectedForDelete, onToggleSelect)
+                    renderStep(
+                      step,
+                      index,
+                      "verification",
+                      state.workflow.verification_steps,
+                      isSelectionMode,
+                      isSelectedForDelete,
+                      onToggleSelect,
+                    )
                   }
                 />
 
@@ -1884,7 +1935,15 @@ function WorkflowBuilderContent({
                   steps={state.workflow.agentic_steps}
                   onAddStep={handleAddStep}
                   renderStep={(step, index, isSelectionMode, isSelectedForDelete, onToggleSelect) =>
-                    renderStep(step, index, "agentic", state.workflow.agentic_steps, isSelectionMode, isSelectedForDelete, onToggleSelect)
+                    renderStep(
+                      step,
+                      index,
+                      "agentic",
+                      state.workflow.agentic_steps,
+                      isSelectionMode,
+                      isSelectedForDelete,
+                      onToggleSelect,
+                    )
                   }
                 />
 
@@ -1894,7 +1953,15 @@ function WorkflowBuilderContent({
                   steps={state.workflow.completion_steps ?? []}
                   onAddStep={handleAddStep}
                   renderStep={(step, index, isSelectionMode, isSelectedForDelete, onToggleSelect) =>
-                    renderStep(step, index, "completion", state.workflow.completion_steps ?? [], isSelectionMode, isSelectedForDelete, onToggleSelect)
+                    renderStep(
+                      step,
+                      index,
+                      "completion",
+                      state.workflow.completion_steps ?? [],
+                      isSelectionMode,
+                      isSelectedForDelete,
+                      onToggleSelect,
+                    )
                   }
                 />
 
@@ -2037,7 +2104,7 @@ function WorkflowBuilderContent({
                   "[WorkflowBuilder] Added steps from state:",
                   result.verificationSteps.length,
                   "verification,",
-                  result.agenticStep ? "1 agentic" : "0 agentic"
+                  result.agenticStep ? "1 agentic" : "0 agentic",
                 );
               }}
             />
@@ -2052,7 +2119,7 @@ function WorkflowBuilderContent({
                   "[WorkflowBuilder] Added steps from live browser:",
                   result.verificationSteps.length,
                   "verification,",
-                  result.agenticStep ? "1 agentic" : "0 agentic"
+                  result.agenticStep ? "1 agentic" : "0 agentic",
                 );
               }}
             />

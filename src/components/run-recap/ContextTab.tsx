@@ -7,14 +7,7 @@
  */
 
 import { useState } from "react";
-import {
-  Variable,
-  History,
-  ChevronDown,
-  ChevronRight,
-  AlertCircle,
-  Clock,
-} from "lucide-react";
+import { Variable, History, ChevronDown, ChevronRight, AlertCircle, Clock } from "lucide-react";
 
 interface ContextTabProps {
   taskRunId: string;
@@ -73,22 +66,13 @@ export function ContextTab({ taskRunId: _taskRunId }: ContextTabProps) {
             <table className="w-full text-sm">
               <thead>
                 <tr className="bg-muted/50">
-                  <th
-                    data-ui-id="recap-var-name"
-                    className="text-left px-4 py-2 font-medium"
-                  >
+                  <th data-ui-id="recap-var-name" className="text-left px-4 py-2 font-medium">
                     Name
                   </th>
-                  <th
-                    data-ui-id="recap-var-value"
-                    className="text-left px-4 py-2 font-medium"
-                  >
+                  <th data-ui-id="recap-var-value" className="text-left px-4 py-2 font-medium">
                     Value
                   </th>
-                  <th
-                    data-ui-id="recap-var-source"
-                    className="text-left px-4 py-2 font-medium"
-                  >
+                  <th data-ui-id="recap-var-source" className="text-left px-4 py-2 font-medium">
                     Source
                   </th>
                   <th className="text-left px-4 py-2 font-medium">Source Step</th>
@@ -97,15 +81,11 @@ export function ContextTab({ taskRunId: _taskRunId }: ContextTabProps) {
               <tbody className="divide-y divide-border">
                 {variables.map((variable, i) => (
                   <tr key={i} className="hover:bg-muted/30">
-                    <td className="px-4 py-2 font-mono text-primary">
-                      {variable.name}
-                    </td>
+                    <td className="px-4 py-2 font-mono text-primary">{variable.name}</td>
                     <td className="px-4 py-2 font-mono text-foreground/80 max-w-xs truncate">
                       {variable.value}
                     </td>
-                    <td className="px-4 py-2 text-muted-foreground">
-                      {variable.source}
-                    </td>
+                    <td className="px-4 py-2 text-muted-foreground">{variable.source}</td>
                     <td className="px-4 py-2 text-muted-foreground">
                       {variable.sourceStep || "-"}
                     </td>
@@ -163,15 +143,9 @@ export function ContextTab({ taskRunId: _taskRunId }: ContextTabProps) {
                   </button>
 
                   {isExpanded && (
-                    <div
-                      data-ui-id="recap-retry-errors"
-                      className="px-4 pb-4 space-y-2"
-                    >
+                    <div data-ui-id="recap-retry-errors" className="px-4 pb-4 space-y-2">
                       {retry.attempts.map((attempt, i) => (
-                        <div
-                          key={i}
-                          className="flex items-start gap-3 p-3 bg-muted/30 rounded"
-                        >
+                        <div key={i} className="flex items-start gap-3 p-3 bg-muted/30 rounded">
                           <span className="text-xs font-mono text-muted-foreground">
                             #{attempt.attempt}
                           </span>

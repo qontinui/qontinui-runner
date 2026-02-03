@@ -517,7 +517,7 @@ export function StateExplorerBuilderTab({
     try {
       // Delete in parallel
       const deletePromises = Array.from(selectedIds).map((id) =>
-        fetch(`${API_BASE}/saved-explorations/${id}`, { method: "DELETE" })
+        fetch(`${API_BASE}/saved-explorations/${id}`, { method: "DELETE" }),
       );
       await Promise.all(deletePromises);
 
@@ -543,9 +543,7 @@ export function StateExplorerBuilderTab({
 
   // Get names of selected explorations for the delete dialog
   const getSelectedNames = useCallback((): string[] => {
-    return explorations
-      .filter((e) => selectedIds.has(e.id))
-      .map((e) => e.name);
+    return explorations.filter((e) => selectedIds.has(e.id)).map((e) => e.name);
   }, [explorations, selectedIds]);
 
   return (
@@ -567,10 +565,7 @@ export function StateExplorerBuilderTab({
             actions={[
               toolbarActions.ai(() => setShowAiAdvisor(true)),
               toolbarActions.new(startCreate, "New"),
-              toolbarActions.delete(
-                () => setIsSelectionMode(!isSelectionMode),
-                isSelectionMode
-              ),
+              toolbarActions.delete(() => setIsSelectionMode(!isSelectionMode), isSelectionMode),
             ]}
           />
 
@@ -590,9 +585,7 @@ export function StateExplorerBuilderTab({
         {/* Selection Mode Header */}
         {isSelectionMode && (
           <div className="flex items-center justify-between px-4 py-2 bg-red-500/10 border-b border-red-500/30">
-            <span className="text-sm text-red-400">
-              {selectedIds.size} selected
-            </span>
+            <span className="text-sm text-red-400">{selectedIds.size} selected</span>
             <div className="flex items-center gap-2">
               {selectedIds.size > 0 && (
                 <button
@@ -643,9 +636,7 @@ export function StateExplorerBuilderTab({
                         ? "bg-neutral-700"
                         : "hover:bg-neutral-800"
                   } ${isSelectionMode ? "border" : ""} ${
-                    isSelectionMode && !selectedIds.has(exploration.id)
-                      ? "border-transparent"
-                      : ""
+                    isSelectionMode && !selectedIds.has(exploration.id) ? "border-transparent" : ""
                   }`}
                 >
                   {/* Checkbox in selection mode */}
@@ -657,9 +648,7 @@ export function StateExplorerBuilderTab({
                           : "border-neutral-500"
                       }`}
                     >
-                      {selectedIds.has(exploration.id) && (
-                        <Check className="w-3 h-3 text-white" />
-                      )}
+                      {selectedIds.has(exploration.id) && <Check className="w-3 h-3 text-white" />}
                     </div>
                   )}
                   <div className="flex-1 min-w-0">
@@ -669,7 +658,9 @@ export function StateExplorerBuilderTab({
                         {exploration.config.strategy}
                       </span>
                       {exploration.run_count > 0 && (
-                        <span className="text-xs text-neutral-500">{exploration.run_count} runs</span>
+                        <span className="text-xs text-neutral-500">
+                          {exploration.run_count} runs
+                        </span>
                       )}
                     </div>
                   </div>

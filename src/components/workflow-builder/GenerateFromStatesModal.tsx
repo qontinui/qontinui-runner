@@ -100,9 +100,7 @@ export function GenerateFromStatesModal({
               <GitBranch className="w-5 h-5 text-emerald-400" />
             </div>
             <div>
-              <h2 className="text-lg font-semibold text-zinc-100">
-                Generate from State Machine
-              </h2>
+              <h2 className="text-lg font-semibold text-zinc-100">Generate from State Machine</h2>
               <p className="text-sm text-zinc-400">
                 Create a verification workflow from loaded states
               </p>
@@ -130,8 +128,8 @@ export function GenerateFromStatesModal({
               <div>
                 <p className="text-amber-400 font-medium">No Configuration Loaded</p>
                 <p className="text-sm text-zinc-400 mt-1">
-                  Please load a state machine configuration first. Go to the Configuration
-                  panel and load a config file exported from qontinui-web.
+                  Please load a state machine configuration first. Go to the Configuration panel and
+                  load a config file exported from qontinui-web.
                 </p>
               </div>
             </div>
@@ -141,8 +139,8 @@ export function GenerateFromStatesModal({
               <div>
                 <p className="text-emerald-400 font-medium">Configuration Ready</p>
                 <p className="text-sm text-zinc-400 mt-1">
-                  Found <span className="font-medium text-zinc-300">{stateCount} states</span> in the loaded configuration.
-                  A verification step will be created for each state.
+                  Found <span className="font-medium text-zinc-300">{stateCount} states</span> in
+                  the loaded configuration. A verification step will be created for each state.
                 </p>
               </div>
             </div>
@@ -219,8 +217,12 @@ export function GenerateFromStatesModal({
                 {/* Include setup navigation */}
                 <label className="flex items-center justify-between p-3 bg-zinc-800/50 rounded-md cursor-pointer hover:bg-zinc-800 transition-colors">
                   <div>
-                    <span className="text-sm font-medium text-zinc-300">Include Setup Navigation</span>
-                    <p className="text-xs text-zinc-500 mt-0.5">Navigate to initial state in setup phase</p>
+                    <span className="text-sm font-medium text-zinc-300">
+                      Include Setup Navigation
+                    </span>
+                    <p className="text-xs text-zinc-500 mt-0.5">
+                      Navigate to initial state in setup phase
+                    </p>
                   </div>
                   <input
                     type="checkbox"
@@ -234,7 +236,9 @@ export function GenerateFromStatesModal({
                 <label className="flex items-center justify-between p-3 bg-zinc-800/50 rounded-md cursor-pointer hover:bg-zinc-800 transition-colors">
                   <div>
                     <span className="text-sm font-medium text-zinc-300">Include AI Contexts</span>
-                    <p className="text-xs text-zinc-500 mt-0.5">Add context snippets to agentic prompt</p>
+                    <p className="text-xs text-zinc-500 mt-0.5">
+                      Add context snippets to agentic prompt
+                    </p>
                   </div>
                   <input
                     type="checkbox"
@@ -248,7 +252,9 @@ export function GenerateFromStatesModal({
                 <label className="flex items-center justify-between p-3 bg-zinc-800/50 rounded-md cursor-pointer hover:bg-zinc-800 transition-colors">
                   <div>
                     <span className="text-sm font-medium text-zinc-300">Include AI Summary</span>
-                    <p className="text-xs text-zinc-500 mt-0.5">Generate summary in completion phase</p>
+                    <p className="text-xs text-zinc-500 mt-0.5">
+                      Generate summary in completion phase
+                    </p>
                   </div>
                   <input
                     type="checkbox"

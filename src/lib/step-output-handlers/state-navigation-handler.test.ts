@@ -18,11 +18,7 @@ describe("StateNavigationHandler", () => {
         ],
       };
 
-      const result = stateNavigationHandler.parseOutput(
-        raw,
-        {},
-        { step_name: "Login Navigation" },
-      );
+      const result = stateNavigationHandler.parseOutput(raw, {}, { step_name: "Login Navigation" });
 
       expect(result.step_type).toBe("state_navigation");
       expect(result.target_state).toBe("logged_in");
@@ -36,7 +32,8 @@ describe("StateNavigationHandler", () => {
         target_state: "checkout",
         reached: true,
         current_state: "checkout", // alternative to final_state
-        path: [ // alternative to path_taken
+        path: [
+          // alternative to path_taken
           { from_state: "cart", to_state: "checkout", transition_name: "proceed" },
         ],
       };
@@ -254,9 +251,7 @@ describe("StateNavigationHandler", () => {
       const output = stateNavigationHandler.parseOutput({
         target_state: "target",
         reached: true,
-        path_taken: [
-          { from_state: "start", to_state: "target", transition_name: "direct" },
-        ],
+        path_taken: [{ from_state: "start", to_state: "target", transition_name: "direct" }],
       });
 
       const fields = stateNavigationHandler.getAssertableFields(output);

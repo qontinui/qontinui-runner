@@ -15,15 +15,7 @@ import { Badge } from "../ui/Badge";
 import { ElementTreeView } from "./ElementTreeView";
 import { EventTimelineView } from "./EventTimelineView";
 import { ActionExecutorView } from "./ActionExecutorView";
-import {
-  Layers,
-  Activity,
-  Play,
-  RefreshCw,
-  Eye,
-  EyeOff,
-  Crosshair,
-} from "lucide-react";
+import { Layers, Activity, Play, RefreshCw, Eye, EyeOff, Crosshair } from "lucide-react";
 
 export interface UIBridgeElement {
   id: string;
@@ -77,6 +69,9 @@ export interface UIBridgeElement {
   is_readonly?: boolean; // readonly or aria-readonly
   is_interactive?: boolean; // Can be interacted with
   ref?: string; // Auto-generated reference like @e1, @e2
+
+  // Cross-origin iframe detection
+  isCrossOrigin?: boolean; // True if element is inside a cross-origin iframe (thumbnail unavailable)
 }
 
 export interface UIBridgeState {
@@ -146,7 +141,7 @@ interface UIBridgeInspectorPanelProps {
   onExecuteAction?: (
     elementId: string,
     action: string,
-    params?: Record<string, unknown>
+    params?: Record<string, unknown>,
   ) => Promise<void>;
   /** Callback when picker mode is toggled */
   onTogglePicker?: (enabled: boolean) => void;
@@ -188,9 +183,7 @@ export function UIBridgeInspectorPanel({
     onToggleOverlays?.(!overlaysEnabled);
   }, [onToggleOverlays, overlaysEnabled]);
 
-  const selectedElement = snapshot?.elements.find(
-    (el) => el.id === selectedElementId
-  );
+  const selectedElement = snapshot?.elements.find((el) => el.id === selectedElementId);
 
   const tabs: { id: TabId; label: string; icon: React.ReactNode }[] = [
     { id: "elements", label: "Elements", icon: <Layers className="w-4 h-4" /> },
@@ -247,18 +240,12 @@ export function UIBridgeInspectorPanel({
           disabled={!connected}
           title={overlaysEnabled ? "Hide overlays" : "Show element overlays"}
         >
-          {overlaysEnabled ? (
-            <EyeOff className="w-4 h-4" />
-          ) : (
-            <Eye className="w-4 h-4" />
-          )}
+          {overlaysEnabled ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
         </Button>
         <div className="flex-1" />
         <div className="text-xs text-muted-foreground">
           {snapshot?.elements.length ?? 0} elements
-          {snapshot?.activeStates.length
-            ? ` | ${snapshot.activeStates.length} active states`
-            : ""}
+          {snapshot?.activeStates.length ? ` | ${snapshot.activeStates.length} active states` : ""}
         </div>
       </div>
 
@@ -299,9 +286,7 @@ export function UIBridgeInspectorPanel({
             loading={loading}
           />
         )}
-        {activeTab === "events" && (
-          <EventTimelineView events={events} loading={loading} />
-        )}
+        {activeTab === "events" && <EventTimelineView events={events} loading={loading} />}
         {activeTab === "actions" && (
           <ActionExecutorView
             element={selectedElement}

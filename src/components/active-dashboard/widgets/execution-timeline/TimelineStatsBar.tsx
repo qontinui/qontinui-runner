@@ -6,17 +6,26 @@
  * - Current iteration
  * - Average iteration duration
  * - Improvement over last verification
+ *
+ * Progress bar is wrapped with error boundary to prevent
+ * data issues from crashing the timeline view.
  */
 
 import { Clock, RotateCcw, Timer, TrendingUp, TrendingDown, Minus } from "lucide-react";
 import { cn } from "../../../../lib/utils";
+import { ProgressBar, ProgressErrorBoundary } from "../../../ui";
 import { getStatusColors } from "@/design-system";
 import type { TimelineStats } from "./types";
+import type { StepStats } from "../shared/types";
 
 interface TimelineStatsBarProps {
   stats: TimelineStats;
+  /** Step statistics for showing overall progress */
+  stepStats?: StepStats;
   /** Additional CSS classes */
   className?: string;
+  /** Show compact version without progress bar */
+  compact?: boolean;
 }
 
 /**
@@ -60,7 +69,12 @@ function formatDuration(ms: number): string {
 /**
  * Timeline-specific statistics bar component.
  */
-export function TimelineStatsBar({ stats, className }: TimelineStatsBarProps) {
+export function TimelineStatsBar({
+  stats,
+  stepStats,
+  className,
+  compact = false,
+}: TimelineStatsBarProps) {
   const successColors = getStatusColors("success");
   const errorColors = getStatusColors("error");
 
@@ -77,13 +91,40 @@ export function TimelineStatsBar({ stats, className }: TimelineStatsBarProps) {
     }
   }
 
+  // Determine overall progress status
+  const getProgressStatus = () => {
+    if (!stepStats) return "active";
+    if (stepStats.failed > 0) return "error";
+    if (stepStats.completed === stepStats.total && stepStats.total > 0) return "success";
+    return "active";
+  };
+
   return (
     <div
       className={cn(
-        "flex items-center gap-6 border-b border-border px-4 py-3 bg-muted/20",
+        "border-b border-border px-4 py-3 bg-muted/20",
         className,
       )}
     >
+      {/* Overall progress bar (shown when stepStats available and not compact) */}
+      {stepStats && !compact && stepStats.total > 0 && (
+        <div className="mb-3">
+          <ProgressErrorBoundary componentName="TimelineStatsBar.ProgressBar">
+            <ProgressBar
+              current={stepStats.completed}
+              total={stepStats.total}
+              status={getProgressStatus()}
+              showLabel
+              labelFormat="both"
+              size="sm"
+              description={`${stepStats.pending} pending${stepStats.failed > 0 ? `, ${stepStats.failed} failed` : ""}`}
+            />
+          </ProgressErrorBoundary>
+        </div>
+      )}
+
+      {/* Stats row */}
+      <div className="flex items-center gap-6">
       {/* Elapsed Time */}
       <div className="flex items-center gap-2">
         <Clock className="h-4 w-4 text-muted-foreground" />
@@ -150,6 +191,7 @@ export function TimelineStatsBar({ stats, className }: TimelineStatsBarProps) {
           </div>
         </div>
       )}
+      </div>
     </div>
   );
 }

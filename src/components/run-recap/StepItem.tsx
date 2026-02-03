@@ -2,6 +2,8 @@
  * StepItem Component
  *
  * Displays a single step in the recap timeline with expandable children.
+ * Progress indicators are wrapped with error boundaries to prevent
+ * parsing errors from crashing the recap view.
  */
 
 import { useState } from "react";
@@ -9,7 +11,23 @@ import { ChevronDown, ChevronRight, Play, Zap, Bot, TestTube, Activity } from "l
 import type { LucideIcon } from "lucide-react";
 import { formatDuration } from "@/lib/formatting";
 import { getStatusIcon } from "@/lib/status-icons";
+import { InlineProgressBar, type ProgressType, ProgressErrorBoundary } from "@/components/ui";
 import type { RecapStep } from "@/types/recap";
+
+/**
+ * Map progress type string to ProgressType for semantic coloring.
+ */
+function mapToProgressType(type: string | undefined): ProgressType {
+  if (!type) return "default";
+  const mapping: Record<string, ProgressType> = {
+    file_progress: "file_progress",
+    analysis_progress: "analysis_progress",
+    test_progress: "test_progress",
+    review_progress: "review_progress",
+    iteration_progress: "iteration_progress",
+  };
+  return mapping[type] || "default";
+}
 
 /**
  * Get the icon for a step type.
@@ -40,7 +58,10 @@ export function StepItem({ step, depth = 0 }: StepItemProps) {
   const Icon = getStepIcon(step.step_type);
 
   return (
-    <div data-ui-id={`recap-step-item-${step.step_type}`} className={depth > 0 ? "ml-6 border-l border-border pl-4" : ""}>
+    <div
+      data-ui-id={`recap-step-item-${step.step_type}`}
+      className={depth > 0 ? "ml-6 border-l border-border pl-4" : ""}
+    >
       <button
         data-ui-id="recap-step-toggle-btn"
         onClick={() => hasChildren && setExpanded(!expanded)}
@@ -79,9 +100,25 @@ export function StepItem({ step, depth = 0 }: StepItemProps) {
                 ({formatDuration(step.duration_ms)})
               </span>
             )}
+            {/* Show completed progress inline - wrapped with error boundary */}
+            {step.progress && step.progress.total !== null && (
+              <ProgressErrorBoundary compact componentName="StepItem.InlineProgressBar">
+                <InlineProgressBar
+                  current={step.progress.current}
+                  total={step.progress.total}
+                  progressType={mapToProgressType(step.progress.type)}
+                />
+              </ProgressErrorBoundary>
+            )}
           </div>
           {step.summary && (
             <p className="text-xs text-muted-foreground truncate mt-0.5">{step.summary}</p>
+          )}
+          {/* Progress description if available */}
+          {step.progress?.description && (
+            <p className="text-xs text-muted-foreground truncate mt-0.5">
+              {step.progress.description}
+            </p>
           )}
           {/* Don't show error if it's identical to summary (avoid duplication) */}
           {step.error && step.error !== step.summary && (

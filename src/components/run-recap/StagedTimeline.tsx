@@ -3,6 +3,8 @@
  *
  * Displays steps grouped by workflow stages (setup, agentic, verification, completion).
  * Uses collapsible sections with stage icons and status indicators.
+ * Progress indicators are wrapped with error boundaries to prevent
+ * parsing errors from crashing the recap view.
  */
 
 import { useState } from "react";
@@ -15,14 +17,27 @@ import {
   ChevronRight,
   Activity,
 } from "lucide-react";
-import {
-  WORKFLOW_STAGE_CONFIG,
-  type WorkflowStage,
-} from "@/types/dashboard/activity-types";
+import { WORKFLOW_STAGE_CONFIG, type WorkflowStage } from "@/types/dashboard/activity-types";
 import type { StageRecap, RecapStep } from "@/types/recap";
 import { getStepIconConfigWithFallback } from "@/lib/step-icons";
 import { formatDuration } from "@/lib/formatting";
 import { getStatusIcon } from "@/lib/status-icons";
+import { InlineProgressBar, type ProgressType, ProgressErrorBoundary } from "@/components/ui";
+
+/**
+ * Map progress type string to ProgressType for semantic coloring.
+ */
+function mapToProgressType(type: string | undefined): ProgressType {
+  if (!type) return "default";
+  const mapping: Record<string, ProgressType> = {
+    file_progress: "file_progress",
+    analysis_progress: "analysis_progress",
+    test_progress: "test_progress",
+    review_progress: "review_progress",
+    iteration_progress: "iteration_progress",
+  };
+  return mapping[type] || "default";
+}
 
 // Stage icons mapping
 const STAGE_ICONS: Record<WorkflowStage, React.ElementType> = {
@@ -40,17 +55,17 @@ const COLOR_CLASSES: Record<string, { bg: string; text: string }> = {
   teal: { bg: "bg-teal-500/10", text: "text-teal-500" },
 };
 
-
 interface StepItemProps {
   step: RecapStep;
 }
 
 function StepItem({ step }: StepItemProps) {
   // Use icon_type if available, falling back to step_type
-  const { icon: Icon, bgClass, textClass } = getStepIconConfigWithFallback(
-    step.icon_type,
-    step.step_type
-  );
+  const {
+    icon: Icon,
+    bgClass,
+    textClass,
+  } = getStepIconConfigWithFallback(step.icon_type, step.step_type);
 
   // Prefer work_summary (AI-generated) over summary (deterministic)
   const displaySummary = step.work_summary || step.summary;
@@ -59,7 +74,10 @@ function StepItem({ step }: StepItemProps) {
   const showError = step.error && step.error !== displaySummary;
 
   return (
-    <div data-ui-id={`recap-staged-step-${step.step_type}`} className="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-muted/30 transition-colors">
+    <div
+      data-ui-id={`recap-staged-step-${step.step_type}`}
+      className="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-muted/30 transition-colors"
+    >
       {/* Status icon */}
       {getStatusIcon(step.status)}
 
@@ -77,9 +95,25 @@ function StepItem({ step }: StepItemProps) {
               ({formatDuration(step.duration_ms)})
             </span>
           )}
+          {/* Show completed progress inline - wrapped with error boundary */}
+          {step.progress && step.progress.total !== null && (
+            <ProgressErrorBoundary compact componentName="StagedTimeline.InlineProgressBar">
+              <InlineProgressBar
+                current={step.progress.current}
+                total={step.progress.total}
+                progressType={mapToProgressType(step.progress.type)}
+              />
+            </ProgressErrorBoundary>
+          )}
         </div>
         {displaySummary && (
           <p className="text-xs text-muted-foreground truncate mt-0.5">{displaySummary}</p>
+        )}
+        {/* Progress description if available */}
+        {step.progress?.description && (
+          <p className="text-xs text-muted-foreground truncate mt-0.5">
+            {step.progress.description}
+          </p>
         )}
         {showError && <p className="text-xs text-red-400 truncate mt-0.5">{step.error}</p>}
       </div>
@@ -92,9 +126,7 @@ interface StageSectionProps {
 }
 
 function StageSection({ stage }: StageSectionProps) {
-  const [expanded, setExpanded] = useState(
-    stage.status === "failed" || stage.status === "running"
-  );
+  const [expanded, setExpanded] = useState(stage.status === "failed" || stage.status === "running");
 
   const stageKey = stage.stage as WorkflowStage;
   const config = WORKFLOW_STAGE_CONFIG[stageKey];
@@ -115,11 +147,15 @@ function StageSection({ stage }: StageSectionProps) {
           <span className="font-medium">{stage.display_name}</span>
           {getStatusIcon(stage.status)}
           {/* Only show iteration badge for stages that loop (verification/agentic) */}
-          {(stage.stage === "verification" || stage.stage === "agentic") && stage.iteration !== undefined && (
-            <span data-ui-id={`recap-iteration-${stage.stage}-${stage.iteration}`} className="text-xs text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
-              Iteration {stage.iteration}
-            </span>
-          )}
+          {(stage.stage === "verification" || stage.stage === "agentic") &&
+            stage.iteration !== undefined && (
+              <span
+                data-ui-id={`recap-iteration-${stage.stage}-${stage.iteration}`}
+                className="text-xs text-muted-foreground bg-muted px-1.5 py-0.5 rounded"
+              >
+                Iteration {stage.iteration}
+              </span>
+            )}
           <span className="text-sm text-muted-foreground">
             ({stage.steps.length} {stage.steps.length === 1 ? "step" : "steps"})
           </span>

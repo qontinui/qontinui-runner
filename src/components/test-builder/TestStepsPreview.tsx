@@ -5,13 +5,7 @@
  * showing each step with its action, expected outcome, and type.
  */
 
-import {
-  Settings,
-  Send,
-  CheckCircle,
-  Trash2,
-  ChevronRight,
-} from "lucide-react";
+import { Settings, Send, CheckCircle, Trash2, ChevronRight } from "lucide-react";
 import type { TestStep } from "../../types/test-orchestrator";
 
 interface TestStepsPreviewProps {
@@ -113,11 +107,7 @@ function StepTypeBadge({ type }: { type: string }) {
   };
 
   return (
-    <span
-      className={`px-1.5 py-0.5 text-xs rounded ${colors[type] || colors.setup}`}
-    >
-      {type}
-    </span>
+    <span className={`px-1.5 py-0.5 text-xs rounded ${colors[type] || colors.setup}`}>{type}</span>
   );
 }
 

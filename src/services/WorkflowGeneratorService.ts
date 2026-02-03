@@ -163,9 +163,7 @@ class WorkflowGeneratorServiceClass {
     } = options;
 
     // Filter states if specific IDs provided
-    const states = stateIds
-      ? config.states.filter((s) => stateIds.includes(s.id))
-      : config.states;
+    const states = stateIds ? config.states.filter((s) => stateIds.includes(s.id)) : config.states;
 
     // Find initial state(s)
     const initialStates = states.filter((s) => s.isInitial);
@@ -240,8 +238,7 @@ class WorkflowGeneratorServiceClass {
     includeContexts?: boolean,
   ): AgenticStep {
     const semanticContext = this.buildSemanticContext(states);
-    const contextContent =
-      includeContexts && contexts ? this.buildContextContent(contexts) : "";
+    const contextContent = includeContexts && contexts ? this.buildContextContent(contexts) : "";
 
     const content = `You are automating an application using a state machine.
 The verification phase found issues reaching one or more expected states.
@@ -299,7 +296,9 @@ Fix any navigation issues to successfully reach all expected states.`;
           state.stateImages.forEach((img) => {
             const patternCount = img.patterns?.length || 0;
             const ocrInfo = img.ocrText ? ` (OCR: "${img.ocrText}")` : "";
-            lines.push(`- ${img.name}${ocrInfo}${patternCount > 1 ? ` (${patternCount} variations)` : ""}`);
+            lines.push(
+              `- ${img.name}${ocrInfo}${patternCount > 1 ? ` (${patternCount} variations)` : ""}`,
+            );
           });
         }
 
@@ -308,7 +307,9 @@ Fix any navigation issues to successfully reach all expected states.`;
           lines.push("**Regions:**");
           state.regions.forEach((region) => {
             const searchFlag = region.isSearchRegion ? " [search region]" : "";
-            lines.push(`- ${region.name}: ${region.width}x${region.height} at (${region.x}, ${region.y})${searchFlag}`);
+            lines.push(
+              `- ${region.name}: ${region.width}x${region.height} at (${region.x}, ${region.y})${searchFlag}`,
+            );
           });
         }
 
@@ -658,7 +659,9 @@ ${additionalContext}
       guidance.push("- This is a goal state - reaching it indicates success");
     }
 
-    return guidance.length > 0 ? guidance.join("\n") : "- Navigate to this state using the application's UI";
+    return guidance.length > 0
+      ? guidance.join("\n")
+      : "- Navigate to this state using the application's UI";
   }
 
   /**

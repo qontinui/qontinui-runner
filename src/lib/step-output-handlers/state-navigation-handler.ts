@@ -67,7 +67,7 @@ export class StateNavigationHandler implements StepOutputHandler<StateNavigation
 
     const targetState = raw.target_state || config.target_state || "";
     const finalState = raw.final_state || raw.current_state;
-    const reached = raw.reached ?? (finalState === targetState);
+    const reached = raw.reached ?? finalState === targetState;
 
     return {
       id: generateStepOutputId(),
@@ -170,10 +170,7 @@ export class StateNavigationHandler implements StepOutputHandler<StateNavigation
       description: "Whether the target state was reached",
       type: "boolean",
       example_value: output.reached,
-      suggested_assertions: [
-        "Assert target state was reached",
-        "Assert navigation succeeded",
-      ],
+      suggested_assertions: ["Assert target state was reached", "Assert navigation succeeded"],
     });
 
     // Target state

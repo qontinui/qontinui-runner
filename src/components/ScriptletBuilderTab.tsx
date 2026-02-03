@@ -101,9 +101,7 @@ export function ScriptletBuilderTab({
 
   // Get names of selected scriptlets for dialog
   const getSelectedNames = useCallback(() => {
-    return scriptlets
-      .filter((s) => selectedIds.has(s.id))
-      .map((s) => s.name);
+    return scriptlets.filter((s) => selectedIds.has(s.id)).map((s) => s.name);
   }, [scriptlets, selectedIds]);
 
   // Fetch scriptlets
@@ -308,10 +306,7 @@ export function ScriptletBuilderTab({
             className="mb-3"
             actions={[
               toolbarActions.aiPlaceholder(),
-              toolbarActions.delete(
-                () => setIsSelectionMode(!isSelectionMode),
-                isSelectionMode
-              ),
+              toolbarActions.delete(() => setIsSelectionMode(!isSelectionMode), isSelectionMode),
               toolbarActions.new(startCreate, "New"),
             ]}
           />
@@ -332,12 +327,10 @@ export function ScriptletBuilderTab({
         {/* Selection Mode Header */}
         {isSelectionMode && (
           <div className="flex items-center justify-between px-4 py-2 bg-red-500/10 border-b border-red-500/30">
-            <span className="text-sm text-red-400">
-              {selectedIds.size} selected
-            </span>
+            <span className="text-sm text-red-400">{selectedIds.size} selected</span>
             <div className="flex items-center gap-2">
               <button
-                onClick={() => setSelectedIds(new Set(filteredScriptlets.map(s => s.id)))}
+                onClick={() => setSelectedIds(new Set(filteredScriptlets.map((s) => s.id)))}
                 className="px-2 py-1 text-xs bg-neutral-700 hover:bg-neutral-600 text-neutral-200 rounded"
               >
                 Select All
@@ -383,7 +376,9 @@ export function ScriptletBuilderTab({
               {filteredScriptlets.map((scriptlet) => (
                 <button
                   key={scriptlet.id}
-                  onClick={() => isSelectionMode ? toggleSelection(scriptlet.id) : selectScriptlet(scriptlet)}
+                  onClick={() =>
+                    isSelectionMode ? toggleSelection(scriptlet.id) : selectScriptlet(scriptlet)
+                  }
                   className={`w-full text-left p-3 rounded-lg transition-colors ${
                     selectedScriptlet?.id === scriptlet.id
                       ? "bg-neutral-700"

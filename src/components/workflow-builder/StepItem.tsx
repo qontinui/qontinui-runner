@@ -83,8 +83,7 @@ export function StepItem({
   onToggleSelect,
 }: StepItemProps) {
   // Check if this is a summary step (locked to last position)
-  const isSummaryStep =
-    step.type === "prompt" && (step as PromptStep).is_summary_step === true;
+  const isSummaryStep = step.type === "prompt" && (step as PromptStep).is_summary_step === true;
 
   // Get the appropriate icon and colors from shared config
   const getIconAndColors = () => {
@@ -207,11 +206,12 @@ export function StepItem({
         flex items-center gap-2 p-2 rounded-md
         bg-zinc-800 hover:bg-zinc-750
         border
-        ${isSelectionMode && isSelectedForDelete
-          ? "border-red-500/50 bg-red-500/10"
-          : isSelected
-            ? "ring-2 ring-blue-500/50 border-blue-500/30"
-            : "border-zinc-700 hover:border-zinc-600"
+        ${
+          isSelectionMode && isSelectedForDelete
+            ? "border-red-500/50 bg-red-500/10"
+            : isSelected
+              ? "ring-2 ring-blue-500/50 border-blue-500/30"
+              : "border-zinc-700 hover:border-zinc-600"
         }
         cursor-pointer transition-all group
       `}
@@ -220,15 +220,11 @@ export function StepItem({
       {isSelectionMode && (
         <div
           className={`flex-shrink-0 w-5 h-5 rounded border-2 flex items-center justify-center transition-colors ${
-            isSelectedForDelete
-              ? "bg-red-500 border-red-500"
-              : "border-zinc-500"
+            isSelectedForDelete ? "bg-red-500 border-red-500" : "border-zinc-500"
           }`}
           data-ui-id={`workflow-builder-step-${step.id}-select-checkbox`}
         >
-          {isSelectedForDelete && (
-            <Check className="w-3 h-3 text-white" />
-          )}
+          {isSelectedForDelete && <Check className="w-3 h-3 text-white" />}
         </div>
       )}
 

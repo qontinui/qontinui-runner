@@ -54,6 +54,35 @@ export type {
   UseWebSocketAutoConnectReturn,
 } from "./useWebSocketAutoConnect";
 
+export {
+  useWebSocketEvents,
+  useWsOrchestratorState,
+  isTauriEnvironment,
+} from "./useWebSocketEvents";
+export type {
+  UseWebSocketEventsOptions,
+  UseWebSocketEventsReturn,
+  UseWsOrchestratorStateOptions,
+  UseWsOrchestratorStateReturn,
+  WebSocketMessage,
+  OrchestratorStateChangePayload,
+  StepProgressPayload,
+  TaskRunUpdatePayload,
+  ExecutorEventPayload,
+  OrchestratorStateChangeCallback,
+  StepProgressCallback,
+  TaskRunUpdateCallback,
+  ExecutorEventCallback,
+} from "./useWebSocketEvents";
+
+export { useUnifiedEvents, useUnifiedOrchestratorState } from "./useUnifiedEvents";
+export type {
+  UseUnifiedEventsOptions,
+  UseUnifiedEventsReturn,
+  UseUnifiedOrchestratorStateOptions,
+  UseUnifiedOrchestratorStateReturn,
+} from "./useUnifiedEvents";
+
 export { useAiTaskPolling, executeAiTask } from "./useAiTaskPolling";
 export type { UseAiTaskPollingOptions, UseAiTaskPollingResult } from "./useAiTaskPolling";
 
@@ -174,3 +203,65 @@ export type { GuiLockState, UseGuiLockResult } from "./useGuiLock";
 
 export { useBridgeExecution } from "./useBridgeExecution";
 export type { BridgeInfo, UseBridgeExecutionResult } from "./useBridgeExecution";
+
+export { useElementThumbnails } from "./useElementThumbnails";
+export type {
+  ElementWithBounds,
+  CacheStats,
+  ThumbnailProgress,
+  UseElementThumbnailsReturn,
+  UseElementThumbnailsOptions,
+} from "./useElementThumbnails";
+
+// Performance monitoring hooks (dev mode only)
+export {
+  useRenderPerformance,
+  useBatchRenderPerformance,
+  withRenderPerformance,
+} from "./useRenderPerformance";
+export type {
+  UseRenderPerformanceOptions,
+  UseRenderPerformanceReturn,
+  BatchRenderMetrics,
+  WithRenderPerformanceProps,
+} from "./useRenderPerformance";
+
+export {
+  useVirtualScrollMetrics,
+  createScrollMetricsTracker,
+} from "./useVirtualScrollMetrics";
+export type {
+  UseVirtualScrollMetricsOptions,
+  UseVirtualScrollMetricsReturn,
+  WithVirtualScrollMetricsProps,
+} from "./useVirtualScrollMetrics";
+
+export { useWebSocketLatency, compareToPolling } from "./useWebSocketLatency";
+export type {
+  UseWebSocketLatencyOptions,
+  UseWebSocketLatencyReturn,
+  WebSocketLatencyStats,
+  PollingComparison,
+} from "./useWebSocketLatency";
+
+// Unified Workflow Execution hooks (single source of truth)
+export {
+  useWorkflowExecution,
+  useWorkflowExecutionOptional,
+  useWorkflowOrchestratorState,
+  useWorkflowTimelineData,
+  useWorkflowCheckpoints,
+  useStepProgress,
+  useCurrentTaskRunIdFromContext,
+  useIsTaskRunningFromContext,
+  useWorkflowConnectionStatus,
+  useWorkflowStatus,
+  useCurrentStep,
+  useWorkflowStepStats,
+} from "./useWorkflowExecution";
+export type {
+  OrchestratorStateResult,
+  CheckpointData,
+  WorkflowConnectionStatus,
+  WorkflowStatusSummary,
+} from "./useWorkflowExecution";

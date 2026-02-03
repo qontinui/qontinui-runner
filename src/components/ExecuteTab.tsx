@@ -43,9 +43,7 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
     setMacrosLoading(true);
     try {
       const macrosRes = await fetch(`${API_BASE}/macros`).catch(() => ({ ok: false }));
-      const macrosData = macrosRes.ok
-        ? await (macrosRes as Response).json()
-        : { success: false };
+      const macrosData = macrosRes.ok ? await (macrosRes as Response).json() : { success: false };
 
       // Sort by modified_at descending (most recent first)
       if (macrosData.success) {

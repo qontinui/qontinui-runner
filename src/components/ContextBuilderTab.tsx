@@ -327,9 +327,7 @@ export function ContextBuilderTab({
     setIsDeleting(true);
     try {
       // Get contexts to delete (only non-builtin can be deleted)
-      const toDelete = contexts.filter(
-        (c) => selectedIds.has(c.id) && c.scope !== "builtin"
-      );
+      const toDelete = contexts.filter((c) => selectedIds.has(c.id) && c.scope !== "builtin");
 
       // Delete in parallel
       const deletePromises = toDelete.map((c) => deleteContextFn(c.scope, c.id));
@@ -354,9 +352,7 @@ export function ContextBuilderTab({
 
   // Get names of selected contexts for the delete dialog
   const getSelectedNames = useCallback((): string[] => {
-    return contexts
-      .filter((c) => selectedIds.has(c.id))
-      .map((c) => c.name);
+    return contexts.filter((c) => selectedIds.has(c.id)).map((c) => c.name);
   }, [contexts, selectedIds]);
 
   return (
@@ -378,10 +374,7 @@ export function ContextBuilderTab({
             actions={[
               toolbarActions.ai(() => setShowAiGenerator(true)),
               toolbarActions.new(startCreate, "New"),
-              toolbarActions.delete(
-                () => setIsSelectionMode(!isSelectionMode),
-                isSelectionMode
-              ),
+              toolbarActions.delete(() => setIsSelectionMode(!isSelectionMode), isSelectionMode),
             ]}
           />
 
@@ -401,9 +394,7 @@ export function ContextBuilderTab({
         {/* Selection Mode Header */}
         {isSelectionMode && (
           <div className="flex items-center justify-between px-4 py-2 bg-red-500/10 border-b border-red-500/30">
-            <span className="text-sm text-red-400">
-              {selectedIds.size} selected
-            </span>
+            <span className="text-sm text-red-400">{selectedIds.size} selected</span>
             <div className="flex items-center gap-2">
               {selectedIds.size > 0 && (
                 <button
@@ -454,9 +445,7 @@ export function ContextBuilderTab({
                         ? "bg-neutral-700"
                         : "hover:bg-neutral-800"
                   } ${isSelectionMode ? "border" : ""} ${
-                    isSelectionMode && !selectedIds.has(context.id)
-                      ? "border-transparent"
-                      : ""
+                    isSelectionMode && !selectedIds.has(context.id) ? "border-transparent" : ""
                   }`}
                 >
                   {/* Checkbox in selection mode */}
@@ -468,9 +457,7 @@ export function ContextBuilderTab({
                           : "border-neutral-500"
                       }`}
                     >
-                      {selectedIds.has(context.id) && (
-                        <Check className="w-3 h-3 text-white" />
-                      )}
+                      {selectedIds.has(context.id) && <Check className="w-3 h-3 text-white" />}
                     </div>
                   )}
                   <div className="flex-1 min-w-0">

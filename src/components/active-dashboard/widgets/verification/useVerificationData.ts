@@ -113,9 +113,7 @@ export function useVerificationData(): VerificationData {
 
           // Set start time from first step
           if (steps.length > 0 && !startTime) {
-            const earliest = Math.min(
-              ...steps.filter((s) => s.startTime).map((s) => s.startTime!),
-            );
+            const earliest = Math.min(...steps.filter((s) => s.startTime).map((s) => s.startTime!));
             if (earliest && earliest !== Infinity) {
               setStartTime(earliest);
             }

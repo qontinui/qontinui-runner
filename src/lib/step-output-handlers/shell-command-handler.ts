@@ -136,8 +136,7 @@ export class ShellCommandHandler implements StepOutputHandler<ShellCommandStepOu
       lines.push("");
       lines.push("**Extracted Variables:**");
       for (const [key, value] of Object.entries(output.extractions)) {
-        const valueStr =
-          typeof value === "object" ? JSON.stringify(value) : String(value);
+        const valueStr = typeof value === "object" ? JSON.stringify(value) : String(value);
         lines.push(`- \`${key}\`: ${valueStr.substring(0, 100)}`);
       }
     }
@@ -179,10 +178,7 @@ export class ShellCommandHandler implements StepOutputHandler<ShellCommandStepOu
       description: "The command exit code (0 typically means success)",
       type: "number",
       example_value: output.exit_code,
-      suggested_assertions: [
-        "Assert exit code equals 0",
-        "Assert exit code is in expected range",
-      ],
+      suggested_assertions: ["Assert exit code equals 0", "Assert exit code is in expected range"],
     });
 
     // Stdout

@@ -88,7 +88,6 @@ export function Settings({
   onLoadProjects,
   webSocketState,
 }: SettingsProps) {
-
   const [activeTab, setActiveTab] = useState<SettingsTab>(() => {
     // If defaultTab is provided and valid, use it
     if (defaultTab && (VALID_TABS as readonly string[]).includes(defaultTab)) {

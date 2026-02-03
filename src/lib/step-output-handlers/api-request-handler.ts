@@ -141,8 +141,7 @@ export class ApiRequestHandler implements StepOutputHandler<ApiRequestStepOutput
       lines.push("");
       lines.push("**Extracted Variables:**");
       for (const [key, value] of Object.entries(output.extractions)) {
-        const valueStr =
-          typeof value === "object" ? JSON.stringify(value) : String(value);
+        const valueStr = typeof value === "object" ? JSON.stringify(value) : String(value);
         lines.push(`- \`${key}\`: ${valueStr.substring(0, 100)}`);
       }
     }
@@ -262,9 +261,8 @@ export class ApiRequestHandler implements StepOutputHandler<ApiRequestStepOutput
           name: key,
           description: `Array with ${value.length} items`,
           type: "array",
-          example_value: value.length > 5
-            ? `[${value.length} items]`
-            : JSON.stringify(value.slice(0, 5)),
+          example_value:
+            value.length > 5 ? `[${value.length} items]` : JSON.stringify(value.slice(0, 5)),
           suggested_assertions: [
             `Assert ${key} has expected length`,
             `Assert ${key} contains expected items`,
@@ -286,10 +284,7 @@ export class ApiRequestHandler implements StepOutputHandler<ApiRequestStepOutput
         description: `Response field: ${key}`,
         type: this.getJsType(value),
         example_value: this.truncateValue(value),
-        suggested_assertions: [
-          `Assert ${key} equals expected value`,
-          `Assert ${key} is not null`,
-        ],
+        suggested_assertions: [`Assert ${key} equals expected value`, `Assert ${key} is not null`],
       });
     }
   }

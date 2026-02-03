@@ -85,6 +85,7 @@ export function ApiRequestStepEditor({
   const [followRedirects, setFollowRedirects] = useState(step.follow_redirects ?? true);
   const [extractions, setExtractions] = useState<ApiVariableExtraction[]>(step.extractions || []);
   const [assertions, setAssertions] = useState<ApiAssertion[]>(step.assertions || []);
+  const [outputVariable, setOutputVariable] = useState(step.output_variable || "");
   const [runOnSubsequent, setRunOnSubsequent] = useState(
     step.run_on_subsequent_iterations ?? false,
   );
@@ -130,6 +131,7 @@ export function ApiRequestStepEditor({
       follow_redirects: followRedirects,
       extractions: extractions.length > 0 ? extractions : undefined,
       assertions: assertions.length > 0 ? assertions : undefined,
+      output_variable: outputVariable.trim() || undefined,
       run_on_subsequent_iterations: runOnSubsequent,
     };
 
@@ -590,6 +592,26 @@ export function ApiRequestStepEditor({
               />
             </div>
           )}
+
+          {/* Output Variable */}
+          <div className="space-y-1.5">
+            <label className="text-sm text-zinc-400 flex items-center gap-2">
+              Output Variable
+              <span className="text-xs text-zinc-600">(optional)</span>
+            </label>
+            <input
+              type="text"
+              value={outputVariable}
+              onChange={(e) => setOutputVariable(e.target.value)}
+              placeholder="response_data"
+              className="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-1 focus:ring-cyan-500/50"
+            />
+            <p className="text-xs text-zinc-500">
+              Store the response body in this variable. Use {"{{variable_name}}"} in subsequent
+              steps. Add ".path.to.field" to extract a specific value (e.g., "auth.token" extracts
+              $.token).
+            </p>
+          </div>
 
           {/* Variable Extractions */}
           <div className="border border-zinc-700 rounded-md overflow-hidden">

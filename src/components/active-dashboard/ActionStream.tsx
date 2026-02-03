@@ -3,13 +3,20 @@
  *
  * Displays a live stream of actions being executed.
  * Shows action type, status, timing, and hierarchical structure.
+ * Uses virtual scrolling for large action lists (100+ items) to maintain performance.
  */
 
+import { useCallback, type CSSProperties } from "react";
 import { CheckCircle2, XCircle, Loader2, ChevronRight } from "lucide-react";
 import { cn } from "../../lib/utils";
-import { Badge, ScrollArea } from "../ui";
+import { Badge, ScrollArea, FixedVirtualList } from "../ui";
 import type { ActionStreamProps, ActionItem, ActionType, ActionStatus } from "./types";
 import { getStatusColors, getAccentColors } from "@/design-system";
+
+/** Threshold for switching to virtual scrolling */
+const VIRTUAL_SCROLL_THRESHOLD = 100;
+/** Height of each action row in pixels */
+const ACTION_ROW_HEIGHT = 64;
 
 /**
  * Get action type color class using design system.
@@ -93,6 +100,22 @@ function ActionRow({ action, isActive }: { action: ActionItem; isActive: boolean
 }
 
 export function ActionStream({ actions, currentAction: _currentAction }: ActionStreamProps) {
+  // Use virtual scrolling for large lists
+  const useVirtualScroll = actions.length > VIRTUAL_SCROLL_THRESHOLD;
+
+  // Render function for virtualized items
+  const renderVirtualItem = useCallback(
+    (action: ActionItem, _index: number, style: CSSProperties) => (
+      <div style={style}>
+        <ActionRow action={action} isActive={action.status === "running"} />
+      </div>
+    ),
+    [],
+  );
+
+  // Key extractor for virtual list
+  const getItemKey = useCallback((action: ActionItem) => action.id, []);
+
   return (
     <div className="flex h-[40%] flex-col bg-card">
       <div className="flex items-center justify-between border-b border-border px-4 py-2">
@@ -100,17 +123,31 @@ export function ActionStream({ actions, currentAction: _currentAction }: ActionS
         <div className="flex gap-2">
           <Badge variant="muted" className="text-xs">
             {actions.length} actions
+            {useVirtualScroll && " (virtualized)"}
           </Badge>
         </div>
       </div>
 
-      <ScrollArea className="flex-1">
-        <div className="flex flex-col-reverse">
-          {actions.map((action) => (
-            <ActionRow key={action.id} action={action} isActive={action.status === "running"} />
-          ))}
-        </div>
-      </ScrollArea>
+      {useVirtualScroll ? (
+        /* Virtual scrolling for large lists */
+        <FixedVirtualList
+          items={actions}
+          itemHeight={ACTION_ROW_HEIGHT}
+          renderItem={renderVirtualItem}
+          getItemKey={getItemKey}
+          reverseOrder={true}
+          overscanCount={10}
+        />
+      ) : (
+        /* Regular scrolling for small lists */
+        <ScrollArea className="flex-1">
+          <div className="flex flex-col-reverse">
+            {actions.map((action) => (
+              <ActionRow key={action.id} action={action} isActive={action.status === "running"} />
+            ))}
+          </div>
+        </ScrollArea>
+      )}
     </div>
   );
 }

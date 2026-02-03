@@ -6,13 +6,14 @@
  */
 
 import { useState } from "react";
-import { Brain, RefreshCw, Archive, Webhook, ChevronDown, Circle, Radio } from "lucide-react";
+import { Brain, RefreshCw, Archive, Webhook, ChevronDown, Circle, Radio, ListChecks } from "lucide-react";
 import { Badge } from "../../../ui/Badge";
 import { ScrollArea } from "../../../ui/ScrollArea";
 import { RoutingStatusSection } from "../../../execution-status/RoutingStatusSection";
 import { RetryStatusSection } from "../../../execution-status/RetryStatusSection";
 import { CompressionStatusSection } from "../../../execution-status/CompressionStatusSection";
 import { HookExecutionSection } from "../../../execution-status/HookExecutionSection";
+import { SubStepProgressWidget } from "../sub-step-progress";
 import { getStatusColors, getAccentColors } from "@/design-system";
 import type { BaseWidgetProps } from "../../../../types/dashboard/widget-props";
 import type { ExecutionStatusWidgetData } from "./types";
@@ -100,11 +101,13 @@ function getStatusInfo(status: ExecutionStatusType["status"]) {
 
 export function ExecutionStatusFullWidget({ data }: ExecutionStatusFullWidgetProps) {
   const { status, isConnected } = data;
+  const [subStepExpanded, setSubStepExpanded] = useState(true);
   const statusInfo = getStatusInfo(status.status);
   const hasRouting = status.routing.decision !== null;
   const hasRetries = status.retry.state.errorHistory.length > 0;
   const hasCompression = status.compression.currentTokenCount !== null;
   const hasHooks = status.hooks.executionHistory.length > 0;
+  const hasSubSteps = status.subSteps.isActive || status.subSteps.steps.length > 0;
 
   return (
     <div className="flex flex-col h-full">
@@ -178,12 +181,38 @@ export function ExecutionStatusFullWidget({ data }: ExecutionStatusFullWidgetPro
               {status.hooks.executionHistory.length} hooks
             </span>
           )}
+          {hasSubSteps && (
+            <span className="flex items-center gap-1 text-muted-foreground">
+              <ListChecks className="w-3 h-3" />
+              {status.subSteps.completedCount}/{status.subSteps.totalCount} steps
+            </span>
+          )}
         </div>
       </div>
 
       {/* Scrollable Content */}
       <ScrollArea className="flex-1">
         <div className="divide-y divide-border/50">
+          {/* Sub-Step Progress Section - shown when active */}
+          {hasSubSteps && (
+            <CollapsibleSection
+              title="Sub-Step Progress"
+              icon={<ListChecks className="w-4 h-4" />}
+              badge={
+                <Badge variant={status.subSteps.isActive ? "info" : "success"} size="sm">
+                  {status.subSteps.completedCount}/{status.subSteps.totalCount}
+                </Badge>
+              }
+            >
+              <SubStepProgressWidget
+                subSteps={status.subSteps}
+                isExpanded={subStepExpanded}
+                onToggleExpand={() => setSubStepExpanded(!subStepExpanded)}
+                className="mt-2"
+              />
+            </CollapsibleSection>
+          )}
+
           {/* Task Routing Section */}
           <CollapsibleSection
             title="Task Routing"

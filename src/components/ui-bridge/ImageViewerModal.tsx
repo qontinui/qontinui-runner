@@ -62,7 +62,7 @@ export function ImageViewerModal({
         }, 200);
       }
     },
-    [onClose]
+    [onClose],
   );
 
   const imageSrc = `data:image/${format};base64,${imageData}`;
@@ -139,7 +139,7 @@ export function ImageViewerModal({
               alt={title}
               className={cn(
                 "object-contain rounded-lg shadow-2xl transition-transform duration-200",
-                "max-h-[90vh] max-w-[90vw]"
+                "max-h-[90vh] max-w-[90vw]",
               )}
               style={{
                 transform: `scale(${zoom}) rotate(${rotation}deg)`,

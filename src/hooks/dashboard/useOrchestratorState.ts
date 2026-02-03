@@ -1,15 +1,27 @@
 /**
  * useOrchestratorState Hook
  *
+ * @deprecated Use useWorkflowOrchestratorState() from useWorkflowExecution.ts instead.
+ * This hook now delegates to the unified WorkflowExecutionContext for consistency.
+ *
  * Fetches and tracks the orchestrator state for a running task.
  * Provides the current workflow stage (Setup, Agentic, Verification, Completion).
  *
- * Uses real-time Tauri events for instant updates with polling as fallback.
+ * Uses real-time events (Tauri or WebSocket) for instant updates with polling as fallback.
+ * Automatically detects the environment and uses:
+ * - Tauri events when running in Tauri desktop app
+ * - WebSocket events when running in browser or external client
  */
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { WorkflowStage } from "../../types/dashboard/activity-types";
+import {
+  useWebSocketEvents,
+  isTauriEnvironment,
+  type OrchestratorStateChangePayload,
+} from "../useWebSocketEvents";
+import { useWorkflowExecutionOptional } from "../../contexts/WorkflowExecutionContext";
 
 const API_BASE = "http://localhost:9876";
 // Polling is now fallback only - real-time events provide instant updates
@@ -17,17 +29,9 @@ const POLL_INTERVAL_MS = 5000;
 
 /**
  * Event payload from backend orchestrator-state-change events.
+ * Re-exported from useWebSocketEvents for type compatibility.
  */
-interface OrchestratorStateChangeEvent {
-  event_type: "OrchestratorStateChange";
-  data: {
-    task_run_id: string;
-    workflow_stage: string;
-    iteration: number;
-    phase: string;
-    state_data?: unknown;
-  };
-}
+type OrchestratorStateChangeEvent = OrchestratorStateChangePayload;
 
 /**
  * Response from the orchestrator state API endpoint.
@@ -83,6 +87,10 @@ export interface OrchestratorStateResult {
 /**
  * Hook to fetch and track orchestrator state for a task.
  *
+ * @deprecated Use useWorkflowOrchestratorState() from useWorkflowExecution.ts instead.
+ * This hook now attempts to use the unified WorkflowExecutionContext when available,
+ * falling back to direct API calls when outside the provider.
+ *
  * Uses real-time Tauri events for instant updates with polling as fallback.
  *
  * @param taskId - The ID of the task to track, or null if no task
@@ -92,10 +100,19 @@ export function useOrchestratorState(
   taskId: string | null,
   isRunning: boolean,
 ): OrchestratorStateResult {
+  // Try to use unified context if available
+  const unifiedContext = useWorkflowExecutionOptional();
+
+  // Check if we should use the unified context
+  const useUnifiedContext = unifiedContext && unifiedContext.taskRunId === taskId;
+
+  // ALL hooks must be called unconditionally (React rules of hooks)
+  // These are used for the legacy fallback implementation
   const [state, setState] = useState<OrchestratorStateResponse | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const unlistenRef = useRef<UnlistenFn | null>(null);
+  const isTauri = isTauriEnvironment();
 
   const fetchState = useCallback(async () => {
     if (!taskId) {
@@ -116,9 +133,28 @@ export function useOrchestratorState(
     }
   }, [taskId]);
 
-  // Subscribe to real-time orchestrator state change events
+  // Handle WebSocket events (when not in Tauri)
+  const handleWsOrchestratorChange = useCallback(
+    (payload: OrchestratorStateChangePayload) => {
+      if (payload.data?.task_run_id === taskId) {
+        // Trigger full fetch to get complete state
+        fetchState();
+      }
+    },
+    [taskId, fetchState]
+  );
+
+  // Subscribe to WebSocket events for non-Tauri environments
+  // Skip when using unified context (it has its own event handling)
+  useWebSocketEvents({
+    enabled: !useUnifiedContext && !isTauri && isRunning && !!taskId,
+    onOrchestratorStateChange: handleWsOrchestratorChange,
+  });
+
+  // Subscribe to Tauri events for Tauri environments
+  // Skip when using unified context (it has its own event handling)
   useEffect(() => {
-    if (!taskId || !isRunning) return;
+    if (useUnifiedContext || !isTauri || !taskId || !isRunning) return;
 
     let mounted = true;
 
@@ -140,8 +176,8 @@ export function useOrchestratorState(
         );
         unlistenRef.current = unlisten;
       } catch (e) {
-        // Tauri events not available (e.g., running in browser) - rely on polling
-        console.debug("Tauri events not available, using polling only:", e);
+        // Tauri events not available - rely on WebSocket/polling
+        console.debug("Tauri events not available:", e);
       }
     };
 
@@ -154,26 +190,47 @@ export function useOrchestratorState(
         unlistenRef.current = null;
       }
     };
-  }, [taskId, isRunning, fetchState]);
+  }, [useUnifiedContext, isTauri, taskId, isRunning, fetchState]);
 
-  // Initial fetch
+  // Initial fetch - skip when using unified context
   useEffect(() => {
+    if (useUnifiedContext) return;
     if (taskId) {
       setIsLoading(true);
       fetchState().finally(() => setIsLoading(false));
     } else {
       setState(null);
     }
-  }, [taskId, fetchState]);
+  }, [useUnifiedContext, taskId, fetchState]);
 
   // Fallback polling while running (reduced frequency since we have real-time events)
+  // Skip when using unified context
   useEffect(() => {
-    if (!taskId || !isRunning) return;
+    if (useUnifiedContext || !taskId || !isRunning) return;
 
     const interval = setInterval(fetchState, POLL_INTERVAL_MS);
     return () => clearInterval(interval);
-  }, [taskId, isRunning, fetchState]);
+  }, [useUnifiedContext, taskId, isRunning, fetchState]);
 
+  // If using unified context, return its values
+  if (useUnifiedContext && unifiedContext) {
+    return {
+      workflowStage: unifiedContext.workflowStage,
+      workflowStageDisplay: unifiedContext.workflowStageDisplay,
+      iteration: unifiedContext.iteration,
+      maxIterations: unifiedContext.maxIterations,
+      hasVerificationPlan: unifiedContext.hasVerificationPlan,
+      isComplete: unifiedContext.isComplete,
+      isPaused: unifiedContext.isPaused,
+      isStopped: unifiedContext.isStopped,
+      isOrchestrated: unifiedContext.isOrchestrated,
+      isLoading: unifiedContext.isLoading,
+      error: unifiedContext.error,
+      refresh: unifiedContext.refresh,
+    };
+  }
+
+  // Return legacy implementation values
   return {
     workflowStage: state?.workflow_stage ?? null,
     workflowStageDisplay: state?.workflow_stage_display ?? null,

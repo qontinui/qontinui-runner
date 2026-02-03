@@ -17,7 +17,11 @@ import type { ShellCommandExecution } from "../shared/types";
  * Check if command used variable expansion.
  */
 function hasVariables(command: ShellCommandExecution): boolean {
-  return Boolean(command.templateCommand && command.resolvedVariables && Object.keys(command.resolvedVariables).length > 0);
+  return Boolean(
+    command.templateCommand &&
+    command.resolvedVariables &&
+    Object.keys(command.resolvedVariables).length > 0,
+  );
 }
 
 /**

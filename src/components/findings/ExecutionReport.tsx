@@ -347,7 +347,10 @@ Work through ALL findings systematically. Fix each one and report your resolutio
   }
 
   return (
-    <div data-ui-id="findings-execution-report" className="flex-1 flex flex-col min-h-0 overflow-hidden">
+    <div
+      data-ui-id="findings-execution-report"
+      className="flex-1 flex flex-col min-h-0 overflow-hidden"
+    >
       {/* Header */}
       <div className="flex-shrink-0 border-b border-border p-4 space-y-3">
         {/* Report Title and Status */}

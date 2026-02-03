@@ -186,10 +186,7 @@ export class McpCallHandler implements StepOutputHandler<McpCallStepOutput> {
         description: "The result returned by the MCP tool",
         type: typeof output.result === "object" ? "object" : "any",
         example_value: this.truncateValue(output.result),
-        suggested_assertions: [
-          "Assert result is not null",
-          "Assert result contains expected data",
-        ],
+        suggested_assertions: ["Assert result is not null", "Assert result contains expected data"],
       });
 
       // Extract nested fields from result
@@ -263,10 +260,7 @@ export class McpCallHandler implements StepOutputHandler<McpCallStepOutput> {
         description: `Result field: ${key}`,
         type: this.getJsType(value),
         example_value: this.truncateValue(value),
-        suggested_assertions: [
-          `Assert ${key} equals expected value`,
-          `Assert ${key} is not null`,
-        ],
+        suggested_assertions: [`Assert ${key} equals expected value`, `Assert ${key} is not null`],
       });
 
       if (typeof value === "object" && value !== null && !Array.isArray(value)) {

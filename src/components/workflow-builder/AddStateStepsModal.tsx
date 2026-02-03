@@ -31,7 +31,12 @@ import {
 } from "lucide-react";
 import { useStateToWorkflow } from "../../hooks/useStateToWorkflow";
 import type { AddStateToWorkflowOptions } from "../../hooks/useStateToWorkflow";
-import type { UnifiedStep, WorkflowPhase, VerificationStep, PromptStep } from "../../types/unified-workflow";
+import type {
+  UnifiedStep,
+  WorkflowPhase,
+  VerificationStep,
+  PromptStep,
+} from "../../types/unified-workflow";
 
 /**
  * Detected configuration type based on state content analysis
@@ -64,15 +69,17 @@ interface ConfigTypeInfo {
  * - DOM-extracted content in strings
  * - Missing or empty imageId in patterns
  */
-function detectConfigType(states: Array<{
-  stateImages?: Array<{
-    patterns?: Array<{ imageId?: string }>;
-    ocrText?: string;
-  }>;
-  regions?: Array<{ x: number; y: number; width: number; height: number }>;
-  locations?: Array<{ x: number; y: number }>;
-  strings?: Array<{ value: string }>;
-}>): ConfigTypeInfo {
+function detectConfigType(
+  states: Array<{
+    stateImages?: Array<{
+      patterns?: Array<{ imageId?: string }>;
+      ocrText?: string;
+    }>;
+    regions?: Array<{ x: number; y: number; width: number; height: number }>;
+    locations?: Array<{ x: number; y: number }>;
+    strings?: Array<{ value: string }>;
+  }>,
+): ConfigTypeInfo {
   let hasImagePatterns = false;
   let hasOcrTextWithoutPatterns = false;
 
@@ -97,7 +104,8 @@ function detectConfigType(states: Array<{
     return {
       type: "visual_gui",
       label: "Visual GUI Automation",
-      description: "This config uses image templates for visual matching. Best with qontinui_vision tests.",
+      description:
+        "This config uses image templates for visual matching. Best with qontinui_vision tests.",
       icon: Monitor,
       iconColor: "text-blue-400",
       bgColor: "bg-blue-500/10",
@@ -138,7 +146,8 @@ function detectConfigType(states: Array<{
   return {
     type: "unknown",
     label: "Unknown Config Type",
-    description: "Could not determine config type. Choose test types based on your automation target.",
+    description:
+      "Could not determine config type. Choose test types based on your automation target.",
     icon: AlertCircle,
     iconColor: "text-zinc-400",
     bgColor: "bg-zinc-500/10",
@@ -151,7 +160,10 @@ function detectConfigType(states: Array<{
 interface AddStateStepsModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onStepsAdded: (steps: { verificationSteps: VerificationStep[]; agenticStep: PromptStep | null }) => void;
+  onStepsAdded: (steps: {
+    verificationSteps: VerificationStep[];
+    agenticStep: PromptStep | null;
+  }) => void;
   /** Function to add a step to the workflow */
   addStep: (step: UnifiedStep, phase: WorkflowPhase) => void;
 }
@@ -303,9 +315,7 @@ export function AddStateStepsModal({
               <Plus className="w-5 h-5 text-purple-400" />
             </div>
             <div>
-              <h2 className="text-lg font-semibold text-zinc-100">
-                Add State Steps to Workflow
-              </h2>
+              <h2 className="text-lg font-semibold text-zinc-100">Add State Steps to Workflow</h2>
               <p className="text-sm text-zinc-400">
                 Generate verification and agentic steps from a state
               </p>
@@ -333,8 +343,8 @@ export function AddStateStepsModal({
               <div>
                 <p className="text-amber-400 font-medium">No Configuration Loaded</p>
                 <p className="text-sm text-zinc-400 mt-1">
-                  Please load a state machine configuration first. Go to the Configuration
-                  panel and load a config file exported from qontinui-web.
+                  Please load a state machine configuration first. Go to the Configuration panel and
+                  load a config file exported from qontinui-web.
                 </p>
               </div>
             </div>
@@ -351,8 +361,12 @@ export function AddStateStepsModal({
           ) : (
             <>
               {/* Config Type Indicator */}
-              <div className={`flex items-start gap-3 p-3 ${configTypeInfo.bgColor} border ${configTypeInfo.borderColor} rounded-lg`}>
-                <configTypeInfo.icon className={`w-5 h-5 ${configTypeInfo.iconColor} flex-shrink-0 mt-0.5`} />
+              <div
+                className={`flex items-start gap-3 p-3 ${configTypeInfo.bgColor} border ${configTypeInfo.borderColor} rounded-lg`}
+              >
+                <configTypeInfo.icon
+                  className={`w-5 h-5 ${configTypeInfo.iconColor} flex-shrink-0 mt-0.5`}
+                />
                 <div className="flex-1">
                   <div className="flex items-center gap-2">
                     <p className={`font-medium ${configTypeInfo.iconColor}`}>
@@ -362,9 +376,7 @@ export function AddStateStepsModal({
                       ({states.length} state{states.length !== 1 ? "s" : ""})
                     </span>
                   </div>
-                  <p className="text-sm text-zinc-400 mt-0.5">
-                    {configTypeInfo.description}
-                  </p>
+                  <p className="text-sm text-zinc-400 mt-0.5">{configTypeInfo.description}</p>
                 </div>
               </div>
 
@@ -389,9 +401,7 @@ export function AddStateStepsModal({
                         {/* State row */}
                         <div
                           className={`flex items-center gap-3 px-3 py-2 cursor-pointer transition-colors ${
-                            isSelected
-                              ? "bg-purple-500/20"
-                              : "hover:bg-zinc-800"
+                            isSelected ? "bg-purple-500/20" : "hover:bg-zinc-800"
                           }`}
                           onClick={() => setSelectedStateId(state.id)}
                         >
@@ -413,14 +423,10 @@ export function AddStateStepsModal({
                           {/* Selection indicator */}
                           <div
                             className={`w-4 h-4 rounded-full border-2 flex items-center justify-center ${
-                              isSelected
-                                ? "border-purple-500 bg-purple-500"
-                                : "border-zinc-600"
+                              isSelected ? "border-purple-500 bg-purple-500" : "border-zinc-600"
                             }`}
                           >
-                            {isSelected && (
-                              <CheckCircle className="w-3 h-3 text-white" />
-                            )}
+                            {isSelected && <CheckCircle className="w-3 h-3 text-white" />}
                           </div>
 
                           {/* State info */}
@@ -565,7 +571,9 @@ export function AddStateStepsModal({
                           <div className="flex-1">
                             <div className="flex items-center gap-2">
                               <Eye className="w-4 h-4 text-zinc-400" />
-                              <span className="text-sm text-zinc-300">Vision Test (qontinui_vision)</span>
+                              <span className="text-sm text-zinc-300">
+                                Vision Test (qontinui_vision)
+                              </span>
                               {configTypeInfo.recommendedVision && (
                                 <span className="text-xs px-1.5 py-0.5 rounded bg-green-500/20 text-green-400">
                                   Recommended
@@ -645,32 +653,27 @@ export function AddStateStepsModal({
               {preview && (addVerificationSteps || addAgenticStep) && (
                 <div className="space-y-2">
                   <label className="block text-sm font-medium text-zinc-400">
-                    Preview ({preview.verificationSteps.length + (preview.agenticStep ? 1 : 0)} steps)
+                    Preview ({preview.verificationSteps.length + (preview.agenticStep ? 1 : 0)}{" "}
+                    steps)
                   </label>
                   <div className="p-3 bg-zinc-800/30 border border-zinc-700 rounded-lg space-y-2 max-h-40 overflow-y-auto">
-                    {addVerificationSteps && preview.verificationSteps.map((step, i) => (
-                      <div
-                        key={i}
-                        className="flex items-center gap-2 text-sm text-zinc-400"
-                      >
-                        <span className="w-5 h-5 rounded bg-green-500/20 text-green-400 flex items-center justify-center text-xs">
-                          V
-                        </span>
-                        <span className="truncate">{step.name}</span>
-                        <span className="text-xs text-zinc-500 ml-auto">
-                          {step.type}
-                        </span>
-                      </div>
-                    ))}
+                    {addVerificationSteps &&
+                      preview.verificationSteps.map((step, i) => (
+                        <div key={i} className="flex items-center gap-2 text-sm text-zinc-400">
+                          <span className="w-5 h-5 rounded bg-green-500/20 text-green-400 flex items-center justify-center text-xs">
+                            V
+                          </span>
+                          <span className="truncate">{step.name}</span>
+                          <span className="text-xs text-zinc-500 ml-auto">{step.type}</span>
+                        </div>
+                      ))}
                     {addAgenticStep && preview.agenticStep && (
                       <div className="flex items-center gap-2 text-sm text-zinc-400">
                         <span className="w-5 h-5 rounded bg-amber-500/20 text-amber-400 flex items-center justify-center text-xs">
                           A
                         </span>
                         <span className="truncate">{preview.agenticStep.name}</span>
-                        <span className="text-xs text-zinc-500 ml-auto">
-                          prompt
-                        </span>
+                        <span className="text-xs text-zinc-500 ml-auto">prompt</span>
                       </div>
                     )}
                   </div>
@@ -698,7 +701,12 @@ export function AddStateStepsModal({
           </button>
           <button
             onClick={handleAdd}
-            disabled={!selectedStateId || isAdding || isLoading || (!addVerificationSteps && !addAgenticStep)}
+            disabled={
+              !selectedStateId ||
+              isAdding ||
+              isLoading ||
+              (!addVerificationSteps && !addAgenticStep)
+            }
             className="flex items-center gap-2 px-4 py-2 text-sm font-medium bg-purple-600 hover:bg-purple-500 text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {isAdding ? (

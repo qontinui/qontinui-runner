@@ -28,12 +28,7 @@ interface StateLibraryPickerProps {
 
 const API_BASE = "http://localhost:9876";
 
-export function StateLibraryPicker({
-  isOpen,
-  onClose,
-  onSelect,
-  phase,
-}: StateLibraryPickerProps) {
+export function StateLibraryPicker({ isOpen, onClose, onSelect, phase }: StateLibraryPickerProps) {
   const [states, setStates] = useState<State[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
@@ -114,7 +109,8 @@ export function StateLibraryPicker({
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
       <div
         data-ui-id="dialog-state-library-picker"
-        className="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl w-[700px] max-w-[90vw] max-h-[80vh] flex flex-col">
+        className="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl w-[700px] max-w-[90vw] max-h-[80vh] flex flex-col"
+      >
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-neutral-700">
           <div>

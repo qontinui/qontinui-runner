@@ -115,7 +115,11 @@ export interface UseLiveBrowserReturn {
   refreshElements: () => Promise<void>;
   selectElement: (elementId: string | null) => void;
   highlightElement: (elementId: string) => Promise<void>;
-  executeAction: (elementId: string, action: string, params?: Record<string, unknown>) => Promise<void>;
+  executeAction: (
+    elementId: string,
+    action: string,
+    params?: Record<string, unknown>,
+  ) => Promise<void>;
   enablePicker: () => Promise<void>;
   disablePicker: () => void;
 
@@ -210,7 +214,7 @@ export function useLiveBrowser(): UseLiveBrowserReturn {
     try {
       // Fetch mobile devices via Tauri command
       const result = await invoke<{ success: boolean; data?: MobileDevice[] }>(
-        "list_mobile_devices"
+        "list_mobile_devices",
       );
       if (result.success && result.data) {
         setMobileDevices(result.data);
@@ -307,7 +311,7 @@ export function useLiveBrowser(): UseLiveBrowserReturn {
     try {
       // For mobile, we just verify the device is available
       const result = await invoke<{ success: boolean; data?: MobileDevice[] }>(
-        "list_mobile_devices"
+        "list_mobile_devices",
       );
 
       const device = result.data?.find((d) => d.device_id === deviceId);
@@ -414,24 +418,27 @@ export function useLiveBrowser(): UseLiveBrowserReturn {
   /**
    * Highlight an element in the page
    */
-  const highlightElement = useCallback(async (elementId: string) => {
-    if (connectedTarget?.type !== "browser") {
-      return;
-    }
+  const highlightElement = useCallback(
+    async (elementId: string) => {
+      if (connectedTarget?.type !== "browser") {
+        return;
+      }
 
-    try {
-      await fetch(`${RUNNER_API}/extension/command`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "highlightElement",
-          params: { elementId },
-        }),
-      });
-    } catch (err) {
-      console.error("[useLiveBrowser] Failed to highlight element:", err);
-    }
-  }, [connectedTarget]);
+      try {
+        await fetch(`${RUNNER_API}/extension/command`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "highlightElement",
+            params: { elementId },
+          }),
+        });
+      } catch (err) {
+        console.error("[useLiveBrowser] Failed to highlight element:", err);
+      }
+    },
+    [connectedTarget],
+  );
 
   /**
    * Execute an action on an element
@@ -468,7 +475,7 @@ export function useLiveBrowser(): UseLiveBrowserReturn {
         throw err;
       }
     },
-    [connectedTarget]
+    [connectedTarget],
   );
 
   /**

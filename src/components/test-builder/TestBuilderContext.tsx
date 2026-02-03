@@ -550,75 +550,81 @@ export function TestBuilderProvider({ children }: { children: ReactNode }) {
   // Save draft test to database
   // Optional finalInput parameter allows passing the final values directly,
   // avoiding race conditions with state updates from updateDraft
-  const saveDraft = useCallback(async (finalInput?: CreateTestInput): Promise<VerificationTest | null> => {
-    if (!state.draftTest) return null;
+  const saveDraft = useCallback(
+    async (finalInput?: CreateTestInput): Promise<VerificationTest | null> => {
+      if (!state.draftTest) return null;
 
-    dispatch({ type: "SET_SAVING", saving: true });
-    dispatch({ type: "SET_ERROR", error: null });
+      dispatch({ type: "SET_SAVING", saving: true });
+      dispatch({ type: "SET_ERROR", error: null });
 
-    try {
-      // Use finalInput if provided, otherwise fall back to draft state
-      const input = finalInput ? { ...finalInput } : { ...state.draftTest.input };
+      try {
+        // Use finalInput if provided, otherwise fall back to draft state
+        const input = finalInput ? { ...finalInput } : { ...state.draftTest.input };
 
-      // Auto-populate test config from collected analyses using the registry pattern
-      if (state.collectedAnalyses) {
-        const existingConfig = (input.config as Record<string, unknown>) ?? {};
+        // Auto-populate test config from collected analyses using the registry pattern
+        if (state.collectedAnalyses) {
+          const existingConfig = (input.config as Record<string, unknown>) ?? {};
 
-        for (const analysis of state.collectedAnalyses.analyses) {
-          // Handle step_output type using the registry
-          const stepOutput = getStepOutputFromAnalysis(analysis);
-          if (stepOutput) {
-            const handler = stepOutputRegistry.get(stepOutput.step_type);
-            if (handler) {
-              const testConfig = handler.toTestConfig(stepOutput);
-              if (testConfig && !existingConfig[testConfig.config_key]) {
-                existingConfig[testConfig.config_key] = testConfig.config_value;
+          for (const analysis of state.collectedAnalyses.analyses) {
+            // Handle step_output type using the registry
+            const stepOutput = getStepOutputFromAnalysis(analysis);
+            if (stepOutput) {
+              const handler = stepOutputRegistry.get(stepOutput.step_type);
+              if (handler) {
+                const testConfig = handler.toTestConfig(stepOutput);
+                if (testConfig && !existingConfig[testConfig.config_key]) {
+                  existingConfig[testConfig.config_key] = testConfig.config_value;
+                }
               }
             }
           }
+
+          // Only update config if we added something
+          if (Object.keys(existingConfig).length > 0) {
+            input.config = existingConfig;
+          }
         }
 
-        // Only update config if we added something
-        if (Object.keys(existingConfig).length > 0) {
-          input.config = existingConfig;
+        const response = await invoke<CommandResponse<VerificationTest>>(
+          "create_verification_test",
+          {
+            input: {
+              name: input.name,
+              description: input.description,
+              test_type: input.test_type,
+              category: input.category,
+              playwright_code: input.playwright_code,
+              vision_config: input.vision_config,
+              python_code: input.python_code,
+              repo_test_config: input.repo_test_config,
+              success_criteria: input.success_criteria,
+              config: input.config || {},
+              timeout_seconds: input.timeout_seconds || 60,
+              is_critical: input.is_critical ?? false,
+              enabled: input.enabled ?? true,
+              tags: input.tags || [],
+            },
+          },
+        );
+
+        if (response.success && response.data) {
+          dispatch({ type: "ADD_TEST", test: response.data });
+          dispatch({ type: "CLEAR_DRAFT" });
+          dispatch({ type: "SET_SELECTED_TEST", id: response.data.id });
+          return response.data;
+        } else {
+          dispatch({ type: "SET_ERROR", error: response.message || "Failed to save test" });
+          return null;
         }
-      }
-
-      const response = await invoke<CommandResponse<VerificationTest>>("create_verification_test", {
-        input: {
-          name: input.name,
-          description: input.description,
-          test_type: input.test_type,
-          category: input.category,
-          playwright_code: input.playwright_code,
-          vision_config: input.vision_config,
-          python_code: input.python_code,
-          repo_test_config: input.repo_test_config,
-          success_criteria: input.success_criteria,
-          config: input.config || {},
-          timeout_seconds: input.timeout_seconds || 60,
-          is_critical: input.is_critical ?? false,
-          enabled: input.enabled ?? true,
-          tags: input.tags || [],
-        },
-      });
-
-      if (response.success && response.data) {
-        dispatch({ type: "ADD_TEST", test: response.data });
-        dispatch({ type: "CLEAR_DRAFT" });
-        dispatch({ type: "SET_SELECTED_TEST", id: response.data.id });
-        return response.data;
-      } else {
-        dispatch({ type: "SET_ERROR", error: response.message || "Failed to save test" });
+      } catch (err) {
+        dispatch({ type: "SET_ERROR", error: String(err) });
         return null;
+      } finally {
+        dispatch({ type: "SET_SAVING", saving: false });
       }
-    } catch (err) {
-      dispatch({ type: "SET_ERROR", error: String(err) });
-      return null;
-    } finally {
-      dispatch({ type: "SET_SAVING", saving: false });
-    }
-  }, [state.draftTest, state.collectedAnalyses]);
+    },
+    [state.draftTest, state.collectedAnalyses],
+  );
 
   // Discard draft test
   const discardDraft = useCallback(() => {

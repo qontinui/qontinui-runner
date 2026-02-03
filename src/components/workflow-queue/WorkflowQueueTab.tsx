@@ -46,7 +46,7 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
   const [stopOnFailure, setStopOnFailure] = useState<boolean>(() => {
     try {
       const stored = localStorage.getItem(OPTIONS_STORAGE_KEY);
-      return stored ? JSON.parse(stored).stopOnFailure ?? true : true;
+      return stored ? (JSON.parse(stored).stopOnFailure ?? true) : true;
     } catch {
       return true;
     }
@@ -84,9 +84,7 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
       const workflowsWithStats: WorkflowWithStats[] = await Promise.all(
         rawWorkflows.map(async (workflow) => {
           try {
-            const statsResponse = await fetch(
-              `${API_BASE}/unified-workflows/${workflow.id}/stats`
-            );
+            const statsResponse = await fetch(`${API_BASE}/unified-workflows/${workflow.id}/stats`);
             const statsResult = await statsResponse.json();
 
             if (statsResult.success && statsResult.data) {
@@ -111,7 +109,7 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
               avgDurationMs: null,
             },
           };
-        })
+        }),
       );
 
       setWorkflows(workflowsWithStats);
@@ -124,7 +122,7 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
             return { ...item, workflow: freshWorkflow };
           }
           return item;
-        })
+        }),
       );
     } catch (error) {
       console.error("Failed to fetch workflows:", error);
@@ -152,7 +150,9 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
 
   const removeFromQueue = useCallback((queueId: string) => {
     setQueue((prev) =>
-      prev.filter((item) => item.queueId !== queueId).map((item, index) => ({ ...item, position: index }))
+      prev
+        .filter((item) => item.queueId !== queueId)
+        .map((item, index) => ({ ...item, position: index })),
     );
   }, []);
 
@@ -263,7 +263,9 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
             <button
               onClick={() => setShowOptions(!showOptions)}
               className={`p-2 rounded-lg transition-colors ${
-                showOptions ? "bg-cyan-500/20 text-cyan-400" : "text-gray-400 hover:text-gray-300 hover:bg-white/5"
+                showOptions
+                  ? "bg-cyan-500/20 text-cyan-400"
+                  : "text-gray-400 hover:text-gray-300 hover:bg-white/5"
               }`}
               title="Execution options"
             >
@@ -319,9 +321,7 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
       </div>
 
       {/* Click outside to close options */}
-      {showOptions && (
-        <div className="fixed inset-0 z-10" onClick={() => setShowOptions(false)} />
-      )}
+      {showOptions && <div className="fixed inset-0 z-10" onClick={() => setShowOptions(false)} />}
     </div>
   );
 }

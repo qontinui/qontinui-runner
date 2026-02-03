@@ -344,7 +344,10 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
       />
 
       {/* Export Summary */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-backup-data-summary-section">
+      <div
+        className="space-y-4 rounded-lg bg-card/50 p-4"
+        data-ui-id="settings-backup-data-summary-section"
+      >
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <Database className="w-4 h-4 text-primary" />
@@ -375,7 +378,10 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
       </div>
 
       {/* Comprehensive Export Section */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-backup-export-section">
+      <div
+        className="space-y-4 rounded-lg bg-card/50 p-4"
+        data-ui-id="settings-backup-export-section"
+      >
         <div className="flex items-center gap-2">
           <Download className="w-4 h-4 text-primary" />
           <h4 className="font-medium text-sm">Export All Data</h4>
@@ -450,7 +456,10 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
       </div>
 
       {/* Import Section */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-backup-import-section">
+      <div
+        className="space-y-4 rounded-lg bg-card/50 p-4"
+        data-ui-id="settings-backup-import-section"
+      >
         <div className="flex items-center gap-2">
           <Upload className="w-4 h-4 text-primary" />
           <h4 className="font-medium text-sm">Import Data</h4>

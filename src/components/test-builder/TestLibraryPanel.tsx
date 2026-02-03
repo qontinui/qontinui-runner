@@ -54,7 +54,16 @@ interface TestListItemProps {
   onToggleSelection: () => void;
 }
 
-function TestListItem({ test, isSelected, isSelectionMode, isChecked, onSelect, onDelete, onDuplicate, onToggleSelection }: TestListItemProps) {
+function TestListItem({
+  test,
+  isSelected,
+  isSelectionMode,
+  isChecked,
+  onSelect,
+  onDelete,
+  onDuplicate,
+  onToggleSelection,
+}: TestListItemProps) {
   const [showMenu, setShowMenu] = useState(false);
   const Icon = testTypeIcons[test.test_type];
 
@@ -75,9 +84,7 @@ function TestListItem({ test, isSelected, isSelectionMode, isChecked, onSelect, 
       {isSelectionMode && (
         <div
           className={`w-4 h-4 rounded border flex-shrink-0 flex items-center justify-center ${
-            isChecked
-              ? "bg-red-500 border-red-500"
-              : "border-neutral-500 hover:border-red-400"
+            isChecked ? "bg-red-500 border-red-500" : "border-neutral-500 hover:border-red-400"
           }`}
         >
           {isChecked && <Check className="w-3 h-3 text-white" />}
@@ -201,9 +208,7 @@ export function TestLibraryPanel({ onOpenAiTab }: TestLibraryPanelProps) {
 
   // Get names of selected tests for dialog
   const getSelectedNames = useCallback(() => {
-    return state.tests
-      .filter((t) => selectedIds.has(t.id))
-      .map((t) => t.name);
+    return state.tests.filter((t) => selectedIds.has(t.id)).map((t) => t.name);
   }, [state.tests, selectedIds]);
 
   const handleCreateTest = (testType: TestType) => {
@@ -350,12 +355,10 @@ export function TestLibraryPanel({ onOpenAiTab }: TestLibraryPanelProps) {
       {/* Selection Mode Header */}
       {isSelectionMode && (
         <div className="flex items-center justify-between px-4 py-2 bg-red-500/10 border-b border-red-500/30">
-          <span className="text-sm text-red-400">
-            {selectedIds.size} selected
-          </span>
+          <span className="text-sm text-red-400">{selectedIds.size} selected</span>
           <div className="flex items-center gap-2">
             <button
-              onClick={() => setSelectedIds(new Set(filteredTests.map(t => t.id)))}
+              onClick={() => setSelectedIds(new Set(filteredTests.map((t) => t.id)))}
               className="px-2 py-1 text-xs bg-neutral-700 hover:bg-neutral-600 text-neutral-200 rounded"
               data-ui-id="test-builder-select-all-btn"
             >

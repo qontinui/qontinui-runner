@@ -208,8 +208,9 @@ export function LearningDashboard() {
 
       {/* Explanatory description */}
       <p className="text-sm text-gray-400">
-        Tracks patterns and performance from AI task executions. Data is recorded when unified workflows
-        and AI tasks complete, showing success rates, strategies, and learned insights over time.
+        Tracks patterns and performance from AI task executions. Data is recorded when unified
+        workflows and AI tasks complete, showing success rates, strategies, and learned insights
+        over time.
       </p>
 
       {/* Current Running Task Indicator */}

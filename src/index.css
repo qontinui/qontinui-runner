@@ -787,7 +787,8 @@
 
   /* Subtle breathing animation for GUI lock indicator */
   @keyframes gui-lock-glow {
-    0%, 100% {
+    0%,
+    100% {
       opacity: 0.4;
       transform: scale(1);
     }
@@ -808,7 +809,8 @@
 
   /* Smooth breathing glow - subtle opacity change */
   @keyframes phase-glow {
-    0%, 100% {
+    0%,
+    100% {
       opacity: 1;
       box-shadow: 0 0 0 0 currentColor;
     }
@@ -839,7 +841,8 @@
 
   /* Slow fade pulse - gentler than Tailwind's pulse */
   @keyframes phase-fade {
-    0%, 100% {
+    0%,
+    100% {
       opacity: 1;
     }
     50% {
@@ -853,7 +856,8 @@
 
   /* Border glow animation */
   @keyframes phase-border-glow {
-    0%, 100% {
+    0%,
+    100% {
       border-color: currentColor;
       box-shadow: 0 0 0 0 transparent;
     }

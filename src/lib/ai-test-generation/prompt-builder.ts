@@ -261,8 +261,7 @@ function formatSinglePageAnalysis(analysis: PageAnalysis, testType: TestType): s
     if (text.length > 30) text = text.substring(0, 30) + "...";
     text = text !== "-" ? `"${text}"` : "-";
 
-    const selector =
-      el.selector || `(${el.bounding_box?.x || 0}, ${el.bounding_box?.y || 0})`;
+    const selector = el.selector || `(${el.bounding_box?.x || 0}, ${el.bounding_box?.y || 0})`;
     lines.push(`| ${idx + 1} | ${label} | ${elType} | ${text} | ${selector} |`);
   }
 
@@ -321,9 +320,7 @@ function formatPageAnalyses(
 /**
  * Format API analyses (legacy format).
  */
-function formatApiAnalyses(
-  analyses: Array<{ name: string; data: ApiRequestAnalysis }>,
-): string {
+function formatApiAnalyses(analyses: Array<{ name: string; data: ApiRequestAnalysis }>): string {
   const lines: string[] = [];
 
   lines.push("## API Analyses");

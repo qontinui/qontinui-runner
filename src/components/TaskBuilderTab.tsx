@@ -301,7 +301,7 @@ export function TaskBuilderTab({ onLog, editTaskId, _onNavigateToLibrary }: Task
     try {
       // Delete in parallel
       const deletePromises = Array.from(selectedIds).map((id) =>
-        fetch(`${API_BASE}/prompts/${id}`, { method: "DELETE" })
+        fetch(`${API_BASE}/prompts/${id}`, { method: "DELETE" }),
       );
       await Promise.all(deletePromises);
 
@@ -327,9 +327,7 @@ export function TaskBuilderTab({ onLog, editTaskId, _onNavigateToLibrary }: Task
 
   // Get names of selected tasks for the delete dialog
   const getSelectedNames = useCallback((): string[] => {
-    return tasks
-      .filter((t) => selectedIds.has(t.id))
-      .map((t) => t.name);
+    return tasks.filter((t) => selectedIds.has(t.id)).map((t) => t.name);
   }, [tasks, selectedIds]);
 
   return (
@@ -351,10 +349,7 @@ export function TaskBuilderTab({ onLog, editTaskId, _onNavigateToLibrary }: Task
             actions={[
               toolbarActions.ai(() => setShowAiGenerator(true)),
               toolbarActions.new(startCreate, "New"),
-              toolbarActions.delete(
-                () => setIsSelectionMode(!isSelectionMode),
-                isSelectionMode
-              ),
+              toolbarActions.delete(() => setIsSelectionMode(!isSelectionMode), isSelectionMode),
             ]}
           />
 
@@ -374,9 +369,7 @@ export function TaskBuilderTab({ onLog, editTaskId, _onNavigateToLibrary }: Task
         {/* Selection Mode Header */}
         {isSelectionMode && (
           <div className="flex items-center justify-between px-4 py-2 bg-red-500/10 border-b border-red-500/30">
-            <span className="text-sm text-red-400">
-              {selectedIds.size} selected
-            </span>
+            <span className="text-sm text-red-400">{selectedIds.size} selected</span>
             <div className="flex items-center gap-2">
               {selectedIds.size > 0 && (
                 <button
@@ -427,9 +420,7 @@ export function TaskBuilderTab({ onLog, editTaskId, _onNavigateToLibrary }: Task
                         ? "bg-neutral-700"
                         : "hover:bg-neutral-800"
                   } ${isSelectionMode ? "border" : ""} ${
-                    isSelectionMode && !selectedIds.has(task.id)
-                      ? "border-transparent"
-                      : ""
+                    isSelectionMode && !selectedIds.has(task.id) ? "border-transparent" : ""
                   }`}
                 >
                   {/* Checkbox in selection mode */}
@@ -441,9 +432,7 @@ export function TaskBuilderTab({ onLog, editTaskId, _onNavigateToLibrary }: Task
                           : "border-neutral-500"
                       }`}
                     >
-                      {selectedIds.has(task.id) && (
-                        <Check className="w-3 h-3 text-white" />
-                      )}
+                      {selectedIds.has(task.id) && <Check className="w-3 h-3 text-white" />}
                     </div>
                   )}
                   <div className="flex-1 min-w-0">

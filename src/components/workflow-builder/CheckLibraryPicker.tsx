@@ -7,7 +7,16 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Search, X, Check as CheckIcon, AlertTriangle, AlignLeft, FileType, Shield, Terminal } from "lucide-react";
+import {
+  Search,
+  X,
+  Check as CheckIcon,
+  AlertTriangle,
+  AlignLeft,
+  FileType,
+  Shield,
+  Terminal,
+} from "lucide-react";
 import type { WorkflowPhase } from "../../types/unified-workflow";
 
 // Check type from Check Builder
@@ -55,12 +64,7 @@ const CHECK_TYPE_COLORS: Record<string, string> = {
   custom_command: "text-gray-400",
 };
 
-export function CheckLibraryPicker({
-  isOpen,
-  onClose,
-  onSelect,
-  phase,
-}: CheckLibraryPickerProps) {
+export function CheckLibraryPicker({ isOpen, onClose, onSelect, phase }: CheckLibraryPickerProps) {
   const [checks, setChecks] = useState<SavedCheck[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
@@ -140,7 +144,8 @@ export function CheckLibraryPicker({
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
       <div
         data-ui-id="dialog-check-library-picker"
-        className="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl w-[700px] max-w-[90vw] max-h-[80vh] flex flex-col">
+        className="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl w-[700px] max-w-[90vw] max-h-[80vh] flex flex-col"
+      >
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-neutral-700">
           <div>
@@ -250,7 +255,9 @@ export function CheckLibraryPicker({
                         {check.working_directory && (
                           <>
                             <span className="text-neutral-600">|</span>
-                            <span className="truncate max-w-[200px]">{check.working_directory}</span>
+                            <span className="truncate max-w-[200px]">
+                              {check.working_directory}
+                            </span>
                           </>
                         )}
                       </div>

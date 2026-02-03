@@ -49,7 +49,7 @@ export interface RenderLogManagerHandle {
  * Hook that manages a ui-bridge RenderLogManager with Tauri integration
  */
 export function useRenderLogManager(
-  options: UseRenderLogManagerOptions = {}
+  options: UseRenderLogManagerOptions = {},
 ): RenderLogManagerHandle {
   const {
     enabled = true,
@@ -159,7 +159,7 @@ export function useRenderLogManager(
         taskRunId,
       });
     },
-    [activeTab, taskRunId]
+    [activeTab, taskRunId],
   );
 
   const clear = useCallback(async () => {
@@ -185,6 +185,6 @@ export function useRenderLogManager(
       getCount,
       isRunning: isRunningRef.current,
     }),
-    [captureSnapshot, clear, getEntries, getCount]
+    [captureSnapshot, clear, getEntries, getCount],
   );
 }

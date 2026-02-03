@@ -187,7 +187,9 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
         fetch(`${API_BASE}/playwright-scripts`),
         fetch(`${API_BASE}/unified-workflows`),
         fetch(`${API_BASE}/macros`),
-        invoke<{ success: boolean; data?: ApiResponseItem[] }>("list_checks", { enabledOnly: false }),
+        invoke<{ success: boolean; data?: ApiResponseItem[] }>("list_checks", {
+          enabledOnly: false,
+        }),
       ]);
 
       // Process tasks

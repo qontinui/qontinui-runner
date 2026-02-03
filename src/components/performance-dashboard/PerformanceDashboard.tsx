@@ -39,7 +39,12 @@ interface PerformanceDashboardProps {
 export function PerformanceDashboard({ configId, configName }: PerformanceDashboardProps) {
   const [timeRange, setTimeRange] = useState<TimeRange>("7d");
 
-  const { data: dashboard, isLoading, error, refetch } = usePerformanceDashboard(configId, timeRange);
+  const {
+    data: dashboard,
+    isLoading,
+    error,
+    refetch,
+  } = usePerformanceDashboard(configId, timeRange);
 
   if (!configId) {
     return (
@@ -120,11 +125,19 @@ export function PerformanceDashboard({ configId, configName }: PerformanceDashbo
           value={formatDurationMs(summary.avg_run_duration_ms)}
           icon={Clock}
         />
-        <MetricCard title="Total Actions" value={summary.total_actions.toLocaleString()} icon={Zap} />
+        <MetricCard
+          title="Total Actions"
+          value={summary.total_actions.toLocaleString()}
+          icon={Zap}
+        />
         <MetricCard
           title="Total Runs"
           value={summary.total_runs}
-          subtitle={summary.last_run_at ? `Last: ${new Date(summary.last_run_at).toLocaleDateString()}` : undefined}
+          subtitle={
+            summary.last_run_at
+              ? `Last: ${new Date(summary.last_run_at).toLocaleDateString()}`
+              : undefined
+          }
           icon={Activity}
         />
         <MetricCard

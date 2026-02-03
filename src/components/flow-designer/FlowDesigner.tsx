@@ -42,7 +42,13 @@ import {
 } from "lucide-react";
 import { save, open } from "@tauri-apps/plugin-dialog";
 import { writeTextFile, readTextFile } from "@tauri-apps/plugin-fs";
-import { useFlowList, flowActions, useUndoRedo, useUndoRedoKeyboard, useAutosave } from "./useFlowDesigner";
+import {
+  useFlowList,
+  flowActions,
+  useUndoRedo,
+  useUndoRedoKeyboard,
+  useAutosave,
+} from "./useFlowDesigner";
 import { FlowStepNode } from "./FlowStepNode";
 import { FlowSidebar } from "./FlowSidebar";
 import { FlowExecutionProvider, useFlowExecution } from "./FlowExecutionContext";
@@ -240,8 +246,10 @@ function ExecutionStatusIndicator() {
   const { isExecuting, flowSuccess, flowError, stepStatuses, reset } = useFlowExecution();
 
   // Count completed and failed steps
-  const completedCount = Array.from(stepStatuses.values()).filter(s => s.status === "completed").length;
-  const failedCount = Array.from(stepStatuses.values()).filter(s => s.status === "failed").length;
+  const completedCount = Array.from(stepStatuses.values()).filter(
+    (s) => s.status === "completed",
+  ).length;
+  const failedCount = Array.from(stepStatuses.values()).filter((s) => s.status === "failed").length;
   const totalProcessed = completedCount + failedCount;
 
   if (!isExecuting && flowSuccess === null && totalProcessed === 0) {
@@ -253,16 +261,12 @@ function ExecutionStatusIndicator() {
       {isExecuting ? (
         <>
           <Loader2 className="w-4 h-4 text-emerald-400 animate-spin" />
-          <span className="text-sm text-emerald-400">
-            Running... ({completedCount} steps)
-          </span>
+          <span className="text-sm text-emerald-400">Running... ({completedCount} steps)</span>
         </>
       ) : flowSuccess === true ? (
         <>
           <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-          <span className="text-sm text-emerald-400">
-            Complete ({completedCount} steps)
-          </span>
+          <span className="text-sm text-emerald-400">Complete ({completedCount} steps)</span>
           <button
             onClick={reset}
             className="ml-2 text-xs text-gray-400 hover:text-white"
@@ -343,7 +347,7 @@ function FlowDesignerInner() {
       onSaveStart: () => console.log("Autosaving..."),
       onSaveSuccess: () => console.log("Autosaved successfully"),
       onSaveError: (err) => console.error("Autosave failed:", err),
-    }
+    },
   );
 
   // React Flow state
@@ -420,40 +424,50 @@ function FlowDesignerInner() {
     setSelectedStepId(null);
   }, []);
 
-  const handleAddStep = useCallback((type: string) => {
-    const id = `${type}-${Date.now()}`;
-    const newStep = createNewStep(type, id);
+  const handleAddStep = useCallback(
+    (type: string) => {
+      const id = `${type}-${Date.now()}`;
+      const newStep = createNewStep(type, id);
 
-    setFlow((f) => {
-      const updated = {
+      setFlow((f) => {
+        const updated = {
+          ...f,
+          steps: { ...f.steps, [id]: newStep },
+          start_step: f.start_step || id,
+        };
+        return updated;
+      });
+
+      setSelectedStepId(id);
+    },
+    [setFlow],
+  );
+
+  const handleUpdateStep = useCallback(
+    (updatedStep: FlowStep) => {
+      setFlow((f) => ({
         ...f,
-        steps: { ...f.steps, [id]: newStep },
-        start_step: f.start_step || id,
-      };
-      return updated;
-    });
+        steps: { ...f.steps, [updatedStep.id]: updatedStep },
+      }));
+    },
+    [setFlow],
+  );
 
-    setSelectedStepId(id);
-  }, [setFlow]);
-
-  const handleUpdateStep = useCallback((updatedStep: FlowStep) => {
-    setFlow((f) => ({
-      ...f,
-      steps: { ...f.steps, [updatedStep.id]: updatedStep },
-    }));
-  }, [setFlow]);
-
-  const handleDeleteStep = useCallback((stepId: string) => {
-    setFlow((f) => {
-      const { [stepId]: _, ...remainingSteps } = f.steps;
-      return {
-        ...f,
-        steps: remainingSteps,
-        start_step: f.start_step === stepId ? Object.keys(remainingSteps)[0] || null : f.start_step,
-      };
-    });
-    setSelectedStepId(null);
-  }, [setFlow]);
+  const handleDeleteStep = useCallback(
+    (stepId: string) => {
+      setFlow((f) => {
+        const { [stepId]: _, ...remainingSteps } = f.steps;
+        return {
+          ...f,
+          steps: remainingSteps,
+          start_step:
+            f.start_step === stepId ? Object.keys(remainingSteps)[0] || null : f.start_step,
+        };
+      });
+      setSelectedStepId(null);
+    },
+    [setFlow],
+  );
 
   const handleSave = async () => {
     setIsSaving(true);
@@ -548,7 +562,8 @@ function FlowDesignerInner() {
       if (!filePath) return;
 
       // Determine format from extension
-      const isYaml = filePath.toLowerCase().endsWith(".yaml") || filePath.toLowerCase().endsWith(".yml");
+      const isYaml =
+        filePath.toLowerCase().endsWith(".yaml") || filePath.toLowerCase().endsWith(".yml");
 
       // Export based on format
       let content: string;
@@ -585,9 +600,7 @@ function FlowDesignerInner() {
       // Ask user to pick a file
       const filePath = await open({
         multiple: false,
-        filters: [
-          { name: "Flow Files", extensions: ["json", "yaml", "yml"] },
-        ],
+        filters: [{ name: "Flow Files", extensions: ["json", "yaml", "yml"] }],
       });
 
       if (!filePath || Array.isArray(filePath)) return;
@@ -596,7 +609,8 @@ function FlowDesignerInner() {
       const content = await readTextFile(filePath);
 
       // Determine format from extension
-      const isYaml = filePath.toLowerCase().endsWith(".yaml") || filePath.toLowerCase().endsWith(".yml");
+      const isYaml =
+        filePath.toLowerCase().endsWith(".yaml") || filePath.toLowerCase().endsWith(".yml");
 
       // Import based on format
       const importedFlow = isYaml
@@ -784,11 +798,7 @@ function FlowDesignerInner() {
                   : "text-gray-500 hover:text-gray-400"
               }`}
             >
-              {autosaveEnabled ? (
-                <Cloud className="w-3 h-3" />
-              ) : (
-                <CloudOff className="w-3 h-3" />
-              )}
+              {autosaveEnabled ? <Cloud className="w-3 h-3" /> : <CloudOff className="w-3 h-3" />}
             </button>
           </div>
 

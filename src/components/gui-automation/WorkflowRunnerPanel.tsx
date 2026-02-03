@@ -12,15 +12,7 @@
 
 import { useState, useEffect, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import {
-  Play,
-  Square,
-  ChevronDown,
-  Search,
-  Settings2,
-  CircleDot,
-  Cpu,
-} from "lucide-react";
+import { Play, Square, ChevronDown, Search, Settings2, CircleDot, Cpu } from "lucide-react";
 import { Card, CardHeader, CardTitle, CardContent } from "../ui/Card";
 import { MonitorSelector } from "../MonitorSelector";
 import { InitialStatesSelector } from "../InitialStatesSelector";
@@ -114,9 +106,7 @@ export function WorkflowRunnerPanel({
     if (!searchQuery.trim()) return workflows;
     const query = searchQuery.toLowerCase();
     return workflows.filter(
-      (w) =>
-        w.name.toLowerCase().includes(query) ||
-        w.category?.toLowerCase().includes(query),
+      (w) => w.name.toLowerCase().includes(query) || w.category?.toLowerCase().includes(query),
     );
   }, [workflows, searchQuery]);
 
@@ -458,10 +448,7 @@ export function WorkflowRunnerPanel({
         </div>
 
         {/* Status Preview */}
-        <WorkflowStatusPreview
-          status={executionStatus}
-          workflowName={selectedWorkflowObj?.name}
-        />
+        <WorkflowStatusPreview status={executionStatus} workflowName={selectedWorkflowObj?.name} />
       </CardContent>
     </Card>
   );

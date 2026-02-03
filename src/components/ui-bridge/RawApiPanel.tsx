@@ -24,7 +24,7 @@ import type { CommandResult } from "../../hooks/useExternalUIBridge";
 interface RawApiPanelProps {
   onSendCommand: <T = unknown>(
     action: string,
-    params?: Record<string, unknown>
+    params?: Record<string, unknown>,
   ) => Promise<CommandResult<T>>;
   lastResult: CommandResult | null;
   commandHistory: Array<{
@@ -97,27 +97,21 @@ export function RawApiPanel({
   }, [action, parsedParams, disabled, isExecuting, onSendCommand]);
 
   // Load preset command
-  const handleLoadPreset = useCallback(
-    (preset: (typeof PRESET_COMMANDS)[number]) => {
-      setAction(preset.action);
-      setParamsJson(JSON.stringify(preset.params, null, 2));
-    },
-    []
-  );
+  const handleLoadPreset = useCallback((preset: (typeof PRESET_COMMANDS)[number]) => {
+    setAction(preset.action);
+    setParamsJson(JSON.stringify(preset.params, null, 2));
+  }, []);
 
   // Copy result to clipboard
-  const handleCopyResult = useCallback(
-    async (result: CommandResult, id?: number) => {
-      try {
-        await navigator.clipboard.writeText(JSON.stringify(result, null, 2));
-        setCopiedId(id ?? -1);
-        setTimeout(() => setCopiedId(null), 2000);
-      } catch {
-        // Ignore errors
-      }
-    },
-    []
-  );
+  const handleCopyResult = useCallback(async (result: CommandResult, id?: number) => {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(result, null, 2));
+      setCopiedId(id ?? -1);
+      setTimeout(() => setCopiedId(null), 2000);
+    } catch {
+      // Ignore errors
+    }
+  }, []);
 
   // Format timestamp
   const formatTime = (timestamp: number) => {
@@ -299,10 +293,7 @@ export function RawApiPanel({
               </div>
             ) : (
               commandHistory.map((entry) => (
-                <div
-                  key={entry.id}
-                  className="p-2 bg-muted/20 rounded-md text-xs group"
-                >
+                <div key={entry.id} className="p-2 bg-muted/20 rounded-md text-xs group">
                   <div className="flex items-center justify-between mb-1">
                     <div className="flex items-center gap-2">
                       <Badge

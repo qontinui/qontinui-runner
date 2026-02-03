@@ -52,6 +52,8 @@ import {
   Network,
   Compass,
   Loader2,
+  Maximize2,
+  Monitor,
 } from "lucide-react";
 import { ConnectionPanel } from "./ConnectionPanel";
 import { RawApiPanel } from "./RawApiPanel";
@@ -63,23 +65,25 @@ import { ElementDescriptionPanel } from "./ElementDescriptionPanel";
 import { NaturalLanguagePanel } from "./NaturalLanguagePanel";
 import { ImageViewerModal } from "./ImageViewerModal";
 import { StateDiscoveryPanel } from "./StateDiscoveryPanel";
-import { ExplorationConfigDialog, type ExplorationConfig, type ExplorationResult } from "./ExplorationConfigDialog";
+import {
+  ExplorationConfigDialog,
+  type ExplorationConfig,
+  type ExplorationResult,
+} from "./ExplorationConfigDialog";
 import { useExternalUIBridge } from "../../hooks/useExternalUIBridge";
 import { useElementThumbnails } from "../../hooks/useElementThumbnails";
 import { cropPreview } from "../../lib/thumbnail-cropper";
 import { generateAIContext } from "../../lib/ui-bridge";
-import type {
-  UIBridgeElement,
-  UIBridgeEvent,
-  UIBridgeSnapshot,
-} from "./UIBridgeInspectorPanel";
+import type { UIBridgeElement, UIBridgeEvent, UIBridgeSnapshot } from "./UIBridgeInspectorPanel";
 
 type TabId = "elements" | "states" | "search" | "describe" | "nl" | "events" | "actions" | "api";
 
 /**
  * Convert external element to UIBridgeElement format for existing components
  */
-function convertToUIBridgeElement(element: ReturnType<typeof useExternalUIBridge>["elements"][number]): UIBridgeElement {
+function convertToUIBridgeElement(
+  element: ReturnType<typeof useExternalUIBridge>["elements"][number],
+): UIBridgeElement {
   return {
     id: element.id,
     tagName: element.tagName,
@@ -134,11 +138,15 @@ export function ExternalUIBridgeInspector() {
 
   // Fingerprint state discovery
   const [isRunningDiscovery, setIsRunningDiscovery] = useState(false);
-  const [discoveryResult, setDiscoveryResult] = useState<import("./StateDiscoveryPanel").FingerprintDiscoveryResult | null>(null);
+  const [discoveryResult, setDiscoveryResult] = useState<
+    import("./StateDiscoveryPanel").FingerprintDiscoveryResult | null
+  >(null);
   const [_discoveryError, setDiscoveryError] = useState<string | null>(null);
 
   // Auto-exploration state
   const [isExploring, setIsExploring] = useState(false);
+  const [isStopping, setIsStopping] = useState(false);
+  const [wasStopped, setWasStopped] = useState(false);
   const [_explorationProgress, setExplorationProgress] = useState<string | null>(null);
   const [explorationResult, setExplorationResult] = useState<ExplorationResult | null>(null);
   const [showExplorationDialog, setShowExplorationDialog] = useState(false);
@@ -147,10 +155,11 @@ export function ExternalUIBridgeInspector() {
   const uiBridgeElements = bridge.elements.map(convertToUIBridgeElement);
 
   // Generate thumbnails from screenshot
-  const { thumbnails, isProcessing: isProcessingThumbnails } = useElementThumbnails(
-    bridge.elements,
-    bridge.pageScreenshot?.data ?? null
-  );
+  const {
+    thumbnails,
+    isProcessing: isProcessingThumbnails,
+    progress: thumbnailProgress,
+  } = useElementThumbnails(bridge.elements, bridge.pageScreenshot?.data ?? null);
 
   // Generate larger preview for detail pane when element is selected
   useEffect(() => {
@@ -167,7 +176,7 @@ export function ExternalUIBridgeInspector() {
         const preview = await cropPreview(
           bridge.pageScreenshot!.data,
           bridge.selectedElement!.bounds,
-          256
+          256,
         );
         if (!cancelled && preview) {
           setDetailPanePreview(preview);
@@ -200,7 +209,7 @@ export function ExternalUIBridgeInspector() {
   const addEvent = useCallback(
     (
       eventType: string,
-      details: Partial<Omit<UIBridgeEvent, "id" | "timestamp" | "eventType">>
+      details: Partial<Omit<UIBridgeEvent, "id" | "timestamp" | "eventType">>,
     ) => {
       const newEvent: UIBridgeEvent = {
         id: ++eventIdRef.current,
@@ -211,7 +220,7 @@ export function ExternalUIBridgeInspector() {
       };
       setEvents((prev) => [newEvent, ...prev].slice(0, 100));
     },
-    []
+    [],
   );
 
   // Handle refresh
@@ -230,16 +239,12 @@ export function ExternalUIBridgeInspector() {
         addEvent("element_selected", { elementId });
       }
     },
-    [bridge, addEvent]
+    [bridge, addEvent],
   );
 
   // Handle action execution
   const handleExecuteAction = useCallback(
-    async (
-      elementId: string,
-      action: string,
-      params?: Record<string, unknown>
-    ) => {
+    async (elementId: string, action: string, params?: Record<string, unknown>) => {
       const startTime = Date.now();
 
       const result = await bridge.executeAction(elementId, action, params);
@@ -256,7 +261,7 @@ export function ExternalUIBridgeInspector() {
 
       return result;
     },
-    [bridge, addEvent]
+    [bridge, addEvent],
   );
 
   // Handle picker toggle
@@ -271,7 +276,7 @@ export function ExternalUIBridgeInspector() {
         addEvent("picker_disabled", {});
       }
     },
-    [bridge, addEvent]
+    [bridge, addEvent],
   );
 
   // Handle overlays toggle
@@ -316,7 +321,7 @@ export function ExternalUIBridgeInspector() {
       const largePreview = await cropPreview(
         bridge.pageScreenshot.data,
         bridge.selectedElement.bounds,
-        600
+        600,
       );
       setLargePreviewData(largePreview);
     } catch (err) {
@@ -397,78 +402,108 @@ export function ExternalUIBridgeInspector() {
         setIsRunningDiscovery(false);
       }
     },
-    [addEvent]
+    [addEvent],
   );
 
-  // Handle running auto-exploration with config
-  const handleRunExploration = useCallback(async (config: ExplorationConfig): Promise<ExplorationResult | null> => {
-    setIsExploring(true);
-    setExplorationProgress("Starting exploration...");
-
+  // Handle stopping exploration
+  const handleStopExploration = useCallback(async () => {
+    setIsStopping(true);
     try {
-      addEvent("exploration_started", { result: { config } });
+      addEvent("exploration_stopping", { result: {} });
+      await invoke("ui_bridge_stop_exploration");
+      // The exploration will complete with partial results
+      // The finally block in handleRunExploration will handle cleanup
+    } catch (err) {
+      console.error("[ExternalUIBridgeInspector] Failed to stop exploration:", err);
+      // Even if stop fails, the exploration might still be running
+    }
+  }, [addEvent]);
 
-      // Call the Tauri command to run exploration via Python
-      const response = await invoke<{
-        success: boolean;
-        message?: string;
-        data?: {
-          exploration_id: string;
-          elements_discovered: number;
-          elements_explored: number;
-          errors: string[];
-          state_discovery_result?: import("./StateDiscoveryPanel").FingerprintDiscoveryResult;
-          cooccurrence_export?: unknown;
-        };
-      }>("ui_bridge_run_exploration", {
-        runnerUrl: "http://localhost:9876",
-        config: {
-          maxDepth: config.maxDepth,
-          maxElementsPerPage: config.maxElementsPerPage,
-          maxTotalElements: config.maxTotalElements,
-          actionDelayMs: config.actionDelayMs,
-          blockedKeywords: config.blockedKeywords,
-          safeKeywords: config.safeKeywords,
-          captureScreenshots: config.captureScreenshots,
-        },
-      });
+  // Handle running auto-exploration with config
+  const handleRunExploration = useCallback(
+    async (config: ExplorationConfig): Promise<ExplorationResult | null> => {
+      setIsExploring(true);
+      setIsStopping(false);
+      setWasStopped(false);
+      setExplorationProgress("Starting exploration...");
 
-      if (response.success && response.data) {
-        const result: ExplorationResult = {
-          explorationId: response.data.exploration_id,
-          elementsDiscovered: response.data.elements_discovered,
-          elementsExplored: response.data.elements_explored,
-          errors: response.data.errors,
-          stateDiscoveryResult: response.data.state_discovery_result,
-        };
-        setExplorationResult(result);
+      try {
+        addEvent("exploration_started", { result: { config } });
 
-        // Also set discovery result if available
-        if (response.data.state_discovery_result) {
-          setDiscoveryResult(response.data.state_discovery_result);
-        }
-
-        addEvent("exploration_completed", {
-          result: {
-            elementsDiscovered: result.elementsDiscovered,
-            elementsExplored: result.elementsExplored,
-            statesFound: result.stateDiscoveryResult?.states.length ?? 0,
-            errors: result.errors.length,
+        // Call the Tauri command to run exploration via Python
+        const response = await invoke<{
+          success: boolean;
+          message?: string;
+          data?: {
+            exploration_id: string;
+            elements_discovered: number;
+            elements_explored: number;
+            errors: string[];
+            state_discovery_result?: import("./StateDiscoveryPanel").FingerprintDiscoveryResult;
+            cooccurrence_export?: unknown;
+          };
+        }>("ui_bridge_run_exploration", {
+          runnerUrl: "http://localhost:9876",
+          config: {
+            maxDepth: config.maxDepth,
+            maxElementsPerPage: config.maxElementsPerPage,
+            maxTotalElements: config.maxTotalElements,
+            actionDelayMs: config.actionDelayMs,
+            blockedKeywords: config.blockedKeywords,
+            safeKeywords: config.safeKeywords,
+            captureScreenshots: config.captureScreenshots,
           },
         });
 
-        // Refresh elements after exploration
-        await bridge.refreshElements();
+        if (response.success && response.data) {
+          const result: ExplorationResult = {
+            explorationId: response.data.exploration_id,
+            elementsDiscovered: response.data.elements_discovered,
+            elementsExplored: response.data.elements_explored,
+            errors: response.data.errors,
+            stateDiscoveryResult: response.data.state_discovery_result,
+          };
+          setExplorationResult(result);
 
-        // Switch to States tab if we discovered states
-        if (result.stateDiscoveryResult && result.stateDiscoveryResult.states.length > 0) {
-          setActiveTab("states");
+          // Also set discovery result if available
+          if (response.data.state_discovery_result) {
+            setDiscoveryResult(response.data.state_discovery_result);
+          }
+
+          addEvent("exploration_completed", {
+            result: {
+              elementsDiscovered: result.elementsDiscovered,
+              elementsExplored: result.elementsExplored,
+              statesFound: result.stateDiscoveryResult?.states.length ?? 0,
+              errors: result.errors.length,
+            },
+          });
+
+          // Refresh elements after exploration
+          await bridge.refreshElements();
+
+          // Switch to States tab if we discovered states
+          if (result.stateDiscoveryResult && result.stateDiscoveryResult.states.length > 0) {
+            setActiveTab("states");
+          }
+
+          return result;
+        } else {
+          const errorMsg = response.message || "Exploration failed";
+          addEvent("exploration_failed", { result: { error: errorMsg } });
+          const result: ExplorationResult = {
+            explorationId: "",
+            elementsDiscovered: 0,
+            elementsExplored: 0,
+            errors: [errorMsg],
+          };
+          setExplorationResult(result);
+          return result;
         }
-
-        return result;
-      } else {
-        const errorMsg = response.message || "Exploration failed";
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : "Unknown error";
         addEvent("exploration_failed", { result: { error: errorMsg } });
+        console.error("[ExternalUIBridgeInspector] Exploration failed:", err);
         const result: ExplorationResult = {
           explorationId: "",
           elementsDiscovered: 0,
@@ -477,24 +512,18 @@ export function ExternalUIBridgeInspector() {
         };
         setExplorationResult(result);
         return result;
+      } finally {
+        // If we were stopping, mark the result as partial
+        if (isStopping) {
+          setWasStopped(true);
+        }
+        setIsExploring(false);
+        setIsStopping(false);
+        setExplorationProgress(null);
       }
-    } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : "Unknown error";
-      addEvent("exploration_failed", { result: { error: errorMsg } });
-      console.error("[ExternalUIBridgeInspector] Exploration failed:", err);
-      const result: ExplorationResult = {
-        explorationId: "",
-        elementsDiscovered: 0,
-        elementsExplored: 0,
-        errors: [errorMsg],
-      };
-      setExplorationResult(result);
-      return result;
-    } finally {
-      setIsExploring(false);
-      setExplorationProgress(null);
-    }
-  }, [addEvent, bridge]);
+    },
+    [addEvent, bridge, isStopping],
+  );
 
   // Track previous connection status to only log once per connection
   const prevConnectionStatus = useRef(bridge.connectionStatus);
@@ -582,9 +611,7 @@ export function ExternalUIBridgeInspector() {
             disabled={bridge.isLoadingElements}
             title="Refresh elements"
           >
-            <RefreshCw
-              className={`w-4 h-4 ${bridge.isLoadingElements ? "animate-spin" : ""}`}
-            />
+            <RefreshCw className={`w-4 h-4 ${bridge.isLoadingElements ? "animate-spin" : ""}`} />
           </Button>
           <Button
             variant={pickerActive ? "primary" : "outline"}
@@ -600,12 +627,60 @@ export function ExternalUIBridgeInspector() {
             onClick={() => handleToggleOverlays(!overlaysEnabled)}
             title={overlaysEnabled ? "Hide overlays" : "Show element overlays"}
           >
-            {overlaysEnabled ? (
-              <EyeOff className="w-4 h-4" />
+            {overlaysEnabled ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+          </Button>
+
+          {/* Screenshot Mode Toggle */}
+          <div className="h-4 w-px bg-border mx-1" />
+          <Button
+            variant={bridge.useFullPageCapture ? "primary" : "outline"}
+            size="sm"
+            onClick={() => bridge.setUseFullPageCapture(!bridge.useFullPageCapture)}
+            disabled={bridge.isCapturingFullPage}
+            title={
+              bridge.useFullPageCapture
+                ? "Full-page capture enabled (slower, captures entire page)"
+                : "Viewport capture (faster, captures only visible area)"
+            }
+          >
+            {bridge.isCapturingFullPage ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : bridge.useFullPageCapture ? (
+              <Maximize2 className="w-4 h-4" />
             ) : (
-              <Eye className="w-4 h-4" />
+              <Monitor className="w-4 h-4" />
             )}
           </Button>
+          {bridge.fullPageScreenshot && bridge.useFullPageCapture && (
+            <span className="text-[10px] text-muted-foreground">
+              {bridge.fullPageScreenshot.totalWidth}x{bridge.fullPageScreenshot.totalHeight}
+            </span>
+          )}
+
+          {/* Full-page capture progress indicator */}
+          {bridge.fullPageCaptureProgress && (
+            <div className="flex items-center gap-2 px-2 py-1 bg-muted/50 rounded-md text-xs">
+              <Loader2 className="w-3 h-3 animate-spin text-primary" />
+              <span className="text-muted-foreground">
+                {bridge.fullPageCaptureProgress.phase === "capturing"
+                  ? `Capturing: ${bridge.fullPageCaptureProgress.currentTile}/${bridge.fullPageCaptureProgress.totalTiles}`
+                  : bridge.fullPageCaptureProgress.phase === "stitching"
+                    ? "Stitching tiles..."
+                    : "Completing..."}
+              </span>
+              {bridge.fullPageCaptureProgress.totalTiles > 0 && (
+                <div className="w-16 h-1.5 bg-muted rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-primary transition-all duration-150"
+                    style={{
+                      width: `${(bridge.fullPageCaptureProgress.currentTile / bridge.fullPageCaptureProgress.totalTiles) * 100}%`,
+                    }}
+                  />
+                </div>
+              )}
+            </div>
+          )}
+
           <Button
             variant="outline"
             size="sm"
@@ -618,9 +693,7 @@ export function ExternalUIBridgeInspector() {
             ) : (
               <FileText className="w-4 h-4" />
             )}
-            <span className="ml-1.5 text-xs">
-              {aiContextCopied ? "Copied!" : "AI Context"}
-            </span>
+            <span className="ml-1.5 text-xs">{aiContextCopied ? "Copied!" : "AI Context"}</span>
           </Button>
 
           {/* Capture Session Controls */}
@@ -664,9 +737,13 @@ export function ExternalUIBridgeInspector() {
                   const cooccurrence = await bridge.generateCooccurrenceExport();
                   if (cooccurrence) {
                     await navigator.clipboard.writeText(JSON.stringify(cooccurrence, null, 2));
-                    console.log("[Session] Co-occurrence export:",
-                      cooccurrence.allFingerprints.length, "fingerprints,",
-                      cooccurrence.stateCandidates.length, "state candidates");
+                    console.log(
+                      "[Session] Co-occurrence export:",
+                      cooccurrence.allFingerprints.length,
+                      "fingerprints,",
+                      cooccurrence.stateCandidates.length,
+                      "state candidates",
+                    );
                   }
                 }}
                 title="Export co-occurrence analysis for state discovery"
@@ -727,11 +804,15 @@ export function ExternalUIBridgeInspector() {
               className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
               title="Click to view details or run again"
             >
-              <span>{explorationResult.elementsExplored}/{explorationResult.elementsDiscovered} explored</span>
+              <span>
+                {explorationResult.elementsExplored}/{explorationResult.elementsDiscovered} explored
+              </span>
               {explorationResult.stateDiscoveryResult && (
                 <>
                   <span>·</span>
-                  <span className="text-primary">{explorationResult.stateDiscoveryResult.states.length} states</span>
+                  <span className="text-primary">
+                    {explorationResult.stateDiscoveryResult.states.length} states
+                  </span>
                 </>
               )}
               {explorationResult.errors.length > 0 && (
@@ -744,9 +825,7 @@ export function ExternalUIBridgeInspector() {
           )}
 
           <div className="flex-1" />
-          <div className="text-xs text-muted-foreground">
-            {bridge.elements.length} elements
-          </div>
+          <div className="text-xs text-muted-foreground">{bridge.elements.length} elements</div>
         </div>
       )}
 
@@ -782,6 +861,30 @@ export function ExternalUIBridgeInspector() {
           <div className="h-full flex flex-col">
             {bridge.connectionStatus === "connected" ? (
               <>
+                {/* Full-page capture progress indicator */}
+                {bridge.isCapturingFullPage && (
+                  <div className="flex items-center gap-2 mb-2 px-2 py-1.5 bg-blue-500/10 border border-blue-500/20 rounded-md text-xs text-blue-400">
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                    <Maximize2 className="w-3 h-3" />
+                    <span>Capturing full page screenshot...</span>
+                  </div>
+                )}
+                {/* Thumbnail generation progress indicator */}
+                {isProcessingThumbnails && thumbnailProgress && !bridge.isCapturingFullPage && (
+                  <div className="flex items-center gap-2 mb-2 px-2 py-1.5 bg-muted/50 rounded-md text-xs text-muted-foreground">
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                    <span>
+                      Generating thumbnails: {thumbnailProgress.processed}/{thumbnailProgress.total}
+                    </span>
+                    <div className="flex-1 h-1 bg-muted rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-primary transition-all duration-150"
+                        style={{ width: `${thumbnailProgress.percentage}%` }}
+                      />
+                    </div>
+                    <span className="font-mono">{thumbnailProgress.percentage}%</span>
+                  </div>
+                )}
                 <ElementTreeView
                   elements={uiBridgeElements}
                   states={[]}
@@ -790,7 +893,11 @@ export function ExternalUIBridgeInspector() {
                   onSelectElement={handleSelectElement}
                   loading={bridge.isLoadingElements}
                   thumbnails={thumbnails}
-                  isLoadingThumbnails={isProcessingThumbnails || bridge.isCapturingScreenshot}
+                  isLoadingThumbnails={
+                    isProcessingThumbnails ||
+                    bridge.isCapturingScreenshot ||
+                    bridge.isCapturingFullPage
+                  }
                   screenshotData={bridge.pageScreenshot?.data}
                 />
 
@@ -808,12 +915,24 @@ export function ExternalUIBridgeInspector() {
                         )}
                         {bridge.selectedElement.role && (
                           <Badge
-                            variant={bridge.selectedElement.accessibility?.hasExplicitRole ? "purple" : "muted"}
-                            title={bridge.selectedElement.accessibility?.hasExplicitRole ? "Explicit ARIA role" : "Implicit role from element type"}
+                            variant={
+                              bridge.selectedElement.accessibility?.hasExplicitRole
+                                ? "purple"
+                                : "muted"
+                            }
+                            title={
+                              bridge.selectedElement.accessibility?.hasExplicitRole
+                                ? "Explicit ARIA role"
+                                : "Implicit role from element type"
+                            }
                           >
                             {bridge.selectedElement.role}
                             <span className="ml-1 opacity-60 text-[9px]">
-                              ({bridge.selectedElement.accessibility?.hasExplicitRole ? "explicit" : "implicit"})
+                              (
+                              {bridge.selectedElement.accessibility?.hasExplicitRole
+                                ? "explicit"
+                                : "implicit"}
+                              )
                             </span>
                           </Badge>
                         )}
@@ -855,11 +974,13 @@ export function ExternalUIBridgeInspector() {
                       {bridge.selectedElement.accessibleName &&
                         bridge.selectedElement.accessibleName !== bridge.selectedElement.label &&
                         bridge.selectedElement.accessibleName !== bridge.selectedElement.text && (
-                        <>
-                          <div className="text-muted-foreground">Accessible Name:</div>
-                          <div className="truncate text-blue-400">{bridge.selectedElement.accessibleName}</div>
-                        </>
-                      )}
+                          <>
+                            <div className="text-muted-foreground">Accessible Name:</div>
+                            <div className="truncate text-blue-400">
+                              {bridge.selectedElement.accessibleName}
+                            </div>
+                          </>
+                        )}
 
                       {bridge.selectedElement.text && (
                         <>
@@ -988,7 +1109,8 @@ export function ExternalUIBridgeInspector() {
                           </div>
 
                           {/* Form States */}
-                          {(bridge.selectedElement.is_required || bridge.selectedElement.is_readonly) && (
+                          {(bridge.selectedElement.is_required ||
+                            bridge.selectedElement.is_readonly) && (
                             <div className="flex flex-wrap gap-1.5">
                               {bridge.selectedElement.is_required && (
                                 <Badge variant="warning" size="sm">
@@ -1008,7 +1130,9 @@ export function ExternalUIBridgeInspector() {
                             {bridge.selectedElement.accessibility?.tabIndex !== undefined && (
                               <>
                                 <div className="text-muted-foreground">Tab Index:</div>
-                                <div className="font-mono">{bridge.selectedElement.accessibility.tabIndex}</div>
+                                <div className="font-mono">
+                                  {bridge.selectedElement.accessibility.tabIndex}
+                                </div>
                               </>
                             )}
 
@@ -1040,42 +1164,50 @@ export function ExternalUIBridgeInspector() {
                             {bridge.selectedElement.accessibility?.ariaLabel && (
                               <>
                                 <div className="text-muted-foreground">aria-label:</div>
-                                <div className="truncate">{bridge.selectedElement.accessibility.ariaLabel}</div>
+                                <div className="truncate">
+                                  {bridge.selectedElement.accessibility.ariaLabel}
+                                </div>
                               </>
                             )}
 
                             {bridge.selectedElement.accessibility?.ariaLabelledBy && (
                               <>
                                 <div className="text-muted-foreground">aria-labelledby:</div>
-                                <div className="font-mono truncate">{bridge.selectedElement.accessibility.ariaLabelledBy}</div>
+                                <div className="font-mono truncate">
+                                  {bridge.selectedElement.accessibility.ariaLabelledBy}
+                                </div>
                               </>
                             )}
 
                             {bridge.selectedElement.accessibility?.ariaDescribedBy && (
                               <>
                                 <div className="text-muted-foreground">aria-describedby:</div>
-                                <div className="font-mono truncate">{bridge.selectedElement.accessibility.ariaDescribedBy}</div>
+                                <div className="font-mono truncate">
+                                  {bridge.selectedElement.accessibility.ariaDescribedBy}
+                                </div>
                               </>
                             )}
 
                             {bridge.selectedElement.accessibility?.accessibleDescription && (
                               <>
                                 <div className="text-muted-foreground">Description:</div>
-                                <div className="truncate">{bridge.selectedElement.accessibility.accessibleDescription}</div>
+                                <div className="truncate">
+                                  {bridge.selectedElement.accessibility.accessibleDescription}
+                                </div>
                               </>
                             )}
 
                             {bridge.selectedElement.accessibility?.ariaLive &&
-                             bridge.selectedElement.accessibility.ariaLive !== "off" && (
-                              <>
-                                <div className="text-muted-foreground">aria-live:</div>
-                                <div>
-                                  <Badge variant="info" size="sm">
-                                    {bridge.selectedElement.accessibility.ariaLive}
-                                  </Badge>
-                                </div>
-                              </>
-                            )}
+                              bridge.selectedElement.accessibility.ariaLive !== "off" && (
+                                <>
+                                  <div className="text-muted-foreground">aria-live:</div>
+                                  <div>
+                                    <Badge variant="info" size="sm">
+                                      {bridge.selectedElement.accessibility.ariaLive}
+                                    </Badge>
+                                  </div>
+                                </>
+                              )}
 
                             {bridge.selectedElement.accessibility?.ariaHidden && (
                               <>
@@ -1129,7 +1261,12 @@ export function ExternalUIBridgeInspector() {
                                   </span>
                                   <button
                                     className="flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground"
-                                    onClick={() => handleCopySelector(bridge.selectedElement!.selector!, "selector")}
+                                    onClick={() =>
+                                      handleCopySelector(
+                                        bridge.selectedElement!.selector!,
+                                        "selector",
+                                      )
+                                    }
                                   >
                                     {copiedSelector === "selector" ? (
                                       <>
@@ -1159,7 +1296,9 @@ export function ExternalUIBridgeInspector() {
                                   </span>
                                   <button
                                     className="flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground"
-                                    onClick={() => handleCopySelector(bridge.selectedElement!.xpath!, "xpath")}
+                                    onClick={() =>
+                                      handleCopySelector(bridge.selectedElement!.xpath!, "xpath")
+                                    }
                                   >
                                     {copiedSelector === "xpath" ? (
                                       <>
@@ -1182,24 +1321,31 @@ export function ExternalUIBridgeInspector() {
                           </div>
 
                           {/* CSS Classes */}
-                          {bridge.selectedElement.classes && bridge.selectedElement.classes.length > 0 && (
-                            <div className="space-y-1">
-                              <span className="text-xs text-muted-foreground flex items-center gap-1">
-                                <Palette className="w-3 h-3" />
-                                CSS Classes:
-                              </span>
-                              <div className="flex flex-wrap gap-1">
-                                {bridge.selectedElement.classes.map((cls, i) => (
-                                  <Badge key={i} variant="muted" className="text-[10px] font-mono">
-                                    .{cls}
-                                  </Badge>
-                                ))}
+                          {bridge.selectedElement.classes &&
+                            bridge.selectedElement.classes.length > 0 && (
+                              <div className="space-y-1">
+                                <span className="text-xs text-muted-foreground flex items-center gap-1">
+                                  <Palette className="w-3 h-3" />
+                                  CSS Classes:
+                                </span>
+                                <div className="flex flex-wrap gap-1">
+                                  {bridge.selectedElement.classes.map((cls, i) => (
+                                    <Badge
+                                      key={i}
+                                      variant="muted"
+                                      className="text-[10px] font-mono"
+                                    >
+                                      .{cls}
+                                    </Badge>
+                                  ))}
+                                </div>
                               </div>
-                            </div>
-                          )}
+                            )}
 
                           {/* Link/Image Attributes */}
-                          {(bridge.selectedElement.href || bridge.selectedElement.src || bridge.selectedElement.alt) && (
+                          {(bridge.selectedElement.href ||
+                            bridge.selectedElement.src ||
+                            bridge.selectedElement.alt) && (
                             <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
                               {bridge.selectedElement.href && (
                                 <>
@@ -1207,7 +1353,10 @@ export function ExternalUIBridgeInspector() {
                                     <Link className="w-3 h-3" />
                                     href:
                                   </div>
-                                  <div className="font-mono truncate text-blue-400" title={bridge.selectedElement.href}>
+                                  <div
+                                    className="font-mono truncate text-blue-400"
+                                    title={bridge.selectedElement.href}
+                                  >
                                     {bridge.selectedElement.href}
                                   </div>
                                 </>
@@ -1218,7 +1367,10 @@ export function ExternalUIBridgeInspector() {
                                     <Image className="w-3 h-3" />
                                     src:
                                   </div>
-                                  <div className="font-mono truncate" title={bridge.selectedElement.src}>
+                                  <div
+                                    className="font-mono truncate"
+                                    title={bridge.selectedElement.src}
+                                  >
                                     {bridge.selectedElement.src}
                                   </div>
                                 </>
@@ -1244,7 +1396,9 @@ export function ExternalUIBridgeInspector() {
                               {bridge.selectedElement.inputType && (
                                 <>
                                   <div className="text-muted-foreground">Input Type:</div>
-                                  <div className="font-mono">{bridge.selectedElement.inputType}</div>
+                                  <div className="font-mono">
+                                    {bridge.selectedElement.inputType}
+                                  </div>
                                 </>
                               )}
                               {bridge.selectedElement.name && (
@@ -1257,22 +1411,29 @@ export function ExternalUIBridgeInspector() {
                           )}
 
                           {/* Data Attributes */}
-                          {bridge.selectedElement.dataAttributes && Object.keys(bridge.selectedElement.dataAttributes).length > 0 && (
-                            <div className="space-y-1">
-                              <span className="text-xs text-muted-foreground flex items-center gap-1">
-                                <Database className="w-3 h-3" />
-                                Data Attributes:
-                              </span>
-                              <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs bg-muted/30 p-2 rounded">
-                                {Object.entries(bridge.selectedElement.dataAttributes).map(([key, value]) => (
-                                  <div key={key} className="contents">
-                                    <div className="text-muted-foreground font-mono">data-{key}:</div>
-                                    <div className="font-mono truncate" title={value}>{value}</div>
-                                  </div>
-                                ))}
+                          {bridge.selectedElement.dataAttributes &&
+                            Object.keys(bridge.selectedElement.dataAttributes).length > 0 && (
+                              <div className="space-y-1">
+                                <span className="text-xs text-muted-foreground flex items-center gap-1">
+                                  <Database className="w-3 h-3" />
+                                  Data Attributes:
+                                </span>
+                                <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs bg-muted/30 p-2 rounded">
+                                  {Object.entries(bridge.selectedElement.dataAttributes).map(
+                                    ([key, value]) => (
+                                      <div key={key} className="contents">
+                                        <div className="text-muted-foreground font-mono">
+                                          data-{key}:
+                                        </div>
+                                        <div className="font-mono truncate" title={value}>
+                                          {value}
+                                        </div>
+                                      </div>
+                                    ),
+                                  )}
+                                </div>
                               </div>
-                            </div>
-                          )}
+                            )}
 
                           {/* Computed Styles */}
                           {bridge.selectedElement.computedStyle && (
@@ -1288,83 +1449,112 @@ export function ExternalUIBridgeInspector() {
                                     <div className="font-mono flex items-center gap-1">
                                       <span
                                         className="w-3 h-3 rounded border border-border/50"
-                                        style={{ backgroundColor: bridge.selectedElement.computedStyle.color }}
+                                        style={{
+                                          backgroundColor:
+                                            bridge.selectedElement.computedStyle.color,
+                                        }}
                                       />
                                       {bridge.selectedElement.computedStyle.color}
                                     </div>
                                   </>
                                 )}
-                                {bridge.selectedElement.computedStyle.backgroundColor && bridge.selectedElement.computedStyle.backgroundColor !== "rgba(0, 0, 0, 0)" && (
-                                  <>
-                                    <div className="text-muted-foreground">Background:</div>
-                                    <div className="font-mono flex items-center gap-1">
-                                      <span
-                                        className="w-3 h-3 rounded border border-border/50"
-                                        style={{ backgroundColor: bridge.selectedElement.computedStyle.backgroundColor }}
-                                      />
-                                      {bridge.selectedElement.computedStyle.backgroundColor}
-                                    </div>
-                                  </>
-                                )}
+                                {bridge.selectedElement.computedStyle.backgroundColor &&
+                                  bridge.selectedElement.computedStyle.backgroundColor !==
+                                    "rgba(0, 0, 0, 0)" && (
+                                    <>
+                                      <div className="text-muted-foreground">Background:</div>
+                                      <div className="font-mono flex items-center gap-1">
+                                        <span
+                                          className="w-3 h-3 rounded border border-border/50"
+                                          style={{
+                                            backgroundColor:
+                                              bridge.selectedElement.computedStyle.backgroundColor,
+                                          }}
+                                        />
+                                        {bridge.selectedElement.computedStyle.backgroundColor}
+                                      </div>
+                                    </>
+                                  )}
                                 {bridge.selectedElement.computedStyle.fontSize && (
                                   <>
                                     <div className="text-muted-foreground">Font Size:</div>
-                                    <div className="font-mono">{bridge.selectedElement.computedStyle.fontSize}</div>
+                                    <div className="font-mono">
+                                      {bridge.selectedElement.computedStyle.fontSize}
+                                    </div>
                                   </>
                                 )}
                                 {bridge.selectedElement.computedStyle.fontWeight && (
                                   <>
                                     <div className="text-muted-foreground">Font Weight:</div>
-                                    <div className="font-mono">{bridge.selectedElement.computedStyle.fontWeight}</div>
+                                    <div className="font-mono">
+                                      {bridge.selectedElement.computedStyle.fontWeight}
+                                    </div>
                                   </>
                                 )}
                                 {bridge.selectedElement.computedStyle.display && (
                                   <>
                                     <div className="text-muted-foreground">Display:</div>
-                                    <div className="font-mono">{bridge.selectedElement.computedStyle.display}</div>
+                                    <div className="font-mono">
+                                      {bridge.selectedElement.computedStyle.display}
+                                    </div>
                                   </>
                                 )}
-                                {bridge.selectedElement.computedStyle.position && bridge.selectedElement.computedStyle.position !== "static" && (
-                                  <>
-                                    <div className="text-muted-foreground">Position:</div>
-                                    <div className="font-mono">{bridge.selectedElement.computedStyle.position}</div>
-                                  </>
-                                )}
-                                {bridge.selectedElement.computedStyle.zIndex && bridge.selectedElement.computedStyle.zIndex !== "auto" && (
-                                  <>
-                                    <div className="text-muted-foreground">Z-Index:</div>
-                                    <div className="font-mono">{bridge.selectedElement.computedStyle.zIndex}</div>
-                                  </>
-                                )}
-                                {bridge.selectedElement.computedStyle.opacity && bridge.selectedElement.computedStyle.opacity !== "1" && (
-                                  <>
-                                    <div className="text-muted-foreground">Opacity:</div>
-                                    <div className="font-mono">{bridge.selectedElement.computedStyle.opacity}</div>
-                                  </>
-                                )}
+                                {bridge.selectedElement.computedStyle.position &&
+                                  bridge.selectedElement.computedStyle.position !== "static" && (
+                                    <>
+                                      <div className="text-muted-foreground">Position:</div>
+                                      <div className="font-mono">
+                                        {bridge.selectedElement.computedStyle.position}
+                                      </div>
+                                    </>
+                                  )}
+                                {bridge.selectedElement.computedStyle.zIndex &&
+                                  bridge.selectedElement.computedStyle.zIndex !== "auto" && (
+                                    <>
+                                      <div className="text-muted-foreground">Z-Index:</div>
+                                      <div className="font-mono">
+                                        {bridge.selectedElement.computedStyle.zIndex}
+                                      </div>
+                                    </>
+                                  )}
+                                {bridge.selectedElement.computedStyle.opacity &&
+                                  bridge.selectedElement.computedStyle.opacity !== "1" && (
+                                    <>
+                                      <div className="text-muted-foreground">Opacity:</div>
+                                      <div className="font-mono">
+                                        {bridge.selectedElement.computedStyle.opacity}
+                                      </div>
+                                    </>
+                                  )}
                               </div>
                             </div>
                           )}
 
                           {/* Page Context */}
-                          {(bridge.selectedElement.sourceUrl || bridge.selectedElement.viewportWidth) && (
+                          {(bridge.selectedElement.sourceUrl ||
+                            bridge.selectedElement.viewportWidth) && (
                             <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
                               {bridge.selectedElement.sourceUrl && (
                                 <>
                                   <div className="text-muted-foreground">Source URL:</div>
-                                  <div className="font-mono truncate text-blue-400" title={bridge.selectedElement.sourceUrl}>
+                                  <div
+                                    className="font-mono truncate text-blue-400"
+                                    title={bridge.selectedElement.sourceUrl}
+                                  >
                                     {bridge.selectedElement.sourceUrl}
                                   </div>
                                 </>
                               )}
-                              {bridge.selectedElement.viewportWidth && bridge.selectedElement.viewportHeight && (
-                                <>
-                                  <div className="text-muted-foreground">Viewport:</div>
-                                  <div className="font-mono">
-                                    {bridge.selectedElement.viewportWidth} x {bridge.selectedElement.viewportHeight}
-                                  </div>
-                                </>
-                              )}
+                              {bridge.selectedElement.viewportWidth &&
+                                bridge.selectedElement.viewportHeight && (
+                                  <>
+                                    <div className="text-muted-foreground">Viewport:</div>
+                                    <div className="font-mono">
+                                      {bridge.selectedElement.viewportWidth} x{" "}
+                                      {bridge.selectedElement.viewportHeight}
+                                    </div>
+                                  </>
+                                )}
                               {bridge.selectedElement.depth !== undefined && (
                                 <>
                                   <div className="text-muted-foreground">DOM Depth:</div>
@@ -1421,7 +1611,12 @@ export function ExternalUIBridgeInspector() {
                                 </span>
                                 <button
                                   className="flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground"
-                                  onClick={() => handleCopySelector(bridge.selectedElement!.fingerprint!.hash, "fingerprint")}
+                                  onClick={() =>
+                                    handleCopySelector(
+                                      bridge.selectedElement!.fingerprint!.hash,
+                                      "fingerprint",
+                                    )
+                                  }
                                 >
                                   {copiedSelector === "fingerprint" ? (
                                     <>
@@ -1443,10 +1638,15 @@ export function ExternalUIBridgeInspector() {
 
                             {/* Structural Identity */}
                             <div className="space-y-1">
-                              <span className="text-xs text-muted-foreground font-medium">Structural Identity</span>
+                              <span className="text-xs text-muted-foreground font-medium">
+                                Structural Identity
+                              </span>
                               <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs bg-muted/30 p-2 rounded">
                                 <div className="text-muted-foreground">Path:</div>
-                                <div className="font-mono text-[10px] truncate" title={bridge.selectedElement.fingerprint.structuralPath}>
+                                <div
+                                  className="font-mono text-[10px] truncate"
+                                  title={bridge.selectedElement.fingerprint.structuralPath}
+                                >
                                   {bridge.selectedElement.fingerprint.structuralPath}
                                 </div>
 
@@ -1476,18 +1676,27 @@ export function ExternalUIBridgeInspector() {
 
                             {/* Semantic Identity */}
                             <div className="space-y-1">
-                              <span className="text-xs text-muted-foreground font-medium">Semantic Identity</span>
+                              <span className="text-xs text-muted-foreground font-medium">
+                                Semantic Identity
+                              </span>
                               <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs bg-muted/30 p-2 rounded">
                                 <div className="text-muted-foreground">Role:</div>
-                                <div className="font-mono">{bridge.selectedElement.fingerprint.role}</div>
+                                <div className="font-mono">
+                                  {bridge.selectedElement.fingerprint.role}
+                                </div>
 
                                 <div className="text-muted-foreground">Tag:</div>
-                                <div className="font-mono">{bridge.selectedElement.fingerprint.tagName}</div>
+                                <div className="font-mono">
+                                  {bridge.selectedElement.fingerprint.tagName}
+                                </div>
 
                                 {bridge.selectedElement.fingerprint.accessibleName && (
                                   <>
                                     <div className="text-muted-foreground">Name (normalized):</div>
-                                    <div className="truncate" title={bridge.selectedElement.fingerprint.accessibleName}>
+                                    <div
+                                      className="truncate"
+                                      title={bridge.selectedElement.fingerprint.accessibleName}
+                                    >
                                       {bridge.selectedElement.fingerprint.accessibleName}
                                     </div>
                                   </>
@@ -1497,7 +1706,9 @@ export function ExternalUIBridgeInspector() {
 
                             {/* Visual Identity */}
                             <div className="space-y-1">
-                              <span className="text-xs text-muted-foreground font-medium">Visual Identity</span>
+                              <span className="text-xs text-muted-foreground font-medium">
+                                Visual Identity
+                              </span>
                               <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs bg-muted/30 p-2 rounded">
                                 <div className="text-muted-foreground">Size Category:</div>
                                 <div>
@@ -1508,93 +1719,121 @@ export function ExternalUIBridgeInspector() {
 
                                 <div className="text-muted-foreground">Relative Position:</div>
                                 <div className="font-mono">
-                                  top: {(bridge.selectedElement.fingerprint.relativePosition.top * 100).toFixed(0)}%,
-                                  left: {(bridge.selectedElement.fingerprint.relativePosition.left * 100).toFixed(0)}%
+                                  top:{" "}
+                                  {(
+                                    bridge.selectedElement.fingerprint.relativePosition.top * 100
+                                  ).toFixed(0)}
+                                  %, left:{" "}
+                                  {(
+                                    bridge.selectedElement.fingerprint.relativePosition.left * 100
+                                  ).toFixed(0)}
+                                  %
                                 </div>
                               </div>
                             </div>
 
                             {/* Repeat Pattern */}
-                            {bridge.selectedElement.fingerprint.isRepeating && bridge.selectedElement.fingerprint.repeatPattern && (
-                              <div className="space-y-1">
-                                <span className="text-xs text-muted-foreground font-medium flex items-center gap-1">
-                                  <Repeat className="w-3 h-3" />
-                                  Repeat Pattern
-                                </span>
-                                <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs bg-blue-500/10 p-2 rounded border border-blue-500/20">
-                                  <div className="text-muted-foreground">Type:</div>
-                                  <div>
-                                    <Badge variant="info" size="sm">
-                                      {bridge.selectedElement.fingerprint.repeatPattern.type}
-                                    </Badge>
+                            {bridge.selectedElement.fingerprint.isRepeating &&
+                              bridge.selectedElement.fingerprint.repeatPattern && (
+                                <div className="space-y-1">
+                                  <span className="text-xs text-muted-foreground font-medium flex items-center gap-1">
+                                    <Repeat className="w-3 h-3" />
+                                    Repeat Pattern
+                                  </span>
+                                  <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs bg-blue-500/10 p-2 rounded border border-blue-500/20">
+                                    <div className="text-muted-foreground">Type:</div>
+                                    <div>
+                                      <Badge variant="info" size="sm">
+                                        {bridge.selectedElement.fingerprint.repeatPattern.type}
+                                      </Badge>
+                                    </div>
+
+                                    <div className="text-muted-foreground">Position:</div>
+                                    <div className="font-mono">
+                                      {bridge.selectedElement.fingerprint.repeatPattern.index + 1}{" "}
+                                      of {bridge.selectedElement.fingerprint.repeatPattern.count}
+                                    </div>
+
+                                    {bridge.selectedElement.fingerprint.repeatPattern
+                                      .itemSelector && (
+                                      <>
+                                        <div className="text-muted-foreground">Item Selector:</div>
+                                        <div
+                                          className="font-mono text-[10px] truncate"
+                                          title={
+                                            bridge.selectedElement.fingerprint.repeatPattern
+                                              .itemSelector
+                                          }
+                                        >
+                                          {
+                                            bridge.selectedElement.fingerprint.repeatPattern
+                                              .itemSelector
+                                          }
+                                        </div>
+                                      </>
+                                    )}
+
+                                    {bridge.selectedElement.fingerprint.repeatPattern
+                                      .containerTag && (
+                                      <>
+                                        <div className="text-muted-foreground">Container:</div>
+                                        <div className="font-mono">
+                                          &lt;
+                                          {
+                                            bridge.selectedElement.fingerprint.repeatPattern
+                                              .containerTag
+                                          }
+                                          &gt;
+                                        </div>
+                                      </>
+                                    )}
+
+                                    {bridge.selectedElement.fingerprint.repeatPattern
+                                      .containerRole && (
+                                      <>
+                                        <div className="text-muted-foreground">Container Role:</div>
+                                        <div className="font-mono">
+                                          {
+                                            bridge.selectedElement.fingerprint.repeatPattern
+                                              .containerRole
+                                          }
+                                        </div>
+                                      </>
+                                    )}
                                   </div>
-
-                                  <div className="text-muted-foreground">Position:</div>
-                                  <div className="font-mono">
-                                    {bridge.selectedElement.fingerprint.repeatPattern.index + 1} of {bridge.selectedElement.fingerprint.repeatPattern.count}
-                                  </div>
-
-                                  {bridge.selectedElement.fingerprint.repeatPattern.itemSelector && (
-                                    <>
-                                      <div className="text-muted-foreground">Item Selector:</div>
-                                      <div className="font-mono text-[10px] truncate" title={bridge.selectedElement.fingerprint.repeatPattern.itemSelector}>
-                                        {bridge.selectedElement.fingerprint.repeatPattern.itemSelector}
-                                      </div>
-                                    </>
-                                  )}
-
-                                  {bridge.selectedElement.fingerprint.repeatPattern.containerTag && (
-                                    <>
-                                      <div className="text-muted-foreground">Container:</div>
-                                      <div className="font-mono">&lt;{bridge.selectedElement.fingerprint.repeatPattern.containerTag}&gt;</div>
-                                    </>
-                                  )}
-
-                                  {bridge.selectedElement.fingerprint.repeatPattern.containerRole && (
-                                    <>
-                                      <div className="text-muted-foreground">Container Role:</div>
-                                      <div className="font-mono">{bridge.selectedElement.fingerprint.repeatPattern.containerRole}</div>
-                                    </>
-                                  )}
                                 </div>
-                              </div>
-                            )}
+                              )}
                           </div>
                         )}
                       </div>
                     )}
 
                     {/* Element Preview Thumbnail */}
-                    {bridge.selectedElement && (detailPanePreview || thumbnails.get(bridge.selectedElement.id)) && (
-                      <div className="mt-3 pt-2 border-t border-border/50">
-                        <div className="text-xs font-semibold mb-1.5">Preview</div>
-                        <img
-                          src={`data:image/png;base64,${detailPanePreview || thumbnails.get(bridge.selectedElement.id)}`}
-                          alt="Element preview"
-                          className="max-h-64 max-w-64 object-contain rounded border border-border cursor-pointer hover:border-primary transition-colors"
-                          onClick={handleOpenPreview}
-                          title="Click to view full size"
-                        />
-                      </div>
-                    )}
+                    {bridge.selectedElement &&
+                      (detailPanePreview || thumbnails.get(bridge.selectedElement.id)) && (
+                        <div className="mt-3 pt-2 border-t border-border/50">
+                          <div className="text-xs font-semibold mb-1.5">Preview</div>
+                          <img
+                            src={`data:image/png;base64,${detailPanePreview || thumbnails.get(bridge.selectedElement.id)}`}
+                            alt="Element preview"
+                            className="max-h-64 max-w-64 object-contain rounded border border-border cursor-pointer hover:border-primary transition-colors"
+                            onClick={handleOpenPreview}
+                            title="Click to view full size"
+                          />
+                        </div>
+                      )}
 
                     {/* Quick actions */}
                     <div className="flex gap-2 mt-3 pt-2 border-t border-border/50">
                       <Button
                         variant="outline"
                         size="sm"
-                        onClick={() =>
-                          bridge.highlightElement(bridge.selectedElement!.id)
-                        }
+                        onClick={() => bridge.highlightElement(bridge.selectedElement!.id)}
                       >
                         <Eye className="w-3.5 h-3.5 mr-1" />
                         Highlight
                       </Button>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => setActiveTab("actions")}
-                      >
+                      <Button variant="outline" size="sm" onClick={() => setActiveTab("actions")}>
                         <Play className="w-3.5 h-3.5 mr-1" />
                         Execute Action
                       </Button>
@@ -1630,9 +1869,7 @@ export function ExternalUIBridgeInspector() {
             onRefresh={bridge.generateCooccurrenceExport}
             onSelectFingerprint={(hash) => {
               // Find element with this fingerprint hash and select it
-              const element = bridge.elements.find(
-                (el) => el.fingerprint?.hash === hash
-              );
+              const element = bridge.elements.find((el) => el.fingerprint?.hash === hash);
               if (element) {
                 handleSelectElement(element.id);
                 setActiveTab("elements");
@@ -1670,13 +1907,12 @@ export function ExternalUIBridgeInspector() {
             onSelectElement={handleSelectElement}
             onHighlightElement={bridge.highlightElement}
             onExecuteAction={handleExecuteAction}
+            pageContext={bridge.pageContext}
             disabled={bridge.connectionStatus !== "connected"}
           />
         )}
 
-        {activeTab === "events" && (
-          <EventTimelineView events={events} loading={false} />
-        )}
+        {activeTab === "events" && <EventTimelineView events={events} loading={false} />}
 
         {activeTab === "actions" && (
           <ActionExecutorView
@@ -1702,8 +1938,11 @@ export function ExternalUIBridgeInspector() {
         isOpen={showExplorationDialog}
         onClose={() => setShowExplorationDialog(false)}
         onRunExploration={handleRunExploration}
+        onStopExploration={handleStopExploration}
         isExploring={isExploring}
+        isStopping={isStopping}
         lastResult={explorationResult}
+        wasStopped={wasStopped}
       />
     </div>
   );

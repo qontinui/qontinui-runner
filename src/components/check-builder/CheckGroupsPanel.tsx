@@ -68,11 +68,7 @@ function GroupListItem({
             onToggleExpand();
           }}
         >
-          {isExpanded ? (
-            <ChevronDown className="w-4 h-4" />
-          ) : (
-            <ChevronRight className="w-4 h-4" />
-          )}
+          {isExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
         </button>
         <div
           className="w-3 h-3 rounded-full flex-shrink-0"
@@ -82,9 +78,7 @@ function GroupListItem({
           <div className="text-sm font-medium truncate">{group.name}</div>
           <div className="text-xs text-muted-foreground">
             {checks.length} check{checks.length !== 1 ? "s" : ""}
-            {!group.enabled && (
-              <span className="ml-1 text-amber-500">(disabled)</span>
-            )}
+            {!group.enabled && <span className="ml-1 text-amber-500">(disabled)</span>}
           </div>
         </div>
         <div className="flex items-center gap-1">
@@ -364,7 +358,14 @@ function AssignChecksModal({
 interface GroupEditorPanelProps {
   group: CheckGroup;
   checks: Check[];
-  onUpdate: (updates: { name?: string; description?: string; color?: string; enabled?: boolean; run_in_parallel?: boolean; stop_on_failure?: boolean }) => void;
+  onUpdate: (updates: {
+    name?: string;
+    description?: string;
+    color?: string;
+    enabled?: boolean;
+    run_in_parallel?: boolean;
+    stop_on_failure?: boolean;
+  }) => void;
   onAssignChecks: () => void;
   onExecute: () => void;
   isExecuting?: boolean;
@@ -488,10 +489,7 @@ function GroupEditorPanel({
         <div className="pt-4 border-t border-neutral-700">
           <div className="flex items-center justify-between mb-3">
             <h4 className="text-sm font-medium">Checks in this group</h4>
-            <button
-              onClick={onAssignChecks}
-              className="text-xs text-cyan-500 hover:text-cyan-400"
-            >
+            <button onClick={onAssignChecks} className="text-xs text-cyan-500 hover:text-cyan-400">
               Edit
             </button>
           </div>
@@ -701,7 +699,7 @@ export function CheckGroupsPanel() {
       <AssignChecksModal
         isOpen={showAssignModal}
         group={selectedGroup}
-        currentCheckIds={selectedGroupId ? (getChecksInGroup(selectedGroupId).map((c) => c.id)) : []}
+        currentCheckIds={selectedGroupId ? getChecksInGroup(selectedGroupId).map((c) => c.id) : []}
         allChecks={checks}
         onClose={() => setShowAssignModal(false)}
         onSave={(checkIds) => selectedGroupId && setChecksInGroup(selectedGroupId, checkIds)}

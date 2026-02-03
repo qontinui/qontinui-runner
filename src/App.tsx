@@ -169,6 +169,9 @@ import { CategoryManager } from "./components/findings/CategoryManager";
 import { HooksManagerPanel } from "./components/hooks";
 import { ErrorMonitorTab } from "./components/error-monitor";
 
+// Development tools
+import { PerformanceOverlay } from "./components/dev";
+
 // Styles
 import "./index.css";
 
@@ -438,16 +441,16 @@ function AppContent() {
 
         // Map page names to tab IDs (same mapping as tutorials)
         const pageToTab: Record<string, MainTabId> = {
-          "run": "gui-automation",
+          run: "gui-automation",
           "gui-automation": "gui-automation",
           "run-recap": "run-recap",
           "run-dashboard": "run-recap", // Dashboard merged into Summary
-          "active": "active",
-          "history": "history",
-          "library": "library",
-          "logs": "logs",
-          "ai": "ai",
-          "settings": "settings",
+          active: "active",
+          history: "history",
+          library: "library",
+          logs: "logs",
+          ai: "ai",
+          settings: "settings",
           "test-builder": "test-builder",
           "unified-workflow-builder": "unified-workflow-builder",
           "error-monitor": "error-monitor",
@@ -788,7 +791,7 @@ function AppContent() {
     if (lastRun?.workflow_name && execution.workflows.length > 0) {
       // Find matching workflow by name
       const matchingWorkflow = execution.workflows.find(
-        (w) => w.name === lastRun.workflow_name || w.id === lastRun.workflow_name
+        (w) => w.name === lastRun.workflow_name || w.id === lastRun.workflow_name,
       );
       if (matchingWorkflow) {
         execution.selectWorkflowWithPersistence(matchingWorkflow.id);
@@ -843,10 +846,7 @@ function AppContent() {
 
       case "workflow-queue":
         return (
-          <WorkflowQueueTab
-            onNavigateToActive={() => setActiveTab("active")}
-            onLog={addLog}
-          />
+          <WorkflowQueueTab onNavigateToActive={() => setActiveTab("active")} onLog={addLog} />
         );
 
       case "active":
@@ -1053,8 +1053,9 @@ function AppContent() {
                 <h1 className="text-xl font-bold text-white">GUI Discoveries</h1>
               </div>
               <p className="text-sm text-gray-400">
-                Detects patterns from GUI automation runs including new UI elements, state transitions,
-                timing updates, and flaky behaviors. Requires running GUI automation workflows (not AI-only tasks).
+                Detects patterns from GUI automation runs including new UI elements, state
+                transitions, timing updates, and flaky behaviors. Requires running GUI automation
+                workflows (not AI-only tasks).
               </p>
             </div>
             <DiscoverySyncPanel />
@@ -1541,6 +1542,9 @@ function AppContent() {
             }}
           />
         )}
+
+        {/* Performance Overlay (dev mode only, toggle with Ctrl+Shift+P) */}
+        <PerformanceOverlay position="bottom-right" />
       </div>
     </RenderLogWrapper>
   );
@@ -1573,7 +1577,7 @@ export default function App() {
         enabled={import.meta.env.DEV}
         idStrategy="prefer-existing"
         debounceMs={100}
-        excludeSelectors={['[data-no-register]']}
+        excludeSelectors={["[data-no-register]"]}
       >
         <AuthProvider>
           <NavigationProvider>

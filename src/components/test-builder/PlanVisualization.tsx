@@ -6,13 +6,7 @@
  */
 
 import React, { useMemo } from "react";
-import {
-  ArrowRight,
-  Check,
-  Play,
-  Link2,
-  Variable,
-} from "lucide-react";
+import { ArrowRight, Check, Play, Link2, Variable } from "lucide-react";
 import type { TestOrchestrationPlan } from "../../types/test-orchestrator";
 
 interface PlanVisualizationProps {
@@ -76,9 +70,7 @@ export function PlanVisualization({
                 ) : isCurrent ? (
                   <Play className="w-5 h-5 text-white" />
                 ) : (
-                  <span className="text-sm font-medium text-neutral-300">
-                    {idx + 1}
-                  </span>
+                  <span className="text-sm font-medium text-neutral-300">{idx + 1}</span>
                 )}
               </div>
 
@@ -114,9 +106,7 @@ export function PlanVisualization({
                         <Variable className="w-3 h-3 text-purple-400" />
                         <span className="text-purple-300">{ext.variable_name}</span>
                         <span className="text-purple-500">←</span>
-                        <span className="text-purple-400 font-mono">
-                          {ext.json_path}
-                        </span>
+                        <span className="text-purple-400 font-mono">{ext.json_path}</span>
                       </div>
                     ))}
                   </div>
@@ -203,9 +193,7 @@ function MethodBadge({ method }: { method: string }) {
   };
 
   return (
-    <span
-      className={`px-1.5 py-0.5 text-xs font-mono rounded ${colors[method] || colors.API}`}
-    >
+    <span className={`px-1.5 py-0.5 text-xs font-mono rounded ${colors[method] || colors.API}`}>
       {method}
     </span>
   );

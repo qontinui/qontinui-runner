@@ -134,7 +134,11 @@ export function useFlowExecutionData(): FlowExecutionData {
 
       setState((prev) => {
         // If this is for a different instance, ignore (unless it's a new flow starting)
-        if (prev.instanceId && data.instance_id !== prev.instanceId && data.type !== "flow_started") {
+        if (
+          prev.instanceId &&
+          data.instance_id !== prev.instanceId &&
+          data.type !== "flow_started"
+        ) {
           return prev;
         }
 
@@ -240,7 +244,8 @@ export function useFlowExecutionData(): FlowExecutionData {
   }, [state.stepHistory, state.elapsedMs]);
 
   // Determine if there's an active execution
-  const isActive = state.status === "running" || state.status === "paused" || state.status === "waiting_for_input";
+  const isActive =
+    state.status === "running" || state.status === "paused" || state.status === "waiting_for_input";
 
   return {
     ...state,

@@ -352,9 +352,7 @@ function MacroRefConfig({
           <option value="1">Monitor 1</option>
           <option value="2">Monitor 2</option>
         </select>
-        <p className="text-xs text-zinc-500 mt-1">
-          Restrict macro execution to a specific monitor
-        </p>
+        <p className="text-xs text-zinc-500 mt-1">Restrict macro execution to a specific monitor</p>
       </div>
 
       <div className="p-3 bg-pink-900/20 border border-pink-700/30 rounded-md">

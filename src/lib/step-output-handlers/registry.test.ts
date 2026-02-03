@@ -40,7 +40,9 @@ describe("StepOutputHandlerRegistry", () => {
       ];
 
       for (const type of expectedTypes) {
-        const handler = stepOutputRegistry.get(type as Parameters<typeof stepOutputRegistry.get>[0]);
+        const handler = stepOutputRegistry.get(
+          type as Parameters<typeof stepOutputRegistry.get>[0],
+        );
         expect(handler).toBeDefined();
         expect(handler?.stepType).toBe(type);
       }

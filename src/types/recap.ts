@@ -30,6 +30,13 @@ export interface RecapStep {
   error?: string;
   /** Nested steps (for workflows containing actions) */
   children: RecapStep[];
+  /** Final progress state (for completed steps that had progress markers) */
+  progress?: {
+    current: number;
+    total: number | null;
+    type: string;
+    description?: string;
+  };
 }
 
 /**

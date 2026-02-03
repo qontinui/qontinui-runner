@@ -27,9 +27,7 @@ class StepOutputHandlerRegistry {
    */
   register<T extends StepOutput>(handler: StepOutputHandler<T>): void {
     if (this.handlers.has(handler.stepType)) {
-      console.warn(
-        `Handler already registered for step type: ${handler.stepType}. Overwriting.`,
-      );
+      console.warn(`Handler already registered for step type: ${handler.stepType}. Overwriting.`);
     }
     this.handlers.set(handler.stepType, handler as StepOutputHandler);
   }

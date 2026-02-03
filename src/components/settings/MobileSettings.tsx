@@ -167,7 +167,10 @@ export function MobileSettings({ onLog }: MobileSettingsProps) {
       </div>
 
       {/* Device Selection */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-mobile-device-section">
+      <div
+        className="space-y-4 rounded-lg bg-card/50 p-4"
+        data-ui-id="settings-mobile-device-section"
+      >
         <div className="flex items-center justify-between">
           <h4 className="font-medium text-sm">Default Device</h4>
           <button
@@ -209,7 +212,10 @@ export function MobileSettings({ onLog }: MobileSettingsProps) {
       </div>
 
       {/* App Package Filter */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-mobile-package-section">
+      <div
+        className="space-y-4 rounded-lg bg-card/50 p-4"
+        data-ui-id="settings-mobile-package-section"
+      >
         <h4 className="font-medium text-sm">App Package</h4>
 
         <div className="space-y-1.5">
@@ -232,7 +238,10 @@ export function MobileSettings({ onLog }: MobileSettingsProps) {
       </div>
 
       {/* Logcat Settings */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-mobile-logcat-section">
+      <div
+        className="space-y-4 rounded-lg bg-card/50 p-4"
+        data-ui-id="settings-mobile-logcat-section"
+      >
         <h4 className="font-medium text-sm">Logcat Capture</h4>
 
         <div className="grid grid-cols-2 gap-4">
@@ -279,7 +288,10 @@ export function MobileSettings({ onLog }: MobileSettingsProps) {
       </div>
 
       {/* Output Directory */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-mobile-output-section">
+      <div
+        className="space-y-4 rounded-lg bg-card/50 p-4"
+        data-ui-id="settings-mobile-output-section"
+      >
         <h4 className="font-medium text-sm">Output Directory</h4>
 
         <div className="space-y-1.5">

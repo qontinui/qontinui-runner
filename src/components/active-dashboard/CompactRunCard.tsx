@@ -111,10 +111,7 @@ function formatElapsed(startTime: number | null): string {
  * Uses forwardRef to support keyboard navigation focus management.
  */
 export const CompactRunCard = forwardRef<HTMLButtonElement, CompactRunCardProps>(
-  function CompactRunCard(
-    { run, isSelected = false, onClick, isFocused = false, index },
-    ref
-  ) {
+  function CompactRunCard({ run, isSelected = false, onClick, isFocused = false, index }, ref) {
     const statusDisplay = getStatusDisplay(run.status);
     const StatusIcon = statusDisplay.icon;
     const colors = getAccentColors(statusDisplay.color as Parameters<typeof getAccentColors>[0]);
@@ -199,7 +196,7 @@ export const CompactRunCard = forwardRef<HTMLButtonElement, CompactRunCardProps>
         </div>
       </button>
     );
-  }
+  },
 );
 
 // Also export as default

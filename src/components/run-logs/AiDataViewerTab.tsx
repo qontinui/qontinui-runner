@@ -211,7 +211,10 @@ function SidebarNav({
   ];
 
   return (
-    <div data-ui-id="logs-ai-data-sidebar" className="w-56 flex-shrink-0 border-r border-border bg-muted/30 overflow-y-auto">
+    <div
+      data-ui-id="logs-ai-data-sidebar"
+      className="w-56 flex-shrink-0 border-r border-border bg-muted/30 overflow-y-auto"
+    >
       <div className="p-2 space-y-1">
         {navGroups.map((group) => {
           const isExpanded = expandedGroups.has(group.id);

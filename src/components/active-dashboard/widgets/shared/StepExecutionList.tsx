@@ -3,13 +3,22 @@
  *
  * Displays a list of step executions with status, timing, and optional details.
  * Used across all step-type widgets for consistent step display.
+ *
+ * Uses virtual scrolling for lists with 100+ items to maintain performance.
  */
 
+import { useCallback, type CSSProperties } from "react";
 import { cn } from "../../../../lib/utils";
 import { ScrollArea, Badge } from "../../../ui";
+import { FixedVirtualList } from "../../../ui/VirtualList";
 import { getStatusColors } from "@/design-system";
 import { StepStatusBadge } from "./StepStatusBadge";
 import type { StepExecution } from "./types";
+
+/** Threshold for switching to virtual scrolling */
+const VIRTUAL_SCROLL_THRESHOLD = 100;
+/** Height of each step row in pixels */
+const STEP_ROW_HEIGHT = 56;
 
 interface StepExecutionListProps<T extends StepExecution> {
   /** List of step executions */
@@ -121,6 +130,9 @@ function StepRow<T extends StepExecution>({
 
 /**
  * Step execution list component.
+ *
+ * Automatically uses virtual scrolling when step count exceeds VIRTUAL_SCROLL_THRESHOLD
+ * for optimal performance with large datasets.
  */
 export function StepExecutionList<T extends StepExecution>({
   steps,
@@ -132,7 +144,32 @@ export function StepExecutionList<T extends StepExecution>({
   height = "h-[300px]",
   reverseOrder = true,
 }: StepExecutionListProps<T>) {
-  const displaySteps = reverseOrder ? steps.slice(0, maxDisplay) : steps.slice(-maxDisplay);
+  // Use virtual scrolling for large lists
+  const useVirtualScroll = steps.length > VIRTUAL_SCROLL_THRESHOLD;
+
+  // For non-virtual mode, limit display count
+  const displaySteps = useVirtualScroll
+    ? steps
+    : reverseOrder
+      ? steps.slice(0, maxDisplay)
+      : steps.slice(-maxDisplay);
+
+  // Render function for virtual list
+  const renderVirtualItem = useCallback(
+    (step: T, _index: number, style: CSSProperties) => (
+      <div style={style}>
+        <StepRow
+          step={step}
+          renderStepContent={renderStepContent}
+          renderStepBadge={renderStepBadge}
+        />
+      </div>
+    ),
+    [renderStepContent, renderStepBadge],
+  );
+
+  // Key extractor for virtual list
+  const getItemKey = useCallback((step: T) => step.id, []);
 
   return (
     <div className={cn("flex flex-col", height, className)}>
@@ -141,27 +178,40 @@ export function StepExecutionList<T extends StepExecution>({
         <h3 className="text-sm font-semibold text-foreground">{title}</h3>
         <Badge variant="muted" className="text-xs">
           {steps.length} step{steps.length !== 1 ? "s" : ""}
+          {useVirtualScroll && " (virtualized)"}
         </Badge>
       </div>
 
-      {/* Scrollable list */}
-      <ScrollArea className="flex-1">
-        <div className={cn(reverseOrder && "flex flex-col-reverse")}>
-          {displaySteps.map((step) => (
-            <StepRow
-              key={step.id}
-              step={step}
-              renderStepContent={renderStepContent}
-              renderStepBadge={renderStepBadge}
-            />
-          ))}
+      {/* List content */}
+      {steps.length === 0 ? (
+        <div className="flex items-center justify-center h-24 text-muted-foreground text-sm">
+          No steps executed yet
         </div>
-        {steps.length === 0 && (
-          <div className="flex items-center justify-center h-24 text-muted-foreground text-sm">
-            No steps executed yet
+      ) : useVirtualScroll ? (
+        /* Virtual scrolling for large lists */
+        <FixedVirtualList
+          items={displaySteps}
+          itemHeight={STEP_ROW_HEIGHT}
+          renderItem={renderVirtualItem}
+          getItemKey={getItemKey}
+          reverseOrder={reverseOrder}
+          overscanCount={10}
+        />
+      ) : (
+        /* Regular scrolling for small lists */
+        <ScrollArea className="flex-1">
+          <div className={cn(reverseOrder && "flex flex-col-reverse")}>
+            {displaySteps.map((step) => (
+              <StepRow
+                key={step.id}
+                step={step}
+                renderStepContent={renderStepContent}
+                renderStepBadge={renderStepBadge}
+              />
+            ))}
           </div>
-        )}
-      </ScrollArea>
+        </ScrollArea>
+      )}
     </div>
   );
 }

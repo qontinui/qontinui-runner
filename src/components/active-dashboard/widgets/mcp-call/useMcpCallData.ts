@@ -124,9 +124,7 @@ export function useMcpCallData(): McpCallData {
   // Calculate statistics
   const stats: StepStats = useMemo(() => {
     const total = calls.length;
-    const completed = calls.filter(
-      (c) => c.status === "success" || c.status === "failed",
-    ).length;
+    const completed = calls.filter((c) => c.status === "success" || c.status === "failed").length;
     const successful = calls.filter((c) => c.status === "success").length;
     const failed = calls.filter((c) => c.status === "failed").length;
     const pending = calls.filter((c) => c.status === "pending" || c.status === "running").length;

@@ -78,7 +78,9 @@ export function WorkflowLibraryPanel({
           <div className="flex flex-col items-center justify-center h-32 text-gray-500">
             <Inbox className="w-8 h-8 mb-2" />
             <p className="text-body-sm">
-              {search || category !== "all" ? "No workflows match your filters" : "No workflows found"}
+              {search || category !== "all"
+                ? "No workflows match your filters"
+                : "No workflows found"}
             </p>
           </div>
         ) : (

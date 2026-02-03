@@ -220,6 +220,78 @@ export interface HookStatus {
 }
 
 // ============================================================================
+// Sub-Step Progress Types
+// ============================================================================
+
+/** Status of a sub-step */
+export type SubStepStatus = "pending" | "running" | "completed" | "failed" | "skipped";
+
+/** Information about a single sub-step */
+export interface SubStepInfo {
+  /** Unique identifier for the sub-step */
+  id: string;
+  /** Parent checkpoint or action ID */
+  parentId: string;
+  /** Human-readable name/description */
+  name: string;
+  /** Current status */
+  status: SubStepStatus;
+  /** Index within the parent (0-based) */
+  index: number;
+  /** Total number of sub-steps in parent */
+  totalCount: number;
+  /** When the sub-step started */
+  startedAt: number | null;
+  /** When the sub-step completed */
+  completedAt: number | null;
+  /** Duration in milliseconds */
+  durationMs: number | null;
+  /** Phase this sub-step belongs to */
+  phase?: string;
+}
+
+/** Sub-step progress status for display */
+export interface SubStepStatus_Display {
+  /** Current sub-step being executed */
+  current: SubStepInfo | null;
+  /** All sub-steps in the current batch */
+  steps: SubStepInfo[];
+  /** Overall progress (0-100) */
+  progressPercent: number;
+  /** Number of completed sub-steps */
+  completedCount: number;
+  /** Total number of sub-steps */
+  totalCount: number;
+  /** Whether sub-step tracking is active */
+  isActive: boolean;
+  /** Phase currently executing */
+  currentPhase: string | null;
+}
+
+/** Raw sub-step complete event from backend */
+export interface RawSubStepCompleteEvent {
+  type: "sub_step_complete";
+  checkpoint_id: string;
+  task_run_id: string;
+  sub_step_id: string;
+  description: string | null;
+  timestamp: number;
+}
+
+/** Raw sub-step started event from backend */
+export interface RawSubStepStartedEvent {
+  type: "sub_step_started";
+  checkpoint_id: string;
+  task_run_id: string;
+  sub_step_id: string;
+  sub_step_index: number;
+  total_sub_steps: number;
+  description: string | null;
+  phase: string | null;
+  timestamp: number;
+}
+
+// ============================================================================
 // Combined Execution Status
 // ============================================================================
 
@@ -241,6 +313,8 @@ export interface ExecutionStatus {
   compression: CompressionStatus;
   /** Lifecycle hooks status */
   hooks: HookStatus;
+  /** Sub-step progress status */
+  subSteps: SubStepStatus_Display;
   /** Last updated timestamp */
   lastUpdated: number;
 }
@@ -444,6 +518,19 @@ export function createDefaultHookStatus(): HookStatus {
   };
 }
 
+/** Create default sub-step status */
+export function createDefaultSubStepStatus(): SubStepStatus_Display {
+  return {
+    current: null,
+    steps: [],
+    progressPercent: 0,
+    completedCount: 0,
+    totalCount: 0,
+    isActive: false,
+    currentPhase: null,
+  };
+}
+
 /** Create default execution status */
 export function createDefaultExecutionStatus(): ExecutionStatus {
   return {
@@ -455,6 +542,7 @@ export function createDefaultExecutionStatus(): ExecutionStatus {
     retry: createDefaultRetryStatus(),
     compression: createDefaultCompressionStatus(),
     hooks: createDefaultHookStatus(),
+    subSteps: createDefaultSubStepStatus(),
     lastUpdated: Date.now(),
   };
 }

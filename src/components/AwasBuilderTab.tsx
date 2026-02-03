@@ -179,9 +179,7 @@ export function AwasBuilderTab({ onLog, editConfigId, _onNavigateToLibrary }: Aw
 
   // Get names of selected configs for dialog
   const getSelectedNames = useCallback(() => {
-    return savedConfigs
-      .filter((c) => selectedIds.has(c.id))
-      .map((c) => c.name);
+    return savedConfigs.filter((c) => selectedIds.has(c.id)).map((c) => c.name);
   }, [savedConfigs, selectedIds]);
 
   // Fetch saved configs from storage (simulated - would be from database)
@@ -523,12 +521,10 @@ export function AwasBuilderTab({ onLog, editConfigId, _onNavigateToLibrary }: Aw
         {/* Selection Mode Header */}
         {isSelectionMode && (
           <div className="flex items-center justify-between px-4 py-2 bg-red-500/10 border-b border-red-500/30">
-            <span className="text-sm text-red-400">
-              {selectedIds.size} selected
-            </span>
+            <span className="text-sm text-red-400">{selectedIds.size} selected</span>
             <div className="flex items-center gap-2">
               <button
-                onClick={() => setSelectedIds(new Set(filteredConfigs.map(c => c.id)))}
+                onClick={() => setSelectedIds(new Set(filteredConfigs.map((c) => c.id)))}
                 className="px-2 py-1 text-xs bg-neutral-700 hover:bg-neutral-600 text-neutral-200 rounded"
               >
                 Select All
@@ -574,7 +570,9 @@ export function AwasBuilderTab({ onLog, editConfigId, _onNavigateToLibrary }: Aw
               {filteredConfigs.map((config) => (
                 <button
                   key={config.id}
-                  onClick={() => isSelectionMode ? toggleSelection(config.id) : selectConfig(config)}
+                  onClick={() =>
+                    isSelectionMode ? toggleSelection(config.id) : selectConfig(config)
+                  }
                   className={`w-full text-left p-3 rounded-lg transition-colors ${
                     selectedConfig?.id === config.id ? "bg-neutral-700" : "hover:bg-neutral-800"
                   } ${isSelectionMode && selectedIds.has(config.id) ? "bg-red-500/10" : ""}`}

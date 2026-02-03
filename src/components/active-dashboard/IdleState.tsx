@@ -9,11 +9,7 @@ import { ArrowRight, Workflow, History } from "lucide-react";
 import { Button } from "../ui";
 import type { IdleStateProps } from "./types";
 
-export function IdleState({
-  onGoToExecute,
-  onGoToRecap,
-  lastRunWorkflowName,
-}: IdleStateProps) {
+export function IdleState({ onGoToExecute, onGoToRecap, lastRunWorkflowName }: IdleStateProps) {
   return (
     <div className="flex flex-1 items-center justify-center pt-16">
       <div className="flex flex-col items-center gap-6 text-center">

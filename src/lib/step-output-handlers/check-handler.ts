@@ -218,10 +218,7 @@ export class CheckHandler implements StepOutputHandler<CheckStepOutput> {
       description: "Number of checks that failed",
       type: "number",
       example_value: output.checks_failed,
-      suggested_assertions: [
-        "Assert no checks failed",
-        "Assert failed count below threshold",
-      ],
+      suggested_assertions: ["Assert no checks failed", "Assert failed count below threshold"],
     });
 
     // Issue count

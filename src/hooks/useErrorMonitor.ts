@@ -53,9 +53,7 @@ interface UseErrorEventsReturn {
   ignore: (id: number, reason?: string) => Promise<void>;
 }
 
-export function useErrorEvents(
-  options: UseErrorEventsOptions = {},
-): UseErrorEventsReturn {
+export function useErrorEvents(options: UseErrorEventsOptions = {}): UseErrorEventsReturn {
   const [errors, setErrors] = useState<StoredErrorEvent[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -76,7 +74,12 @@ export function useErrorEvents(
       const result = await errorMonitorService.queryErrorEvents(query);
       setErrors(result);
     } catch (err) {
-      const errorMessage = typeof err === 'string' ? err : err instanceof Error ? err.message : "Failed to fetch errors";
+      const errorMessage =
+        typeof err === "string"
+          ? err
+          : err instanceof Error
+            ? err.message
+            : "Failed to fetch errors";
       console.error("[useErrorMonitor] fetchErrors failed:", err);
       setError(errorMessage);
     } finally {
@@ -109,28 +112,20 @@ export function useErrorEvents(
 
   const acknowledge = useCallback(async (id: number) => {
     await errorMonitorService.acknowledgeError(id);
-    setErrors((prev) =>
-      prev.map((e) => (e.id === id ? { ...e, status: "acknowledged" } : e)),
-    );
+    setErrors((prev) => prev.map((e) => (e.id === id ? { ...e, status: "acknowledged" } : e)));
   }, []);
 
   const resolve = useCallback(async (id: number, notes?: string) => {
     await errorMonitorService.resolveError(id, notes);
     setErrors((prev) =>
-      prev.map((e) =>
-        e.id === id ? { ...e, status: "resolved", resolution_notes: notes } : e,
-      ),
+      prev.map((e) => (e.id === id ? { ...e, status: "resolved", resolution_notes: notes } : e)),
     );
   }, []);
 
   const ignore = useCallback(async (id: number, reason?: string) => {
     await errorMonitorService.ignoreError(id, reason);
     setErrors((prev) =>
-      prev.map((e) =>
-        e.id === id
-          ? { ...e, status: "ignored", resolution_notes: reason }
-          : e,
-      ),
+      prev.map((e) => (e.id === id ? { ...e, status: "ignored", resolution_notes: reason } : e)),
     );
   }, []);
 
@@ -167,9 +162,7 @@ interface UseErrorSummaryReturn {
   refresh: () => Promise<void>;
 }
 
-export function useErrorSummary(
-  options: UseErrorSummaryOptions = {},
-): UseErrorSummaryReturn {
+export function useErrorSummary(options: UseErrorSummaryOptions = {}): UseErrorSummaryReturn {
   const [summary, setSummary] = useState<ErrorSummary | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -180,12 +173,15 @@ export function useErrorSummary(
     try {
       setLoading(true);
       setError(null);
-      const result = await errorMonitorService.getErrorSummary(
-        optionsRef.current.taskRunId,
-      );
+      const result = await errorMonitorService.getErrorSummary(optionsRef.current.taskRunId);
       setSummary(result);
     } catch (err) {
-      const errorMessage = typeof err === 'string' ? err : err instanceof Error ? err.message : "Failed to fetch summary";
+      const errorMessage =
+        typeof err === "string"
+          ? err
+          : err instanceof Error
+            ? err.message
+            : "Failed to fetch summary";
       console.error("[useErrorMonitor] fetchSummary failed:", err);
       setError(errorMessage);
     } finally {
@@ -244,9 +240,7 @@ interface UseDebugContextReturn {
   getAiContext: () => Promise<string>;
 }
 
-export function useDebugContext(
-  options: UseDebugContextOptions = {},
-): UseDebugContextReturn {
+export function useDebugContext(options: UseDebugContextOptions = {}): UseDebugContextReturn {
   const [context, setContext] = useState<DebugContext | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -263,7 +257,12 @@ export function useDebugContext(
       );
       setContext(result);
     } catch (err) {
-      const errorMessage = typeof err === 'string' ? err : err instanceof Error ? err.message : "Failed to fetch debug context";
+      const errorMessage =
+        typeof err === "string"
+          ? err
+          : err instanceof Error
+            ? err.message
+            : "Failed to fetch debug context";
       console.error("[useErrorMonitor] fetchContext failed:", err);
       setError(errorMessage);
     } finally {
@@ -314,8 +313,7 @@ export function useFixWorkflow(): UseFixWorkflowReturn {
       setSummary(result);
       return result;
     } catch (err) {
-      const msg =
-        err instanceof Error ? err.message : "Failed to check fixable errors";
+      const msg = err instanceof Error ? err.message : "Failed to check fixable errors";
       setError(msg);
       throw new Error(msg);
     } finally {
@@ -330,8 +328,7 @@ export function useFixWorkflow(): UseFixWorkflowReturn {
       const result = await errorMonitorService.generateErrorFixWorkflow();
       return result.workflowJson;
     } catch (err) {
-      const msg =
-        err instanceof Error ? err.message : "Failed to generate workflow";
+      const msg = err instanceof Error ? err.message : "Failed to generate workflow";
       setError(msg);
       throw new Error(msg);
     } finally {
@@ -343,12 +340,10 @@ export function useFixWorkflow(): UseFixWorkflowReturn {
     try {
       setLoading(true);
       setError(null);
-      const result =
-        await errorMonitorService.generateSingleErrorFixWorkflow(errorId);
+      const result = await errorMonitorService.generateSingleErrorFixWorkflow(errorId);
       return result.workflowJson;
     } catch (err) {
-      const msg =
-        err instanceof Error ? err.message : "Failed to generate workflow";
+      const msg = err instanceof Error ? err.message : "Failed to generate workflow";
       setError(msg);
       throw new Error(msg);
     } finally {
@@ -382,8 +377,7 @@ interface UseErrorBadgeReturn {
 export function useErrorBadge(taskRunId?: string): UseErrorBadgeReturn {
   const [count, setCount] = useState(0);
   const [hasActionable, setHasActionable] = useState(false);
-  const [highestSeverity, setHighestSeverity] =
-    useState<ErrorSeverity | null>(null);
+  const [highestSeverity, setHighestSeverity] = useState<ErrorSeverity | null>(null);
 
   useEffect(() => {
     const fetchBadgeData = async () => {

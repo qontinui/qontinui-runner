@@ -41,15 +41,7 @@ import type { UseProjectLogsReturn } from "./types";
  */
 export function useProjectLogs(): UseProjectLogsReturn {
   // Configuration management
-  const {
-    config,
-    loading,
-    error,
-    directories,
-    loadConfig,
-    saveConfig,
-    setConfig,
-  } = useLogConfig();
+  const { config, loading, error, directories, loadConfig, saveConfig, setConfig } = useLogConfig();
 
   // Source selection operations
   const { setSelectedSources, setGlobalProfile } = useLogSourceOperations({

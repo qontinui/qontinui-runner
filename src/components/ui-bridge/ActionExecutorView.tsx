@@ -34,7 +34,7 @@ interface ActionExecutorViewProps {
   onExecuteAction?: (
     elementId: string,
     action: string,
-    params?: Record<string, unknown>
+    params?: Record<string, unknown>,
   ) => Promise<unknown>;
   disabled?: boolean;
 }
@@ -208,7 +208,7 @@ export function ActionExecutorView({
         setExecuting(false);
       }
     },
-    [element, onExecuteAction, disabled, executing, textParam, valueParam]
+    [element, onExecuteAction, disabled, executing, textParam, valueParam],
   );
 
   // Quick action button
@@ -230,11 +230,7 @@ export function ActionExecutorView({
         title={action.description}
         className="flex items-center gap-1"
       >
-        {executing ? (
-          <Loader2 className="w-3.5 h-3.5 animate-spin" />
-        ) : (
-          action.icon
-        )}
+        {executing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : action.icon}
         {action.label}
       </Button>
     );
@@ -245,9 +241,7 @@ export function ActionExecutorView({
       <div className="flex flex-col items-center justify-center h-full text-muted-foreground text-sm gap-2">
         <Play className="w-8 h-8 opacity-50" />
         <p>Select an element to execute actions</p>
-        <p className="text-xs">
-          Use the Elements tab or element picker to select
-        </p>
+        <p className="text-xs">Use the Elements tab or element picker to select</p>
       </div>
     );
   }
@@ -263,19 +257,14 @@ export function ActionExecutorView({
         <CardContent className="py-2">
           <div className="flex items-center gap-2">
             <Badge variant="default">{element.type}</Badge>
-            <span className="text-sm font-mono truncate flex-1">
-              {element.id}
-            </span>
+            <span className="text-sm font-mono truncate flex-1">{element.id}</span>
             {element.label && (
-              <span className="text-xs text-muted-foreground truncate">
-                {element.label}
-              </span>
+              <span className="text-xs text-muted-foreground truncate">{element.label}</span>
             )}
           </div>
           {element.value !== undefined && (
             <div className="mt-1 text-xs text-muted-foreground">
-              Value:{" "}
-              <span className="font-mono">{element.value || "(empty)"}</span>
+              Value: <span className="font-mono">{element.value || "(empty)"}</span>
             </div>
           )}
         </CardContent>
@@ -288,7 +277,7 @@ export function ActionExecutorView({
             "flex items-center gap-2 p-2 rounded-md text-sm",
             lastResult.success
               ? "bg-accent/10 text-accent border border-accent/30"
-              : "bg-destructive/10 text-destructive border border-destructive/30"
+              : "bg-destructive/10 text-destructive border border-destructive/30",
           )}
         >
           {lastResult.success ? (
@@ -306,9 +295,7 @@ export function ActionExecutorView({
 
       {/* Quick actions */}
       <div>
-        <div className="text-xs font-semibold text-muted-foreground mb-2">
-          Quick Actions
-        </div>
+        <div className="text-xs font-semibold text-muted-foreground mb-2">Quick Actions</div>
         <div className="flex flex-wrap gap-2">
           {quickActions.map((action) => renderActionButton(action))}
         </div>
@@ -324,9 +311,7 @@ export function ActionExecutorView({
           {/* Text input for type action */}
           {paramActions.some((a) => a.paramType === "text") && (
             <div className="mb-3">
-              <label className="text-xs text-muted-foreground mb-1 block">
-                Text to type:
-              </label>
+              <label className="text-xs text-muted-foreground mb-1 block">Text to type:</label>
               <div className="flex gap-2">
                 <input
                   type="text"
@@ -346,9 +331,7 @@ export function ActionExecutorView({
           {/* Value input for select action */}
           {paramActions.some((a) => a.paramType === "value") && (
             <div className="mb-3">
-              <label className="text-xs text-muted-foreground mb-1 block">
-                Option value:
-              </label>
+              <label className="text-xs text-muted-foreground mb-1 block">Option value:</label>
               <div className="flex gap-2">
                 <input
                   type="text"
@@ -383,9 +366,7 @@ export function ActionExecutorView({
 
         {showAdvanced && (
           <div className="mt-2 p-2 bg-muted/20 rounded-md">
-            <div className="text-xs text-muted-foreground mb-2">
-              Element Details
-            </div>
+            <div className="text-xs text-muted-foreground mb-2">Element Details</div>
             <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
               <div className="text-muted-foreground">Tag:</div>
               <div className="font-mono">{element.tagName}</div>
@@ -401,8 +382,7 @@ export function ActionExecutorView({
               </div>
               <div className="text-muted-foreground">Size:</div>
               <div className="font-mono">
-                {element.bounds.width.toFixed(0)} x{" "}
-                {element.bounds.height.toFixed(0)}
+                {element.bounds.width.toFixed(0)} x {element.bounds.height.toFixed(0)}
               </div>
             </div>
           </div>

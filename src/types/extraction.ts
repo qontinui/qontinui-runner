@@ -156,3 +156,56 @@ export interface CloudExtractionSession {
   completed_at?: string;
   created_by?: string;
 }
+
+/**
+ * Phase of the auto-exploration process
+ */
+export type ExplorationPhase =
+  | "connecting"
+  | "discovering"
+  | "exploring"
+  | "analyzing"
+  | "complete"
+  | "stopped";
+
+/**
+ * Information about the element currently being explored
+ */
+export interface CurrentElementInfo {
+  /** Element ID */
+  id: string;
+  /** Human-readable label (text content or accessible name) */
+  label: string;
+  /** Action being performed (click, focus, etc.) */
+  action: string;
+}
+
+/**
+ * Real-time progress updates for auto-exploration
+ */
+export interface ExplorationProgress {
+  /** Current phase of exploration */
+  phase: ExplorationPhase;
+  /** Current navigation depth (0 = starting page) */
+  currentDepth: number;
+  /** Maximum configured exploration depth */
+  maxDepth: number;
+  /** Total unique elements discovered so far */
+  elementsDiscovered: number;
+  /** Number of elements that have been interacted with */
+  elementsExplored: number;
+  /** Estimated number of elements remaining to explore */
+  elementsRemaining: number;
+  /** Information about the element currently being explored, null if not exploring */
+  currentElement: CurrentElementInfo | null;
+  /** Number of unique states discovered */
+  statesFound: number;
+  /** Number of errors encountered */
+  errorsCount: number;
+  /** Time elapsed since exploration started (milliseconds) */
+  elapsedTimeMs: number;
+  /** Estimated time remaining (milliseconds), -1 if unknown */
+  estimatedRemainingMs: number;
+  /** Progress message for display */
+  message: string;
+}

@@ -106,7 +106,7 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
       acc[severity].push(finding);
       return acc;
     },
-    {} as Record<string, Finding[]>
+    {} as Record<string, Finding[]>,
   );
 
   // Categories for filter
@@ -162,9 +162,7 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
                         >
                           {finding.categoryId}
                         </span>
-                        <span className="flex-1 text-sm font-medium truncate">
-                          {finding.title}
-                        </span>
+                        <span className="flex-1 text-sm font-medium truncate">{finding.title}</span>
                         {isExpanded ? (
                           <ChevronDown className="w-4 h-4 text-muted-foreground" />
                         ) : (
@@ -181,9 +179,7 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
                             </p>
                           )}
                           {finding.resolution && (
-                            <p className="mt-1 text-green-400">
-                              Resolution: {finding.resolution}
-                            </p>
+                            <p className="mt-1 text-green-400">Resolution: {finding.resolution}</p>
                           )}
                         </div>
                       )}
@@ -196,13 +192,8 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
         })}
 
         {findings.length === 0 && (
-          <div
-            data-ui-id="recap-finding-placeholder"
-            className="px-3 py-4 text-center"
-          >
-            <p className="text-sm text-muted-foreground">
-              No findings recorded for this run.
-            </p>
+          <div data-ui-id="recap-finding-placeholder" className="px-3 py-4 text-center">
+            <p className="text-sm text-muted-foreground">No findings recorded for this run.</p>
           </div>
         )}
       </div>

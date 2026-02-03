@@ -148,7 +148,7 @@ function isInteractive(element: ExternalElement): boolean {
  */
 export function generateAIContext(
   elements: ExternalElement[],
-  options: AIContextOptions = {}
+  options: AIContextOptions = {},
 ): string {
   const {
     pageTitle,
@@ -173,9 +173,7 @@ export function generateAIContext(
   }
 
   // Filter elements
-  const filteredElements = interactiveOnly
-    ? elements.filter(isInteractive)
-    : elements;
+  const filteredElements = interactiveOnly ? elements.filter(isInteractive) : elements;
 
   // Count header
   const label = interactiveOnly ? "Interactive Elements" : "Elements";
@@ -231,7 +229,7 @@ export function generateAIContext(
     if (includeBounds && element.bounds) {
       const { x, y, width, height } = element.bounds;
       details.push(
-        `    - Position: (${Math.round(x)}, ${Math.round(y)}) ${Math.round(width)}x${Math.round(height)}`
+        `    - Position: (${Math.round(x)}, ${Math.round(y)}) ${Math.round(width)}x${Math.round(height)}`,
       );
     }
 
@@ -248,7 +246,7 @@ export function generateAIContext(
     // Actions (only if non-obvious)
     if (element.actions && element.actions.length > 0) {
       const nonObviousActions = element.actions.filter(
-        (action) => !["click", "focus"].includes(action.toLowerCase())
+        (action) => !["click", "focus"].includes(action.toLowerCase()),
       );
       if (nonObviousActions.length > 0) {
         details.push(`    - Actions: ${nonObviousActions.join(", ")}`);

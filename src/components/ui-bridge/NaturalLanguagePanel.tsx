@@ -10,9 +10,11 @@
  * - Element matching with confidence
  * - Alternative interpretations
  * - Execute with confirmation
+ * - Integration with persisted element descriptions
+ * - Command history
  */
 
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { Button } from "../ui/Button";
 import { Badge } from "../ui/Badge";
 import {
@@ -34,20 +36,59 @@ import {
   List,
   CheckCircle,
   XCircle,
+  Bot,
+  Loader2,
+  Lightbulb,
+  History,
+  Database,
 } from "lucide-react";
-import type { ExternalElement, CommandResult } from "../../hooks/useExternalUIBridge";
+import type { ExternalElement, CommandResult, PageContext } from "../../hooks/useExternalUIBridge";
+import {
+  ElementDescriptionService,
+  type PersistedElementDescription,
+} from "../../services/element-description-service";
+import {
+  normalizeAction,
+  normalizeElement,
+  expandQuery,
+  getElementSynonyms,
+  containsElementSynonym,
+} from "../../lib/ui-bridge/synonyms";
+import {
+  generateQuerySuggestions,
+  shouldRegenerateSuggestions,
+  type QuerySuggestion,
+} from "../../lib/ui-bridge/querySuggestions";
+import {
+  matchElementsWithLLM,
+  isLLMAvailable,
+  type LLMMatchResult,
+} from "../../lib/ui-bridge/llmElementMatcher";
 
 interface NaturalLanguagePanelProps {
   elements: ExternalElement[];
   onExecuteAction: (
     elementId: string,
     action: string,
-    params?: Record<string, unknown>
+    params?: Record<string, unknown>,
   ) => Promise<CommandResult>;
   onSelectElement: (elementId: string) => void;
   onHighlightElement: (elementId: string) => void;
+  pageContext?: PageContext | null;
   disabled?: boolean;
 }
+
+/** Command history entry */
+interface CommandHistoryEntry {
+  command: string;
+  action: string;
+  elementId: string;
+  timestamp: number;
+  success: boolean;
+}
+
+const COMMAND_HISTORY_KEY = "qontinui-nl-command-history";
+const MAX_HISTORY_ENTRIES = 20;
 
 interface ParsedIntent {
   action: string;
@@ -61,12 +102,20 @@ interface ElementMatch {
   element: ExternalElement;
   score: number;
   matchReason: string;
+  /** Whether this match came from LLM */
+  fromLLM?: boolean;
 }
 
 interface InterpretationResult {
   intent: ParsedIntent;
   matches: ElementMatch[];
   bestMatch: ElementMatch | null;
+  /** Whether LLM was used for matching */
+  usedLLM?: boolean;
+  /** LLM matching status */
+  llmStatus?: "idle" | "loading" | "success" | "error" | "timeout";
+  /** LLM error message if any */
+  llmError?: string;
 }
 
 // Action patterns with their variations
@@ -114,10 +163,7 @@ const ACTION_PATTERNS: Array<{
   {
     action: "focus",
     label: "Focus",
-    patterns: [
-      /^focus\s+(?:on\s+)?(?:the\s+)?(.+)/i,
-      /^go\s+to\s+(?:the\s+)?(.+)/i,
-    ],
+    patterns: [/^focus\s+(?:on\s+)?(?:the\s+)?(.+)/i, /^go\s+to\s+(?:the\s+)?(.+)/i],
     icon: <Eye className="w-4 h-4" />,
   },
   {
@@ -154,21 +200,22 @@ const ACTION_PATTERNS: Array<{
   {
     action: "hover",
     label: "Hover",
-    patterns: [
-      /^hover\s+(?:over\s+)?(?:the\s+)?(.+)/i,
-      /^mouse\s+over\s+(?:the\s+)?(.+)/i,
-    ],
+    patterns: [/^hover\s+(?:over\s+)?(?:the\s+)?(.+)/i, /^mouse\s+over\s+(?:the\s+)?(.+)/i],
     icon: <MousePointer className="w-4 h-4" />,
   },
 ];
 
 /**
  * Parse natural language input to extract intent
+ *
+ * Uses synonym normalization to detect actions even when users
+ * use alternative verbs (e.g., "tap" -> "click", "write" -> "type")
  */
 function parseIntent(input: string): ParsedIntent | null {
   const trimmed = input.trim();
   if (!trimmed) return null;
 
+  // First, try to match against defined patterns
   for (const pattern of ACTION_PATTERNS) {
     for (const regex of pattern.patterns) {
       const match = trimmed.match(regex);
@@ -207,6 +254,35 @@ function parseIntent(input: string): ParsedIntent | null {
     }
   }
 
+  // Second, try to detect action via synonym normalization
+  // This catches cases like "hit the submit button" where "hit" isn't in patterns
+  const words = trimmed.split(/\s+/);
+  if (words.length >= 2) {
+    const firstWord = words[0].toLowerCase();
+    const normalizedAction = normalizeAction(firstWord);
+
+    // Check if the normalized action maps to a known pattern
+    const matchedPattern = ACTION_PATTERNS.find((p) => p.action === normalizedAction);
+    if (matchedPattern && normalizedAction !== firstWord) {
+      // We found a synonym match - extract the target description
+      // Remove the action word and common filler words
+      const targetDescription = trimmed
+        .substring(firstWord.length)
+        .trim()
+        .replace(/^(?:on\s+)?(?:the\s+)?/i, "")
+        .trim();
+
+      if (targetDescription) {
+        return {
+          action: matchedPattern.action,
+          actionLabel: matchedPattern.label,
+          targetDescription,
+          confidence: 0.8, // Slightly lower confidence for synonym match
+        };
+      }
+    }
+  }
+
   // Fallback: assume click if no action verb found
   // Look for just a target description
   const fallbackMatch = trimmed.match(/^(?:the\s+)?(.+)/i);
@@ -240,24 +316,96 @@ function calculateSimilarity(a: string, b: string): number {
 
 /**
  * Find elements matching the target description
+ *
+ * Uses synonym expansion to match elements even when users use
+ * alternative terms (e.g., "sign in" matches "login", "btn" matches "button")
+ *
+ * Also checks against persisted element descriptions for enhanced matching.
  */
 function findMatchingElements(
   targetDescription: string,
-  elements: ExternalElement[]
+  elements: ExternalElement[],
+  descriptions?: Map<string, PersistedElementDescription>,
 ): ElementMatch[] {
   const matches: ElementMatch[] = [];
   const lowerTarget = targetDescription.toLowerCase();
   const targetWords = lowerTarget.split(/\s+/);
 
+  // Expand the query with synonyms to check multiple variations
+  const expandedQueries = expandQuery(lowerTarget);
+
+  // Get canonical element concepts from the target for synonym matching
+  const targetConcepts = normalizeElement(lowerTarget);
+
   for (const element of elements) {
     let score = 0;
     const reasons: string[] = [];
+    const elementId = element.id.toLowerCase();
+    const elementLabel = element.label?.toLowerCase() || "";
+    const elementText = element.text?.toLowerCase() || "";
 
-    // Check ID match
-    if (element.id.toLowerCase().includes(lowerTarget)) {
+    // Check persisted description if available
+    const desc = descriptions?.get(element.id);
+    if (desc) {
+      // Check aliases from persisted description
+      for (const alias of desc.aliases) {
+        const lowerAlias = alias.toLowerCase();
+        if (lowerAlias.includes(lowerTarget) || lowerTarget.includes(lowerAlias)) {
+          score += 0.95; // High score for alias match
+          reasons.push(`Alias match: "${alias}"`);
+          break;
+        }
+      }
+
+      // Check description text
+      const lowerDesc = desc.description.toLowerCase();
+      if (lowerDesc.includes(lowerTarget)) {
+        score += 0.7;
+        reasons.push("Description contains target");
+      } else {
+        const descSimilarity = calculateSimilarity(desc.description, lowerTarget);
+        if (descSimilarity > 0.3) {
+          score += descSimilarity * 0.6;
+          reasons.push(`Description similarity: ${(descSimilarity * 100).toFixed(0)}%`);
+        }
+      }
+
+      // Check purpose
+      const lowerPurpose = desc.purpose.toLowerCase();
+      if (lowerPurpose.includes(lowerTarget)) {
+        score += 0.5;
+        reasons.push("Purpose contains target");
+      }
+
+      // Check interaction (AI-generated)
+      if (desc.interaction) {
+        const lowerInteraction = desc.interaction.toLowerCase();
+        if (lowerInteraction.includes(lowerTarget)) {
+          score += 0.4;
+          reasons.push("Interaction guide matches");
+        }
+      }
+    }
+
+    // Check ID match (original + expanded queries)
+    let idMatched = false;
+    if (elementId.includes(lowerTarget)) {
       score += 0.8;
       reasons.push("ID contains target");
+      idMatched = true;
     } else {
+      // Check expanded queries against ID
+      for (const expanded of expandedQueries) {
+        if (expanded !== lowerTarget && elementId.includes(expanded)) {
+          score += 0.75;
+          reasons.push(`ID contains synonym "${expanded}"`);
+          idMatched = true;
+          break;
+        }
+      }
+    }
+
+    if (!idMatched) {
       // Check word overlap with ID
       const idSimilarity = calculateSimilarity(element.id, lowerTarget);
       if (idSimilarity > 0.3) {
@@ -266,12 +414,26 @@ function findMatchingElements(
       }
     }
 
-    // Check label match
+    // Check label match (original + expanded queries)
     if (element.label) {
-      if (element.label.toLowerCase().includes(lowerTarget)) {
+      let labelMatched = false;
+      if (elementLabel.includes(lowerTarget)) {
         score += 0.9;
         reasons.push("Label contains target");
+        labelMatched = true;
       } else {
+        // Check expanded queries against label
+        for (const expanded of expandedQueries) {
+          if (expanded !== lowerTarget && elementLabel.includes(expanded)) {
+            score += 0.85;
+            reasons.push(`Label contains synonym "${expanded}"`);
+            labelMatched = true;
+            break;
+          }
+        }
+      }
+
+      if (!labelMatched) {
         const labelSimilarity = calculateSimilarity(element.label, lowerTarget);
         if (labelSimilarity > 0.3) {
           score += labelSimilarity * 0.7;
@@ -280,12 +442,26 @@ function findMatchingElements(
       }
     }
 
-    // Check text match
+    // Check text match (original + expanded queries)
     if (element.text) {
-      if (element.text.toLowerCase().includes(lowerTarget)) {
+      let textMatched = false;
+      if (elementText.includes(lowerTarget)) {
         score += 0.85;
         reasons.push("Text contains target");
+        textMatched = true;
       } else {
+        // Check expanded queries against text
+        for (const expanded of expandedQueries) {
+          if (expanded !== lowerTarget && elementText.includes(expanded)) {
+            score += 0.8;
+            reasons.push(`Text contains synonym "${expanded}"`);
+            textMatched = true;
+            break;
+          }
+        }
+      }
+
+      if (!textMatched) {
         const textSimilarity = calculateSimilarity(element.text, lowerTarget);
         if (textSimilarity > 0.3) {
           score += textSimilarity * 0.65;
@@ -294,19 +470,26 @@ function findMatchingElements(
       }
     }
 
-    // Check type match (e.g., "button", "input")
+    // Check type match (e.g., "button", "input") - use synonyms
     if (targetWords.includes(element.type)) {
       score += 0.3;
       reasons.push("Type matches");
+    } else {
+      // Check if target contains a synonym of the element type
+      // E.g., if element is "button" and target contains "btn"
+      if (containsElementSynonym(lowerTarget, element.type)) {
+        score += 0.25;
+        reasons.push(`Type synonym matches "${element.type}"`);
+      }
     }
 
-    // Check for specific element type keywords
+    // Check for specific element type keywords (using synonyms from dictionary)
     const typeKeywords: Record<string, string[]> = {
-      button: ["button", "btn", "submit", "click"],
-      input: ["input", "field", "textbox", "text field"],
+      button: getElementSynonyms("button"),
+      input: getElementSynonyms("input"),
       link: ["link", "anchor", "href"],
       checkbox: ["checkbox", "check box", "toggle"],
-      select: ["dropdown", "select", "menu", "picker"],
+      select: getElementSynonyms("dropdown"),
     };
 
     for (const [type, keywords] of Object.entries(typeKeywords)) {
@@ -317,6 +500,23 @@ function findMatchingElements(
             reasons.push(`Keyword "${keyword}" matches type`);
             break;
           }
+        }
+      }
+    }
+
+    // Check if element matches any canonical concepts from the target
+    // E.g., if user says "sign in" and element has "login" in its properties
+    for (const concept of targetConcepts) {
+      const synonyms = getElementSynonyms(concept);
+      for (const syn of synonyms) {
+        if (
+          elementId.includes(syn) ||
+          elementLabel.includes(syn) ||
+          elementText.includes(syn)
+        ) {
+          score += 0.4;
+          reasons.push(`Matches concept "${concept}" (via "${syn}")`);
+          break;
         }
       }
     }
@@ -339,12 +539,13 @@ function findMatchingElements(
  */
 function interpretCommand(
   input: string,
-  elements: ExternalElement[]
+  elements: ExternalElement[],
+  descriptions?: Map<string, PersistedElementDescription>,
 ): InterpretationResult | null {
   const intent = parseIntent(input);
   if (!intent) return null;
 
-  const matches = findMatchingElements(intent.targetDescription, elements);
+  const matches = findMatchingElements(intent.targetDescription, elements, descriptions);
   const bestMatch = matches.length > 0 ? matches[0] : null;
 
   return {
@@ -369,6 +570,7 @@ export function NaturalLanguagePanel({
   onExecuteAction,
   onSelectElement: _onSelectElement,
   onHighlightElement,
+  pageContext,
   disabled = false,
 }: NaturalLanguagePanelProps) {
   const [input, setInput] = useState("");
@@ -383,16 +585,276 @@ export function NaturalLanguagePanel({
   } | null>(null);
   const [showExamples, setShowExamples] = useState(true);
   const [showAlternatives, setShowAlternatives] = useState(false);
+  const [showSuggestions, setShowSuggestions] = useState(true);
+  const [showHistory, setShowHistory] = useState(false);
+
+  // Persisted element descriptions for enhanced matching
+  const [descriptions, setDescriptions] = useState<Map<string, PersistedElementDescription>>(
+    new Map(),
+  );
+  const loadedPageRef = useRef<string | null>(null);
+
+  // Command history
+  const [commandHistory, setCommandHistory] = useState<CommandHistoryEntry[]>(() => {
+    try {
+      const stored = localStorage.getItem(COMMAND_HISTORY_KEY);
+      if (stored) {
+        return JSON.parse(stored) as CommandHistoryEntry[];
+      }
+    } catch {
+      // Ignore
+    }
+    return [];
+  });
+
+  // AI Matching state
+  const [aiMatchingEnabled, setAiMatchingEnabled] = useState(() => {
+    // Load preference from localStorage
+    const stored = localStorage.getItem("nlp-ai-matching-enabled");
+    return stored === "true";
+  });
+  const [aiAvailable, setAiAvailable] = useState(false);
+  const [isLoadingAI, setIsLoadingAI] = useState(false);
+
+  // Track previous elements for suggestion regeneration
+  const prevElementsRef = useRef<ExternalElement[]>([]);
+
+  // Check AI availability on mount
+  useEffect(() => {
+    isLLMAvailable().then(setAiAvailable);
+  }, []);
+
+  // Save AI matching preference to localStorage
+  useEffect(() => {
+    localStorage.setItem("nlp-ai-matching-enabled", String(aiMatchingEnabled));
+  }, [aiMatchingEnabled]);
+
+  // Load persisted descriptions when page context changes
+  useEffect(() => {
+    if (!pageContext?.url) {
+      loadedPageRef.current = null;
+      setDescriptions(new Map());
+      return;
+    }
+
+    if (loadedPageRef.current === pageContext.url) {
+      return;
+    }
+
+    loadedPageRef.current = pageContext.url;
+    const loaded = ElementDescriptionService.loadDescriptions(pageContext.url);
+    setDescriptions(loaded);
+    console.log(`[NaturalLanguagePanel] Loaded ${loaded.size} descriptions for enhanced matching`);
+  }, [pageContext?.url]);
+
+  // Save command history to localStorage
+  useEffect(() => {
+    localStorage.setItem(COMMAND_HISTORY_KEY, JSON.stringify(commandHistory));
+  }, [commandHistory]);
+
+  // Add command to history
+  const addToHistory = useCallback(
+    (command: string, action: string, elementId: string, success: boolean) => {
+      setCommandHistory((prev) => {
+        const newEntry: CommandHistoryEntry = {
+          command,
+          action,
+          elementId,
+          timestamp: Date.now(),
+          success,
+        };
+        // Remove duplicate command if exists
+        const filtered = prev.filter((e) => e.command !== command);
+        // Add to front, limit size
+        return [newEntry, ...filtered].slice(0, MAX_HISTORY_ENTRIES);
+      });
+    },
+    [],
+  );
+
+  // Clear command history
+  const clearHistory = useCallback(() => {
+    setCommandHistory([]);
+    localStorage.removeItem(COMMAND_HISTORY_KEY);
+  }, []);
+
+  // Generate query suggestions based on page elements
+  const querySuggestions = useMemo(() => {
+    return generateQuerySuggestions(elements, { maxSuggestions: 6 });
+  }, [elements]);
+
+  // Regenerate suggestions when elements change significantly
+  useEffect(() => {
+    if (shouldRegenerateSuggestions(prevElementsRef.current, elements)) {
+      // Show suggestions when elements change (new page loaded)
+      setShowSuggestions(true);
+    }
+    prevElementsRef.current = elements;
+  }, [elements]);
+
+  // Collapse suggestions when user starts typing their own query
+  useEffect(() => {
+    if (input.trim().length > 0) {
+      setShowSuggestions(false);
+    }
+  }, [input]);
+
+  // Handle clicking a suggestion
+  const handleSuggestionClick = useCallback(
+    async (suggestion: QuerySuggestion) => {
+      // Fill the input with the suggestion text
+      setInput(suggestion.text);
+
+      // Also immediately execute it
+      setIsExecuting(true);
+      setLastResult(null);
+
+      try {
+        const result = await onExecuteAction(suggestion.elementId, suggestion.action, undefined);
+
+        setLastResult({
+          success: result.success,
+          command: suggestion.text,
+          elementId: suggestion.elementId,
+          error: result.error,
+          timestamp: Date.now(),
+        });
+
+        if (result.success) {
+          // Clear input on success
+          setInput("");
+          setInterpretation(null);
+          // Show suggestions again for next action
+          setShowSuggestions(true);
+        }
+      } catch (err) {
+        setLastResult({
+          success: false,
+          command: suggestion.text,
+          elementId: suggestion.elementId,
+          error: err instanceof Error ? err.message : "Execution failed",
+          timestamp: Date.now(),
+        });
+      } finally {
+        setIsExecuting(false);
+      }
+    },
+    [onExecuteAction],
+  );
 
   // Real-time interpretation as user types
   useEffect(() => {
-    if (input.trim() && elements.length > 0) {
-      const result = interpretCommand(input, elements);
-      setInterpretation(result);
-    } else {
-      setInterpretation(null);
+    let cancelled = false;
+
+    async function interpretWithAI() {
+      if (!input.trim() || elements.length === 0) {
+        setInterpretation(null);
+        return;
+      }
+
+      // First, do regex/synonym matching with descriptions for enhanced matching
+      const regexResult = interpretCommand(input, elements, descriptions);
+      setInterpretation(regexResult);
+
+      // If AI matching is enabled and regex match has low confidence, try LLM
+      const shouldTryAI =
+        aiMatchingEnabled &&
+        aiAvailable &&
+        regexResult &&
+        (!regexResult.bestMatch || regexResult.bestMatch.score < 0.7);
+
+      if (shouldTryAI && regexResult) {
+        setIsLoadingAI(true);
+
+        // Update interpretation to show loading state
+        setInterpretation({
+          ...regexResult,
+          llmStatus: "loading",
+        });
+
+        try {
+          // Call LLM for element matching
+          const llmResult = await matchElementsWithLLM(
+            regexResult.intent.targetDescription,
+            elements,
+            { timeout: 30000, maxResults: 5 },
+          );
+
+          if (cancelled) return;
+
+          if (llmResult.success && llmResult.matches.length > 0) {
+            // Convert LLM matches to ElementMatch format
+            const llmMatches: ElementMatch[] = llmResult.matches
+              .map((m: LLMMatchResult) => {
+                const element = elements.find((e) => e.id === m.elementId);
+                if (!element) return null;
+                return {
+                  element,
+                  score: m.confidence,
+                  matchReason: m.explanation || "AI matched",
+                  fromLLM: true,
+                } as ElementMatch;
+              })
+              .filter((m): m is ElementMatch => m !== null);
+
+            if (llmMatches.length > 0) {
+              // Merge with regex matches, preferring LLM matches
+              const allMatches = [...llmMatches];
+              for (const regexMatch of regexResult.matches) {
+                if (!allMatches.some((m) => m.element.id === regexMatch.element.id)) {
+                  allMatches.push(regexMatch);
+                }
+              }
+
+              // Sort by score
+              allMatches.sort((a, b) => b.score - a.score);
+
+              setInterpretation({
+                ...regexResult,
+                matches: allMatches.slice(0, 5),
+                bestMatch: allMatches[0] || null,
+                usedLLM: true,
+                llmStatus: "success",
+              });
+            } else {
+              // LLM returned no matches, keep regex result
+              setInterpretation({
+                ...regexResult,
+                llmStatus: "success",
+              });
+            }
+          } else {
+            // LLM failed or returned no matches
+            setInterpretation({
+              ...regexResult,
+              llmStatus: llmResult.error ? "error" : "success",
+              llmError: llmResult.error,
+            });
+          }
+        } catch (err) {
+          if (!cancelled) {
+            setInterpretation({
+              ...regexResult,
+              llmStatus: "error",
+              llmError: err instanceof Error ? err.message : "AI matching failed",
+            });
+          }
+        } finally {
+          if (!cancelled) {
+            setIsLoadingAI(false);
+          }
+        }
+      }
     }
-  }, [input, elements]);
+
+    // Debounce the AI call
+    const timeoutId = setTimeout(interpretWithAI, 300);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timeoutId);
+    };
+  }, [input, elements, descriptions, aiMatchingEnabled, aiAvailable]);
 
   // Execute the interpreted command
   const handleExecute = useCallback(async () => {
@@ -403,11 +865,7 @@ export function NaturalLanguagePanel({
     setLastResult(null);
 
     try {
-      const result = await onExecuteAction(
-        bestMatch.element.id,
-        intent.action,
-        intent.params
-      );
+      const result = await onExecuteAction(bestMatch.element.id, intent.action, intent.params);
 
       setLastResult({
         success: result.success,
@@ -416,6 +874,9 @@ export function NaturalLanguagePanel({
         error: result.error,
         timestamp: Date.now(),
       });
+
+      // Add to history
+      addToHistory(input, intent.action, bestMatch.element.id, result.success);
 
       if (result.success) {
         // Clear input on success
@@ -430,10 +891,11 @@ export function NaturalLanguagePanel({
         error: err instanceof Error ? err.message : "Execution failed",
         timestamp: Date.now(),
       });
+      addToHistory(input, intent.action, bestMatch.element.id, false);
     } finally {
       setIsExecuting(false);
     }
-  }, [interpretation, input, isExecuting, onExecuteAction]);
+  }, [interpretation, input, isExecuting, onExecuteAction, addToHistory]);
 
   // Execute on an alternative match
   const handleExecuteAlternative = useCallback(
@@ -455,6 +917,9 @@ export function NaturalLanguagePanel({
           timestamp: Date.now(),
         });
 
+        // Add to history
+        addToHistory(input, intent.action, match.element.id, result.success);
+
         if (result.success) {
           setInput("");
           setInterpretation(null);
@@ -467,12 +932,19 @@ export function NaturalLanguagePanel({
           error: err instanceof Error ? err.message : "Execution failed",
           timestamp: Date.now(),
         });
+        addToHistory(input, intent.action, match.element.id, false);
       } finally {
         setIsExecuting(false);
       }
     },
-    [interpretation, input, isExecuting, onExecuteAction]
+    [interpretation, input, isExecuting, onExecuteAction, addToHistory],
   );
+
+  // Load command from history
+  const handleLoadHistoryCommand = useCallback((entry: CommandHistoryEntry) => {
+    setInput(entry.command);
+    setShowHistory(false);
+  }, []);
 
   // Load example command
   const handleLoadExample = useCallback((example: string) => {
@@ -497,6 +969,35 @@ export function NaturalLanguagePanel({
 
   return (
     <div className="flex flex-col h-full">
+      {/* AI Matching Toggle */}
+      {aiAvailable && (
+        <div className="mb-3 flex items-center justify-between">
+          <button
+            onClick={() => setAiMatchingEnabled(!aiMatchingEnabled)}
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
+              aiMatchingEnabled
+                ? "bg-primary/20 text-primary border border-primary/30"
+                : "bg-muted/30 text-muted-foreground border border-border/50 hover:bg-muted/50"
+            }`}
+            title={
+              aiMatchingEnabled
+                ? "AI matching enabled - uses LLM for semantic element matching"
+                : "Enable AI matching for better element recognition"
+            }
+          >
+            <Bot className="w-3.5 h-3.5" />
+            AI Matching
+            {aiMatchingEnabled && <Check className="w-3 h-3" />}
+          </button>
+          {isLoadingAI && (
+            <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              <span>Analyzing with AI...</span>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Input area */}
       <div className="mb-4">
         <div className="flex gap-2">
@@ -564,9 +1065,7 @@ export function NaturalLanguagePanel({
           <p className="text-xs text-muted-foreground mt-1">
             Command: "{lastResult.command}" → {lastResult.elementId}
           </p>
-          {lastResult.error && (
-            <p className="text-xs text-destructive mt-1">{lastResult.error}</p>
-          )}
+          {lastResult.error && <p className="text-xs text-destructive mt-1">{lastResult.error}</p>}
         </div>
       )}
 
@@ -576,6 +1075,18 @@ export function NaturalLanguagePanel({
           <div className="flex items-center gap-2 mb-2">
             <Sparkles className="w-4 h-4 text-primary" />
             <span className="text-sm font-medium">Parsed Intent</span>
+            {interpretation.usedLLM && (
+              <Badge variant="info" className="text-[10px]">
+                <Bot className="w-2.5 h-2.5 mr-0.5" />
+                AI
+              </Badge>
+            )}
+            {interpretation.llmStatus === "loading" && (
+              <Badge variant="muted" className="text-[10px]">
+                <Loader2 className="w-2.5 h-2.5 mr-0.5 animate-spin" />
+                Analyzing...
+              </Badge>
+            )}
             <Badge
               variant={interpretation.intent.confidence >= 0.7 ? "success" : "warning"}
               className="text-[10px] ml-auto"
@@ -612,6 +1123,12 @@ export function NaturalLanguagePanel({
               <div className="flex items-center gap-2 mb-2">
                 <Target className="w-4 h-4 text-accent" />
                 <span className="text-sm font-medium">Best Match</span>
+                {interpretation.bestMatch.fromLLM && (
+                  <Badge variant="info" className="text-[10px]">
+                    <Bot className="w-2.5 h-2.5 mr-0.5" />
+                    AI
+                  </Badge>
+                )}
                 <Badge variant="success" className="text-[10px]">
                   {(interpretation.bestMatch.score * 100).toFixed(0)}% match
                 </Badge>
@@ -655,6 +1172,22 @@ export function NaturalLanguagePanel({
               <p className="text-xs text-muted-foreground mt-1">
                 Try being more specific or check the Elements tab to see available IDs
               </p>
+              {aiMatchingEnabled && !interpretation.usedLLM && interpretation.llmStatus !== "loading" && (
+                <p className="text-xs text-muted-foreground mt-1">
+                  <Bot className="w-3 h-3 inline mr-1" />
+                  AI matching is analyzing the page...
+                </p>
+              )}
+            </div>
+          )}
+
+          {/* LLM Error */}
+          {interpretation.llmStatus === "error" && interpretation.llmError && (
+            <div className="mt-3 pt-3 border-t border-border/30">
+              <div className="flex items-center gap-2 text-amber-500">
+                <AlertCircle className="w-4 h-4" />
+                <span className="text-xs">AI matching error: {interpretation.llmError}</span>
+              </div>
             </div>
           )}
 
@@ -702,13 +1235,119 @@ export function NaturalLanguagePanel({
                           Use
                         </Button>
                       </div>
-                      <p className="text-xs text-muted-foreground mt-0.5">
-                        {match.matchReason}
-                      </p>
+                      <p className="text-xs text-muted-foreground mt-0.5">{match.matchReason}</p>
                     </div>
                   ))}
                 </div>
               )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Description Enhanced Matching Indicator */}
+      {descriptions.size > 0 && !interpretation && (
+        <div className="mb-3 flex items-center gap-2 text-xs text-emerald-600 dark:text-emerald-400">
+          <Database className="w-3.5 h-3.5" />
+          <span>{descriptions.size} element descriptions loaded for enhanced matching</span>
+        </div>
+      )}
+
+      {/* Smart Query Suggestions - show when not typing and suggestions available */}
+      {!interpretation && querySuggestions.length > 0 && (
+        <div className="mb-4">
+          <button
+            className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground mb-2"
+            onClick={() => setShowSuggestions(!showSuggestions)}
+          >
+            {showSuggestions ? (
+              <ChevronDown className="w-3.5 h-3.5" />
+            ) : (
+              <ChevronRight className="w-3.5 h-3.5" />
+            )}
+            <Lightbulb className="w-3.5 h-3.5 text-amber-500" />
+            <span>Suggested for this page</span>
+            <Badge variant="muted" className="text-[10px] ml-1">
+              {querySuggestions.length}
+            </Badge>
+          </button>
+
+          {showSuggestions && (
+            <div className="flex flex-wrap gap-2">
+              {querySuggestions.map((suggestion) => (
+                <button
+                  key={suggestion.elementId}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs bg-primary/10 hover:bg-primary/20 border border-primary/20 hover:border-primary/40 rounded-full transition-all duration-150 disabled:opacity-50 disabled:cursor-not-allowed"
+                  onClick={() => handleSuggestionClick(suggestion)}
+                  onMouseEnter={() => onHighlightElement(suggestion.elementId)}
+                  disabled={isExecuting}
+                  title={suggestion.reason}
+                >
+                  {suggestion.action === "click" && <MousePointer className="w-3 h-3" />}
+                  {suggestion.action === "type" && <Type className="w-3 h-3" />}
+                  {suggestion.action === "check" && <Check className="w-3 h-3" />}
+                  {suggestion.action === "uncheck" && <ToggleRight className="w-3 h-3" />}
+                  {suggestion.action === "focus" && <Eye className="w-3 h-3" />}
+                  <span className="max-w-[180px] truncate">{suggestion.text}</span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Command History */}
+      {!interpretation && commandHistory.length > 0 && (
+        <div className="mb-4">
+          <button
+            className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground mb-2"
+            onClick={() => setShowHistory(!showHistory)}
+          >
+            {showHistory ? (
+              <ChevronDown className="w-3.5 h-3.5" />
+            ) : (
+              <ChevronRight className="w-3.5 h-3.5" />
+            )}
+            <History className="w-3.5 h-3.5 text-blue-500" />
+            <span>Command History</span>
+            <Badge variant="muted" className="text-[10px] ml-1">
+              {commandHistory.length}
+            </Badge>
+            <button
+              className="ml-auto text-[10px] text-muted-foreground hover:text-destructive"
+              onClick={(e) => {
+                e.stopPropagation();
+                clearHistory();
+              }}
+              title="Clear history"
+            >
+              <Trash2 className="w-3 h-3" />
+            </button>
+          </button>
+
+          {showHistory && (
+            <div className="space-y-1 max-h-40 overflow-auto">
+              {commandHistory.map((entry, i) => (
+                <button
+                  key={`${entry.command}-${entry.timestamp}-${i}`}
+                  className={`w-full p-2 text-left text-xs rounded transition-colors flex items-center gap-2 ${
+                    entry.success
+                      ? "bg-muted/10 hover:bg-muted/20"
+                      : "bg-destructive/5 hover:bg-destructive/10"
+                  }`}
+                  onClick={() => handleLoadHistoryCommand(entry)}
+                >
+                  {entry.success ? (
+                    <CheckCircle className="w-3 h-3 text-green-500 flex-shrink-0" />
+                  ) : (
+                    <XCircle className="w-3 h-3 text-destructive flex-shrink-0" />
+                  )}
+                  <span className="truncate flex-1">{entry.command}</span>
+                  <span className="text-[10px] text-muted-foreground">
+                    {new Date(entry.timestamp).toLocaleTimeString()}
+                  </span>
+                </button>
+              ))}
             </div>
           )}
         </div>

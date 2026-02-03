@@ -47,6 +47,8 @@ export type StepType =
 export interface TimelineStep {
   /** Unique step ID */
   id: string;
+  /** Checkpoint ID for fetching progress markers */
+  checkpointId?: string;
   /** Step type */
   type: StepType;
   /** Display name of the step */
@@ -69,6 +71,13 @@ export interface TimelineStep {
   error?: string;
   /** Brief output/result preview */
   outputPreview?: string;
+  /** Progress marker data (if available) */
+  progress?: {
+    current: number;
+    total: number | null;
+    type: string;
+    description?: string;
+  };
 }
 
 /**

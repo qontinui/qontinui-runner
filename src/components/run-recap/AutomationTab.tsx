@@ -78,7 +78,10 @@ export function AutomationTab({ taskRunId: _taskRunId, stats }: AutomationTabPro
         </div>
 
         {/* Visual Bar Chart */}
-        <div data-ui-id="recap-actions-chart" className="h-4 bg-muted rounded-full overflow-hidden flex">
+        <div
+          data-ui-id="recap-actions-chart"
+          className="h-4 bg-muted rounded-full overflow-hidden flex"
+        >
           {total > 0 ? (
             <>
               <div
@@ -161,9 +164,7 @@ export function AutomationTab({ taskRunId: _taskRunId, stats }: AutomationTabPro
             ))}
           </div>
         ) : (
-          <p className="text-sm text-muted-foreground">
-            No screenshots captured for this run.
-          </p>
+          <p className="text-sm text-muted-foreground">No screenshots captured for this run.</p>
         )}
       </div>
 

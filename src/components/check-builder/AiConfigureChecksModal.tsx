@@ -83,12 +83,10 @@ interface AiConfigureChecksModalProps {
   onChecksCreated?: (checks: CreateCheckInput[]) => Promise<void>;
 }
 
-export function AiConfigureChecksModal({
-  isOpen,
-  onClose,
-}: AiConfigureChecksModalProps) {
+export function AiConfigureChecksModal({ isOpen, onClose }: AiConfigureChecksModalProps) {
   // Get context for creating groups
-  const { createCheck, createCheckGroup, setChecksInGroup, loadChecks, loadCheckGroups } = useCheckBuilder();
+  const { createCheck, createCheckGroup, setChecksInGroup, loadChecks, loadCheckGroups } =
+    useCheckBuilder();
 
   // Step state
   const [step, setStep] = useState<ModalStep>("input");
@@ -247,13 +245,14 @@ export function AiConfigureChecksModal({
 
   // Group checks by project
   const checksByProject = useMemo(() => {
-    const groups: Map<string, { indices: number[]; projectName: string; languages: string[] }> = new Map();
+    const groups: Map<string, { indices: number[]; projectName: string; languages: string[] }> =
+      new Map();
 
     suggestedChecks.forEach((suggestion, index) => {
       const projectPath = suggestion.project_path;
       if (!groups.has(projectPath)) {
         // Find the project in scan results to get name and languages
-        const project = scanResult?.projects.find(p => p.path === projectPath);
+        const project = scanResult?.projects.find((p) => p.path === projectPath);
         groups.set(projectPath, {
           indices: [],
           projectName: project?.name || projectPath.split(/[/\\]/).pop() || projectPath,
@@ -267,39 +266,48 @@ export function AiConfigureChecksModal({
   }, [suggestedChecks, scanResult]);
 
   // Toggle all checks for a project
-  const toggleProject = useCallback((projectPath: string) => {
-    const projectInfo = checksByProject.get(projectPath);
-    if (!projectInfo) return;
+  const toggleProject = useCallback(
+    (projectPath: string) => {
+      const projectInfo = checksByProject.get(projectPath);
+      if (!projectInfo) return;
 
-    const allSelected = projectInfo.indices.every(i => selectedChecks.has(i));
+      const allSelected = projectInfo.indices.every((i) => selectedChecks.has(i));
 
-    setSelectedChecks((prev) => {
-      const next = new Set(prev);
-      if (allSelected) {
-        // Deselect all in this project
-        projectInfo.indices.forEach(i => next.delete(i));
-      } else {
-        // Select all in this project
-        projectInfo.indices.forEach(i => next.add(i));
-      }
-      return next;
-    });
-  }, [checksByProject, selectedChecks]);
+      setSelectedChecks((prev) => {
+        const next = new Set(prev);
+        if (allSelected) {
+          // Deselect all in this project
+          projectInfo.indices.forEach((i) => next.delete(i));
+        } else {
+          // Select all in this project
+          projectInfo.indices.forEach((i) => next.add(i));
+        }
+        return next;
+      });
+    },
+    [checksByProject, selectedChecks],
+  );
 
   // Check if all checks in a project are selected
-  const isProjectFullySelected = useCallback((projectPath: string) => {
-    const projectInfo = checksByProject.get(projectPath);
-    if (!projectInfo) return false;
-    return projectInfo.indices.every(i => selectedChecks.has(i));
-  }, [checksByProject, selectedChecks]);
+  const isProjectFullySelected = useCallback(
+    (projectPath: string) => {
+      const projectInfo = checksByProject.get(projectPath);
+      if (!projectInfo) return false;
+      return projectInfo.indices.every((i) => selectedChecks.has(i));
+    },
+    [checksByProject, selectedChecks],
+  );
 
   // Check if some (but not all) checks in a project are selected
-  const isProjectPartiallySelected = useCallback((projectPath: string) => {
-    const projectInfo = checksByProject.get(projectPath);
-    if (!projectInfo) return false;
-    const selectedCount = projectInfo.indices.filter(i => selectedChecks.has(i)).length;
-    return selectedCount > 0 && selectedCount < projectInfo.indices.length;
-  }, [checksByProject, selectedChecks]);
+  const isProjectPartiallySelected = useCallback(
+    (projectPath: string) => {
+      const projectInfo = checksByProject.get(projectPath);
+      if (!projectInfo) return false;
+      const selectedCount = projectInfo.indices.filter((i) => selectedChecks.has(i)).length;
+      return selectedCount > 0 && selectedCount < projectInfo.indices.length;
+    },
+    [checksByProject, selectedChecks],
+  );
 
   // Reset and close (defined before handleCreateChecks since handleCreateChecks depends on it)
   const handleClose = useCallback(() => {
@@ -328,7 +336,10 @@ export function AiConfigureChecksModal({
 
     try {
       // Group selected suggestions by project path
-      const suggestionsByProject = new Map<string, { suggestion: SuggestedCheckWithReason; index: number }[]>();
+      const suggestionsByProject = new Map<
+        string,
+        { suggestion: SuggestedCheckWithReason; index: number }[]
+      >();
       selectedSuggestions.forEach((suggestion, idx) => {
         const projectPath = suggestion.project_path;
         if (!suggestionsByProject.has(projectPath)) {
@@ -357,7 +368,7 @@ export function AiConfigureChecksModal({
         if (checkIds.length === 0) continue;
 
         // Get project info for the group name
-        const project = scanResult?.projects.find(p => p.path === projectPath);
+        const project = scanResult?.projects.find((p) => p.path === projectPath);
         const projectName = project?.name || projectPath.split(/[/\\]/).pop() || projectPath;
         const languages = project?.languages || [];
 
@@ -390,7 +401,17 @@ export function AiConfigureChecksModal({
     } finally {
       setIsCreating(false);
     }
-  }, [suggestedChecks, selectedChecks, scanResult, createCheck, createCheckGroup, setChecksInGroup, loadChecks, loadCheckGroups, handleClose]);
+  }, [
+    suggestedChecks,
+    selectedChecks,
+    scanResult,
+    createCheck,
+    createCheckGroup,
+    setChecksInGroup,
+    loadChecks,
+    loadCheckGroups,
+    handleClose,
+  ]);
 
   // Go back
   const handleBack = useCallback(() => {
@@ -411,7 +432,8 @@ export function AiConfigureChecksModal({
       {/* Dialog */}
       <div
         data-ui-id="dialog-ai-configure-checks"
-        className="relative bg-card border border-border rounded-lg shadow-xl w-full max-w-3xl mx-4 max-h-[85vh] flex flex-col overflow-hidden">
+        className="relative bg-card border border-border rounded-lg shadow-xl w-full max-w-3xl mx-4 max-h-[85vh] flex flex-col overflow-hidden"
+      >
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-border">
           <div className="flex items-center gap-2">
@@ -441,8 +463,8 @@ export function AiConfigureChecksModal({
           {step === "input" && (
             <div className="space-y-4">
               <p className="text-sm text-muted-foreground">
-                Select a workspace directory to scan for projects. The AI will detect project
-                types and suggest appropriate code quality checks.
+                Select a workspace directory to scan for projects. The AI will detect project types
+                and suggest appropriate code quality checks.
               </p>
 
               {/* Directory Selection */}
@@ -577,16 +599,16 @@ export function AiConfigureChecksModal({
               {/* Selection Header */}
               <div className="flex items-center justify-between">
                 <p className="text-sm text-muted-foreground">
-                  {selectedChecks.size} of {suggestedChecks.length} check{suggestedChecks.length !== 1 ? "s" : ""} selected
-                  {" · "}{checksByProject.size} project{checksByProject.size !== 1 ? "s" : ""}
+                  {selectedChecks.size} of {suggestedChecks.length} check
+                  {suggestedChecks.length !== 1 ? "s" : ""} selected
+                  {" · "}
+                  {checksByProject.size} project{checksByProject.size !== 1 ? "s" : ""}
                 </p>
                 <button
                   onClick={toggleAll}
                   className="text-sm text-purple-400 hover:text-purple-300 transition-colors"
                 >
-                  {selectedChecks.size === suggestedChecks.length
-                    ? "Deselect All"
-                    : "Select All"}
+                  {selectedChecks.size === suggestedChecks.length ? "Deselect All" : "Select All"}
                 </button>
               </div>
 
@@ -598,7 +620,7 @@ export function AiConfigureChecksModal({
                     projectPath={projectPath}
                     projectName={projectInfo.projectName}
                     languages={projectInfo.languages}
-                    checks={projectInfo.indices.map(i => ({
+                    checks={projectInfo.indices.map((i) => ({
                       index: i,
                       suggestion: suggestedChecks[i],
                     }))}
@@ -797,7 +819,7 @@ function ProjectCheckGroup({
 }: ProjectCheckGroupProps) {
   const [isExpanded, setIsExpanded] = useState(true);
 
-  const selectedCount = checks.filter(c => selectedChecks.has(c.index)).length;
+  const selectedCount = checks.filter((c) => selectedChecks.has(c.index)).length;
 
   // Get language color for badge
   const getLanguageBadgeColor = (lang: string) => {
@@ -930,9 +952,7 @@ function CompactCheckItem({ suggestion, isSelected, onToggle }: CompactCheckItem
     <button
       onClick={onToggle}
       className={`w-full px-3 py-2 flex items-center gap-3 text-left transition-colors ${
-        isSelected
-          ? "bg-purple-900/10"
-          : "hover:bg-neutral-800/30"
+        isSelected ? "bg-purple-900/10" : "hover:bg-neutral-800/30"
       }`}
     >
       {/* Checkbox */}
@@ -949,16 +969,14 @@ function CompactCheckItem({ suggestion, isSelected, onToggle }: CompactCheckItem
         <span className={`px-1.5 py-0.5 rounded text-xs ${getToolColor(check.tool)}`}>
           {check.tool}
         </span>
-        <span className={`text-xs ${getTypeColor(check.check_type)}`}>
-          {check.check_type}
+        <span className={`text-xs ${getTypeColor(check.check_type)}`}>{check.check_type}</span>
+        <span className="text-sm truncate">
+          {check.name.replace(`${suggestion.project_path.split(/[/\\]/).pop()} - `, "")}
         </span>
-        <span className="text-sm truncate">{check.name.replace(`${suggestion.project_path.split(/[/\\]/).pop()} - `, '')}</span>
       </div>
 
       {/* Auto-fix badge */}
-      {check.auto_fix && (
-        <span className="text-xs text-emerald-400 flex-shrink-0">auto-fix</span>
-      )}
+      {check.auto_fix && <span className="text-xs text-emerald-400 flex-shrink-0">auto-fix</span>}
     </button>
   );
 }

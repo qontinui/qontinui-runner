@@ -24,19 +24,10 @@ import {
 } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { ScrollArea } from "../ui/ScrollArea";
-import {
-  getStatusColors,
-} from "@/design-system";
-import {
-  useErrorEvents,
-  useErrorSummary,
-} from "../../hooks/useErrorMonitor";
+import { getStatusColors } from "@/design-system";
+import { useErrorEvents, useErrorSummary } from "../../hooks/useErrorMonitor";
 import { formatErrorTime } from "../../services/error-monitor-service";
-import type {
-  StoredErrorEvent,
-  ErrorSeverity,
-  ErrorStatus,
-} from "../../types/errorMonitor";
+import type { StoredErrorEvent, ErrorSeverity, ErrorStatus } from "../../types/errorMonitor";
 import { FixErrorsButton } from "./FixErrorsButton";
 // Log source management is now in Settings > Log Sources (LogSourcesSettings.tsx)
 
@@ -62,13 +53,7 @@ function SeverityIcon({ severity }: { severity: ErrorSeverity }) {
   }
 }
 
-function SeverityBadge({
-  severity,
-  count,
-}: {
-  severity: ErrorSeverity;
-  count: number;
-}) {
+function SeverityBadge({ severity, count }: { severity: ErrorSeverity; count: number }) {
   if (count === 0) return null;
 
   const colors = {
@@ -80,22 +65,14 @@ function SeverityBadge({
   };
 
   return (
-    <span
-      className={cn(
-        "px-2 py-0.5 rounded-md text-xs font-medium border",
-        colors[severity],
-      )}
-    >
+    <span className={cn("px-2 py-0.5 rounded-md text-xs font-medium border", colors[severity])}>
       {count} {severity}
     </span>
   );
 }
 
 function StatusBadge({ status }: { status: ErrorStatus }) {
-  const statusConfig: Record<
-    ErrorStatus,
-    { label: string; className: string }
-  > = {
+  const statusConfig: Record<ErrorStatus, { label: string; className: string }> = {
     new: { label: "New", className: "bg-red-500/20 text-red-500" },
     acknowledged: {
       label: "Acknowledged",
@@ -119,9 +96,7 @@ function StatusBadge({ status }: { status: ErrorStatus }) {
   const config = statusConfig[status] || { label: status, className: "" };
 
   return (
-    <span
-      className={cn("px-2 py-0.5 rounded-md text-xs font-medium", config.className)}
-    >
+    <span className={cn("px-2 py-0.5 rounded-md text-xs font-medium", config.className)}>
       {config.label}
     </span>
   );
@@ -150,10 +125,7 @@ function ErrorItem({
       )}
     >
       {/* Header row */}
-      <div
-        className="flex items-start gap-3 px-4 py-3 cursor-pointer"
-        onClick={onToggleExpand}
-      >
+      <div className="flex items-start gap-3 px-4 py-3 cursor-pointer" onClick={onToggleExpand}>
         {/* Severity icon */}
         <div className="flex-shrink-0 mt-0.5">
           <SeverityIcon severity={error.severity} />
@@ -167,14 +139,10 @@ function ErrorItem({
             </span>
             <StatusBadge status={error.status} />
             {error.occurrenceCount > 1 && (
-              <span className="text-xs text-muted-foreground">
-                x{error.occurrenceCount}
-              </span>
+              <span className="text-xs text-muted-foreground">x{error.occurrenceCount}</span>
             )}
           </div>
-          <p className="text-sm text-muted-foreground line-clamp-2">
-            {error.message}
-          </p>
+          <p className="text-sm text-muted-foreground line-clamp-2">{error.message}</p>
           <div className="flex items-center gap-3 mt-1 text-xs text-muted-foreground">
             <span className="flex items-center gap-1">
               <FolderOpen className="w-3 h-3" />
@@ -207,9 +175,7 @@ function ErrorItem({
         <div className="px-4 pb-3 pl-11 space-y-3">
           {/* Full message */}
           <div>
-            <span className="text-xs font-medium text-muted-foreground">
-              Full Message
-            </span>
+            <span className="text-xs font-medium text-muted-foreground">Full Message</span>
             <p className="text-sm mt-1 whitespace-pre-wrap bg-muted/50 p-2 rounded">
               {error.message}
             </p>
@@ -218,9 +184,7 @@ function ErrorItem({
           {/* Stack trace */}
           {error.stackTrace && (
             <div>
-              <span className="text-xs font-medium text-muted-foreground">
-                Stack Trace
-              </span>
+              <span className="text-xs font-medium text-muted-foreground">Stack Trace</span>
               <pre className="text-xs mt-1 bg-muted/50 p-2 rounded overflow-x-auto max-h-48">
                 {error.stackTrace}
               </pre>
@@ -230,9 +194,7 @@ function ErrorItem({
           {/* Context lines */}
           {error.contextLines && (
             <div>
-              <span className="text-xs font-medium text-muted-foreground">
-                Context
-              </span>
+              <span className="text-xs font-medium text-muted-foreground">Context</span>
               <pre className="text-xs mt-1 bg-muted/50 p-2 rounded overflow-x-auto">
                 {error.contextLines}
               </pre>
@@ -242,12 +204,8 @@ function ErrorItem({
           {/* Resolution notes */}
           {error.resolutionNotes && (
             <div>
-              <span className="text-xs font-medium text-muted-foreground">
-                Resolution Notes
-              </span>
-              <p className="text-sm mt-1 bg-green-500/10 p-2 rounded">
-                {error.resolutionNotes}
-              </p>
+              <span className="text-xs font-medium text-muted-foreground">Resolution Notes</span>
+              <p className="text-sm mt-1 bg-green-500/10 p-2 rounded">{error.resolutionNotes}</p>
             </div>
           )}
 
@@ -320,9 +278,7 @@ function EmptyState() {
 
 export function ErrorMonitorTab() {
   const [searchText, setSearchText] = useState("");
-  const [selectedSeverities, setSelectedSeverities] = useState<ErrorSeverity[]>(
-    [],
-  );
+  const [selectedSeverities, setSelectedSeverities] = useState<ErrorSeverity[]>([]);
   const [selectedStatuses, setSelectedStatuses] = useState<ErrorStatus[]>([]);
   const [showFilters, setShowFilters] = useState(false);
   const [expandedErrorId, setExpandedErrorId] = useState<number | null>(null);
@@ -355,13 +311,7 @@ export function ErrorMonitorTab() {
     );
   }, [errors, searchText]);
 
-  const severityOptions: ErrorSeverity[] = [
-    "critical",
-    "error",
-    "warning",
-    "info",
-    "debug",
-  ];
+  const severityOptions: ErrorSeverity[] = ["critical", "error", "warning", "info", "debug"];
   const statusOptions: ErrorStatus[] = [
     "new",
     "acknowledged",
@@ -373,17 +323,13 @@ export function ErrorMonitorTab() {
 
   const toggleSeverity = (severity: ErrorSeverity) => {
     setSelectedSeverities((prev) =>
-      prev.includes(severity)
-        ? prev.filter((s) => s !== severity)
-        : [...prev, severity],
+      prev.includes(severity) ? prev.filter((s) => s !== severity) : [...prev, severity],
     );
   };
 
   const toggleStatus = (status: ErrorStatus) => {
     setSelectedStatuses((prev) =>
-      prev.includes(status)
-        ? prev.filter((s) => s !== status)
-        : [...prev, status],
+      prev.includes(status) ? prev.filter((s) => s !== status) : [...prev, status],
     );
   };
 
@@ -394,9 +340,7 @@ export function ErrorMonitorTab() {
   };
 
   const hasActiveFilters =
-    selectedSeverities.length > 0 ||
-    selectedStatuses.length > 0 ||
-    searchText.length > 0;
+    selectedSeverities.length > 0 || selectedStatuses.length > 0 || searchText.length > 0;
 
   return (
     <div className="flex flex-col h-full">
@@ -423,9 +367,7 @@ export function ErrorMonitorTab() {
               className="p-1.5 hover:bg-muted rounded transition-colors"
               title="Refresh"
             >
-              <RefreshCw
-                className={cn("w-4 h-4", loading && "animate-spin")}
-              />
+              <RefreshCw className={cn("w-4 h-4", loading && "animate-spin")} />
             </button>
           </div>
         </div>
@@ -433,18 +375,9 @@ export function ErrorMonitorTab() {
         {/* Summary badges */}
         {summary && (
           <div className="flex items-center gap-2 flex-wrap">
-            <SeverityBadge
-              severity="critical"
-              count={summary.criticalCount || 0}
-            />
-            <SeverityBadge
-              severity="error"
-              count={summary.errorCount || 0}
-            />
-            <SeverityBadge
-              severity="warning"
-              count={summary.warningCount || 0}
-            />
+            <SeverityBadge severity="critical" count={summary.criticalCount || 0} />
+            <SeverityBadge severity="error" count={summary.errorCount || 0} />
+            <SeverityBadge severity="warning" count={summary.warningCount || 0} />
           </div>
         )}
       </div>
@@ -506,9 +439,7 @@ export function ErrorMonitorTab() {
           <div className="mt-3 pt-3 border-t border-border space-y-3">
             {/* Severity filters */}
             <div>
-              <span className="text-xs font-medium text-muted-foreground">
-                Severity
-              </span>
+              <span className="text-xs font-medium text-muted-foreground">Severity</span>
               <div className="flex gap-2 mt-1 flex-wrap">
                 {severityOptions.map((severity) => (
                   <button
@@ -529,9 +460,7 @@ export function ErrorMonitorTab() {
 
             {/* Status filters */}
             <div>
-              <span className="text-xs font-medium text-muted-foreground">
-                Status
-              </span>
+              <span className="text-xs font-medium text-muted-foreground">Status</span>
               <div className="flex gap-2 mt-1 flex-wrap">
                 {statusOptions.map((status) => (
                   <button
@@ -575,9 +504,7 @@ export function ErrorMonitorTab() {
                 error={error}
                 isExpanded={expandedErrorId === error.id}
                 onToggleExpand={() =>
-                  setExpandedErrorId(
-                    expandedErrorId === error.id ? null : error.id,
-                  )
+                  setExpandedErrorId(expandedErrorId === error.id ? null : error.id)
                 }
                 onAcknowledge={() => acknowledge(error.id)}
                 onResolve={() => resolve(error.id)}
@@ -594,11 +521,8 @@ export function ErrorMonitorTab() {
           {filteredErrors.length} error{filteredErrors.length !== 1 ? "s" : ""}
           {hasActiveFilters && ` (filtered from ${errors.length})`}
         </span>
-        <span className="text-xs text-muted-foreground">
-          Auto-refresh: 30s
-        </span>
+        <span className="text-xs text-muted-foreground">Auto-refresh: 30s</span>
       </div>
-
     </div>
   );
 }

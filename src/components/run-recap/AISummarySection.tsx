@@ -6,7 +6,15 @@
  */
 
 import { useState, useMemo } from "react";
-import { Sparkles, Target, AlertTriangle, Loader2, FileText, ChevronDown, ChevronUp } from "lucide-react";
+import {
+  Sparkles,
+  Target,
+  AlertTriangle,
+  Loader2,
+  FileText,
+  ChevronDown,
+  ChevronUp,
+} from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { getStatusColors, getAccentColors } from "@/design-system";
 import { aiDataService } from "@/services";
@@ -80,7 +88,10 @@ export function AISummarySection({
   // If we have a summary, display it prominently
   if (aiSummary) {
     return (
-      <div data-ui-id="recap-ai-summary-section" className="rounded-xl border-2 border-primary/30 bg-gradient-to-br from-primary/5 to-primary/10 p-5 space-y-4">
+      <div
+        data-ui-id="recap-ai-summary-section"
+        className="rounded-xl border-2 border-primary/30 bg-gradient-to-br from-primary/5 to-primary/10 p-5 space-y-4"
+      >
         {/* Header */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -114,7 +125,10 @@ export function AISummarySection({
 
         {/* Summary Text */}
         <div className="space-y-2">
-          <p data-ui-id="recap-ai-summary-text" className="text-foreground/90 leading-relaxed whitespace-pre-wrap">
+          <p
+            data-ui-id="recap-ai-summary-text"
+            className="text-foreground/90 leading-relaxed whitespace-pre-wrap"
+          >
             {displayText}
           </p>
           {isLongSummary && (
@@ -170,7 +184,11 @@ export function AISummarySection({
 
   if (isComplete) {
     return (
-      <div data-ui-id="recap-ai-summary-section" data-has-summary="false" className="rounded-xl border border-border bg-muted/20 p-5">
+      <div
+        data-ui-id="recap-ai-summary-section"
+        data-has-summary="false"
+        className="rounded-xl border border-border bg-muted/20 p-5"
+      >
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3 text-muted-foreground">
             <FileText className="w-5 h-5 opacity-50" />
@@ -192,10 +210,16 @@ export function AISummarySection({
 
   // Run is still in progress
   return (
-    <div data-ui-id="recap-ai-summary-section" data-has-summary="false" className="rounded-xl border border-border bg-muted/20 p-5">
+    <div
+      data-ui-id="recap-ai-summary-section"
+      data-has-summary="false"
+      className="rounded-xl border border-border bg-muted/20 p-5"
+    >
       <div className="flex items-center gap-3 text-muted-foreground">
         <FileText className="w-5 h-5 opacity-50" />
-        <span data-ui-id="recap-ai-summary-text">Run in progress. Summary will be available after completion.</span>
+        <span data-ui-id="recap-ai-summary-text">
+          Run in progress. Summary will be available after completion.
+        </span>
       </div>
       <p data-ui-id="recap-summary-timestamp" className="text-xs text-muted-foreground mt-2">
         Waiting for run to complete...

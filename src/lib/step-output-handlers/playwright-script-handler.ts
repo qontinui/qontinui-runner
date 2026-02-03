@@ -259,10 +259,7 @@ export class PlaywrightScriptHandler implements StepOutputHandler<PlaywrightScri
         description: "Number of console errors during execution",
         type: "number",
         example_value: errorCount,
-        suggested_assertions: [
-          "Assert no console errors",
-          "Assert error count below threshold",
-        ],
+        suggested_assertions: ["Assert no console errors", "Assert error count below threshold"],
       });
     }
 
@@ -277,9 +274,7 @@ export class PlaywrightScriptHandler implements StepOutputHandler<PlaywrightScri
         suggested_assertions: ["Assert expected number of API calls made"],
       });
 
-      const failedCount = output.network_requests.filter(
-        (r) => r.status && r.status >= 400,
-      ).length;
+      const failedCount = output.network_requests.filter((r) => r.status && r.status >= 400).length;
       fields.push({
         path: "network_requests.failed_count",
         name: "Failed Request Count",

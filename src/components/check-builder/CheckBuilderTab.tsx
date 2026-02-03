@@ -81,7 +81,15 @@ interface CheckListItemProps {
   onToggleSelection: () => void;
 }
 
-function CheckListItem({ check, isSelected, isSelectionMode, isChecked, onSelect, onDelete, onToggleSelection }: CheckListItemProps) {
+function CheckListItem({
+  check,
+  isSelected,
+  isSelectionMode,
+  isChecked,
+  onSelect,
+  onDelete,
+  onToggleSelection,
+}: CheckListItemProps) {
   const [showMenu, setShowMenu] = useState(false);
   const toolInfo = getToolInfo(check.tool);
   const TypeIcon = checkTypeIcons[check.check_type] || Terminal;
@@ -103,9 +111,7 @@ function CheckListItem({ check, isSelected, isSelectionMode, isChecked, onSelect
       {isSelectionMode && (
         <div
           className={`w-4 h-4 rounded border flex-shrink-0 flex items-center justify-center ${
-            isChecked
-              ? "bg-red-500 border-red-500"
-              : "border-neutral-500 hover:border-red-400"
+            isChecked ? "bg-red-500 border-red-500" : "border-neutral-500 hover:border-red-400"
           }`}
         >
           {isChecked && <CheckIcon className="w-3 h-3 text-white" />}
@@ -210,9 +216,7 @@ function CheckLibraryPanel({ onOpenAiModal }: CheckLibraryPanelProps) {
 
   // Get names of selected checks for dialog
   const getSelectedNames = useCallback(() => {
-    return checks
-      .filter((c) => selectedIds.has(c.id))
-      .map((c) => c.name);
+    return checks.filter((c) => selectedIds.has(c.id)).map((c) => c.name);
   }, [checks, selectedIds]);
 
   const filteredChecks = checks.filter((check) => {
@@ -386,12 +390,10 @@ function CheckLibraryPanel({ onOpenAiModal }: CheckLibraryPanelProps) {
       {/* Selection Mode Header */}
       {isSelectionMode && (
         <div className="flex items-center justify-between px-4 py-2 bg-red-500/10 border-b border-red-500/30">
-          <span className="text-sm text-red-400">
-            {selectedIds.size} selected
-          </span>
+          <span className="text-sm text-red-400">{selectedIds.size} selected</span>
           <div className="flex items-center gap-2">
             <button
-              onClick={() => setSelectedIds(new Set(filteredChecks.map(c => c.id)))}
+              onClick={() => setSelectedIds(new Set(filteredChecks.map((c) => c.id)))}
               className="px-2 py-1 text-xs bg-neutral-700 hover:bg-neutral-600 text-neutral-200 rounded"
               data-ui-id="check-builder-select-all-btn"
             >
@@ -509,7 +511,11 @@ interface CheckEditorPanelProps {
   onCloseAiModal: () => void;
 }
 
-function CheckEditorPanel({ showAiConfigureModal, onOpenAiModal, onCloseAiModal }: CheckEditorPanelProps) {
+function CheckEditorPanel({
+  showAiConfigureModal,
+  onOpenAiModal,
+  onCloseAiModal,
+}: CheckEditorPanelProps) {
   const { selectedCheck, updateCheck, setDirty, executeCheck, lastExecutionResult, isSaving } =
     useCheckBuilder();
 
@@ -589,10 +595,7 @@ function CheckEditorPanel({ showAiConfigureModal, onOpenAiModal, onCloseAiModal 
         </div>
 
         {/* AI Configure Checks Modal */}
-        <AiConfigureChecksModal
-          isOpen={showAiConfigureModal}
-          onClose={() => onCloseAiModal()}
-        />
+        <AiConfigureChecksModal isOpen={showAiConfigureModal} onClose={() => onCloseAiModal()} />
       </div>
     );
   }
@@ -764,10 +767,7 @@ function CheckEditorPanel({ showAiConfigureModal, onOpenAiModal, onCloseAiModal 
       </div>
 
       {/* AI Configure Checks Modal */}
-      <AiConfigureChecksModal
-        isOpen={showAiConfigureModal}
-        onClose={() => onCloseAiModal()}
-      />
+      <AiConfigureChecksModal isOpen={showAiConfigureModal} onClose={() => onCloseAiModal()} />
 
       {/* Execution Results */}
       {lastExecutionResult && (
@@ -1044,9 +1044,9 @@ function CheckPropertiesPanel() {
               />
             </label>
             <p className="text-xs text-amber-500/80">
-              ⚠️ Critical check failure will STOP the entire workflow immediately.
-              Other checks will be skipped and the AI will not attempt to fix issues.
-              Only enable for checks that must pass before any work can proceed.
+              ⚠️ Critical check failure will STOP the entire workflow immediately. Other checks will
+              be skipped and the AI will not attempt to fix issues. Only enable for checks that must
+              pass before any work can proceed.
             </p>
 
             <label
@@ -1144,16 +1144,23 @@ function CheckPropertiesPanel() {
 }
 
 // Tab Switcher Component
-function TabSwitcher({ activeTab, onTabChange }: { activeTab: TabView; onTabChange: (tab: TabView) => void }) {
+function TabSwitcher({
+  activeTab,
+  onTabChange,
+}: {
+  activeTab: TabView;
+  onTabChange: (tab: TabView) => void;
+}) {
   return (
     <div className="flex items-center border-b border-border/50 bg-card px-4">
       <button
         onClick={() => onTabChange("checks")}
         className={`
           flex items-center gap-2 px-4 py-3 text-sm font-medium border-b-2 transition-colors
-          ${activeTab === "checks"
-            ? "border-cyan-500 text-cyan-400"
-            : "border-transparent text-muted-foreground hover:text-foreground"
+          ${
+            activeTab === "checks"
+              ? "border-cyan-500 text-cyan-400"
+              : "border-transparent text-muted-foreground hover:text-foreground"
           }
         `}
         data-ui-id="check-builder-checks-tab-btn"
@@ -1165,9 +1172,10 @@ function TabSwitcher({ activeTab, onTabChange }: { activeTab: TabView; onTabChan
         onClick={() => onTabChange("groups")}
         className={`
           flex items-center gap-2 px-4 py-3 text-sm font-medium border-b-2 transition-colors
-          ${activeTab === "groups"
-            ? "border-cyan-500 text-cyan-400"
-            : "border-transparent text-muted-foreground hover:text-foreground"
+          ${
+            activeTab === "groups"
+              ? "border-cyan-500 text-cyan-400"
+              : "border-transparent text-muted-foreground hover:text-foreground"
           }
         `}
         data-ui-id="check-builder-groups-tab-btn"

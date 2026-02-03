@@ -172,7 +172,10 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
         </div>
       )}
 
-      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-advanced-debug-section">
+      <div
+        className="space-y-4 rounded-lg bg-card/50 p-4"
+        data-ui-id="settings-advanced-debug-section"
+      >
         <h4 className="font-medium text-sm">Debug</h4>
 
         <div className="space-y-2">
@@ -265,7 +268,10 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
       </div>
 
       {/* Device Information Section */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-advanced-device-info-section">
+      <div
+        className="space-y-4 rounded-lg bg-card/50 p-4"
+        data-ui-id="settings-advanced-device-info-section"
+      >
         <div className="flex items-center justify-between">
           <h4 className="font-medium text-sm flex items-center gap-2">
             <Monitor className="w-4 h-4 text-primary" />

@@ -148,7 +148,8 @@ export function DashboardPage({
     // Check if we should handle flow execution pause/resume
     if (isFlowActive && flowExecutionData.instanceId) {
       try {
-        const flowIsPaused = flowExecutionData.status === "paused" || flowExecutionData.status === "waiting_for_input";
+        const flowIsPaused =
+          flowExecutionData.status === "paused" || flowExecutionData.status === "waiting_for_input";
         if (flowIsPaused) {
           console.log(`[DASHBOARD] Resume flow execution: ${flowExecutionData.instanceId}`);
           const result = await invoke<boolean>("resume_flow_execution", {
@@ -242,7 +243,11 @@ export function DashboardPage({
       <div className="flex h-full flex-col bg-background">
         {/* Control Bar - always visible */}
         <ControlBar
-          taskName={isFlowActive ? (flowExecutionData.flowName ?? state.taskInfo?.taskName ?? null) : (state.taskInfo?.taskName ?? null)}
+          taskName={
+            isFlowActive
+              ? (flowExecutionData.flowName ?? state.taskInfo?.taskName ?? null)
+              : (state.taskInfo?.taskName ?? null)
+          }
           phase={state.currentPhase}
           showPhaseBadge={state.showPhaseBadge}
           status={displayStatus}
@@ -272,7 +277,9 @@ export function DashboardPage({
         {/* Bottom Bar - always visible */}
         <BottomBar
           iteration={state.isOrchestrated ? state.iteration : (state.taskInfo?.iteration ?? 1)}
-          maxIterations={state.isOrchestrated ? state.maxIterations : (state.taskInfo?.maxIterations ?? 1)}
+          maxIterations={
+            state.isOrchestrated ? state.maxIterations : (state.taskInfo?.maxIterations ?? 1)
+          }
           activeActivity={state.layout.activeWidget}
           isRunning={state.isRunning}
           currentOrchestratorAgent={state.currentOrchestratorAgent}

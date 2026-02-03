@@ -15,6 +15,21 @@ export { StatusBanner, type StatusBannerProps } from "./StatusBanner";
 export { EmptyState, type EmptyStateProps } from "./EmptyState";
 export { ScrollArea, ScrollBar } from "./ScrollArea";
 export { Progress, type ProgressProps } from "./Progress";
+export {
+  ProgressBar,
+  InlineProgressBar,
+  type ProgressBarProps,
+  type ProgressType,
+  type ProgressStatus,
+  type LabelFormat,
+} from "./ProgressBar";
 export { Tabs, TabsList, TabsTrigger, TabsContent } from "./Tabs";
 export { ConfirmDialog } from "./ConfirmDialog";
 export { BatchDeleteDialog } from "./BatchDeleteDialog";
+export { FixedVirtualList, VariableVirtualList } from "./VirtualList";
+export { ErrorBoundary, type ErrorBoundaryProps } from "./ErrorBoundary";
+export {
+  ProgressErrorBoundary,
+  withProgressErrorBoundary,
+  type ProgressErrorBoundaryProps,
+} from "./ProgressErrorBoundary";

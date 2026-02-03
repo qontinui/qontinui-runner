@@ -62,7 +62,8 @@ const PROMPT_TEMPLATES = [
   },
   {
     label: "Auth Login",
-    prompt: "POST request for user authentication with email and password, expecting JWT token response",
+    prompt:
+      "POST request for user authentication with email and password, expecting JWT token response",
   },
   {
     label: "File Upload",
@@ -170,9 +171,7 @@ export function AiApiRequestGenerator({
           <>
             {/* Base URL (optional) */}
             <div className="mb-4">
-              <label className="block text-xs text-neutral-400 mb-2">
-                Base URL (optional)
-              </label>
+              <label className="block text-xs text-neutral-400 mb-2">Base URL (optional)</label>
               <input
                 type="text"
                 value={baseUrl}
@@ -227,10 +226,14 @@ export function AiApiRequestGenerator({
             <div className="flex-1 flex flex-col min-h-0 overflow-auto">
               {/* Name & Method */}
               <div className="mb-4 flex items-center gap-3">
-                <span className={`text-xs px-2 py-1 rounded font-mono ${METHOD_COLORS[generatedRequest.method]}`}>
+                <span
+                  className={`text-xs px-2 py-1 rounded font-mono ${METHOD_COLORS[generatedRequest.method]}`}
+                >
                   {generatedRequest.method}
                 </span>
-                <span className="text-sm font-medium text-neutral-200">{generatedRequest.name}</span>
+                <span className="text-sm font-medium text-neutral-200">
+                  {generatedRequest.name}
+                </span>
               </div>
 
               {/* Description */}

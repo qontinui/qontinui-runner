@@ -88,7 +88,8 @@ interface LoadedConfig {
 /**
  * Options for adding state steps to workflow
  */
-export interface AddStateToWorkflowOptions extends SingleStateGeneratorOptions, SingleStateAgenticOptions {
+export interface AddStateToWorkflowOptions
+  extends SingleStateGeneratorOptions, SingleStateAgenticOptions {
   /** Add verification steps to workflow (default: true) */
   addVerificationSteps?: boolean;
   /** Add agentic instruction to workflow (default: true) */

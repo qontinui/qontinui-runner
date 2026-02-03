@@ -428,10 +428,7 @@ export default function ImageDetailModal({ entry, isOpen, onClose }: ImageDetail
             {/* Footer */}
             <div className="border-t border-border p-4 flex justify-end">
               <Dialog.Close asChild>
-                <button
-                  data-ui-id="dialog-image-detail-confirm-btn"
-                  className="btn-secondary"
-                >
+                <button data-ui-id="dialog-image-detail-confirm-btn" className="btn-secondary">
                   Close
                 </button>
               </Dialog.Close>

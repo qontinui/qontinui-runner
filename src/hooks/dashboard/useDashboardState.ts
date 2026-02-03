@@ -24,7 +24,8 @@ import {
 } from "../../components/shared/AiMessageDisplay";
 
 const API_BASE = "http://localhost:9876";
-const ACTIVITY_POLL_INTERVAL_MS = 1000;
+// Polling is now fallback only - real-time events provide instant updates
+const ACTIVITY_POLL_INTERVAL_MS = 5000;
 
 /**
  * Overall dashboard status.
@@ -116,8 +117,10 @@ export function useDashboardState(): UseDashboardStateResult {
 
   // Layout management - pass isRunning to avoid false idle detection
   // Note: useDashboardLayout handles reset internally when taskId changes
-  const { layout, setActiveWidget, updateActivityState, getWidgetConfig } =
-    useDashboardLayout(taskInfo, isRunning);
+  const { layout, setActiveWidget, updateActivityState, getWidgetConfig } = useDashboardLayout(
+    taskInfo,
+    isRunning,
+  );
 
   // Phase tracking
   const { currentPhase, showPhaseBadge } = usePhaseTracking({

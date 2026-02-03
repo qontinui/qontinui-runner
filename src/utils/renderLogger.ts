@@ -59,7 +59,7 @@ export async function logRender(
   options?: {
     visibleSections?: string[];
     taskRunId?: number;
-  }
+  },
 ): Promise<void> {
   // Only log in development mode
   if (import.meta.env.PROD) {

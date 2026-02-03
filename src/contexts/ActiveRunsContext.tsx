@@ -5,14 +5,7 @@
  * Enables multi-run dashboard view with run selection and GUI lock awareness.
  */
 
-import {
-  createContext,
-  useContext,
-  useState,
-  useEffect,
-  useCallback,
-  type ReactNode,
-} from "react";
+import { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from "react";
 import type { TaskActivityInfo } from "../types/dashboard/widget-registry";
 
 const API_BASE = "http://localhost:9876";
@@ -135,11 +128,7 @@ interface BridgeData {
 /**
  * Convert task API data to ActiveRun.
  */
-function taskToActiveRun(
-  task: RunningTaskData,
-  hasGuiLock: boolean,
-  mode: BridgeMode
-): ActiveRun {
+function taskToActiveRun(task: RunningTaskData, hasGuiLock: boolean, mode: BridgeMode): ActiveRun {
   const taskInfo: TaskActivityInfo = {
     taskId: task.id,
     taskType: task.task_type,
@@ -347,9 +336,7 @@ export function ActiveRunsProvider({ children }: ActiveRunsProviderProps) {
     refresh,
   };
 
-  return (
-    <ActiveRunsContext.Provider value={value}>{children}</ActiveRunsContext.Provider>
-  );
+  return <ActiveRunsContext.Provider value={value}>{children}</ActiveRunsContext.Provider>;
 }
 
 /**

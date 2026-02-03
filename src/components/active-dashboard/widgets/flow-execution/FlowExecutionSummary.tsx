@@ -5,15 +5,7 @@
  * Shows compact status, progress, and key metrics.
  */
 
-import {
-  CheckCircle,
-  XCircle,
-  Clock,
-  Pause,
-  AlertCircle,
-  Loader2,
-  GitBranch,
-} from "lucide-react";
+import { CheckCircle, XCircle, Clock, Pause, AlertCircle, Loader2, GitBranch } from "lucide-react";
 import { cn } from "../../../../lib/utils";
 import type { FlowExecutionSummaryProps } from "./types";
 
@@ -79,9 +71,10 @@ function StatusIndicator({ status }: { status: string }) {
 }
 
 /**
- * Progress bar component.
+ * Progress bar component with defensive parsing.
+ * Handles invalid values gracefully to prevent crashes.
  */
-function ProgressBar({
+function FlowProgressBar({
   completed,
   total,
   failed,
@@ -90,10 +83,17 @@ function ProgressBar({
   total: number;
   failed: number;
 }) {
-  if (total === 0) return null;
+  // Defensive parsing: ensure values are valid numbers
+  const safeCompleted = Number.isFinite(completed) ? Math.max(0, completed) : 0;
+  const safeTotal = Number.isFinite(total) ? Math.max(0, total) : 0;
+  const safeFailed = Number.isFinite(failed) ? Math.max(0, failed) : 0;
 
-  const successPercent = ((completed - failed) / Math.max(total, completed)) * 100;
-  const failedPercent = (failed / Math.max(total, completed)) * 100;
+  if (safeTotal === 0 && safeCompleted === 0) return null;
+
+  // Prevent division issues
+  const denominator = Math.max(safeTotal, safeCompleted, 1);
+  const successPercent = Math.min(100, Math.max(0, ((safeCompleted - safeFailed) / denominator) * 100));
+  const failedPercent = Math.min(100 - successPercent, Math.max(0, (safeFailed / denominator) * 100));
 
   return (
     <div className="w-full h-1.5 bg-muted/50 rounded-full overflow-hidden">
@@ -114,10 +114,7 @@ function ProgressBar({
 /**
  * Flow Execution Summary Widget.
  */
-export function FlowExecutionSummary({
-  data,
-  className,
-}: FlowExecutionSummaryProps) {
+export function FlowExecutionSummary({ data, className }: FlowExecutionSummaryProps) {
   // No active execution - show empty state
   if (!data.isActive && data.status === "idle") {
     return (
@@ -138,14 +135,12 @@ export function FlowExecutionSummary({
       <div className="flex items-center justify-between">
         <StatusIndicator status={status} />
         {flowName && (
-          <span className="text-xs text-muted-foreground truncate max-w-[120px]">
-            {flowName}
-          </span>
+          <span className="text-xs text-muted-foreground truncate max-w-[120px]">{flowName}</span>
         )}
       </div>
 
       {/* Progress bar */}
-      <ProgressBar
+      <FlowProgressBar
         completed={stats.completedSteps}
         total={stats.totalSteps || stats.completedSteps}
         failed={stats.failedSteps}
@@ -168,9 +163,7 @@ export function FlowExecutionSummary({
       {currentStepId && status === "running" && (
         <div className="flex items-center gap-1.5 text-xs">
           <Loader2 className="w-3 h-3 animate-spin text-emerald-400" />
-          <span className="text-muted-foreground truncate">
-            {currentStepId}
-          </span>
+          <span className="text-muted-foreground truncate">{currentStepId}</span>
         </div>
       )}
 

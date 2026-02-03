@@ -6,11 +6,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
-import type {
-  RenderLogStorage,
-  RenderLogEntry,
-  RenderLogEntryType,
-} from "ui-bridge";
+import type { RenderLogStorage, RenderLogEntry, RenderLogEntryType } from "ui-bridge";
 
 /**
  * Convert ui-bridge entry to the format expected by the Rust backend
@@ -25,10 +21,7 @@ interface BackendRenderLogEntry {
   task_run_id?: number;
 }
 
-function convertToBackendFormat(
-  entry: RenderLogEntry,
-  taskRunId?: number
-): BackendRenderLogEntry {
+function convertToBackendFormat(entry: RenderLogEntry, taskRunId?: number): BackendRenderLogEntry {
   // Map ui-bridge entry type to component name
   const componentMap: Record<RenderLogEntryType, string> = {
     snapshot: "DOMSnapshot",
@@ -63,7 +56,10 @@ export class TauriRenderLogStorage implements RenderLogStorage {
 
   constructor(options: { maxEntries?: number; taskRunId?: string | number } = {}) {
     this.maxEntries = options.maxEntries ?? 1000;
-    this.taskRunId = typeof options.taskRunId === "string" ? parseInt(options.taskRunId, 10) || undefined : options.taskRunId;
+    this.taskRunId =
+      typeof options.taskRunId === "string"
+        ? parseInt(options.taskRunId, 10) || undefined
+        : options.taskRunId;
     this.isDev = import.meta.env.DEV;
   }
 
@@ -71,7 +67,8 @@ export class TauriRenderLogStorage implements RenderLogStorage {
    * Set the current task run ID
    */
   setTaskRunId(taskRunId: string | number | undefined): void {
-    this.taskRunId = typeof taskRunId === "string" ? parseInt(taskRunId, 10) || undefined : taskRunId;
+    this.taskRunId =
+      typeof taskRunId === "string" ? parseInt(taskRunId, 10) || undefined : taskRunId;
   }
 
   async append(entry: RenderLogEntry): Promise<void> {

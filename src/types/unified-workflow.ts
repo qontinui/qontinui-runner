@@ -281,6 +281,16 @@ export interface ApiRequestStep extends BaseStep {
   /** Assertions for response verification (step fails if any assertion fails) */
   assertions?: ApiAssertion[];
 
+  /**
+   * Variable name to store the entire response body.
+   * Enables API request chaining where subsequent steps can reference
+   * the response using {{variable_name}} syntax.
+   *
+   * Supports JSON path extraction: "response.data.token" extracts $.data.token
+   * and stores it in a variable named "response".
+   */
+  output_variable?: string;
+
   /** Credential ID for authentication (from secure storage) */
   credential_id?: string;
 

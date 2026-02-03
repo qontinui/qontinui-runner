@@ -1063,7 +1063,9 @@ export function AddStepDropdown({
             <Plus className="w-4 h-4 text-zinc-400" />
             <div className="flex-1 min-w-0">
               <div className="font-medium text-zinc-200">New Custom Check</div>
-              <div className="text-xs text-zinc-500">Create an inline check with a custom command</div>
+              <div className="text-xs text-zinc-500">
+                Create an inline check with a custom command
+              </div>
             </div>
           </button>
         </div>

@@ -30,10 +30,7 @@ interface EventTimelineViewProps {
   maxEvents?: number;
 }
 
-const EVENT_TYPE_CONFIG: Record<
-  string,
-  { icon: React.ReactNode; color: string; label: string }
-> = {
+const EVENT_TYPE_CONFIG: Record<string, { icon: React.ReactNode; color: string; label: string }> = {
   element_registered: {
     icon: <Eye className="w-3.5 h-3.5" />,
     color: "text-blue-400",
@@ -284,7 +281,7 @@ export function EventTimelineView({
                   "flex items-center gap-1 px-2 py-1 text-xs rounded-md transition-colors",
                   filterType === type
                     ? "bg-primary text-primary-foreground"
-                    : "bg-muted/50 hover:bg-muted"
+                    : "bg-muted/50 hover:bg-muted",
                 )}
                 onClick={() => setFilterType(filterType === type ? null : type)}
               >
@@ -308,7 +305,7 @@ export function EventTimelineView({
               key={event.id}
               className={cn(
                 "border-b border-border/30 last:border-b-0",
-                !event.success && "bg-destructive/5"
+                !event.success && "bg-destructive/5",
               )}
             >
               {/* Event header */}
@@ -332,14 +329,10 @@ export function EventTimelineView({
                 <span className="flex-1 text-xs truncate">
                   <span className="font-medium">{config.label}</span>
                   {event.elementId && (
-                    <span className="text-muted-foreground ml-1">
-                      on {event.elementId}
-                    </span>
+                    <span className="text-muted-foreground ml-1">on {event.elementId}</span>
                   )}
                   {event.action && (
-                    <span className="text-muted-foreground ml-1">
-                      ({event.action})
-                    </span>
+                    <span className="text-muted-foreground ml-1">({event.action})</span>
                   )}
                 </span>
 

@@ -45,8 +45,9 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  // In dev mode, we wait for auto-login to complete before showing the app
-  const [devAutoLoginPending, setDevAutoLoginPending] = useState(import.meta.env.DEV);
+  // Dev auto-login pending flag - starts false, set to true only when auto-login starts
+  // This prevents blocking the UI while waiting for auth check to complete
+  const [devAutoLoginPending, setDevAutoLoginPending] = useState(false);
   const mountCountRef = useRef(0);
   const refreshCallCountRef = useRef(0);
   const hasAttemptedDevLogin = useRef(false);
@@ -182,7 +183,6 @@ export function AuthProvider({ children }: AuthProviderProps) {
   useEffect(() => {
     // Only run in development mode
     if (!import.meta.env.DEV) {
-      setDevAutoLoginPending(false);
       return;
     }
 
@@ -212,18 +212,42 @@ export function AuthProvider({ children }: AuthProviderProps) {
       console.log(
         "[AUTH] Dev mode: Set VITE_DEV_EMAIL and VITE_DEV_PASSWORD in .env to enable auto-login",
       );
-      setDevAutoLoginPending(false);
       return;
     }
 
     // Auto-login in development
     console.log("[AUTH] Dev mode: Not authenticated, attempting auto-login...");
     hasAttemptedDevLogin.current = true;
-    login(DEV_AUTO_LOGIN.email, DEV_AUTO_LOGIN.password).catch((err) => {
-      console.error("[AUTH] Dev mode auto-login failed:", err);
-      // Don't set devAutoLoginPending here - the effect will re-run and handle it above
-    });
+    // Set pending flag BEFORE starting login so UI shows "Signing in..."
+    setDevAutoLoginPending(true);
+    login(DEV_AUTO_LOGIN.email, DEV_AUTO_LOGIN.password)
+      .then(() => {
+        // Login successful - the authStatus effect will clear devAutoLoginPending
+        console.log("[AUTH] Dev mode auto-login succeeded");
+      })
+      .catch((err) => {
+        console.error("[AUTH] Dev mode auto-login failed:", err);
+        // Clear pending flag on failure so user can see login screen
+        setDevAutoLoginPending(false);
+      });
   }, [loading, authStatus?.authenticated, login]);
+
+  /**
+   * Failsafe timeout for loading state
+   * If loading is still true after 3 seconds, force it to false
+   * This prevents the app from being stuck on "Loading..." forever
+   */
+  useEffect(() => {
+    if (!loading) return;
+
+    const timeout = setTimeout(() => {
+      console.warn("[AUTH] Loading timeout - forcing loading to false");
+      setLoading(false);
+      setDevAutoLoginPending(false);
+    }, 3000);
+
+    return () => clearTimeout(timeout);
+  }, [loading]);
 
   /**
    * Set up auto-refresh timer when authenticated

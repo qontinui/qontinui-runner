@@ -8,12 +8,13 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import type { Finding, FindingsData, FindingSeverity, FindingStatus } from "./types";
 import { getSeverityColors, getStatusColors } from "@/design-system";
+import { useCurrentTaskRunId } from "@/contexts";
 
 /** Polling interval for findings data (5 seconds - less frequent than other widgets) */
 const POLL_INTERVAL_MS = 5000;
 
-/** API endpoint for findings */
-const FINDINGS_API_URL = "http://localhost:9876/findings/summary";
+/** API base URL for findings */
+const FINDINGS_API_BASE = "http://localhost:9876/findings/summary";
 
 /**
  * Backend finding format (from Rust API).
@@ -121,13 +122,20 @@ function sortFindingsBySeverity(findings: Finding[]): Finding[] {
 /**
  * Hook for accessing findings data.
  * Polls the API and returns aggregated findings data.
+ * Filters to current task run when one is active.
  */
 export function useFindingsData(): FindingsData {
   const [findings, setFindings] = useState<Finding[]>([]);
+  const currentTaskRunId = useCurrentTaskRunId();
 
   const fetchFindings = useCallback(async () => {
     try {
-      const response = await fetch(FINDINGS_API_URL);
+      // Build URL with optional task_run_id filter
+      const url = currentTaskRunId
+        ? `${FINDINGS_API_BASE}?task_run_id=${encodeURIComponent(currentTaskRunId)}`
+        : FINDINGS_API_BASE;
+
+      const response = await fetch(url);
       if (!response.ok) {
         // API not available or error - return empty data
         setFindings([]);
@@ -145,7 +153,7 @@ export function useFindingsData(): FindingsData {
       // Network error or API not available
       setFindings([]);
     }
-  }, []);
+  }, [currentTaskRunId]);
 
   // Initial fetch and polling
   useEffect(() => {

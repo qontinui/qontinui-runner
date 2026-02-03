@@ -1,15 +1,28 @@
 /**
  * useExecutionTimelineData Hook
  *
+ * @deprecated Use useWorkflowTimelineData() from useWorkflowExecution.ts instead.
+ * This hook now attempts to use the unified WorkflowExecutionContext when available,
+ * falling back to direct API calls when outside the provider.
+ *
  * Fetches and manages data for the Execution Timeline widget.
  * Polls the step execution API for ALL step types (no filter).
  * Also fetches orchestrator state to determine current workflow stage.
  */
 
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
-import type { ExecutionTimelineData, TimelineStep, PhaseGroup, IterationGroup, StepType, TimelineStats, VerificationResult } from "./types";
+import type {
+  ExecutionTimelineData,
+  TimelineStep,
+  PhaseGroup,
+  IterationGroup,
+  StepType,
+  TimelineStats,
+  VerificationResult,
+} from "./types";
 import type { StepExecutionStatus, StepStats } from "../shared/types";
 import type { WorkflowStage } from "../../../../types/dashboard/activity-types";
+import { useWorkflowExecutionOptional } from "../../../../contexts/WorkflowExecutionContext";
 
 const API_BASE = "http://localhost:9876";
 const POLL_INTERVAL_MS = 1000; // Poll every 1 second to catch running steps
@@ -22,7 +35,7 @@ interface CurrentExecutionStepsResponse {
   task_run_id: string | null;
   workflow_name?: string;
   workflow_type?: string;
-  workflow_start_time?: string;  // ISO 8601 timestamp from task_run.created_at
+  workflow_start_time?: string; // ISO 8601 timestamp from task_run.created_at
   current_stage?: WorkflowStage;
   executions: Array<{
     id: string;
@@ -148,7 +161,10 @@ function mapStepType(apiType: string): StepType {
  * Map API phase to WorkflowStage.
  * If no phase is provided, uses the current orchestrator stage or defaults to "setup".
  */
-function mapPhase(apiPhase: string | undefined, fallbackStage: WorkflowStage = "setup"): WorkflowStage {
+function mapPhase(
+  apiPhase: string | undefined,
+  fallbackStage: WorkflowStage = "setup",
+): WorkflowStage {
   if (!apiPhase) return fallbackStage;
   const phaseMap: Record<string, WorkflowStage> = {
     setup: "setup",
@@ -170,8 +186,20 @@ const PHASE_ORDER: WorkflowStage[] = ["setup", "verification", "agentic", "compl
 
 /**
  * Hook that provides execution timeline data for the widget.
+ *
+ * @deprecated Use useWorkflowTimelineData() from useWorkflowExecution.ts instead.
+ * This hook now attempts to use the unified WorkflowExecutionContext when available.
  */
 export function useExecutionTimelineData(): ExecutionTimelineData {
+  // Try to use unified context if available
+  const unifiedContext = useWorkflowExecutionOptional();
+
+  // Determine if we should use unified context (must be checked BEFORE hooks for consistent ordering)
+  // NOTE: We check this but still call all hooks unconditionally to satisfy React rules
+  const useUnifiedContext = !!(unifiedContext && unifiedContext.taskRunId);
+
+  // ALL hooks must be called unconditionally (React rules of hooks)
+  // Legacy state - only used when unified context is not available
   const [allSteps, setAllSteps] = useState<TimelineStep[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [_error, _setError] = useState<string | null>(null);
@@ -202,7 +230,9 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
           } else if (data.task_run_id) {
             // Fetch orchestrator state to get the current workflow stage
             try {
-              const orchResponse = await fetch(`${API_BASE}/task-runs/${data.task_run_id}/orchestrator-state`);
+              const orchResponse = await fetch(
+                `${API_BASE}/task-runs/${data.task_run_id}/orchestrator-state`,
+              );
               if (orchResponse.ok) {
                 const orchData: OrchestratorStateResponse = await orchResponse.json();
                 if (orchData.workflow_stage) {
@@ -224,7 +254,8 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
             // 1. The API status is NOT a terminal status (success, failed, skipped)
             // 2. The step has started (has start_time)
             // 3. The step hasn't completed (no end_time and no duration_ms)
-            const isTerminalStatus = status === "success" || status === "failed" || status === "skipped";
+            const isTerminalStatus =
+              status === "success" || status === "failed" || status === "skipped";
             if (!isTerminalStatus && exec.start_time && !exec.end_time && !exec.duration_ms) {
               status = "running";
             }
@@ -276,15 +307,17 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
     }
   }, [startTime]);
 
-  // Initial fetch and polling
+  // Initial fetch and polling - skip when using unified context
   useEffect(() => {
+    if (useUnifiedContext) return; // Don't poll when unified context is available
     fetchSteps();
     const interval = setInterval(fetchSteps, POLL_INTERVAL_MS);
     return () => clearInterval(interval);
-  }, [fetchSteps]);
+  }, [fetchSteps, useUnifiedContext]);
 
-  // Update elapsed time
+  // Update elapsed time - skip when using unified context
   useEffect(() => {
+    if (useUnifiedContext) return;
     if (!startTime) {
       setElapsedTime(0);
       return;
@@ -298,7 +331,7 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
     updateElapsed();
     const interval = setInterval(updateElapsed, 1000);
     return () => clearInterval(interval);
-  }, [startTime]);
+  }, [startTime, useUnifiedContext]);
 
   // Get currently running step
   // If no step is running but the workflow is active (has a currentStage),
@@ -317,13 +350,14 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
       const lastCompleted = completedSteps[0];
 
       // Use phase-specific names for the synthetic step
-      const phaseName = currentStage === "agentic"
-        ? "Preparing AI Session"
-        : currentStage === "verification"
-          ? "Starting Verification"
-          : currentStage === "completion"
-            ? "Starting Completion"
-            : "Preparing Next Step";
+      const phaseName =
+        currentStage === "agentic"
+          ? "Preparing AI Session"
+          : currentStage === "verification"
+            ? "Starting Verification"
+            : currentStage === "completion"
+              ? "Starting Completion"
+              : "Preparing Next Step";
 
       return {
         id: "_workflow_processing",
@@ -380,7 +414,7 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
 
     // Get phases that have steps and sort them chronologically
     const phasesWithSteps = Array.from(groups.keys()).filter(
-      (phase) => groups.get(phase)!.length > 0
+      (phase) => groups.get(phase)!.length > 0,
     );
 
     // Sort phases by earliest startTime (chronological order)
@@ -425,7 +459,10 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
     };
 
     // Helper function to create iteration groups for verification/agentic phases
-    const createIterationGroups = (steps: TimelineStep[], activePhase: boolean): IterationGroup[] => {
+    const createIterationGroups = (
+      steps: TimelineStep[],
+      activePhase: boolean,
+    ): IterationGroup[] => {
       const iterationMap = new Map<number, TimelineStep[]>();
 
       // Group steps by iteration (use iteration 1 for steps without iteration)
@@ -463,7 +500,7 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
       return iterations.map((iteration): IterationGroup => {
         const iterSteps = sortByStartTime(iterationMap.get(iteration) || []);
         const completed = iterSteps.filter(
-          (s) => s.status === "success" || s.status === "failed"
+          (s) => s.status === "success" || s.status === "failed",
         ).length;
         const successful = iterSteps.filter((s) => s.status === "success").length;
         const failed = iterSteps.filter((s) => s.status === "failed").length;
@@ -489,9 +526,7 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
     // Convert to PhaseGroup array in chronological order
     return phasesWithSteps.map((phase) => {
       const steps = groups.get(phase) || [];
-      const completed = steps.filter(
-        (s) => s.status === "success" || s.status === "failed",
-      ).length;
+      const completed = steps.filter((s) => s.status === "success" || s.status === "failed").length;
       const successful = steps.filter((s) => s.status === "success").length;
       const failed = steps.filter((s) => s.status === "failed").length;
       const isActive = phase === currentPhase;
@@ -500,9 +535,10 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
       // Phases that have iterations: verification and agentic
       const hasIterations = phase === "verification" || phase === "agentic";
       const iterationGroups = hasIterations ? createIterationGroups(steps, isActive) : [];
-      const currentIteration = hasIterations && iterationGroups.length > 0
-        ? Math.max(...iterationGroups.map((g) => g.iteration))
-        : undefined;
+      const currentIteration =
+        hasIterations && iterationGroups.length > 0
+          ? Math.max(...iterationGroups.map((g) => g.iteration))
+          : undefined;
 
       return {
         phase,
@@ -532,12 +568,12 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
     const verificationIterations = verificationGroup?.iterationGroups || [];
     const agenticIterations = agenticGroup?.iterationGroups || [];
 
-    const maxVerificationIter = verificationIterations.length > 0
-      ? Math.max(...verificationIterations.map((g) => g.iteration))
-      : 0;
-    const maxAgenticIter = agenticIterations.length > 0
-      ? Math.max(...agenticIterations.map((g) => g.iteration))
-      : 0;
+    const maxVerificationIter =
+      verificationIterations.length > 0
+        ? Math.max(...verificationIterations.map((g) => g.iteration))
+        : 0;
+    const maxAgenticIter =
+      agenticIterations.length > 0 ? Math.max(...agenticIterations.map((g) => g.iteration)) : 0;
     const maxIteration = Math.max(maxVerificationIter, maxAgenticIter);
 
     // Current iteration is the one that's active, or the max if none active
@@ -545,7 +581,8 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
     if (verificationGroup?.isActive || agenticGroup?.isActive) {
       const activeVerification = verificationIterations.find((g) => g.isActive);
       const activeAgentic = agenticIterations.find((g) => g.isActive);
-      currentIteration = activeVerification?.iteration || activeAgentic?.iteration || maxIteration || null;
+      currentIteration =
+        activeVerification?.iteration || activeAgentic?.iteration || maxIteration || null;
     } else if (maxIteration > 0) {
       currentIteration = maxIteration;
     }
@@ -554,22 +591,27 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
     // Track which iterations have all check steps complete for improvement calculation
     const verificationResults: VerificationResult[] = verificationIterations.map((iterGroup) => {
       // Count verification steps that are checks/tests
-      const checkSteps = iterGroup.steps.filter((s) =>
-        s.type === "check" || s.type === "test" || s.type === "playwright" || s.type === "check_group"
+      const checkSteps = iterGroup.steps.filter(
+        (s) =>
+          s.type === "check" ||
+          s.type === "test" ||
+          s.type === "playwright" ||
+          s.type === "check_group",
       );
       const passed = checkSteps.filter((s) => s.status === "success").length;
       const total = checkSteps.length;
       // Check if all check steps have completed (success or failed, not pending/running)
       const allCheckStepsComplete = checkSteps.every(
-        (s) => s.status === "success" || s.status === "failed"
+        (s) => s.status === "success" || s.status === "failed",
       );
 
       // Calculate duration from steps
       const startTimes = iterGroup.steps.filter((s) => s.startTime).map((s) => s.startTime!);
       const endTimes = iterGroup.steps.filter((s) => s.endTime).map((s) => s.endTime!);
-      const durationMs = startTimes.length > 0 && endTimes.length > 0
-        ? Math.max(...endTimes) - Math.min(...startTimes)
-        : undefined;
+      const durationMs =
+        startTimes.length > 0 && endTimes.length > 0
+          ? Math.max(...endTimes) - Math.min(...startTimes)
+          : undefined;
 
       return {
         iteration: iterGroup.iteration,
@@ -616,9 +658,11 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
       }
     }
 
-    const avgIterationDurationMs = completedIterationDurations.length > 0
-      ? completedIterationDurations.reduce((a, b) => a + b, 0) / completedIterationDurations.length
-      : null;
+    const avgIterationDurationMs =
+      completedIterationDurations.length > 0
+        ? completedIterationDurations.reduce((a, b) => a + b, 0) /
+          completedIterationDurations.length
+        : null;
 
     return {
       elapsedTime,
@@ -633,7 +677,9 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
   // Calculate step execution statistics
   const stepStats: StepStats = useMemo(() => {
     const total = allSteps.length;
-    const completed = allSteps.filter((s) => s.status === "success" || s.status === "failed").length;
+    const completed = allSteps.filter(
+      (s) => s.status === "success" || s.status === "failed",
+    ).length;
     const successful = allSteps.filter((s) => s.status === "success").length;
     const failed = allSteps.filter((s) => s.status === "failed").length;
     const pending = total - completed;
@@ -650,6 +696,23 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
     };
   }, [allSteps, elapsedTime]);
 
+  // If using unified context, return its data
+  if (useUnifiedContext && unifiedContext) {
+    return {
+      phaseGroups: unifiedContext.phaseGroups,
+      allSteps: unifiedContext.steps,
+      currentStep: unifiedContext.currentStep,
+      currentPhase: unifiedContext.workflowStage,
+      stats: unifiedContext.timelineStats,
+      stepStats: unifiedContext.stepStats,
+      isLoading: unifiedContext.isLoading,
+      error: unifiedContext.error,
+      workflowName: unifiedContext.workflowName,
+      taskRunId: unifiedContext.taskRunId,
+    };
+  }
+
+  // Return legacy implementation data
   return {
     phaseGroups,
     allSteps,

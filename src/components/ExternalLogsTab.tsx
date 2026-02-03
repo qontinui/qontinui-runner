@@ -135,7 +135,9 @@ export function ExternalLogsTab({
       <div className="h-full flex flex-col items-center justify-center text-muted-foreground">
         <FileText className="w-12 h-12 mb-4 opacity-50" />
         <p className="text-lg font-medium mb-2">No Log Sources Available</p>
-        <p className="text-sm mb-4">Select log sources for this project or configure them in Settings</p>
+        <p className="text-sm mb-4">
+          Select log sources for this project or configure them in Settings
+        </p>
         <button
           onClick={onConfigureSources}
           className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-md hover:bg-primary/90 transition-colors"

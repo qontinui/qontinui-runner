@@ -135,9 +135,7 @@ export function ExecutionStatsCard({
         {/* Success rate */}
         <div className="flex items-center gap-1.5">
           <CheckCircle2 className={cn("h-3.5 w-3.5", successColors.text)} />
-          <span className={cn("font-mono", successColors.text)}>
-            {successRate.toFixed(0)}%
-          </span>
+          <span className={cn("font-mono", successColors.text)}>{successRate.toFixed(0)}%</span>
         </div>
 
         {/* Failed count (if any) */}
@@ -170,10 +168,7 @@ export function ExecutionStatsCard({
   // Full card view
   return (
     <div
-      className={cn(
-        "bg-card border border-border rounded-lg shadow-sm overflow-hidden",
-        className,
-      )}
+      className={cn("bg-card border border-border rounded-lg shadow-sm overflow-hidden", className)}
     >
       {/* Header */}
       <div className="px-3 py-2 border-b border-border/50 bg-muted/30">

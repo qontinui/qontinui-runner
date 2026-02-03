@@ -41,15 +41,13 @@ export function BatchDeleteDialog({
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       {/* Backdrop */}
-      <div
-        className="absolute inset-0 bg-black/50"
-        onClick={isDeleting ? undefined : onClose}
-      />
+      <div className="absolute inset-0 bg-black/50" onClick={isDeleting ? undefined : onClose} />
 
       {/* Dialog */}
       <div
         data-ui-id="dialog-batch-delete"
-        className="relative bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl w-full max-w-md mx-4 overflow-hidden">
+        className="relative bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl w-full max-w-md mx-4 overflow-hidden"
+      >
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-zinc-700 bg-red-500/10">
           <div className="flex items-center gap-2">
@@ -78,10 +76,7 @@ export function BatchDeleteDialog({
             <div className="max-h-40 overflow-y-auto bg-zinc-800 rounded-md border border-zinc-700">
               <ul className="divide-y divide-zinc-700">
                 {itemNames.map((name, index) => (
-                  <li
-                    key={index}
-                    className="px-3 py-2 text-sm text-zinc-300 truncate"
-                  >
+                  <li key={index} className="px-3 py-2 text-sm text-zinc-300 truncate">
                     {name}
                   </li>
                 ))}
@@ -112,7 +107,10 @@ export function BatchDeleteDialog({
                 Deleting...
               </>
             ) : (
-              <>Delete {itemCount} {itemType}{pluralSuffix}</>
+              <>
+                Delete {itemCount} {itemType}
+                {pluralSuffix}
+              </>
             )}
           </button>
         </div>

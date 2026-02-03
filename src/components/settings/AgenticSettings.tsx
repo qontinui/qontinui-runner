@@ -207,7 +207,10 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
       )}
 
       {/* Memory Compression Section */}
-      <div className="rounded-lg bg-card/50 overflow-hidden" data-ui-id="settings-agentic-compression-section">
+      <div
+        className="rounded-lg bg-card/50 overflow-hidden"
+        data-ui-id="settings-agentic-compression-section"
+      >
         <button
           onClick={() => setCompressionExpanded(!compressionExpanded)}
           className="w-full p-4 flex items-center justify-between hover:bg-muted/30 transition-colors"
@@ -361,7 +364,10 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
       </div>
 
       {/* Retry with Feedback Section */}
-      <div className="rounded-lg bg-card/50 overflow-hidden" data-ui-id="settings-agentic-retry-section">
+      <div
+        className="rounded-lg bg-card/50 overflow-hidden"
+        data-ui-id="settings-agentic-retry-section"
+      >
         <button
           onClick={() => setRetryExpanded(!retryExpanded)}
           className="w-full p-4 flex items-center justify-between hover:bg-muted/30 transition-colors"
@@ -554,7 +560,10 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
       </div>
 
       {/* Task Routing Section */}
-      <div className="rounded-lg bg-card/50 overflow-hidden" data-ui-id="settings-agentic-routing-section">
+      <div
+        className="rounded-lg bg-card/50 overflow-hidden"
+        data-ui-id="settings-agentic-routing-section"
+      >
         <button
           onClick={() => setRoutingExpanded(!routingExpanded)}
           className="w-full p-4 flex items-center justify-between hover:bg-muted/30 transition-colors"

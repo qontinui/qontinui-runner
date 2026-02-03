@@ -133,7 +133,16 @@ export function useLogManager(): UseLogManagerResult {
       phase?: string,
       phaseIteration?: number,
     ) => {
-      logManager.addAiOutputLog(line, source, actionId, taskRunId, sessionId, sessionName, phase, phaseIteration);
+      logManager.addAiOutputLog(
+        line,
+        source,
+        actionId,
+        taskRunId,
+        sessionId,
+        sessionName,
+        phase,
+        phaseIteration,
+      );
     },
     [],
   );

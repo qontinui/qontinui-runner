@@ -103,7 +103,8 @@ export function DomDiffModal({
         <Dialog.Overlay className="fixed inset-0 bg-black/70 z-50" />
         <Dialog.Content
           data-ui-id="dialog-dom-diff"
-          className="fixed inset-4 bg-gray-900 rounded-lg shadow-2xl z-50 flex flex-col overflow-hidden">
+          className="fixed inset-4 bg-gray-900 rounded-lg shadow-2xl z-50 flex flex-col overflow-hidden"
+        >
           {/* Header */}
           <div className="flex items-center justify-between p-4 border-b border-gray-700">
             <div className="flex items-center gap-4">

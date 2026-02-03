@@ -24,9 +24,14 @@
  * - Wraps dashboard in ActiveRunsProvider for tracking concurrent runs
  * - Shows ActiveRunsBar when multiple runs are active
  * - Allows switching between runs to view their dashboards
+ *
+ * State Management:
+ * - ActiveRunsProvider: Tracks multiple concurrent runs
+ * - WorkflowExecutionProvider: Unified state store for workflow execution data
+ *   (orchestrator state, checkpoints, progress markers, restart recovery)
  */
 
-import { ActiveRunsProvider } from "../../contexts";
+import { ActiveRunsProvider, WorkflowExecutionProvider } from "../../contexts";
 import { DashboardPage, type DashboardPageProps } from "./DashboardPage";
 
 export type ActiveDashboardPageProps = DashboardPageProps;
@@ -34,13 +39,16 @@ export type ActiveDashboardPageProps = DashboardPageProps;
 /**
  * ActiveDashboardPage - The Active Dashboard entry point.
  *
- * This component wraps the DashboardPage with ActiveRunsProvider
- * to enable multi-run support.
+ * This component wraps the DashboardPage with:
+ * 1. ActiveRunsProvider - for tracking concurrent runs
+ * 2. WorkflowExecutionProvider - for unified workflow state management
  */
 export function ActiveDashboardPage(props: ActiveDashboardPageProps) {
   return (
     <ActiveRunsProvider>
-      <DashboardPage {...props} />
+      <WorkflowExecutionProvider>
+        <DashboardPage {...props} />
+      </WorkflowExecutionProvider>
     </ActiveRunsProvider>
   );
 }

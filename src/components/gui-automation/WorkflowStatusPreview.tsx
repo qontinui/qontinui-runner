@@ -15,10 +15,7 @@ interface WorkflowStatusPreviewProps {
   className?: string;
 }
 
-const statusConfig: Record<
-  ExecutionStatus,
-  { label: string; dotColor: string; pulse: boolean }
-> = {
+const statusConfig: Record<ExecutionStatus, { label: string; dotColor: string; pulse: boolean }> = {
   ready: {
     label: "Ready to start...",
     dotColor: "bg-muted-foreground",
@@ -65,9 +62,7 @@ export function WorkflowStatusPreview({
             )}
           />
         )}
-        <span
-          className={cn("relative inline-flex h-2.5 w-2.5 rounded-full", config.dotColor)}
-        />
+        <span className={cn("relative inline-flex h-2.5 w-2.5 rounded-full", config.dotColor)} />
       </span>
 
       {/* Status text */}

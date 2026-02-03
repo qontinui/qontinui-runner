@@ -83,7 +83,10 @@ export function CategorySection({
   }
 
   return (
-    <div data-ui-id={`findings-category-section-${category.id}`} className="rounded-lg border border-border overflow-hidden">
+    <div
+      data-ui-id={`findings-category-section-${category.id}`}
+      className="rounded-lg border border-border overflow-hidden"
+    >
       {/* Category Header */}
       <button
         data-ui-id="findings-category-toggle-btn"

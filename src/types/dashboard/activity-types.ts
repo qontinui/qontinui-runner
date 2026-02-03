@@ -254,7 +254,7 @@ export const WORKFLOW_STAGE_CONFIG: Record<
   },
   completion: {
     label: "Completion",
-    color: "teal",
+    color: "cyan",
     description: "Completing and summarizing results",
   },
 };

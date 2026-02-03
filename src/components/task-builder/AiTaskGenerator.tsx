@@ -40,7 +40,8 @@ const PROMPT_TEMPLATES = [
   },
   {
     label: "Code Review",
-    prompt: "Create a prompt that reviews code changes and provides feedback on quality and potential issues",
+    prompt:
+      "Create a prompt that reviews code changes and provides feedback on quality and potential issues",
   },
   {
     label: "Bug Analysis",
@@ -74,9 +75,11 @@ export function AiTaskGenerator({
   // Generate task using AI
   const handleGenerate = useCallback(async () => {
     if (!prompt.trim()) {
-      setError(mode === "generate"
-        ? "Please describe what you want the task to do"
-        : "Please enter the prompt you want to improve");
+      setError(
+        mode === "generate"
+          ? "Please describe what you want the task to do"
+          : "Please enter the prompt you want to improve",
+      );
       return;
     }
 
@@ -292,7 +295,10 @@ export function AiTaskGenerator({
                   <label className="block text-xs text-neutral-400 mb-1">Tags</label>
                   <div className="flex flex-wrap gap-1">
                     {generatedTask.tags.map((tag) => (
-                      <span key={tag} className="px-2 py-0.5 text-xs bg-amber-900/30 text-amber-300 rounded">
+                      <span
+                        key={tag}
+                        className="px-2 py-0.5 text-xs bg-amber-900/30 text-amber-300 rounded"
+                      >
                         {tag}
                       </span>
                     ))}

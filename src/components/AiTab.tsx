@@ -82,7 +82,6 @@ interface ActiveTaskInfo {
   maxSessions?: number | null;
 }
 
-
 export function AiTab({
   aiOutputLines,
   onClearAiOutput,
@@ -153,7 +152,7 @@ export function AiTab({
     // Falls back to sessionId prefix matching for backward compatibility with old data
     if (selectedRun?.id) {
       return aiOutputLines.filter(
-        (line) => line.taskRunId === selectedRun.id || line.sessionId?.startsWith(selectedRun.id)
+        (line) => line.taskRunId === selectedRun.id || line.sessionId?.startsWith(selectedRun.id),
       );
     }
     return aiOutputLines;
@@ -302,7 +301,13 @@ export function AiTab({
 
   // Toggle per-run auto-continue setting
   const toggleRunAutoContinue = useCallback(async () => {
-    if (!selectedSessionId || selectedSessionId === ALL_SESSIONS || runAutoContinueLoading || runAutoContinue === null) return;
+    if (
+      !selectedSessionId ||
+      selectedSessionId === ALL_SESSIONS ||
+      runAutoContinueLoading ||
+      runAutoContinue === null
+    )
+      return;
 
     setRunAutoContinueLoading(true);
     try {

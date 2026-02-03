@@ -107,7 +107,15 @@ export interface ScreenBoundingBox {
 export interface GuiActionStepOutput extends BaseStepOutput {
   step_type: "gui_action";
   /** Type of action performed */
-  action_type: "click" | "double_click" | "right_click" | "type" | "scroll" | "drag" | "hover" | "key_press";
+  action_type:
+    | "click"
+    | "double_click"
+    | "right_click"
+    | "type"
+    | "scroll"
+    | "drag"
+    | "hover"
+    | "key_press";
   /** Target location on screen */
   target_location?: {
     x: number;

@@ -123,10 +123,7 @@ export function NewRunDialog({ open, onClose, onSuccess }: NewRunDialogProps) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       {/* Backdrop */}
-      <div
-        className="absolute inset-0 bg-black/50"
-        onClick={isLoading ? undefined : onClose}
-      />
+      <div className="absolute inset-0 bg-black/50" onClick={isLoading ? undefined : onClose} />
 
       {/* Dialog */}
       <div
@@ -150,9 +147,7 @@ export function NewRunDialog({ open, onClose, onSuccess }: NewRunDialogProps) {
         <div className="p-6 space-y-6">
           {/* Mode Selection */}
           <div className="space-y-3">
-            <label className="text-sm font-medium text-zinc-300">
-              Select Run Mode
-            </label>
+            <label className="text-sm font-medium text-zinc-300">Select Run Mode</label>
 
             {/* GUI Mode Option */}
             <button
@@ -193,16 +188,14 @@ export function NewRunDialog({ open, onClose, onSuccess }: NewRunDialogProps) {
                     </span>
                   </div>
                   <p className="text-sm text-zinc-400 mt-1">
-                    Takes control of the screen for visual automation. Only one GUI
-                    run can be active at a time.
+                    Takes control of the screen for visual automation. Only one GUI run can be
+                    active at a time.
                   </p>
                 </div>
                 {/* Radio indicator */}
                 <div
                   className={`w-4 h-4 rounded-full border-2 flex items-center justify-center ${
-                    selectedMode === "gui"
-                      ? "border-emerald-500"
-                      : "border-zinc-600"
+                    selectedMode === "gui" ? "border-emerald-500" : "border-zinc-600"
                   }`}
                 >
                   {selectedMode === "gui" && (
@@ -251,16 +244,13 @@ export function NewRunDialog({ open, onClose, onSuccess }: NewRunDialogProps) {
                     </span>
                   </div>
                   <p className="text-sm text-zinc-400 mt-1">
-                    Runs without screen control. Multiple headless runs can execute
-                    simultaneously.
+                    Runs without screen control. Multiple headless runs can execute simultaneously.
                   </p>
                 </div>
                 {/* Radio indicator */}
                 <div
                   className={`w-4 h-4 rounded-full border-2 flex items-center justify-center ${
-                    selectedMode === "headless"
-                      ? "border-blue-500"
-                      : "border-zinc-600"
+                    selectedMode === "headless" ? "border-blue-500" : "border-zinc-600"
                   }`}
                 >
                   {selectedMode === "headless" && (
@@ -273,18 +263,14 @@ export function NewRunDialog({ open, onClose, onSuccess }: NewRunDialogProps) {
 
           {/* GUI Lock Warning */}
           {guiLockConflict && (
-            <div
-              className={`p-4 rounded-lg ${amberColors.bg} border ${amberColors.border}`}
-            >
+            <div className={`p-4 rounded-lg ${amberColors.bg} border ${amberColors.border}`}>
               <div className="flex items-start gap-3">
                 <AlertTriangle className={`w-5 h-5 ${amberColors.text} flex-shrink-0 mt-0.5`} />
                 <div className="flex-1">
-                  <p className={`text-sm font-medium ${amberColors.text}`}>
-                    GUI Lock Conflict
-                  </p>
+                  <p className={`text-sm font-medium ${amberColors.text}`}>GUI Lock Conflict</p>
                   <p className="text-sm text-zinc-400 mt-1">
-                    Another bridge currently holds the GUI lock. You can force-acquire
-                    the lock, which will interrupt the other run&apos;s GUI control.
+                    Another bridge currently holds the GUI lock. You can force-acquire the lock,
+                    which will interrupt the other run&apos;s GUI control.
                   </p>
                   {/* Force acquire checkbox */}
                   <label className="flex items-center gap-2 mt-3 cursor-pointer">
@@ -295,9 +281,7 @@ export function NewRunDialog({ open, onClose, onSuccess }: NewRunDialogProps) {
                       disabled={isLoading}
                       className="w-4 h-4 rounded border-zinc-600 bg-zinc-800 text-amber-500 focus:ring-amber-500/50"
                     />
-                    <span className="text-sm text-zinc-300">
-                      Force-acquire GUI lock
-                    </span>
+                    <span className="text-sm text-zinc-300">Force-acquire GUI lock</span>
                   </label>
                 </div>
               </div>

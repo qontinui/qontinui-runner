@@ -110,7 +110,7 @@ export function ActiveRunsBar({ onNewRun, onRunCreated }: ActiveRunsBarProps) {
           break;
       }
     },
-    [otherRuns, focusedIndex, selectRun, activeRuns]
+    [otherRuns, focusedIndex, selectRun, activeRuns],
   );
 
   /**
@@ -159,7 +159,9 @@ export function ActiveRunsBar({ onNewRun, onRunCreated }: ActiveRunsBarProps) {
       data-ui-id="active-runs-bar"
       role="listbox"
       aria-label="Active workflow runs"
-      aria-activedescendant={focusedIndex >= 0 ? `run-${otherRuns[focusedIndex]?.runId}` : undefined}
+      aria-activedescendant={
+        focusedIndex >= 0 ? `run-${otherRuns[focusedIndex]?.runId}` : undefined
+      }
       tabIndex={0}
       onKeyDown={handleKeyDown}
       onFocus={() => {

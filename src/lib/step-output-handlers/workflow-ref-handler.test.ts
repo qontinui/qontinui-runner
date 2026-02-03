@@ -141,9 +141,7 @@ describe("WorkflowRefHandler", () => {
         workflow_id: "wf_config",
         workflow_name: "Config Test",
         final_state: "done",
-        nested_outputs: [
-          { step_type: "check", step_name: "Check", success: true },
-        ],
+        nested_outputs: [{ step_type: "check", step_name: "Check", success: true }],
       });
 
       const config = workflowRefHandler.toTestConfig(output);

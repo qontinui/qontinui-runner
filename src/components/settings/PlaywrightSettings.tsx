@@ -97,7 +97,10 @@ export function PlaywrightSettings({ onLog }: PlaywrightSettingsProps) {
       />
 
       {/* Authentication Credentials */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-playwright-auth-section">
+      <div
+        className="space-y-4 rounded-lg bg-card/50 p-4"
+        data-ui-id="settings-playwright-auth-section"
+      >
         <h4 className="font-medium text-sm">Test Authentication</h4>
         <p className="text-xs text-muted-foreground">
           These credentials are passed to Playwright tests as environment variables
@@ -155,7 +158,10 @@ export function PlaywrightSettings({ onLog }: PlaywrightSettingsProps) {
       </div>
 
       {/* Environment Configuration */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-playwright-environment-section">
+      <div
+        className="space-y-4 rounded-lg bg-card/50 p-4"
+        data-ui-id="settings-playwright-environment-section"
+      >
         <h4 className="font-medium text-sm">Environment</h4>
 
         {/* Base URL */}

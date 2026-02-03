@@ -6,7 +6,15 @@
  */
 
 import { useState } from "react";
-import { Terminal, FolderOpen, Hash, ChevronRight, ChevronDown, Variable, FileCode } from "lucide-react";
+import {
+  Terminal,
+  FolderOpen,
+  Hash,
+  ChevronRight,
+  ChevronDown,
+  Variable,
+  FileCode,
+} from "lucide-react";
 import { cn } from "../../../../lib/utils";
 import { Badge, ScrollArea } from "../../../ui";
 import { StepStatsBar, StepStatusBadge, StepOutputPanel } from "../shared";
@@ -41,7 +49,7 @@ function extractParameters(command: string): string[] {
   const flagMatches = command.match(/(?:^|\s)(--?[a-zA-Z][\w-]*|\/[a-zA-Z][\w]*)/g);
   if (flagMatches) {
     // Take first few unique flags
-    const uniqueFlags = [...new Set(flagMatches.map(f => f.trim()))];
+    const uniqueFlags = [...new Set(flagMatches.map((f) => f.trim()))];
     params.push(...uniqueFlags.slice(0, 4));
   }
 
@@ -55,16 +63,22 @@ function hasTitle(command: ShellCommandExecution): boolean {
   if (!command.name) return false;
   // Name is meaningful if it's different from the command and not just the base command
   const baseCmd = extractBaseCommand(command.command);
-  return command.name !== command.command &&
-         command.name.toLowerCase() !== baseCmd.toLowerCase() &&
-         command.name.length > 0;
+  return (
+    command.name !== command.command &&
+    command.name.toLowerCase() !== baseCmd.toLowerCase() &&
+    command.name.length > 0
+  );
 }
 
 /**
  * Check if command used variable expansion (has template and resolved variables).
  */
 function hasVariables(command: ShellCommandExecution): boolean {
-  return Boolean(command.templateCommand && command.resolvedVariables && Object.keys(command.resolvedVariables).length > 0);
+  return Boolean(
+    command.templateCommand &&
+    command.resolvedVariables &&
+    Object.keys(command.resolvedVariables).length > 0,
+  );
 }
 
 /**
@@ -83,7 +97,9 @@ function InlineCommandDetail({ command }: { command: ShellCommandExecution }) {
           <div className="mb-2 pb-2 border-b border-border/30">
             <div className="flex items-center gap-2 mb-1">
               <FileCode className="h-3 w-3 text-muted-foreground flex-shrink-0" />
-              <span className="text-[10px] uppercase tracking-wide text-muted-foreground font-medium">Template</span>
+              <span className="text-[10px] uppercase tracking-wide text-muted-foreground font-medium">
+                Template
+              </span>
             </div>
             <code className="font-mono text-xs text-muted-foreground break-all whitespace-pre-wrap">
               {command.templateCommand}
@@ -96,7 +112,9 @@ function InlineCommandDetail({ command }: { command: ShellCommandExecution }) {
           <Terminal className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0 mt-0.5" />
           <div className="flex-1">
             {hasVars && (
-              <span className="text-[10px] uppercase tracking-wide text-muted-foreground font-medium mr-2">Resolved</span>
+              <span className="text-[10px] uppercase tracking-wide text-muted-foreground font-medium mr-2">
+                Resolved
+              </span>
             )}
             <code className="font-mono text-xs text-foreground break-all whitespace-pre-wrap">
               {command.command}
@@ -137,9 +155,7 @@ function InlineCommandDetail({ command }: { command: ShellCommandExecution }) {
                   {`{{${name}}}`}
                 </Badge>
                 <span className="text-xs text-muted-foreground">=</span>
-                <code className="font-mono text-xs text-foreground break-all">
-                  {value}
-                </code>
+                <code className="font-mono text-xs text-foreground break-all">{value}</code>
               </div>
             ))}
           </div>
@@ -172,7 +188,9 @@ function InlineCommandDetail({ command }: { command: ShellCommandExecution }) {
           <div className="text-center text-muted-foreground text-xs py-4">No output captured</div>
         )}
         {command.status === "running" && (
-          <div className="text-center text-muted-foreground text-xs py-4">Command is running...</div>
+          <div className="text-center text-muted-foreground text-xs py-4">
+            Command is running...
+          </div>
         )}
       </div>
     </div>
@@ -218,11 +236,7 @@ function CommandRow({
       >
         {/* Expand/collapse indicator */}
         <div className="flex-shrink-0 mt-0.5 text-muted-foreground">
-          {isExpanded ? (
-            <ChevronDown className="h-4 w-4" />
-          ) : (
-            <ChevronRight className="h-4 w-4" />
-          )}
+          {isExpanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
         </div>
 
         {/* Status icon */}
@@ -270,11 +284,7 @@ function CommandRow({
           {parameters.length > 0 && (
             <div className="flex flex-wrap gap-1 mt-1">
               {parameters.map((param, idx) => (
-                <Badge
-                  key={idx}
-                  variant="muted"
-                  className="text-[10px] font-mono px-1.5 py-0"
-                >
+                <Badge key={idx} variant="muted" className="text-[10px] font-mono px-1.5 py-0">
                   {param}
                 </Badge>
               ))}

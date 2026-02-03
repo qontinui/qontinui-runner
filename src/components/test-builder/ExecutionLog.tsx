@@ -6,14 +6,7 @@
  */
 
 import { useState } from "react";
-import {
-  Check,
-  X,
-  ChevronDown,
-  ChevronRight,
-  Clock,
-  Variable,
-} from "lucide-react";
+import { Check, X, ChevronDown, ChevronRight, Clock, Variable } from "lucide-react";
 import type {
   OrchestrationExecutionResult,
   StepExecutionResult,
@@ -25,7 +18,7 @@ interface ExecutionLogProps {
 
 export function ExecutionLog({ result }: ExecutionLogProps) {
   const [expandedSteps, setExpandedSteps] = useState<Set<number>>(
-    new Set(result.failed_at_step !== undefined ? [result.failed_at_step] : [])
+    new Set(result.failed_at_step !== undefined ? [result.failed_at_step] : []),
   );
 
   const toggleStep = (index: number) => {
@@ -64,9 +57,7 @@ export function ExecutionLog({ result }: ExecutionLogProps) {
           ) : (
             <X className="w-5 h-5 text-red-400" />
           )}
-          <span
-            className={`font-medium ${result.success ? "text-green-400" : "text-red-400"}`}
-          >
+          <span className={`font-medium ${result.success ? "text-green-400" : "text-red-400"}`}>
             {result.success ? "Execution Successful" : "Execution Failed"}
           </span>
         </div>
@@ -76,8 +67,8 @@ export function ExecutionLog({ result }: ExecutionLogProps) {
             {result.total_duration_ms}ms
           </span>
           <span>
-            {result.step_results.filter((s) => s.success).length}/
-            {result.step_results.length} steps passed
+            {result.step_results.filter((s) => s.success).length}/{result.step_results.length} steps
+            passed
           </span>
         </div>
       </div>
@@ -109,15 +100,10 @@ export function ExecutionLog({ result }: ExecutionLogProps) {
           </div>
           <div className="flex flex-wrap gap-2">
             {Object.entries(result.all_variables).map(([name, value]) => (
-              <div
-                key={name}
-                className="px-2 py-1 bg-neutral-800 rounded text-xs font-mono"
-              >
+              <div key={name} className="px-2 py-1 bg-neutral-800 rounded text-xs font-mono">
                 <span className="text-purple-400">{name}</span>
                 <span className="text-neutral-500"> = </span>
-                <span className="text-neutral-300">
-                  {formatValue(value, 50)}
-                </span>
+                <span className="text-neutral-300">{formatValue(value, 50)}</span>
               </div>
             ))}
           </div>
@@ -208,15 +194,11 @@ function StepResult({ step, isExpanded, onToggle }: StepResultProps) {
 
           {/* Request details */}
           <div className="space-y-2">
-            <div className="text-xs font-medium text-neutral-400 uppercase">
-              Request
-            </div>
+            <div className="text-xs font-medium text-neutral-400 uppercase">Request</div>
             <div className="p-2 bg-neutral-950 rounded">
               <div className="flex items-center gap-2 text-sm">
                 <MethodBadge method={step.request.method} />
-                <code className="text-neutral-300 break-all">
-                  {step.request.url}
-                </code>
+                <code className="text-neutral-300 break-all">{step.request.url}</code>
               </div>
               {step.request.body && (
                 <div className="mt-2">
@@ -233,9 +215,7 @@ function StepResult({ step, isExpanded, onToggle }: StepResultProps) {
           <div className="space-y-2">
             <div className="text-xs font-medium text-neutral-400 uppercase flex items-center gap-2">
               Response
-              <span className="text-neutral-500">
-                ({step.response.size_bytes} bytes)
-              </span>
+              <span className="text-neutral-500">({step.response.size_bytes} bytes)</span>
             </div>
             <div className="p-2 bg-neutral-950 rounded">
               <pre className="text-xs text-neutral-400 overflow-auto max-h-48">
@@ -259,9 +239,7 @@ function StepResult({ step, isExpanded, onToggle }: StepResultProps) {
                   >
                     <span className="text-purple-400 shrink-0">{name}</span>
                     <span className="text-neutral-500">=</span>
-                    <span className="text-neutral-300 break-all">
-                      {formatValue(value, 200)}
-                    </span>
+                    <span className="text-neutral-300 break-all">{formatValue(value, 200)}</span>
                   </div>
                 ))}
               </div>
@@ -286,11 +264,7 @@ function StatusBadge({ code }: { code: number }) {
     color = "bg-red-900/50 text-red-400";
   }
 
-  return (
-    <span className={`px-1.5 py-0.5 text-xs font-mono rounded ${color}`}>
-      {code}
-    </span>
-  );
+  return <span className={`px-1.5 py-0.5 text-xs font-mono rounded ${color}`}>{code}</span>;
 }
 
 /**

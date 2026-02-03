@@ -70,6 +70,10 @@ export type {
   ExtractedState,
   ExtractionSession,
   BoundingBox,
+  // Auto-exploration progress types
+  ExplorationPhase,
+  CurrentElementInfo,
+  ExplorationProgress,
 } from "./extraction";
 
 // Playwright script types

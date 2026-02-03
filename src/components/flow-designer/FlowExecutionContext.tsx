@@ -116,7 +116,12 @@ export function FlowExecutionProvider({ children, flowIdFilter }: FlowExecutionP
 
       // If filtering by flow ID and this event doesn't match, ignore
       // (but allow flow_started events through to potentially start tracking)
-      if (flowIdFilter && data.flow_id && data.flow_id !== flowIdFilter && data.type !== "flow_started") {
+      if (
+        flowIdFilter &&
+        data.flow_id &&
+        data.flow_id !== flowIdFilter &&
+        data.type !== "flow_started"
+      ) {
         return;
       }
 
@@ -211,14 +216,19 @@ export function FlowExecutionProvider({ children, flowIdFilter }: FlowExecutionP
       flowError,
       reset,
     }),
-    [isExecuting, currentFlowId, instanceId, currentStepId, stepStatuses, getStepStatus, flowSuccess, flowError]
+    [
+      isExecuting,
+      currentFlowId,
+      instanceId,
+      currentStepId,
+      stepStatuses,
+      getStepStatus,
+      flowSuccess,
+      flowError,
+    ],
   );
 
-  return (
-    <FlowExecutionContext.Provider value={value}>
-      {children}
-    </FlowExecutionContext.Provider>
-  );
+  return <FlowExecutionContext.Provider value={value}>{children}</FlowExecutionContext.Provider>;
 }
 
 /**

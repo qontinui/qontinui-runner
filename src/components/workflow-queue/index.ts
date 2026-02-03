@@ -9,4 +9,9 @@ export { WorkflowLibraryPanel } from "./WorkflowLibraryPanel";
 export { WorkflowQueuePanel } from "./WorkflowQueuePanel";
 export { WorkflowLibraryCard } from "./WorkflowLibraryCard";
 export { WorkflowQueueItem } from "./WorkflowQueueItem";
-export type { WorkflowWithStats, QueuedWorkflow, WorkflowStats, QueueExecutionOptions } from "./types";
+export type {
+  WorkflowWithStats,
+  QueuedWorkflow,
+  WorkflowStats,
+  QueueExecutionOptions,
+} from "./types";

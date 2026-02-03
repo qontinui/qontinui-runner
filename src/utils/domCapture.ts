@@ -254,7 +254,7 @@ function getUniqueSelector(element: Element): string {
 
   if (classes && element.parentElement) {
     const siblings = Array.from(element.parentElement.children).filter(
-      (el) => el.tagName === element.tagName
+      (el) => el.tagName === element.tagName,
     );
     if (siblings.length === 1) {
       return `${tag}${classes}`;
@@ -315,7 +315,7 @@ function getDirectText(element: Element): string | null {
 function captureElement(
   element: Element,
   depth: number,
-  config: CaptureConfig
+  config: CaptureConfig,
 ): ElementSnapshot | null {
   // Check exclusions
   for (const selector of config.excludeSelectors) {
@@ -404,10 +404,7 @@ function captureElement(
 
   // Capture relevant attributes
   for (const attr of element.attributes) {
-    if (
-      ["class", "style"].includes(attr.name) ||
-      attr.name.startsWith("data-")
-    ) {
+    if (["class", "style"].includes(attr.name) || attr.name.startsWith("data-")) {
       continue; // Skip these, captured elsewhere
     }
     snapshot.attributes[attr.name] = attr.value;
@@ -465,7 +462,7 @@ function captureElement(
 export function captureDOMSnapshot(
   config: Partial<CaptureConfig> = {},
   activeTab: string | null = null,
-  captureType: DOMSnapshot["captureType"] = "manual"
+  captureType: DOMSnapshot["captureType"] = "manual",
 ): DOMSnapshot {
   const startTime = performance.now();
   const fullConfig = { ...DEFAULT_CONFIG, ...config };

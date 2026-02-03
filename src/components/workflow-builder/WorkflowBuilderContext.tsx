@@ -327,11 +327,7 @@ function workflowBuilderReducer(
         if (direction === "down") {
           const index = steps.findIndex((s) => s.id === stepId);
           const nextStep = steps[index + 1];
-          if (
-            nextStep &&
-            nextStep.type === "prompt" &&
-            (nextStep as PromptStep).is_summary_step
-          ) {
+          if (nextStep && nextStep.type === "prompt" && (nextStep as PromptStep).is_summary_step) {
             return state;
           }
         }
@@ -802,32 +798,29 @@ export function WorkflowBuilderProvider({
   }, []);
 
   // Export a workflow by ID
-  const exportWorkflow = useCallback(
-    async (id: string): Promise<WorkflowExport | null> => {
-      dispatch({ type: "SET_LOADING", payload: true });
-      dispatch({ type: "SET_ERROR", payload: null });
+  const exportWorkflow = useCallback(async (id: string): Promise<WorkflowExport | null> => {
+    dispatch({ type: "SET_LOADING", payload: true });
+    dispatch({ type: "SET_ERROR", payload: null });
 
-      try {
-        const response = await fetch(`${API_BASE}/unified-workflows/${id}/export`);
-        const data = await response.json();
+    try {
+      const response = await fetch(`${API_BASE}/unified-workflows/${id}/export`);
+      const data = await response.json();
 
-        if (data.success && data.data) {
-          dispatch({ type: "SET_LOADING", payload: false });
-          return data.data as WorkflowExport;
-        } else {
-          dispatch({ type: "SET_ERROR", payload: data.error || "Failed to export workflow" });
-          dispatch({ type: "SET_LOADING", payload: false });
-          return null;
-        }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "Failed to export workflow";
-        dispatch({ type: "SET_ERROR", payload: message });
+      if (data.success && data.data) {
+        dispatch({ type: "SET_LOADING", payload: false });
+        return data.data as WorkflowExport;
+      } else {
+        dispatch({ type: "SET_ERROR", payload: data.error || "Failed to export workflow" });
         dispatch({ type: "SET_LOADING", payload: false });
         return null;
       }
-    },
-    [],
-  );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to export workflow";
+      dispatch({ type: "SET_ERROR", payload: message });
+      dispatch({ type: "SET_LOADING", payload: false });
+      return null;
+    }
+  }, []);
 
   // Import a workflow
   const importWorkflow = useCallback(

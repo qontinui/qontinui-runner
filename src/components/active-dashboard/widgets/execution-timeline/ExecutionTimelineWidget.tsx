@@ -32,11 +32,20 @@ import {
 } from "lucide-react";
 import { cn } from "../../../../lib/utils";
 import { Badge, ScrollArea } from "../../../ui";
-import { StepStatusBadge } from "../shared";
+import { StepStatusBadge, StepProgressMarker } from "../shared";
 import { TimelineStatsBar } from "./TimelineStatsBar";
 import { getAccentColors, getStatusColors } from "@/design-system";
-import { WORKFLOW_STAGE_CONFIG, type WorkflowStage } from "../../../../types/dashboard/activity-types";
-import type { ExecutionTimelineWidgetProps, TimelineStep, PhaseGroup, IterationGroup, StepType } from "./types";
+import {
+  WORKFLOW_STAGE_CONFIG,
+  type WorkflowStage,
+} from "../../../../types/dashboard/activity-types";
+import type {
+  ExecutionTimelineWidgetProps,
+  TimelineStep,
+  PhaseGroup,
+  IterationGroup,
+  StepType,
+} from "./types";
 
 /**
  * Get icon component for step type.
@@ -122,8 +131,15 @@ function formatDuration(ms: number | undefined): string {
 
 /**
  * Individual step row component.
+ * Shows step progress bar for running steps or completed steps with progress data.
  */
-function StepRow({ step }: { step: TimelineStep }) {
+function StepRow({
+  step,
+  taskRunId,
+}: {
+  step: TimelineStep;
+  taskRunId: string | null;
+}) {
   const Icon = getStepIcon(step.type);
   const accentColor = getStepAccentColor(step.type);
   const colors = getAccentColors(accentColor as Parameters<typeof getAccentColors>[0]);
@@ -131,51 +147,77 @@ function StepRow({ step }: { step: TimelineStep }) {
   const isActive = step.status === "running";
   const pendingColors = getStatusColors("pending");
 
+  // Show progress for running steps or completed steps that have progress data
+  const showProgress = isActive && step.checkpointId && taskRunId;
+  // Show inline progress for completed steps that had progress
+  const showCompletedProgress = !isActive && step.progress && step.progress.total !== null;
+
   return (
     <div
       className={cn(
-        "flex items-center gap-3 px-3 py-2 border-l-2 transition-colors",
+        "border-l-2 transition-colors",
         isActive
           ? cn(pendingColors.border, pendingColors.bg)
           : "border-transparent hover:bg-muted/30",
       )}
     >
-      {/* Status indicator */}
-      <StepStatusBadge status={step.status} iconOnly size="sm" />
+      {/* Main step row */}
+      <div className="flex items-center gap-3 px-3 py-2">
+        {/* Status indicator */}
+        <StepStatusBadge status={step.status} iconOnly size="sm" />
 
-      {/* Step type badge */}
-      <Badge
-        className={cn(
-          "text-[10px] flex-shrink-0 font-mono border",
-          colors.bg,
-          colors.text,
-          colors.border,
+        {/* Step type badge */}
+        <Badge
+          className={cn(
+            "text-[10px] flex-shrink-0 font-mono border",
+            colors.bg,
+            colors.text,
+            colors.border,
+          )}
+        >
+          <Icon className="h-2.5 w-2.5 mr-1" />
+          {step.type}
+        </Badge>
+
+        {/* Step name */}
+        <span className="flex-1 text-sm truncate text-foreground">{step.name}</span>
+
+        {/* Completed progress summary */}
+        {showCompletedProgress && step.progress && (
+          <span className="text-xs text-muted-foreground tabular-nums">
+            {step.progress.current}/{step.progress.total}
+          </span>
         )}
-      >
-        <Icon className="h-2.5 w-2.5 mr-1" />
-        {step.type}
-      </Badge>
 
-      {/* Step name */}
-      <span className="flex-1 text-sm truncate text-foreground">{step.name}</span>
+        {/* Duration */}
+        {step.durationMs !== undefined && (
+          <span className="text-xs text-muted-foreground font-mono">
+            {formatDuration(step.durationMs)}
+          </span>
+        )}
 
-      {/* Duration */}
-      {step.durationMs !== undefined && (
-        <span className="text-xs text-muted-foreground font-mono">
-          {formatDuration(step.durationMs)}
-        </span>
-      )}
+        {/* Running indicator */}
+        {isActive && <Loader2 className={cn("h-3.5 w-3.5 animate-spin", pendingColors.text)} />}
 
-      {/* Running indicator */}
-      {isActive && (
-        <Loader2 className={cn("h-3.5 w-3.5 animate-spin", pendingColors.text)} />
-      )}
+        {/* Error indicator */}
+        {step.error && (
+          <span title={step.error}>
+            <AlertCircle className={cn("h-3.5 w-3.5", errorColors.text)} />
+          </span>
+        )}
+      </div>
 
-      {/* Error indicator */}
-      {step.error && (
-        <span title={step.error}>
-          <AlertCircle className={cn("h-3.5 w-3.5", errorColors.text)} />
-        </span>
+      {/* Progress bar for running steps */}
+      {showProgress && taskRunId && step.checkpointId && (
+        <div className="px-3 pb-2 pl-10">
+          <StepProgressMarker
+            taskRunId={taskRunId}
+            checkpointId={step.checkpointId}
+            autoRefresh={isActive}
+            compact
+            size="xs"
+          />
+        </div>
       )}
     </div>
   );
@@ -189,11 +231,13 @@ function IterationSection({
   phaseColor,
   phase,
   defaultExpanded = true,
+  taskRunId,
 }: {
   iterationGroup: IterationGroup;
   phaseColor: string;
   phase: WorkflowStage;
   defaultExpanded?: boolean;
+  taskRunId: string | null;
 }) {
   const [expanded, setExpanded] = useState(defaultExpanded);
   const colors = getAccentColors(phaseColor as Parameters<typeof getAccentColors>[0]);
@@ -259,7 +303,7 @@ function IterationSection({
       {expanded && (
         <div className="bg-muted/5">
           {iterationGroup.steps.map((step) => (
-            <StepRow key={step.id} step={step} />
+            <StepRow key={step.id} step={step} taskRunId={taskRunId} />
           ))}
         </div>
       )}
@@ -275,11 +319,13 @@ function PhaseSection({
   defaultExpanded = true,
   expandedIterations,
   onIterationToggle: _onIterationToggle,
+  taskRunId,
 }: {
   group: PhaseGroup;
   defaultExpanded?: boolean;
   expandedIterations: Set<string>;
   onIterationToggle: (key: string, expanded: boolean) => void;
+  taskRunId: string | null;
 }) {
   const [expanded, setExpanded] = useState(defaultExpanded || group.isActive);
   const config = WORKFLOW_STAGE_CONFIG[group.phase];
@@ -323,13 +369,14 @@ function PhaseSection({
         </Badge>
 
         {/* Running indicator */}
-        {group.isActive && (
-          <Loader2 className={cn("h-3.5 w-3.5 animate-spin", colors.text)} />
-        )}
+        {group.isActive && <Loader2 className={cn("h-3.5 w-3.5 animate-spin", colors.text)} />}
 
         {/* Iteration count for phases with iterations */}
         {group.hasIterations && group.iterationGroups.length > 0 && (
-          <Badge variant="muted" className="text-[10px] px-1.5 py-0 h-5 gap-1 text-muted-foreground">
+          <Badge
+            variant="muted"
+            className="text-[10px] px-1.5 py-0 h-5 gap-1 text-muted-foreground"
+          >
             <RotateCcw className="h-2.5 w-2.5" />
             {group.iterationGroups.length} iteration{group.iterationGroups.length !== 1 ? "s" : ""}
           </Badge>
@@ -362,7 +409,7 @@ function PhaseSection({
             // Flat list for phases without iterations
             <>
               {group.steps.map((step) => (
-                <StepRow key={step.id} step={step} />
+                <StepRow key={step.id} step={step} taskRunId={taskRunId} />
               ))}
               {group.steps.length === 0 && (
                 <div className="px-4 py-3 text-sm text-muted-foreground text-center">
@@ -383,6 +430,7 @@ function PhaseSection({
                     phaseColor={config.color}
                     phase={group.phase}
                     defaultExpanded={isIterExpanded}
+                    taskRunId={taskRunId}
                   />
                 );
               })}
@@ -402,7 +450,7 @@ export function ExecutionTimelineWidget({
   data,
   className,
 }: ExecutionTimelineWidgetProps) {
-  const { phaseGroups, stats, isLoading, workflowName, currentPhase } = data;
+  const { phaseGroups, stats, stepStats, isLoading, workflowName, currentPhase, taskRunId } = data;
 
   // Track which iterations are expanded
   // By default, only the current/latest iteration in each phase is expanded
@@ -437,8 +485,8 @@ export function ExecutionTimelineWidget({
             }
           }
           // If nothing was expanded, expand the latest
-          const phaseHasExpanded = group.iterationGroups.some(
-            (g) => newExpandedSet.has(`${group.phase}-${g.iteration}`)
+          const phaseHasExpanded = group.iterationGroups.some((g) =>
+            newExpandedSet.has(`${group.phase}-${g.iteration}`),
           );
           if (!phaseHasExpanded) {
             newExpandedSet.add(`${group.phase}-${maxIteration}`);
@@ -479,8 +527,8 @@ export function ExecutionTimelineWidget({
 
   return (
     <div className={cn("flex flex-col h-full overflow-hidden", className)}>
-      {/* Stats Bar */}
-      <TimelineStatsBar stats={stats} />
+      {/* Stats Bar with overall workflow progress */}
+      <TimelineStatsBar stats={stats} stepStats={stepStats} />
 
       {/* Workflow name header */}
       {workflowName && (
@@ -507,6 +555,7 @@ export function ExecutionTimelineWidget({
               defaultExpanded={group.isActive || group.steps.length < 10}
               expandedIterations={expandedIterations}
               onIterationToggle={handleIterationToggle}
+              taskRunId={taskRunId}
             />
           ))}
           {phaseGroups.length === 0 && (

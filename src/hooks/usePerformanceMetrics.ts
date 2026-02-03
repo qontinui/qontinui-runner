@@ -25,8 +25,7 @@ export const performanceMetricsKeys = {
     [...performanceMetricsKeys.all, "actions", configId, timeRange] as const,
   transitions: (configId: string) =>
     [...performanceMetricsKeys.all, "transitions", configId] as const,
-  elements: (configId: string) =>
-    [...performanceMetricsKeys.all, "elements", configId] as const,
+  elements: (configId: string) => [...performanceMetricsKeys.all, "elements", configId] as const,
   successTrend: (configId: string, timeRange?: TimeRange) =>
     [...performanceMetricsKeys.all, "success-trend", configId, timeRange] as const,
 };

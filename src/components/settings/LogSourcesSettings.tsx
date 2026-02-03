@@ -306,7 +306,10 @@ export function LogSourcesSettings({ onLog }: LogSourcesSettingsProps) {
       </div>
 
       {/* AI Selection Mode */}
-      <div className="rounded-lg bg-card/50 p-4" data-ui-id="settings-logsources-ai-selection-section">
+      <div
+        className="rounded-lg bg-card/50 p-4"
+        data-ui-id="settings-logsources-ai-selection-section"
+      >
         <button
           onClick={() => toggleSection("aiSettings")}
           className="flex items-center gap-2 w-full text-left"
@@ -493,7 +496,9 @@ export function LogSourcesSettings({ onLog }: LogSourcesSettingsProps) {
             if (editingProfile) {
               updateProfile(profile as GlobalLogSourceProfile);
             } else {
-              addProfile(profile as Omit<GlobalLogSourceProfile, "id" | "created_at" | "updated_at">);
+              addProfile(
+                profile as Omit<GlobalLogSourceProfile, "id" | "created_at" | "updated_at">,
+              );
             }
           }}
           onCancel={() => {
@@ -777,7 +782,10 @@ function SourceEditor({
                 className="flex-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
                 data-ui-id="settings-logsources-source-path-input"
               />
-              <button className="p-2 bg-muted/50 hover:bg-muted rounded-md" data-ui-id="settings-logsources-source-path-browse-btn">
+              <button
+                className="p-2 bg-muted/50 hover:bg-muted rounded-md"
+                data-ui-id="settings-logsources-source-path-browse-btn"
+              >
                 <FolderOpen className="w-4 h-4" />
               </button>
             </div>
@@ -972,7 +980,11 @@ function SourceEditor({
         </div>
 
         <div className="flex justify-end gap-2 pt-2">
-          <button onClick={onCancel} className="px-3 py-1.5 text-sm hover:bg-muted rounded-md" data-ui-id="settings-logsources-source-cancel-btn">
+          <button
+            onClick={onCancel}
+            className="px-3 py-1.5 text-sm hover:bg-muted rounded-md"
+            data-ui-id="settings-logsources-source-cancel-btn"
+          >
             Cancel
           </button>
           <button
@@ -1114,7 +1126,11 @@ function ProfileEditor({
         </div>
 
         <div className="flex justify-end gap-2 pt-2">
-          <button onClick={onCancel} className="px-3 py-1.5 text-sm hover:bg-muted rounded-md" data-ui-id="settings-logsources-profile-cancel-btn">
+          <button
+            onClick={onCancel}
+            className="px-3 py-1.5 text-sm hover:bg-muted rounded-md"
+            data-ui-id="settings-logsources-profile-cancel-btn"
+          >
             Cancel
           </button>
           <button

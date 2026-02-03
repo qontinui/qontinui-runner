@@ -3,12 +3,12 @@
  *
  * Compact summary view for the execution timeline widget.
  * Shows current phase, step count, and progress indicator.
+ * Progress bar is wrapped with error boundary to prevent crashes.
  */
 
 import { Loader2, CheckCircle2, XCircle, Clock } from "lucide-react";
 import { cn } from "../../../../lib/utils";
-import { Badge } from "../../../ui";
-import { StepStatsBar } from "../shared";
+import { Badge, ProgressBar, ProgressErrorBoundary } from "../../../ui";
 import { getAccentColors, getStatusColors } from "@/design-system";
 import { WORKFLOW_STAGE_CONFIG } from "../../../../types/dashboard/activity-types";
 import type { ExecutionTimelineSummaryProps } from "./types";
@@ -76,22 +76,44 @@ export function ExecutionTimelineSummary({ data, className }: ExecutionTimelineS
     );
   }
 
+  // Determine overall progress status
+  const getProgressStatus = () => {
+    if (stepStats.failed > 0) return "error";
+    if (stepStats.completed === stepStats.total && stepStats.total > 0) return "success";
+    return "active";
+  };
+
   return (
     <div className={cn("space-y-2", className)}>
-      {/* Compact stats */}
-      <StepStatsBar stats={stepStats} compact />
+      {/* Overall progress bar */}
+      <ProgressErrorBoundary componentName="ExecutionTimelineSummary.ProgressBar">
+        <ProgressBar
+          current={stepStats.completed}
+          total={stepStats.total}
+          status={getProgressStatus()}
+          showLabel
+          labelFormat="count"
+          size="xs"
+        />
+      </ProgressErrorBoundary>
 
       {/* Current step indicator */}
       {currentStep && (
         <div className="flex items-center gap-2 text-xs">
-          <Loader2 className={cn(
-            "h-3 w-3 animate-spin",
-            currentStep.id === "_workflow_processing" ? "text-purple-500" : "text-blue-500"
-          )} />
-          <span className={cn(
-            "truncate",
-            currentStep.id === "_workflow_processing" ? "text-purple-500/70 italic" : "text-muted-foreground"
-          )}>
+          <Loader2
+            className={cn(
+              "h-3 w-3 animate-spin",
+              currentStep.id === "_workflow_processing" ? "text-purple-500" : "text-blue-500",
+            )}
+          />
+          <span
+            className={cn(
+              "truncate",
+              currentStep.id === "_workflow_processing"
+                ? "text-purple-500/70 italic"
+                : "text-muted-foreground",
+            )}
+          >
             {currentStep.name}
           </span>
         </div>

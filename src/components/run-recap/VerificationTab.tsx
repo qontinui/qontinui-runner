@@ -20,10 +20,7 @@ import {
   AlertCircle,
 } from "lucide-react";
 import { useTaskRunVerificationResults } from "../../hooks/useAiData";
-import type {
-  VerificationPhaseResult,
-  VerificationStepResult,
-} from "../../types/aiData";
+import type { VerificationPhaseResult, VerificationStepResult } from "../../types/aiData";
 
 interface VerificationTabProps {
   taskRunId: string;
@@ -101,9 +98,7 @@ function StepResultCard({
 
           <div className="text-left">
             <span className="font-medium">{step.step_name}</span>
-            <span className="text-xs text-muted-foreground ml-2">
-              ({step.step_type})
-            </span>
+            <span className="text-xs text-muted-foreground ml-2">({step.step_type})</span>
           </div>
         </div>
 
@@ -202,10 +197,7 @@ function IterationCard({
   };
 
   return (
-    <div
-      data-ui-id={`verification-iteration-${result.iteration}`}
-      className="card overflow-hidden"
-    >
+    <div data-ui-id={`verification-iteration-${result.iteration}`} className="card overflow-hidden">
       <button
         onClick={() => setIsExpanded(!isExpanded)}
         className="w-full px-4 py-3 flex items-center justify-between hover:bg-muted/50 transition-colors"
@@ -304,8 +296,8 @@ export function VerificationTab({ taskRunId }: VerificationTabProps) {
           <FlaskConical className="w-12 h-12 mx-auto mb-4 text-muted-foreground opacity-50" />
           <h3 className="font-medium text-lg mb-2">No Verification Results</h3>
           <p className="text-sm text-muted-foreground max-w-md mx-auto">
-            No verification steps have been executed for this run. Verification steps
-            include tests, checks, and other validation tasks defined in your workflow.
+            No verification steps have been executed for this run. Verification steps include tests,
+            checks, and other validation tasks defined in your workflow.
           </p>
         </div>
       </div>

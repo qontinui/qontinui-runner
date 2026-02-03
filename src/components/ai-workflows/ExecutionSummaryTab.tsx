@@ -459,7 +459,8 @@ export function ExecutionSummaryTab() {
                     <XCircle className="w-3 h-3" />
                   )}
                   <span>
-                    #{iter.iteration}: {iter.passed_checks}/{iter.passed_checks + iter.failed_checks}
+                    #{iter.iteration}: {iter.passed_checks}/
+                    {iter.passed_checks + iter.failed_checks}
                   </span>
                   {iter.agentic_phase_ran && (
                     <span className="opacity-75">

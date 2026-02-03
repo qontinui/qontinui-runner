@@ -78,12 +78,7 @@ export {
 } from "./workflow-ref";
 
 // MCP Call
-export {
-  McpCallWidget,
-  McpCallSummary,
-  useMcpCallData,
-  type McpCallData,
-} from "./mcp-call";
+export { McpCallWidget, McpCallSummary, useMcpCallData, type McpCallData } from "./mcp-call";
 
 // Execution Timeline
 export {

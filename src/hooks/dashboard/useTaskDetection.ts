@@ -134,7 +134,14 @@ function parseExecutionSteps(stepsJson?: string): DetectedStepTypes {
     ];
 
     // Shell command step types
-    const shellCommandStepTypes = ["shell_command", "shell", "command", "cmd", "bash", "powershell"];
+    const shellCommandStepTypes = [
+      "shell_command",
+      "shell",
+      "command",
+      "cmd",
+      "bash",
+      "powershell",
+    ];
 
     // AI/Prompt step types (for detecting AI activity from execution steps)
     const aiStepTypes = ["prompt", "ai_task", "ai", "agentic", "llm"];

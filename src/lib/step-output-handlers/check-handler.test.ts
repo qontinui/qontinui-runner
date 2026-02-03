@@ -31,7 +31,8 @@ describe("CheckHandler", () => {
     it("should handle alternative field names", () => {
       const raw = {
         check_type: "validation",
-        errors: [ // alternative to issues
+        errors: [
+          // alternative to issues
           { severity: "error", message: "Invalid input" },
         ],
         passed: 10, // alternative to checks_passed
@@ -176,9 +177,7 @@ describe("CheckHandler", () => {
     it("should generate config from check output", () => {
       const output = checkHandler.parseOutput({
         check_type: "accessibility",
-        issues: [
-          { severity: "warning", message: "Known issue" },
-        ],
+        issues: [{ severity: "warning", message: "Known issue" }],
         checks_passed: 9,
         checks_failed: 1,
       });

@@ -5,11 +5,7 @@
  * Projects reference global log sources — no embedded source types needed.
  */
 
-import type {
-  ProjectLogConfig,
-  LogSourceContent,
-  ProjectLogsState,
-} from "../../types/projectLogs";
+import type { ProjectLogConfig, LogSourceContent, ProjectLogsState } from "../../types/projectLogs";
 
 // Re-export domain types for convenience
 export type { ProjectLogConfig, LogSourceContent, ProjectLogsState };

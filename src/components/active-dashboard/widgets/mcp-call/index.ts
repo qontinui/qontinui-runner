@@ -8,4 +8,9 @@
 export { McpCallWidget } from "./McpCallWidget";
 export { McpCallSummary } from "./McpCallSummary";
 export { useMcpCallData } from "./useMcpCallData";
-export type { McpCallData, McpCallWidgetProps, McpCallSummaryProps, McpCallExecution } from "./types";
+export type {
+  McpCallData,
+  McpCallWidgetProps,
+  McpCallSummaryProps,
+  McpCallExecution,
+} from "./types";

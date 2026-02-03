@@ -8,11 +8,7 @@
 
 import { useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import {
-  workflowGeneratorService,
-  type GeneratorConfig,
-  type GeneratorOptions,
-} from "../services";
+import { workflowGeneratorService, type GeneratorConfig, type GeneratorOptions } from "../services";
 import type { UnifiedWorkflow } from "../types/unified-workflow";
 
 // =============================================================================
@@ -242,18 +238,14 @@ export function useWorkflowGenerator(): UseWorkflowGeneratorReturn {
         }
 
         // Generate the workflow
-        const workflow = workflowGeneratorService.generateFromStateMachine(
-          generatorConfig,
-          {
-            workflowName:
-              options.workflowName ??
-              `${rustConfig.metadata.name || "State Machine"} Verification`,
-            workflowDescription:
-              options.workflowDescription ??
-              `Auto-generated workflow to verify states in ${rustConfig.metadata.name || "the loaded configuration"}`,
-            ...options,
-          },
-        );
+        const workflow = workflowGeneratorService.generateFromStateMachine(generatorConfig, {
+          workflowName:
+            options.workflowName ?? `${rustConfig.metadata.name || "State Machine"} Verification`,
+          workflowDescription:
+            options.workflowDescription ??
+            `Auto-generated workflow to verify states in ${rustConfig.metadata.name || "the loaded configuration"}`,
+          ...options,
+        });
 
         setHasConfig(true);
         return { success: true, workflow };

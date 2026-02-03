@@ -17,6 +17,9 @@ import {
   type RawHookExecutionEvent,
   type RawHookStartedEvent,
   type RawStatusChangeEvent,
+  type RawSubStepCompleteEvent,
+  type RawSubStepStartedEvent,
+  type SubStepInfo,
   type RoutingDecision,
   type RetryAttempt,
   type RetryState,
@@ -27,12 +30,17 @@ import {
 } from "../types/executionStatus";
 
 const EVENT_CHANNEL = "execution-status";
+const SUB_STEP_COMPLETE_CHANNEL = "sub_step_complete";
+const SUB_STEP_STARTED_CHANNEL = "sub_step_started";
 
 /** Maximum number of hook execution results to keep in history */
 const MAX_HOOK_HISTORY = 50;
 
 /** Maximum number of retry attempts to keep in history */
 const MAX_RETRY_HISTORY = 10;
+
+/** Maximum number of sub-steps to keep in history */
+const MAX_SUB_STEP_HISTORY = 100;
 
 export interface UseExecutionStatusReturn {
   /** Current execution status */
@@ -79,7 +87,14 @@ export function useExecutionStatus(): UseExecutionStatusReturn {
 
   // Handle retry attempt event
   const handleRetryAttempt = useCallback((event: RawRetryAttemptEvent) => {
-    const { task_run_id, timestamp, attempt: _attempt, state, exhausted, next_retry_delay_ms } = event;
+    const {
+      task_run_id,
+      timestamp,
+      attempt: _attempt,
+      state,
+      exhausted,
+      next_retry_delay_ms,
+    } = event;
 
     const retryState: RetryState = {
       attempt: state.attempt,
@@ -234,6 +249,97 @@ export function useExecutionStatus(): UseExecutionStatusReturn {
     }));
   }, []);
 
+  // Handle sub-step started event
+  const handleSubStepStarted = useCallback((event: RawSubStepStartedEvent) => {
+    const newStep: SubStepInfo = {
+      id: event.sub_step_id,
+      parentId: event.checkpoint_id,
+      name: event.description || `Step ${event.sub_step_index + 1}`,
+      status: "running",
+      index: event.sub_step_index,
+      totalCount: event.total_sub_steps,
+      startedAt: event.timestamp,
+      completedAt: null,
+      durationMs: null,
+      phase: event.phase || undefined,
+    };
+
+    setStatus((prev) => {
+      // Check if this is a new batch
+      const isNewBatch =
+        prev.subSteps.totalCount !== event.total_sub_steps || event.sub_step_index === 0;
+
+      const existingSteps = isNewBatch ? [] : prev.subSteps.steps;
+      const updatedSteps = [...existingSteps];
+
+      // Update or add the step
+      const existingIndex = updatedSteps.findIndex((s) => s.id === event.sub_step_id);
+      if (existingIndex >= 0) {
+        updatedSteps[existingIndex] = newStep;
+      } else {
+        updatedSteps.push(newStep);
+      }
+
+      // Keep history limited
+      const limitedSteps = updatedSteps.slice(-MAX_SUB_STEP_HISTORY);
+      const completedCount = limitedSteps.filter((s) => s.status === "completed").length;
+      const progressPercent =
+        event.total_sub_steps > 0 ? (completedCount / event.total_sub_steps) * 100 : 0;
+
+      return {
+        ...prev,
+        taskRunId: event.task_run_id,
+        subSteps: {
+          current: newStep,
+          steps: limitedSteps,
+          progressPercent,
+          completedCount,
+          totalCount: event.total_sub_steps,
+          isActive: true,
+          currentPhase: event.phase || prev.subSteps.currentPhase,
+        },
+        lastUpdated: event.timestamp,
+      };
+    });
+  }, []);
+
+  // Handle sub-step complete event
+  const handleSubStepComplete = useCallback((event: RawSubStepCompleteEvent) => {
+    setStatus((prev) => {
+      const updatedSteps = prev.subSteps.steps.map((step) => {
+        if (step.id === event.sub_step_id) {
+          return {
+            ...step,
+            status: "completed" as const,
+            completedAt: event.timestamp,
+            durationMs: step.startedAt ? event.timestamp - step.startedAt : null,
+            name: event.description || step.name,
+          };
+        }
+        return step;
+      });
+
+      const completedCount = updatedSteps.filter((s) => s.status === "completed").length;
+      const progressPercent =
+        prev.subSteps.totalCount > 0 ? (completedCount / prev.subSteps.totalCount) * 100 : 0;
+      const allComplete = completedCount >= prev.subSteps.totalCount && prev.subSteps.totalCount > 0;
+
+      return {
+        ...prev,
+        taskRunId: event.task_run_id,
+        subSteps: {
+          ...prev.subSteps,
+          current: allComplete ? null : prev.subSteps.current,
+          steps: updatedSteps,
+          progressPercent,
+          completedCount,
+          isActive: !allComplete,
+        },
+        lastUpdated: event.timestamp,
+      };
+    });
+  }, []);
+
   // Process incoming events
   const processEvent = useCallback(
     (event: RawExecutionStatusEvent) => {
@@ -280,34 +386,65 @@ export function useExecutionStatus(): UseExecutionStatusReturn {
     ],
   );
 
+  // Store additional unlisten functions for sub-step events
+  const unlistenSubStepCompleteRef = useRef<UnlistenFn | null>(null);
+  const unlistenSubStepStartedRef = useRef<UnlistenFn | null>(null);
+
   // Subscribe to execution status events
   useEffect(() => {
     let isMounted = true;
 
-    const setupListener = async () => {
+    const setupListeners = async () => {
       try {
+        // Main execution status channel
         const unlisten = await listen<RawExecutionStatusEvent>(EVENT_CHANNEL, (event) => {
           if (isMounted) {
             processEvent(event.payload);
           }
         });
 
+        // Sub-step complete events
+        const unlistenSubStepComplete = await listen<RawSubStepCompleteEvent>(
+          SUB_STEP_COMPLETE_CHANNEL,
+          (event) => {
+            if (isMounted) {
+              handleSubStepComplete(event.payload);
+              setLastEventTime(event.payload.timestamp);
+            }
+          }
+        );
+
+        // Sub-step started events
+        const unlistenSubStepStarted = await listen<RawSubStepStartedEvent>(
+          SUB_STEP_STARTED_CHANNEL,
+          (event) => {
+            if (isMounted) {
+              handleSubStepStarted(event.payload);
+              setLastEventTime(event.payload.timestamp);
+            }
+          }
+        );
+
         if (isMounted) {
           unlistenRef.current = unlisten;
+          unlistenSubStepCompleteRef.current = unlistenSubStepComplete;
+          unlistenSubStepStartedRef.current = unlistenSubStepStarted;
           setIsConnected(true);
-          console.log("[useExecutionStatus] Connected to execution status events");
+          console.log("[useExecutionStatus] Connected to execution status events (including sub-steps)");
         } else {
           unlisten();
+          unlistenSubStepComplete();
+          unlistenSubStepStarted();
         }
       } catch (error) {
-        console.error("[useExecutionStatus] Failed to set up event listener:", error);
+        console.error("[useExecutionStatus] Failed to set up event listeners:", error);
         if (isMounted) {
           setIsConnected(false);
         }
       }
     };
 
-    setupListener();
+    setupListeners();
 
     return () => {
       isMounted = false;
@@ -315,9 +452,17 @@ export function useExecutionStatus(): UseExecutionStatusReturn {
         unlistenRef.current();
         unlistenRef.current = null;
       }
+      if (unlistenSubStepCompleteRef.current) {
+        unlistenSubStepCompleteRef.current();
+        unlistenSubStepCompleteRef.current = null;
+      }
+      if (unlistenSubStepStartedRef.current) {
+        unlistenSubStepStartedRef.current();
+        unlistenSubStepStartedRef.current = null;
+      }
       setIsConnected(false);
     };
-  }, [processEvent]);
+  }, [processEvent, handleSubStepComplete, handleSubStepStarted]);
 
   // Clear status
   const clearStatus = useCallback(() => {

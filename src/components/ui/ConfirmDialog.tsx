@@ -32,14 +32,17 @@ interface ConfirmDialogProps {
   onConfirm: () => void;
 }
 
-const variantStyles: Record<DialogVariant, {
-  headerBg: string;
-  iconColor: string;
-  titleColor: string;
-  buttonBg: string;
-  buttonHover: string;
-  Icon: typeof AlertTriangle | typeof Info;
-}> = {
+const variantStyles: Record<
+  DialogVariant,
+  {
+    headerBg: string;
+    iconColor: string;
+    titleColor: string;
+    buttonBg: string;
+    buttonHover: string;
+    Icon: typeof AlertTriangle | typeof Info;
+  }
+> = {
   warning: {
     headerBg: "bg-amber-500/10",
     iconColor: "text-amber-400",
@@ -86,10 +89,7 @@ export function ConfirmDialog({
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       {/* Backdrop */}
-      <div
-        className="absolute inset-0 bg-black/50"
-        onClick={isLoading ? undefined : onClose}
-      />
+      <div className="absolute inset-0 bg-black/50" onClick={isLoading ? undefined : onClose} />
 
       {/* Dialog */}
       <div
@@ -97,7 +97,9 @@ export function ConfirmDialog({
         className="relative bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl w-full max-w-md mx-4 overflow-hidden"
       >
         {/* Header */}
-        <div className={`flex items-center justify-between px-6 py-4 border-b border-zinc-700 ${styles.headerBg}`}>
+        <div
+          className={`flex items-center justify-between px-6 py-4 border-b border-zinc-700 ${styles.headerBg}`}
+        >
           <div className="flex items-center gap-2">
             <Icon className={`w-5 h-5 ${styles.iconColor}`} />
             <h3 className={`text-lg font-semibold ${styles.titleColor}`}>{title}</h3>
@@ -115,9 +117,7 @@ export function ConfirmDialog({
         {/* Content */}
         <div className="p-6 space-y-3">
           <p className="text-zinc-300">{message}</p>
-          {description && (
-            <p className="text-sm text-zinc-400">{description}</p>
-          )}
+          {description && <p className="text-sm text-zinc-400">{description}</p>}
         </div>
 
         {/* Footer */}

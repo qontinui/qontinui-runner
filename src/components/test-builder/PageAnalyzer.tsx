@@ -853,16 +853,10 @@ export function PageAnalyzer({ onAnalysisComplete, initialAnalyses }: PageAnalyz
                     <div className="space-y-3">
                       <div className="flex items-center gap-4 text-xs text-neutral-400">
                         <span className="font-mono">{analysis.data.step_type}</span>
-                        <span
-                          className={
-                            analysis.data.success ? "text-green-400" : "text-red-400"
-                          }
-                        >
+                        <span className={analysis.data.success ? "text-green-400" : "text-red-400"}>
                           {analysis.data.success ? "Success" : "Failed"}
                         </span>
-                        {analysis.data.duration_ms && (
-                          <span>{analysis.data.duration_ms}ms</span>
-                        )}
+                        {analysis.data.duration_ms && <span>{analysis.data.duration_ms}ms</span>}
                         <span>
                           Executed: {new Date(analysis.data.executed_at).toLocaleString()}
                         </span>

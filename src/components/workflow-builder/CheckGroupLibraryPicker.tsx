@@ -140,7 +140,8 @@ export function CheckGroupLibraryPicker({
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
       <div
         data-ui-id="dialog-check-group-library-picker"
-        className="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl w-[700px] max-w-[90vw] max-h-[80vh] flex flex-col">
+        className="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl w-[700px] max-w-[90vw] max-h-[80vh] flex flex-col"
+      >
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-neutral-700">
           <div>
@@ -236,9 +237,7 @@ export function CheckGroupLibraryPicker({
                           <Layers className="w-3 h-3" />
                           {checks.length} check{checks.length !== 1 ? "s" : ""}
                         </span>
-                        {group.run_in_parallel && (
-                          <span className="text-cyan-400">parallel</span>
-                        )}
+                        {group.run_in_parallel && <span className="text-cyan-400">parallel</span>}
                         {group.stop_on_failure && (
                           <span className="text-amber-400">stop on failure</span>
                         )}

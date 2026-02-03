@@ -207,7 +207,8 @@ export function McpServerToolPicker({
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
       <div
         data-ui-id="dialog-mcp-server-tool-picker"
-        className="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl w-[700px] max-w-[90vw] max-h-[80vh] flex flex-col">
+        className="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl w-[700px] max-w-[90vw] max-h-[80vh] flex flex-col"
+      >
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-neutral-700">
           <div className="flex items-center gap-3">
@@ -222,7 +223,9 @@ export function McpServerToolPicker({
             )}
             <div>
               <h2 className="text-lg font-semibold">
-                {mode === "servers" ? "Select MCP Server" : `Select Tool from ${selectedServer?.name}`}
+                {mode === "servers"
+                  ? "Select MCP Server"
+                  : `Select Tool from ${selectedServer?.name}`}
               </h2>
               <p className="text-sm text-muted-foreground">
                 {mode === "servers"
@@ -321,25 +324,24 @@ export function McpServerToolPicker({
                 ))}
               </div>
             )
+          ) : // Tool List
+          filteredTools.length === 0 ? (
+            <div className="text-center py-8 text-muted-foreground">
+              {tools.length === 0
+                ? "No tools available from this server."
+                : "No tools match your search."}
+            </div>
           ) : (
-            // Tool List
-            filteredTools.length === 0 ? (
-              <div className="text-center py-8 text-muted-foreground">
-                {tools.length === 0
-                  ? "No tools available from this server."
-                  : "No tools match your search."}
-              </div>
-            ) : (
-              <div className="grid grid-cols-1 gap-2">
-                {filteredTools.map((tool) => {
-                  const isSelected = selectedToolName === tool.name;
+            <div className="grid grid-cols-1 gap-2">
+              {filteredTools.map((tool) => {
+                const isSelected = selectedToolName === tool.name;
 
-                  return (
-                    <button
-                      key={tool.name}
-                      onClick={() => setSelectedToolName(tool.name)}
-                      onDoubleClick={() => handleToolDoubleClick(tool)}
-                      className={`
+                return (
+                  <button
+                    key={tool.name}
+                    onClick={() => setSelectedToolName(tool.name)}
+                    onDoubleClick={() => handleToolDoubleClick(tool)}
+                    className={`
                         relative flex items-start gap-3 p-3 rounded-lg text-left transition-all
                         ${
                           isSelected
@@ -347,36 +349,35 @@ export function McpServerToolPicker({
                             : "bg-neutral-800/50 border-2 border-transparent hover:bg-neutral-800 hover:border-neutral-600"
                         }
                       `}
-                      data-ui-id={`workflow-builder-mcp-picker-tool-item-${tool.name}`}
-                    >
-                      {isSelected && (
-                        <div className="absolute top-2 right-2">
-                          <CheckIcon className="w-4 h-4 text-cyan-400" />
+                    data-ui-id={`workflow-builder-mcp-picker-tool-item-${tool.name}`}
+                  >
+                    {isSelected && (
+                      <div className="absolute top-2 right-2">
+                        <CheckIcon className="w-4 h-4 text-cyan-400" />
+                      </div>
+                    )}
+                    <div className="p-2 rounded-md bg-neutral-900 text-amber-400">
+                      <Wrench className="w-4 h-4" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="font-medium font-mono">{tool.name}</div>
+                      {tool.description && (
+                        <p className="text-sm text-muted-foreground mt-0.5 line-clamp-2">
+                          {tool.description}
+                        </p>
+                      )}
+                      {tool.input_schema && (
+                        <div className="mt-1.5 text-xs text-muted-foreground">
+                          <span className="text-neutral-500">
+                            {Object.keys(tool.input_schema.properties || {}).length} parameters
+                          </span>
                         </div>
                       )}
-                      <div className="p-2 rounded-md bg-neutral-900 text-amber-400">
-                        <Wrench className="w-4 h-4" />
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        <div className="font-medium font-mono">{tool.name}</div>
-                        {tool.description && (
-                          <p className="text-sm text-muted-foreground mt-0.5 line-clamp-2">
-                            {tool.description}
-                          </p>
-                        )}
-                        {tool.input_schema && (
-                          <div className="mt-1.5 text-xs text-muted-foreground">
-                            <span className="text-neutral-500">
-                              {Object.keys(tool.input_schema.properties || {}).length} parameters
-                            </span>
-                          </div>
-                        )}
-                      </div>
-                    </button>
-                  );
-                })}
-              </div>
-            )
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
           )}
         </div>
 

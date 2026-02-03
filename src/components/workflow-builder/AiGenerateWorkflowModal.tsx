@@ -5,7 +5,16 @@
  */
 
 import { useState, useCallback } from "react";
-import { Sparkles, X, Loader2, Check, AlertCircle, ChevronDown, ChevronUp, Settings2 } from "lucide-react";
+import {
+  Sparkles,
+  X,
+  Loader2,
+  Check,
+  AlertCircle,
+  ChevronDown,
+  ChevronUp,
+  Settings2,
+} from "lucide-react";
 import type { UnifiedWorkflow } from "../../types";
 import { getAccentColors } from "@/design-system";
 
@@ -135,7 +144,17 @@ export function AiGenerateWorkflowModal({
     } finally {
       setIsGenerating(false);
     }
-  }, [description, category, tags, maxIterations, provider, model, skipAiSummary, logSourceSelection, autoIncludeContexts]);
+  }, [
+    description,
+    category,
+    tags,
+    maxIterations,
+    provider,
+    model,
+    skipAiSummary,
+    logSourceSelection,
+    autoIncludeContexts,
+  ]);
 
   const handleClose = useCallback(() => {
     setDescription("");
@@ -189,7 +208,8 @@ export function AiGenerateWorkflowModal({
       {/* Dialog */}
       <div
         data-ui-id="dialog-ai-generate-workflow"
-        className="relative bg-card border border-border rounded-lg shadow-xl w-full max-w-2xl mx-4 max-h-[85vh] flex flex-col overflow-hidden">
+        className="relative bg-card border border-border rounded-lg shadow-xl w-full max-w-2xl mx-4 max-h-[85vh] flex flex-col overflow-hidden"
+      >
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-border">
           <div className="flex items-center gap-2">
@@ -326,7 +346,9 @@ export function AiGenerateWorkflowModal({
                       min={1}
                       max={100}
                       value={maxIterations}
-                      onChange={(e) => setMaxIterations(e.target.value ? parseInt(e.target.value, 10) : "")}
+                      onChange={(e) =>
+                        setMaxIterations(e.target.value ? parseInt(e.target.value, 10) : "")
+                      }
                       className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
                       disabled={isGenerating}
                     />

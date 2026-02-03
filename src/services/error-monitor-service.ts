@@ -54,10 +54,7 @@ export const errorMonitorService = {
   /**
    * Get unresolved error events.
    */
-  async getUnresolvedErrors(
-    taskRunId?: string,
-    limit?: number,
-  ): Promise<StoredErrorEvent[]> {
+  async getUnresolvedErrors(taskRunId?: string, limit?: number): Promise<StoredErrorEvent[]> {
     return invoke("get_unresolved_errors", { taskRunId, limit });
   },
 
@@ -126,10 +123,7 @@ export const errorMonitorService = {
   /**
    * Search error events by message content.
    */
-  async searchErrors(
-    query: string,
-    limit?: number,
-  ): Promise<StoredErrorEvent[]> {
+  async searchErrors(query: string, limit?: number): Promise<StoredErrorEvent[]> {
     return invoke("search_errors", { query, limit });
   },
 
@@ -143,10 +137,7 @@ export const errorMonitorService = {
   /**
    * Get recent errors (for notification badge).
    */
-  async getRecentErrors(
-    hours?: number,
-    limit?: number,
-  ): Promise<StoredErrorEvent[]> {
+  async getRecentErrors(hours?: number, limit?: number): Promise<StoredErrorEvent[]> {
     return invoke("get_recent_errors", { hours, limit });
   },
 
@@ -165,10 +156,7 @@ export const errorMonitorService = {
   /**
    * Get curated debug context for the AI debug agent.
    */
-  async getDebugContext(
-    taskRunId?: string,
-    maxErrors?: number,
-  ): Promise<DebugContext> {
+  async getDebugContext(taskRunId?: string, maxErrors?: number): Promise<DebugContext> {
     return invoke("get_debug_context", { taskRunId, maxErrors });
   },
 
@@ -186,18 +174,14 @@ export const errorMonitorService = {
   /**
    * Generate an error fix workflow.
    */
-  async generateErrorFixWorkflow(
-    config?: ErrorFixWorkflowConfig,
-  ): Promise<GeneratedWorkflow> {
+  async generateErrorFixWorkflow(config?: ErrorFixWorkflowConfig): Promise<GeneratedWorkflow> {
     return invoke("generate_error_fix_workflow", { config });
   },
 
   /**
    * Generate a workflow to fix a single error.
    */
-  async generateSingleErrorFixWorkflow(
-    errorId: number,
-  ): Promise<GeneratedWorkflow> {
+  async generateSingleErrorFixWorkflow(errorId: number): Promise<GeneratedWorkflow> {
     return invoke("generate_single_error_fix_workflow", { errorId });
   },
 

@@ -10,11 +10,12 @@ import type { TaskRun, RunPromptRequest, RunPromptResponse } from "../types/task
 import { isTaskFinished } from "../types/taskRun";
 
 const API_BASE = "http://localhost:9876";
-const DEFAULT_POLL_INTERVAL_MS = 2000;
+// Polling is now fallback only - real-time events provide instant updates
+const DEFAULT_POLL_INTERVAL_MS = 5000;
 const DEFAULT_TIMEOUT_MS = 600000; // 10 minutes
 
 export interface UseAiTaskPollingOptions {
-  /** Polling interval in milliseconds (default: 2000) */
+  /** Polling interval in milliseconds (default: 5000, fallback since real-time events are primary) */
   pollIntervalMs?: number;
   /** Timeout in milliseconds (default: 600000 = 10 minutes) */
   timeoutMs?: number;

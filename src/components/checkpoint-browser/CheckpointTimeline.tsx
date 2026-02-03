@@ -2,8 +2,10 @@
  * CheckpointTimeline.tsx
  *
  * Displays checkpoints as a vertical timeline with trigger indicators.
+ * Uses virtual scrolling for large checkpoint lists (50+ items) to maintain performance.
  */
 
+import { useCallback, type CSSProperties } from "react";
 import {
   Clock,
   User,
@@ -16,6 +18,12 @@ import {
 } from "lucide-react";
 import type { CheckpointSummary } from "../../types/checkpoint";
 import { TRIGGER_TYPE_LABELS, TRIGGER_TYPE_COLORS, formatTimestamp } from "../../types/checkpoint";
+import { FixedVirtualList } from "../ui";
+
+/** Threshold for switching to virtual scrolling */
+const VIRTUAL_SCROLL_THRESHOLD = 50;
+/** Height of each checkpoint item in pixels */
+const CHECKPOINT_ITEM_HEIGHT = 120;
 
 interface CheckpointTimelineProps {
   checkpoints: CheckpointSummary[];
@@ -174,6 +182,37 @@ export function CheckpointTimeline({
   compareMode,
   activeId,
 }: CheckpointTimelineProps) {
+  // Sort by creation time (newest first)
+  const sortedCheckpoints = [...checkpoints].sort(
+    (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+  );
+
+  // Use virtual scrolling for large lists
+  const useVirtualScroll = sortedCheckpoints.length > VIRTUAL_SCROLL_THRESHOLD;
+
+  // Render function for virtualized items
+  const renderVirtualItem = useCallback(
+    (cp: CheckpointSummary, index: number, style: CSSProperties) => (
+      <div style={style}>
+        <CheckpointItem
+          checkpoint={cp}
+          isSelected={cp.id === selectedId}
+          isCompare={cp.id === compareId}
+          isActive={cp.id === activeId}
+          compareMode={compareMode}
+          onSelect={() => onSelect(cp.id)}
+          onCompare={() => onCompare(cp.id)}
+          isFirst={index === 0}
+          isLast={index === sortedCheckpoints.length - 1}
+        />
+      </div>
+    ),
+    [selectedId, compareId, activeId, compareMode, onSelect, onCompare, sortedCheckpoints.length],
+  );
+
+  // Key extractor for virtual list
+  const getItemKey = useCallback((cp: CheckpointSummary) => cp.id, []);
+
   if (checkpoints.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center h-full text-gray-500 p-4">
@@ -184,29 +223,38 @@ export function CheckpointTimeline({
     );
   }
 
-  // Sort by creation time (newest first)
-  const sortedCheckpoints = [...checkpoints].sort(
-    (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
-  );
-
   return (
-    <div className="overflow-auto h-full p-4">
-      <div className="space-y-0">
-        {sortedCheckpoints.map((cp, idx) => (
-          <CheckpointItem
-            key={cp.id}
-            checkpoint={cp}
-            isSelected={cp.id === selectedId}
-            isCompare={cp.id === compareId}
-            isActive={cp.id === activeId}
-            compareMode={compareMode}
-            onSelect={() => onSelect(cp.id)}
-            onCompare={() => onCompare(cp.id)}
-            isFirst={idx === 0}
-            isLast={idx === sortedCheckpoints.length - 1}
-          />
-        ))}
-      </div>
+    <div className="h-full p-4">
+      {useVirtualScroll ? (
+        /* Virtual scrolling for large lists */
+        <FixedVirtualList
+          items={sortedCheckpoints}
+          itemHeight={CHECKPOINT_ITEM_HEIGHT}
+          renderItem={renderVirtualItem}
+          getItemKey={getItemKey}
+          overscanCount={5}
+        />
+      ) : (
+        /* Regular scrolling for small lists */
+        <div className="overflow-auto h-full">
+          <div className="space-y-0">
+            {sortedCheckpoints.map((cp, idx) => (
+              <CheckpointItem
+                key={cp.id}
+                checkpoint={cp}
+                isSelected={cp.id === selectedId}
+                isCompare={cp.id === compareId}
+                isActive={cp.id === activeId}
+                compareMode={compareMode}
+                onSelect={() => onSelect(cp.id)}
+                onCompare={() => onCompare(cp.id)}
+                isFirst={idx === 0}
+                isLast={idx === sortedCheckpoints.length - 1}
+              />
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

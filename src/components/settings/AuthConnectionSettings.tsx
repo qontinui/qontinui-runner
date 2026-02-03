@@ -115,7 +115,10 @@ export function AuthConnectionSettings({
 
       {/* User Info */}
       {auth.authStatus?.user && (
-        <div className="rounded-lg bg-card/50 p-4 flex items-center justify-between" data-ui-id="settings-authconnection-user-section">
+        <div
+          className="rounded-lg bg-card/50 p-4 flex items-center justify-between"
+          data-ui-id="settings-authconnection-user-section"
+        >
           <div className="flex items-center gap-3">
             <div className="w-8 h-8 rounded-full bg-primary/20 flex items-center justify-center">
               <User className="w-4 h-4 text-primary" />
@@ -147,7 +150,10 @@ export function AuthConnectionSettings({
       )}
 
       {/* Runner Name */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-authconnection-runner-identity-section">
+      <div
+        className="space-y-4 rounded-lg bg-card/50 p-4"
+        data-ui-id="settings-authconnection-runner-identity-section"
+      >
         <div className="flex items-center gap-2">
           <Tag className="w-4 h-4 text-primary" />
           <h4 className="font-medium text-sm">Runner Identity</h4>
@@ -174,7 +180,10 @@ export function AuthConnectionSettings({
 
       {/* Project Selection */}
       {projects.length > 0 && (
-        <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-authconnection-project-section">
+        <div
+          className="space-y-4 rounded-lg bg-card/50 p-4"
+          data-ui-id="settings-authconnection-project-section"
+        >
           <div className="flex items-center gap-2">
             <Cloud className="w-4 h-4 text-primary" />
             <h4 className="font-medium text-sm">Select Project</h4>
@@ -239,7 +248,10 @@ export function AuthConnectionSettings({
       )}
 
       {/* Connection Controls */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-authconnection-connection-section">
+      <div
+        className="space-y-4 rounded-lg bg-card/50 p-4"
+        data-ui-id="settings-authconnection-connection-section"
+      >
         <div className="flex items-center gap-2">
           <Wifi className="w-4 h-4 text-primary" />
           <h4 className="font-medium text-sm">Connection Status</h4>

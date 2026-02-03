@@ -42,10 +42,7 @@ interface TestOrchestratorPanelProps {
   onLog?: (level: string, message: string) => void;
 }
 
-export function TestOrchestratorPanel({
-  onTestGenerated,
-  onLog,
-}: TestOrchestratorPanelProps) {
+export function TestOrchestratorPanel({ onTestGenerated, onLog }: TestOrchestratorPanelProps) {
   // Phase state
   const [phase, setPhase] = useState<OrchestratorPhase>("select");
 
@@ -63,8 +60,7 @@ export function TestOrchestratorPanel({
   const [plan, setPlan] = useState<TestOrchestrationPlan | null>(null);
 
   // Execution state
-  const [executionResult, setExecutionResult] =
-    useState<OrchestrationExecutionResult | null>(null);
+  const [executionResult, setExecutionResult] = useState<OrchestrationExecutionResult | null>(null);
   const [currentStepIndex, setCurrentStepIndex] = useState(0);
 
   // Generation state
@@ -80,7 +76,7 @@ export function TestOrchestratorPanel({
   const loadAuthContext = useCallback(async () => {
     try {
       const response = await invoke<{ success: boolean; data?: ResolvedExecutionContext }>(
-        "get_resolved_execution_context"
+        "get_resolved_execution_context",
       );
       if (response.success && response.data) {
         setAuthContext(response.data);
@@ -93,7 +89,7 @@ export function TestOrchestratorPanel({
   const loadSavedRequests = useCallback(async () => {
     try {
       const response = await invoke<CommandResponse<SavedApiRequest[]>>(
-        "get_saved_requests_for_orchestration"
+        "get_saved_requests_for_orchestration",
       );
       if (response.success && response.data) {
         setAvailableRequests(response.data);
@@ -116,7 +112,7 @@ export function TestOrchestratorPanel({
     (req) =>
       req.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
       req.url.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      req.description.toLowerCase().includes(searchQuery.toLowerCase())
+      req.description.toLowerCase().includes(searchQuery.toLowerCase()),
   );
 
   // Toggle request selection
@@ -168,7 +164,7 @@ export function TestOrchestratorPanel({
 
       const response = await invoke<CommandResponse<TestOrchestrationPlan>>(
         "plan_test_orchestration",
-        { request }
+        { request },
       );
 
       if (response.success && response.data) {
@@ -202,7 +198,7 @@ export function TestOrchestratorPanel({
 
       const response = await invoke<CommandResponse<OrchestrationExecutionResult>>(
         "execute_test_orchestration",
-        { plan }
+        { plan },
       );
 
       if (response.success && response.data) {
@@ -216,9 +212,8 @@ export function TestOrchestratorPanel({
         } else {
           // Get the error message from the failed step
           const failedStepIdx = response.data.failed_at_step;
-          const failedStep = failedStepIdx !== undefined
-            ? response.data.step_results[failedStepIdx]
-            : undefined;
+          const failedStep =
+            failedStepIdx !== undefined ? response.data.step_results[failedStepIdx] : undefined;
           const statusCode = failedStep?.response?.status_code;
           const errorDetail = failedStep?.error || `HTTP ${statusCode || "unknown"}`;
 
@@ -228,12 +223,11 @@ export function TestOrchestratorPanel({
             ? " Auth tokens in saved requests may have expired. Try re-capturing the requests while logged in."
             : "";
 
-          onLog?.(
-            "warn",
-            `Execution failed at step ${failedStepIdx}: ${errorDetail}${authHint}`
-          );
+          onLog?.("warn", `Execution failed at step ${failedStepIdx}: ${errorDetail}${authHint}`);
           // Also set the error for display
-          setError(`Step ${failedStepIdx !== undefined ? failedStepIdx + 1 : "?"} failed: ${errorDetail}${authHint}`);
+          setError(
+            `Step ${failedStepIdx !== undefined ? failedStepIdx + 1 : "?"} failed: ${errorDetail}${authHint}`,
+          );
         }
       } else {
         setError(response.message || "Failed to execute plan");
@@ -246,7 +240,7 @@ export function TestOrchestratorPanel({
     } finally {
       setIsLoading(false);
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- generateTest is defined below and causes circular dependency warning
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- generateTest is defined below and causes circular dependency warning
   }, [plan, onLog]);
 
   // Generate test code
@@ -268,7 +262,7 @@ export function TestOrchestratorPanel({
             plan,
             testType,
             additionalInstructions: null,
-          }
+          },
         );
 
         if (response.success && response.data) {
@@ -287,7 +281,7 @@ export function TestOrchestratorPanel({
         setIsLoading(false);
       }
     },
-    [plan, testType, onLog]
+    [plan, testType, onLog],
   );
 
   // Apply generated test
@@ -309,9 +303,7 @@ export function TestOrchestratorPanel({
   };
 
   // Get selected requests as array (currently unused but kept for future use)
-  const _selectedRequests = availableRequests.filter((r) =>
-    selectedRequestIds.has(r.id)
-  );
+  const _selectedRequests = availableRequests.filter((r) => selectedRequestIds.has(r.id));
 
   return (
     <div className="h-full flex flex-col bg-neutral-900 overflow-hidden">
@@ -326,10 +318,13 @@ export function TestOrchestratorPanel({
         )}
         {/* Auth indicator */}
         {authContext && (
-          <AuthIndicator context={authContext} onOpenSettings={() => {
-            // Navigate to settings - emit an event or use a callback
-            onLog?.("info", "Open Settings > Execution Variables to configure auth");
-          }} />
+          <AuthIndicator
+            context={authContext}
+            onOpenSettings={() => {
+              // Navigate to settings - emit an event or use a callback
+              onLog?.("info", "Open Settings > Execution Variables to configure auth");
+            }}
+          />
         )}
       </div>
 
@@ -415,13 +410,9 @@ export function TestOrchestratorPanel({
                           >
                             {req.method}
                           </span>
-                          <span className="text-sm text-neutral-200 truncate">
-                            {req.name}
-                          </span>
+                          <span className="text-sm text-neutral-200 truncate">{req.name}</span>
                         </div>
-                        <div className="text-xs text-neutral-500 truncate">
-                          {req.url}
-                        </div>
+                        <div className="text-xs text-neutral-500 truncate">{req.url}</div>
                       </div>
                     </label>
                   ))
@@ -489,11 +480,7 @@ export function TestOrchestratorPanel({
             {/* Create Plan button */}
             <button
               onClick={createPlan}
-              disabled={
-                isLoading ||
-                selectedRequestIds.size === 0 ||
-                !testDescription.trim()
-              }
+              disabled={isLoading || selectedRequestIds.size === 0 || !testDescription.trim()}
               className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-purple-600 text-white rounded hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
               data-ui-id="test-builder-orchestrator-create-plan-btn"
             >
@@ -514,8 +501,7 @@ export function TestOrchestratorPanel({
               <RefreshCw className="w-8 h-8 text-purple-400 animate-spin mx-auto mb-4" />
               <p className="text-neutral-300">AI is creating your execution plan...</p>
               <p className="text-sm text-neutral-500 mt-2">
-                Analyzing {selectedRequestIds.size} requests and planning variable
-                chaining
+                Analyzing {selectedRequestIds.size} requests and planning variable chaining
               </p>
             </div>
           </div>
@@ -525,9 +511,7 @@ export function TestOrchestratorPanel({
         {phase === "review" && plan && (
           <div className="p-4 space-y-4">
             <div className="flex items-center justify-between">
-              <h3 className="text-sm font-medium text-neutral-200">
-                Execution Plan
-              </h3>
+              <h3 className="text-sm font-medium text-neutral-200">Execution Plan</h3>
               <div className="flex items-center gap-2">
                 <button
                   onClick={reset}
@@ -568,9 +552,7 @@ export function TestOrchestratorPanel({
             )}
 
             {/* Execution result (if re-viewing after execution) */}
-            {executionResult && (
-              <ExecutionLog result={executionResult} />
-            )}
+            {executionResult && <ExecutionLog result={executionResult} />}
 
             {/* Execute button */}
             <button
@@ -593,19 +575,13 @@ export function TestOrchestratorPanel({
         {phase === "executing" && plan && (
           <div className="p-4 space-y-4">
             <div className="flex items-center justify-between">
-              <h3 className="text-sm font-medium text-neutral-200">
-                Executing Plan
-              </h3>
+              <h3 className="text-sm font-medium text-neutral-200">Executing Plan</h3>
               <div className="text-sm text-neutral-400">
                 Step {currentStepIndex + 1} of {plan.steps.length}
               </div>
             </div>
 
-            <PlanVisualization
-              plan={plan}
-              currentStepIndex={currentStepIndex}
-              isExecuting
-            />
+            <PlanVisualization plan={plan} currentStepIndex={currentStepIndex} isExecuting />
 
             <div className="flex items-center justify-center p-4">
               <RefreshCw className="w-6 h-6 text-blue-400 animate-spin" />
@@ -621,9 +597,7 @@ export function TestOrchestratorPanel({
           <div className="flex-1 flex items-center justify-center p-8">
             <div className="text-center">
               <RefreshCw className="w-8 h-8 text-purple-400 animate-spin mx-auto mb-4" />
-              <p className="text-neutral-300">
-                AI is generating verification test code...
-              </p>
+              <p className="text-neutral-300">AI is generating verification test code...</p>
               <p className="text-sm text-neutral-500 mt-2">
                 Creating {testType} test from execution results
               </p>
@@ -641,12 +615,8 @@ export function TestOrchestratorPanel({
 
             {/* Test info */}
             <div className="p-3 bg-neutral-800 rounded border border-neutral-700">
-              <div className="text-sm font-medium text-neutral-200">
-                {generatedTest.name}
-              </div>
-              <div className="text-xs text-neutral-400 mt-1">
-                {generatedTest.description}
-              </div>
+              <div className="text-sm font-medium text-neutral-200">{generatedTest.name}</div>
+              <div className="text-xs text-neutral-400 mt-1">{generatedTest.description}</div>
             </div>
 
             {/* Explanation */}
@@ -674,9 +644,7 @@ export function TestOrchestratorPanel({
 
             {/* Code preview */}
             <div className="space-y-2">
-              <h4 className="text-xs font-medium text-neutral-400 uppercase">
-                Generated Code
-              </h4>
+              <h4 className="text-xs font-medium text-neutral-400 uppercase">Generated Code</h4>
               <pre className="p-3 bg-neutral-950 rounded border border-neutral-800 text-xs text-neutral-300 overflow-auto max-h-64">
                 {generatedTest.code}
               </pre>
@@ -722,7 +690,7 @@ function PhaseIndicator({ phase }: { phase: OrchestratorPhase }) {
     (p) =>
       p.key === phase ||
       (phase === "planning" && p.key === "select") ||
-      (phase === "generating" && p.key === "executing")
+      (phase === "generating" && p.key === "executing"),
   );
 
   return (
@@ -738,14 +706,10 @@ function PhaseIndicator({ phase }: { phase: OrchestratorPhase }) {
                   : "bg-neutral-700 text-neutral-400"
             }`}
           >
-            {idx < currentIndex ? (
-              <Check className="w-3 h-3 inline mr-1" />
-            ) : null}
+            {idx < currentIndex ? <Check className="w-3 h-3 inline mr-1" /> : null}
             {p.label}
           </div>
-          {idx < phases.length - 1 && (
-            <ChevronRight className="w-4 h-4 text-neutral-600 mx-1" />
-          )}
+          {idx < phases.length - 1 && <ChevronRight className="w-4 h-4 text-neutral-600 mx-1" />}
         </div>
       ))}
     </div>
@@ -791,8 +755,7 @@ function AuthIndicator({
   const authStatus = context.authTokenStatus ?? "";
   const isWarning =
     context.authSource !== "captured" &&
-    (authStatus.includes("not set") ||
-      authStatus.includes("not configured"));
+    (authStatus.includes("not set") || authStatus.includes("not configured"));
 
   return (
     <button

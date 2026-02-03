@@ -122,7 +122,8 @@ export function HtmlViewerModal({ capture, onClose }: Props) {
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
       <div
         data-ui-id="dialog-html-viewer"
-        className="bg-background border border-border rounded-lg shadow-xl w-[90vw] h-[90vh] flex flex-col overflow-hidden">
+        className="bg-background border border-border rounded-lg shadow-xl w-[90vw] h-[90vh] flex flex-col overflow-hidden"
+      >
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-border flex-shrink-0">
           <div className="flex items-center gap-3 min-w-0">

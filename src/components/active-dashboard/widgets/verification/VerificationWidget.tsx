@@ -176,11 +176,7 @@ function CheckStepRow({
       >
         {/* Expand/collapse indicator */}
         <div className="flex-shrink-0 text-muted-foreground">
-          {isExpanded ? (
-            <ChevronDown className="h-4 w-4" />
-          ) : (
-            <ChevronRight className="h-4 w-4" />
-          )}
+          {isExpanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
         </div>
 
         {/* Status icon */}
@@ -237,13 +233,16 @@ function CheckStepRow({
             <div className={cn("px-4 py-2", errorColors.bg)}>
               <div className="flex items-center gap-2 mb-1">
                 <AlertCircle className={cn("h-3 w-3", errorColors.text)} />
-                <span className={cn("text-[10px] uppercase tracking-wide font-medium", errorColors.text)}>
+                <span
+                  className={cn(
+                    "text-[10px] uppercase tracking-wide font-medium",
+                    errorColors.text,
+                  )}
+                >
                   Error
                 </span>
               </div>
-              <p className={cn("text-xs whitespace-pre-wrap", errorColors.text)}>
-                {step.error}
-              </p>
+              <p className={cn("text-xs whitespace-pre-wrap", errorColors.text)}>{step.error}</p>
             </div>
           )}
           {!step.output && !step.error && (

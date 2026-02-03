@@ -117,7 +117,7 @@ export function RenderLogProvider({
         console.debug("[RenderLog] Failed to append log:", error);
       }
     },
-    [isDev]
+    [isDev],
   );
 
   /**
@@ -133,7 +133,11 @@ export function RenderLogProvider({
         // Wait a frame for DOM to settle
         await new Promise((resolve) => requestAnimationFrame(resolve));
 
-        const snapshot = captureDOMSnapshot(captureConfig, activeTab, trigger as DOMSnapshot["captureType"]);
+        const snapshot = captureDOMSnapshot(
+          captureConfig,
+          activeTab,
+          trigger as DOMSnapshot["captureType"],
+        );
 
         const entry: RenderLogEntry = {
           id: snapshot.id,
@@ -187,14 +191,16 @@ export function RenderLogProvider({
         setLastCaptureTime(Date.now());
         setCaptureCount((c) => c + 1);
 
-        console.debug(`[RenderLog] Captured snapshot: ${trigger} (${snapshot.stats.captureTimeMs}ms)`);
+        console.debug(
+          `[RenderLog] Captured snapshot: ${trigger} (${snapshot.stats.captureTimeMs}ms)`,
+        );
       } catch (error) {
         console.debug("[RenderLog] Failed to capture snapshot:", error);
       } finally {
         isCapturingRef.current = false;
       }
     },
-    [isEnabled, isDev, activeTab, taskRunId, captureConfig, sendLog]
+    [isEnabled, isDev, activeTab, taskRunId, captureConfig, sendLog],
   );
 
   /**
@@ -236,7 +242,7 @@ export function RenderLogProvider({
         isCapturingRef.current = false;
       }
     },
-    [isEnabled, isDev, activeTab, taskRunId, sendLog]
+    [isEnabled, isDev, activeTab, taskRunId, sendLog],
   );
 
   /**
@@ -311,10 +317,7 @@ export function RenderLogProvider({
             if (attrName === "class") {
               const el = mutation.target as Element;
               const classes = el.className || "";
-              if (
-                classes.includes("animate-") ||
-                classes.includes("transition-")
-              ) {
+              if (classes.includes("animate-") || classes.includes("transition-")) {
                 return false;
               }
             }
@@ -382,11 +385,7 @@ export function RenderLogProvider({
     captureCount,
   };
 
-  return (
-    <RenderLogContext.Provider value={value}>
-      {children}
-    </RenderLogContext.Provider>
-  );
+  return <RenderLogContext.Provider value={value}>{children}</RenderLogContext.Provider>;
 }
 
 // ============================================================================

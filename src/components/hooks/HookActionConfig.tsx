@@ -52,8 +52,7 @@ function CommandConfig({ config, actionType, onChange }: CommandConfigProps) {
           className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm font-mono resize-none focus:outline-none focus:ring-2 focus:ring-primary/50"
         />
         <p className="mt-1 text-xs text-muted-foreground">
-          Supports variable substitution: {"{{task_name}}"}, {"{{iteration}}"}, {"{{status}}"},
-          etc.
+          Supports variable substitution: {"{{task_name}}"}, {"{{iteration}}"}, {"{{status}}"}, etc.
         </p>
       </div>
 
@@ -274,9 +273,7 @@ function WebhookConfig({ config, actionType, onChange }: WebhookConfigProps) {
       </div>
 
       <div>
-        <label className="block text-sm font-medium text-muted-foreground mb-1">
-          Request Body
-        </label>
+        <label className="block text-sm font-medium text-muted-foreground mb-1">Request Body</label>
         <textarea
           value={config.body || ""}
           onChange={(e) =>

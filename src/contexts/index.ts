@@ -19,11 +19,7 @@ export {
   useTaskStartTime,
 } from "./TaskContext";
 
-export {
-  RenderLogProvider,
-  useRenderLog,
-  useRenderLogOptional,
-} from "./RenderLogContext";
+export { RenderLogProvider, useRenderLog, useRenderLogOptional } from "./RenderLogContext";
 export type { RenderLogEntry } from "./RenderLogContext";
 
 export {
@@ -34,6 +30,20 @@ export {
   useSelectedRunHasGuiLock,
 } from "./ActiveRunsContext";
 export type { ActiveRun, GuiLockInfo } from "./ActiveRunsContext";
+
+// Unified Workflow Execution Context (single source of truth)
+export {
+  WorkflowExecutionProvider,
+  useWorkflowExecution,
+  useWorkflowExecutionOptional,
+} from "./WorkflowExecutionContext";
+export type {
+  WorkflowExecutionState,
+  WorkflowExecutionContextValue,
+  StepCheckpoint,
+  StepProgress,
+  ResumePoint,
+} from "./WorkflowExecutionContext";
 
 // Re-export execution-related hooks for convenience
 export {

@@ -107,6 +107,93 @@ export const flowService = {
     return invoke("cancel_flow_execution", { instanceId });
   },
 
+  /**
+   * Run a flow execution to completion.
+   * Executes all steps until the flow completes, fails, or reaches a human input step.
+   * Events are emitted during execution via the "flow-event" channel.
+   * @param instanceId - Execution instance ID.
+   * @returns Flow execution result with status and outputs.
+   */
+  async runFlowExecution(instanceId: string): Promise<{
+    instance_id: string;
+    success: boolean;
+    status: string;
+    error: string | null;
+    steps_executed: number;
+    outputs: Record<string, unknown>;
+  }> {
+    return invoke("run_flow_execution", { instanceId });
+  },
+
+  /**
+   * Execute a single step in the flow (step-by-step mode).
+   * Useful for debugging or when each step needs to be visualized before continuing.
+   * @param instanceId - Execution instance ID.
+   * @returns Result of the step execution.
+   */
+  async stepFlowExecution(instanceId: string): Promise<{
+    step_id: string | null;
+    success: boolean;
+    flow_completed: boolean;
+    outputs: Record<string, unknown>;
+    error: string | null;
+    next_step: string | null;
+  }> {
+    return invoke("step_flow_execution", { instanceId });
+  },
+
+  /**
+   * Pause a running flow execution.
+   * The flow can be resumed later with resumeFlowExecution.
+   * @param instanceId - Execution instance ID to pause.
+   * @returns True if paused, false if not found or not running.
+   */
+  async pauseFlowExecution(instanceId: string): Promise<boolean> {
+    return invoke("pause_flow_execution", { instanceId });
+  },
+
+  /**
+   * Resume a paused flow execution.
+   * Continues execution from where it was paused.
+   * @param instanceId - Execution instance ID to resume.
+   * @returns True if resumed successfully.
+   */
+  async resumeFlowExecution(instanceId: string): Promise<boolean> {
+    return invoke("resume_flow_execution", { instanceId });
+  },
+
+  /**
+   * Step into a paused flow (execute one step and pause again).
+   * Useful for step-by-step debugging.
+   * @param instanceId - Execution instance ID.
+   * @returns Result of the single step execution.
+   */
+  async stepIntoFlow(instanceId: string): Promise<{
+    step_id: string | null;
+    success: boolean;
+    flow_completed: boolean;
+    outputs: Record<string, unknown>;
+    error: string | null;
+    next_step: string | null;
+  }> {
+    return invoke("step_into_flow", { instanceId });
+  },
+
+  /**
+   * Provide human input to a flow waiting for input.
+   * @param instanceId - Execution instance ID.
+   * @param stepId - The step ID waiting for input.
+   * @param input - The input value to provide.
+   * @returns True if input was accepted.
+   */
+  async provideFlowInput(
+    instanceId: string,
+    stepId: string,
+    input: unknown,
+  ): Promise<boolean> {
+    return invoke("provide_flow_input", { instanceId, stepId, input });
+  },
+
   // ===========================================================================
   // Sample Data
   // ===========================================================================
@@ -189,7 +276,7 @@ export const flowService = {
   async createFlowVersion(
     flowId: string,
     message?: string,
-    createdBy?: string
+    createdBy?: string,
   ): Promise<{ id: string; version: number }> {
     return invoke("create_flow_version", { flowId, message, createdBy });
   },
@@ -200,7 +287,7 @@ export const flowService = {
    * @returns Array of version summaries.
    */
   async listFlowVersions(
-    flowId: string
+    flowId: string,
   ): Promise<Array<{ id: string; version: number; message?: string; created_at: string }>> {
     return invoke("list_flow_versions", { flowId });
   },
@@ -213,7 +300,7 @@ export const flowService = {
    */
   async getFlowVersion(
     flowId: string,
-    version: number
+    version: number,
   ): Promise<{ definition: Flow; message?: string } | null> {
     return invoke("get_flow_version", { flowId, version });
   },
@@ -228,7 +315,7 @@ export const flowService = {
   async restoreFlowVersion(
     flowId: string,
     version: number,
-    createdBy?: string
+    createdBy?: string,
   ): Promise<{ new_version: number }> {
     return invoke("restore_flow_version", { flowId, version, createdBy });
   },

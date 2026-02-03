@@ -24,3 +24,4 @@ export { NaturalLanguagePanel } from "./NaturalLanguagePanel";
 export { ElementTreeView } from "./ElementTreeView";
 export { EventTimelineView } from "./EventTimelineView";
 export { ActionExecutorView } from "./ActionExecutorView";
+export { LazyThumbnail } from "./LazyThumbnail";

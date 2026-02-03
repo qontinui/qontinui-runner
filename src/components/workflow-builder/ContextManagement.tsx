@@ -54,7 +54,7 @@ export function ContextManagement() {
   const contextIds = useMemo(() => workflow.context_ids ?? [], [workflow.context_ids]);
   const disabledContextIds = useMemo(
     () => new Set(workflow.disabled_context_ids ?? []),
-    [workflow.disabled_context_ids]
+    [workflow.disabled_context_ids],
   );
   const autoIncludeContexts = workflow.auto_include_contexts ?? true;
 
@@ -63,7 +63,7 @@ export function ContextManagement() {
     (ids: string[]) => {
       updateWorkflow({ context_ids: ids });
     },
-    [updateWorkflow]
+    [updateWorkflow],
   );
 
   // Helper to update disabled context IDs
@@ -71,7 +71,7 @@ export function ContextManagement() {
     (ids: string[]) => {
       updateWorkflow({ disabled_context_ids: ids });
     },
-    [updateWorkflow]
+    [updateWorkflow],
   );
 
   // Helper to update auto-include setting
@@ -79,7 +79,7 @@ export function ContextManagement() {
     (value: boolean) => {
       updateWorkflow({ auto_include_contexts: value });
     },
-    [updateWorkflow]
+    [updateWorkflow],
   );
 
   // Add a context manually
@@ -90,7 +90,7 @@ export function ContextManagement() {
       }
       setContextPicker({ isOpen: false, searchQuery: "" });
     },
-    [contextIds, setContextIds]
+    [contextIds, setContextIds],
   );
 
   // Remove a context from manual list
@@ -98,7 +98,7 @@ export function ContextManagement() {
     (contextId: string) => {
       setContextIds(contextIds.filter((id) => id !== contextId));
     },
-    [contextIds, setContextIds]
+    [contextIds, setContextIds],
   );
 
   // Toggle a context as disabled (for auto-include)
@@ -112,7 +112,7 @@ export function ContextManagement() {
       }
       setDisabledContextIds(Array.from(disabled));
     },
-    [disabledContextIds, setDisabledContextIds]
+    [disabledContextIds, setDisabledContextIds],
   );
 
   // Toggle a context (remove if manual, disable if auto-included)
@@ -124,7 +124,7 @@ export function ContextManagement() {
         removeContext(contextId);
       }
     },
-    [toggleContextDisabled, removeContext]
+    [toggleContextDisabled, removeContext],
   );
 
   // Evaluate auto-include when description changes (only if enabled)

@@ -69,7 +69,7 @@ export function ConnectionPanel({
         setIsConnecting(false);
       }
     },
-    [onConnectToTab]
+    [onConnectToTab],
   );
 
   const getStatusBadge = () => {

@@ -21,7 +21,7 @@ interface PhaseSectionProps {
     index: number,
     isSelectionMode: boolean,
     isSelectedForDelete: boolean,
-    onToggleSelect: () => void
+    onToggleSelect: () => void,
   ) => React.ReactNode;
 }
 
@@ -73,9 +73,7 @@ export function PhaseSection({ phase, steps, onAddStep, renderStep }: PhaseSecti
 
   // Get names of selected steps for the delete dialog
   const getSelectedStepNames = useCallback((): string[] => {
-    return steps
-      .filter((s) => selectedStepIds.has(s.id))
-      .map((s) => s.name || `${s.type} step`);
+    return steps.filter((s) => selectedStepIds.has(s.id)).map((s) => s.name || `${s.type} step`);
   }, [steps, selectedStepIds]);
 
   // Color classes based on phase
@@ -190,9 +188,7 @@ export function PhaseSection({ phase, steps, onAddStep, renderStep }: PhaseSecti
           {/* Selection Mode Header */}
           {isStepSelectionMode && (
             <div className="flex items-center justify-between px-3 py-2 bg-red-500/10 border border-red-500/30 rounded-md">
-              <span className="text-sm text-red-400">
-                {selectedStepIds.size} selected
-              </span>
+              <span className="text-sm text-red-400">{selectedStepIds.size} selected</span>
               <div className="flex items-center gap-2">
                 {selectedStepIds.size > 0 && (
                   <button
@@ -234,12 +230,8 @@ export function PhaseSection({ phase, steps, onAddStep, renderStep }: PhaseSecti
                     ${isStepSelectionMode && selectedStepIds.has(step.id) ? "ring-2 ring-red-500/50" : ""}
                   `}
                 >
-                  {renderStep(
-                    step,
-                    index,
-                    isStepSelectionMode,
-                    selectedStepIds.has(step.id),
-                    () => toggleStepSelection(step.id)
+                  {renderStep(step, index, isStepSelectionMode, selectedStepIds.has(step.id), () =>
+                    toggleStepSelection(step.id),
                   )}
                 </div>
               ))}

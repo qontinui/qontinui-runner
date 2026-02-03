@@ -6,7 +6,16 @@
  * and execution statistics.
  */
 
-import { Play, Pause, Square, Settings, RotateCcw, ToggleRight, ToggleLeft, Loader2 } from "lucide-react";
+import {
+  Play,
+  Pause,
+  Square,
+  Settings,
+  RotateCcw,
+  ToggleRight,
+  ToggleLeft,
+  Loader2,
+} from "lucide-react";
 import { useAutoContinue } from "../../contexts";
 import { Button, Badge } from "../ui";
 import type { ExecutionStatus } from "./types";
@@ -120,6 +129,7 @@ function IterationBadge({
 function WorkflowStageIndicator({
   currentStage,
   isRunning,
+  isComplete: _isComplete,
   phaseStepCounts,
   showStepCounts = false,
   iteration,
@@ -127,11 +137,16 @@ function WorkflowStageIndicator({
 }: {
   currentStage: WorkflowStage | null;
   isRunning: boolean;
+  isComplete: boolean;
   phaseStepCounts?: PhaseStepCounts;
   showStepCounts?: boolean;
   iteration?: number;
   maxIterations?: number;
 }) {
+  // Use the stage from the API. Don't default to "setup" when data isn't available yet,
+  // as this causes UI inconsistency when the actual stage is different (e.g., verification).
+  // The WorkflowStageIndicator will show a loading/neutral state when effectiveStage is null.
+  const effectiveStage = currentStage;
   return (
     <div className="flex items-center gap-2">
       {/* Iteration counter - show when in verification or agentic loop */}
@@ -140,7 +155,7 @@ function WorkflowStageIndicator({
           <IterationBadge
             iteration={iteration}
             maxIterations={maxIterations}
-            isRunning={isRunning && (currentStage === "verification" || currentStage === "agentic")}
+            isRunning={isRunning && (effectiveStage === "verification" || effectiveStage === "agentic")}
           />
           <span className="w-4" /> {/* Spacer to match arrow width */}
         </>
@@ -150,14 +165,12 @@ function WorkflowStageIndicator({
       <div className="flex items-center gap-1.5">
         {WORKFLOW_STAGES.map((stage, index) => {
           const config = WORKFLOW_STAGE_CONFIG[stage];
-          const isCurrent = stage === currentStage;
+          const isCurrent = stage === effectiveStage;
           const isPast =
-            currentStage && WORKFLOW_STAGES.indexOf(stage) < WORKFLOW_STAGES.indexOf(currentStage);
+            effectiveStage && WORKFLOW_STAGES.indexOf(stage) < WORKFLOW_STAGES.indexOf(effectiveStage);
 
           // Get color classes based on state
-          const colors = getAccentColors(
-            config.color as Parameters<typeof getAccentColors>[0],
-          );
+          const colors = getAccentColors(config.color as Parameters<typeof getAccentColors>[0]);
 
           // Get step counts for this phase
           const stepCounts = phaseStepCounts?.[stage];
@@ -165,7 +178,8 @@ function WorkflowStageIndicator({
           const isPhaseComplete = hasSteps && stepCounts.completed === stepCounts.total;
 
           // Base classes - larger for better visibility
-          let stageClasses = "px-2.5 py-1 text-xs font-medium rounded-md transition-all duration-200 flex items-center gap-1.5";
+          let stageClasses =
+            "px-2.5 py-1 text-xs font-medium rounded-md transition-all duration-200 flex items-center gap-1.5";
 
           if (isCurrent) {
             // Current stage: fully colored with smooth glow animation
@@ -234,7 +248,10 @@ export function ControlBar({
   } = useAutoContinue();
 
   return (
-    <div data-ui-id="dashboard-control-bar" className="flex h-14 items-center justify-between border-b border-border bg-card px-4">
+    <div
+      data-ui-id="dashboard-control-bar"
+      className="flex h-14 items-center justify-between border-b border-border bg-card px-4"
+    >
       {/* Left: Task Name */}
       <div className="flex items-center gap-3 min-w-0 flex-1">
         {taskName && (
@@ -249,6 +266,7 @@ export function ControlBar({
           <WorkflowStageIndicator
             currentStage={workflowStage ?? null}
             isRunning={isRunning}
+            isComplete={status === "completed"}
             phaseStepCounts={phaseStepCounts}
             showStepCounts={showPhaseStepCounts}
             iteration={iteration}
@@ -323,7 +341,11 @@ export function ControlBar({
                 ? `${getAccentColors("orange").bg} ${getAccentColors("orange").text} hover:opacity-80`
                 : "bg-muted text-muted-foreground hover:bg-muted/80"
             } ${autoContinueLoading ? "opacity-50" : ""}`}
-            title={autoContinueEnabled ? "Auto-continue enabled - workflow resumes on restart" : "Auto-continue disabled"}
+            title={
+              autoContinueEnabled
+                ? "Auto-continue enabled - workflow resumes on restart"
+                : "Auto-continue disabled"
+            }
           >
             <RotateCcw className="w-3 h-3" />
             {autoContinueLoading ? (
@@ -335,7 +357,6 @@ export function ControlBar({
             )}
           </button>
         </div>
-
       </div>
     </div>
   );

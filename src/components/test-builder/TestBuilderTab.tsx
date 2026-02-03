@@ -33,8 +33,15 @@ interface TestBuilderTabProps {
 }
 
 function TestBuilderContent({ onLog }: TestBuilderTabProps) {
-  const { selectedTest, state, setDirty, isDraftSelected, updateDraft, setCollectedAnalyses, startNewTest } =
-    useTestBuilder();
+  const {
+    selectedTest,
+    state,
+    setDirty,
+    isDraftSelected,
+    updateDraft,
+    setCollectedAnalyses,
+    startNewTest,
+  } = useTestBuilder();
 
   // Track the code in local state for the editor
   const [code, setCode] = useState("");

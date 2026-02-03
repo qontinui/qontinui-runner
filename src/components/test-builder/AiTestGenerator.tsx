@@ -8,8 +8,31 @@
 
 import { useState, useCallback, useMemo, useRef, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Sparkles, Loader2, RefreshCw, Check, X, Copy, Wand2, Info, Upload, FileText, Image as ImageIcon, Database, ChevronDown } from "lucide-react";
-import type { PageAnalysis, TestType, MultiRequestAnalysis, CollectedAnalysisSet, ReferenceDocument, ReferenceDocumentType, TaskRunSummary, WorkflowRunContext } from "./types";
+import {
+  Sparkles,
+  Loader2,
+  RefreshCw,
+  Check,
+  X,
+  Copy,
+  Wand2,
+  Info,
+  Upload,
+  FileText,
+  Image as ImageIcon,
+  Database,
+  ChevronDown,
+} from "lucide-react";
+import type {
+  PageAnalysis,
+  TestType,
+  MultiRequestAnalysis,
+  CollectedAnalysisSet,
+  ReferenceDocument,
+  ReferenceDocumentType,
+  TaskRunSummary,
+  WorkflowRunContext,
+} from "./types";
 import { logRender } from "../../utils/renderLogger";
 import { getStepOutputFromAnalysis } from "./types";
 import {
@@ -160,10 +183,11 @@ export function AiTestGenerator({
     const fetchRecentRuns = async () => {
       try {
         console.log("[AiTestGenerator] Fetching recent task runs...");
-        const response = await invoke<{ success: boolean; data?: TaskRunSummary[]; message?: string }>(
-          "list_recent_task_runs",
-          { limit: 20 }
-        );
+        const response = await invoke<{
+          success: boolean;
+          data?: TaskRunSummary[];
+          message?: string;
+        }>("list_recent_task_runs", { limit: 20 });
         console.log("[AiTestGenerator] Response:", response);
         if (response.success && response.data) {
           console.log("[AiTestGenerator] Setting recentTaskRuns:", response.data.length, "runs");
@@ -171,7 +195,7 @@ export function AiTestGenerator({
           // Log render with dropdown state
           logRender("AiTestGenerator", "task_runs_loaded", {
             task_run_count: response.data.length,
-            task_runs: response.data.map(r => ({
+            task_runs: response.data.map((r) => ({
               id: r.id,
               task_name: r.task_name,
               status: r.status,
@@ -180,7 +204,10 @@ export function AiTestGenerator({
             dropdown_has_options: response.data.length > 0,
           });
         } else {
-          console.warn("[AiTestGenerator] No data in response or not successful:", response.message);
+          console.warn(
+            "[AiTestGenerator] No data in response or not successful:",
+            response.message,
+          );
           // Log render with empty state
           logRender("AiTestGenerator", "task_runs_empty", {
             task_run_count: 0,
@@ -213,7 +240,7 @@ export function AiTestGenerator({
       try {
         const response = await invoke<{ success: boolean; data?: WorkflowRunContext }>(
           "get_workflow_run_context",
-          { taskRunId: selectedTaskRunId }
+          { taskRunId: selectedTaskRunId },
         );
         if (response.success && response.data) {
           setWorkflowRunContext(response.data);
@@ -227,7 +254,6 @@ export function AiTestGenerator({
     fetchContext();
   }, [selectedTaskRunId]);
 
-
   // Check if we have any analysis data - used for conditional rendering below
   const _hasAnalysis = analysis || multiRequestAnalysis || collectedAnalyses;
 
@@ -239,31 +265,31 @@ export function AiTestGenerator({
     const newDocs: ReferenceDocument[] = [];
 
     for (const file of Array.from(files)) {
-      const extension = file.name.split('.').pop()?.toLowerCase();
+      const extension = file.name.split(".").pop()?.toLowerCase();
       let docType: ReferenceDocumentType;
 
       // Determine document type from extension
-      if (extension === 'md' || extension === 'markdown') {
-        docType = 'markdown';
-      } else if (extension === 'json') {
-        docType = 'json';
-      } else if (['png', 'jpg', 'jpeg', 'gif', 'webp'].includes(extension || '')) {
-        docType = 'image';
+      if (extension === "md" || extension === "markdown") {
+        docType = "markdown";
+      } else if (extension === "json") {
+        docType = "json";
+      } else if (["png", "jpg", "jpeg", "gif", "webp"].includes(extension || "")) {
+        docType = "image";
       } else {
-        docType = 'text';
+        docType = "text";
       }
 
       try {
         let content: string;
 
-        if (docType === 'image') {
+        if (docType === "image") {
           // Read image as base64
           content = await new Promise<string>((resolve, reject) => {
             const reader = new FileReader();
             reader.onload = () => {
               const result = reader.result as string;
               // Extract base64 part (remove data:image/...;base64, prefix)
-              const base64 = result.split(',')[1] || result;
+              const base64 = result.split(",")[1] || result;
               resolve(base64);
             };
             reader.onerror = reject;
@@ -276,7 +302,7 @@ export function AiTestGenerator({
 
         newDocs.push({
           id: `doc-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
-          name: file.name.replace(/\.[^/.]+$/, ''), // Remove extension for display
+          name: file.name.replace(/\.[^/.]+$/, ""), // Remove extension for display
           type: docType,
           content,
           filename: file.name,
@@ -287,17 +313,17 @@ export function AiTestGenerator({
       }
     }
 
-    setReferenceDocuments(prev => [...prev, ...newDocs]);
+    setReferenceDocuments((prev) => [...prev, ...newDocs]);
 
     // Reset file input
     if (fileInputRef.current) {
-      fileInputRef.current.value = '';
+      fileInputRef.current.value = "";
     }
   }, []);
 
   // Remove a reference document
   const handleRemoveDocument = useCallback((docId: string) => {
-    setReferenceDocuments(prev => prev.filter(d => d.id !== docId));
+    setReferenceDocuments((prev) => prev.filter((d) => d.id !== docId));
   }, []);
 
   // Build element summary for the prompt (single page analysis)
@@ -431,15 +457,16 @@ export function AiTestGenerator({
                 collected_at: collectedAnalyses.collected_at,
               }
             : null,
-          reference_documents: referenceDocuments.length > 0
-            ? referenceDocuments.map((d) => ({
-                id: d.id,
-                name: d.name,
-                type: d.type,
-                content: d.content,
-                filename: d.filename,
-              }))
-            : null,
+          reference_documents:
+            referenceDocuments.length > 0
+              ? referenceDocuments.map((d) => ({
+                  id: d.id,
+                  name: d.name,
+                  type: d.type,
+                  content: d.content,
+                  filename: d.filename,
+                }))
+              : null,
           workflow_run_context: workflowRunContext,
         },
       });
@@ -454,7 +481,15 @@ export function AiTestGenerator({
     } finally {
       setIsGenerating(false);
     }
-  }, [prompt, analysis, multiRequestAnalysis, collectedAnalyses, referenceDocuments, workflowRunContext, testType]);
+  }, [
+    prompt,
+    analysis,
+    multiRequestAnalysis,
+    collectedAnalyses,
+    referenceDocuments,
+    workflowRunContext,
+    testType,
+  ]);
 
   // Accept generated code
   const handleAccept = useCallback(() => {
@@ -551,9 +586,7 @@ export function AiTestGenerator({
             {/* Prompt textarea with document upload */}
             <div className="flex-1 flex flex-col min-h-0">
               <div className="flex items-center justify-between mb-2">
-                <label className="text-xs text-neutral-400">
-                  Describe what you want to test
-                </label>
+                <label className="text-xs text-neutral-400">Describe what you want to test</label>
                 {/* Document upload button */}
                 <div className="flex items-center gap-2">
                   <input
@@ -596,7 +629,7 @@ export function AiTestGenerator({
                       key={doc.id}
                       className="flex items-center gap-1.5 px-2 py-1 bg-neutral-800 border border-neutral-700 rounded text-xs"
                     >
-                      {doc.type === 'image' ? (
+                      {doc.type === "image" ? (
                         <ImageIcon className="w-3 h-3 text-blue-400" />
                       ) : (
                         <FileText className="w-3 h-3 text-green-400" />
@@ -604,9 +637,7 @@ export function AiTestGenerator({
                       <span className="text-neutral-300 max-w-24 truncate" title={doc.filename}>
                         {doc.name}
                       </span>
-                      <span className="text-neutral-500">
-                        ({doc.type})
-                      </span>
+                      <span className="text-neutral-500">({doc.type})</span>
                       <button
                         onClick={() => handleRemoveDocument(doc.id)}
                         className="p-0.5 text-neutral-500 hover:text-red-400 transition-colors"
@@ -626,9 +657,7 @@ export function AiTestGenerator({
             {/* Workflow Run Context Selector */}
             <div className="mt-4">
               <div className="flex items-center justify-between mb-2">
-                <label className="text-xs text-neutral-400">
-                  Workflow Run Context
-                </label>
+                <label className="text-xs text-neutral-400">Workflow Run Context</label>
                 <button
                   onClick={() => setShowWorkflowSelector(!showWorkflowSelector)}
                   className="flex items-center gap-1 px-2 py-1 text-xs bg-neutral-800 text-neutral-300 rounded hover:bg-neutral-700 transition-colors border border-neutral-700"
@@ -636,7 +665,9 @@ export function AiTestGenerator({
                 >
                   <Database className="w-3 h-3" />
                   {selectedTaskRunId ? "Change Run" : "Add Run Data"}
-                  <ChevronDown className={`w-3 h-3 transition-transform ${showWorkflowSelector ? "rotate-180" : ""}`} />
+                  <ChevronDown
+                    className={`w-3 h-3 transition-transform ${showWorkflowSelector ? "rotate-180" : ""}`}
+                  />
                 </button>
               </div>
 
@@ -681,15 +712,41 @@ export function AiTestGenerator({
                     </button>
                   </div>
                   <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-neutral-500">
-                    <span>Status: <span className="text-neutral-400">{workflowRunContext.task_run.status}</span></span>
-                    <span>Screenshots: <span className="text-neutral-400">{workflowRunContext.screenshots.length}</span></span>
-                    <span>API Requests: <span className="text-neutral-400">{workflowRunContext.api_requests.length}</span></span>
-                    <span>Events: <span className="text-neutral-400">{workflowRunContext.events.length}</span></span>
+                    <span>
+                      Status:{" "}
+                      <span className="text-neutral-400">{workflowRunContext.task_run.status}</span>
+                    </span>
+                    <span>
+                      Screenshots:{" "}
+                      <span className="text-neutral-400">
+                        {workflowRunContext.screenshots.length}
+                      </span>
+                    </span>
+                    <span>
+                      API Requests:{" "}
+                      <span className="text-neutral-400">
+                        {workflowRunContext.api_requests.length}
+                      </span>
+                    </span>
+                    <span>
+                      Events:{" "}
+                      <span className="text-neutral-400">{workflowRunContext.events.length}</span>
+                    </span>
                     {workflowRunContext.automation && (
-                      <span>Automation: <span className="text-neutral-400">{workflowRunContext.automation.automation_status}</span></span>
+                      <span>
+                        Automation:{" "}
+                        <span className="text-neutral-400">
+                          {workflowRunContext.automation.automation_status}
+                        </span>
+                      </span>
                     )}
                     {workflowRunContext.knowledge.length > 0 && (
-                      <span>Findings: <span className="text-neutral-400">{workflowRunContext.knowledge.length}</span></span>
+                      <span>
+                        Findings:{" "}
+                        <span className="text-neutral-400">
+                          {workflowRunContext.knowledge.length}
+                        </span>
+                      </span>
                     )}
                   </div>
                   {workflowRunContext.task_run.summary && (
@@ -728,10 +785,7 @@ export function AiTestGenerator({
                 </label>
                 <div className="max-h-32 overflow-y-auto p-2 bg-neutral-800/50 rounded text-xs">
                   {stepOutputDetails.map((detail) => (
-                    <div
-                      key={detail.id}
-                      className="flex items-center gap-2 py-1 text-neutral-400"
-                    >
+                    <div key={detail.id} className="flex items-center gap-2 py-1 text-neutral-400">
                       <span
                         className={`w-2 h-2 rounded-full ${
                           detail.success ? "bg-green-500" : "bg-red-500"

@@ -440,7 +440,10 @@ export function UserInputPanel({
       </div>
 
       {/* Questions List */}
-      <div data-ui-id="findings-questions-list" className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3">
+      <div
+        data-ui-id="findings-questions-list"
+        className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3"
+      >
         {findingsNeedingInput.map((finding) => (
           <QuestionCard
             key={finding.id}

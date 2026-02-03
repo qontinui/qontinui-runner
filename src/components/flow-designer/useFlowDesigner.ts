@@ -65,9 +65,7 @@ export function useUndoRedo<T>(initialValue: T): UseUndoRedoResult<T> {
     setState((prev) => {
       const currentValue = prev.history[prev.currentIndex];
       const resolvedValue =
-        typeof newValue === "function"
-          ? (newValue as (prev: T) => T)(currentValue)
-          : newValue;
+        typeof newValue === "function" ? (newValue as (prev: T) => T)(currentValue) : newValue;
 
       // Don't add to history if value hasn't changed (deep compare via JSON)
       try {
@@ -101,9 +99,7 @@ export function useUndoRedo<T>(initialValue: T): UseUndoRedoResult<T> {
     setState((prev) => {
       const currentValue = prev.history[prev.currentIndex];
       const resolvedValue =
-        typeof newValue === "function"
-          ? (newValue as (prev: T) => T)(currentValue)
-          : newValue;
+        typeof newValue === "function" ? (newValue as (prev: T) => T)(currentValue) : newValue;
 
       // Replace current state in history without adding new entry
       const newHistory = [...prev.history];
@@ -166,7 +162,7 @@ export function useUndoRedoKeyboard(
   redo: () => void,
   canUndo: boolean,
   canRedo: boolean,
-  enabled: boolean = true
+  enabled: boolean = true,
 ) {
   useEffect(() => {
     if (!enabled) return;
@@ -233,7 +229,7 @@ interface UseAutosaveResult {
 export function useAutosave<T>(
   value: T,
   saveFn: (value: T) => Promise<void>,
-  options: UseAutosaveOptions = {}
+  options: UseAutosaveOptions = {},
 ): UseAutosaveResult {
   const {
     delayMs = DEFAULT_AUTOSAVE_DELAY_MS,

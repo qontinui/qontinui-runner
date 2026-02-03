@@ -283,6 +283,8 @@ export interface CreateCheckGroupInput {
   run_in_parallel?: boolean;
   stop_on_failure?: boolean;
   tags?: string[];
+  /** Check IDs to add to the group during creation */
+  check_ids?: string[];
 }
 
 // Input for updating an existing check group

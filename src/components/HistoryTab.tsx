@@ -4,6 +4,7 @@
  * Unified history view showing both GUI automation runs and AI task runs.
  * Provides a comprehensive view of all automation activity with filtering
  * and search capabilities.
+ * Uses virtual scrolling for large run lists (100+ items) to maintain performance.
  *
  * Features:
  * - Combined timeline of GUI and AI runs
@@ -11,9 +12,10 @@
  * - Filter by status (Success/Failed/All)
  * - Search by name
  * - Click to view run details
+ * - Virtual scrolling for large history lists
  */
 
-import { useState, useEffect, useMemo, useCallback } from "react";
+import { useState, useEffect, useMemo, useCallback, type CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   History,
@@ -32,6 +34,12 @@ import {
 } from "lucide-react";
 import { getAccentColors, getStatusColors } from "@/design-system";
 import type { RunDetails, TieredInfoResponse } from "../types/statistics";
+import { FixedVirtualList } from "./ui";
+
+/** Threshold for switching to virtual scrolling */
+const VIRTUAL_SCROLL_THRESHOLD = 100;
+/** Height of each run row in pixels */
+const RUN_ROW_HEIGHT = 72;
 
 // Storage key for filter preferences
 const STORAGE_KEY_FILTER = "historyTab.filter";
@@ -433,7 +441,7 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps)
       </div>
 
       {/* Run list */}
-      <div className="flex-1 overflow-y-auto">
+      <div className="flex-1 overflow-hidden">
         {loading && filteredRuns.length === 0 ? (
           <div className="text-center py-8 text-muted-foreground">Loading...</div>
         ) : error ? (
@@ -448,8 +456,103 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps)
                 : "Start an automation to see history"}
             </p>
           </div>
+        ) : filteredRuns.length > VIRTUAL_SCROLL_THRESHOLD ? (
+          /* Virtual scrolling for large lists */
+          <FixedVirtualList
+            items={filteredRuns}
+            itemHeight={RUN_ROW_HEIGHT}
+            renderItem={(run: UnifiedRun, _index: number, style: CSSProperties) => (
+              <div style={style} className="px-1 py-1">
+                <div
+                  className={`card p-3 flex items-center gap-3 hover:bg-muted/30 transition-colors cursor-pointer ${
+                    selectedRuns.has(run.id) ? "ring-2 ring-primary" : ""
+                  }`}
+                  onClick={() => toggleSelection(run.id)}
+                >
+                  {/* Type indicator */}
+                  <div
+                    className={`p-2 rounded-lg ${
+                      run.type === "gui" ? getAccentColors("blue").bg : getAccentColors("purple").bg
+                    }`}
+                  >
+                    {run.type === "gui" ? (
+                      <Monitor className={`w-4 h-4 ${getAccentColors("blue").text}`} />
+                    ) : (
+                      <Bot className={`w-4 h-4 ${getAccentColors("purple").text}`} />
+                    )}
+                  </div>
+
+                  {/* Status icon */}
+                  {run.success === true ? (
+                    <CheckCircle
+                      className={`w-4 h-4 ${getStatusColors("success").text} flex-shrink-0`}
+                    />
+                  ) : run.success === false ? (
+                    <XCircle className={`w-4 h-4 ${getStatusColors("error").text} flex-shrink-0`} />
+                  ) : run.status === "running" ? (
+                    <Clock
+                      className={`w-4 h-4 ${getAccentColors("blue").text} animate-pulse flex-shrink-0`}
+                    />
+                  ) : (
+                    <AlertTriangle
+                      className={`w-4 h-4 ${getAccentColors("yellow").text} flex-shrink-0`}
+                    />
+                  )}
+
+                  {/* Run info */}
+                  <div className="flex-1 min-w-0">
+                    <div className="font-medium truncate">{run.name}</div>
+                    <div className="text-xs text-muted-foreground flex items-center gap-2">
+                      <Calendar className="w-3 h-3" />
+                      {formatTime(run.startedAt)}
+                      {run.durationMs && (
+                        <>
+                          <span className="text-muted-foreground/50">|</span>
+                          <Clock className="w-3 h-3" />
+                          {formatDuration(run.durationMs)}
+                        </>
+                      )}
+                      {run.loopCount !== undefined && run.loopCount > 0 && (
+                        <>
+                          <span className="text-muted-foreground/50">|</span>
+                          {run.loopCount} loops
+                        </>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Error preview */}
+                  {run.error && (
+                    <div
+                      className={`text-xs ${getStatusColors("error").text} max-w-[200px] truncate`}
+                    >
+                      {run.error}
+                    </div>
+                  )}
+
+                  {/* Actions */}
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (run.type === "gui") {
+                        onNavigateToRun();
+                      } else {
+                        onNavigateToAi();
+                      }
+                    }}
+                    className="p-1 rounded hover:bg-muted"
+                  >
+                    <ChevronRight className="w-4 h-4 text-muted-foreground" />
+                  </button>
+                </div>
+              </div>
+            )}
+            getItemKey={(run: UnifiedRun) => run.id}
+            overscanCount={10}
+          />
         ) : (
-          <div className="space-y-2">
+          /* Regular scrolling for small lists */
+          <div className="space-y-2 overflow-y-auto h-full">
             {filteredRuns.map((run) => (
               <div
                 key={run.id}

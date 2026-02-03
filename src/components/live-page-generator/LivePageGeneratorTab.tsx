@@ -184,7 +184,7 @@ function loadPersistedState(): Partial<PersistedState> {
         parsed.explorationLog = parsed.explorationLog.map((log: FlowStep) =>
           log.status === "running"
             ? { ...log, status: "error" as const, error: "Session was interrupted" }
-            : log
+            : log,
         );
       }
       return parsed;
@@ -216,7 +216,9 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
   // Instructions state (with persistence)
   const [instructions, setInstructions] = useState(persistedState.instructions ?? "");
   const [expectedResults, setExpectedResults] = useState(persistedState.expectedResults ?? "");
-  const [agenticInstructions, setAgenticInstructions] = useState(persistedState.agenticInstructions ?? "");
+  const [agenticInstructions, setAgenticInstructions] = useState(
+    persistedState.agenticInstructions ?? "",
+  );
 
   // Generation state
   const [isGenerating, setIsGenerating] = useState(false);
@@ -243,14 +245,14 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
   const [flowPrompt, setFlowPrompt] = useState(persistedState.flowPrompt ?? "");
   const [isExploring, setIsExploring] = useState(false);
   const [explorationLog, setExplorationLog] = useState<FlowStep[]>(
-    persistedState.explorationLog ?? []
+    persistedState.explorationLog ?? [],
   );
   const [multiPageContext, setMultiPageContext] = useState<MultiPageContext | null>(
-    persistedState.multiPageContext ?? null
+    persistedState.multiPageContext ?? null,
   );
   const [flowError, setFlowError] = useState<string | null>(null);
   const [selectedPageIndex, setSelectedPageIndex] = useState<number | null>(
-    persistedState.selectedPageIndex ?? null
+    persistedState.selectedPageIndex ?? null,
   );
 
   // Tree expansion state for captured pages
@@ -272,7 +274,15 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
     } catch (e) {
       console.error("[LivePageGenerator] Failed to persist state:", e);
     }
-  }, [flowPrompt, instructions, expectedResults, agenticInstructions, multiPageContext, explorationLog, selectedPageIndex]);
+  }, [
+    flowPrompt,
+    instructions,
+    expectedResults,
+    agenticInstructions,
+    multiPageContext,
+    explorationLog,
+    selectedPageIndex,
+  ]);
 
   // Use the live browser hook
   const {
@@ -297,17 +307,15 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
 
   // Convert elements to ExternalElement format for UI Bridge panels
   // DiscoveredElement and ExternalElement are structurally compatible
-  const externalElements = useMemo(() =>
-    elements as unknown as ExternalElement[],
-    [elements]
-  );
+  const externalElements = useMemo(() => elements as unknown as ExternalElement[], [elements]);
 
   // Get selected element for UI Bridge panels
-  const selectedElement = useMemo(() =>
-    selectedElementId
-      ? externalElements.find(el => el.id === selectedElementId) ?? null
-      : null,
-    [externalElements, selectedElementId]
+  const selectedElement = useMemo(
+    () =>
+      selectedElementId
+        ? (externalElements.find((el) => el.id === selectedElementId) ?? null)
+        : null,
+    [externalElements, selectedElementId],
   );
 
   // Create page context for ElementDescriptionPanel
@@ -326,7 +334,7 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
     async (
       elementId: string,
       action: string,
-      params?: Record<string, unknown>
+      params?: Record<string, unknown>,
     ): Promise<CommandResult> => {
       try {
         await executeAction(elementId, action, params);
@@ -334,11 +342,11 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
       } catch (error) {
         return {
           success: false,
-          error: error instanceof Error ? error.message : "Action failed"
+          error: error instanceof Error ? error.message : "Action failed",
         };
       }
     },
-    [executeAction]
+    [executeAction],
   );
 
   // Wrapper for selectElement that matches expected signature
@@ -346,7 +354,7 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
     (elementId: string | null) => {
       selectElement(elementId);
     },
-    [selectElement]
+    [selectElement],
   );
 
   // Refresh targets on mount
@@ -382,7 +390,7 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
         onLog?.("error", `Failed to connect to tab: ${error}`);
       }
     },
-    [connectToTab, onLog]
+    [connectToTab, onLog],
   );
 
   // Handle device selection
@@ -397,7 +405,7 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
         onLog?.("error", `Failed to connect to device: ${error}`);
       }
     },
-    [connectToMobile, onLog]
+    [connectToMobile, onLog],
   );
 
   // Handle target click from unified list
@@ -413,7 +421,7 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
         if (device) handleSelectDevice(device);
       }
     },
-    [browserTabs, mobileDevices, handleSelectTab, handleSelectDevice]
+    [browserTabs, mobileDevices, handleSelectTab, handleSelectDevice],
   );
 
   // Capture UI Bridge context from connected target
@@ -440,7 +448,10 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
         })),
       };
       setUiBridgeContext(context);
-      onLog?.("success", `Captured context: ${elements.length} elements from ${connectedTarget?.name}`);
+      onLog?.(
+        "success",
+        `Captured context: ${elements.length} elements from ${connectedTarget?.name}`,
+      );
     } catch (error) {
       onLog?.("error", `Failed to capture context: ${error}`);
     } finally {
@@ -507,7 +518,10 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
         }),
       });
 
-      let tabInfo = { url: connectedTarget?.url || "unknown", title: connectedTarget?.name || "Unknown" };
+      let tabInfo = {
+        url: connectedTarget?.url || "unknown",
+        title: connectedTarget?.name || "Unknown",
+      };
       if (tabResponse.ok) {
         const tabData = await tabResponse.json();
         if (tabData.success && tabData.data) {
@@ -609,7 +623,12 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
       stepNum++;
       setExplorationLog((prev) => [
         ...prev,
-        { step: stepNum, action: "capture", description: "Capturing initial page", status: "running" },
+        {
+          step: stepNum,
+          action: "capture",
+          description: "Capturing initial page",
+          status: "running",
+        },
       ]);
 
       const initialCapture = await captureCurrentPage();
@@ -622,9 +641,13 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
       setExplorationLog((prev) =>
         prev.map((l) =>
           l.step === stepNum
-            ? { ...l, status: "completed", description: `Captured ${initialCapture.elements.length} elements from ${initialCapture.title}` }
-            : l
-        )
+            ? {
+                ...l,
+                status: "completed",
+                description: `Captured ${initialCapture.elements.length} elements from ${initialCapture.title}`,
+              }
+            : l,
+        ),
       );
       onLog?.("success", `Captured initial page: ${initialCapture.elements.length} elements`);
 
@@ -639,7 +662,12 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
 
         setExplorationLog((prev) => [
           ...prev,
-          { step: stepNum, action: "ai_decision", description: "AI analyzing page...", status: "running" },
+          {
+            step: stepNum,
+            action: "ai_decision",
+            description: "AI analyzing page...",
+            status: "running",
+          },
         ]);
 
         const aiResult = await invoke<{
@@ -660,7 +688,11 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
             current_elements: currentCapture.elements,
             current_url: currentCapture.url,
             current_title: currentCapture.title,
-            captured_pages: captures.map((c) => ({ url: c.url, title: c.title, element_count: c.elements.length })),
+            captured_pages: captures.map((c) => ({
+              url: c.url,
+              title: c.title,
+              element_count: c.elements.length,
+            })),
             step_number: stepNum,
           },
         });
@@ -675,8 +707,8 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
           prev.map((l) =>
             l.step === stepNum
               ? { ...l, description: `AI: ${aiAction.reason}`, status: "completed" }
-              : l
-          )
+              : l,
+          ),
         );
 
         if (aiAction.action === "done") {
@@ -690,8 +722,8 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
           aiAction.action === "click"
             ? `Clicking: ${aiAction.element_description || aiAction.element_id}`
             : aiAction.action === "type"
-            ? `Typing "${aiAction.text}" into ${aiAction.element_description || aiAction.element_id}`
-            : `Waiting ${aiAction.wait_ms}ms`;
+              ? `Typing "${aiAction.text}" into ${aiAction.element_description || aiAction.element_id}`
+              : `Waiting ${aiAction.wait_ms}ms`;
 
         setExplorationLog((prev) => [
           ...prev,
@@ -712,14 +744,19 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
           }
 
           setExplorationLog((prev) =>
-            prev.map((l) => (l.step === stepNum ? { ...l, status: "completed" } : l))
+            prev.map((l) => (l.step === stepNum ? { ...l, status: "completed" } : l)),
           );
 
           if (aiAction.should_capture_after) {
             stepNum++;
             setExplorationLog((prev) => [
               ...prev,
-              { step: stepNum, action: "capture", description: "Capturing page after action", status: "running" },
+              {
+                step: stepNum,
+                action: "capture",
+                description: "Capturing page after action",
+                status: "running",
+              },
             ]);
 
             await executeWait(1000);
@@ -738,8 +775,8 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
                   prev.map((l) =>
                     l.step === stepNum
                       ? { ...l, status: "completed", description: "Skipped duplicate capture" }
-                      : l
-                  )
+                      : l,
+                  ),
                 );
               } else {
                 newCapture.stepIndex = captures.length;
@@ -748,18 +785,25 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
                 setExplorationLog((prev) =>
                   prev.map((l) =>
                     l.step === stepNum
-                      ? { ...l, status: "completed", description: `Captured ${newCapture.elements.length} elements from ${newCapture.title}` }
-                      : l
-                  )
+                      ? {
+                          ...l,
+                          status: "completed",
+                          description: `Captured ${newCapture.elements.length} elements from ${newCapture.title}`,
+                        }
+                      : l,
+                  ),
                 );
-                onLog?.("success", `Captured page: ${newCapture.elements.length} elements from ${newCapture.title}`);
+                onLog?.(
+                  "success",
+                  `Captured page: ${newCapture.elements.length} elements from ${newCapture.title}`,
+                );
               }
             }
           }
         } catch (actionError) {
           const errorMsg = actionError instanceof Error ? actionError.message : String(actionError);
           setExplorationLog((prev) =>
-            prev.map((l) => (l.step === stepNum ? { ...l, status: "error", error: errorMsg } : l))
+            prev.map((l) => (l.step === stepNum ? { ...l, status: "error", error: errorMsg } : l)),
           );
           throw new Error(`Action failed: ${errorMsg}`);
         }
@@ -771,27 +815,22 @@ export function LivePageGeneratorTab({ onLog, onNavigateToLibrary }: LivePageGen
           pages: captures,
           totalElements,
         });
-        onLog?.("success", `Exploration complete: ${captures.length} page(s), ${totalElements} elements`);
+        onLog?.(
+          "success",
+          `Exploration complete: ${captures.length} page(s), ${totalElements} elements`,
+        );
       }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       setFlowError(errorMsg);
       setExplorationLog((prev) =>
-        prev.map((l) =>
-          l.status === "running"
-            ? { ...l, status: "error", error: errorMsg }
-            : l
-        )
+        prev.map((l) => (l.status === "running" ? { ...l, status: "error", error: errorMsg } : l)),
       );
       onLog?.("error", `Exploration failed: ${errorMsg}`);
     } finally {
       setIsExploring(false);
       setExplorationLog((prev) =>
-        prev.map((l) =>
-          l.status === "running"
-            ? { ...l, status: "completed" }
-            : l
-        )
+        prev.map((l) => (l.status === "running" ? { ...l, status: "completed" } : l)),
       );
     }
   }, [
@@ -881,7 +920,8 @@ ${agenticInstructions || "Fix any issues identified by the test failures."}`;
         input: {
           user_prompt: fullPrompt,
           page_context: pageContextForAI,
-          context_ids: contextSelection.selectedIds.length > 0 ? contextSelection.selectedIds : null,
+          context_ids:
+            contextSelection.selectedIds.length > 0 ? contextSelection.selectedIds : null,
         },
       });
 
@@ -906,7 +946,15 @@ ${agenticInstructions || "Fix any issues identified by the test failures."}`;
     } finally {
       setIsGenerating(false);
     }
-  }, [instructions, expectedResults, agenticInstructions, uiBridgeContext, multiPageContext, contextSelection.selectedIds, onLog]);
+  }, [
+    instructions,
+    expectedResults,
+    agenticInstructions,
+    uiBridgeContext,
+    multiPageContext,
+    contextSelection.selectedIds,
+    onLog,
+  ]);
 
   // Save verification test to library
   const handleSaveTest = useCallback(async () => {
@@ -984,7 +1032,7 @@ ${agenticInstructions || "Fix any issues identified by the test failures."}`;
         onLog?.("error", "Failed to copy to clipboard");
       }
     },
-    [onLog]
+    [onLog],
   );
 
   // Build tree from multi-page context
@@ -999,9 +1047,13 @@ ${agenticInstructions || "Fix any issues identified by the test failures."}`;
         id: `page-${idx}-el-${elIdx}`,
         name: el.text?.slice(0, 30) || el.label?.slice(0, 30) || el.id,
         type: "element" as const,
-        icon: (el.tagName.toLowerCase() === "input" ? "input" :
-               el.tagName.toLowerCase() === "button" ? "button" :
-               el.tagName.toLowerCase() === "img" ? "image" : "text") as "input" | "button" | "image" | "text",
+        icon: (el.tagName.toLowerCase() === "input"
+          ? "input"
+          : el.tagName.toLowerCase() === "button"
+            ? "button"
+            : el.tagName.toLowerCase() === "img"
+              ? "image"
+              : "text") as "input" | "button" | "image" | "text",
       })),
     }));
   }, [multiPageContext]);
@@ -1068,17 +1120,21 @@ ${agenticInstructions || "Fix any issues identified by the test failures."}`;
           </div>
           <div className="border-t border-border px-4 py-2">
             <div className="flex items-center gap-2">
-              <span className={cn(
-                "h-2 w-2 rounded-full",
-                isExtensionConnected ? "bg-brand-success animate-pulse" : "bg-text-muted"
-              )} />
+              <span
+                className={cn(
+                  "h-2 w-2 rounded-full",
+                  isExtensionConnected ? "bg-brand-success animate-pulse" : "bg-text-muted",
+                )}
+              />
               <span className="text-xs text-text-muted">
                 {isExtensionConnected ? "Extension Connected" : "Extension Not Connected"}
               </span>
-              <Plug className={cn(
-                "ml-auto h-3 w-3",
-                isExtensionConnected ? "text-brand-success" : "text-text-muted"
-              )} />
+              <Plug
+                className={cn(
+                  "ml-auto h-3 w-3",
+                  isExtensionConnected ? "text-brand-success" : "text-text-muted",
+                )}
+              />
             </div>
           </div>
         </div>
@@ -1091,7 +1147,7 @@ ${agenticInstructions || "Fix any issues identified by the test failures."}`;
               "flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
               leftPanelTab === "flow"
                 ? "bg-brand-primary/10 text-brand-primary"
-                : "text-text-muted hover:bg-surface-hover hover:text-text-primary"
+                : "text-text-muted hover:bg-surface-hover hover:text-text-primary",
             )}
           >
             <Workflow className="h-3.5 w-3.5" />
@@ -1103,7 +1159,7 @@ ${agenticInstructions || "Fix any issues identified by the test failures."}`;
               "flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
               leftPanelTab === "context"
                 ? "bg-brand-primary/10 text-brand-primary"
-                : "text-text-muted hover:bg-surface-hover hover:text-text-primary"
+                : "text-text-muted hover:bg-surface-hover hover:text-text-primary",
             )}
           >
             <Layers className="h-3.5 w-3.5" />
@@ -1115,7 +1171,7 @@ ${agenticInstructions || "Fix any issues identified by the test failures."}`;
               "flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
               leftPanelTab === "search"
                 ? "bg-brand-primary/10 text-brand-primary"
-                : "text-text-muted hover:bg-surface-hover hover:text-text-primary"
+                : "text-text-muted hover:bg-surface-hover hover:text-text-primary",
             )}
           >
             <Search className="h-3.5 w-3.5" />
@@ -1127,7 +1183,7 @@ ${agenticInstructions || "Fix any issues identified by the test failures."}`;
               "flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
               leftPanelTab === "describe"
                 ? "bg-brand-primary/10 text-brand-primary"
-                : "text-text-muted hover:bg-surface-hover hover:text-text-primary"
+                : "text-text-muted hover:bg-surface-hover hover:text-text-primary",
             )}
           >
             <Bot className="h-3.5 w-3.5" />
@@ -1139,7 +1195,7 @@ ${agenticInstructions || "Fix any issues identified by the test failures."}`;
               "flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
               leftPanelTab === "nl"
                 ? "bg-brand-primary/10 text-brand-primary"
-                : "text-text-muted hover:bg-surface-hover hover:text-text-primary"
+                : "text-text-muted hover:bg-surface-hover hover:text-text-primary",
             )}
           >
             <MessageSquare className="h-3.5 w-3.5" />
@@ -1174,22 +1230,29 @@ ${agenticInstructions || "Fix any issues identified by the test failures."}`;
                   <div className="absolute left-6 top-4 bottom-4 w-px bg-border" />
                   <div className="space-y-2">
                     {explorationLog.map((step) => {
-                      const IconComponent = flowIconMap[step.action as keyof typeof flowIconMap] || Bot;
+                      const IconComponent =
+                        flowIconMap[step.action as keyof typeof flowIconMap] || Bot;
                       return (
                         <div key={step.step} className="relative flex items-start gap-3 pl-2">
-                          <div className={cn(
-                            "relative z-10 flex h-6 w-6 items-center justify-center rounded-full border bg-surface-raised",
-                            step.status === "running" ? "border-brand-primary" :
-                            step.status === "completed" ? "border-brand-success" :
-                            "border-error"
-                          )}>
+                          <div
+                            className={cn(
+                              "relative z-10 flex h-6 w-6 items-center justify-center rounded-full border bg-surface-raised",
+                              step.status === "running"
+                                ? "border-brand-primary"
+                                : step.status === "completed"
+                                  ? "border-brand-success"
+                                  : "border-error",
+                            )}
+                          >
                             {step.status === "running" ? (
                               <Loader2 className="h-3 w-3 animate-spin text-brand-primary" />
                             ) : (
-                              <IconComponent className={cn(
-                                "h-3 w-3",
-                                step.status === "completed" ? "text-brand-primary" : "text-error"
-                              )} />
+                              <IconComponent
+                                className={cn(
+                                  "h-3 w-3",
+                                  step.status === "completed" ? "text-brand-primary" : "text-error",
+                                )}
+                              />
                             )}
                           </div>
                           <div className="flex flex-1 items-center justify-between">
@@ -1197,10 +1260,12 @@ ${agenticInstructions || "Fix any issues identified by the test failures."}`;
                               <span className="mr-1.5 text-xs font-medium text-text-muted">
                                 {step.step}.
                               </span>
-                              <span className={cn(
-                                "text-xs",
-                                step.status === "error" ? "text-error" : "text-text-secondary"
-                              )}>
+                              <span
+                                className={cn(
+                                  "text-xs",
+                                  step.status === "error" ? "text-error" : "text-text-secondary",
+                                )}
+                              >
                                 {step.description}
                               </span>
                             </div>
@@ -1324,6 +1389,7 @@ ${agenticInstructions || "Fix any issues identified by the test failures."}`;
                 onSelectElement={handleSelectElement}
                 onHighlightElement={highlightElement}
                 onExecuteAction={handleExecuteActionWithResult}
+                pageContext={pageContext}
                 disabled={connectionStatus !== "connected"}
               />
             </div>
@@ -1343,7 +1409,7 @@ ${agenticInstructions || "Fix any issues identified by the test failures."}`;
               "flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
               rightPanelTab === "definition"
                 ? "bg-brand-secondary/10 text-brand-secondary"
-                : "text-text-muted hover:bg-surface-hover hover:text-text-primary"
+                : "text-text-muted hover:bg-surface-hover hover:text-text-primary",
             )}
           >
             <FileText className="h-3.5 w-3.5" />
@@ -1355,7 +1421,7 @@ ${agenticInstructions || "Fix any issues identified by the test failures."}`;
               "flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
               rightPanelTab === "output"
                 ? "bg-brand-success/10 text-brand-success"
-                : "text-text-muted hover:bg-surface-hover hover:text-text-primary"
+                : "text-text-muted hover:bg-surface-hover hover:text-text-primary",
             )}
           >
             <Code className="h-3.5 w-3.5" />
@@ -1470,7 +1536,7 @@ ${agenticInstructions || "Fix any issues identified by the test failures."}`;
                         "flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
                         outputSubTab === "python"
                           ? "bg-brand-success/10 text-brand-success"
-                          : "text-text-muted hover:bg-surface-hover hover:text-text-primary"
+                          : "text-text-muted hover:bg-surface-hover hover:text-text-primary",
                       )}
                     >
                       <FileCode className="h-3.5 w-3.5" />
@@ -1482,7 +1548,7 @@ ${agenticInstructions || "Fix any issues identified by the test failures."}`;
                         "flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
                         outputSubTab === "agentic"
                           ? "bg-brand-secondary/10 text-brand-secondary"
-                          : "text-text-muted hover:bg-surface-hover hover:text-text-primary"
+                          : "text-text-muted hover:bg-surface-hover hover:text-text-primary",
                       )}
                     >
                       <FileCode className="h-3.5 w-3.5" />
@@ -1493,10 +1559,12 @@ ${agenticInstructions || "Fix any issues identified by the test failures."}`;
                   {/* Code Block */}
                   <div className="flex-1 overflow-auto p-3">
                     <pre className="h-full rounded-lg border border-border bg-surface-raised p-4 text-xs leading-relaxed overflow-auto">
-                      <code className={cn(
-                        "font-mono",
-                        outputSubTab === "python" ? "text-brand-success" : "text-brand-secondary"
-                      )}>
+                      <code
+                        className={cn(
+                          "font-mono",
+                          outputSubTab === "python" ? "text-brand-success" : "text-brand-secondary",
+                        )}
+                      >
                         {outputSubTab === "python"
                           ? generatedContent.verificationTest || "(No test code generated)"
                           : generatedContent.agenticStep || "(No agentic step generated)"}
@@ -1508,12 +1576,16 @@ ${agenticInstructions || "Fix any issues identified by the test failures."}`;
                   <div className="flex gap-2 border-t border-border p-3">
                     <button
                       onClick={outputSubTab === "python" ? handleSaveTest : handleSaveTask}
-                      disabled={outputSubTab === "python" ? (isSavingTest || !!savedTestId) : (isSavingTask || !!savedTaskId)}
+                      disabled={
+                        outputSubTab === "python"
+                          ? isSavingTest || !!savedTestId
+                          : isSavingTask || !!savedTaskId
+                      }
                       className={cn(
                         "flex-1 flex items-center justify-center gap-2 rounded-lg py-2 text-sm font-medium transition-colors",
                         (outputSubTab === "python" ? savedTestId : savedTaskId)
                           ? "bg-brand-success/20 text-brand-success"
-                          : "bg-surface-hover text-text-primary hover:bg-surface-active"
+                          : "bg-surface-hover text-text-primary hover:bg-surface-active",
                       )}
                     >
                       {(outputSubTab === "python" ? isSavingTest : isSavingTask) ? (
@@ -1523,15 +1595,19 @@ ${agenticInstructions || "Fix any issues identified by the test failures."}`;
                       ) : (
                         <Save className="h-4 w-4" />
                       )}
-                      {(outputSubTab === "python" ? savedTestId : savedTaskId) ? "Saved" : "Save to Library"}
+                      {(outputSubTab === "python" ? savedTestId : savedTaskId)
+                        ? "Saved"
+                        : "Save to Library"}
                     </button>
                     <button
-                      onClick={() => copyToClipboard(
-                        outputSubTab === "python"
-                          ? generatedContent.verificationTest
-                          : generatedContent.agenticStep,
-                        outputSubTab === "python" ? "Test code" : "Agentic prompt"
-                      )}
+                      onClick={() =>
+                        copyToClipboard(
+                          outputSubTab === "python"
+                            ? generatedContent.verificationTest
+                            : generatedContent.agenticStep,
+                          outputSubTab === "python" ? "Test code" : "Agentic prompt",
+                        )
+                      }
                       className="flex items-center justify-center gap-2 px-4 rounded-lg bg-surface-hover text-text-primary hover:bg-surface-active transition-colors"
                     >
                       <Copy className="h-4 w-4" />
@@ -1558,7 +1634,8 @@ ${agenticInstructions || "Fix any issues identified by the test failures."}`;
                     <Bot className="w-12 h-12 mx-auto mb-3 opacity-30" />
                     <h3 className="text-base font-medium mb-1">No Output Yet</h3>
                     <p className="text-sm">
-                      Fill in the test definition and click "Generate Assets" to create test code and agentic steps.
+                      Fill in the test definition and click "Generate Assets" to create test code
+                      and agentic steps.
                     </p>
                   </div>
                 </div>
@@ -1635,7 +1712,7 @@ function TreeItem({ node, expanded, onToggle, onSelect, isSelected, depth = 0 }:
         className={cn(
           "w-full flex items-center gap-2 rounded-md px-2 py-1.5 transition-colors hover:bg-surface-hover text-left",
           depth > 0 && "ml-4",
-          isSelected && node.type === "page" && "bg-brand-primary/10"
+          isSelected && node.type === "page" && "bg-brand-primary/10",
         )}
       >
         {hasChildren ? (
@@ -1660,7 +1737,7 @@ function TreeItem({ node, expanded, onToggle, onSelect, isSelected, depth = 0 }:
         <span
           className={cn(
             "text-sm flex-1 truncate",
-            node.type === "page" ? "text-text-primary font-medium" : "text-text-muted"
+            node.type === "page" ? "text-text-primary font-medium" : "text-text-muted",
           )}
         >
           {node.name}

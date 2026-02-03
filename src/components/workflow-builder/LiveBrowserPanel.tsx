@@ -38,7 +38,12 @@ import {
   Zap,
 } from "lucide-react";
 import { useLiveBrowser, type DiscoveredElement } from "../../hooks/useLiveBrowser";
-import type { UnifiedStep, WorkflowPhase, VerificationStep, PromptStep } from "../../types/unified-workflow";
+import type {
+  UnifiedStep,
+  WorkflowPhase,
+  VerificationStep,
+  PromptStep,
+} from "../../types/unified-workflow";
 import { generateStepId } from "../../types";
 
 // =============================================================================
@@ -51,7 +56,10 @@ interface LiveBrowserPanelProps {
   /** Function to add a step to the workflow */
   addStep: (step: UnifiedStep, phase: WorkflowPhase) => void;
   /** Callback when steps are added */
-  onStepsAdded?: (steps: { verificationSteps: VerificationStep[]; agenticStep: PromptStep | null }) => void;
+  onStepsAdded?: (steps: {
+    verificationSteps: VerificationStep[];
+    agenticStep: PromptStep | null;
+  }) => void;
 }
 
 interface SelectedElementForTest {
@@ -94,7 +102,7 @@ function generateLocator(element: DiscoveredElement): string {
 function generatePlaywrightTest(
   selectedElements: SelectedElementForTest[],
   testName: string,
-  pageUrl?: string
+  pageUrl?: string,
 ): string {
   const lines: string[] = [
     `import { test, expect } from '@playwright/test';`,
@@ -110,7 +118,8 @@ function generatePlaywrightTest(
 
   for (const { element, assertions } of selectedElements) {
     const locator = generateLocator(element);
-    const elementName = element.label || element.id || element.text?.slice(0, 20) || element.tagName;
+    const elementName =
+      element.label || element.id || element.text?.slice(0, 20) || element.tagName;
 
     lines.push(`  // Verify: ${elementName}`);
     lines.push(`  const ${element.id?.replace(/-/g, "_") || "element"} = ${locator};`);
@@ -120,30 +129,38 @@ function generatePlaywrightTest(
 
       switch (assertion.type) {
         case "visible":
-          lines.push(`  await expect(${element.id?.replace(/-/g, "_") || "element"}).toBeVisible();`);
+          lines.push(
+            `  await expect(${element.id?.replace(/-/g, "_") || "element"}).toBeVisible();`,
+          );
           break;
         case "enabled":
-          lines.push(`  await expect(${element.id?.replace(/-/g, "_") || "element"}).toBeEnabled();`);
+          lines.push(
+            `  await expect(${element.id?.replace(/-/g, "_") || "element"}).toBeEnabled();`,
+          );
           break;
         case "text":
           if (assertion.expected) {
             lines.push(
-              `  await expect(${element.id?.replace(/-/g, "_") || "element"}).toHaveText('${String(assertion.expected).replace(/'/g, "\\'")}');`
+              `  await expect(${element.id?.replace(/-/g, "_") || "element"}).toHaveText('${String(assertion.expected).replace(/'/g, "\\'")}');`,
             );
           }
           break;
         case "value":
           if (assertion.expected !== undefined) {
             lines.push(
-              `  await expect(${element.id?.replace(/-/g, "_") || "element"}).toHaveValue('${String(assertion.expected).replace(/'/g, "\\'")}');`
+              `  await expect(${element.id?.replace(/-/g, "_") || "element"}).toHaveValue('${String(assertion.expected).replace(/'/g, "\\'")}');`,
             );
           }
           break;
         case "checked":
           if (assertion.expected === true) {
-            lines.push(`  await expect(${element.id?.replace(/-/g, "_") || "element"}).toBeChecked();`);
+            lines.push(
+              `  await expect(${element.id?.replace(/-/g, "_") || "element"}).toBeChecked();`,
+            );
           } else {
-            lines.push(`  await expect(${element.id?.replace(/-/g, "_") || "element"}).not.toBeChecked();`);
+            lines.push(
+              `  await expect(${element.id?.replace(/-/g, "_") || "element"}).not.toBeChecked();`,
+            );
           }
           break;
       }
@@ -160,17 +177,13 @@ function generatePlaywrightTest(
  */
 function generateVerificationSteps(
   selectedElements: SelectedElementForTest[],
-  pageUrl?: string
+  pageUrl?: string,
 ): VerificationStep[] {
   const steps: VerificationStep[] = [];
 
   // Create a single Playwright test step with all assertions
   if (selectedElements.length > 0) {
-    const testCode = generatePlaywrightTest(
-      selectedElements,
-      "Live Browser Verification",
-      pageUrl
-    );
+    const testCode = generatePlaywrightTest(selectedElements, "Live Browser Verification", pageUrl);
 
     steps.push({
       id: generateStepId(),
@@ -193,7 +206,7 @@ function generateAgenticPrompt(
   userDescription: string,
   userInstructions: string,
   selectedElements: SelectedElementForTest[],
-  pageUrl?: string
+  pageUrl?: string,
 ): PromptStep {
   const elementDescriptions = selectedElements
     .map((e) => {
@@ -340,19 +353,19 @@ export function LiveBrowserPanel({
           return {
             ...e,
             assertions: e.assertions.map((a) =>
-              a.type === assertionType ? { ...a, ...updates } : a
+              a.type === assertionType ? { ...a, ...updates } : a,
             ),
           };
-        })
+        }),
       );
     },
-    []
+    [],
   );
 
   // Check if an element is selected for test
   const isElementSelected = useCallback(
     (elementId: string) => selectedForTest.some((e) => e.element.id === elementId),
-    [selectedForTest]
+    [selectedForTest],
   );
 
   // Generate and add steps to workflow
@@ -366,7 +379,7 @@ export function LiveBrowserPanel({
           pageDescription,
           agenticInstructions,
           selectedForTest,
-          connectedTarget?.url
+          connectedTarget?.url,
         )
       : null;
 
@@ -399,7 +412,11 @@ export function LiveBrowserPanel({
   // Preview code
   const previewCode = useMemo(() => {
     if (selectedForTest.length === 0) return "";
-    return generatePlaywrightTest(selectedForTest, "Live Browser Verification", connectedTarget?.url);
+    return generatePlaywrightTest(
+      selectedForTest,
+      "Live Browser Verification",
+      connectedTarget?.url,
+    );
   }, [selectedForTest, connectedTarget]);
 
   if (!isOpen) return null;
@@ -454,8 +471,18 @@ export function LiveBrowserPanel({
         <div className="flex border-b border-zinc-700 flex-shrink-0">
           {[
             { id: "targets", label: "Targets", icon: Globe },
-            { id: "elements", label: "Elements", icon: MousePointer, disabled: connectionStatus !== "connected" },
-            { id: "generate", label: "Generate", icon: FileCode, disabled: selectedForTest.length === 0 },
+            {
+              id: "elements",
+              label: "Elements",
+              icon: MousePointer,
+              disabled: connectionStatus !== "connected",
+            },
+            {
+              id: "generate",
+              label: "Generate",
+              icon: FileCode,
+              disabled: selectedForTest.length === 0,
+            },
           ].map((tab) => (
             <button
               key={tab.id}
@@ -512,7 +539,13 @@ export function LiveBrowserPanel({
                   <WifiOff className="w-5 h-5 text-amber-400" />
                 )}
                 <div className="flex-1">
-                  <p className={isExtensionConnected ? "text-green-400 font-medium" : "text-amber-400 font-medium"}>
+                  <p
+                    className={
+                      isExtensionConnected
+                        ? "text-green-400 font-medium"
+                        : "text-amber-400 font-medium"
+                    }
+                  >
                     {isExtensionConnected ? "Extension Connected" : "Extension Not Connected"}
                   </p>
                   <p className="text-xs text-zinc-400">
@@ -527,7 +560,9 @@ export function LiveBrowserPanel({
                   className="p-2 hover:bg-white/10 rounded transition-colors"
                   title="Refresh targets"
                 >
-                  <RefreshCw className={`w-4 h-4 text-zinc-400 ${isLoadingTargets ? "animate-spin" : ""}`} />
+                  <RefreshCw
+                    className={`w-4 h-4 text-zinc-400 ${isLoadingTargets ? "animate-spin" : ""}`}
+                  />
                 </button>
               </div>
 
@@ -544,7 +579,9 @@ export function LiveBrowserPanel({
                   )}
                   <Globe className="w-4 h-4 text-blue-400" />
                   <span className="font-medium text-zinc-200">Browser Tabs</span>
-                  <span className="text-xs text-zinc-500 ml-auto">{browserTabs.length} available</span>
+                  <span className="text-xs text-zinc-500 ml-auto">
+                    {browserTabs.length} available
+                  </span>
                 </button>
 
                 {expandedSections.has("browser") && (
@@ -557,7 +594,9 @@ export function LiveBrowserPanel({
                     ) : browserTabs.length === 0 ? (
                       <div className="px-4 py-8 text-center text-zinc-500">
                         <p>No browser tabs found</p>
-                        <p className="text-xs mt-1">Make sure the extension is installed and enabled</p>
+                        <p className="text-xs mt-1">
+                          Make sure the extension is installed and enabled
+                        </p>
                       </div>
                     ) : (
                       browserTabs.map((tab) => (
@@ -616,7 +655,9 @@ export function LiveBrowserPanel({
                   )}
                   <Smartphone className="w-4 h-4 text-green-400" />
                   <span className="font-medium text-zinc-200">Mobile Devices</span>
-                  <span className="text-xs text-zinc-500 ml-auto">{mobileDevices.length} available</span>
+                  <span className="text-xs text-zinc-500 ml-auto">
+                    {mobileDevices.length} available
+                  </span>
                 </button>
 
                 {expandedSections.has("mobile") && (
@@ -624,14 +665,17 @@ export function LiveBrowserPanel({
                     {mobileDevices.length === 0 ? (
                       <div className="px-4 py-8 text-center text-zinc-500">
                         <p>No mobile devices found</p>
-                        <p className="text-xs mt-1">Connect an Android device or start an emulator</p>
+                        <p className="text-xs mt-1">
+                          Connect an Android device or start an emulator
+                        </p>
                       </div>
                     ) : (
                       mobileDevices.map((device) => (
                         <div
                           key={device.device_id}
                           className={`flex items-center gap-3 px-4 py-3 hover:bg-zinc-800/50 transition-colors ${
-                            connectedTarget?.type === "mobile" && connectedTarget?.id === device.device_id
+                            connectedTarget?.type === "mobile" &&
+                            connectedTarget?.id === device.device_id
                               ? "bg-green-500/10"
                               : ""
                           }`}
@@ -642,19 +686,24 @@ export function LiveBrowserPanel({
                             <Smartphone className="w-4 h-4 text-zinc-500" />
                           )}
                           <div className="flex-1 min-w-0">
-                            <p className="text-sm text-zinc-200">{device.model || device.device_id}</p>
+                            <p className="text-sm text-zinc-200">
+                              {device.model || device.device_id}
+                            </p>
                             <p className="text-xs text-zinc-500">
                               {device.device_type} - {device.state}
                             </p>
                           </div>
-                          {connectedTarget?.type === "mobile" && connectedTarget?.id === device.device_id ? (
+                          {connectedTarget?.type === "mobile" &&
+                          connectedTarget?.id === device.device_id ? (
                             <span className="text-xs text-green-400 px-2 py-1 rounded bg-green-500/20">
                               Connected
                             </span>
                           ) : (
                             <button
                               onClick={() => connectToMobile(device.device_id)}
-                              disabled={device.state !== "device" || connectionStatus === "connecting"}
+                              disabled={
+                                device.state !== "device" || connectionStatus === "connecting"
+                              }
                               className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium bg-green-600 hover:bg-green-500 text-white rounded transition-colors disabled:opacity-50"
                             >
                               {connectionStatus === "connecting" ? (
@@ -876,7 +925,9 @@ export function LiveBrowserPanel({
                     className="w-4 h-4 rounded border-zinc-600 bg-zinc-700 text-cyan-500"
                   />
                   <div>
-                    <span className="text-sm text-zinc-200">Include Playwright Verification Tests</span>
+                    <span className="text-sm text-zinc-200">
+                      Include Playwright Verification Tests
+                    </span>
                     <p className="text-xs text-zinc-500">
                       Generate test assertions for selected elements
                     </p>

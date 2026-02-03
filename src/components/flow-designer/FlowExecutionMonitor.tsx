@@ -200,7 +200,7 @@ export function FlowExecutionMonitor({
           default:
             break;
         }
-      })
+      }),
     );
 
     return () => {
@@ -415,7 +415,7 @@ export function FlowExecutionMonitor({
                     {JSON.stringify(
                       executionState.stepHistory[selectedHistoryIndex].outputs,
                       null,
-                      2
+                      2,
                     )}
                   </pre>
                   {executionState.stepHistory[selectedHistoryIndex].error && (

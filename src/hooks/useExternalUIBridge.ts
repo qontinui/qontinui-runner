@@ -9,6 +9,8 @@
  */
 
 import { useState, useCallback, useEffect, useRef } from "react";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { stitchScreenshots, type ScreenshotTile } from "../lib/thumbnail-cropper";
 
 // =============================================================================
 // Types
@@ -138,6 +140,7 @@ export interface ExternalElement {
   is_readonly?: boolean; // readonly or aria-readonly
   is_interactive?: boolean; // Can be interacted with
   ref?: string; // Auto-generated reference like @e1, @e2
+  isCrossOrigin?: boolean; // True if element is inside a cross-origin iframe (thumbnail unavailable)
 
   // Extraction attributes (for automation/extraction pipeline)
   selector?: string; // CSS selector
@@ -188,6 +191,115 @@ export interface PageScreenshot {
   capturedAt: number;
   /** Viewport dimensions at capture time */
   viewport: { width: number; height: number };
+  /** Scroll info if scroll-based capture was used */
+  scrollInfo?: {
+    scrolled: boolean;
+    /** Updated bounds after scrolling (element is now visible in viewport) */
+    newBounds?: {
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+    } | null;
+  } | null;
+}
+
+/**
+ * Options for scroll-based element capture
+ */
+export interface ScrollCaptureOptions {
+  /** Bounds of the element to capture */
+  elementBounds: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
+  /** Whether to restore scroll position after capture (default: true) */
+  restoreScroll?: boolean;
+}
+
+/**
+ * Options for full-page screenshot capture
+ */
+export interface FullPageCaptureOptions {
+  /** Delay in ms between tile captures (default: 150) */
+  tileDelay?: number;
+  /** If true, hide fixed/sticky elements during capture (default: false) */
+  hideFixedElements?: boolean;
+}
+
+/**
+ * Stitched full-page screenshot result
+ */
+export interface FullPageScreenshot {
+  /** Base64 encoded PNG data (without data URL prefix) */
+  data: string;
+  /** Timestamp when screenshot was captured */
+  capturedAt: number;
+  /** Total page dimensions */
+  totalWidth: number;
+  totalHeight: number;
+  /** Viewport dimensions at capture time */
+  viewport: { width: number; height: number };
+  /** Number of tiles stitched */
+  tilesStitched: number;
+  /** Scroll offset used during capture (for bounds conversion) */
+  scrollOffset: { x: number; y: number };
+}
+
+/**
+ * A single tile from the full-page screenshot capture
+ */
+export interface FullPageTile {
+  /** Base64 encoded PNG data (without data URL prefix) */
+  screenshot: string;
+  /** X position of this tile on the full page */
+  x: number;
+  /** Y position of this tile on the full page */
+  y: number;
+  /** Width of this tile */
+  width: number;
+  /** Height of this tile */
+  height: number;
+  /** Row index in the tile grid */
+  row: number;
+  /** Column index in the tile grid */
+  col: number;
+}
+
+/**
+ * Result of full-page screenshot capture (before stitching)
+ */
+export interface FullPageCaptureResult {
+  /** Array of tile screenshots with positions */
+  tiles: FullPageTile[];
+  /** Total width of the full page */
+  totalWidth: number;
+  /** Total height of the full page */
+  totalHeight: number;
+  /** Viewport width used for capture */
+  viewportWidth: number;
+  /** Viewport height used for capture */
+  viewportHeight: number;
+  /** Timestamp when capture completed */
+  capturedAt: number;
+  /** Tab ID that was captured */
+  tabId: number;
+  /** URL of the captured page */
+  url: string;
+}
+
+/**
+ * Progress state for full-page screenshot capture
+ */
+export interface FullPageCaptureProgress {
+  /** Current tile being captured (1-indexed for display) */
+  currentTile: number;
+  /** Total number of tiles to capture */
+  totalTiles: number;
+  /** Current phase of capture */
+  phase: "capturing" | "stitching" | "complete";
 }
 
 // =============================================================================
@@ -280,13 +392,16 @@ export interface CooccurrenceExport {
    * Fingerprint statistics: for each fingerprint, how often it appears.
    * Field names match Python FingerprintStats dataclass.
    */
-  fingerprintStats: Record<string, {
-    hash: string;
-    totalAppearances: number;
-    captureIds: string[];
-    firstSeen: number; // capture index
-    lastSeen: number; // capture index
-  }>;
+  fingerprintStats: Record<
+    string,
+    {
+      hash: string;
+      totalAppearances: number;
+      captureIds: string[];
+      firstSeen: number; // capture index
+      lastSeen: number; // capture index
+    }
+  >;
 
   /**
    * Transition data: what fingerprints appeared/disappeared by each action.
@@ -314,6 +429,19 @@ export interface CooccurrenceExport {
   }>;
 }
 
+/**
+ * Options for the useExternalUIBridge hook
+ */
+export interface UseExternalUIBridgeOptions {
+  /**
+   * Use full-page capture for thumbnails (default: true).
+   * Full-page capture scrolls and stitches the entire page,
+   * enabling thumbnails for off-screen elements.
+   * Falls back to viewport capture if full-page fails.
+   */
+  useFullPageCapture?: boolean;
+}
+
 export interface UseExternalUIBridgeReturn {
   // Connection state
   connectionStatus: ConnectionStatus;
@@ -329,7 +457,14 @@ export interface UseExternalUIBridgeReturn {
 
   // Screenshot data
   pageScreenshot: PageScreenshot | null;
+  fullPageScreenshot: FullPageScreenshot | null;
   isCapturingScreenshot: boolean;
+  isCapturingFullPage: boolean;
+  fullPageCaptureProgress: FullPageCaptureProgress | null;
+
+  // Screenshot mode
+  useFullPageCapture: boolean;
+  setUseFullPageCapture: (value: boolean) => void;
 
   // Loading states
   isLoadingTabs: boolean;
@@ -347,10 +482,29 @@ export interface UseExternalUIBridgeReturn {
   disconnect: () => void;
   refreshElements: () => Promise<void>;
   capturePageScreenshot: () => Promise<string | null>;
+  /**
+   * Capture a screenshot with the element scrolled into view.
+   * Useful for capturing thumbnails of off-screen elements.
+   *
+   * @param options - Options for scroll-based capture
+   * @returns PageScreenshot with scroll info indicating new element bounds
+   */
+  captureElementScreenshot: (options: ScrollCaptureOptions) => Promise<PageScreenshot | null>;
+  /**
+   * Capture the full page by scrolling and capturing viewport-sized tiles.
+   * Returns the raw tiles for client-side stitching. Use stitchScreenshots()
+   * from thumbnail-cropper.ts to combine tiles into a single image.
+   *
+   * @param options - Options for full-page capture
+   * @returns FullPageCaptureResult with tiles and page dimensions
+   */
+  captureFullPageScreenshot: (
+    options?: FullPageCaptureOptions,
+  ) => Promise<FullPageCaptureResult | null>;
   executeAction: (
     elementId: string,
     action: string,
-    params?: Record<string, unknown>
+    params?: Record<string, unknown>,
   ) => Promise<CommandResult>;
   highlightElement: (elementId: string) => Promise<void>;
   enablePicker: () => Promise<void>;
@@ -359,7 +513,7 @@ export interface UseExternalUIBridgeReturn {
   // Raw API access (for Postman-like panel)
   sendCommand: <T = unknown>(
     action: string,
-    params?: Record<string, unknown>
+    params?: Record<string, unknown>,
   ) => Promise<CommandResult<T>>;
   lastCommandResult: CommandResult | null;
   commandHistory: Array<{
@@ -393,7 +547,10 @@ const MAX_COMMAND_HISTORY = 50;
 // Hook Implementation
 // =============================================================================
 
-export function useExternalUIBridge(): UseExternalUIBridgeReturn {
+export function useExternalUIBridge(
+  options: UseExternalUIBridgeOptions = {},
+): UseExternalUIBridgeReturn {
+  const { useFullPageCapture: initialUseFullPageCapture = true } = options;
   // Connection state
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("disconnected");
   const [isExtensionConnected, setIsExtensionConnected] = useState(false);
@@ -412,7 +569,13 @@ export function useExternalUIBridge(): UseExternalUIBridgeReturn {
 
   // Screenshot state
   const [pageScreenshot, setPageScreenshot] = useState<PageScreenshot | null>(null);
+  const [fullPageScreenshot, setFullPageScreenshot] = useState<FullPageScreenshot | null>(null);
   const [isCapturingScreenshot, setIsCapturingScreenshot] = useState(false);
+  const [isCapturingFullPage, setIsCapturingFullPage] = useState(false);
+  const [useFullPageCapture, setUseFullPageCapture] = useState(initialUseFullPageCapture);
+  const [fullPageCaptureProgress, setFullPageCaptureProgress] =
+    useState<FullPageCaptureProgress | null>(null);
+  const progressRequestIdRef = useRef<string | null>(null);
 
   // Selection
   const [selectedElementId, setSelectedElementId] = useState<string | null>(null);
@@ -447,7 +610,7 @@ export function useExternalUIBridge(): UseExternalUIBridgeReturn {
   const sendCommand = useCallback(
     async <T = unknown>(
       action: string,
-      params: Record<string, unknown> = {}
+      params: Record<string, unknown> = {},
     ): Promise<CommandResult<T>> => {
       const startTime = Date.now();
 
@@ -523,7 +686,7 @@ export function useExternalUIBridge(): UseExternalUIBridgeReturn {
         return result;
       }
     },
-    []
+    [],
   );
 
   /**
@@ -631,7 +794,7 @@ export function useExternalUIBridge(): UseExternalUIBridgeReturn {
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps -- refreshElementsInternal is stable, including it causes infinite loops
-    [browserTabs, sendCommand]
+    [browserTabs, sendCommand],
   );
 
   /**
@@ -650,6 +813,7 @@ export function useExternalUIBridge(): UseExternalUIBridgeReturn {
     setElements([]);
     setPageContext(null);
     setPageScreenshot(null);
+    setFullPageScreenshot(null);
     setSelectedElementId(null);
     setError(null);
   }, [connectedTabId, sendCommand]);
@@ -688,7 +852,8 @@ export function useExternalUIBridge(): UseExternalUIBridgeReturn {
                 setLastCapture(captureResult.data);
 
                 // Update session status
-                const statusResult = await sendCommand<CaptureSessionStatus>("getCaptureSessionStatus");
+                const statusResult =
+                  await sendCommand<CaptureSessionStatus>("getCaptureSessionStatus");
                 if (statusResult.success && statusResult.data) {
                   setCaptureSession(statusResult.data);
                 }
@@ -701,7 +866,12 @@ export function useExternalUIBridge(): UseExternalUIBridgeReturn {
 
         // Capture screenshot for thumbnails after elements load
         // Do this asynchronously to not block the element loading
-        capturePageScreenshotInternal();
+        // Use full-page capture by default for better thumbnail coverage
+        if (useFullPageCapture) {
+          captureFullPageScreenshotInternal();
+        } else {
+          captureViewportScreenshotInternal();
+        }
       } else {
         setElements([]);
       }
@@ -713,9 +883,9 @@ export function useExternalUIBridge(): UseExternalUIBridgeReturn {
   };
 
   /**
-   * Internal screenshot capture (doesn't update loading state for elements)
+   * Internal viewport screenshot capture (doesn't update loading state for elements)
    */
-  const capturePageScreenshotInternal = async () => {
+  const captureViewportScreenshotInternal = async () => {
     setIsCapturingScreenshot(true);
 
     try {
@@ -731,11 +901,106 @@ export function useExternalUIBridge(): UseExternalUIBridgeReturn {
           capturedAt: result.data.capturedAt,
           viewport: result.data.viewport,
         });
+        // Clear full-page screenshot when using viewport mode
+        setFullPageScreenshot(null);
       }
     } catch (err) {
       console.error("[useExternalUIBridge] Screenshot capture failed:", err);
     } finally {
       setIsCapturingScreenshot(false);
+    }
+  };
+
+  /**
+   * Internal full-page screenshot capture with stitching.
+   * Falls back to viewport capture if full-page fails.
+   */
+  const captureFullPageScreenshotInternal = async () => {
+    setIsCapturingFullPage(true);
+
+    try {
+      const result = await sendCommand<{
+        tiles: Array<{
+          screenshot: string;
+          x: number;
+          y: number;
+          width: number;
+          height: number;
+          row: number;
+          col: number;
+        }>;
+        totalWidth: number;
+        totalHeight: number;
+        viewportWidth: number;
+        viewportHeight: number;
+        capturedAt: number;
+        tabId: number;
+        url: string;
+      }>("captureFullPageScreenshot", {
+        tileDelay: 150,
+        hideFixedElements: false,
+      });
+
+      if (result.success && result.data?.tiles && result.data.tiles.length > 0) {
+        // Stitch the tiles together
+        const tiles: ScreenshotTile[] = result.data.tiles.map((tile) => ({
+          screenshot: tile.screenshot,
+          x: tile.x,
+          y: tile.y,
+          width: tile.width,
+          height: tile.height,
+          row: tile.row,
+          col: tile.col,
+        }));
+
+        const stitchResult = await stitchScreenshots(
+          tiles,
+          result.data.totalWidth,
+          result.data.totalHeight,
+        );
+
+        if (stitchResult) {
+          setFullPageScreenshot({
+            data: stitchResult.data,
+            capturedAt: result.data.capturedAt,
+            totalWidth: result.data.totalWidth,
+            totalHeight: result.data.totalHeight,
+            viewport: {
+              width: result.data.viewportWidth,
+              height: result.data.viewportHeight,
+            },
+            tilesStitched: stitchResult.tilesProcessed,
+            scrollOffset: { x: 0, y: 0 },
+          });
+
+          // Also set as pageScreenshot for compatibility with thumbnail generation
+          setPageScreenshot({
+            data: stitchResult.data,
+            capturedAt: result.data.capturedAt,
+            viewport: {
+              width: result.data.totalWidth,
+              height: result.data.totalHeight,
+            },
+          });
+
+          console.log(
+            `[useExternalUIBridge] Full-page screenshot captured: ${result.data.totalWidth}x${result.data.totalHeight}, ${stitchResult.tilesProcessed} tiles`,
+          );
+          return;
+        }
+      }
+
+      // Fall back to viewport capture if full-page failed
+      console.warn(
+        "[useExternalUIBridge] Full-page capture failed, falling back to viewport capture",
+      );
+      await captureViewportScreenshotInternal();
+    } catch (err) {
+      console.error("[useExternalUIBridge] Full-page screenshot capture failed:", err);
+      // Fall back to viewport capture
+      await captureViewportScreenshotInternal();
+    } finally {
+      setIsCapturingFullPage(false);
     }
   };
 
@@ -806,7 +1071,7 @@ export function useExternalUIBridge(): UseExternalUIBridgeReturn {
     async (
       elementId: string,
       action: string,
-      params: Record<string, unknown> = {}
+      params: Record<string, unknown> = {},
     ): Promise<CommandResult> => {
       if (connectionStatus !== "connected") {
         return { success: false, error: "Not connected to a browser tab" };
@@ -818,7 +1083,7 @@ export function useExternalUIBridge(): UseExternalUIBridgeReturn {
 
       if (captureSession.active) {
         // Find the target element's fingerprint
-        const targetElement = elements.find(el => el.id === elementId);
+        const targetElement = elements.find((el) => el.id === elementId);
         targetFingerprint = targetElement?.fingerprint?.hash || null;
 
         // Capture before state
@@ -841,7 +1106,7 @@ export function useExternalUIBridge(): UseExternalUIBridgeReturn {
         // If capture session is active, capture after state and record action
         if (captureSession.active && beforeCaptureId) {
           // Small delay to let the page update
-          await new Promise(resolve => setTimeout(resolve, 100));
+          await new Promise((resolve) => setTimeout(resolve, 100));
 
           // Capture after state
           const afterResult = await createActionCapture({
@@ -862,9 +1127,16 @@ export function useExternalUIBridge(): UseExternalUIBridgeReturn {
             });
 
             if (actionResult.success && actionResult.data) {
-              console.log("[Action] Recorded:", action, "on", elementId,
-                "added:", actionResult.data.addedFingerprints.length,
-                "removed:", actionResult.data.removedFingerprints.length);
+              console.log(
+                "[Action] Recorded:",
+                action,
+                "on",
+                elementId,
+                "added:",
+                actionResult.data.addedFingerprints.length,
+                "removed:",
+                actionResult.data.removedFingerprints.length,
+              );
             }
 
             // Update elements and session status
@@ -886,7 +1158,7 @@ export function useExternalUIBridge(): UseExternalUIBridgeReturn {
       return result;
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps -- createActionCapture and refreshElementsInternal are stable
-    [connectionStatus, sendCommand, captureSession.active, elements, connectedTabInfo]
+    [connectionStatus, sendCommand, captureSession.active, elements, connectedTabInfo],
   );
 
   /**
@@ -900,7 +1172,7 @@ export function useExternalUIBridge(): UseExternalUIBridgeReturn {
 
       await sendCommand("highlightElement", { elementId });
     },
-    [connectionStatus, sendCommand]
+    [connectionStatus, sendCommand],
   );
 
   /**
@@ -962,6 +1234,147 @@ export function useExternalUIBridge(): UseExternalUIBridgeReturn {
     }
   }, [connectionStatus, sendCommand]);
 
+  /**
+   * Capture a screenshot with the specified element scrolled into view.
+   * Useful for capturing thumbnails of off-screen elements.
+   *
+   * This function will:
+   * 1. Scroll the page to bring the element into the viewport
+   * 2. Capture the screenshot
+   * 3. Restore the original scroll position (by default)
+   * 4. Return the screenshot with updated element bounds
+   *
+   * @param options - Options for scroll-based capture
+   * @returns PageScreenshot with scrollInfo containing new bounds, or null if capture fails
+   */
+  const captureElementScreenshot = useCallback(
+    async (options: ScrollCaptureOptions): Promise<PageScreenshot | null> => {
+      if (connectionStatus !== "connected") {
+        return null;
+      }
+
+      try {
+        const result = await sendCommand<{
+          screenshot: string;
+          capturedAt: number;
+          viewport: { width: number; height: number };
+          scrollInfo?: {
+            scrolled: boolean;
+            newBounds?: {
+              x: number;
+              y: number;
+              width: number;
+              height: number;
+            } | null;
+          } | null;
+        }>("capturePageScreenshot", {
+          scrollToElement: true,
+          elementBounds: options.elementBounds,
+          restoreScroll: options.restoreScroll ?? true,
+        });
+
+        if (result.success && result.data?.screenshot) {
+          return {
+            data: result.data.screenshot,
+            capturedAt: result.data.capturedAt,
+            viewport: result.data.viewport,
+            scrollInfo: result.data.scrollInfo,
+          };
+        }
+
+        return null;
+      } catch (err) {
+        console.error("[useExternalUIBridge] Element screenshot capture failed:", err);
+        return null;
+      }
+    },
+    [connectionStatus, sendCommand],
+  );
+
+  /**
+   * Capture the full page by scrolling and capturing viewport-sized tiles.
+   * Returns the raw tiles for client-side stitching. Use stitchScreenshots()
+   * from thumbnail-cropper.ts to combine tiles into a single image.
+   *
+   * This function will:
+   * 1. Get total page dimensions
+   * 2. Divide page into viewport-sized tiles
+   * 3. Scroll to each tile position and capture
+   * 4. Restore original scroll position
+   * 5. Return array of tiles with their positions
+   *
+   * Progress updates are emitted via the fullPageCaptureProgress state.
+   *
+   * @param options - Options for full-page capture
+   * @returns FullPageCaptureResult with tiles and page dimensions, or null if capture fails
+   */
+  const captureFullPageScreenshot = useCallback(
+    async (options: FullPageCaptureOptions = {}): Promise<FullPageCaptureResult | null> => {
+      if (connectionStatus !== "connected") {
+        return null;
+      }
+
+      // Generate a unique progress request ID
+      const progressRequestId = `fp-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+      progressRequestIdRef.current = progressRequestId;
+
+      // Initialize progress state
+      setFullPageCaptureProgress({
+        currentTile: 0,
+        totalTiles: 0,
+        phase: "capturing",
+      });
+
+      try {
+        const result = await sendCommand<{
+          tiles: Array<{
+            screenshot: string;
+            x: number;
+            y: number;
+            width: number;
+            height: number;
+            row: number;
+            col: number;
+          }>;
+          totalWidth: number;
+          totalHeight: number;
+          viewportWidth: number;
+          viewportHeight: number;
+          capturedAt: number;
+          tabId: number;
+          url: string;
+        }>("captureFullPageScreenshot", {
+          tileDelay: options.tileDelay ?? 150,
+          hideFixedElements: options.hideFixedElements ?? false,
+          progressRequestId,
+        });
+
+        if (result.success && result.data?.tiles) {
+          return {
+            tiles: result.data.tiles,
+            totalWidth: result.data.totalWidth,
+            totalHeight: result.data.totalHeight,
+            viewportWidth: result.data.viewportWidth,
+            viewportHeight: result.data.viewportHeight,
+            capturedAt: result.data.capturedAt,
+            tabId: result.data.tabId,
+            url: result.data.url,
+          };
+        }
+
+        return null;
+      } catch (err) {
+        console.error("[useExternalUIBridge] Full page screenshot capture failed:", err);
+        return null;
+      } finally {
+        // Clear progress state when complete
+        progressRequestIdRef.current = null;
+        setFullPageCaptureProgress(null);
+      }
+    },
+    [connectionStatus, sendCommand],
+  );
+
   // Check extension status on mount
   useEffect(() => {
     checkExtensionStatus();
@@ -977,6 +1390,42 @@ export function useExternalUIBridge(): UseExternalUIBridgeReturn {
     }
   }, [connectionStatus, checkExtensionStatus]);
 
+  // Listen for full-page capture progress events from Tauri
+  useEffect(() => {
+    let unlisten: UnlistenFn | null = null;
+
+    const setupListener = async () => {
+      try {
+        unlisten = await listen<{
+          currentTile: number;
+          totalTiles: number;
+          phase: string;
+        }>("full-page-capture-progress", (event) => {
+          const { currentTile, totalTiles, phase } = event.payload;
+
+          // Only update if we have an active capture in progress
+          if (progressRequestIdRef.current !== null) {
+            setFullPageCaptureProgress({
+              currentTile,
+              totalTiles,
+              phase: phase as "capturing" | "stitching" | "complete",
+            });
+          }
+        });
+      } catch (err) {
+        console.error("[useExternalUIBridge] Failed to set up progress listener:", err);
+      }
+    };
+
+    setupListener();
+
+    return () => {
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, []);
+
   // ==========================================================================
   // Capture Session Management (for State Machine Discovery)
   // ==========================================================================
@@ -986,7 +1435,9 @@ export function useExternalUIBridge(): UseExternalUIBridgeReturn {
    */
   const startCaptureSession = useCallback(async () => {
     try {
-      const result = await sendCommand<{ sessionId: string; startedAt: number }>("startCaptureSession");
+      const result = await sendCommand<{ sessionId: string; startedAt: number }>(
+        "startCaptureSession",
+      );
 
       if (result.success && result.data) {
         setCaptureSession({
@@ -1066,8 +1517,8 @@ export function useExternalUIBridge(): UseExternalUIBridgeReturn {
 
       // Collect all unique fingerprints
       const allFingerprintsSet = new Set<string>();
-      captures.forEach(cap => {
-        cap.elementFingerprints.forEach(fp => allFingerprintsSet.add(fp));
+      captures.forEach((cap) => {
+        cap.elementFingerprints.forEach((fp) => allFingerprintsSet.add(fp));
       });
       const allFingerprints = Array.from(allFingerprintsSet).sort();
 
@@ -1097,13 +1548,16 @@ export function useExternalUIBridge(): UseExternalUIBridgeReturn {
       }
 
       // Build fingerprint statistics (matching Python FingerprintStats dataclass)
-      const fingerprintStats: Record<string, {
-        hash: string;
-        totalAppearances: number;
-        captureIds: string[];
-        firstSeen: number;
-        lastSeen: number;
-      }> = {};
+      const fingerprintStats: Record<
+        string,
+        {
+          hash: string;
+          totalAppearances: number;
+          captureIds: string[];
+          firstSeen: number;
+          lastSeen: number;
+        }
+      > = {};
 
       for (const fp of allFingerprints) {
         const captureIds: string[] = [];
@@ -1128,7 +1582,7 @@ export function useExternalUIBridge(): UseExternalUIBridgeReturn {
       }
 
       // Build transitions from actions (matching Python TransitionRecord dataclass)
-      const transitions = actions.map(action => ({
+      const transitions = actions.map((action) => ({
         actionId: action.actionId,
         actionType: action.actionType,
         targetFingerprint: action.targetFingerprint,
@@ -1171,7 +1625,7 @@ export function useExternalUIBridge(): UseExternalUIBridgeReturn {
         }
 
         if (group.length > 1) {
-          const groupKey = group.sort().join(',');
+          const groupKey = group.sort().join(",");
           if (!processedPairs.has(groupKey)) {
             processedPairs.add(groupKey);
             stateCandidates.push({
@@ -1198,10 +1652,15 @@ export function useExternalUIBridge(): UseExternalUIBridgeReturn {
         stateCandidates,
       };
 
-      console.log("[useExternalUIBridge] Generated co-occurrence export:",
-        allFingerprints.length, "fingerprints,",
-        captures.length, "captures,",
-        stateCandidates.length, "state candidates");
+      console.log(
+        "[useExternalUIBridge] Generated co-occurrence export:",
+        allFingerprints.length,
+        "fingerprints,",
+        captures.length,
+        "captures,",
+        stateCandidates.length,
+        "state candidates",
+      );
 
       setCooccurrenceData(result);
       setIsLoadingCooccurrence(false);
@@ -1228,7 +1687,14 @@ export function useExternalUIBridge(): UseExternalUIBridgeReturn {
 
     // Screenshot data
     pageScreenshot,
+    fullPageScreenshot,
     isCapturingScreenshot,
+    isCapturingFullPage,
+    fullPageCaptureProgress,
+
+    // Screenshot mode
+    useFullPageCapture,
+    setUseFullPageCapture,
 
     // Loading states
     isLoadingTabs,
@@ -1246,6 +1712,8 @@ export function useExternalUIBridge(): UseExternalUIBridgeReturn {
     disconnect,
     refreshElements,
     capturePageScreenshot,
+    captureElementScreenshot,
+    captureFullPageScreenshot,
     executeAction,
     highlightElement,
     enablePicker,

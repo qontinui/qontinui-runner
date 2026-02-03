@@ -177,8 +177,8 @@ export function RunRecapTab() {
             )}
           </div>
           <p className="text-sm text-muted-foreground">
-            Add more iterations to continue working toward the goal. New sessions will
-            have access to all previous output and context.
+            Add more iterations to continue working toward the goal. New sessions will have access
+            to all previous output and context.
           </p>
           <div className="flex items-center gap-3 flex-wrap">
             <div className="flex items-center gap-2">
@@ -192,9 +192,7 @@ export function RunRecapTab() {
                 max={20}
                 value={additionalSessions}
                 onChange={(e) =>
-                  setAdditionalSessions(
-                    Math.max(1, Math.min(20, parseInt(e.target.value) || 1)),
-                  )
+                  setAdditionalSessions(Math.max(1, Math.min(20, parseInt(e.target.value) || 1)))
                 }
                 className="w-16 px-2 py-1 text-sm border border-border rounded bg-background text-foreground"
               />
@@ -231,11 +229,7 @@ export function RunRecapTab() {
       )}
 
       {/* Tabbed Content */}
-      <Tabs
-        value={activeTab}
-        onValueChange={setActiveTab}
-        className="w-full"
-      >
+      <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
         <TabsList data-ui-id="recap-tabs" className="w-full justify-start flex-wrap gap-1">
           <TabsTrigger data-ui-id="recap-tab-timeline" value="timeline">
             Timeline

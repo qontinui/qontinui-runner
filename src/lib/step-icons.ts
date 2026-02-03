@@ -229,7 +229,7 @@ export function getStepIconConfig(stepType: string): StepIconConfig {
  */
 export function getStepIconConfigWithFallback(
   iconType: string | undefined,
-  stepType: string
+  stepType: string,
 ): StepIconConfig {
   if (iconType && STEP_ICON_CONFIG[iconType]) {
     return STEP_ICON_CONFIG[iconType];

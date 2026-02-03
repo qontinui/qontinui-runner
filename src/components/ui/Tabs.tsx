@@ -80,7 +80,13 @@ interface TabsTriggerProps {
   "data-ui-id"?: string;
 }
 
-export function TabsTrigger({ value, children, className, disabled, "data-ui-id": dataUiId }: TabsTriggerProps) {
+export function TabsTrigger({
+  value,
+  children,
+  className,
+  disabled,
+  "data-ui-id": dataUiId,
+}: TabsTriggerProps) {
   const { value: currentValue, onValueChange } = useTabsContext();
   const isActive = currentValue === value;
 

@@ -5,13 +5,7 @@
  */
 
 import { useState } from "react";
-import {
-  Wrench,
-  Loader2,
-  AlertCircle,
-  CheckCircle,
-  ChevronDown,
-} from "lucide-react";
+import { Wrench, Loader2, AlertCircle, CheckCircle, ChevronDown } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { useFixWorkflow } from "../../hooks/useErrorMonitor";
 
@@ -39,12 +33,7 @@ export function FixErrorsButton({
   const [success, setSuccess] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const {
-    summary,
-    loading: checkingErrors,
-    check,
-    generateWorkflow,
-  } = useFixWorkflow();
+  const { summary, loading: checkingErrors, check, generateWorkflow } = useFixWorkflow();
 
   const handleClick = async () => {
     setError(null);
@@ -116,7 +105,8 @@ export function FixErrorsButton({
           verification_steps: workflow.verification_steps || [],
           agentic_steps: workflow.agentic_steps || [],
           completion_steps: workflow.completion_steps || [],
-          max_iterations: (workflow.settings as Record<string, unknown>)?.max_agentic_iterations || 10,
+          max_iterations:
+            (workflow.settings as Record<string, unknown>)?.max_agentic_iterations || 10,
           targeted_error_ids: workflow.targeted_error_ids || [],
         }),
       });
@@ -157,7 +147,8 @@ export function FixErrorsButton({
       verification_steps: workflowJson.verification_steps || [],
       agentic_steps: workflowJson.agentic_steps || [],
       completion_steps: workflowJson.completion_steps || [],
-      max_iterations: (workflowJson.settings as Record<string, unknown>)?.max_agentic_iterations || 10,
+      max_iterations:
+        (workflowJson.settings as Record<string, unknown>)?.max_agentic_iterations || 10,
     };
 
     const response = await fetch(`${API_BASE}/unified-workflows`, {
@@ -189,11 +180,12 @@ export function FixErrorsButton({
   const criticalCount = summary?.criticalCount || 0;
 
   // Color based on severity
-  const buttonColors = criticalCount > 0
-    ? "bg-red-500 hover:bg-red-600 text-white"
-    : hasErrors
-    ? "bg-amber-500 hover:bg-amber-600 text-white"
-    : "bg-muted hover:bg-muted/80 text-muted-foreground";
+  const buttonColors =
+    criticalCount > 0
+      ? "bg-red-500 hover:bg-red-600 text-white"
+      : hasErrors
+        ? "bg-amber-500 hover:bg-amber-600 text-white"
+        : "bg-muted hover:bg-muted/80 text-muted-foreground";
 
   if (compact) {
     return (
@@ -247,16 +239,14 @@ export function FixErrorsButton({
           {generating
             ? "Generating..."
             : success
-            ? "Workflow Ready"
-            : error
-            ? "Error"
-            : hasErrors
-            ? `Fix ${errorCount} Error${errorCount !== 1 ? "s" : ""}`
-            : "Fix Errors"}
+              ? "Workflow Ready"
+              : error
+                ? "Error"
+                : hasErrors
+                  ? `Fix ${errorCount} Error${errorCount !== 1 ? "s" : ""}`
+                  : "Fix Errors"}
         </span>
-        {hasErrors && !isLoading && !success && !error && (
-          <ChevronDown className="w-4 h-4" />
-        )}
+        {hasErrors && !isLoading && !success && !error && <ChevronDown className="w-4 h-4" />}
       </button>
 
       {/* Error message */}
@@ -274,27 +264,19 @@ export function FixErrorsButton({
             <h3 className="font-medium mb-2">Fixable Errors Summary</h3>
             <div className="grid grid-cols-3 gap-2 text-center">
               <div className="p-2 bg-red-500/10 rounded">
-                <div className="text-lg font-bold text-red-500">
-                  {summary.criticalCount}
-                </div>
+                <div className="text-lg font-bold text-red-500">{summary.criticalCount}</div>
                 <div className="text-xs text-muted-foreground">Critical</div>
               </div>
               <div className="p-2 bg-orange-500/10 rounded">
-                <div className="text-lg font-bold text-orange-500">
-                  {summary.errorCount}
-                </div>
+                <div className="text-lg font-bold text-orange-500">{summary.errorCount}</div>
                 <div className="text-xs text-muted-foreground">Errors</div>
               </div>
               <div className="p-2 bg-yellow-500/10 rounded">
-                <div className="text-lg font-bold text-yellow-500">
-                  {summary.warningCount}
-                </div>
+                <div className="text-lg font-bold text-yellow-500">{summary.warningCount}</div>
                 <div className="text-xs text-muted-foreground">Warnings</div>
               </div>
             </div>
-            <p className="text-sm text-muted-foreground mt-3">
-              {summary.recommendedAction}
-            </p>
+            <p className="text-sm text-muted-foreground mt-3">{summary.recommendedAction}</p>
           </div>
 
           {/* Actions */}
@@ -343,10 +325,7 @@ export function FixErrorsButton({
 
       {/* Backdrop to close dropdown */}
       {showDropdown && (
-        <div
-          className="fixed inset-0 z-40"
-          onClick={() => setShowDropdown(false)}
-        />
+        <div className="fixed inset-0 z-40" onClick={() => setShowDropdown(false)} />
       )}
     </div>
   );

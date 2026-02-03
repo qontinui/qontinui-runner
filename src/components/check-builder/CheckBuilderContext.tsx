@@ -319,15 +319,17 @@ export function CheckBuilderProvider({ children, onLog }: CheckBuilderProviderPr
         // Load member info for each group
         const memberPromises = response.data.map(async (group) => {
           try {
-            const memberResponse = await invoke<{ success: boolean; data?: Check[]; message?: string }>(
-              "get_checks_in_group",
-              { groupId: group.id },
-            );
+            const memberResponse = await invoke<{
+              success: boolean;
+              data?: Check[];
+              message?: string;
+            }>("get_checks_in_group", { groupId: group.id });
             return {
               groupId: group.id,
-              checkIds: memberResponse.success && memberResponse.data
-                ? memberResponse.data.map((c) => c.id)
-                : [],
+              checkIds:
+                memberResponse.success && memberResponse.data
+                  ? memberResponse.data.map((c) => c.id)
+                  : [],
             };
           } catch {
             return { groupId: group.id, checkIds: [] };
@@ -434,9 +436,12 @@ export function CheckBuilderProvider({ children, onLog }: CheckBuilderProviderPr
     async (id: string): Promise<boolean> => {
       setState((s) => ({ ...s, isSaving: true, error: null }));
       try {
-        const response = await invoke<{ success: boolean; message?: string }>("delete_check_group", {
-          id,
-        });
+        const response = await invoke<{ success: boolean; message?: string }>(
+          "delete_check_group",
+          {
+            id,
+          },
+        );
         if (response.success) {
           setState((s) => {
             const newMembers = { ...s.checkGroupMembers };
@@ -520,7 +525,10 @@ export function CheckBuilderProvider({ children, onLog }: CheckBuilderProviderPr
   const removeCheckFromGroup = useCallback(
     async (groupId: string, checkId: string): Promise<boolean> => {
       const currentChecks = state.checkGroupMembers[groupId] || [];
-      return setChecksInGroup(groupId, currentChecks.filter((id) => id !== checkId));
+      return setChecksInGroup(
+        groupId,
+        currentChecks.filter((id) => id !== checkId),
+      );
     },
     [state.checkGroupMembers, setChecksInGroup],
   );

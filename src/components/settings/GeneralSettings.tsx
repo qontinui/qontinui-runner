@@ -154,7 +154,10 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
         icon={<SettingsIcon className="w-6 h-6" />}
       />
 
-      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-general-application-section">
+      <div
+        className="space-y-4 rounded-lg bg-card/50 p-4"
+        data-ui-id="settings-general-application-section"
+      >
         <h4 className="font-medium text-sm">Application</h4>
 
         <div className="space-y-2">
@@ -192,7 +195,10 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
       </div>
 
       {/* Workflow Builder Settings */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-general-workflow-builder-section">
+      <div
+        className="space-y-4 rounded-lg bg-card/50 p-4"
+        data-ui-id="settings-general-workflow-builder-section"
+      >
         <h4 className="font-medium text-sm flex items-center gap-2">
           <FileText className="w-4 h-4" />
           Workflow Builder
@@ -225,14 +231,17 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
         <div className="p-3 bg-primary/5 rounded-lg">
           <div className="text-xs text-muted-foreground">
             <strong className="text-foreground">Tip:</strong> The AI Summary step generates a
-            comprehensive summary of your workflow execution, including what was accomplished and any
-            issues encountered. It runs at the end of the completion phase.
+            comprehensive summary of your workflow execution, including what was accomplished and
+            any issues encountered. It runs at the end of the completion phase.
           </div>
         </div>
       </div>
 
       {/* Default Profile Setting */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-general-default-profile-section">
+      <div
+        className="space-y-4 rounded-lg bg-card/50 p-4"
+        data-ui-id="settings-general-default-profile-section"
+      >
         <h4 className="font-medium text-sm">Default Profile</h4>
 
         <div className="space-y-2">

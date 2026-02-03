@@ -28,7 +28,8 @@ export function SaveMacroDialog() {
       {/* Dialog */}
       <div
         data-ui-id="dialog-save-macro"
-        className="relative bg-card border border-border rounded-lg shadow-xl w-full max-w-md mx-4 p-6 space-y-4">
+        className="relative bg-card border border-border rounded-lg shadow-xl w-full max-w-md mx-4 p-6 space-y-4"
+      >
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <Save className="w-5 h-5 text-primary" />

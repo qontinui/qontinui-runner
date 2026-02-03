@@ -9,4 +9,10 @@ export { StepStatusBadge } from "./StepStatusBadge";
 export { StepExecutionList } from "./StepExecutionList";
 export { StepOutputPanel } from "./StepOutputPanel";
 export { StepStatsBar } from "./StepStatsBar";
+export {
+  StepProgressMarker,
+  StepProgressIndicator,
+  useStepProgressMarkers,
+  type ProgressMarker,
+} from "./StepProgressMarker";
 export type { StepExecution, StepExecutionStatus, StepStats } from "./types";

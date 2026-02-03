@@ -230,7 +230,10 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
       )}
 
       {/* Action Caching Section */}
-      <div className="rounded-lg bg-card/50 overflow-hidden" data-ui-id="settings-selfhealing-caching-section">
+      <div
+        className="rounded-lg bg-card/50 overflow-hidden"
+        data-ui-id="settings-selfhealing-caching-section"
+      >
         <button
           onClick={() => setCachingExpanded(!cachingExpanded)}
           className="w-full p-4 flex items-center justify-between hover:bg-muted/30 transition-colors"
@@ -306,7 +309,10 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
       </div>
 
       {/* Visual Validation Section */}
-      <div className="rounded-lg bg-card/50 overflow-hidden" data-ui-id="settings-selfhealing-validation-section">
+      <div
+        className="rounded-lg bg-card/50 overflow-hidden"
+        data-ui-id="settings-selfhealing-validation-section"
+      >
         <button
           onClick={() => setValidationExpanded(!validationExpanded)}
           className="w-full p-4 flex items-center justify-between hover:bg-muted/30 transition-colors"
@@ -354,7 +360,10 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
       </div>
 
       {/* LLM Assistance Section */}
-      <div className="rounded-lg bg-card/50 overflow-hidden" data-ui-id="settings-selfhealing-llm-section">
+      <div
+        className="rounded-lg bg-card/50 overflow-hidden"
+        data-ui-id="settings-selfhealing-llm-section"
+      >
         <button
           onClick={() => setLlmExpanded(!llmExpanded)}
           className="w-full p-4 flex items-center justify-between hover:bg-muted/30 transition-colors"

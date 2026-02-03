@@ -7,7 +7,16 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Search, X, Check as CheckIcon, TestTube2, Eye, Code, FileCode, Terminal } from "lucide-react";
+import {
+  Search,
+  X,
+  Check as CheckIcon,
+  TestTube2,
+  Eye,
+  Code,
+  FileCode,
+  Terminal,
+} from "lucide-react";
 import type { WorkflowPhase } from "../../types/unified-workflow";
 
 // Test type from Test Builder
@@ -53,12 +62,7 @@ const TEST_TYPE_LABELS: Record<string, string> = {
   repository_test: "Repository",
 };
 
-export function TestLibraryPicker({
-  isOpen,
-  onClose,
-  onSelect,
-  phase,
-}: TestLibraryPickerProps) {
+export function TestLibraryPicker({ isOpen, onClose, onSelect, phase }: TestLibraryPickerProps) {
   const [tests, setTests] = useState<SavedTest[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
@@ -137,7 +141,8 @@ export function TestLibraryPicker({
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
       <div
         data-ui-id="dialog-test-library-picker"
-        className="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl w-[700px] max-w-[90vw] max-h-[80vh] flex flex-col">
+        className="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl w-[700px] max-w-[90vw] max-h-[80vh] flex flex-col"
+      >
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-neutral-700">
           <div>
