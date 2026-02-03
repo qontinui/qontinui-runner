@@ -152,11 +152,11 @@ class TestAnalysisService:
         Returns:
             PageAnalysis dict with screenshot, annotated screenshot, and elements.
         """
+        import json
+        import os
+        import subprocess
         import tempfile
         import time
-        import subprocess
-        import os
-        import json
 
         start_time = time.time()
         analysis_id = str(uuid.uuid4())

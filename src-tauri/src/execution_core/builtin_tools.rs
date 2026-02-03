@@ -133,7 +133,10 @@ pub async fn execute_builtin_tool(
 // JSON Tools
 // ============================================================================
 
-fn execute_json_parse(step_id: &str, inputs: &HashMap<String, serde_json::Value>) -> StepExecutionResult {
+fn execute_json_parse(
+    step_id: &str,
+    inputs: &HashMap<String, serde_json::Value>,
+) -> StepExecutionResult {
     let input = match inputs.get("input").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return StepExecutionResult::failure(step_id, "Missing required input 'input'"),
@@ -145,7 +148,10 @@ fn execute_json_parse(step_id: &str, inputs: &HashMap<String, serde_json::Value>
     }
 }
 
-fn execute_json_stringify(step_id: &str, inputs: &HashMap<String, serde_json::Value>) -> StepExecutionResult {
+fn execute_json_stringify(
+    step_id: &str,
+    inputs: &HashMap<String, serde_json::Value>,
+) -> StepExecutionResult {
     let input = match inputs.get("input") {
         Some(v) => v,
         None => return StepExecutionResult::failure(step_id, "Missing required input 'input'"),
@@ -202,10 +208,15 @@ fn execute_merge_context(
 // String Tools
 // ============================================================================
 
-fn execute_string_concat(step_id: &str, inputs: &HashMap<String, serde_json::Value>) -> StepExecutionResult {
+fn execute_string_concat(
+    step_id: &str,
+    inputs: &HashMap<String, serde_json::Value>,
+) -> StepExecutionResult {
     let parts = match inputs.get("parts").and_then(|v| v.as_array()) {
         Some(arr) => arr,
-        None => return StepExecutionResult::failure(step_id, "Missing required input 'parts' (array)"),
+        None => {
+            return StepExecutionResult::failure(step_id, "Missing required input 'parts' (array)")
+        }
     };
 
     let separator = inputs
@@ -221,7 +232,10 @@ fn execute_string_concat(step_id: &str, inputs: &HashMap<String, serde_json::Val
     StepExecutionResult::success(step_id, None).with_output("output", json!(result.join(separator)))
 }
 
-fn execute_string_split(step_id: &str, inputs: &HashMap<String, serde_json::Value>) -> StepExecutionResult {
+fn execute_string_split(
+    step_id: &str,
+    inputs: &HashMap<String, serde_json::Value>,
+) -> StepExecutionResult {
     let input = match inputs.get("input").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return StepExecutionResult::failure(step_id, "Missing required input 'input'"),
@@ -236,7 +250,10 @@ fn execute_string_split(step_id: &str, inputs: &HashMap<String, serde_json::Valu
     StepExecutionResult::success(step_id, None).with_output("parts", json!(parts))
 }
 
-fn execute_string_replace(step_id: &str, inputs: &HashMap<String, serde_json::Value>) -> StepExecutionResult {
+fn execute_string_replace(
+    step_id: &str,
+    inputs: &HashMap<String, serde_json::Value>,
+) -> StepExecutionResult {
     let input = match inputs.get("input").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return StepExecutionResult::failure(step_id, "Missing required input 'input'"),
@@ -266,7 +283,10 @@ fn execute_string_replace(step_id: &str, inputs: &HashMap<String, serde_json::Va
     StepExecutionResult::success(step_id, None).with_output("output", json!(output))
 }
 
-fn execute_string_trim(step_id: &str, inputs: &HashMap<String, serde_json::Value>) -> StepExecutionResult {
+fn execute_string_trim(
+    step_id: &str,
+    inputs: &HashMap<String, serde_json::Value>,
+) -> StepExecutionResult {
     let input = match inputs.get("input").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return StepExecutionResult::failure(step_id, "Missing required input 'input'"),
@@ -275,7 +295,10 @@ fn execute_string_trim(step_id: &str, inputs: &HashMap<String, serde_json::Value
     StepExecutionResult::success(step_id, None).with_output("output", json!(input.trim()))
 }
 
-fn execute_string_uppercase(step_id: &str, inputs: &HashMap<String, serde_json::Value>) -> StepExecutionResult {
+fn execute_string_uppercase(
+    step_id: &str,
+    inputs: &HashMap<String, serde_json::Value>,
+) -> StepExecutionResult {
     let input = match inputs.get("input").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return StepExecutionResult::failure(step_id, "Missing required input 'input'"),
@@ -284,7 +307,10 @@ fn execute_string_uppercase(step_id: &str, inputs: &HashMap<String, serde_json::
     StepExecutionResult::success(step_id, None).with_output("output", json!(input.to_uppercase()))
 }
 
-fn execute_string_lowercase(step_id: &str, inputs: &HashMap<String, serde_json::Value>) -> StepExecutionResult {
+fn execute_string_lowercase(
+    step_id: &str,
+    inputs: &HashMap<String, serde_json::Value>,
+) -> StepExecutionResult {
     let input = match inputs.get("input").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return StepExecutionResult::failure(step_id, "Missing required input 'input'"),
@@ -297,7 +323,10 @@ fn execute_string_lowercase(step_id: &str, inputs: &HashMap<String, serde_json::
 // Array Tools
 // ============================================================================
 
-fn execute_array_length(step_id: &str, inputs: &HashMap<String, serde_json::Value>) -> StepExecutionResult {
+fn execute_array_length(
+    step_id: &str,
+    inputs: &HashMap<String, serde_json::Value>,
+) -> StepExecutionResult {
     let array = match inputs.get("array").and_then(|v| v.as_array()) {
         Some(arr) => arr,
         None => return StepExecutionResult::failure(step_id, "Missing required input 'array'"),
@@ -306,7 +335,10 @@ fn execute_array_length(step_id: &str, inputs: &HashMap<String, serde_json::Valu
     StepExecutionResult::success(step_id, None).with_output("length", json!(array.len()))
 }
 
-fn execute_array_map(step_id: &str, inputs: &HashMap<String, serde_json::Value>) -> StepExecutionResult {
+fn execute_array_map(
+    step_id: &str,
+    inputs: &HashMap<String, serde_json::Value>,
+) -> StepExecutionResult {
     let array = match inputs.get("array").and_then(|v| v.as_array()) {
         Some(arr) => arr,
         None => return StepExecutionResult::failure(step_id, "Missing required input 'array'"),
@@ -325,7 +357,10 @@ fn execute_array_map(step_id: &str, inputs: &HashMap<String, serde_json::Value>)
     StepExecutionResult::success(step_id, None).with_output("result", json!(mapped))
 }
 
-fn execute_array_filter(step_id: &str, inputs: &HashMap<String, serde_json::Value>) -> StepExecutionResult {
+fn execute_array_filter(
+    step_id: &str,
+    inputs: &HashMap<String, serde_json::Value>,
+) -> StepExecutionResult {
     let array = match inputs.get("array").and_then(|v| v.as_array()) {
         Some(arr) => arr,
         None => return StepExecutionResult::failure(step_id, "Missing required input 'array'"),
@@ -350,7 +385,10 @@ fn execute_array_filter(step_id: &str, inputs: &HashMap<String, serde_json::Valu
     StepExecutionResult::success(step_id, None).with_output("result", json!(filtered))
 }
 
-fn execute_array_find(step_id: &str, inputs: &HashMap<String, serde_json::Value>) -> StepExecutionResult {
+fn execute_array_find(
+    step_id: &str,
+    inputs: &HashMap<String, serde_json::Value>,
+) -> StepExecutionResult {
     let array = match inputs.get("array").and_then(|v| v.as_array()) {
         Some(arr) => arr,
         None => return StepExecutionResult::failure(step_id, "Missing required input 'array'"),
@@ -373,7 +411,10 @@ fn execute_array_find(step_id: &str, inputs: &HashMap<String, serde_json::Value>
         .with_output("found", json!(found.is_some()))
 }
 
-fn execute_array_join(step_id: &str, inputs: &HashMap<String, serde_json::Value>) -> StepExecutionResult {
+fn execute_array_join(
+    step_id: &str,
+    inputs: &HashMap<String, serde_json::Value>,
+) -> StepExecutionResult {
     let array = match inputs.get("array").and_then(|v| v.as_array()) {
         Some(arr) => arr,
         None => return StepExecutionResult::failure(step_id, "Missing required input 'array'"),
@@ -392,10 +433,14 @@ fn execute_array_join(step_id: &str, inputs: &HashMap<String, serde_json::Value>
         })
         .collect();
 
-    StepExecutionResult::success(step_id, None).with_output("output", json!(strings.join(separator)))
+    StepExecutionResult::success(step_id, None)
+        .with_output("output", json!(strings.join(separator)))
 }
 
-fn execute_array_push(step_id: &str, inputs: &HashMap<String, serde_json::Value>) -> StepExecutionResult {
+fn execute_array_push(
+    step_id: &str,
+    inputs: &HashMap<String, serde_json::Value>,
+) -> StepExecutionResult {
     let array = match inputs.get("array").and_then(|v| v.as_array()) {
         Some(arr) => arr.clone(),
         None => return StepExecutionResult::failure(step_id, "Missing required input 'array'"),
@@ -412,16 +457,16 @@ fn execute_array_push(step_id: &str, inputs: &HashMap<String, serde_json::Value>
     StepExecutionResult::success(step_id, None).with_output("result", json!(result))
 }
 
-fn execute_array_slice(step_id: &str, inputs: &HashMap<String, serde_json::Value>) -> StepExecutionResult {
+fn execute_array_slice(
+    step_id: &str,
+    inputs: &HashMap<String, serde_json::Value>,
+) -> StepExecutionResult {
     let array = match inputs.get("array").and_then(|v| v.as_array()) {
         Some(arr) => arr,
         None => return StepExecutionResult::failure(step_id, "Missing required input 'array'"),
     };
 
-    let start = inputs
-        .get("start")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
+    let start = inputs.get("start").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
     let end = inputs
         .get("end")
@@ -449,7 +494,10 @@ fn execute_timestamp(step_id: &str) -> StepExecutionResult {
         .with_output("unix_millis", json!(now.timestamp_millis()))
 }
 
-fn execute_format_date(step_id: &str, inputs: &HashMap<String, serde_json::Value>) -> StepExecutionResult {
+fn execute_format_date(
+    step_id: &str,
+    inputs: &HashMap<String, serde_json::Value>,
+) -> StepExecutionResult {
     let format = inputs
         .get("format")
         .and_then(|v| v.as_str())
@@ -458,8 +506,7 @@ fn execute_format_date(step_id: &str, inputs: &HashMap<String, serde_json::Value
     let timestamp = inputs.get("timestamp").and_then(|v| v.as_i64());
 
     let datetime = if let Some(ts) = timestamp {
-        chrono::DateTime::from_timestamp(ts, 0)
-            .unwrap_or_else(chrono::Utc::now)
+        chrono::DateTime::from_timestamp(ts, 0).unwrap_or_else(chrono::Utc::now)
     } else {
         chrono::Utc::now()
     };
@@ -498,7 +545,10 @@ fn execute_log(step_id: &str, inputs: &HashMap<String, serde_json::Value>) -> St
 // Sleep Tool
 // ============================================================================
 
-async fn execute_sleep(step_id: &str, inputs: &HashMap<String, serde_json::Value>) -> StepExecutionResult {
+async fn execute_sleep(
+    step_id: &str,
+    inputs: &HashMap<String, serde_json::Value>,
+) -> StepExecutionResult {
     let ms = inputs.get("ms").and_then(|v| v.as_u64()).unwrap_or(1000);
     tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await;
     StepExecutionResult::success(step_id, None)
@@ -515,7 +565,10 @@ fn execute_uuid(step_id: &str) -> StepExecutionResult {
     StepExecutionResult::success(step_id, None).with_output("uuid", json!(id))
 }
 
-fn execute_random_number(step_id: &str, inputs: &HashMap<String, serde_json::Value>) -> StepExecutionResult {
+fn execute_random_number(
+    step_id: &str,
+    inputs: &HashMap<String, serde_json::Value>,
+) -> StepExecutionResult {
     let min = inputs.get("min").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let max = inputs.get("max").and_then(|v| v.as_f64()).unwrap_or(1.0);
 
@@ -526,7 +579,10 @@ fn execute_random_number(step_id: &str, inputs: &HashMap<String, serde_json::Val
     StepExecutionResult::success(step_id, None).with_output("value", json!(value))
 }
 
-fn execute_hash_sha256(step_id: &str, inputs: &HashMap<String, serde_json::Value>) -> StepExecutionResult {
+fn execute_hash_sha256(
+    step_id: &str,
+    inputs: &HashMap<String, serde_json::Value>,
+) -> StepExecutionResult {
     let input = match inputs.get("input").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return StepExecutionResult::failure(step_id, "Missing required input 'input'"),
@@ -541,7 +597,10 @@ fn execute_hash_sha256(step_id: &str, inputs: &HashMap<String, serde_json::Value
     StepExecutionResult::success(step_id, None).with_output("hash", json!(hex))
 }
 
-fn execute_base64_encode(step_id: &str, inputs: &HashMap<String, serde_json::Value>) -> StepExecutionResult {
+fn execute_base64_encode(
+    step_id: &str,
+    inputs: &HashMap<String, serde_json::Value>,
+) -> StepExecutionResult {
     let input = match inputs.get("input").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return StepExecutionResult::failure(step_id, "Missing required input 'input'"),
@@ -553,7 +612,10 @@ fn execute_base64_encode(step_id: &str, inputs: &HashMap<String, serde_json::Val
     StepExecutionResult::success(step_id, None).with_output("output", json!(encoded))
 }
 
-fn execute_base64_decode(step_id: &str, inputs: &HashMap<String, serde_json::Value>) -> StepExecutionResult {
+fn execute_base64_decode(
+    step_id: &str,
+    inputs: &HashMap<String, serde_json::Value>,
+) -> StepExecutionResult {
     let input = match inputs.get("input").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return StepExecutionResult::failure(step_id, "Missing required input 'input'"),
@@ -569,7 +631,10 @@ fn execute_base64_decode(step_id: &str, inputs: &HashMap<String, serde_json::Val
     }
 }
 
-fn execute_env_get(step_id: &str, inputs: &HashMap<String, serde_json::Value>) -> StepExecutionResult {
+fn execute_env_get(
+    step_id: &str,
+    inputs: &HashMap<String, serde_json::Value>,
+) -> StepExecutionResult {
     let key = match inputs.get("key").and_then(|v| v.as_str()) {
         Some(k) => k,
         None => return StepExecutionResult::failure(step_id, "Missing required input 'key'"),
@@ -641,7 +706,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_timestamp() {
-        let result = execute_builtin_tool("step1", "timestamp", &HashMap::new(), &HashMap::new()).await;
+        let result =
+            execute_builtin_tool("step1", "timestamp", &HashMap::new(), &HashMap::new()).await;
         assert!(result.is_some());
         let result = result.unwrap();
         assert!(result.success);
@@ -662,7 +728,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_not_builtin() {
-        let result = execute_builtin_tool("step1", "unknown_tool", &HashMap::new(), &HashMap::new()).await;
+        let result =
+            execute_builtin_tool("step1", "unknown_tool", &HashMap::new(), &HashMap::new()).await;
         assert!(result.is_none());
     }
 }

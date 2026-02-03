@@ -18,12 +18,12 @@ logger = logging.getLogger(__name__)
 
 # Try to import the UI Bridge explorer from qontinui library
 try:
-    from qontinui.discovery.ui_bridge_explorer import (
-        UIBridgeExplorer,
-        ExplorationResult,
-        ExplorationConfig,
-    )
     from qontinui.discovery.target_connection import create_connection
+    from qontinui.discovery.ui_bridge_explorer import (
+        ExplorationConfig,
+        ExplorationResult,
+        UIBridgeExplorer,
+    )
 
     HAS_UI_BRIDGE_EXPLORER = True
 except ImportError as e:

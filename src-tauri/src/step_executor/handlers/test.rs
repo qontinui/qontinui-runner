@@ -60,7 +60,10 @@ impl TestHandler {
         is_critical: bool,
         context: &HandlerContext,
     ) -> StepHandlerResult {
-        info!("Executing test by ID: {} (critical: {})", test_id, is_critical);
+        info!(
+            "Executing test by ID: {} (critical: {})",
+            test_id, is_critical
+        );
 
         // Emit action started event
         let action_id = format!("test-{}", uuid::Uuid::new_v4());
@@ -83,7 +86,14 @@ impl TestHandler {
                 let error = format!("Test not found: {}", test_id);
                 context
                     .event_emitter
-                    .emit_action_failed(&action_id, &action_name, start_timestamp, sequence, &error, None)
+                    .emit_action_failed(
+                        &action_id,
+                        &action_name,
+                        start_timestamp,
+                        sequence,
+                        &error,
+                        None,
+                    )
                     .await;
                 return StepHandlerResult::failure(error);
             }
@@ -91,7 +101,14 @@ impl TestHandler {
                 let error = format!("Failed to fetch test: {}", e);
                 context
                     .event_emitter
-                    .emit_action_failed(&action_id, &action_name, start_timestamp, sequence, &error, None)
+                    .emit_action_failed(
+                        &action_id,
+                        &action_name,
+                        start_timestamp,
+                        sequence,
+                        &error,
+                        None,
+                    )
                     .await;
                 return StepHandlerResult::failure(error);
             }
@@ -144,7 +161,13 @@ impl TestHandler {
         if success {
             context
                 .event_emitter
-                .emit_action_completed(&action_id, &action_name, start_timestamp, sequence, result_metadata.clone())
+                .emit_action_completed(
+                    &action_id,
+                    &action_name,
+                    start_timestamp,
+                    sequence,
+                    result_metadata.clone(),
+                )
                 .await;
 
             info!(
@@ -288,7 +311,13 @@ impl TestHandler {
         if success {
             context
                 .event_emitter
-                .emit_action_completed(&action_id, &action_name, start_timestamp, sequence, result_metadata.clone())
+                .emit_action_completed(
+                    &action_id,
+                    &action_name,
+                    start_timestamp,
+                    sequence,
+                    result_metadata.clone(),
+                )
                 .await;
 
             info!(

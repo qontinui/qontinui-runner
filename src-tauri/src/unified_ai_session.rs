@@ -441,7 +441,11 @@ impl UnifiedAiSessionExecutor {
                 }
             }
             Ok(Err(e)) => {
-                error!("UNIFIED-AI-SESSION: {} failed: {}", config.phase.as_str(), e);
+                error!(
+                    "UNIFIED-AI-SESSION: {} failed: {}",
+                    config.phase.as_str(),
+                    e
+                );
 
                 let details = StepDetails::ai_session(session_id.clone()).with_error(e.to_string());
 
@@ -519,12 +523,16 @@ impl UnifiedAiSessionExecutor {
             }
             WorkflowPhase::Verification => {
                 let iteration = config.iteration.unwrap_or(1);
-                AiSessionContext::verification(&config.task_run_id, &config.workflow_name, iteration)
-                    .with_runtime_env()
-                    .with_new_trace()
-                    .with_ai_settings()
-                    .with_available_tools(available_tools)
-                    .with_turn_count(iteration)
+                AiSessionContext::verification(
+                    &config.task_run_id,
+                    &config.workflow_name,
+                    iteration,
+                )
+                .with_runtime_env()
+                .with_new_trace()
+                .with_ai_settings()
+                .with_available_tools(available_tools)
+                .with_turn_count(iteration)
             }
             WorkflowPhase::Agentic => {
                 let iteration = config.iteration.unwrap_or(1);
@@ -575,10 +583,13 @@ impl UnifiedAiSessionExecutor {
 
     /// Build the ProgressContext if checkpoint_id is provided.
     fn build_progress_context(&self, config: &AiSessionConfig) -> Option<ProgressContext> {
-        config.checkpoint_id.as_ref().map(|checkpoint_id| ProgressContext {
-            checkpoint_id: checkpoint_id.clone(),
-            task_run_id: config.task_run_id.clone(),
-        })
+        config
+            .checkpoint_id
+            .as_ref()
+            .map(|checkpoint_id| ProgressContext {
+                checkpoint_id: checkpoint_id.clone(),
+                task_run_id: config.task_run_id.clone(),
+            })
     }
 
     /// Transform the prompt based on configuration flags.
@@ -605,7 +616,10 @@ impl UnifiedAiSessionExecutor {
     }
 
     /// Get the start, complete, and error event kinds for a phase.
-    fn get_event_kinds(&self, phase: WorkflowPhase) -> (StepEventKind, StepEventKind, StepEventKind) {
+    fn get_event_kinds(
+        &self,
+        phase: WorkflowPhase,
+    ) -> (StepEventKind, StepEventKind, StepEventKind) {
         match phase {
             WorkflowPhase::Setup => (
                 StepEventKind::SetupAiStart,
@@ -656,9 +670,12 @@ impl UnifiedAiSessionExecutor {
                     iteration,
                 )
             }
-            WorkflowPhase::Completion => {
-                StepMetadata::completion(&config.task_run_id, StepType::Prompt, &config.step_name, 0)
-            }
+            WorkflowPhase::Completion => StepMetadata::completion(
+                &config.task_run_id,
+                StepType::Prompt,
+                &config.step_name,
+                0,
+            ),
         }
     }
 }
@@ -688,8 +705,8 @@ mod tests {
 
     #[test]
     fn test_ai_session_config_setup() {
-        let config = AiSessionConfig::setup("task-123", "My Workflow", "Setup Step")
-            .with_timeout(Some(300));
+        let config =
+            AiSessionConfig::setup("task-123", "My Workflow", "Setup Step").with_timeout(Some(300));
         assert_eq!(config.phase, WorkflowPhase::Setup);
         assert!(config.iteration.is_none());
         assert!(config.add_autonomous_context);
@@ -708,8 +725,7 @@ mod tests {
 
     #[test]
     fn test_ai_session_config_agentic() {
-        let config = AiSessionConfig::agentic("task-123", "My Workflow", 3)
-            .with_timeout(Some(300));
+        let config = AiSessionConfig::agentic("task-123", "My Workflow", 3).with_timeout(Some(300));
         assert_eq!(config.phase, WorkflowPhase::Agentic);
         assert_eq!(config.iteration, Some(3));
         assert!(config.add_autonomous_context);
@@ -720,9 +736,8 @@ mod tests {
 
     #[test]
     fn test_ai_session_config_completion() {
-        let config =
-            AiSessionConfig::completion("task-123", "My Workflow", "Completion Step", 5)
-                .with_timeout(Some(300));
+        let config = AiSessionConfig::completion("task-123", "My Workflow", "Completion Step", 5)
+            .with_timeout(Some(300));
         assert_eq!(config.phase, WorkflowPhase::Completion);
         assert_eq!(config.iteration, Some(5)); // iterations_run for turn count
         assert!(!config.add_autonomous_context);

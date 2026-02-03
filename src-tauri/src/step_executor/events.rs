@@ -198,7 +198,12 @@ pub struct StepTimer {
 
 impl StepTimer {
     /// Create a new step timer (called after emit_action_started).
-    pub fn new(action_id: String, action_name: String, start_timestamp: f64, sequence: u32) -> Self {
+    pub fn new(
+        action_id: String,
+        action_name: String,
+        start_timestamp: f64,
+        sequence: u32,
+    ) -> Self {
         Self {
             action_id,
             action_name,

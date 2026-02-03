@@ -487,11 +487,7 @@ impl AiSessionContext {
     }
 
     /// Create context for agentic phase AI session.
-    pub fn agentic(
-        task_run_id: impl Into<String>,
-        workflow_name: &str,
-        iteration: u32,
-    ) -> Self {
+    pub fn agentic(task_run_id: impl Into<String>, workflow_name: &str, iteration: u32) -> Self {
         let context = ExecutionContext::agentic(task_run_id, iteration);
         let session_name = format!("{} - Iteration {}", workflow_name, iteration);
         Self::new(context, session_name)

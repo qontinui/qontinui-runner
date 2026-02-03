@@ -141,8 +141,8 @@ pub fn has_playwright_test_password() -> Result<CommandResponse, String> {
     info!("Checking if Playwright test password exists");
 
     // Check keychain first, then fall back to settings for backward compatibility
-    let keychain_has = has_playwright_password()
-        .map_err(|e| format!("Failed to check keychain: {}", e))?;
+    let keychain_has =
+        has_playwright_password().map_err(|e| format!("Failed to check keychain: {}", e))?;
     let settings_has = settings::get_playwright_settings().test_password.is_some();
 
     Ok(CommandResponse {

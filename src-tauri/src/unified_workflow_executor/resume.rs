@@ -53,7 +53,10 @@ impl ResumePoint {
             ResumePoint::SetupPhase { from_step } => {
                 format!("from setup phase, step {}", from_step)
             }
-            ResumePoint::VerificationPhase { iteration, from_step } => {
+            ResumePoint::VerificationPhase {
+                iteration,
+                from_step,
+            } => {
                 format!(
                     "from verification phase, iteration {}, step {}",
                     iteration, from_step
@@ -130,7 +133,12 @@ impl ResumeManager {
                 );
 
                 // Determine resume point from explicit state + step checkpoints
-                self.resume_point_from_state(&s.state_name, s.phase.as_deref(), s.iteration, execution_id)
+                self.resume_point_from_state(
+                    &s.state_name,
+                    s.phase.as_deref(),
+                    s.iteration,
+                    execution_id,
+                )
             }
             None => {
                 // No explicit state saved - try legacy heuristic
@@ -206,7 +214,8 @@ impl ResumeManager {
             }
 
             "completion_running" => {
-                let completed_count = self.count_completed_steps(execution_id, "completion", None)?;
+                let completed_count =
+                    self.count_completed_steps(execution_id, "completion", None)?;
                 Ok(ResumePoint::CompletionPhase {
                     from_step: completed_count,
                 })
@@ -240,9 +249,9 @@ impl ResumeManager {
         phase: &str,
         iteration: Option<u32>,
     ) -> Result<usize, String> {
-        let checkpoints = self
-            .checkpoint_mgr
-            .get_completed_steps(execution_id, phase, iteration)?;
+        let checkpoints =
+            self.checkpoint_mgr
+                .get_completed_steps(execution_id, phase, iteration)?;
 
         let completed = checkpoints
             .iter()
@@ -345,10 +354,7 @@ mod tests {
 
     #[test]
     fn test_resume_point_description() {
-        assert_eq!(
-            ResumePoint::FromStart.description(),
-            "from start"
-        );
+        assert_eq!(ResumePoint::FromStart.description(), "from start");
         assert_eq!(
             ResumePoint::SetupPhase { from_step: 2 }.description(),
             "from setup phase, step 2"

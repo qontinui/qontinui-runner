@@ -58,7 +58,7 @@ export interface UseVirtualScrollMetricsReturn {
  * ```
  */
 export function useVirtualScrollMetrics(
-  options: UseVirtualScrollMetricsOptions = {}
+  options: UseVirtualScrollMetricsOptions = {},
 ): UseVirtualScrollMetricsReturn {
   const { enabled = import.meta.env.DEV, throttleMs = 16 } = options;
 
@@ -71,7 +71,7 @@ export function useVirtualScrollMetrics(
       if (!enabled) return;
       getPerformanceMonitor().updateVirtualScrollMetrics(visibleItems, totalItems);
     },
-    [enabled]
+    [enabled],
   );
 
   // Record a scroll frame (throttled)
@@ -132,9 +132,7 @@ export interface WithVirtualScrollMetricsProps {
  * );
  * ```
  */
-export function createScrollMetricsTracker(
-  getItems: () => { visible: number; total: number }
-): {
+export function createScrollMetricsTracker(getItems: () => { visible: number; total: number }): {
   onScroll: () => void;
   useTracker: () => void;
 } {

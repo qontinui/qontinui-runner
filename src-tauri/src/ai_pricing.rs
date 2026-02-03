@@ -79,7 +79,10 @@ pub fn get_pricing(model_id: &str) -> Option<ModelPricing> {
     }
 
     // Claude Sonnet 4
-    if model_lower.contains("sonnet-4") && !model_lower.contains("3-5") && !model_lower.contains("3.5") {
+    if model_lower.contains("sonnet-4")
+        && !model_lower.contains("3-5")
+        && !model_lower.contains("3.5")
+    {
         return Some(CLAUDE_SONNET_4_PRICING);
     }
 

@@ -291,13 +291,13 @@ pub trait IntoOutcome {
 impl IntoOutcome for bool {
     fn into_outcome(self, duration_ms: u64) -> ExecutionOutcome {
         if self {
-            ExecutionOutcome::success("Operation completed")
-                .with_duration(duration_ms)
+            ExecutionOutcome::success("Operation completed").with_duration(duration_ms)
         } else {
             ExecutionOutcome::failure(
                 "Operation failed",
                 ExecutionError::new("No specific error message"),
-            ).with_duration(duration_ms)
+            )
+            .with_duration(duration_ms)
         }
     }
 }
@@ -310,10 +310,10 @@ where
     fn into_outcome(self, duration_ms: u64) -> ExecutionOutcome {
         match self {
             Ok(value) => value.into_outcome(duration_ms),
-            Err(err) => ExecutionOutcome::failure(
-                "Operation failed",
-                ExecutionError::new(err.to_string()),
-            ).with_duration(duration_ms),
+            Err(err) => {
+                ExecutionOutcome::failure("Operation failed", ExecutionError::new(err.to_string()))
+                    .with_duration(duration_ms)
+            }
         }
     }
 }
@@ -526,8 +526,8 @@ impl IntoOutcome for (bool, Option<String>, Option<String>) {
         let (success, error, output) = self;
 
         if success {
-            let mut outcome = ExecutionOutcome::success("Step completed")
-                .with_duration(duration_ms);
+            let mut outcome =
+                ExecutionOutcome::success("Step completed").with_duration(duration_ms);
 
             if let Some(out) = output {
                 outcome = outcome.with_output("result", serde_json::json!(out));
@@ -536,10 +536,8 @@ impl IntoOutcome for (bool, Option<String>, Option<String>) {
             outcome
         } else {
             let error_msg = error.unwrap_or_else(|| "Step failed".to_string());
-            ExecutionOutcome::failure(
-                "Step failed",
-                ExecutionError::execution(&error_msg),
-            ).with_duration(duration_ms)
+            ExecutionOutcome::failure("Step failed", ExecutionError::execution(&error_msg))
+                .with_duration(duration_ms)
         }
     }
 }
@@ -556,7 +554,9 @@ impl IntoOutcome for crate::unified_workflow_executor::SetupResult {
                 .with_duration(duration_ms)
                 .with_output("step_count", serde_json::json!(self.step_results.len()))
         } else {
-            let failed_steps: Vec<_> = self.step_results.iter()
+            let failed_steps: Vec<_> = self
+                .step_results
+                .iter()
                 .filter(|r| !r.success)
                 .map(|r| r.step_name.clone())
                 .collect();
@@ -594,8 +594,7 @@ impl IntoOutcome for crate::unified_workflow_executor::VerificationResult {
                 summary,
                 ExecutionError::execution(format!(
                     "{}/{} steps failed",
-                    phase_result.failed_steps,
-                    phase_result.total_steps
+                    phase_result.failed_steps, phase_result.total_steps
                 )),
             )
             .with_duration(duration_ms)
@@ -603,7 +602,10 @@ impl IntoOutcome for crate::unified_workflow_executor::VerificationResult {
             .with_output("passed_steps", serde_json::json!(phase_result.passed_steps))
             .with_output("failed_steps", serde_json::json!(phase_result.failed_steps))
             .with_output("total_steps", serde_json::json!(phase_result.total_steps))
-            .with_output("critical_failure", serde_json::json!(phase_result.critical_failure))
+            .with_output(
+                "critical_failure",
+                serde_json::json!(phase_result.critical_failure),
+            )
         }
     }
 }
@@ -616,7 +618,9 @@ impl IntoOutcome for crate::unified_workflow_executor::CompletionResult {
                 .with_duration(duration_ms)
                 .with_output("step_count", serde_json::json!(self.step_results.len()))
         } else {
-            let failed_steps: Vec<_> = self.step_results.iter()
+            let failed_steps: Vec<_> = self
+                .step_results
+                .iter()
                 .filter(|r| !r.success)
                 .map(|r| r.step_name.clone())
                 .collect();
@@ -716,22 +720,30 @@ mod tests {
         let step_error = ExecutionError::step_failure("Step failed", "playwright", "Login Test");
         assert_eq!(step_error.message, "Step failed");
         assert_eq!(step_error.code, Some("STEP_FAILURE".to_string()));
-        assert_eq!(step_error.location, Some("playwright:Login Test".to_string()));
+        assert_eq!(
+            step_error.location,
+            Some("playwright:Login Test".to_string())
+        );
     }
 
     #[test]
     fn test_tuple_into_outcome_success() {
-        let tuple: (bool, Option<String>, Option<String>) = (true, None, Some("output data".to_string()));
+        let tuple: (bool, Option<String>, Option<String>) =
+            (true, None, Some("output data".to_string()));
         let outcome = tuple.into_outcome(150);
 
         assert!(outcome.success);
         assert_eq!(outcome.duration_ms, 150);
-        assert_eq!(outcome.get_output("result"), Some(&serde_json::json!("output data")));
+        assert_eq!(
+            outcome.get_output("result"),
+            Some(&serde_json::json!("output data"))
+        );
     }
 
     #[test]
     fn test_tuple_into_outcome_failure() {
-        let tuple: (bool, Option<String>, Option<String>) = (false, Some("Error occurred".to_string()), None);
+        let tuple: (bool, Option<String>, Option<String>) =
+            (false, Some("Error occurred".to_string()), None);
         let outcome = tuple.into_outcome(200);
 
         assert!(!outcome.success);
@@ -769,8 +781,14 @@ mod tests {
         let outcome = wrapped.into_outcome();
         assert!(outcome.success);
         assert_eq!(outcome.duration_ms, 1500);
-        assert_eq!(outcome.get_output("step_type"), Some(&serde_json::json!("playwright")));
-        assert_eq!(outcome.get_output("step_name"), Some(&serde_json::json!("Login Test")));
+        assert_eq!(
+            outcome.get_output("step_type"),
+            Some(&serde_json::json!("playwright"))
+        );
+        assert_eq!(
+            outcome.get_output("step_name"),
+            Some(&serde_json::json!("Login Test"))
+        );
     }
 
     #[test]
@@ -805,56 +823,55 @@ mod tests {
 
     #[test]
     fn test_setup_result_into_outcome_success() {
-        use crate::unified_workflow_executor::SetupResult;
         use crate::step_executor::{StepExecutionConfig, StepExecutionResult};
+        use crate::unified_workflow_executor::SetupResult;
 
         let result = SetupResult {
             success: true,
-            step_results: vec![
-                StepExecutionResult {
-                    step_index: 0,
-                    step_type: "shell_command".to_string(),
-                    step_name: "Install deps".to_string(),
-                    success: true,
-                    error: None,
-                    screenshot_path: None,
-                    started_at: None,
-                    ended_at: None,
-                    duration_ms: 1000,
-                    config: StepExecutionConfig::default(),
-                    verification_details: None,
-                }
-            ],
+            step_results: vec![StepExecutionResult {
+                step_index: 0,
+                step_type: "shell_command".to_string(),
+                step_name: "Install deps".to_string(),
+                success: true,
+                error: None,
+                screenshot_path: None,
+                started_at: None,
+                ended_at: None,
+                duration_ms: 1000,
+                config: StepExecutionConfig::default(),
+                verification_details: None,
+            }],
         };
 
         let outcome = result.into_outcome(1500);
         assert!(outcome.success);
         assert_eq!(outcome.duration_ms, 1500);
-        assert_eq!(outcome.get_output("step_count"), Some(&serde_json::json!(1)));
+        assert_eq!(
+            outcome.get_output("step_count"),
+            Some(&serde_json::json!(1))
+        );
     }
 
     #[test]
     fn test_completion_result_into_outcome_failure() {
-        use crate::unified_workflow_executor::CompletionResult;
         use crate::step_executor::{StepExecutionConfig, StepExecutionResult};
+        use crate::unified_workflow_executor::CompletionResult;
 
         let result = CompletionResult {
             success: false,
-            step_results: vec![
-                StepExecutionResult {
-                    step_index: 0,
-                    step_type: "shell_command".to_string(),
-                    step_name: "Generate report".to_string(),
-                    success: false,
-                    error: Some("Command failed".to_string()),
-                    screenshot_path: None,
-                    started_at: None,
-                    ended_at: None,
-                    duration_ms: 500,
-                    config: StepExecutionConfig::default(),
-                    verification_details: None,
-                }
-            ],
+            step_results: vec![StepExecutionResult {
+                step_index: 0,
+                step_type: "shell_command".to_string(),
+                step_name: "Generate report".to_string(),
+                success: false,
+                error: Some("Command failed".to_string()),
+                screenshot_path: None,
+                started_at: None,
+                ended_at: None,
+                duration_ms: 500,
+                config: StepExecutionConfig::default(),
+                verification_details: None,
+            }],
         };
 
         let outcome = result.into_outcome(600);

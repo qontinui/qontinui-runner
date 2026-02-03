@@ -133,13 +133,7 @@ function formatDuration(ms: number | undefined): string {
  * Individual step row component.
  * Shows step progress bar for running steps or completed steps with progress data.
  */
-function StepRow({
-  step,
-  taskRunId,
-}: {
-  step: TimelineStep;
-  taskRunId: string | null;
-}) {
+function StepRow({ step, taskRunId }: { step: TimelineStep; taskRunId: string | null }) {
   const Icon = getStepIcon(step.type);
   const accentColor = getStepAccentColor(step.type);
   const colors = getAccentColors(accentColor as Parameters<typeof getAccentColors>[0]);

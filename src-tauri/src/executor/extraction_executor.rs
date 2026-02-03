@@ -284,7 +284,10 @@ impl ExtractionExecutor {
             let state = self.lifecycle.read().await.get_state().await;
             state.can_accept_commands()
         });
-        debug!("[EXTRACTION_EXECUTOR] is_running_internal() returning: {}", result);
+        debug!(
+            "[EXTRACTION_EXECUTOR] is_running_internal() returning: {}",
+            result
+        );
         result
     }
 

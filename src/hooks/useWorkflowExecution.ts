@@ -85,7 +85,7 @@ export function useWorkflowOrchestratorState(): OrchestratorStateResult {
       ctx.isLoading,
       ctx.error,
       ctx.refresh,
-    ]
+    ],
   );
 }
 
@@ -124,7 +124,7 @@ export function useWorkflowTimelineData(): ExecutionTimelineData {
       ctx.error,
       ctx.workflowName,
       ctx.taskRunId,
-    ]
+    ],
   );
 }
 
@@ -152,7 +152,7 @@ export function useWorkflowCheckpoints(): CheckpointData {
       resumePoint: ctx.resumePoint,
       currentStepProgress: ctx.currentStepProgress,
     }),
-    [ctx.checkpoints, ctx.lastCompletedCheckpoint, ctx.resumePoint, ctx.currentStepProgress]
+    [ctx.checkpoints, ctx.lastCompletedCheckpoint, ctx.resumePoint, ctx.currentStepProgress],
   );
 }
 
@@ -211,7 +211,7 @@ export function useWorkflowConnectionStatus(): WorkflowConnectionStatus {
       isReconnecting: ctx.isReconnecting,
       lastEventTimestamp: ctx.lastEventTimestamp,
     }),
-    [ctx.isConnected, ctx.connectionMethod, ctx.isReconnecting, ctx.lastEventTimestamp]
+    [ctx.isConnected, ctx.connectionMethod, ctx.isReconnecting, ctx.lastEventTimestamp],
   );
 }
 
@@ -249,7 +249,7 @@ export function useWorkflowStatus(): WorkflowStatusSummary {
       ctx.isComplete,
       ctx.isStopped,
       ctx.elapsedTime,
-    ]
+    ],
   );
 }
 

@@ -106,7 +106,16 @@ export const AllVariantsOverview: Story = {
         <section>
           <h2 className="text-lg font-semibold mb-4">Progress Types (Colors)</h2>
           <div className="grid grid-cols-3 gap-4">
-            {(["default", "file_progress", "test_progress", "analysis_progress", "review_progress", "iteration_progress"] as const).map((type) => (
+            {(
+              [
+                "default",
+                "file_progress",
+                "test_progress",
+                "analysis_progress",
+                "review_progress",
+                "iteration_progress",
+              ] as const
+            ).map((type) => (
               <div key={type} className="p-3 bg-muted/30 rounded-lg">
                 <span className="text-xs text-muted-foreground block mb-2">{type}</span>
                 <ProgressBar current={65} total={100} progressType={type} />
@@ -119,10 +128,14 @@ export const AllVariantsOverview: Story = {
         <section>
           <h2 className="text-lg font-semibold mb-4">InlineProgressBar</h2>
           <div className="flex flex-wrap gap-6">
-            {(["default", "file_progress", "test_progress", "analysis_progress"] as ProgressType[]).map((type) => (
+            {(
+              ["default", "file_progress", "test_progress", "analysis_progress"] as ProgressType[]
+            ).map((type) => (
               <div key={type} className="flex items-center gap-2">
                 <InlineProgressBar current={7} total={12} progressType={type} />
-                <span className="text-xs text-muted-foreground">{type.replace("_progress", "")}</span>
+                <span className="text-xs text-muted-foreground">
+                  {type.replace("_progress", "")}
+                </span>
               </div>
             ))}
           </div>
@@ -132,7 +145,15 @@ export const AllVariantsOverview: Story = {
         <section>
           <h2 className="text-lg font-semibold mb-4">StepProgressIndicator</h2>
           <div className="flex flex-wrap gap-6">
-            {(["file_progress", "test_progress", "analysis_progress", "review_progress", "iteration_progress"] as const).map((type) => (
+            {(
+              [
+                "file_progress",
+                "test_progress",
+                "analysis_progress",
+                "review_progress",
+                "iteration_progress",
+              ] as const
+            ).map((type) => (
               <div key={type} className="flex items-center gap-2">
                 <StepProgressIndicator current={5} total={10} type={type} />
               </div>
@@ -328,12 +349,7 @@ export const DashboardWidgetExample: Story = {
           </span>
         </div>
 
-        <ProgressBar
-          current={overallProgress}
-          total={overallTotal}
-          size="lg"
-          className="mb-6"
-        />
+        <ProgressBar current={overallProgress} total={overallTotal} size="lg" className="mb-6" />
 
         <div className="space-y-3">
           {tasks.map((task) => (
@@ -384,11 +400,14 @@ function FileUploadExampleComponent() {
               status: newProgress >= 100 ? "complete" : "uploading",
             };
           }
-          if (file.status === "queued" && prev.every((f) => f.status !== "uploading" || f.progress === 100)) {
+          if (
+            file.status === "queued" &&
+            prev.every((f) => f.status !== "uploading" || f.progress === 100)
+          ) {
             return { ...file, status: "uploading" };
           }
           return file;
-        })
+        }),
       );
     }, 500);
 
@@ -396,48 +415,48 @@ function FileUploadExampleComponent() {
   }, []);
 
   return (
-      <div className="bg-card/50 rounded-lg p-4 w-[400px]">
-        <h3 className="text-sm font-semibold mb-4">Uploading Files</h3>
-        <div className="space-y-3">
-          {files.map((file) => (
-            <div key={file.name} className="p-3 bg-muted/20 rounded-lg">
-              <div className="flex items-center justify-between mb-2">
-                <div>
-                  <span className="text-sm font-medium block">{file.name}</span>
-                  <span className="text-xs text-muted-foreground">{file.size}</span>
-                </div>
-                <span
-                  className={`text-xs ${
-                    file.status === "complete"
-                      ? "text-green-500"
-                      : file.status === "uploading"
-                        ? "text-blue-400"
-                        : "text-muted-foreground"
-                  }`}
-                >
-                  {file.status === "complete" && "Complete"}
-                  {file.status === "uploading" && `${file.progress}%`}
-                  {file.status === "queued" && "Queued"}
-                </span>
+    <div className="bg-card/50 rounded-lg p-4 w-[400px]">
+      <h3 className="text-sm font-semibold mb-4">Uploading Files</h3>
+      <div className="space-y-3">
+        {files.map((file) => (
+          <div key={file.name} className="p-3 bg-muted/20 rounded-lg">
+            <div className="flex items-center justify-between mb-2">
+              <div>
+                <span className="text-sm font-medium block">{file.name}</span>
+                <span className="text-xs text-muted-foreground">{file.size}</span>
               </div>
-              <ProgressBar
-                current={file.progress}
-                total={100}
-                size="xs"
-                status={
+              <span
+                className={`text-xs ${
                   file.status === "complete"
-                    ? "success"
+                    ? "text-green-500"
                     : file.status === "uploading"
-                      ? "active"
-                      : "idle"
-                }
-                progressType="file_progress"
-              />
+                      ? "text-blue-400"
+                      : "text-muted-foreground"
+                }`}
+              >
+                {file.status === "complete" && "Complete"}
+                {file.status === "uploading" && `${file.progress}%`}
+                {file.status === "queued" && "Queued"}
+              </span>
             </div>
-          ))}
-        </div>
+            <ProgressBar
+              current={file.progress}
+              total={100}
+              size="xs"
+              status={
+                file.status === "complete"
+                  ? "success"
+                  : file.status === "uploading"
+                    ? "active"
+                    : "idle"
+              }
+              progressType="file_progress"
+            />
+          </div>
+        ))}
       </div>
-    );
+    </div>
+  );
 }
 
 export const FileUploadExample: Story = {

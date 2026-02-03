@@ -130,10 +130,7 @@ pub async fn navigate_to_multiple_states(
 
     Ok(CommandResponse {
         success: true,
-        message: Some(format!(
-            "Navigate to {} states command sent",
-            state_ids_len
-        )),
+        message: Some(format!("Navigate to {} states command sent", state_ids_len)),
         data: None,
     })
 }

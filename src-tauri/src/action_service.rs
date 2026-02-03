@@ -249,8 +249,8 @@ impl UnifiedActionService {
 
         // Use configurable timeout (default: disabled - run until completion)
         // Falls back to 1 hour if timeout is disabled to prevent infinite hangs on IPC
-        let timeout_duration = Timeouts::action_execution()
-            .unwrap_or_else(|| Duration::from_secs(3600));
+        let timeout_duration =
+            Timeouts::action_execution().unwrap_or_else(|| Duration::from_secs(3600));
 
         // Execute via spawn_blocking since PythonBridge uses block_on internally
         let app_state = self.app_state.clone();
@@ -564,8 +564,8 @@ impl UnifiedActionService {
 
                 // Use configurable timeout (default: disabled - run until completion)
                 // Falls back to 5 minutes if timeout is disabled to prevent infinite hangs on IPC
-                let timeout_duration = Timeouts::screenshot_capture()
-                    .unwrap_or_else(|| Duration::from_secs(300));
+                let timeout_duration =
+                    Timeouts::screenshot_capture().unwrap_or_else(|| Duration::from_secs(300));
                 match bridge.send_command_and_wait(
                     "capture_screenshot",
                     Some(params),

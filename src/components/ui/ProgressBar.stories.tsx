@@ -504,8 +504,7 @@ export const Animated: Story = {
   parameters: {
     docs: {
       description: {
-        story:
-          "Demonstrates animated progress with smooth transitions as the value increments.",
+        story: "Demonstrates animated progress with smooth transitions as the value increments.",
       },
     },
   },
@@ -569,16 +568,8 @@ export const AllSizes: Story = {
       <div className="space-y-4 w-full">
         {sizes.map((size) => (
           <div key={size}>
-            <span className="text-xs text-muted-foreground mb-1 block">
-              {size.toUpperCase()}
-            </span>
-            <ProgressBar
-              current={60}
-              total={100}
-              size={size}
-              showLabel
-              labelFormat="percentage"
-            />
+            <span className="text-xs text-muted-foreground mb-1 block">{size.toUpperCase()}</span>
+            <ProgressBar current={60} total={100} size={size} showLabel labelFormat="percentage" />
           </div>
         ))}
       </div>
@@ -609,12 +600,7 @@ export const AllStates: Story = {
       <div className="space-y-4 w-full">
         <div>
           <span className="text-xs text-muted-foreground mb-1 block">Idle (0%)</span>
-          <ProgressBar
-            current={0}
-            total={100}
-            showLabel
-            labelFormat="percentage"
-          />
+          <ProgressBar current={0} total={100} showLabel labelFormat="percentage" />
         </div>
         <div>
           <span className="text-xs text-muted-foreground mb-1 block">Active (pulse)</span>
@@ -628,12 +614,7 @@ export const AllStates: Story = {
         </div>
         <div>
           <span className="text-xs text-muted-foreground mb-1 block">Indeterminate</span>
-          <ProgressBar
-            current={23}
-            indeterminate
-            showLabel
-            labelFormat="count"
-          />
+          <ProgressBar current={23} indeterminate showLabel labelFormat="count" />
         </div>
         <div>
           <span className="text-xs text-muted-foreground mb-1 block">Success</span>
@@ -647,13 +628,7 @@ export const AllStates: Story = {
         </div>
         <div>
           <span className="text-xs text-muted-foreground mb-1 block">Error</span>
-          <ProgressBar
-            current={67}
-            total={100}
-            status="error"
-            showLabel
-            labelFormat="percentage"
-          />
+          <ProgressBar current={67} total={100} status="error" showLabel labelFormat="percentage" />
         </div>
       </div>
     );

@@ -441,7 +441,6 @@ pub struct GlobalLogSource {
     pub keywords: Vec<String>,
 
     // --- Error monitoring fields ---
-
     /// Log format: "plaintext", "json", or "jsonl"
     #[serde(default = "default_format")]
     pub format: String,

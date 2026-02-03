@@ -93,9 +93,7 @@ impl<T: ExecutionOutput> ExecutionOutputCollection for [T] {
     }
 
     fn total_duration_ms(&self) -> u64 {
-        self.iter()
-            .filter_map(|item| item.duration_ms())
-            .sum()
+        self.iter().filter_map(|item| item.duration_ms()).sum()
     }
 
     fn collect_errors(&self) -> Vec<&str> {

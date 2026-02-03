@@ -169,10 +169,7 @@ impl StepExecutorAdapter {
     /// Execute a step and convert the result to ExecutionOutcome.
     ///
     /// This is a convenience method that handles the IntoOutcome conversion.
-    pub async fn execute_to_outcome(
-        &self,
-        config: AdaptedStepConfig,
-    ) -> ExecutionOutcome {
+    pub async fn execute_to_outcome(&self, config: AdaptedStepConfig) -> ExecutionOutcome {
         let result = self.execute_internal(&config).await;
         let duration_ms = result.duration_ms;
 
@@ -191,8 +188,8 @@ impl StepExecutorAdapter {
         let mut results = Vec::new();
 
         for (index, step) in steps.iter().enumerate() {
-            let config = AdaptedStepConfig::from_execution_step(step, execution_id)
-                .with_index(index);
+            let config =
+                AdaptedStepConfig::from_execution_step(step, execution_id).with_index(index);
 
             let step_result = self.execute_internal(&config).await;
             let outcome = step_result.clone().into_outcome(step_result.duration_ms);
@@ -219,10 +216,7 @@ impl StepExecutorAdapter {
         let started_at = chrono::Utc::now().to_rfc3339();
 
         let step = &config.step;
-        let step_name = step
-            .name
-            .clone()
-            .unwrap_or_else(|| step.step_type.clone());
+        let step_name = step.name.clone().unwrap_or_else(|| step.step_type.clone());
 
         debug!(
             "Executing step via adapter: {} (type: {})",
@@ -230,7 +224,10 @@ impl StepExecutorAdapter {
         );
 
         // Execute the step using the underlying executor
-        let result = self.executor.execute_steps(&[step.clone()], &config.execution_id).await;
+        let result = self
+            .executor
+            .execute_steps(&[step.clone()], &config.execution_id)
+            .await;
 
         let duration_ms = start_time.elapsed().as_millis() as u64;
         let ended_at = chrono::Utc::now().to_rfc3339();
@@ -384,9 +381,7 @@ impl Executor for LifecycleStepAdapter {
 impl LifecycleExecutor for LifecycleStepAdapter {
     async fn start(&mut self) -> Result<(), ExecutorError> {
         if self.running {
-            return Err(ExecutorError::invalid_state(
-                "Lifecycle already started",
-            ));
+            return Err(ExecutorError::invalid_state("Lifecycle already started"));
         }
 
         info!(
@@ -405,9 +400,7 @@ impl LifecycleExecutor for LifecycleStepAdapter {
 
     async fn stop(&mut self) -> Result<(), ExecutorError> {
         if !self.running {
-            return Err(ExecutorError::invalid_state(
-                "Lifecycle not running",
-            ));
+            return Err(ExecutorError::invalid_state("Lifecycle not running"));
         }
 
         info!(
@@ -489,19 +482,20 @@ impl BatchStepExecutor {
             .collect();
 
         if failed_steps == 0 {
-            ExecutionOutcome::success(format!(
-                "All {} steps completed successfully",
-                total_steps
-            ))
-            .with_duration(duration_ms)
-            .with_output("step_count", serde_json::json!(total_steps))
-            .with_output("successful_steps", serde_json::json!(successful_steps))
-            .with_output("step_summaries", serde_json::json!(step_summaries))
+            ExecutionOutcome::success(format!("All {} steps completed successfully", total_steps))
+                .with_duration(duration_ms)
+                .with_output("step_count", serde_json::json!(total_steps))
+                .with_output("successful_steps", serde_json::json!(successful_steps))
+                .with_output("step_summaries", serde_json::json!(step_summaries))
         } else {
             let first_error = results
                 .iter()
                 .find(|(r, _)| !r.success)
-                .map(|(r, _)| r.error.clone().unwrap_or_else(|| "Unknown error".to_string()))
+                .map(|(r, _)| {
+                    r.error
+                        .clone()
+                        .unwrap_or_else(|| "Unknown error".to_string())
+                })
                 .unwrap_or_else(|| "Unknown error".to_string());
 
             ExecutionOutcome::failure(
@@ -585,8 +579,7 @@ mod tests {
             ..Default::default()
         };
 
-        let config = AdaptedStepConfig::from_execution_step(&step, "exec-123")
-            .with_index(5);
+        let config = AdaptedStepConfig::from_execution_step(&step, "exec-123").with_index(5);
 
         assert_eq!(config.execution_id, "exec-123");
         assert_eq!(config.step_index, 5);
@@ -650,11 +643,8 @@ mod tests {
     fn test_aggregate_outcomes_with_failure() {
         let outcomes = vec![
             ExecutionOutcome::success("Step 1 done").with_duration(100),
-            ExecutionOutcome::failure(
-                "Step 2 failed",
-                ExecutionError::execution("Some error"),
-            )
-            .with_duration(50),
+            ExecutionOutcome::failure("Step 2 failed", ExecutionError::execution("Some error"))
+                .with_duration(50),
         ];
 
         let aggregate = aggregate_outcomes(&outcomes);

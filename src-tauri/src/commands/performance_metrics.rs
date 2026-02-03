@@ -343,7 +343,14 @@ fn aggregate_summary(
     // Get config statistics for overall metrics
     let stats = tiered_info::get_config_statistics(conn, config_id)?;
 
-    let (total_runs, overall_success_rate, avg_run_duration_ms, flaky_transition_count, flaky_template_count, last_run_at) = match stats {
+    let (
+        total_runs,
+        overall_success_rate,
+        avg_run_duration_ms,
+        flaky_transition_count,
+        flaky_template_count,
+        last_run_at,
+    ) = match stats {
         Some(s) => {
             let success_rate = if s.total_runs > 0 {
                 s.successful_runs as f64 / s.total_runs as f64
@@ -478,10 +485,19 @@ fn aggregate_action_performance(
     }
     .map_err(|e| format!("Failed to query action events: {}", e))?;
 
-    while let Some(row) = rows.next().map_err(|e| format!("Failed to read row: {}", e))? {
-        let action_type: String = row.get(0).map_err(|e| format!("Failed to get action_type: {}", e))?;
-        let duration_ms: i64 = row.get(1).map_err(|e| format!("Failed to get duration_ms: {}", e))?;
-        let success: i32 = row.get(2).map_err(|e| format!("Failed to get success: {}", e))?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| format!("Failed to read row: {}", e))?
+    {
+        let action_type: String = row
+            .get(0)
+            .map_err(|e| format!("Failed to get action_type: {}", e))?;
+        let duration_ms: i64 = row
+            .get(1)
+            .map_err(|e| format!("Failed to get duration_ms: {}", e))?;
+        let success: i32 = row
+            .get(2)
+            .map_err(|e| format!("Failed to get success: {}", e))?;
 
         action_data
             .entry(action_type)
@@ -698,7 +714,10 @@ fn aggregate_success_rate_trend(
         }
     };
 
-    debug!("Aggregating success rate trend ({}) for config {}", bucket_format, config_id);
+    debug!(
+        "Aggregating success rate trend ({}) for config {}",
+        bucket_format, config_id
+    );
 
     let mut stmt = conn
         .prepare(sql)
@@ -712,10 +731,19 @@ fn aggregate_success_rate_trend(
     .map_err(|e| format!("Failed to query trend data: {}", e))?;
 
     let mut trend: Vec<TimeSeriesDataPoint> = Vec::new();
-    while let Some(row) = rows.next().map_err(|e| format!("Failed to read trend row: {}", e))? {
-        let timestamp: String = row.get(0).map_err(|e| format!("Failed to get timestamp: {}", e))?;
-        let total: u32 = row.get(1).map_err(|e| format!("Failed to get total: {}", e))?;
-        let successes: u32 = row.get(2).map_err(|e| format!("Failed to get successes: {}", e))?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| format!("Failed to read trend row: {}", e))?
+    {
+        let timestamp: String = row
+            .get(0)
+            .map_err(|e| format!("Failed to get timestamp: {}", e))?;
+        let total: u32 = row
+            .get(1)
+            .map_err(|e| format!("Failed to get total: {}", e))?;
+        let successes: u32 = row
+            .get(2)
+            .map_err(|e| format!("Failed to get successes: {}", e))?;
 
         let value = if total > 0 {
             successes as f64 / total as f64
@@ -816,10 +844,19 @@ fn aggregate_duration_trend(
     .map_err(|e| format!("Failed to query duration trend data: {}", e))?;
 
     let mut trend: Vec<TimeSeriesDataPoint> = Vec::new();
-    while let Some(row) = rows.next().map_err(|e| format!("Failed to read duration row: {}", e))? {
-        let timestamp: String = row.get(0).map_err(|e| format!("Failed to get timestamp: {}", e))?;
-        let avg_duration: f64 = row.get(1).map_err(|e| format!("Failed to get avg_duration: {}", e))?;
-        let total: u32 = row.get(2).map_err(|e| format!("Failed to get total: {}", e))?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| format!("Failed to read duration row: {}", e))?
+    {
+        let timestamp: String = row
+            .get(0)
+            .map_err(|e| format!("Failed to get timestamp: {}", e))?;
+        let avg_duration: f64 = row
+            .get(1)
+            .map_err(|e| format!("Failed to get avg_duration: {}", e))?;
+        let total: u32 = row
+            .get(2)
+            .map_err(|e| format!("Failed to get total: {}", e))?;
 
         trend.push(TimeSeriesDataPoint {
             timestamp,

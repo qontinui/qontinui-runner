@@ -16,8 +16,8 @@
 //! - `playwright` - Playwright TypeScript test
 //! - `pytest` - pytest-playwright test structure
 
-pub mod storage;
 pub mod script_generator;
+pub mod storage;
 pub mod types;
 
 pub use script_generator::ScriptGenerator;

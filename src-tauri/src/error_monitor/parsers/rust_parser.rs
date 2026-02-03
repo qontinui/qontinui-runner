@@ -29,8 +29,7 @@ mod rust_patterns {
     });
 
     /// Matches panic message on following line
-    pub static PANIC_REASON: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"^(.+)$").unwrap());
+    pub static PANIC_REASON: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(.+)$").unwrap());
 
     /// Matches backtrace frame: "   N: function_name"
     pub static BACKTRACE_FRAME: LazyLock<Regex> =
@@ -50,26 +49,23 @@ mod rust_patterns {
     });
 
     /// Matches cargo/rustc error: "error[E0382]: borrow of moved value"
-    pub static COMPILER_ERROR: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"^(error|warning)(?:\[([A-Z]\d+)\])?: (.+)$").unwrap()
-    });
+    pub static COMPILER_ERROR: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^(error|warning)(?:\[([A-Z]\d+)\])?: (.+)$").unwrap());
 
     /// Matches compiler error location: " --> path/to/file.rs:line:col"
     pub static COMPILER_LOCATION: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"^\s*-->\s*([^:]+):(\d+):(\d+)$").unwrap());
 
     /// Matches error chain: "Caused by:"
-    pub static CAUSED_BY: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"^Caused by:$").unwrap());
+    pub static CAUSED_BY: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^Caused by:$").unwrap());
 
     /// Matches anyhow/eyre context: "Context:"
     pub static ERROR_CONTEXT: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"^(?:Context|Error|Note):?\s*(.*)$").unwrap());
 
     /// Matches assertion failure
-    pub static ASSERTION_FAILED: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"assertion (?:failed|`[^`]+` failed): (.+)$").unwrap()
-    });
+    pub static ASSERTION_FAILED: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"assertion (?:failed|`[^`]+` failed): (.+)$").unwrap());
 
     /// Matches unwrap/expect failure
     pub static UNWRAP_FAILED: LazyLock<Regex> = LazyLock::new(|| {
@@ -336,9 +332,7 @@ impl LogParser for RustParser {
             }
 
             // Check for compiler error
-            if let Some((error, consumed)) =
-                self.parse_compiler_error(&lines[i..], source_name)
-            {
+            if let Some((error, consumed)) = self.parse_compiler_error(&lines[i..], source_name) {
                 errors.push(error);
                 i += consumed;
                 continue;
@@ -472,7 +466,11 @@ stack backtrace:
 
         let error = &errors[0];
         assert!(error.stack_trace.is_some());
-        assert!(error.stack_trace.as_ref().unwrap().contains("my_crate::my_function"));
+        assert!(error
+            .stack_trace
+            .as_ref()
+            .unwrap()
+            .contains("my_crate::my_function"));
     }
 
     #[test]

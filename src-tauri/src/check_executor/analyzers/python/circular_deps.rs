@@ -379,7 +379,7 @@ fn extract_from_import(
         // Skip keywords
         if kind == "from" || kind == "import" || kind == "," {
             if kind == "import" {
-                past_module = true;  // Everything after "import" is an imported name
+                past_module = true; // Everything after "import" is an imported name
             }
             continue;
         }
@@ -559,7 +559,7 @@ fn find_cycles(
 fn build_adjacency_list(
     graph: &HashMap<ModulePath, DependencyNode>,
     module_to_file: &HashMap<ModulePath, String>,
-    root: &Path,
+    _root: &Path,
 ) -> HashMap<ModulePath, Vec<ModulePath>> {
     let mut adjacency: HashMap<ModulePath, Vec<ModulePath>> = HashMap::new();
 
@@ -570,7 +570,7 @@ fn build_adjacency_list(
             // Find the best matching module for this import
             // Prefer exact matches over prefix matches
             let mut best_match: Option<&ModulePath> = None;
-            let mut best_is_exact = false;
+            let best_is_exact = false;
 
             for target_module in module_to_file.keys() {
                 let target_str = target_module.as_str();
@@ -579,7 +579,6 @@ fn build_adjacency_list(
                 // Check for exact match
                 if target_str == import_str {
                     best_match = Some(target_module);
-                    best_is_exact = true;
                     break; // Exact match is the best possible
                 }
 

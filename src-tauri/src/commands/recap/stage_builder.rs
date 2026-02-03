@@ -153,9 +153,8 @@ fn build_stages_from_history(
     for occurrence in &stage_occurrences {
         // Partition steps by both phase AND iteration
         // For verification/agentic phases, steps have "(iteration N)" in their name
-        let (mut stage_steps, leftover): (Vec<RecapStep>, Vec<RecapStep>) = remaining_steps
-            .into_iter()
-            .partition(|s| {
+        let (mut stage_steps, leftover): (Vec<RecapStep>, Vec<RecapStep>) =
+            remaining_steps.into_iter().partition(|s| {
                 let phase_matches = s.phase.as_deref() == Some(&occurrence.stage);
                 if !phase_matches {
                     return false;
@@ -340,7 +339,10 @@ fn build_stages_heuristic(task_run: &TaskRun, steps: &[RecapStep]) -> Vec<StageR
             "setup" => setup_steps.push(step.clone()),
             "verification" => {
                 let iter = step.iteration.unwrap_or(1);
-                verification_by_iter.entry(iter).or_default().push(step.clone());
+                verification_by_iter
+                    .entry(iter)
+                    .or_default()
+                    .push(step.clone());
             }
             "agentic" => {
                 let iter = step.iteration.unwrap_or(1);
@@ -362,8 +364,8 @@ fn build_stages_heuristic(task_run: &TaskRun, steps: &[RecapStep]) -> Vec<StageR
         let status = compute_stage_status(&setup_steps, task_run);
 
         // Derive stage timestamps from steps, falling back to task_run.created_at
-        let started_at = get_earliest_timestamp(&setup_steps)
-            .or_else(|| Some(task_run.created_at.clone()));
+        let started_at =
+            get_earliest_timestamp(&setup_steps).or_else(|| Some(task_run.created_at.clone()));
         let ended_at = get_latest_timestamp(&setup_steps);
         let duration_ms = match (&started_at, &ended_at) {
             (Some(start), Some(end)) => calculate_duration_ms(start, end),
@@ -516,8 +518,8 @@ fn build_stages_heuristic(task_run: &TaskRun, steps: &[RecapStep]) -> Vec<StageR
 
         // Derive stage timestamps from steps, falling back to task_run.completed_at
         let started_at = get_earliest_timestamp(&completion_steps);
-        let ended_at = get_latest_timestamp(&completion_steps)
-            .or_else(|| task_run.completed_at.clone());
+        let ended_at =
+            get_latest_timestamp(&completion_steps).or_else(|| task_run.completed_at.clone());
         let duration_ms = match (&started_at, &ended_at) {
             (Some(start), Some(end)) => calculate_duration_ms(start, end),
             _ => None,

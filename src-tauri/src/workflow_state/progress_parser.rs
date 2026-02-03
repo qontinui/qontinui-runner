@@ -149,7 +149,8 @@ fn get_processing_action_pattern() -> &'static Regex {
     PROCESSING_ACTION_PATTERN.get_or_init(|| {
         // Matches: "Processing file 3 of 10...", "Analyzing 5/20...", "Completed 8 of 15"
         // Uses possessive-like matching with atomic groups simulated by specific patterns
-        Regex::new(r"(?i)^(Processing|Analyzing|Completed)\s+(?:file\s+)?(\d+)\s*(?:of|/)\s*(\d+)").unwrap()
+        Regex::new(r"(?i)^(Processing|Analyzing|Completed)\s+(?:file\s+)?(\d+)\s*(?:of|/)\s*(\d+)")
+            .unwrap()
     })
 }
 
@@ -608,7 +609,9 @@ mod tests {
     fn test_explicit_typed_progress() {
         let mut parser = ProgressParser::new();
 
-        let progress = parser.parse_line("[PROGRESS: file_progress: 25/50]").unwrap();
+        let progress = parser
+            .parse_line("[PROGRESS: file_progress: 25/50]")
+            .unwrap();
         assert_eq!(progress.current, 25);
         assert_eq!(progress.total, Some(50));
         assert_eq!(progress.marker_type, "file_progress");
@@ -744,7 +747,9 @@ mod tests {
         let mut parser = ProgressParser::new();
 
         // "Task X of Y:"
-        let progress = parser.parse_line("Task 2 of 5: Update dependencies").unwrap();
+        let progress = parser
+            .parse_line("Task 2 of 5: Update dependencies")
+            .unwrap();
         assert_eq!(progress.current, 2);
         assert_eq!(progress.total, Some(5));
         assert_eq!(progress.marker_type, "task_progress");

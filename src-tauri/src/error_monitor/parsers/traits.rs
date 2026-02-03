@@ -140,8 +140,7 @@ pub mod patterns {
 
     /// Common log timestamp pattern (various formats)
     pub static TIMESTAMP_COMMON: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(\d{4}[-/]\d{2}[-/]\d{2}[T ]?\d{2}:\d{2}:\d{2}(?:\.\d+)?)")
-            .unwrap()
+        Regex::new(r"(\d{4}[-/]\d{2}[-/]\d{2}[T ]?\d{2}:\d{2}:\d{2}(?:\.\d+)?)").unwrap()
     });
 
     /// Generic error/warning level pattern

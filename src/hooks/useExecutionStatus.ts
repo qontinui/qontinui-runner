@@ -322,7 +322,8 @@ export function useExecutionStatus(): UseExecutionStatusReturn {
       const completedCount = updatedSteps.filter((s) => s.status === "completed").length;
       const progressPercent =
         prev.subSteps.totalCount > 0 ? (completedCount / prev.subSteps.totalCount) * 100 : 0;
-      const allComplete = completedCount >= prev.subSteps.totalCount && prev.subSteps.totalCount > 0;
+      const allComplete =
+        completedCount >= prev.subSteps.totalCount && prev.subSteps.totalCount > 0;
 
       return {
         ...prev,
@@ -411,7 +412,7 @@ export function useExecutionStatus(): UseExecutionStatusReturn {
               handleSubStepComplete(event.payload);
               setLastEventTime(event.payload.timestamp);
             }
-          }
+          },
         );
 
         // Sub-step started events
@@ -422,7 +423,7 @@ export function useExecutionStatus(): UseExecutionStatusReturn {
               handleSubStepStarted(event.payload);
               setLastEventTime(event.payload.timestamp);
             }
-          }
+          },
         );
 
         if (isMounted) {
@@ -430,7 +431,9 @@ export function useExecutionStatus(): UseExecutionStatusReturn {
           unlistenSubStepCompleteRef.current = unlistenSubStepComplete;
           unlistenSubStepStartedRef.current = unlistenSubStepStarted;
           setIsConnected(true);
-          console.log("[useExecutionStatus] Connected to execution status events (including sub-steps)");
+          console.log(
+            "[useExecutionStatus] Connected to execution status events (including sub-steps)",
+          );
         } else {
           unlisten();
           unlistenSubStepComplete();

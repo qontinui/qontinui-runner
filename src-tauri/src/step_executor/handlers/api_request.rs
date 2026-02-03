@@ -166,7 +166,10 @@ impl StepHandler for ApiRequestHandler {
 
                 info!(
                     "API request '{}' completed: status={}, duration={}ms, extractions={}",
-                    step_name, result.status_code, result.response_time_ms, result.extractions.len()
+                    step_name,
+                    result.status_code,
+                    result.response_time_ms,
+                    result.extractions.len()
                 );
 
                 if result.success {

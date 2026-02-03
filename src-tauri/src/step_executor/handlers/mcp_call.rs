@@ -176,7 +176,11 @@ impl McpCallHandler {
             error_message: error.map(|e| e.to_string()),
         };
 
-        match context.app_state.checkpoint_db.create_task_run_mcp_call(&input) {
+        match context
+            .app_state
+            .checkpoint_db
+            .create_task_run_mcp_call(&input)
+        {
             Ok(id) => {
                 info!(
                     "Saved MCP call result to database: {} (tool: {})",

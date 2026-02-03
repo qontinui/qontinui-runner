@@ -73,7 +73,11 @@ impl StepHandler for AwasCheckSupportHandler {
 
             info!(
                 "AWAS is {} at {}",
-                if supported { "supported" } else { "not supported" },
+                if supported {
+                    "supported"
+                } else {
+                    "not supported"
+                },
                 url
             );
 

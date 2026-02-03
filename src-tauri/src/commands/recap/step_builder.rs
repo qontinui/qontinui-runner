@@ -429,12 +429,12 @@ pub fn build_steps(
                         .map(|s| s.to_string());
 
                     // If no explicit timestamps, try to calculate from duration
-                    let (started_at, ended_at) = if step_started_at.is_some() || step_ended_at.is_some()
-                    {
-                        (step_started_at, step_ended_at)
-                    } else {
-                        (None, None) // No timestamps available in verification results
-                    };
+                    let (started_at, ended_at) =
+                        if step_started_at.is_some() || step_ended_at.is_some() {
+                            (step_started_at, step_ended_at)
+                        } else {
+                            (None, None) // No timestamps available in verification results
+                        };
 
                     seen_step_names.insert(dedup_key);
                     steps.push(RecapStep {
@@ -661,7 +661,10 @@ pub fn build_steps(
                 .get("step_type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("step");
-            let iteration = data.get("iteration").and_then(|v| v.as_u64()).map(|i| i as u32);
+            let iteration = data
+                .get("iteration")
+                .and_then(|v| v.as_u64())
+                .map(|i| i as u32);
 
             // Process events based on phase
             // Skip verification phase events only if we already have verification results
@@ -683,7 +686,12 @@ pub fn build_steps(
 
             // Create a unique key that includes iteration to handle multiple iterations
             let dedup_key = if let Some(iter) = iteration {
-                format!("{}:iter{}:{}", display_name, iter, phase.unwrap_or("unknown"))
+                format!(
+                    "{}:iter{}:{}",
+                    display_name,
+                    iter,
+                    phase.unwrap_or("unknown")
+                )
             } else {
                 format!("{}:{}", display_name, phase.unwrap_or("unknown"))
             };
@@ -718,12 +726,21 @@ pub fn build_steps(
                         return false;
                     }
                     // Check if this is the same step by comparing action_id or step details
-                    if let (Some(ref e_action_id), Some(ref this_action_id)) = (&e.action_id, &event.action_id) {
+                    if let (Some(ref e_action_id), Some(ref this_action_id)) =
+                        (&e.action_id, &event.action_id)
+                    {
                         return e_action_id == this_action_id;
                     }
                     // Fallback: compare by parsing data
-                    if let Some(e_data) = e.data.as_ref().and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok()) {
-                        let e_step_name = e_data.get("step_name").and_then(|v| v.as_str()).unwrap_or("");
+                    if let Some(e_data) = e
+                        .data
+                        .as_ref()
+                        .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+                    {
+                        let e_step_name = e_data
+                            .get("step_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
                         let e_phase = e_data.get("phase").and_then(|v| v.as_str()).unwrap_or("");
                         let e_iteration = e_data.get("iteration").and_then(|v| v.as_u64());
                         return e_step_name == step_name
@@ -747,8 +764,7 @@ pub fn build_steps(
 
             // For step_execution events, timestamp is when the event was recorded (completion time)
             // Calculate started_at from ended_at - duration
-            let (started_at, ended_at) =
-                calculate_timestamps(Some(&event.timestamp), duration_ms);
+            let (started_at, ended_at) = calculate_timestamps(Some(&event.timestamp), duration_ms);
 
             info!(
                 "Adding step from event: name='{}', phase={:?}, status='{}', step_type='{}'",

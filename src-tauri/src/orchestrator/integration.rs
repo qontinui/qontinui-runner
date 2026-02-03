@@ -16,7 +16,7 @@ use tracing::{debug, error, info, warn};
 use std::collections::HashMap;
 
 use crate::database::CheckpointDb;
-use crate::error_monitor::{DebugContextCurator, CuratorConfig};
+use crate::error_monitor::{CuratorConfig, DebugContextCurator};
 use crate::execution_context::AiSessionContext;
 use crate::orchestrator::{
     checkpoint::{
@@ -756,7 +756,7 @@ impl Orchestrator {
         match self.db.connection() {
             Ok(conn) => {
                 let config = CuratorConfig {
-                    max_errors: 20, // Limit to avoid overwhelming context
+                    max_errors: 20,     // Limit to avoid overwhelming context
                     max_stack_lines: 3, // Brief excerpts
                     ..Default::default()
                 };

@@ -49,11 +49,18 @@ pub enum FlowCondition {
     /// Check if a string matches a regex pattern.
     Matches { value: String, pattern: String },
     /// Check if an array contains an element.
-    ArrayContains { array: String, element: serde_json::Value },
+    ArrayContains {
+        array: String,
+        element: serde_json::Value,
+    },
     /// Check if an array is empty.
     ArrayEmpty { array: String },
     /// Check if array length meets a condition.
-    ArrayLength { array: String, operator: ComparisonOp, value: usize },
+    ArrayLength {
+        array: String,
+        operator: ComparisonOp,
+        value: usize,
+    },
     /// Logical AND of conditions.
     And { conditions: Vec<FlowCondition> },
     /// Logical OR of conditions.
@@ -187,68 +194,46 @@ impl FlowCondition {
             Self::NotEquals { left, right } => {
                 get_value_from_context(left, context).as_ref() != Some(right)
             }
-            Self::GreaterThan { left, right } => {
-                get_value_from_context(left, context)
-                    .and_then(|v| v.as_f64())
-                    .map(|v| v > *right)
-                    .unwrap_or(false)
-            }
-            Self::GreaterThanOrEqual { left, right } => {
-                get_value_from_context(left, context)
-                    .and_then(|v| v.as_f64())
-                    .map(|v| v >= *right)
-                    .unwrap_or(false)
-            }
-            Self::LessThan { left, right } => {
-                get_value_from_context(left, context)
-                    .and_then(|v| v.as_f64())
-                    .map(|v| v < *right)
-                    .unwrap_or(false)
-            }
-            Self::LessThanOrEqual { left, right } => {
-                get_value_from_context(left, context)
-                    .and_then(|v| v.as_f64())
-                    .map(|v| v <= *right)
-                    .unwrap_or(false)
-            }
-            Self::IsTrue { value } => {
-                get_value_from_context(value, context)
-                    .map(|v| is_truthy(&v))
-                    .unwrap_or(false)
-            }
-            Self::IsFalse { value } => {
-                get_value_from_context(value, context)
-                    .map(|v| !is_truthy(&v))
-                    .unwrap_or(true)
-            }
-            Self::IsNull { value } => {
-                get_value_from_context(value, context)
-                    .map(|v| v.is_null())
-                    .unwrap_or(true)
-            }
-            Self::IsNotNull { value } => {
-                get_value_from_context(value, context)
-                    .map(|v| !v.is_null())
-                    .unwrap_or(false)
-            }
-            Self::Contains { value, substring } => {
-                get_value_from_context(value, context)
-                    .and_then(|v| v.as_str().map(|s| s.to_string()))
-                    .map(|s| s.contains(substring))
-                    .unwrap_or(false)
-            }
-            Self::StartsWith { value, prefix } => {
-                get_value_from_context(value, context)
-                    .and_then(|v| v.as_str().map(|s| s.to_string()))
-                    .map(|s| s.starts_with(prefix))
-                    .unwrap_or(false)
-            }
-            Self::EndsWith { value, suffix } => {
-                get_value_from_context(value, context)
-                    .and_then(|v| v.as_str().map(|s| s.to_string()))
-                    .map(|s| s.ends_with(suffix))
-                    .unwrap_or(false)
-            }
+            Self::GreaterThan { left, right } => get_value_from_context(left, context)
+                .and_then(|v| v.as_f64())
+                .map(|v| v > *right)
+                .unwrap_or(false),
+            Self::GreaterThanOrEqual { left, right } => get_value_from_context(left, context)
+                .and_then(|v| v.as_f64())
+                .map(|v| v >= *right)
+                .unwrap_or(false),
+            Self::LessThan { left, right } => get_value_from_context(left, context)
+                .and_then(|v| v.as_f64())
+                .map(|v| v < *right)
+                .unwrap_or(false),
+            Self::LessThanOrEqual { left, right } => get_value_from_context(left, context)
+                .and_then(|v| v.as_f64())
+                .map(|v| v <= *right)
+                .unwrap_or(false),
+            Self::IsTrue { value } => get_value_from_context(value, context)
+                .map(|v| is_truthy(&v))
+                .unwrap_or(false),
+            Self::IsFalse { value } => get_value_from_context(value, context)
+                .map(|v| !is_truthy(&v))
+                .unwrap_or(true),
+            Self::IsNull { value } => get_value_from_context(value, context)
+                .map(|v| v.is_null())
+                .unwrap_or(true),
+            Self::IsNotNull { value } => get_value_from_context(value, context)
+                .map(|v| !v.is_null())
+                .unwrap_or(false),
+            Self::Contains { value, substring } => get_value_from_context(value, context)
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .map(|s| s.contains(substring))
+                .unwrap_or(false),
+            Self::StartsWith { value, prefix } => get_value_from_context(value, context)
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .map(|s| s.starts_with(prefix))
+                .unwrap_or(false),
+            Self::EndsWith { value, suffix } => get_value_from_context(value, context)
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .map(|s| s.ends_with(suffix))
+                .unwrap_or(false),
             Self::Matches { value, pattern } => {
                 let val = get_value_from_context(value, context)
                     .and_then(|v| v.as_str().map(|s| s.to_string()));
@@ -261,34 +246,32 @@ impl FlowCondition {
                     false
                 }
             }
-            Self::ArrayContains { array, element } => {
-                get_value_from_context(array, context)
-                    .and_then(|v| v.as_array().cloned())
-                    .map(|arr| arr.contains(element))
-                    .unwrap_or(false)
-            }
-            Self::ArrayEmpty { array } => {
-                get_value_from_context(array, context)
-                    .and_then(|v| v.as_array().cloned())
-                    .map(|arr| arr.is_empty())
-                    .unwrap_or(true)
-            }
-            Self::ArrayLength { array, operator, value } => {
-                get_value_from_context(array, context)
-                    .and_then(|v| v.as_array().cloned())
-                    .map(|arr| {
-                        let len = arr.len();
-                        match operator {
-                            ComparisonOp::Eq => len == *value,
-                            ComparisonOp::Ne => len != *value,
-                            ComparisonOp::Gt => len > *value,
-                            ComparisonOp::Gte => len >= *value,
-                            ComparisonOp::Lt => len < *value,
-                            ComparisonOp::Lte => len <= *value,
-                        }
-                    })
-                    .unwrap_or(false)
-            }
+            Self::ArrayContains { array, element } => get_value_from_context(array, context)
+                .and_then(|v| v.as_array().cloned())
+                .map(|arr| arr.contains(element))
+                .unwrap_or(false),
+            Self::ArrayEmpty { array } => get_value_from_context(array, context)
+                .and_then(|v| v.as_array().cloned())
+                .map(|arr| arr.is_empty())
+                .unwrap_or(true),
+            Self::ArrayLength {
+                array,
+                operator,
+                value,
+            } => get_value_from_context(array, context)
+                .and_then(|v| v.as_array().cloned())
+                .map(|arr| {
+                    let len = arr.len();
+                    match operator {
+                        ComparisonOp::Eq => len == *value,
+                        ComparisonOp::Ne => len != *value,
+                        ComparisonOp::Gt => len > *value,
+                        ComparisonOp::Gte => len >= *value,
+                        ComparisonOp::Lt => len < *value,
+                        ComparisonOp::Lte => len <= *value,
+                    }
+                })
+                .unwrap_or(false),
             Self::And { conditions } => conditions.iter().all(|c| c.evaluate(context)),
             Self::Or { conditions } => conditions.iter().any(|c| c.evaluate(context)),
             Self::Not { condition } => !condition.evaluate(context),
@@ -317,7 +300,11 @@ impl FlowCondition {
             Self::Matches { value, pattern } => format!("{} matches /{}/", value, pattern),
             Self::ArrayContains { array, element } => format!("{} contains {}", array, element),
             Self::ArrayEmpty { array } => format!("{} is empty", array),
-            Self::ArrayLength { array, operator, value } => {
+            Self::ArrayLength {
+                array,
+                operator,
+                value,
+            } => {
                 let op = match operator {
                     ComparisonOp::Eq => "==",
                     ComparisonOp::Ne => "!=",
@@ -448,8 +435,7 @@ fn evaluate_expression(expr: &str, context: &HashMap<String, serde_json::Value>)
         if !left.ends_with('=') {
             let left = left.trim();
             let right = right.trim();
-            let left_val = get_value_from_context(left, context)
-                .and_then(|v| v.as_f64());
+            let left_val = get_value_from_context(left, context).and_then(|v| v.as_f64());
             let right_val = right.parse::<f64>().ok();
             if let (Some(l), Some(r)) = (left_val, right_val) {
                 return l > r;
@@ -462,8 +448,7 @@ fn evaluate_expression(expr: &str, context: &HashMap<String, serde_json::Value>)
         if !left.ends_with('=') {
             let left = left.trim();
             let right = right.trim();
-            let left_val = get_value_from_context(left, context)
-                .and_then(|v| v.as_f64());
+            let left_val = get_value_from_context(left, context).and_then(|v| v.as_f64());
             let right_val = right.parse::<f64>().ok();
             if let (Some(l), Some(r)) = (left_val, right_val) {
                 return l < r;

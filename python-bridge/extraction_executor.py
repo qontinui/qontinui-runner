@@ -77,8 +77,8 @@ sys.path.insert(0, str(qontinui_src_path))
 
 # Import our specialized modules
 from event_manager import EventManager, EventType  # noqa: E402
-from services.web_extraction_service import WebExtractionService  # noqa: E402
 from services.vision_extraction_service import VisionExtractionService  # noqa: E402
+from services.web_extraction_service import WebExtractionService  # noqa: E402
 from websocket_handler import WebSocketHandler  # noqa: E402
 
 

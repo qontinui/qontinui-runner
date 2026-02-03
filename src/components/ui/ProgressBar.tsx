@@ -103,10 +103,7 @@ export interface ProgressBarProps {
 /**
  * Map progress types to accent colors.
  */
-function getProgressColor(
-  type: ProgressType | string,
-  status: ProgressStatus,
-): AccentColor {
+function getProgressColor(type: ProgressType | string, status: ProgressStatus): AccentColor {
   // Status overrides type colors
   if (status === "success") return "green";
   if (status === "error") return "red";
@@ -278,12 +275,7 @@ export const ProgressBar = React.forwardRef<HTMLDivElement, ProgressBarProps>(
               </span>
             )}
             {description && (
-              <span
-                className={cn(
-                  "text-muted-foreground truncate ml-2",
-                  sizeClasses.text,
-                )}
-              >
+              <span className={cn("text-muted-foreground truncate ml-2", sizeClasses.text)}>
                 {description}
               </span>
             )}

@@ -36,7 +36,10 @@ pub enum AppEvent {
     },
 
     /// Executor error event.
-    ExecutorError { message: String, details: Option<String> },
+    ExecutorError {
+        message: String,
+        details: Option<String>,
+    },
 
     /// Executor response for command completion.
     ExecutorResponse {
@@ -61,7 +64,10 @@ pub enum AppEvent {
     },
 
     /// Web extraction error event.
-    ExtractionError { message: String, details: Option<String> },
+    ExtractionError {
+        message: String,
+        details: Option<String>,
+    },
 
     /// Web extraction response.
     ExtractionResponse {
@@ -184,7 +190,10 @@ pub enum AppEvent {
     // Generic Events
     // ========================================================================
     /// Generic error event.
-    Error { message: String, context: Option<String> },
+    Error {
+        message: String,
+        context: Option<String>,
+    },
 }
 
 impl AppEvent {
@@ -489,10 +498,7 @@ impl AppEvent {
     }
 
     /// Create a task run update event.
-    pub fn task_run_update(
-        task_run_id: impl Into<String>,
-        status: impl Into<String>,
-    ) -> Self {
+    pub fn task_run_update(task_run_id: impl Into<String>, status: impl Into<String>) -> Self {
         AppEvent::TaskRunUpdate {
             task_run_id: task_run_id.into(),
             status: status.into(),
@@ -578,9 +584,7 @@ mod tests {
     fn test_executor_event_creation() {
         let event = AppEvent::executor_event("test_event", serde_json::json!({"key": "value"}));
         match event {
-            AppEvent::ExecutorEvent {
-                event, data, ..
-            } => {
+            AppEvent::ExecutorEvent { event, data, .. } => {
                 assert_eq!(event, "test_event");
                 assert_eq!(data["key"], "value");
             }

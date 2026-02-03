@@ -60,18 +60,21 @@ pub mod states;
 mod types;
 
 // Panic handling imports
-use std::sync::Arc;
 use futures_util::FutureExt;
+use std::sync::Arc;
 use tracing::{error, info};
 
 // Core types used by external code
 pub use loop_controller::{
-    LoopController, ResumeConfig, resume_interrupted_workflows,
     // Phase-aware versions (preferred for unified workflows)
-    convert_json_steps_with_phase, extract_prompt_steps_with_phase,
+    convert_json_steps_with_phase,
+    extract_prompt_steps_with_phase,
     extract_workflow_id_from_task_id,
+    resume_interrupted_workflows,
+    LoopController,
+    ResumeConfig,
 };
-pub use types::{LoopConfig, LoopResult, WorkflowPhase, get_parent_task_id};
+pub use types::{get_parent_task_id, LoopConfig, LoopResult, WorkflowPhase};
 
 // Types exposed for API consumers and advanced usage
 // These may not be directly used in this crate but are part of the public API
@@ -89,8 +92,8 @@ pub use phases::{AgenticExecutor, CompletionExecutor, SetupExecutor, Verificatio
 // Note: Used with the Executor trait implementations in phases.rs
 #[allow(unused_imports)]
 pub use phase_configs::{
-    SetupConfig, SetupResult, VerificationConfig, VerificationResult,
-    AgenticConfig, CompletionConfig, CompletionResult,
+    AgenticConfig, CompletionConfig, CompletionResult, SetupConfig, SetupResult,
+    VerificationConfig, VerificationResult,
 };
 
 // Re-export resume types for restart recovery
@@ -128,8 +131,7 @@ pub fn spawn_workflow_with_panic_guard<F>(
     execution_id: String,
     workflow_name: String,
     fut: F,
-)
-where
+) where
     F: std::future::Future<Output = loop_controller::WorkflowResult> + Send + 'static,
 {
     tokio::spawn(async move {
@@ -191,8 +193,7 @@ pub fn spawn_sequence_with_panic_guard<F>(
     execution_id: String,
     sequence_name: String,
     fut: F,
-)
-where
+) where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     tokio::spawn(async move {

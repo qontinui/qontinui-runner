@@ -48,17 +48,20 @@ impl ScriptGenerator {
         let mut script = String::new();
 
         // Header and imports
-        script.push_str(r#"#!/usr/bin/env python3
+        script.push_str(
+            r#"#!/usr/bin/env python3
 """
 Auto-generated automation script from recording.
-Recording: "#);
+Recording: "#,
+        );
         script.push_str(&recording.name);
         if let Some(desc) = &recording.description {
             script.push_str(&format!("\nDescription: {}", desc));
         }
         script.push_str(&format!("\nBase URL: {}", recording.base_url));
         script.push_str(&format!("\nGenerated: {}", chrono::Utc::now().to_rfc3339()));
-        script.push_str(r#"
+        script.push_str(
+            r#"
 """
 
 import time
@@ -112,19 +115,27 @@ def run_automation(base_url: Optional[str] = None) -> None:
     client = UIBridgeClient()
 
     # Navigate to starting URL
-    start_url = base_url or ""#);
+    start_url = base_url or ""#,
+        );
         script.push_str(&format!("\"{}\"", recording.base_url));
-        script.push_str(r#"
+        script.push_str(
+            r#"
     print(f"Navigating to {start_url}")
     client.navigate(start_url)
-"#);
+"#,
+        );
 
         // Add wait based on strategy
         Self::add_python_wait(&mut script, options);
 
         // Generate action code
         for (i, action) in actions.iter().enumerate() {
-            script.push_str(&format!("\n    # Action {}: {} on {}\n", i + 1, action.action_type, action.target.tag_name));
+            script.push_str(&format!(
+                "\n    # Action {}: {} on {}\n",
+                i + 1,
+                action.action_type,
+                action.target.tag_name
+            ));
 
             let selector = Self::get_best_selector(&action.target, options);
 
@@ -149,13 +160,17 @@ def run_automation(base_url: Optional[str] = None) -> None:
                 }
                 ActionType::Navigate => {
                     if let Some(ActionData::Navigate(data)) = &action.action_data {
-                        script.push_str(&format!("    print(\"Navigating to: {}\")\n", data.to_url));
+                        script
+                            .push_str(&format!("    print(\"Navigating to: {}\")\n", data.to_url));
                         script.push_str(&format!("    client.navigate(\"{}\")\n", data.to_url));
                     }
                 }
                 ActionType::Select => {
                     if let Some(ActionData::Select(data)) = &action.action_data {
-                        script.push_str(&format!("    print(\"Selecting: {} in {}\")\n", data.value, selector));
+                        script.push_str(&format!(
+                            "    print(\"Selecting: {} in {}\")\n",
+                            data.value, selector
+                        ));
                         script.push_str(&format!(
                             "    client.select(\"{}\", \"{}\")\n",
                             selector, data.value
@@ -184,7 +199,9 @@ def run_automation(base_url: Optional[str] = None) -> None:
                 }
                 ActionType::Hover => {
                     script.push_str(&format!("    print(\"Hovering: {}\")\n", selector));
-                    script.push_str(&format!("    # Hover action - implement based on your client\n"));
+                    script.push_str(&format!(
+                        "    # Hover action - implement based on your client\n"
+                    ));
                 }
             }
 
@@ -194,13 +211,15 @@ def run_automation(base_url: Optional[str] = None) -> None:
             }
         }
 
-        script.push_str(r#"
+        script.push_str(
+            r#"
     print("Automation completed successfully!")
 
 
 if __name__ == "__main__":
     run_automation()
-"#);
+"#,
+        );
 
         Ok(script)
     }
@@ -219,25 +238,36 @@ if __name__ == "__main__":
         let mut script = String::new();
 
         // Header
-        script.push_str(r#"/**
+        script.push_str(
+            r#"/**
  * Auto-generated Playwright test from recording.
- * Recording: "#);
+ * Recording: "#,
+        );
         script.push_str(&recording.name);
         script.push_str(&format!("\n * Base URL: {}", recording.base_url));
-        script.push_str(&format!("\n * Generated: {}", chrono::Utc::now().to_rfc3339()));
-        script.push_str(r#"
+        script.push_str(&format!(
+            "\n * Generated: {}",
+            chrono::Utc::now().to_rfc3339()
+        ));
+        script.push_str(
+            r#"
  */
 
 import { test, expect } from '@playwright/test';
 
-test.describe('"#);
+test.describe('"#,
+        );
         script.push_str(&test_name);
-        script.push_str(r#"', () => {
-  test('"#);
+        script.push_str(
+            r#"', () => {
+  test('"#,
+        );
         script.push_str(&test_name);
-        script.push_str(r#"', async ({ page }) => {
+        script.push_str(
+            r#"', async ({ page }) => {
     // Navigate to starting URL
-    await page.goto('"#);
+    await page.goto('"#,
+        );
         script.push_str(&recording.base_url);
         script.push_str("');\n");
 
@@ -257,12 +287,18 @@ test.describe('"#);
 
             match action.action_type {
                 ActionType::Click => {
-                    script.push_str(&format!("    await page.locator('{}').click();\n", selector));
+                    script.push_str(&format!(
+                        "    await page.locator('{}').click();\n",
+                        selector
+                    ));
                 }
                 ActionType::Type => {
                     if let Some(ActionData::Type(data)) = &action.action_data {
                         if data.clear_first {
-                            script.push_str(&format!("    await page.locator('{}').clear();\n", selector));
+                            script.push_str(&format!(
+                                "    await page.locator('{}').clear();\n",
+                                selector
+                            ));
                         }
                         script.push_str(&format!(
                             "    await page.locator('{}').fill('{}');\n",
@@ -294,11 +330,15 @@ test.describe('"#);
                 }
                 ActionType::Keypress => {
                     if let Some(ActionData::Keypress(data)) = &action.action_data {
-                        script.push_str(&format!("    await page.keyboard.press('{}');\n", data.key));
+                        script
+                            .push_str(&format!("    await page.keyboard.press('{}');\n", data.key));
                     }
                 }
                 ActionType::Hover => {
-                    script.push_str(&format!("    await page.locator('{}').hover();\n", selector));
+                    script.push_str(&format!(
+                        "    await page.locator('{}').hover();\n",
+                        selector
+                    ));
                 }
             }
 
@@ -331,30 +371,29 @@ test.describe('"#);
             .test_name
             .clone()
             .map(|n| format!("test_{}", n.to_lowercase().replace(' ', "_")))
-            .unwrap_or_else(|| {
-                format!(
-                    "test_{}",
-                    recording.name.to_lowercase().replace(' ', "_")
-                )
-            });
+            .unwrap_or_else(|| format!("test_{}", recording.name.to_lowercase().replace(' ', "_")));
 
         let mut script = String::new();
 
         // Header
-        script.push_str(r#""""
+        script.push_str(
+            r#""""
 Auto-generated pytest-playwright test from recording.
-Recording: "#);
+Recording: "#,
+        );
         script.push_str(&recording.name);
         script.push_str(&format!("\nBase URL: {}", recording.base_url));
         script.push_str(&format!("\nGenerated: {}", chrono::Utc::now().to_rfc3339()));
-        script.push_str(r#"
+        script.push_str(
+            r#"
 """
 
 import pytest
 from playwright.sync_api import Page, expect
 
 
-"#);
+"#,
+        );
         script.push_str(&format!("def {}(page: Page) -> None:\n", test_name));
         if let Some(desc) = &options.test_description {
             script.push_str(&format!("    \"\"\"{}.\"\"\"\n", desc));
@@ -386,7 +425,8 @@ from playwright.sync_api import Page, expect
                 ActionType::Type => {
                     if let Some(ActionData::Type(data)) = &action.action_data {
                         if data.clear_first {
-                            script.push_str(&format!("    page.locator(\"{}\").clear()\n", selector));
+                            script
+                                .push_str(&format!("    page.locator(\"{}\").clear()\n", selector));
                         }
                         script.push_str(&format!(
                             "    page.locator(\"{}\").fill(\"{}\")\n",
@@ -457,23 +497,34 @@ from playwright.sync_api import Page, expect
         let mut script = String::new();
 
         // Header
-        script.push_str(r#"/**
+        script.push_str(
+            r#"/**
  * Auto-generated Cypress test from recording.
- * Recording: "#);
+ * Recording: "#,
+        );
         script.push_str(&recording.name);
         script.push_str(&format!("\n * Base URL: {}", recording.base_url));
-        script.push_str(&format!("\n * Generated: {}", chrono::Utc::now().to_rfc3339()));
-        script.push_str(r#"
+        script.push_str(&format!(
+            "\n * Generated: {}",
+            chrono::Utc::now().to_rfc3339()
+        ));
+        script.push_str(
+            r#"
  */
 
-describe('"#);
+describe('"#,
+        );
         script.push_str(&test_name);
-        script.push_str(r#"', () => {
-  it('"#);
+        script.push_str(
+            r#"', () => {
+  it('"#,
+        );
         script.push_str(&test_name);
-        script.push_str(r#"', () => {
+        script.push_str(
+            r#"', () => {
     // Navigate to starting URL
-    cy.visit('"#);
+    cy.visit('"#,
+        );
         script.push_str(&recording.base_url);
         script.push_str("');\n");
 
@@ -518,7 +569,10 @@ describe('"#);
                     }
                 }
                 _ => {
-                    script.push_str(&format!("    // {} action - implement as needed\n", action.action_type));
+                    script.push_str(&format!(
+                        "    // {} action - implement as needed\n",
+                        action.action_type
+                    ));
                 }
             }
         }

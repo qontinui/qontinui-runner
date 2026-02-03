@@ -155,7 +155,9 @@ function WorkflowStageIndicator({
           <IterationBadge
             iteration={iteration}
             maxIterations={maxIterations}
-            isRunning={isRunning && (effectiveStage === "verification" || effectiveStage === "agentic")}
+            isRunning={
+              isRunning && (effectiveStage === "verification" || effectiveStage === "agentic")
+            }
           />
           <span className="w-4" /> {/* Spacer to match arrow width */}
         </>
@@ -167,7 +169,8 @@ function WorkflowStageIndicator({
           const config = WORKFLOW_STAGE_CONFIG[stage];
           const isCurrent = stage === effectiveStage;
           const isPast =
-            effectiveStage && WORKFLOW_STAGES.indexOf(stage) < WORKFLOW_STAGES.indexOf(effectiveStage);
+            effectiveStage &&
+            WORKFLOW_STAGES.indexOf(stage) < WORKFLOW_STAGES.indexOf(effectiveStage);
 
           // Get color classes based on state
           const colors = getAccentColors(config.color as Parameters<typeof getAccentColors>[0]);

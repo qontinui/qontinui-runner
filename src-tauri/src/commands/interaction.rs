@@ -63,9 +63,7 @@ pub fn start_interaction_recording(
     );
 
     if !is_default_bridge_running(&state) {
-        return Err(
-            "Python executor is not running. Please start the executor first.".to_string(),
-        );
+        return Err("Python executor is not running. Please start the executor first.".to_string());
     }
 
     let params = json!({
@@ -105,9 +103,7 @@ pub fn stop_interaction_recording(state: State<Arc<AppState>>) -> Result<Command
     info!("Stopping interaction recording");
 
     if !is_default_bridge_running(&state) {
-        return Err(
-            "Python executor is not running. Please start the executor first.".to_string(),
-        );
+        return Err("Python executor is not running. Please start the executor first.".to_string());
     }
 
     with_default_bridge(&state, |bridge| {

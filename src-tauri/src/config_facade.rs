@@ -393,7 +393,8 @@ pub fn migrate_api_keys_to_keychain() -> Result<(), String> {
 
     // Save settings if we migrated anything (to clear plaintext values)
     if migrated_any {
-        save_settings(&settings).map_err(|e| format!("Failed to save settings after migration: {}", e))?;
+        save_settings(&settings)
+            .map_err(|e| format!("Failed to save settings after migration: {}", e))?;
         info!("API key migration complete");
     } else {
         info!("No API keys to migrate");
@@ -428,7 +429,10 @@ mod tests {
         assert_eq!(AccessibilitySettings::field_name(), "accessibility");
         assert_eq!(DebugSettings::field_name(), "debug");
         assert_eq!(PathSettings::field_name(), "paths");
-        assert_eq!(ExecutionVariablesSettings::field_name(), "execution_variables");
+        assert_eq!(
+            ExecutionVariablesSettings::field_name(),
+            "execution_variables"
+        );
         assert_eq!(GlobalLogSourceSettings::field_name(), "log_sources");
     }
 }

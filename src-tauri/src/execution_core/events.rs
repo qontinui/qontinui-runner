@@ -254,9 +254,9 @@ impl ExecutionEvent {
     /// Get the step ID for this event (if applicable).
     pub fn step_id(&self) -> Option<&str> {
         match self {
-            Self::FlowStarted { .. }
-            | Self::FlowCompleted { .. }
-            | Self::FlowCancelled { .. } => None,
+            Self::FlowStarted { .. } | Self::FlowCompleted { .. } | Self::FlowCancelled { .. } => {
+                None
+            }
 
             Self::FlowPaused { step_id, .. }
             | Self::FlowResumed { step_id, .. }

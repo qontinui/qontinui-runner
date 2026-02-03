@@ -9,10 +9,9 @@
 #![allow(dead_code)]
 
 use crate::scheduler::{
-    clear_task_condition_status, compute_next_run, get_task,
-    load_scheduler_state, record_execution, save_scheduler_state, update_task_condition_status,
-    ConditionStatus, RepositoryWatch, ScheduledTask, ScheduledTaskStatus, ScheduledTaskType,
-    TaskExecutionRecord,
+    clear_task_condition_status, compute_next_run, get_task, load_scheduler_state,
+    record_execution, save_scheduler_state, update_task_condition_status, ConditionStatus,
+    RepositoryWatch, ScheduledTask, ScheduledTaskStatus, ScheduledTaskType, TaskExecutionRecord,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

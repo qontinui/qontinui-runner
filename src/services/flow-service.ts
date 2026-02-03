@@ -186,11 +186,7 @@ export const flowService = {
    * @param input - The input value to provide.
    * @returns True if input was accepted.
    */
-  async provideFlowInput(
-    instanceId: string,
-    stepId: string,
-    input: unknown,
-  ): Promise<boolean> {
+  async provideFlowInput(instanceId: string, stepId: string, input: unknown): Promise<boolean> {
     return invoke("provide_flow_input", { instanceId, stepId, input });
   },
 

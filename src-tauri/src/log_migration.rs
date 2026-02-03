@@ -550,8 +550,6 @@ fn migrate_api_request_events(
 #[cfg(test)]
 mod tests {
     use super::*;
-    
-    
 
     #[test]
     fn test_parse_general_event() {

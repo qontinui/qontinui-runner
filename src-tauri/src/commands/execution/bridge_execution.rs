@@ -74,12 +74,11 @@ pub async fn run_workflow_on_bridge(
     }
 
     // Execute on the specific bridge
-    let result = manager
-        .with_bridge(&bridge_id, |bridge| {
-            bridge
-                .start_execution_with_params(Some(serde_json::Value::Object(execution_params)))
-                .map_err(|e| format!("Failed to start execution: {}", e))
-        })?;
+    let result = manager.with_bridge(&bridge_id, |bridge| {
+        bridge
+            .start_execution_with_params(Some(serde_json::Value::Object(execution_params)))
+            .map_err(|e| format!("Failed to start execution: {}", e))
+    })?;
 
     match result {
         Ok(()) => {
@@ -180,9 +179,7 @@ pub async fn transfer_gui_lock(
 /// * `Ok(CommandResponse)` - Success with list of bridge info
 /// * `Err(String)` - Error if bridge manager not initialized
 #[tauri::command]
-pub async fn list_bridges(
-    state: State<'_, Arc<AppState>>,
-) -> Result<CommandResponse, String> {
+pub async fn list_bridges(state: State<'_, Arc<AppState>>) -> Result<CommandResponse, String> {
     debug!("Listing all bridges");
 
     let manager = get_bridge_manager(&state)?;

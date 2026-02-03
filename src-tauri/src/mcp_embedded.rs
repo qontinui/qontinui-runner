@@ -113,8 +113,7 @@ impl EmbeddedMcp {
             _ => {
                 return Err(format!(
                     "Tool '{}' expects object arguments, got: {}",
-                    name,
-                    args
+                    name, args
                 ));
             }
         };
@@ -133,9 +132,7 @@ impl EmbeddedMcp {
                     // Return outputs as the result
                     Ok(json!(result.outputs))
                 } else {
-                    let error = result
-                        .error
-                        .unwrap_or_else(|| "Unknown error".to_string());
+                    let error = result.error.unwrap_or_else(|| "Unknown error".to_string());
                     warn!(tool = %name, error = %error, "Builtin tool failed");
                     Err(error)
                 }
@@ -920,7 +917,11 @@ mod tests {
     fn test_get_all_tools() {
         let tools = EmbeddedMcp::get_all_tools();
         // Should have builtin + runner tools
-        assert!(tools.len() >= 20, "Expected at least 20 tools, got {}", tools.len());
+        assert!(
+            tools.len() >= 20,
+            "Expected at least 20 tools, got {}",
+            tools.len()
+        );
 
         // Check that each tool has required fields
         for tool in &tools {
@@ -976,7 +977,10 @@ mod tests {
     async fn test_call_builtin_tool_string_concat() {
         let mcp = EmbeddedMcp::new();
         let result = mcp
-            .call_tool("string_concat", json!({"parts": ["a", "b", "c"], "separator": "-"}))
+            .call_tool(
+                "string_concat",
+                json!({"parts": ["a", "b", "c"], "separator": "-"}),
+            )
             .await;
         assert!(result.is_ok());
         let output = result.unwrap();

@@ -102,9 +102,7 @@ export function ErrorBoundaryTestSuite() {
           {/* Test 1: Generic Error Boundary */}
           <div className="space-y-2">
             <h3 className="text-sm font-medium">1. Generic ErrorBoundary</h3>
-            <ErrorBoundary
-              onError={(error) => console.log("[Test] Caught error:", error.message)}
-            >
+            <ErrorBoundary onError={(error) => console.log("[Test] Caught error:", error.message)}>
               <ErrorThrower message="Generic boundary test" />
             </ErrorBoundary>
           </div>
@@ -116,7 +114,9 @@ export function ErrorBoundaryTestSuite() {
               enableRetry
               maxRetries={3}
               retryDelay={3000}
-              onError={(error) => console.log("[Test] Caught error (retry enabled):", error.message)}
+              onError={(error) =>
+                console.log("[Test] Caught error (retry enabled):", error.message)
+              }
             >
               <ErrorThrower message="Retry boundary test" />
             </ErrorBoundary>

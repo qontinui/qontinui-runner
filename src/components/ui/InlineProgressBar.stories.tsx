@@ -286,7 +286,8 @@ export const InTableContext: Story = {
   parameters: {
     docs: {
       description: {
-        story: "Example showing InlineProgressBar used within a table for multiple task progress tracking",
+        story:
+          "Example showing InlineProgressBar used within a table for multiple task progress tracking",
       },
     },
   },

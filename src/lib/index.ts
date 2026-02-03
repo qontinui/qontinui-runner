@@ -9,12 +9,7 @@ export { cn } from "./utils";
 export { APP_VERSION } from "./appInfo";
 
 // Performance monitoring (dev mode only)
-export {
-  PerformanceMonitor,
-  getPerformanceMonitor,
-  measure,
-  measureAsync,
-} from "./performance";
+export { PerformanceMonitor, getPerformanceMonitor, measure, measureAsync } from "./performance";
 export type {
   PerformanceMeasure,
   NetworkMetrics,
@@ -26,11 +21,7 @@ export type {
 } from "./performance";
 
 export { NetworkMonitor, getNetworkMonitor } from "./network-monitor";
-export type {
-  RequestRecord,
-  EndpointStats,
-  NetworkMonitorStats,
-} from "./network-monitor";
+export type { RequestRecord, EndpointStats, NetworkMonitorStats } from "./network-monitor";
 
 export {
   generatePerformanceReport,

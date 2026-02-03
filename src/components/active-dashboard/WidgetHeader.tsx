@@ -91,6 +91,7 @@ export function WidgetHeader({
   itemLabel,
   detailRoute: _detailRoute,
   onViewAll,
+  actions,
 }: WidgetHeaderProps) {
   const IconComponent = iconMap[icon] ?? Monitor;
   const colors = getAccentClasses(accentColor, isActive);
@@ -140,6 +141,9 @@ export function WidgetHeader({
             {itemCount} {itemLabel ?? "items"}
           </span>
         )}
+
+        {/* Custom action buttons */}
+        {actions}
 
         {/* View All link - hidden when widget is already active (in main container) */}
         {onViewAll && !isActive && (

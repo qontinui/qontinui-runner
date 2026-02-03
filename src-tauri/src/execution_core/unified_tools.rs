@@ -336,7 +336,11 @@ async fn execute_shell_command(
                     .with_duration(duration_ms)
             } else if fail_on_error {
                 let error_msg = if !stderr.is_empty() {
-                    format!("Command failed (exit code {:?}): {}", exit_code, stderr.trim())
+                    format!(
+                        "Command failed (exit code {:?}): {}",
+                        exit_code,
+                        stderr.trim()
+                    )
                 } else {
                     format!("Command failed with exit code {:?}", exit_code)
                 };
@@ -496,7 +500,11 @@ async fn execute_api_request(
                     } else {
                         StepExecutionResult::failure(
                             step_id,
-                            format!("HTTP {}: {}", status_code, body.chars().take(500).collect::<String>()),
+                            format!(
+                                "HTTP {}: {}",
+                                status_code,
+                                body.chars().take(500).collect::<String>()
+                            ),
                         )
                         .with_output("status_code", json!(status_code))
                         .with_output("body", json!(body))
@@ -699,16 +707,12 @@ test('Flow Designer Test', async ({{ page }}) => {{
 async fn execute_mcp_call(step_id: &str, inputs: &HashMap<String, Value>) -> StepExecutionResult {
     let server_id = match inputs.get("server_id").and_then(|v| v.as_str()) {
         Some(id) => id.to_string(),
-        None => {
-            return StepExecutionResult::failure(step_id, "Missing required input 'server_id'")
-        }
+        None => return StepExecutionResult::failure(step_id, "Missing required input 'server_id'"),
     };
 
     let tool_name = match inputs.get("tool_name").and_then(|v| v.as_str()) {
         Some(name) => name.to_string(),
-        None => {
-            return StepExecutionResult::failure(step_id, "Missing required input 'tool_name'")
-        }
+        None => return StepExecutionResult::failure(step_id, "Missing required input 'tool_name'"),
     };
 
     let arguments = inputs.get("arguments").cloned().unwrap_or(json!({}));
@@ -825,36 +829,32 @@ mod tests {
         assert!(schema.is_some());
         let schema = schema.unwrap();
         assert_eq!(schema.name, "shell_command");
-        assert!(schema.inputs.iter().any(|i| i.name == "command" && i.required));
+        assert!(schema
+            .inputs
+            .iter()
+            .any(|i| i.name == "command" && i.required));
 
         let schema = UnifiedToolRegistry::get_tool_schema("api_request");
         assert!(schema.is_some());
         let schema = schema.unwrap();
-        assert!(schema.inputs.iter().any(|i| i.name == "method" && i.required));
+        assert!(schema
+            .inputs
+            .iter()
+            .any(|i| i.name == "method" && i.required));
         assert!(schema.inputs.iter().any(|i| i.name == "url" && i.required));
     }
 
     #[tokio::test]
     async fn test_unknown_tool() {
-        let result = execute_unified_tool(
-            "step1",
-            "unknown_tool",
-            &HashMap::new(),
-            &HashMap::new(),
-        )
-        .await;
+        let result =
+            execute_unified_tool("step1", "unknown_tool", &HashMap::new(), &HashMap::new()).await;
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn test_shell_command_missing_input() {
-        let result = execute_unified_tool(
-            "step1",
-            "shell_command",
-            &HashMap::new(),
-            &HashMap::new(),
-        )
-        .await;
+        let result =
+            execute_unified_tool("step1", "shell_command", &HashMap::new(), &HashMap::new()).await;
         assert!(result.is_some());
         let result = result.unwrap();
         assert!(!result.success);
@@ -863,13 +863,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_api_request_missing_inputs() {
-        let result = execute_unified_tool(
-            "step1",
-            "api_request",
-            &HashMap::new(),
-            &HashMap::new(),
-        )
-        .await;
+        let result =
+            execute_unified_tool("step1", "api_request", &HashMap::new(), &HashMap::new()).await;
         assert!(result.is_some());
         let result = result.unwrap();
         assert!(!result.success);

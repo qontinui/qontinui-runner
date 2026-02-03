@@ -9,7 +9,9 @@ use tracing::info;
 
 use super::{HandlerContext, StepHandler, StepHandlerResult};
 use crate::check_executor::{execute_check, CheckDefinition, CheckTool, CheckType};
-use crate::step_executor::executor::{CheckIssueDetail, ExecutionStepConfig, IndividualCheckResult};
+use crate::step_executor::executor::{
+    CheckIssueDetail, ExecutionStepConfig, IndividualCheckResult,
+};
 
 /// Handler for check_group steps.
 pub struct CheckGroupHandler;
@@ -227,7 +229,10 @@ impl StepHandler for CheckGroupHandler {
             StepHandlerResult::success_with_data(output_data)
         } else {
             StepHandlerResult::failure_with_data(
-                format!("Check group '{}' failed: {}/{} passed", group.name, passed, total),
+                format!(
+                    "Check group '{}' failed: {}/{} passed",
+                    group.name, passed, total
+                ),
                 output_data,
             )
         }

@@ -125,9 +125,13 @@ impl StepHandler for ShellCommandHandler {
 
         // Execute the command
         let start = std::time::Instant::now();
-        let (success, exit_code, stdout, stderr) =
-            Self::run_command(&command, is_powershell, working_directory.as_deref(), timeout_secs)
-                .await;
+        let (success, exit_code, stdout, stderr) = Self::run_command(
+            &command,
+            is_powershell,
+            working_directory.as_deref(),
+            timeout_secs,
+        )
+        .await;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         info!(
@@ -361,7 +365,9 @@ mod tests {
         assert!(ShellCommandHandler::is_powershell_command("Get-Process"));
         assert!(ShellCommandHandler::is_powershell_command("Set-Location"));
         assert!(ShellCommandHandler::is_powershell_command("$env:PATH"));
-        assert!(ShellCommandHandler::is_powershell_command("gci | Where-Object { $_.Name }"));
+        assert!(ShellCommandHandler::is_powershell_command(
+            "gci | Where-Object { $_.Name }"
+        ));
         assert!(!ShellCommandHandler::is_powershell_command("echo hello"));
         assert!(!ShellCommandHandler::is_powershell_command("ls -la"));
     }

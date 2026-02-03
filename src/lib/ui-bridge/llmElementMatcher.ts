@@ -350,7 +350,10 @@ export async function matchElementsWithLLM(
   const startTime = Date.now();
 
   // Check cache
-  const cacheKey = getCacheKey(query, elements.map((e) => e.id));
+  const cacheKey = getCacheKey(
+    query,
+    elements.map((e) => e.id),
+  );
   const cached = getFromCache(matchCache, cacheKey);
   if (cached) {
     return cached;

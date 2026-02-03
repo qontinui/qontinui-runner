@@ -22,8 +22,7 @@ pub mod traits;
 pub mod unified_execution;
 
 pub use bridge_helpers::{
-    get_or_create_default_bridge,
-    is_default_bridge_running, require_running_bridge,
+    get_or_create_default_bridge, is_default_bridge_running, require_running_bridge,
     stop_default_bridge, with_default_bridge,
 };
 pub use bridge_manager::{BridgeInfo, BridgeManager, BridgeMode, CreateBridgeResult};
@@ -40,5 +39,5 @@ pub use traits::{Executor, ExecutorError, FromContext};
 // Note: These are public API exports used by external consumers (e.g., MCP API)
 #[allow(unused_imports)]
 pub use unified_execution::{
-    UnifiedStepRunner, aggregate_step_results, build_outcome, execute_with_lifecycle,
+    aggregate_step_results, build_outcome, execute_with_lifecycle, UnifiedStepRunner,
 };

@@ -83,9 +83,7 @@ impl ExecutionTracker {
     /// Get the number of steps that are currently in progress (started but not ended).
     #[allow(dead_code)]
     pub fn in_progress_count(&self) -> usize {
-        self.started_steps
-            .difference(&self.ended_steps)
-            .count()
+        self.started_steps.difference(&self.ended_steps).count()
     }
 }
 

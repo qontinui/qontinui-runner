@@ -21,7 +21,9 @@ use super::super::{AppState, CommandResponse};
 /// * `Ok(CommandResponse)` - Success with status data
 /// * `Err(String)` - Error if status query fails
 #[tauri::command]
-pub async fn get_executor_status(state: State<'_, Arc<AppState>>) -> Result<CommandResponse, String> {
+pub async fn get_executor_status(
+    state: State<'_, Arc<AppState>>,
+) -> Result<CommandResponse, String> {
     debug!("[GET_EXECUTOR_STATUS] Called - checking bridge state...");
 
     // Use bridge manager directly - use async methods to avoid nested runtime panic
@@ -30,7 +32,9 @@ pub async fn get_executor_status(state: State<'_, Arc<AppState>>) -> Result<Comm
         if let Some(ref manager) = *manager_guard {
             // Use async version to avoid nested runtime panic when called from async context
             let running = manager.is_default_bridge_running_async().await;
-            let s_name = manager.get_default_bridge_state_async().await
+            let s_name = manager
+                .get_default_bridge_state_async()
+                .await
                 .map(|s| s.name().to_string())
                 .unwrap_or_else(|| "not_started".to_string());
 
@@ -192,7 +196,9 @@ pub async fn set_input_capture_enabled(
     info!("Setting input capture enabled: {}", enabled);
 
     let manager_guard = state.bridge_manager.lock().await;
-    let manager = manager_guard.as_ref().ok_or("Bridge manager not initialized")?;
+    let manager = manager_guard
+        .as_ref()
+        .ok_or("Bridge manager not initialized")?;
 
     // Use async check to avoid nested runtime panic
     if !manager.is_default_bridge_running_async().await {
@@ -234,7 +240,9 @@ pub async fn set_input_capture_enabled(
 /// * `Ok(CommandResponse)` - Success with is_monitoring, events_count, session_id
 /// * `Err(String)` - Error if executor not running
 #[tauri::command]
-pub async fn get_input_validation_status(state: State<'_, Arc<AppState>>) -> Result<CommandResponse, String> {
+pub async fn get_input_validation_status(
+    state: State<'_, Arc<AppState>>,
+) -> Result<CommandResponse, String> {
     let manager_guard = state.bridge_manager.lock().await;
     // Use async check to avoid nested runtime panic
     let is_running = if let Some(ref manager) = *manager_guard {

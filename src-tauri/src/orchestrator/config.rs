@@ -60,8 +60,7 @@ use super::parallel::MergeStrategy;
 ///
 /// This combines all feature configurations into a single structure
 /// that can be serialized, stored, and loaded.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EnhancedOrchestratorConfig {
     /// Base orchestrator configuration
     pub base: BaseConfig,
@@ -94,7 +93,6 @@ pub struct EnhancedOrchestratorConfig {
     /// Learning loop configuration
     pub learning: LearningSystemConfig,
 }
-
 
 impl EnhancedOrchestratorConfig {
     /// Create a minimal configuration with only essential features.

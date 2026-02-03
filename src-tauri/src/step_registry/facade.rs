@@ -283,13 +283,8 @@ mod tests {
 
     #[test]
     fn test_step_key_from_metadata() {
-        let metadata = StepMetadata::verification(
-            "task-123",
-            StepType::Playwright,
-            "Test Step",
-            3,
-            2,
-        );
+        let metadata =
+            StepMetadata::verification("task-123", StepType::Playwright, "Test Step", 3, 2);
 
         let key = StepKey::from_metadata(&metadata);
         assert_eq!(key.phase, WorkflowPhase::Verification);

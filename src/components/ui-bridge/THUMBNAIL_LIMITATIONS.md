@@ -61,16 +61,19 @@ However, this is designed for single-element capture, not batch processing.
 **Description**: Capture multiple screenshots at different scroll positions and stitch them together.
 
 **Implementation**:
+
 - `stitchScreenshots()` function in `thumbnail-cropper.ts` handles tile stitching
 - Browser extension captures viewport-sized tiles at different scroll positions
 - Tiles are stitched into a single full-page image using canvas operations
 - Full-page capture is now the **default mode** for thumbnail generation
 
 **Key Files**:
+
 - `src/lib/thumbnail-cropper.ts` - `stitchScreenshots()`, `stitchScreenshotsToDataUrl()`, `ScreenshotTile` interface
 - `extension/background.js` - Full-page screenshot capture with tile generation
 
 **Performance Notes**:
+
 - Slightly slower than viewport-only capture (multiple screenshots required)
 - Memory usage scales with page height
 - Toggle available to disable full-page capture for very long pages
@@ -80,19 +83,26 @@ However, this is designed for single-element capture, not batch processing.
 **Description**: When a thumbnail is needed for an off-screen element, scroll to it, capture, scroll back.
 
 **Implementation Approach**:
+
 ```typescript
-async function captureOffScreenElement(elementId: string, bounds: ElementBounds): Promise<string | null> {
+async function captureOffScreenElement(
+  elementId: string,
+  bounds: ElementBounds,
+): Promise<string | null> {
   // Check if element is in viewport
   const viewport = await getViewportDimensions();
-  const isOffScreen = bounds.y < 0 || bounds.y + bounds.height > viewport.height ||
-                      bounds.x < 0 || bounds.x + bounds.width > viewport.width;
+  const isOffScreen =
+    bounds.y < 0 ||
+    bounds.y + bounds.height > viewport.height ||
+    bounds.x < 0 ||
+    bounds.x + bounds.width > viewport.width;
 
   if (isOffScreen) {
     // Use existing scrollToElement capability
     const result = await capturePageScreenshot({
       scrollToElement: true,
       elementBounds: bounds,
-      restoreScroll: true
+      restoreScroll: true,
     });
     // Use result.scrollInfo.newBounds for cropping
     return cropThumbnail(result.screenshot, result.scrollInfo.newBounds);
@@ -104,11 +114,13 @@ async function captureOffScreenElement(elementId: string, bounds: ElementBounds)
 ```
 
 **Pros**:
+
 - Leverages existing scroll infrastructure
 - Simpler implementation
 - Lower memory usage
 
 **Cons**:
+
 - Multiple scroll operations visible to user if many off-screen elements
 - Slower for pages with many off-screen elements
 - May trigger layout shifts or lazy loading
@@ -122,16 +134,19 @@ async function captureOffScreenElement(elementId: string, bounds: ElementBounds)
 **Description**: Show visual indicators for off-screen elements; let user scroll manually.
 
 **Implementation Approach**:
+
 1. Detect elements outside viewport during capture
 2. Mark these elements in the UI (e.g., "Scroll to capture thumbnail")
 3. Provide button to scroll to element and capture its thumbnail
 
 **Pros**:
+
 - Minimal implementation effort
 - User stays in control
 - No page manipulation
 
 **Cons**:
+
 - Poor UX for many off-screen elements
 - Manual effort required
 
@@ -160,9 +175,11 @@ This is a fundamental browser security restriction:
 3. **Canvas Tainting**: Drawing cross-origin content to a canvas "taints" it, preventing further pixel access
 
 From [Chromium documentation](https://www.chromium.org/Home/chromium-security/extension-content-script-fetches/):
+
 > Cross-origin fetches are disallowed from content scripts in Chrome Extensions. Such requests can be made from extension background pages instead.
 
 From [Mozilla MDN](https://developer.mozilla.org/en-US/docs/Mozilla/Add-ons/WebExtensions/API/tabs/captureVisibleTab):
+
 > The `captureVisibleTab` method captures the visible area of the tab, including rendered content.
 
 ### Why This Cannot Be Fully Solved
@@ -182,16 +199,19 @@ Cross-origin iframe content is protected by browser security at the rendering la
 **Description**: Detect cross-origin iframes and show a placeholder or warning.
 
 **Implementation**:
+
 - `CropElement` interface in `thumbnail-cropper.ts` includes `isCrossOrigin` flag
 - `cropThumbnailsWithMetadata()` returns `BatchCropResult` with `crossOriginSkipped` list
 - `LazyThumbnail` component shows amber-colored globe icon placeholder for cross-origin elements
 - Tooltip explains: "Thumbnail not available - cross-origin iframe content"
 
 **Key Files**:
+
 - `src/lib/thumbnail-cropper.ts` - `CropElement`, `BatchCropResult`, `cropThumbnailsWithMetadata()`
 - `src/components/ui-bridge/LazyThumbnail.tsx` - Cross-origin placeholder rendering
 
 **User Experience**:
+
 - Cross-origin iframes are clearly marked with a distinct visual indicator
 - Users understand why thumbnails cannot be captured (browser security)
 - No confusion with broken thumbnails or errors
@@ -201,16 +221,19 @@ Cross-origin iframe content is protected by browser security at the rendering la
 **Description**: Use a server-side headless browser (Puppeteer/Playwright) to capture pages.
 
 **Implementation Approach**:
+
 1. Send URL to server
 2. Server loads page in Puppeteer with full navigation
 3. Puppeteer captures screenshot from its context
 4. Returns screenshot to client
 
 **Pros**:
+
 - Captures everything the browser renders
 - Can handle complex iframe scenarios
 
 **Cons**:
+
 - Requires server infrastructure
 - Authentication/session handling complex
 - Latency for remote capture
@@ -225,14 +248,17 @@ Cross-origin iframe content is protected by browser security at the rendering la
 **Description**: Work with iframe content owners to enable capture.
 
 **Implementation Approach**:
+
 - Request content owners add `X-Frame-Options: ALLOW-FROM`
 - Use PostMessage API to request screenshots from iframe content
 
 **Pros**:
+
 - Maintains security model
 - Works when cooperation possible
 
 **Cons**:
+
 - Requires third-party cooperation
 - Not applicable in most real-world scenarios
 
@@ -260,6 +286,7 @@ if (cropWidth > img.width * 0.9 && cropHeight > img.height * 0.9) {
 ### Technical Root Cause
 
 This is a deliberate design decision to:
+
 1. Skip page-level containers (body, main wrappers) that don't provide meaningful thumbnails
 2. Reduce processing time by avoiding redundant full-page crops
 3. Focus on UI components rather than layout containers
@@ -267,6 +294,7 @@ This is a deliberate design decision to:
 ### Analysis
 
 This is not a bug but a feature. Large containers typically:
+
 - Are layout wrappers with no distinct visual identity
 - Would produce thumbnails nearly identical to the full screenshot
 - Provide little value in UI element identification
@@ -280,16 +308,19 @@ This is not a bug but a feature. Large containers typically:
 **Description**: Allow users/callers to specify the skip threshold.
 
 **Implementation**:
+
 - `CropOptions` interface includes `skipLargeThreshold` parameter (default: 0.9)
 - All cropping functions (`cropThumbnail`, `cropThumbnails`, `cropThumbnailsWithMetadata`) support this option
 - `useElementThumbnails` hook exposes `skipLargeThreshold` in options
 - Set to `1.0` to disable skipping and include all elements
 
 **Key Files**:
+
 - `src/lib/thumbnail-cropper.ts` - `CropOptions.skipLargeThreshold`
 - `src/hooks/useElementThumbnails.ts` - `UseElementThumbnailsOptions.skipLargeThreshold`
 
 **Usage Example**:
+
 ```typescript
 const { thumbnails } = useElementThumbnails(elements, screenshot, {
   skipLargeThreshold: 1.0, // Include all elements regardless of size
@@ -301,19 +332,22 @@ const { thumbnails } = useElementThumbnails(elements, screenshot, {
 **Description**: Instead of skipping, return metadata indicating "large container".
 
 **Implementation**:
+
 ```typescript
 interface ThumbnailResult {
   thumbnail?: string;
   skipped?: boolean;
-  skipReason?: 'large_container' | 'off_screen' | 'zero_size';
+  skipReason?: "large_container" | "off_screen" | "zero_size";
 }
 ```
 
 **Pros**:
+
 - Preserves information
 - UI can show appropriate indicator
 
 **Cons**:
+
 - Changes return type (breaking change)
 
 **Feasibility**: High
@@ -355,11 +389,11 @@ Implement **Solution A** with a sensible default. Most use cases benefit from sk
 
 ## Summary: Priority Matrix
 
-| Limitation | Impact | Solvability | Status |
-|------------|--------|-------------|--------|
-| Off-Screen Elements | High | High (scroll-capture) | **IMPLEMENTED** - Full-page capture (Solution A) |
-| Cross-Origin Iframes | Medium | Low (detection only) | **IMPLEMENTED** - Detect and flag (Solution A) |
-| Large Containers | Low | Very High | **IMPLEMENTED** - Configurable threshold (Solution A) |
+| Limitation           | Impact | Solvability           | Status                                                |
+| -------------------- | ------ | --------------------- | ----------------------------------------------------- |
+| Off-Screen Elements  | High   | High (scroll-capture) | **IMPLEMENTED** - Full-page capture (Solution A)      |
+| Cross-Origin Iframes | Medium | Low (detection only)  | **IMPLEMENTED** - Detect and flag (Solution A)        |
+| Large Containers     | Low    | Very High             | **IMPLEMENTED** - Configurable threshold (Solution A) |
 
 ### Implementation Notes
 

@@ -70,8 +70,8 @@ pub mod learning; // Learning insights dashboard commands
 pub mod logging;
 pub mod mcp; // MCP client management and tool calling
 pub mod mobile; // Mobile development feedback (ADB, screenshots, logcat)
-pub mod performance_metrics; // Performance metrics dashboard
 pub mod mobile_settings; // Mobile settings (ADB path, device config)
+pub mod performance_metrics; // Performance metrics dashboard
 pub mod playwright_settings;
 pub mod project_logs;
 pub mod rag;

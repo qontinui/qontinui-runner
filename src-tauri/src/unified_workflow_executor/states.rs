@@ -125,8 +125,9 @@ impl WorkflowState for UnifiedWorkflowState {
             | UnifiedWorkflowState::VerificationComplete { .. } => Some("verification"),
             UnifiedWorkflowState::AgenticRunning { .. }
             | UnifiedWorkflowState::AgenticComplete { .. } => Some("agentic"),
-            UnifiedWorkflowState::CompletionRunning
-            | UnifiedWorkflowState::CompletionComplete => Some("completion"),
+            UnifiedWorkflowState::CompletionRunning | UnifiedWorkflowState::CompletionComplete => {
+                Some("completion")
+            }
             // For failed/stopped states, we can't return &'static str since phase is owned String
             // Just return the known phases or None
             UnifiedWorkflowState::Failed { phase, .. } => match phase.as_deref() {
@@ -320,10 +321,7 @@ mod tests {
             UnifiedWorkflowState::verification_running(1).name(),
             "verification_running"
         );
-        assert_eq!(
-            UnifiedWorkflowState::failed("test").name(),
-            "failed"
-        );
+        assert_eq!(UnifiedWorkflowState::failed("test").name(), "failed");
     }
 
     #[test]

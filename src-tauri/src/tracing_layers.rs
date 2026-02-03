@@ -210,7 +210,10 @@ where
             let parent_id = parent.id();
             if let Ok(spans) = self.active_spans.read() {
                 if let Some(parent_data) = spans.get(&parent_id.into_u64()) {
-                    (Some(parent_data.span_id.clone()), parent_data.trace_id.clone())
+                    (
+                        Some(parent_data.span_id.clone()),
+                        parent_data.trace_id.clone(),
+                    )
                 } else {
                     (None, Self::generate_trace_id())
                 }
@@ -441,7 +444,10 @@ where
             let parent_id = parent.id();
             if let Ok(spans) = self.active_spans.read() {
                 if let Some(parent_data) = spans.get(&parent_id.into_u64()) {
-                    (Some(parent_data.span_id.clone()), parent_data.trace_id.clone())
+                    (
+                        Some(parent_data.span_id.clone()),
+                        parent_data.trace_id.clone(),
+                    )
                 } else {
                     (None, Self::generate_trace_id())
                 }
@@ -676,7 +682,11 @@ mod tests {
     #[test]
     fn test_config_default_summary_spans() {
         let config = SpanLayerConfig::default();
-        assert!(config.summary_span_names.contains(&"workflow.execute".to_string()));
-        assert!(config.summary_span_names.contains(&"ai.session".to_string()));
+        assert!(config
+            .summary_span_names
+            .contains(&"workflow.execute".to_string()));
+        assert!(config
+            .summary_span_names
+            .contains(&"ai.session".to_string()));
     }
 }

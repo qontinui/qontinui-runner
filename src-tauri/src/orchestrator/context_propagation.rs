@@ -185,12 +185,18 @@ impl SharedVariableStore {
 
     /// Get all variables as a HashMap.
     pub fn get_all(&self) -> HashMap<String, String> {
-        self.variables.read().ok().map(|v| v.clone()).unwrap_or_default()
+        self.variables
+            .read()
+            .ok()
+            .map(|v| v.clone())
+            .unwrap_or_default()
     }
 
     /// Check if a variable exists.
     pub fn contains(&self, name: &str) -> bool {
-        self.variables.read().ok()
+        self.variables
+            .read()
+            .ok()
             .map(|v| v.contains_key(name))
             .unwrap_or(false)
     }

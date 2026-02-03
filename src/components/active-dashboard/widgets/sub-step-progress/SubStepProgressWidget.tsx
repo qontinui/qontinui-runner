@@ -6,7 +6,15 @@
  */
 
 import React from "react";
-import { ChevronDown, ChevronRight, CheckCircle2, Circle, Loader2, XCircle, SkipForward } from "lucide-react";
+import {
+  ChevronDown,
+  ChevronRight,
+  CheckCircle2,
+  Circle,
+  Loader2,
+  XCircle,
+  SkipForward,
+} from "lucide-react";
 import { Progress } from "../../../ui/Progress";
 import type { SubStepStatus_Display, SubStepInfo } from "../../../../types/executionStatus";
 
@@ -136,8 +144,8 @@ export function SubStepProgressWidget({
                     step.status === "completed"
                       ? "text-gray-400"
                       : step.status === "running"
-                      ? "text-blue-300"
-                      : "text-gray-500"
+                        ? "text-blue-300"
+                        : "text-gray-500"
                   }`}
                 >
                   {step.name}

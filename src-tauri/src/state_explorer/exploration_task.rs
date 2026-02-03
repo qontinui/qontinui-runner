@@ -636,9 +636,7 @@ impl ExplorationTask {
         if result.success {
             Ok(result.data.unwrap_or(serde_json::json!({})))
         } else {
-            Err(result
-                .error
-                .unwrap_or_else(|| "Unknown error".to_string()))
+            Err(result.error.unwrap_or_else(|| "Unknown error".to_string()))
         }
     }
 
@@ -660,11 +658,7 @@ impl ExplorationTask {
                     return Err("Python executor not running".to_string());
                 }
                 bridge
-                    .send_command_and_wait(
-                        "verify_elements",
-                        Some(params),
-                        Duration::from_secs(30),
-                    )
+                    .send_command_and_wait("verify_elements", Some(params), Duration::from_secs(30))
                     .map_err(|e| format!("Command error: {}", e))
             })?
         })
@@ -674,9 +668,7 @@ impl ExplorationTask {
         if result.success {
             Ok(result.data.unwrap_or(serde_json::json!({})))
         } else {
-            Err(result
-                .error
-                .unwrap_or_else(|| "Unknown error".to_string()))
+            Err(result.error.unwrap_or_else(|| "Unknown error".to_string()))
         }
     }
 

@@ -110,7 +110,7 @@ impl StepHandler for CheckHandler {
         use std::sync::atomic::{AtomicU32, Ordering};
         static CHECK_SEQUENCE: AtomicU32 = AtomicU32::new(1);
         let sequence = CHECK_SEQUENCE.fetch_add(1, Ordering::SeqCst);
-        let timestamp = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let _timestamp = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
         let action_id = format!("check-{}", sequence);
 
         // Truncate command for display
@@ -167,10 +167,16 @@ impl StepHandler for CheckHandler {
                     (false, Some(format!("Failed to execute check: {}", e)), None)
                 }
                 Err(_) => {
-                    warn!("Check '{}' timed out after {}s", step_name, timeout_secs_val);
+                    warn!(
+                        "Check '{}' timed out after {}s",
+                        step_name, timeout_secs_val
+                    );
                     (
                         false,
-                        Some(format!("Check timed out after {} seconds", timeout_secs_val)),
+                        Some(format!(
+                            "Check timed out after {} seconds",
+                            timeout_secs_val
+                        )),
                         None,
                     )
                 }
@@ -197,7 +203,15 @@ impl StepHandler for CheckHandler {
         });
 
         if final_success {
-            Self::emit_completed(context, &action_id, &action_name, timestamp, sequence, result_metadata).await;
+            Self::emit_completed(
+                context,
+                &action_id,
+                &action_name,
+                timestamp,
+                sequence,
+                result_metadata,
+            )
+            .await;
         } else {
             Self::emit_failed(
                 context,
@@ -320,7 +334,9 @@ impl CheckHandler {
             ("lint", "typescript") => Some("npx eslint . --ext .ts,.tsx".to_string()),
             ("format", "typescript") => Some("npx prettier --check .".to_string()),
             ("typecheck", "typescript") => Some("npx tsc --noEmit".to_string()),
-            ("analyze", "typescript") => Some("npx eslint . --ext .ts,.tsx --format json".to_string()),
+            ("analyze", "typescript") => {
+                Some("npx eslint . --ext .ts,.tsx --format json".to_string())
+            }
             ("security", "typescript") => Some("npm audit".to_string()),
 
             // JavaScript
@@ -332,17 +348,24 @@ impl CheckHandler {
 
             // C/C++
             ("lint", "c_cpp") => Some("cppcheck --enable=all .".to_string()),
-            ("format", "c_cpp") => Some("clang-format --dry-run -Werror **/*.cpp **/*.c **/*.h".to_string()),
+            ("format", "c_cpp") => {
+                Some("clang-format --dry-run -Werror **/*.cpp **/*.c **/*.h".to_string())
+            }
             ("typecheck", "c_cpp") => Some("make -n".to_string()),
             ("analyze", "c_cpp") => Some("cppcheck --enable=all --xml .".to_string()),
             ("security", "c_cpp") => Some("flawfinder .".to_string()),
 
             // Java
-            ("lint", "java") => Some("./gradlew checkstyleMain || mvn checkstyle:check".to_string()),
+            ("lint", "java") => {
+                Some("./gradlew checkstyleMain || mvn checkstyle:check".to_string())
+            }
             ("format", "java") => Some("./gradlew spotlessCheck || mvn spotless:check".to_string()),
             ("typecheck", "java") => Some("./gradlew compileJava || mvn compile".to_string()),
             ("analyze", "java") => Some("./gradlew pmd || mvn pmd:check".to_string()),
-            ("security", "java") => Some("./gradlew dependencyCheckAnalyze || mvn org.owasp:dependency-check-maven:check".to_string()),
+            ("security", "java") => Some(
+                "./gradlew dependencyCheckAnalyze || mvn org.owasp:dependency-check-maven:check"
+                    .to_string(),
+            ),
 
             // Ruby
             ("lint", "ruby") => Some("bundle exec rubocop".to_string()),
@@ -355,7 +378,9 @@ impl CheckHandler {
             ("lint", "php") => Some("./vendor/bin/phpcs".to_string()),
             ("format", "php") => Some("./vendor/bin/php-cs-fixer fix --dry-run --diff".to_string()),
             ("typecheck", "php") => Some("./vendor/bin/phpstan analyse".to_string()),
-            ("analyze", "php") => Some("./vendor/bin/phpmd . text cleancode,codesize,controversial".to_string()),
+            ("analyze", "php") => {
+                Some("./vendor/bin/phpmd . text cleancode,codesize,controversial".to_string())
+            }
             ("security", "php") => Some("composer audit".to_string()),
 
             // Elixir
@@ -373,7 +398,9 @@ impl CheckHandler {
             ("security", "swift") => None,
 
             // .NET
-            ("lint", "dotnet") | ("format", "dotnet") => Some("dotnet format --verify-no-changes".to_string()),
+            ("lint", "dotnet") | ("format", "dotnet") => {
+                Some("dotnet format --verify-no-changes".to_string())
+            }
             ("typecheck", "dotnet") => Some("dotnet build --no-restore".to_string()),
             ("analyze", "dotnet") => Some("dotnet build /p:TreatWarningsAsErrors=true".to_string()),
             ("security", "dotnet") => Some("dotnet list package --vulnerable".to_string()),
@@ -418,7 +445,9 @@ impl CheckHandler {
                 if command.contains("prettier") {
                     command.replace("--check", "--write")
                 } else {
-                    command.replace("format:check", "format").replace("--check", "")
+                    command
+                        .replace("format:check", "format")
+                        .replace("--check", "")
                 }
             }
             ("format", "c_cpp") => command.replace("--dry-run -Werror", "-i"),
@@ -450,7 +479,11 @@ impl CheckHandler {
         );
 
         if success {
-            let output_data = if stdout.is_empty() { None } else { Some(stdout) };
+            let output_data = if stdout.is_empty() {
+                None
+            } else {
+                Some(stdout)
+            };
             (true, None, output_data)
         } else {
             let mut combined_output = String::new();
@@ -522,7 +555,14 @@ impl CheckHandler {
     ) {
         context
             .event_emitter
-            .emit_action_failed(action_id, action_name, start_timestamp, sequence, error, metadata)
+            .emit_action_failed(
+                action_id,
+                action_name,
+                start_timestamp,
+                sequence,
+                error,
+                metadata,
+            )
             .await;
     }
 
@@ -617,11 +657,7 @@ impl CheckHandler {
             }
             Err(e) => {
                 warn!("HTTP check '{}' failed: {}", step_name, e);
-                (
-                    false,
-                    Some(format!("HTTP request failed: {}", e)),
-                    None,
-                )
+                (false, Some(format!("HTTP request failed: {}", e)), None)
             }
         };
 
@@ -633,7 +669,15 @@ impl CheckHandler {
         });
 
         if final_success {
-            Self::emit_completed(context, &action_id, &action_name, timestamp, sequence, result_metadata).await;
+            Self::emit_completed(
+                context,
+                &action_id,
+                &action_name,
+                timestamp,
+                sequence,
+                result_metadata,
+            )
+            .await;
         } else {
             Self::emit_failed(
                 context,

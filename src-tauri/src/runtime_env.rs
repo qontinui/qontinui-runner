@@ -646,7 +646,10 @@ mod tests {
     #[test]
     fn test_count_turns_in_output_empty() {
         assert_eq!(count_turns_in_output(""), 0);
-        assert_eq!(count_turns_in_output("Some random output without markers"), 0);
+        assert_eq!(
+            count_turns_in_output("Some random output without markers"),
+            0
+        );
     }
 
     #[test]

@@ -26,7 +26,10 @@ pub async fn query_error_events(
     db: State<'_, Arc<CheckpointDb>>,
     query: ErrorQuery,
 ) -> Result<Vec<StoredErrorEvent>, String> {
-    tracing::info!("[ERROR_MONITOR] query_error_events called with query: {:?}", query);
+    tracing::info!(
+        "[ERROR_MONITOR] query_error_events called with query: {:?}",
+        query
+    );
     let db = db.inner().clone();
     let result = tokio::task::spawn_blocking(move || {
         let conn = db.connection()?;
@@ -36,7 +39,10 @@ pub async fn query_error_events(
     .map_err(|e| format!("Task join error: {}", e))?;
 
     match &result {
-        Ok(events) => tracing::info!("[ERROR_MONITOR] query_error_events returning {} events", events.len()),
+        Ok(events) => tracing::info!(
+            "[ERROR_MONITOR] query_error_events returning {} events",
+            events.len()
+        ),
         Err(e) => tracing::error!("[ERROR_MONITOR] query_error_events error: {}", e),
     }
     result
@@ -82,8 +88,8 @@ pub async fn update_error_status(
     status: String,
     resolution_notes: Option<String>,
 ) -> Result<(), String> {
-    let status = ErrorStatus::from_str(&status)
-        .ok_or_else(|| format!("Invalid status: {}", status))?;
+    let status =
+        ErrorStatus::from_str(&status).ok_or_else(|| format!("Invalid status: {}", status))?;
 
     let db = db.inner().clone();
     tokio::task::spawn_blocking(move || {
@@ -96,10 +102,7 @@ pub async fn update_error_status(
 
 /// Acknowledge an error (mark as seen).
 #[tauri::command]
-pub async fn acknowledge_error(
-    db: State<'_, Arc<CheckpointDb>>,
-    id: i64,
-) -> Result<(), String> {
+pub async fn acknowledge_error(db: State<'_, Arc<CheckpointDb>>, id: i64) -> Result<(), String> {
     let db = db.inner().clone();
     tokio::task::spawn_blocking(move || {
         let conn = db.connection()?;
@@ -237,8 +240,7 @@ pub async fn get_recent_errors(
 
     tokio::task::spawn_blocking(move || {
         let conn = db.connection()?;
-        let captured_after =
-            chrono::Utc::now() - chrono::Duration::hours(hours as i64);
+        let captured_after = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
 
         let query = ErrorQuery {
             captured_after: Some(captured_after.to_rfc3339()),

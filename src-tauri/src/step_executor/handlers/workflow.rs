@@ -49,7 +49,9 @@ impl StepHandler for WorkflowHandler {
                     StepHandlerResult::success()
                 } else {
                     StepHandlerResult::failure(
-                        result.error.unwrap_or_else(|| "Workflow failed".to_string()),
+                        result
+                            .error
+                            .unwrap_or_else(|| "Workflow failed".to_string()),
                     )
                 }
             }

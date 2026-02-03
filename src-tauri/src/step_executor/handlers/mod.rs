@@ -53,8 +53,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 
-use super::executor::ExecutionStepConfig;
 use super::events::TreeEventEmitter;
+use super::executor::ExecutionStepConfig;
 
 // Step handler implementations
 mod action;

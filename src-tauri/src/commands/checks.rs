@@ -16,8 +16,7 @@ use crate::check_executor::{
     CHECK_TOOLS, CHECK_TYPE_INFO,
 };
 use crate::database::{
-    Check, CreateCheckGroupInput, CreateCheckInput, UpdateCheckGroupInput,
-    UpdateCheckInput,
+    Check, CreateCheckGroupInput, CreateCheckInput, UpdateCheckGroupInput, UpdateCheckInput,
 };
 use crate::AppState;
 use serde::{Deserialize, Serialize};

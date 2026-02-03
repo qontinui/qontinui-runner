@@ -169,7 +169,9 @@ impl BridgeManager {
                     warn!("Force-releasing GUI lock for new bridge");
                     self.gui_lock.force_release().await;
                     if !self.gui_lock.try_acquire(&bridge_id).await {
-                        return Err("Failed to acquire GUI lock even after force release".to_string());
+                        return Err(
+                            "Failed to acquire GUI lock even after force release".to_string()
+                        );
                     }
                 } else {
                     return Err("GUI lock is held by another bridge. Use force_gui_lock=true to override or use headless mode.".to_string());
@@ -439,10 +441,7 @@ impl BridgeManager {
 
         // Verify source bridge exists and holds the lock
         if !self.gui_lock.is_held_by(&from_bid).await {
-            return Err(format!(
-                "Bridge '{}' does not hold the GUI lock",
-                from
-            ));
+            return Err(format!("Bridge '{}' does not hold the GUI lock", from));
         }
 
         // Verify target bridge exists
@@ -465,10 +464,7 @@ impl BridgeManager {
 
         // Release from source
         if !self.gui_lock.release(&from_bid).await {
-            return Err(format!(
-                "Failed to release GUI lock from bridge '{}'",
-                from
-            ));
+            return Err(format!("Failed to release GUI lock from bridge '{}'", from));
         }
 
         // Acquire on target
@@ -484,10 +480,7 @@ impl BridgeManager {
                     from
                 );
             }
-            return Err(format!(
-                "Failed to acquire GUI lock on bridge '{}'",
-                to
-            ));
+            return Err(format!("Failed to acquire GUI lock on bridge '{}'", to));
         }
 
         info!("GUI lock transferred from '{}' to '{}'", from, to);
@@ -532,9 +525,7 @@ impl BridgeManager {
         let bid = BridgeId::from_string(bridge_id.to_string());
         let bridges = self.bridges.read().unwrap();
 
-        bridges
-            .get(&bid)
-            .and_then(|m| m.headless_events.clone())
+        bridges.get(&bid).and_then(|m| m.headless_events.clone())
     }
 
     /// Subscribe to headless events for a bridge.
@@ -544,8 +535,7 @@ impl BridgeManager {
         &self,
         bridge_id: &str,
     ) -> Option<broadcast::Receiver<serde_json::Value>> {
-        self.get_headless_events(bridge_id)
-            .map(|tx| tx.subscribe())
+        self.get_headless_events(bridge_id).map(|tx| tx.subscribe())
     }
 
     /// Get the number of active bridges.
@@ -642,7 +632,9 @@ impl BridgeManager {
         if result.started {
             Ok(result.bridge_id)
         } else {
-            Err(result.error.unwrap_or_else(|| "Failed to start default bridge".to_string()))
+            Err(result
+                .error
+                .unwrap_or_else(|| "Failed to start default bridge".to_string()))
         }
     }
 
@@ -672,7 +664,8 @@ impl BridgeManager {
     where
         F: FnOnce(&mut PythonBridge) -> R,
     {
-        let bridge_id = self.default_bridge_id_sync()
+        let bridge_id = self
+            .default_bridge_id_sync()
             .ok_or_else(|| "No default bridge available".to_string())?;
 
         self.with_bridge(&bridge_id, f)
@@ -753,7 +746,11 @@ impl BridgeManager {
         let bridges_ref = &self.bridges;
         let mut bridges = bridges_ref.write().unwrap();
         if let Some(managed) = bridges.get_mut(&bid) {
-            managed.bridge.start().await.map_err(|e| format!("Failed to start bridge: {}", e))?;
+            managed
+                .bridge
+                .start()
+                .await
+                .map_err(|e| format!("Failed to start bridge: {}", e))?;
             Ok(true)
         } else {
             Ok(false)

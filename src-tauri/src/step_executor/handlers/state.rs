@@ -49,7 +49,9 @@ impl StepHandler for StateHandler {
                     StepHandlerResult::success()
                 } else {
                     StepHandlerResult::failure(
-                        result.error.unwrap_or_else(|| "State navigation failed".to_string()),
+                        result
+                            .error
+                            .unwrap_or_else(|| "State navigation failed".to_string()),
                     )
                 }
             }

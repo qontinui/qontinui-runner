@@ -10,7 +10,14 @@
  * Only active in development mode.
  */
 
-import { useCallback, useEffect, useRef, useState, Profiler, type ProfilerOnRenderCallback } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  Profiler,
+  type ProfilerOnRenderCallback,
+} from "react";
 import { getPerformanceMonitor, type RenderMetrics } from "../lib/performance";
 
 // ============================================================================
@@ -68,7 +75,7 @@ export interface UseRenderPerformanceReturn {
  * ```
  */
 export function useRenderPerformance(
-  options: UseRenderPerformanceOptions
+  options: UseRenderPerformanceOptions,
 ): UseRenderPerformanceReturn {
   const { componentName, enabled = import.meta.env.DEV, logToConsole = false } = options;
 
@@ -101,7 +108,7 @@ export function useRenderPerformance(
       actualDuration: number,
       baseDuration: number,
       startTime: number,
-      commitTime: number
+      commitTime: number,
     ) => {
       if (!enabled) return;
 
@@ -116,18 +123,20 @@ export function useRenderPerformance(
       if (dataChangeTimeRef.current !== null) {
         const timeToUpdate = commitTime - dataChangeTimeRef.current;
         if (logToConsole) {
-          console.log(`[RenderPerformance] ${componentName} time-to-update: ${timeToUpdate.toFixed(2)}ms`);
+          console.log(
+            `[RenderPerformance] ${componentName} time-to-update: ${timeToUpdate.toFixed(2)}ms`,
+          );
         }
         dataChangeTimeRef.current = null;
       }
 
       if (logToConsole) {
         console.log(
-          `[RenderPerformance] ${componentName} ${phase}: ${actualDuration.toFixed(2)}ms (base: ${baseDuration.toFixed(2)}ms)`
+          `[RenderPerformance] ${componentName} ${phase}: ${actualDuration.toFixed(2)}ms (base: ${baseDuration.toFixed(2)}ms)`,
         );
       }
     },
-    [componentName, enabled, logToConsole]
+    [componentName, enabled, logToConsole],
   );
 
   // Profiler wrapper component
@@ -143,7 +152,7 @@ export function useRenderPerformance(
         </Profiler>
       );
     },
-    [componentName, enabled, onRender]
+    [componentName, enabled, onRender],
   );
 
   // Mark when data changes to measure time-to-update
@@ -252,7 +261,7 @@ export interface WithRenderPerformanceProps {
  */
 export function withRenderPerformance<P extends object>(
   WrappedComponent: React.ComponentType<P>,
-  componentName: string
+  componentName: string,
 ): React.FC<P & WithRenderPerformanceProps> {
   const displayName = WrappedComponent.displayName || WrappedComponent.name || "Component";
 

@@ -63,7 +63,9 @@ impl PlaywrightHandler {
                     StepHandlerResult::success()
                 } else {
                     StepHandlerResult::failure(
-                        result.error.unwrap_or_else(|| "Playwright test failed".to_string()),
+                        result
+                            .error
+                            .unwrap_or_else(|| "Playwright test failed".to_string()),
                     )
                 }
             }

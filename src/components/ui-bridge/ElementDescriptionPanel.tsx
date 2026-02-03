@@ -545,28 +545,29 @@ export function ElementDescriptionPanel({
         : undefined;
 
       // Call the Tauri command
-      const result = await invoke<{ success: boolean; message?: string; data?: AiDescriptionResponse }>(
-        "generate_element_ai_description",
-        {
-          input: {
-            element_type: selectedElement.type,
-            role: selectedElement.role || selectedElement.accessibility?.role || undefined,
-            label: selectedElement.label || selectedElement.accessibleName || undefined,
-            text: selectedElement.text || undefined,
-            value: selectedElement.value || undefined,
-            placeholder: selectedElement.placeholder || undefined,
-            states,
-            actions: selectedElement.actions || [],
-            parent_info: parentInfo,
-            page_context: pageContext
-              ? {
-                  url: pageContext.url || undefined,
-                  title: pageContext.title || undefined,
-                }
-              : undefined,
-          },
+      const result = await invoke<{
+        success: boolean;
+        message?: string;
+        data?: AiDescriptionResponse;
+      }>("generate_element_ai_description", {
+        input: {
+          element_type: selectedElement.type,
+          role: selectedElement.role || selectedElement.accessibility?.role || undefined,
+          label: selectedElement.label || selectedElement.accessibleName || undefined,
+          text: selectedElement.text || undefined,
+          value: selectedElement.value || undefined,
+          placeholder: selectedElement.placeholder || undefined,
+          states,
+          actions: selectedElement.actions || [],
+          parent_info: parentInfo,
+          page_context: pageContext
+            ? {
+                url: pageContext.url || undefined,
+                title: pageContext.title || undefined,
+              }
+            : undefined,
         },
-      );
+      });
 
       if (!result.success || !result.data) {
         throw new Error(result.message || "Failed to generate AI description");
@@ -619,7 +620,16 @@ export function ElementDescriptionPanel({
     if (!aiAvailable || !pageContext?.url || isGeneratingBulk) return;
 
     // Filter to interactive elements that don't have AI descriptions yet
-    const interactiveTypes = ["button", "input", "textarea", "select", "checkbox", "radio", "link", "tab"];
+    const interactiveTypes = [
+      "button",
+      "input",
+      "textarea",
+      "select",
+      "checkbox",
+      "radio",
+      "link",
+      "tab",
+    ];
     const toGenerate = elements.filter(
       (el) =>
         interactiveTypes.includes(el.type) &&
@@ -661,28 +671,29 @@ export function ElementDescriptionPanel({
         }
 
         // Call the Tauri command
-        const result = await invoke<{ success: boolean; message?: string; data?: AiDescriptionResponse }>(
-          "generate_element_ai_description",
-          {
-            input: {
-              element_type: element.type,
-              role: element.role || element.accessibility?.role || undefined,
-              label: element.label || element.accessibleName || undefined,
-              text: element.text || undefined,
-              value: element.value || undefined,
-              placeholder: element.placeholder || undefined,
-              states,
-              actions: element.actions || [],
-              parent_info: undefined,
-              page_context: pageContext
-                ? {
-                    url: pageContext.url || undefined,
-                    title: pageContext.title || undefined,
-                  }
-                : undefined,
-            },
+        const result = await invoke<{
+          success: boolean;
+          message?: string;
+          data?: AiDescriptionResponse;
+        }>("generate_element_ai_description", {
+          input: {
+            element_type: element.type,
+            role: element.role || element.accessibility?.role || undefined,
+            label: element.label || element.accessibleName || undefined,
+            text: element.text || undefined,
+            value: element.value || undefined,
+            placeholder: element.placeholder || undefined,
+            states,
+            actions: element.actions || [],
+            parent_info: undefined,
+            page_context: pageContext
+              ? {
+                  url: pageContext.url || undefined,
+                  title: pageContext.title || undefined,
+                }
+              : undefined,
           },
-        );
+        });
 
         if (result.success && result.data) {
           const heuristic = generateHeuristicDescription(element);
@@ -1247,9 +1258,7 @@ export function ElementDescriptionPanel({
                   <div className="flex flex-wrap items-center gap-1">
                     {domContext.path.map((segment: PathSegment, index: number) => (
                       <span key={index} className="flex items-center gap-1">
-                        {index > 0 && (
-                          <ArrowRight className="w-3 h-3 text-muted-foreground/50" />
-                        )}
+                        {index > 0 && <ArrowRight className="w-3 h-3 text-muted-foreground/50" />}
                         {segment.elementId ? (
                           <button
                             className={`px-1.5 py-0.5 text-xs rounded transition-colors ${
@@ -1258,11 +1267,17 @@ export function ElementDescriptionPanel({
                                 : "bg-muted/30 hover:bg-muted/50 text-muted-foreground"
                             }`}
                             onClick={() => segment.elementId && onSelectElement(segment.elementId)}
-                            title={segment.label ? `${segment.tagName}: ${segment.label}` : segment.tagName}
+                            title={
+                              segment.label
+                                ? `${segment.tagName}: ${segment.label}`
+                                : segment.tagName
+                            }
                           >
                             {segment.tagName}
                             {segment.role && segment.role !== segment.tagName && (
-                              <span className="text-[10px] opacity-70 ml-0.5">[{segment.role}]</span>
+                              <span className="text-[10px] opacity-70 ml-0.5">
+                                [{segment.role}]
+                              </span>
                             )}
                           </button>
                         ) : (
@@ -1285,14 +1300,19 @@ export function ElementDescriptionPanel({
                   <span className="text-xs text-muted-foreground mb-1.5 block">Parent Element</span>
                   <button
                     className="flex items-center gap-2 px-2 py-1.5 bg-muted/30 hover:bg-muted/50 rounded-md transition-colors w-full text-left"
-                    onClick={() => domContext.parent && onSelectElement(domContext.parent.elementId)}
+                    onClick={() =>
+                      domContext.parent && onSelectElement(domContext.parent.elementId)
+                    }
                   >
                     {renderTypeIcon(domContext.parent.type)}
                     <span className="text-xs font-mono truncate flex-1">
                       {domContext.parent.tagName}
-                      {domContext.parent.role && domContext.parent.role !== domContext.parent.tagName && (
-                        <span className="text-muted-foreground ml-1">[{domContext.parent.role}]</span>
-                      )}
+                      {domContext.parent.role &&
+                        domContext.parent.role !== domContext.parent.tagName && (
+                          <span className="text-muted-foreground ml-1">
+                            [{domContext.parent.role}]
+                          </span>
+                        )}
                     </span>
                     {domContext.parent.label && (
                       <span className="text-xs text-muted-foreground truncate max-w-[120px]">
@@ -1306,7 +1326,9 @@ export function ElementDescriptionPanel({
               {/* Landmark Context */}
               {domContext.landmark && (
                 <div>
-                  <span className="text-xs text-muted-foreground mb-1.5 block">Landmark Context</span>
+                  <span className="text-xs text-muted-foreground mb-1.5 block">
+                    Landmark Context
+                  </span>
                   <div className="flex items-center gap-2 px-2 py-1.5 bg-purple-500/10 border border-purple-500/20 rounded-md">
                     <MapPin className="w-3.5 h-3.5 text-purple-500" />
                     <span className="text-xs font-medium text-purple-600 dark:text-purple-400">
@@ -1317,11 +1339,12 @@ export function ElementDescriptionPanel({
                         - "{domContext.landmark.label}"
                       </span>
                     )}
-                    {domContext.landmark.positionZone && domContext.landmark.positionZone !== domContext.landmark.role && (
-                      <Badge variant="muted" className="text-[10px] ml-auto">
-                        {domContext.landmark.positionZone}
-                      </Badge>
-                    )}
+                    {domContext.landmark.positionZone &&
+                      domContext.landmark.positionZone !== domContext.landmark.role && (
+                        <Badge variant="muted" className="text-[10px] ml-auto">
+                          {domContext.landmark.positionZone}
+                        </Badge>
+                      )}
                   </div>
                 </div>
               )}
@@ -1357,7 +1380,9 @@ export function ElementDescriptionPanel({
                           </span>
                         )}
                         {sibling.isCurrent && (
-                          <Badge variant="default" className="text-[10px]">current</Badge>
+                          <Badge variant="default" className="text-[10px]">
+                            current
+                          </Badge>
                         )}
                       </button>
                     ))}
@@ -1479,7 +1504,9 @@ export function ElementDescriptionPanel({
                     <div className="text-[10px] text-muted-foreground">Total</div>
                   </div>
                   <div className="p-2 bg-primary/10 rounded">
-                    <div className="text-lg font-semibold text-primary">{storageStats.aiDescriptions}</div>
+                    <div className="text-lg font-semibold text-primary">
+                      {storageStats.aiDescriptions}
+                    </div>
                     <div className="text-[10px] text-muted-foreground">AI</div>
                   </div>
                 </div>

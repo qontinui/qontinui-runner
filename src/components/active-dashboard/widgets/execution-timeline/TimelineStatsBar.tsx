@@ -100,12 +100,7 @@ export function TimelineStatsBar({
   };
 
   return (
-    <div
-      className={cn(
-        "border-b border-border px-4 py-3 bg-muted/20",
-        className,
-      )}
-    >
+    <div className={cn("border-b border-border px-4 py-3 bg-muted/20", className)}>
       {/* Overall progress bar (shown when stepStats available and not compact) */}
       {stepStats && !compact && stepStats.total > 0 && (
         <div className="mb-3">
@@ -125,72 +120,72 @@ export function TimelineStatsBar({
 
       {/* Stats row */}
       <div className="flex items-center gap-6">
-      {/* Elapsed Time */}
-      <div className="flex items-center gap-2">
-        <Clock className="h-4 w-4 text-muted-foreground" />
-        <div>
-          <p className="text-xs text-muted-foreground">Elapsed</p>
-          <p className="font-mono text-sm text-foreground">{formatTime(stats.elapsedTime)}</p>
-        </div>
-      </div>
-
-      {/* Current Iteration */}
-      {stats.maxIteration > 0 && (
+        {/* Elapsed Time */}
         <div className="flex items-center gap-2">
-          <RotateCcw className="h-4 w-4 text-muted-foreground" />
+          <Clock className="h-4 w-4 text-muted-foreground" />
           <div>
-            <p className="text-xs text-muted-foreground">Iteration</p>
-            <p className="font-mono text-sm text-foreground">
-              {stats.currentIteration ?? stats.maxIteration}
-            </p>
+            <p className="text-xs text-muted-foreground">Elapsed</p>
+            <p className="font-mono text-sm text-foreground">{formatTime(stats.elapsedTime)}</p>
           </div>
         </div>
-      )}
 
-      {/* Average Iteration Duration */}
-      {stats.avgIterationDurationMs !== null && (
-        <div className="flex items-center gap-2">
-          <Timer className="h-4 w-4 text-muted-foreground" />
-          <div>
-            <p className="text-xs text-muted-foreground">Avg Iteration</p>
-            <p className="font-mono text-sm text-foreground">
-              {formatDuration(stats.avgIterationDurationMs)}
-            </p>
+        {/* Current Iteration */}
+        {stats.maxIteration > 0 && (
+          <div className="flex items-center gap-2">
+            <RotateCcw className="h-4 w-4 text-muted-foreground" />
+            <div>
+              <p className="text-xs text-muted-foreground">Iteration</p>
+              <p className="font-mono text-sm text-foreground">
+                {stats.currentIteration ?? stats.maxIteration}
+              </p>
+            </div>
           </div>
-        </div>
-      )}
+        )}
 
-      {/* Improvement over last iteration */}
-      {stats.improvement && (
-        <div className="flex items-center gap-2">
-          <ImprovementIcon className={cn("h-4 w-4", improvementColorClass)} />
-          <div>
-            <p className="text-xs text-muted-foreground">vs Last Iteration</p>
-            <p className={cn("font-mono text-sm", improvementColorClass)}>
-              {stats.improvement.delta > 0 ? "+" : ""}
-              {stats.improvement.delta}/{stats.improvement.total} tests
-              <span className="text-xs ml-1">
-                ({stats.improvement.percentage > 0 ? "+" : ""}
-                {stats.improvement.percentage.toFixed(1)}%)
-              </span>
-            </p>
+        {/* Average Iteration Duration */}
+        {stats.avgIterationDurationMs !== null && (
+          <div className="flex items-center gap-2">
+            <Timer className="h-4 w-4 text-muted-foreground" />
+            <div>
+              <p className="text-xs text-muted-foreground">Avg Iteration</p>
+              <p className="font-mono text-sm text-foreground">
+                {formatDuration(stats.avgIterationDurationMs)}
+              </p>
+            </div>
           </div>
-        </div>
-      )}
+        )}
 
-      {/* Show latest verification result if no improvement data yet */}
-      {!stats.improvement && stats.verificationResults.length > 0 && (
-        <div className="flex items-center gap-2">
-          <TrendingUp className="h-4 w-4 text-muted-foreground" />
-          <div>
-            <p className="text-xs text-muted-foreground">Verification</p>
-            <p className="font-mono text-sm text-foreground">
-              {stats.verificationResults[stats.verificationResults.length - 1].passed}/
-              {stats.verificationResults[stats.verificationResults.length - 1].total} passed
-            </p>
+        {/* Improvement over last iteration */}
+        {stats.improvement && (
+          <div className="flex items-center gap-2">
+            <ImprovementIcon className={cn("h-4 w-4", improvementColorClass)} />
+            <div>
+              <p className="text-xs text-muted-foreground">vs Last Iteration</p>
+              <p className={cn("font-mono text-sm", improvementColorClass)}>
+                {stats.improvement.delta > 0 ? "+" : ""}
+                {stats.improvement.delta}/{stats.improvement.total} tests
+                <span className="text-xs ml-1">
+                  ({stats.improvement.percentage > 0 ? "+" : ""}
+                  {stats.improvement.percentage.toFixed(1)}%)
+                </span>
+              </p>
+            </div>
           </div>
-        </div>
-      )}
+        )}
+
+        {/* Show latest verification result if no improvement data yet */}
+        {!stats.improvement && stats.verificationResults.length > 0 && (
+          <div className="flex items-center gap-2">
+            <TrendingUp className="h-4 w-4 text-muted-foreground" />
+            <div>
+              <p className="text-xs text-muted-foreground">Verification</p>
+              <p className="font-mono text-sm text-foreground">
+                {stats.verificationResults[stats.verificationResults.length - 1].passed}/
+                {stats.verificationResults[stats.verificationResults.length - 1].total} passed
+              </p>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

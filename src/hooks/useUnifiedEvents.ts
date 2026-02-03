@@ -87,9 +87,7 @@ export interface UseUnifiedEventsReturn {
 // Hook Implementation
 // ============================================================================
 
-export function useUnifiedEvents(
-  options: UseUnifiedEventsOptions = {}
-): UseUnifiedEventsReturn {
+export function useUnifiedEvents(options: UseUnifiedEventsOptions = {}): UseUnifiedEventsReturn {
   const {
     enabled = true,
     onOrchestratorStateChange,
@@ -107,10 +105,10 @@ export function useUnifiedEvents(
   const [lastOrchestratorStateTauri, setLastOrchestratorStateTauri] =
     useState<OrchestratorStateChangePayload | null>(null);
   const [lastStepProgressTauri, setLastStepProgressTauri] = useState<StepProgressPayload | null>(
-    null
+    null,
   );
   const [lastTaskRunUpdateTauri, setLastTaskRunUpdateTauri] = useState<TaskRunUpdatePayload | null>(
-    null
+    null,
   );
 
   const unlistenRefs = useRef<UnlistenFn[]>([]);
@@ -133,7 +131,7 @@ export function useUnifiedEvents(
             if (!mounted) return;
             setLastOrchestratorStateTauri(event.payload);
             onOrchestratorStateChange?.(event.payload);
-          }
+          },
         );
         unlistenFns.push(unlistenOrchestrator);
 
@@ -152,7 +150,7 @@ export function useUnifiedEvents(
             if (!mounted) return;
             setLastTaskRunUpdateTauri(event.payload);
             onTaskRunUpdate?.(event.payload);
-          }
+          },
         );
         unlistenFns.push(unlistenTaskRunUpdate);
 
@@ -162,7 +160,7 @@ export function useUnifiedEvents(
           (event) => {
             if (!mounted) return;
             onExecutorEvent?.(event.payload);
-          }
+          },
         );
         unlistenFns.push(unlistenExecutorEvent);
 
@@ -275,7 +273,7 @@ export interface UseUnifiedOrchestratorStateReturn {
 }
 
 export function useUnifiedOrchestratorState(
-  options: UseUnifiedOrchestratorStateOptions = {}
+  options: UseUnifiedOrchestratorStateOptions = {},
 ): UseUnifiedOrchestratorStateReturn {
   const { taskId, onStateChange, enabled = true } = options;
   const isTauri = isTauriEnvironment();
@@ -292,7 +290,7 @@ export function useUnifiedOrchestratorState(
       setFilteredState(payload);
       onStateChange?.(payload);
     },
-    [taskId, onStateChange]
+    [taskId, onStateChange],
   );
 
   // Use Tauri events when in Tauri environment
@@ -313,7 +311,7 @@ export function useUnifiedOrchestratorState(
           (event) => {
             if (!mounted) return;
             handleStateChange(event.payload);
-          }
+          },
         );
 
         if (mounted) {

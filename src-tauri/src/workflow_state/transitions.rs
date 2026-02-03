@@ -62,11 +62,7 @@ impl fmt::Display for StateTransitionError {
                 )
             }
             StateTransitionError::TerminalState { state } => {
-                write!(
-                    f,
-                    "Cannot transition from terminal state '{}'",
-                    state
-                )
+                write!(f, "Cannot transition from terminal state '{}'", state)
             }
             StateTransitionError::PersistenceError(msg) => {
                 write!(f, "Failed to persist state transition: {}", msg)

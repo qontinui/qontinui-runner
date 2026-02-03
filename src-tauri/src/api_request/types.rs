@@ -16,7 +16,6 @@ pub enum HttpMethod {
     Delete,
 }
 
-
 impl From<HttpMethod> for reqwest::Method {
     fn from(method: HttpMethod) -> Self {
         match method {

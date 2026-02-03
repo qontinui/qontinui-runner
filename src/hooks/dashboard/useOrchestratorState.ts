@@ -141,7 +141,7 @@ export function useOrchestratorState(
         fetchState();
       }
     },
-    [taskId, fetchState]
+    [taskId, fetchState],
   );
 
   // Subscribe to WebSocket events for non-Tauri environments

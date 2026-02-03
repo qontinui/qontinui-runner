@@ -1071,27 +1071,24 @@ export function StateDiscoveryPanel({
   }, [discoveryResult, selectedForComparison]);
 
   // Navigation handlers
-  const navigateToState = useCallback(
-    (stateId: string, stateName: string) => {
-      setNavigationState((prev) => ({
-        ...prev,
-        selectedStateId: stateId,
-        selectedTransitionId: null,
-        selectedFingerprintId: null,
-        history: addToHistory(prev.history, { type: "state", id: stateId, label: stateName }),
-      }));
-      setViewMode("states");
-      setShowDiscoveredStates(true);
-      setExpandedDiscoveredStates((prev) => new Set([...prev, stateId]));
+  const navigateToState = useCallback((stateId: string, stateName: string) => {
+    setNavigationState((prev) => ({
+      ...prev,
+      selectedStateId: stateId,
+      selectedTransitionId: null,
+      selectedFingerprintId: null,
+      history: addToHistory(prev.history, { type: "state", id: stateId, label: stateName }),
+    }));
+    setViewMode("states");
+    setShowDiscoveredStates(true);
+    setExpandedDiscoveredStates((prev) => new Set([...prev, stateId]));
 
-      // Scroll to the state card after a short delay
-      setTimeout(() => {
-        const cardElement = stateCardRefs.current.get(stateId);
-        cardElement?.scrollIntoView({ behavior: "smooth", block: "center" });
-      }, 100);
-    },
-    [],
-  );
+    // Scroll to the state card after a short delay
+    setTimeout(() => {
+      const cardElement = stateCardRefs.current.get(stateId);
+      cardElement?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }, 100);
+  }, []);
 
   const navigateToTransition = useCallback(
     (fromStateId: string, toStateId: string, actionType?: string) => {
@@ -1465,11 +1462,7 @@ export function StateDiscoveryPanel({
                 variant={compareMode ? "primary" : "outline"}
                 size="sm"
                 onClick={() => (compareMode ? exitCompareMode() : setCompareMode(true))}
-                title={
-                  compareMode
-                    ? "Exit compare mode"
-                    : "Compare two states side-by-side"
-                }
+                title={compareMode ? "Exit compare mode" : "Compare two states side-by-side"}
                 data-ui-id="state-discovery-compare-toggle"
               >
                 <GitCompare className="w-4 h-4 mr-1.5" />

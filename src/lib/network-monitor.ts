@@ -154,7 +154,7 @@ export class NetworkMonitor {
     // Keep only last 5 minutes of requests
     const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
     this.completedRequests = this.completedRequests.filter(
-      (r) => r.startTime > fiveMinutesAgo - this.getStartTimeOffset()
+      (r) => r.startTime > fiveMinutesAgo - this.getStartTimeOffset(),
     );
 
     this.notifySubscribers();
@@ -201,7 +201,7 @@ export class NetworkMonitor {
   private calculateRequestsPerMinute(normalizedUrl: string): number {
     const oneMinuteAgo = performance.now() - 60 * 1000;
     return this.completedRequests.filter(
-      (r) => this.normalizeUrl(r.url) === normalizedUrl && r.startTime > oneMinuteAgo
+      (r) => this.normalizeUrl(r.url) === normalizedUrl && r.startTime > oneMinuteAgo,
     ).length;
   }
 
@@ -221,8 +221,9 @@ export class NetworkMonitor {
       .filter((r) => r.latency !== undefined)
       .map((r) => r.latency!);
 
-    const errorCount = this.completedRequests.filter((r) => r.error || (r.status && r.status >= 400))
-      .length;
+    const errorCount = this.completedRequests.filter(
+      (r) => r.error || (r.status && r.status >= 400),
+    ).length;
 
     return {
       totalRequests: this.completedRequests.length,
@@ -239,7 +240,11 @@ export class NetworkMonitor {
   /**
    * Get polling analysis for endpoints
    */
-  getPollingAnalysis(): { endpoint: string; estimatedInterval: number; requestsPerMinute: number }[] {
+  getPollingAnalysis(): {
+    endpoint: string;
+    estimatedInterval: number;
+    requestsPerMinute: number;
+  }[] {
     const analysis: {
       endpoint: string;
       estimatedInterval: number;

@@ -176,7 +176,7 @@ export function isTauriEnvironment(): boolean {
 const DEFAULT_WS_URL = "ws://localhost:9876/ws/events";
 
 export function useWebSocketEvents(
-  options: UseWebSocketEventsOptions = {}
+  options: UseWebSocketEventsOptions = {},
 ): UseWebSocketEventsReturn {
   const {
     url = DEFAULT_WS_URL,
@@ -245,7 +245,7 @@ export function useWebSocketEvents(
         console.error("[useWebSocketEvents] Failed to parse message:", err);
       }
     },
-    [onOrchestratorStateChange, onStepProgress, onTaskRunUpdate, onExecutorEvent]
+    [onOrchestratorStateChange, onStepProgress, onTaskRunUpdate, onExecutorEvent],
   );
 
   // Connect to WebSocket
@@ -285,9 +285,15 @@ export function useWebSocketEvents(
         onDisconnected?.();
 
         // Attempt reconnect if auto-reconnect is enabled
-        if (shouldReconnectRef.current && autoReconnect && reconnectAttempts < maxReconnectAttempts) {
+        if (
+          shouldReconnectRef.current &&
+          autoReconnect &&
+          reconnectAttempts < maxReconnectAttempts
+        ) {
           const delay = reconnectBaseDelay * Math.pow(2, reconnectAttempts);
-          console.log(`[useWebSocketEvents] Reconnecting in ${delay}ms (attempt ${reconnectAttempts + 1})`);
+          console.log(
+            `[useWebSocketEvents] Reconnecting in ${delay}ms (attempt ${reconnectAttempts + 1})`,
+          );
 
           reconnectTimeoutRef.current = setTimeout(() => {
             setReconnectAttempts((prev) => prev + 1);
@@ -412,7 +418,7 @@ export interface UseWsOrchestratorStateReturn {
 }
 
 export function useWsOrchestratorState(
-  options: UseWsOrchestratorStateOptions = {}
+  options: UseWsOrchestratorStateOptions = {},
 ): UseWsOrchestratorStateReturn {
   const { taskId, onStateChange, enabled = true } = options;
   const [filteredState, setFilteredState] = useState<OrchestratorStateChangePayload | null>(null);
@@ -426,7 +432,7 @@ export function useWsOrchestratorState(
       setFilteredState(payload);
       onStateChange?.(payload);
     },
-    [taskId, onStateChange]
+    [taskId, onStateChange],
   );
 
   const { isConnected, lastOrchestratorState } = useWebSocketEvents({

@@ -23,9 +23,8 @@ mod python_patterns {
         LazyLock::new(|| Regex::new(r"^Traceback \(most recent call last\):").unwrap());
 
     /// Matches a traceback file line: '  File "path", line N, in func'
-    pub static TRACEBACK_FILE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"^\s+File "([^"]+)", line (\d+)(?:, in (.+))?$"#).unwrap()
-    });
+    pub static TRACEBACK_FILE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"^\s+File "([^"]+)", line (\d+)(?:, in (.+))?$"#).unwrap());
 
     /// Matches an exception line: 'ExceptionType: message' or 'ExceptionType'
     pub static EXCEPTION_LINE: LazyLock<Regex> = LazyLock::new(|| {
@@ -52,9 +51,8 @@ mod python_patterns {
         LazyLock::new(|| Regex::new(r"^AssertionError(?::\s*(.+))?$").unwrap());
 
     /// Matches import errors
-    pub static IMPORT_ERROR: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"^(?:ModuleNotFoundError|ImportError):\s*(.+)$").unwrap()
-    });
+    pub static IMPORT_ERROR: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^(?:ModuleNotFoundError|ImportError):\s*(.+)$").unwrap());
 
     /// Matches syntax errors (special format with caret)
     pub static SYNTAX_ERROR: LazyLock<Regex> =
@@ -176,9 +174,11 @@ impl PythonParser {
         }
 
         // Build error event
-        let message = exception_message
-            .clone()
-            .unwrap_or_else(|| exception_type.clone().unwrap_or_else(|| "Unknown error".to_string()));
+        let message = exception_message.clone().unwrap_or_else(|| {
+            exception_type
+                .clone()
+                .unwrap_or_else(|| "Unknown error".to_string())
+        });
 
         let severity = self.severity_for_exception(exception_type.as_deref());
 
@@ -311,10 +311,7 @@ impl LogParser for PythonParser {
             if let Some(caps) = python_patterns::EXCEPTION_LINE.captures(line) {
                 let exc_type = caps.get(1).unwrap().as_str();
                 if self.is_known_exception(exc_type) {
-                    let message = caps
-                        .get(2)
-                        .map(|m| m.as_str())
-                        .unwrap_or(exc_type);
+                    let message = caps.get(2).map(|m| m.as_str()).unwrap_or(exc_type);
 
                     let error = ErrorEventBuilder::new(source_name)
                         .severity(self.severity_for_exception(Some(exc_type)))

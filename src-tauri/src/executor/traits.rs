@@ -216,7 +216,10 @@ mod tests {
     #[test]
     fn test_executor_error_constructors() {
         let err = ExecutorError::missing("config_storage");
-        assert!(matches!(err, ExecutorError::MissingDependency("config_storage")));
+        assert!(matches!(
+            err,
+            ExecutorError::MissingDependency("config_storage")
+        ));
 
         let err = ExecutorError::failed("test failure");
         assert!(matches!(err, ExecutorError::ExecutionFailed(_)));

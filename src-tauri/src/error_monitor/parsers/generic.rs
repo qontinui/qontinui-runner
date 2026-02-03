@@ -28,9 +28,8 @@ mod default_patterns {
     });
 
     /// HTTP error status pattern (4xx, 5xx)
-    pub static HTTP_ERROR: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?:HTTP|status|code)[/\s:]*([45]\d{2})(?:\s|$)"#).unwrap()
-    });
+    pub static HTTP_ERROR: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"(?:HTTP|status|code)[/\s:]*([45]\d{2})(?:\s|$)"#).unwrap());
 
     /// Stack trace indicator (common patterns)
     pub static STACK_TRACE_START: LazyLock<Regex> = LazyLock::new(|| {
@@ -60,8 +59,10 @@ mod default_patterns {
 
     /// Permission/access denied pattern
     pub static PERMISSION_ERROR: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)\b(permission\s+denied|access\s+denied|unauthorized|forbidden|EACCES|EPERM)\b")
-            .unwrap()
+        Regex::new(
+            r"(?i)\b(permission\s+denied|access\s+denied|unauthorized|forbidden|EACCES|EPERM)\b",
+        )
+        .unwrap()
     });
 
     /// File not found pattern
@@ -71,8 +72,10 @@ mod default_patterns {
 
     /// Out of memory pattern
     pub static OOM_ERROR: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)\b(out\s+of\s+memory|memory\s+(?:exhausted|allocation\s+failed)|OOM|ENOMEM)\b")
-            .unwrap()
+        Regex::new(
+            r"(?i)\b(out\s+of\s+memory|memory\s+(?:exhausted|allocation\s+failed)|OOM|ENOMEM)\b",
+        )
+        .unwrap()
     });
 }
 
@@ -212,7 +215,11 @@ impl GenericParser {
 
         // Critical patterns (OOM, etc.)
         if default_patterns::OOM_ERROR.is_match(line) {
-            return Some((ErrorSeverity::Critical, line.to_string(), Some("OutOfMemory".to_string())));
+            return Some((
+                ErrorSeverity::Critical,
+                line.to_string(),
+                Some("OutOfMemory".to_string()),
+            ));
         }
 
         // Exception pattern with type
@@ -250,31 +257,43 @@ impl GenericParser {
             } else {
                 ErrorSeverity::Warning
             };
-            return Some((
-                severity,
-                line.to_string(),
-                Some(format!("HTTP{}", status)),
-            ));
+            return Some((severity, line.to_string(), Some(format!("HTTP{}", status))));
         }
 
         // Connection errors
         if default_patterns::CONNECTION_ERROR.is_match(line) {
-            return Some((ErrorSeverity::Error, line.to_string(), Some("ConnectionError".to_string())));
+            return Some((
+                ErrorSeverity::Error,
+                line.to_string(),
+                Some("ConnectionError".to_string()),
+            ));
         }
 
         // Permission errors
         if default_patterns::PERMISSION_ERROR.is_match(line) {
-            return Some((ErrorSeverity::Error, line.to_string(), Some("PermissionError".to_string())));
+            return Some((
+                ErrorSeverity::Error,
+                line.to_string(),
+                Some("PermissionError".to_string()),
+            ));
         }
 
         // Not found errors
         if default_patterns::NOT_FOUND_ERROR.is_match(line) {
-            return Some((ErrorSeverity::Error, line.to_string(), Some("NotFoundError".to_string())));
+            return Some((
+                ErrorSeverity::Error,
+                line.to_string(),
+                Some("NotFoundError".to_string()),
+            ));
         }
 
         // Timeout
         if default_patterns::TIMEOUT_PATTERN.is_match(line) {
-            return Some((ErrorSeverity::Error, line.to_string(), Some("TimeoutError".to_string())));
+            return Some((
+                ErrorSeverity::Error,
+                line.to_string(),
+                Some("TimeoutError".to_string()),
+            ));
         }
 
         // General failure

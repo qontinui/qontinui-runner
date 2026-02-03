@@ -226,10 +226,7 @@ export type {
   WithRenderPerformanceProps,
 } from "./useRenderPerformance";
 
-export {
-  useVirtualScrollMetrics,
-  createScrollMetricsTracker,
-} from "./useVirtualScrollMetrics";
+export { useVirtualScrollMetrics, createScrollMetricsTracker } from "./useVirtualScrollMetrics";
 export type {
   UseVirtualScrollMetricsOptions,
   UseVirtualScrollMetricsReturn,

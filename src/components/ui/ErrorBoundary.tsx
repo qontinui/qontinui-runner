@@ -119,10 +119,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
     }
 
     // Start auto-retry if enabled and we haven't exceeded max retries
-    if (
-      this.props.enableRetry &&
-      this.state.retryCount < (this.props.maxRetries ?? 3)
-    ) {
+    if (this.props.enableRetry && this.state.retryCount < (this.props.maxRetries ?? 3)) {
       this.scheduleRetry();
     }
   }
@@ -191,11 +188,9 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
       }
 
       // Default fallback UI
-      const showDetails =
-        this.props.showErrorInDev && import.meta.env.DEV;
+      const showDetails = this.props.showErrorInDev && import.meta.env.DEV;
       const canRetry =
-        this.props.enableRetry &&
-        this.state.retryCount < (this.props.maxRetries ?? 3);
+        this.props.enableRetry && this.state.retryCount < (this.props.maxRetries ?? 3);
 
       return (
         <div className="p-4 border border-red-500/30 rounded-md bg-red-500/5">

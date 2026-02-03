@@ -861,13 +861,15 @@ fn determine_relevant_categories(context: &LogSourceSelectionContext) -> Vec<Log
     if let Some(ref app_name) = context.application_name {
         let app_lower = app_name.to_lowercase();
         if (app_lower.contains("mobile") || app_lower.contains("app"))
-            && !categories.contains(&LogSourceCategory::Mobile) {
-                categories.push(LogSourceCategory::Mobile);
-            }
+            && !categories.contains(&LogSourceCategory::Mobile)
+        {
+            categories.push(LogSourceCategory::Mobile);
+        }
         if (app_lower.contains("frontend") || app_lower.contains("web") || app_lower.contains("ui"))
-            && !categories.contains(&LogSourceCategory::Frontend) {
-                categories.push(LogSourceCategory::Frontend);
-            }
+            && !categories.contains(&LogSourceCategory::Frontend)
+        {
+            categories.push(LogSourceCategory::Frontend);
+        }
         if app_lower.contains("backend")
             || app_lower.contains("server")
             || app_lower.contains("api")
@@ -1144,8 +1146,7 @@ pub fn find_log_sources_with_ai(
                                 if let Some(ext) = path.extension() {
                                     if ext == "log" || ext == "txt" {
                                         if let Some(path_str) = path.to_str() {
-                                            discovered_logs
-                                                .push(path_str.replace("\\", "/"));
+                                            discovered_logs.push(path_str.replace("\\", "/"));
                                         }
                                     }
                                 }

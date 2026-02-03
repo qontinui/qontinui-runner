@@ -230,7 +230,10 @@ impl Timeouts {
         info!("  SHELL_COMMAND: {:?}", Self::shell_command());
         info!("  WORKFLOW_EXECUTION: {:?}", Self::workflow_execution());
         info!("  STATE_NAVIGATION: {:?}", Self::state_navigation());
-        info!("  UI_BRIDGE_EXPLORATION: {:?}", Self::ui_bridge_exploration());
+        info!(
+            "  UI_BRIDGE_EXPLORATION: {:?}",
+            Self::ui_bridge_exploration()
+        );
         info!("  SCREENSHOT_CAPTURE: {:?}", Self::screenshot_capture());
         info!("  API_REQUEST: {:?}", Self::api_request());
         info!("  MCP_CALL: {:?}", Self::mcp_call());

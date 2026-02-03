@@ -292,8 +292,7 @@ impl AnalysisContext {
         ];
 
         self.locks.iter().any(|lock| {
-            lock_patterns.contains(&lock.name)
-                || lock.protects.contains(&state_name.to_string())
+            lock_patterns.contains(&lock.name) || lock.protects.contains(&state_name.to_string())
         })
     }
 }

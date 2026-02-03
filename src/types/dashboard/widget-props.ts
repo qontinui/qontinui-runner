@@ -51,6 +51,8 @@ export interface WidgetHeaderProps {
   detailRoute?: string;
   /** Callback for "View All" click */
   onViewAll?: () => void;
+  /** Optional action elements rendered in the header's right section */
+  actions?: React.ReactNode;
 }
 
 /**

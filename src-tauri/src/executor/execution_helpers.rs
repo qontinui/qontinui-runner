@@ -466,8 +466,7 @@ mod tests {
     #[test]
     fn test_consolidate_step_names_with_default() {
         let steps: Vec<ExecutionStepConfig> = vec![];
-        let names =
-            prompt_builder::consolidate_step_names_with_default(&steps, "Default Task");
+        let names = prompt_builder::consolidate_step_names_with_default(&steps, "Default Task");
         assert_eq!(names, "Default Task");
 
         let steps_with_names = vec![ExecutionStepConfig {
@@ -655,7 +654,11 @@ mod tests {
         });
 
         assert_eq!(result, 42);
-        assert!(duration_ms >= 10, "Duration should be at least 10ms, got {}", duration_ms);
+        assert!(
+            duration_ms >= 10,
+            "Duration should be at least 10ms, got {}",
+            duration_ms
+        );
     }
 
     #[test]
@@ -666,7 +669,10 @@ mod tests {
         let outcome = success.into_outcome(duration_ms);
 
         assert!(outcome.success);
-        assert!(outcome.duration_ms < 10, "Simple operation should be very fast");
+        assert!(
+            outcome.duration_ms < 10,
+            "Simple operation should be very fast"
+        );
     }
 
     #[tokio::test]
@@ -674,9 +680,14 @@ mod tests {
         let (result, duration_ms) = timeout_helper::timed_result_async(async {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             "async result"
-        }).await;
+        })
+        .await;
 
         assert_eq!(result, "async result");
-        assert!(duration_ms >= 10, "Duration should be at least 10ms, got {}", duration_ms);
+        assert!(
+            duration_ms >= 10,
+            "Duration should be at least 10ms, got {}",
+            duration_ms
+        );
     }
 }

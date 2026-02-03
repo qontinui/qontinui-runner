@@ -45,7 +45,9 @@ impl StepHandler for ActionHandler {
                     StepHandlerResult::success()
                 } else {
                     StepHandlerResult::failure(
-                        result.message.unwrap_or_else(|| "Action failed".to_string()),
+                        result
+                            .message
+                            .unwrap_or_else(|| "Action failed".to_string()),
                     )
                 }
             }

@@ -36,9 +36,10 @@ fn traverse_for_async(node: &Node, source: &str, count: &mut u32) {
     let kind = node.kind();
 
     if (kind == "function_declaration" || kind == "arrow_function" || kind == "method_definition")
-        && has_async_keyword(node, source) {
-            *count += 1;
-        }
+        && has_async_keyword(node, source)
+    {
+        *count += 1;
+    }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {

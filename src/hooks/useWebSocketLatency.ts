@@ -78,7 +78,7 @@ export interface UseWebSocketLatencyReturn {
  * ```
  */
 export function useWebSocketLatency(
-  options: UseWebSocketLatencyOptions = {}
+  options: UseWebSocketLatencyOptions = {},
 ): UseWebSocketLatencyReturn {
   const { enabled = import.meta.env.DEV } = options;
 
@@ -160,7 +160,7 @@ export function useWebSocketLatency(
           : 0;
 
       const uptime = Date.now() - startTimeRef.current;
-      const messageRate = uptime > 0 ? (messagesRef.current / (uptime / 60000)) : 0;
+      const messageRate = uptime > 0 ? messagesRef.current / (uptime / 60000) : 0;
 
       setStats({
         messagesReceived: messagesRef.current,
@@ -171,7 +171,7 @@ export function useWebSocketLatency(
         messageRate,
       });
     },
-    [enabled, calculateLatency]
+    [enabled, calculateLatency],
   );
 
   // Record connection state change
@@ -193,7 +193,7 @@ export function useWebSocketLatency(
         reconnectCount: reconnectsRef.current,
       }));
     },
-    [enabled]
+    [enabled],
   );
 
   // Reset all stats
@@ -248,7 +248,7 @@ export interface PollingComparison {
 export function compareToPolling(
   wsStats: WebSocketLatencyStats,
   pollingIntervalMs: number = 5000,
-  pollingLatencyMs: number = 100
+  pollingLatencyMs: number = 100,
 ): PollingComparison {
   // Calculate polling requests per minute
   const pollingRequestsPerMinute = 60000 / pollingIntervalMs;

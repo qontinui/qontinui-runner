@@ -215,7 +215,11 @@ impl StepMetadata {
     /// Generate and set a unique step ID based on context.
     pub fn with_generated_step_id(mut self) -> Self {
         let phase = self.context.phase.as_str();
-        let iter_part = self.context.iteration.map(|i| format!("-{}", i)).unwrap_or_default();
+        let iter_part = self
+            .context
+            .iteration
+            .map(|i| format!("-{}", i))
+            .unwrap_or_default();
         self.step_id = Some(format!(
             "{}-{}{}-{}-{}",
             self.context.task_run_id,
@@ -326,7 +330,11 @@ impl StepMetadata {
             id.clone()
         } else {
             let phase = self.context.phase.as_str();
-            let iter_part = self.context.iteration.map(|i| format!("-{}", i)).unwrap_or_default();
+            let iter_part = self
+                .context
+                .iteration
+                .map(|i| format!("-{}", i))
+                .unwrap_or_default();
             format!(
                 "{}-{}{}-{}-{}",
                 self.context.task_run_id,
@@ -682,13 +690,8 @@ mod tests {
 
     #[test]
     fn test_step_metadata_to_json() {
-        let metadata = StepMetadata::verification(
-            "task-123",
-            StepType::Playwright,
-            "Login Test",
-            2,
-            1,
-        );
+        let metadata =
+            StepMetadata::verification("task-123", StepType::Playwright, "Login Test", 2, 1);
         let json = metadata.to_json();
 
         assert_eq!(json["task_run_id"], "task-123");
@@ -702,13 +705,7 @@ mod tests {
 
     #[test]
     fn test_step_metadata_accessors() {
-        let metadata = StepMetadata::agentic(
-            "task-456",
-            StepType::AiSession,
-            "AI Analysis",
-            0,
-            3,
-        );
+        let metadata = StepMetadata::agentic("task-456", StepType::AiSession, "AI Analysis", 0, 3);
 
         assert_eq!(metadata.task_run_id(), "task-456");
         assert_eq!(metadata.phase(), WorkflowPhase::Agentic);
@@ -739,11 +736,13 @@ mod tests {
         assert_eq!(shell_metadata.expected_duration_ms, Some(30_000));
 
         // AiSession default is 300_000ms (5 minutes)
-        let ai_metadata = StepMetadata::agentic("task-123", StepType::AiSession, "AI Analysis", 0, 1);
+        let ai_metadata =
+            StepMetadata::agentic("task-123", StepType::AiSession, "AI Analysis", 0, 1);
         assert_eq!(ai_metadata.expected_duration_ms, Some(300_000));
 
         // Playwright default is 60_000ms
-        let playwright_metadata = StepMetadata::verification("task-123", StepType::Playwright, "Login Test", 0, 1);
+        let playwright_metadata =
+            StepMetadata::verification("task-123", StepType::Playwright, "Login Test", 0, 1);
         assert_eq!(playwright_metadata.expected_duration_ms, Some(60_000));
 
         // Action default is 5_000ms
@@ -795,12 +794,7 @@ mod tests {
 
     #[test]
     fn test_step_details_merge() {
-        let metadata = StepMetadata::setup(
-            "task-789",
-            StepType::ShellCommand,
-            "Build",
-            0,
-        );
+        let metadata = StepMetadata::setup("task-789", StepType::ShellCommand, "Build", 0);
         let details = StepDetails::shell_command("npm run build".to_string(), None, None);
 
         // Convert metadata to JSON object

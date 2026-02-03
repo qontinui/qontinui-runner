@@ -357,52 +357,52 @@ impl FlowExecutor {
         flow: Option<&'a Flow>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = StepResult> + Send + 'a>> {
         Box::pin(async move {
-        let step_type_name = get_step_type_name(&step.step_type);
+            let step_type_name = get_step_type_name(&step.step_type);
 
-        self.emit_event(FlowEvent::StepStarted {
-            instance_id: state.instance_id.clone(),
-            step_id: step.id.clone(),
-            step_name: step.name.clone(),
-            step_type: step_type_name.clone(),
-        });
+            self.emit_event(FlowEvent::StepStarted {
+                instance_id: state.instance_id.clone(),
+                step_id: step.id.clone(),
+                step_name: step.name.clone(),
+                step_type: step_type_name.clone(),
+            });
 
-        let start_time = std::time::Instant::now();
+            let start_time = std::time::Instant::now();
 
-        // Record step start
-        state.step_started(&step.id);
+            // Record step start
+            state.step_started(&step.id);
 
-        // Check step condition if present
-        if let Some(condition) = &step.condition {
-            if !condition.evaluate(&state.context) {
-                debug!(step_id = %step.id, "Step condition not met, skipping");
-                let next = step.get_next_steps().first().cloned();
-                return StepResult::success(&step.id, next)
-                    .with_output("skipped".to_string(), serde_json::json!(true));
+            // Check step condition if present
+            if let Some(condition) = &step.condition {
+                if !condition.evaluate(&state.context) {
+                    debug!(step_id = %step.id, "Step condition not met, skipping");
+                    let next = step.get_next_steps().first().cloned();
+                    return StepResult::success(&step.id, next)
+                        .with_output("skipped".to_string(), serde_json::json!(true));
+                }
             }
-        }
 
-        // Resolve input mappings
-        let resolved_inputs = resolve_input_mappings(&step.input_mappings, &state.context);
+            // Resolve input mappings
+            let resolved_inputs = resolve_input_mappings(&step.input_mappings, &state.context);
 
-        // Execute with timeout and retry logic
-        let result = self
-            .execute_step_inner_with_retry(step, state, flow, resolved_inputs)
-            .await;
+            // Execute with timeout and retry logic
+            let result = self
+                .execute_step_inner_with_retry(step, state, flow, resolved_inputs)
+                .await;
 
-        let duration = start_time.elapsed().as_millis() as u64;
-        let mut result = result;
-        result.duration_ms = duration;
+            let duration = start_time.elapsed().as_millis() as u64;
+            let mut result = result;
+            result.duration_ms = duration;
 
-        self.emit_event(FlowEvent::StepCompleted {
-            instance_id: state.instance_id.clone(),
-            step_id: step.id.clone(),
-            success: result.success,
-            outputs: result.outputs.clone(),
-            error: result.error.clone(),
-            duration_ms: duration,
-        });
+            self.emit_event(FlowEvent::StepCompleted {
+                instance_id: state.instance_id.clone(),
+                step_id: step.id.clone(),
+                success: result.success,
+                outputs: result.outputs.clone(),
+                error: result.error.clone(),
+                duration_ms: duration,
+            });
 
-        result
+            result
         })
     }
 
@@ -475,7 +475,10 @@ impl FlowExecutor {
                     timeout_secs = timeout_secs,
                     "Step timed out"
                 );
-                StepResult::failure(&step.id, format!("Step timed out after {} seconds", timeout_secs))
+                StepResult::failure(
+                    &step.id,
+                    format!("Step timed out after {} seconds", timeout_secs),
+                )
             }
         }
     }
@@ -822,8 +825,11 @@ impl FlowExecutor {
                     }
                     step_result.with_duration(result.duration_ms)
                 } else {
-                    StepResult::failure(step_id, result.error.unwrap_or_else(|| "Unknown error".to_string()))
-                        .with_duration(result.duration_ms)
+                    StepResult::failure(
+                        step_id,
+                        result.error.unwrap_or_else(|| "Unknown error".to_string()),
+                    )
+                    .with_duration(result.duration_ms)
                 };
             }
         }
@@ -911,7 +917,9 @@ impl FlowExecutor {
             } else {
                 StepResult::failure(
                     step_id,
-                    exec_result.error.unwrap_or_else(|| "Unknown error".to_string()),
+                    exec_result
+                        .error
+                        .unwrap_or_else(|| "Unknown error".to_string()),
                 )
                 .with_duration(exec_result.duration_ms)
             }
@@ -1070,7 +1078,13 @@ impl FlowExecutor {
         );
 
         // Create channel for branch results
-        let (tx, mut rx) = mpsc::channel::<(String, bool, HashMap<String, serde_json::Value>, Option<String>, u64)>(total);
+        let (tx, mut rx) = mpsc::channel::<(
+            String,
+            bool,
+            HashMap<String, serde_json::Value>,
+            Option<String>,
+            u64,
+        )>(total);
         let completed_count = Arc::new(AtomicUsize::new(0));
         let successful_count = Arc::new(AtomicUsize::new(0));
 
@@ -1109,7 +1123,9 @@ impl FlowExecutor {
                 );
 
                 // Send result (ignore send errors if receiver dropped)
-                let _ = tx.send((branch_id_clone, success, outputs, error, duration)).await;
+                let _ = tx
+                    .send((branch_id_clone, success, outputs, error, duration))
+                    .await;
             });
         }
 
@@ -1195,8 +1211,14 @@ impl FlowExecutor {
         if overall_success {
             let mut result = StepResult::success(step_id, Some(next.to_string()))
                 .with_output("branches".to_string(), serde_json::json!(results))
-                .with_output("completed_count".to_string(), serde_json::json!(received_count))
-                .with_output("successful_count".to_string(), serde_json::json!(success_count));
+                .with_output(
+                    "completed_count".to_string(),
+                    serde_json::json!(received_count),
+                )
+                .with_output(
+                    "successful_count".to_string(),
+                    serde_json::json!(success_count),
+                );
 
             // Add all branch outputs to step result
             for (key, value) in all_outputs {
@@ -1223,14 +1245,8 @@ impl FlowExecutor {
 
         // Return success with the branch ID as output
         let mut outputs = HashMap::new();
-        outputs.insert(
-            "branch_id".to_string(),
-            serde_json::json!(branch_id),
-        );
-        outputs.insert(
-            "executed".to_string(),
-            serde_json::json!(true),
-        );
+        outputs.insert("branch_id".to_string(), serde_json::json!(branch_id));
+        outputs.insert("executed".to_string(), serde_json::json!(true));
 
         (true, outputs, None)
     }
@@ -1296,12 +1312,24 @@ impl FlowExecutor {
 
         for (index, item) in items.iter().enumerate() {
             // Set loop context variables
-            state.context.insert("loop.index".to_string(), serde_json::json!(index));
+            state
+                .context
+                .insert("loop.index".to_string(), serde_json::json!(index));
             state.context.insert("loop.item".to_string(), item.clone());
-            state.context.insert("loop.length".to_string(), serde_json::json!(total_iterations));
-            state.context.insert("loop.first".to_string(), serde_json::json!(index == 0));
-            state.context.insert("loop.last".to_string(), serde_json::json!(index == total_iterations - 1));
-            state.context.insert("loop.break".to_string(), serde_json::json!(false));
+            state.context.insert(
+                "loop.length".to_string(),
+                serde_json::json!(total_iterations),
+            );
+            state
+                .context
+                .insert("loop.first".to_string(), serde_json::json!(index == 0));
+            state.context.insert(
+                "loop.last".to_string(),
+                serde_json::json!(index == total_iterations - 1),
+            );
+            state
+                .context
+                .insert("loop.break".to_string(), serde_json::json!(false));
 
             debug!(
                 step_id = %step_id,
@@ -1331,10 +1359,7 @@ impl FlowExecutor {
 
             // Store iteration outputs with index prefix
             for (key, value) in &body_result.outputs {
-                iteration_outputs.insert(
-                    format!("loop.results.{}.{}", index, key),
-                    value.clone(),
-                );
+                iteration_outputs.insert(format!("loop.results.{}.{}", index, key), value.clone());
             }
 
             // Track errors
@@ -1399,9 +1424,15 @@ impl FlowExecutor {
         } else {
             StepResult::success(step_id, Some(next.to_string()))
                 .with_output("loop_results".to_string(), serde_json::json!(loop_results))
-                .with_output("iterations".to_string(), serde_json::json!(iterations_completed))
+                .with_output(
+                    "iterations".to_string(),
+                    serde_json::json!(iterations_completed),
+                )
                 .with_output("total".to_string(), serde_json::json!(total_iterations))
-                .with_output("completed".to_string(), serde_json::json!(iterations_completed == total_iterations))
+                .with_output(
+                    "completed".to_string(),
+                    serde_json::json!(iterations_completed == total_iterations),
+                )
         }
     }
 
@@ -1931,15 +1962,21 @@ mod tests {
             state.context.keys().collect::<Vec<_>>()
         );
         // Verify all 3 items were processed (indices 0, 1, 2)
-        assert!(state.context.contains_key("loop.results.0.unix") ||
-                state.context.contains_key("loop.results.0.iso"),
-                "Expected loop.results.0.* keys");
-        assert!(state.context.contains_key("loop.results.1.unix") ||
-                state.context.contains_key("loop.results.1.iso"),
-                "Expected loop.results.1.* keys");
-        assert!(state.context.contains_key("loop.results.2.unix") ||
-                state.context.contains_key("loop.results.2.iso"),
-                "Expected loop.results.2.* keys");
+        assert!(
+            state.context.contains_key("loop.results.0.unix")
+                || state.context.contains_key("loop.results.0.iso"),
+            "Expected loop.results.0.* keys"
+        );
+        assert!(
+            state.context.contains_key("loop.results.1.unix")
+                || state.context.contains_key("loop.results.1.iso"),
+            "Expected loop.results.1.* keys"
+        );
+        assert!(
+            state.context.contains_key("loop.results.2.unix")
+                || state.context.contains_key("loop.results.2.iso"),
+            "Expected loop.results.2.* keys"
+        );
     }
 
     #[tokio::test]
@@ -2083,10 +2120,7 @@ mod tests {
                 id: "parallel_step".to_string(),
                 name: "Parallel Step".to_string(),
                 step_type: StepType::Parallel {
-                    branches: vec![
-                        "branch_a".to_string(),
-                        "branch_b".to_string(),
-                    ],
+                    branches: vec!["branch_a".to_string(), "branch_b".to_string()],
                     merge_strategy: ParallelMerge::WaitAny,
                     next: "end".to_string(),
                 },
@@ -2196,11 +2230,10 @@ mod tests {
             .add_step(FlowStep::end("end"));
 
         let mut state = FlowState::new(&flow);
-        let executor = FlowExecutor::new()
-            .with_config(FlowExecutorConfig {
-                default_step_timeout_secs: 1,
-                ..Default::default()
-            });
+        let executor = FlowExecutor::new().with_config(FlowExecutorConfig {
+            default_step_timeout_secs: 1,
+            ..Default::default()
+        });
 
         let result = executor.execute(&flow, &mut state).await;
 
@@ -2216,11 +2249,10 @@ mod tests {
             .add_step(FlowStep::end("end"));
 
         let mut state = FlowState::new(&flow);
-        let executor = FlowExecutor::new()
-            .with_config(FlowExecutorConfig {
-                default_step_timeout_secs: 60, // Short timeout
-                ..Default::default()
-            });
+        let executor = FlowExecutor::new().with_config(FlowExecutorConfig {
+            default_step_timeout_secs: 60, // Short timeout
+            ..Default::default()
+        });
 
         let result = executor.execute(&flow, &mut state).await;
         assert!(result.is_ok()); // Should complete before timeout
@@ -2296,18 +2328,19 @@ mod tests {
     #[tokio::test]
     async fn test_continue_on_error() {
         let flow = Flow::new("continue_on_error_test")
-            .add_step(FlowStep::tool("failing_step", "nonexistent_tool")
-                .continue_on_error()
-                .then("next_step"))
+            .add_step(
+                FlowStep::tool("failing_step", "nonexistent_tool")
+                    .continue_on_error()
+                    .then("next_step"),
+            )
             .add_step(FlowStep::tool("next_step", "timestamp").then("end"))
             .add_step(FlowStep::end("end"));
 
         let mut state = FlowState::new(&flow);
-        let executor = FlowExecutor::new()
-            .with_config(FlowExecutorConfig {
-                continue_on_error: true, // Also enable globally
-                ..Default::default()
-            });
+        let executor = FlowExecutor::new().with_config(FlowExecutorConfig {
+            continue_on_error: true, // Also enable globally
+            ..Default::default()
+        });
 
         let result = executor.execute(&flow, &mut state).await;
 
@@ -2347,11 +2380,10 @@ mod tests {
             .add_step(FlowStep::end("end"));
 
         let mut state = FlowState::new(&flow);
-        let executor = FlowExecutor::new()
-            .with_config(FlowExecutorConfig {
-                max_iterations: 10, // Limit iterations
-                ..Default::default()
-            });
+        let executor = FlowExecutor::new().with_config(FlowExecutorConfig {
+            max_iterations: 10, // Limit iterations
+            ..Default::default()
+        });
 
         let result = executor.execute(&flow, &mut state).await;
 
@@ -2375,10 +2407,9 @@ mod tests {
             .add_step(FlowStep::end("end"));
 
         let mut state = FlowState::new(&flow);
-        let executor = FlowExecutor::new()
-            .with_event_callback(move |_event| {
-                event_count_clone.fetch_add(1, Ordering::SeqCst);
-            });
+        let executor = FlowExecutor::new().with_event_callback(move |_event| {
+            event_count_clone.fetch_add(1, Ordering::SeqCst);
+        });
 
         let result = executor.execute(&flow, &mut state).await;
 
@@ -2603,8 +2634,9 @@ mod tests {
 
         assert!(result.is_ok());
         // Timestamp tool should have produced outputs
-        assert!(state.context.contains_key("ts_step.iso") ||
-                state.context.contains_key("ts_step.unix"));
+        assert!(
+            state.context.contains_key("ts_step.iso") || state.context.contains_key("ts_step.unix")
+        );
     }
 
     #[tokio::test]
@@ -2633,7 +2665,10 @@ mod tests {
     async fn test_builtin_json_parse_tool() {
         let mut tool_step = FlowStep::tool("parse_step", "json_parse");
         if let StepType::Tool { ref mut inputs, .. } = tool_step.step_type {
-            inputs.insert("input".to_string(), serde_json::json!(r#"{"key": "value"}"#));
+            inputs.insert(
+                "input".to_string(),
+                serde_json::json!(r#"{"key": "value"}"#),
+            );
         }
         tool_step = tool_step.then("end");
 

@@ -25,19 +25,16 @@ mod js_patterns {
     });
 
     /// Matches V8 stack trace line: "    at functionName (file:line:col)"
-    pub static STACK_FRAME_V8: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"^\s+at\s+(?:(.+?)\s+)?\(?([^:]+):(\d+):(\d+)\)?$").unwrap()
-    });
+    pub static STACK_FRAME_V8: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^\s+at\s+(?:(.+?)\s+)?\(?([^:]+):(\d+):(\d+)\)?$").unwrap());
 
     /// Matches anonymous stack frame: "    at file:line:col"
-    pub static STACK_FRAME_ANON: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"^\s+at\s+([^:]+):(\d+):(\d+)$").unwrap()
-    });
+    pub static STACK_FRAME_ANON: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^\s+at\s+([^:]+):(\d+):(\d+)$").unwrap());
 
     /// Matches Next.js/webpack error format
-    pub static NEXTJS_ERROR: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)^(?:error|Error)\s*[-:]?\s*(.+)$").unwrap()
-    });
+    pub static NEXTJS_ERROR: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)^(?:error|Error)\s*[-:]?\s*(.+)$").unwrap());
 
     /// Matches TypeScript compilation error: "src/file.ts(10,5): error TS2322: ..."
     pub static TS_ERROR: LazyLock<Regex> = LazyLock::new(|| {
@@ -149,14 +146,15 @@ impl JavaScriptParser {
         let mut first_location: Option<ErrorLocation> = None;
 
         // Parse the error line
-        let (error_type, message) = if let Some(caps) = js_patterns::ERROR_WITH_TYPE.captures(first_line) {
-            (
-                Some(caps.get(1).unwrap().as_str().to_string()),
-                caps.get(2).unwrap().as_str().to_string(),
-            )
-        } else {
-            (None, first_line.to_string())
-        };
+        let (error_type, message) =
+            if let Some(caps) = js_patterns::ERROR_WITH_TYPE.captures(first_line) {
+                (
+                    Some(caps.get(1).unwrap().as_str().to_string()),
+                    caps.get(2).unwrap().as_str().to_string(),
+                )
+            } else {
+                (None, first_line.to_string())
+            };
 
         // Parse stack frames
         for line in lines.iter().skip(1) {

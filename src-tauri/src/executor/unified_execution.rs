@@ -25,10 +25,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::warn;
 
-use super::results::{ExecutionOutcome, OutcomeBuilder, ExecutionError};
+use super::results::{ExecutionError, ExecutionOutcome, OutcomeBuilder};
 use super::step_adapter::{
-    AdaptedStepConfig, BatchStepExecutor, LifecycleStepAdapter, StepExecutorAdapter,
-    aggregate_outcomes, results_to_outcomes,
+    aggregate_outcomes, results_to_outcomes, AdaptedStepConfig, BatchStepExecutor,
+    LifecycleStepAdapter, StepExecutorAdapter,
 };
 use super::traits::{Executor, ExecutorError, LifecycleExecutor};
 use crate::commands::AppState;
@@ -121,7 +121,10 @@ impl UnifiedStepRunner {
         steps: &[ExecutionStepConfig],
         execution_id: &str,
     ) -> (Vec<StepExecutionResult>, Vec<ExecutionOutcome>) {
-        let pairs = self.adapter.execute_steps_to_outcomes(steps, execution_id).await;
+        let pairs = self
+            .adapter
+            .execute_steps_to_outcomes(steps, execution_id)
+            .await;
 
         let results: Vec<_> = pairs.iter().map(|(r, _)| r.clone()).collect();
         let outcomes: Vec<_> = pairs.into_iter().map(|(_, o)| o).collect();
@@ -158,11 +161,7 @@ pub async fn execute_with_lifecycle(
     let start = std::time::Instant::now();
 
     // Create the adapter
-    let adapter = StepExecutorAdapter::new(
-        app_state,
-        config_storage,
-        app_handle,
-    );
+    let adapter = StepExecutorAdapter::new(app_state, config_storage, app_handle);
 
     // Wrap with lifecycle management
     let mut lifecycle = LifecycleStepAdapter::new(adapter);
@@ -179,8 +178,7 @@ pub async fn execute_with_lifecycle(
     let mut results = Vec::new();
 
     for (index, step) in steps.iter().enumerate() {
-        let config = AdaptedStepConfig::from_execution_step(step, execution_id)
-            .with_index(index);
+        let config = AdaptedStepConfig::from_execution_step(step, execution_id).with_index(index);
 
         match lifecycle.execute(config).await {
             Ok(result) => {
@@ -238,10 +236,7 @@ pub fn build_outcome(success: bool, summary: impl Into<String>) -> ExecutionOutc
     if success {
         OutcomeBuilder::success(summary).build()
     } else {
-        OutcomeBuilder::failure(
-            summary,
-            ExecutionError::execution("Execution failed"),
-        ).build()
+        OutcomeBuilder::failure(summary, ExecutionError::execution("Execution failed")).build()
     }
 }
 
@@ -255,7 +250,10 @@ mod tests {
         let outcome = aggregate_step_results(results);
 
         assert!(outcome.success);
-        assert_eq!(outcome.get_output("step_count"), Some(&serde_json::json!(0)));
+        assert_eq!(
+            outcome.get_output("step_count"),
+            Some(&serde_json::json!(0))
+        );
     }
 
     #[test]

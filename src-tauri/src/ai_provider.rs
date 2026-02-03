@@ -784,8 +784,10 @@ mod tests {
 
     #[test]
     fn test_ai_response_failure_with_output() {
-        let response =
-            AiResponse::error_with_output("partial output".to_string(), "Error occurred".to_string());
+        let response = AiResponse::error_with_output(
+            "partial output".to_string(),
+            "Error occurred".to_string(),
+        );
         assert!(!response.success);
         assert_eq!(response.output, "partial output");
         assert_eq!(response.error, Some("Error occurred".to_string()));

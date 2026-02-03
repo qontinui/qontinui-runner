@@ -509,11 +509,7 @@ function findMatchingElements(
     for (const concept of targetConcepts) {
       const synonyms = getElementSynonyms(concept);
       for (const syn of synonyms) {
-        if (
-          elementId.includes(syn) ||
-          elementLabel.includes(syn) ||
-          elementText.includes(syn)
-        ) {
+        if (elementId.includes(syn) || elementLabel.includes(syn) || elementText.includes(syn)) {
           score += 0.4;
           reasons.push(`Matches concept "${concept}" (via "${syn}")`);
           break;
@@ -1172,12 +1168,14 @@ export function NaturalLanguagePanel({
               <p className="text-xs text-muted-foreground mt-1">
                 Try being more specific or check the Elements tab to see available IDs
               </p>
-              {aiMatchingEnabled && !interpretation.usedLLM && interpretation.llmStatus !== "loading" && (
-                <p className="text-xs text-muted-foreground mt-1">
-                  <Bot className="w-3 h-3 inline mr-1" />
-                  AI matching is analyzing the page...
-                </p>
-              )}
+              {aiMatchingEnabled &&
+                !interpretation.usedLLM &&
+                interpretation.llmStatus !== "loading" && (
+                  <p className="text-xs text-muted-foreground mt-1">
+                    <Bot className="w-3 h-3 inline mr-1" />
+                    AI matching is analyzing the page...
+                  </p>
+                )}
             </div>
           )}
 

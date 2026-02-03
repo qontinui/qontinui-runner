@@ -36,10 +36,7 @@ export function StepsTimeline({ steps }: StepsTimelineProps) {
   );
 
   // Key extractor for virtual list
-  const getItemKey = useCallback(
-    (step: RecapStep, index: number) => `${step.name}-${index}`,
-    [],
-  );
+  const getItemKey = useCallback((step: RecapStep, index: number) => `${step.name}-${index}`, []);
 
   if (steps.length === 0) {
     return (
@@ -54,8 +51,7 @@ export function StepsTimeline({ steps }: StepsTimelineProps) {
     <div data-ui-id="recap-steps-timeline" className="card">
       <div className="px-4 py-3 border-b border-border">
         <h3 className="text-sm font-medium">
-          Steps ({steps.length})
-          {useVirtualScroll && " - virtualized"}
+          Steps ({steps.length}){useVirtualScroll && " - virtualized"}
         </h3>
       </div>
       {useVirtualScroll ? (

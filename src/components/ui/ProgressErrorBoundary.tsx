@@ -111,10 +111,7 @@ export class ProgressErrorBoundary extends Component<
     }
 
     // Start auto-retry if enabled and we haven't exceeded max retries
-    if (
-      this.props.enableRetry &&
-      this.state.retryCount < (this.props.maxRetries ?? 2)
-    ) {
+    if (this.props.enableRetry && this.state.retryCount < (this.props.maxRetries ?? 2)) {
       this.scheduleRetry();
     }
   }
@@ -157,15 +154,8 @@ export class ProgressErrorBoundary extends Component<
       if (compact) {
         return (
           <span
-            className={cn(
-              "text-xs text-muted-foreground/50 tabular-nums",
-              className,
-            )}
-            title={
-              import.meta.env.DEV
-                ? `Error: ${this.state.error?.message}`
-                : undefined
-            }
+            className={cn("text-xs text-muted-foreground/50 tabular-nums", className)}
+            title={import.meta.env.DEV ? `Error: ${this.state.error?.message}` : undefined}
           >
             {placeholder}
           </span>
@@ -175,15 +165,8 @@ export class ProgressErrorBoundary extends Component<
       // Standard fallback - minimal visual footprint
       return (
         <div
-          className={cn(
-            "flex items-center justify-center text-muted-foreground/40",
-            className,
-          )}
-          title={
-            import.meta.env.DEV
-              ? `Error: ${this.state.error?.message}`
-              : undefined
-          }
+          className={cn("flex items-center justify-center text-muted-foreground/40", className)}
+          title={import.meta.env.DEV ? `Error: ${this.state.error?.message}` : undefined}
         >
           <span className="text-xs tabular-nums">{placeholder}</span>
         </div>

@@ -92,7 +92,10 @@ impl EventBroadcaster {
                     }
                 }
                 Err(e) => {
-                    warn!("Failed to serialize event {} for WebSocket: {}", event_name, e);
+                    warn!(
+                        "Failed to serialize event {} for WebSocket: {}",
+                        event_name, e
+                    );
                 }
             }
         }
@@ -226,7 +229,11 @@ impl EventBroadcaster {
 
     /// Broadcast an AI output event with content type.
     pub fn ai_output_with_type(&self, session_id: &str, content: &str, content_type: &str) {
-        self.broadcast_or_warn(AppEvent::ai_output_with_type(session_id, content, content_type));
+        self.broadcast_or_warn(AppEvent::ai_output_with_type(
+            session_id,
+            content,
+            content_type,
+        ));
     }
 
     /// Broadcast a generic error event.
@@ -247,7 +254,11 @@ impl EventBroadcaster {
     ///
     /// This is provided for backward compatibility with existing code that
     /// uses raw JSON payloads. New code should use the typed AppEvent variants.
-    pub fn broadcast_raw(&self, event_name: &str, payload: &serde_json::Value) -> Result<(), String> {
+    pub fn broadcast_raw(
+        &self,
+        event_name: &str,
+        payload: &serde_json::Value,
+    ) -> Result<(), String> {
         // 1. Emit to Tauri frontend
         if let Err(e) = self.app_handle.emit(event_name, payload) {
             return Err(format!("Failed to emit {} to Tauri: {}", event_name, e));

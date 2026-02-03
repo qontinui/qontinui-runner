@@ -86,9 +86,9 @@ impl StepEventKind {
             | Self::VerificationStepComplete
             | Self::VerificationStepError => WorkflowPhase::Verification,
 
-            Self::AgenticAiStart
-            | Self::AgenticAiComplete
-            | Self::AgenticAiError => WorkflowPhase::Agentic,
+            Self::AgenticAiStart | Self::AgenticAiComplete | Self::AgenticAiError => {
+                WorkflowPhase::Agentic
+            }
 
             Self::CompletionAutomationStart
             | Self::CompletionAutomationComplete
@@ -212,10 +212,7 @@ mod tests {
 
     #[test]
     fn test_event_phases() {
-        assert_eq!(
-            StepEventKind::SetupAiStart.phase(),
-            WorkflowPhase::Setup
-        );
+        assert_eq!(StepEventKind::SetupAiStart.phase(), WorkflowPhase::Setup);
         assert_eq!(
             StepEventKind::VerificationStepComplete.phase(),
             WorkflowPhase::Verification

@@ -252,10 +252,31 @@ export const AllMarkerTypes: Story = {
 export const InStepRowContext: Story = {
   render: () => {
     const steps = [
-      { id: 1, name: "Setup Environment", status: "complete", current: 5, total: 5, type: "file_progress" },
+      {
+        id: 1,
+        name: "Setup Environment",
+        status: "complete",
+        current: 5,
+        total: 5,
+        type: "file_progress",
+      },
       { id: 2, name: "Run Tests", status: "running", current: 8, total: 20, type: "test_progress" },
-      { id: 3, name: "Analyze Results", status: "pending", current: 0, total: 10, type: "analysis_progress" },
-      { id: 4, name: "Generate Report", status: "pending", current: 0, total: null, type: "review_progress" },
+      {
+        id: 3,
+        name: "Analyze Results",
+        status: "pending",
+        current: 0,
+        total: 10,
+        type: "analysis_progress",
+      },
+      {
+        id: 4,
+        name: "Generate Report",
+        status: "pending",
+        current: 0,
+        total: null,
+        type: "review_progress",
+      },
     ] as const;
 
     const getStatusBadge = (status: string) => {
@@ -279,11 +300,7 @@ export const InStepRowContext: Story = {
               {step.status}
             </span>
             {(step.status === "running" || step.status === "complete") && (
-              <StepProgressIndicator
-                current={step.current}
-                total={step.total}
-                type={step.type}
-              />
+              <StepProgressIndicator current={step.current} total={step.total} type={step.type} />
             )}
           </div>
         ))}
@@ -325,7 +342,12 @@ export const MockFullDisplay: Story = {
     }> = [
       { type: "file_progress", current: 45, total: 100, description: "Processing source files" },
       { type: "test_progress", current: 8, total: 20, description: "Running unit tests" },
-      { type: "analysis_progress", current: 12, total: null, description: "Analyzing dependencies" },
+      {
+        type: "analysis_progress",
+        current: 12,
+        total: null,
+        description: "Analyzing dependencies",
+      },
     ];
 
     const getLabel = (type: string) => {

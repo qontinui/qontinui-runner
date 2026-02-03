@@ -26,7 +26,7 @@ use crate::AppState;
 use super::phases::{AgenticExecutor, CompletionExecutor, SetupExecutor, VerificationExecutor};
 use super::resume::{ResumeManager, ResumePoint};
 use super::states::UnifiedWorkflowState;
-use super::types::{AgenticOutcome, IterationResult, LoopConfig, LoopResult, get_parent_task_id};
+use super::types::{get_parent_task_id, AgenticOutcome, IterationResult, LoopConfig, LoopResult};
 
 /// The main loop controller for unified workflows.
 ///
@@ -157,35 +157,39 @@ impl LoopController {
         let resume_point = resume_manager
             .determine_resume_point(&config.execution_id)
             .unwrap_or_else(|e| {
-                warn!("Failed to determine resume point: {} - starting from beginning", e);
+                warn!(
+                    "Failed to determine resume point: {} - starting from beginning",
+                    e
+                );
                 ResumePoint::FromStart
             });
 
         info!("Resume point: {}", resume_point.description());
 
         // Calculate effective starting iteration based on resume point
-        let (skip_setup, effective_starting_iteration, run_agentic_first, skip_to_completion) = match &resume_point {
-            ResumePoint::FromStart => (false, 0, false, false),
-            ResumePoint::SetupPhase { .. } => {
-                // Resume in setup - re-run setup (could be smarter about partial resume)
-                (false, 0, false, false)
-            }
-            ResumePoint::VerificationPhase { iteration, .. } => {
-                // Skip setup, start verification at the given iteration
-                // iteration is 1-indexed, starting_iteration is 0-indexed (number of completed iterations)
-                (true, iteration.saturating_sub(1), false, false)
-            }
-            ResumePoint::AgenticPhase { iteration } => {
-                // Skip setup, run agentic phase first, then continue verification loop
-                // The agentic phase is at the given iteration, so we'll run it and then
-                // continue with verification at iteration + 1
-                (true, iteration.saturating_sub(1), true, false)
-            }
-            ResumePoint::CompletionPhase { .. } => {
-                // Skip directly to completion - verification already passed
-                (true, 0, false, true)
-            }
-        };
+        let (skip_setup, effective_starting_iteration, run_agentic_first, skip_to_completion) =
+            match &resume_point {
+                ResumePoint::FromStart => (false, 0, false, false),
+                ResumePoint::SetupPhase { .. } => {
+                    // Resume in setup - re-run setup (could be smarter about partial resume)
+                    (false, 0, false, false)
+                }
+                ResumePoint::VerificationPhase { iteration, .. } => {
+                    // Skip setup, start verification at the given iteration
+                    // iteration is 1-indexed, starting_iteration is 0-indexed (number of completed iterations)
+                    (true, iteration.saturating_sub(1), false, false)
+                }
+                ResumePoint::AgenticPhase { iteration } => {
+                    // Skip setup, run agentic phase first, then continue verification loop
+                    // The agentic phase is at the given iteration, so we'll run it and then
+                    // continue with verification at iteration + 1
+                    (true, iteration.saturating_sub(1), true, false)
+                }
+                ResumePoint::CompletionPhase { .. } => {
+                    // Skip directly to completion - verification already passed
+                    (true, 0, false, true)
+                }
+            };
 
         // =====================================================================
         // CLEAR OLD DATA FOR FRESH RUNS
@@ -194,7 +198,10 @@ impl LoopController {
         // from previous interrupted runs to prevent data pollution.
         // This includes: checkpoints, transition history, verification results, workflow state
         if matches!(resume_point, ResumePoint::FromStart) {
-            info!("Fresh run - clearing old data for execution {}", config.execution_id);
+            info!(
+                "Fresh run - clearing old data for execution {}",
+                config.execution_id
+            );
 
             // Clear step checkpoints
             if let Err(e) = resume_manager.clear_all_checkpoints(&config.execution_id) {
@@ -202,18 +209,36 @@ impl LoopController {
             }
 
             // Clear transition history
-            if let Err(e) = self.checkpoint_db.update_task_run_transition_history(&config.execution_id, "[]") {
-                warn!("Failed to clear transition history: {} - continuing anyway", e);
+            if let Err(e) = self
+                .checkpoint_db
+                .update_task_run_transition_history(&config.execution_id, "[]")
+            {
+                warn!(
+                    "Failed to clear transition history: {} - continuing anyway",
+                    e
+                );
             }
 
             // Clear verification phase results
-            if let Err(e) = self.checkpoint_db.delete_verification_phase_results(&config.execution_id) {
-                warn!("Failed to clear verification phase results: {} - continuing anyway", e);
+            if let Err(e) = self
+                .checkpoint_db
+                .delete_verification_phase_results(&config.execution_id)
+            {
+                warn!(
+                    "Failed to clear verification phase results: {} - continuing anyway",
+                    e
+                );
             }
 
             // Clear workflow execution state
-            if let Err(e) = self.checkpoint_db.delete_workflow_execution_state(&config.execution_id) {
-                warn!("Failed to clear workflow execution state: {} - continuing anyway", e);
+            if let Err(e) = self
+                .checkpoint_db
+                .delete_workflow_execution_state(&config.execution_id)
+            {
+                warn!(
+                    "Failed to clear workflow execution state: {} - continuing anyway",
+                    e
+                );
             }
         }
 
@@ -224,7 +249,10 @@ impl LoopController {
             info!("=== PHASE 1: SETUP ===");
 
             // Persist workflow state: SetupRunning
-            self.persist_workflow_state(&config.execution_id, &UnifiedWorkflowState::setup_running());
+            self.persist_workflow_state(
+                &config.execution_id,
+                &UnifiedWorkflowState::setup_running(),
+            );
 
             self.record_stage_transition(
                 &config.execution_id,
@@ -266,7 +294,10 @@ impl LoopController {
             }
 
             // Persist workflow state: SetupComplete
-            self.persist_workflow_state(&config.execution_id, &UnifiedWorkflowState::setup_complete());
+            self.persist_workflow_state(
+                &config.execution_id,
+                &UnifiedWorkflowState::setup_complete(),
+            );
         } else {
             info!("=== PHASE 1: SETUP SKIPPED (resuming from later phase) ===");
         }
@@ -323,10 +354,16 @@ impl LoopController {
                     info!("Resumed agentic phase completed successfully");
                 }
                 AgenticOutcome::Failed { error, .. } => {
-                    warn!("Resumed agentic phase failed: {}, but continuing with verification loop", error);
+                    warn!(
+                        "Resumed agentic phase failed: {}, but continuing with verification loop",
+                        error
+                    );
                 }
                 AgenticOutcome::Error { error } => {
-                    warn!("Resumed agentic phase errored: {}, but continuing with verification loop", error);
+                    warn!(
+                        "Resumed agentic phase errored: {}, but continuing with verification loop",
+                        error
+                    );
                 }
                 AgenticOutcome::Skipped => {
                     info!("Resumed agentic phase was skipped (no agentic steps)");
@@ -352,7 +389,7 @@ impl LoopController {
             // Skip directly to completion - return a synthetic loop result indicating success
             info!("=== PHASE 2: VERIFICATION-AGENTIC LOOP SKIPPED (resuming to completion) ===");
             LoopResult {
-                iterations_run: 0, // We don't know how many iterations ran before
+                iterations_run: 0,         // We don't know how many iterations ran before
                 verification_passed: true, // Must have passed if we're in completion phase
                 max_iterations_reached: false,
                 critical_failure: false,
@@ -397,7 +434,10 @@ impl LoopController {
                 // Persist workflow state: Stopped
                 self.persist_workflow_state(
                     &config.execution_id,
-                    &UnifiedWorkflowState::stopped_in_phase("verification", Some(loop_result.iterations_run)),
+                    &UnifiedWorkflowState::stopped_in_phase(
+                        "verification",
+                        Some(loop_result.iterations_run),
+                    ),
                 );
                 return WorkflowResult {
                     success: false,
@@ -411,7 +451,10 @@ impl LoopController {
             info!("=== PHASE 3: COMPLETION (verification PASSED) ===");
 
             // Persist workflow state: CompletionRunning
-            self.persist_workflow_state(&config.execution_id, &UnifiedWorkflowState::completion_running());
+            self.persist_workflow_state(
+                &config.execution_id,
+                &UnifiedWorkflowState::completion_running(),
+            );
 
             self.record_stage_transition(
                 &config.execution_id,
@@ -440,7 +483,10 @@ impl LoopController {
             }
 
             // Persist workflow state: CompletionComplete
-            self.persist_workflow_state(&config.execution_id, &UnifiedWorkflowState::completion_complete());
+            self.persist_workflow_state(
+                &config.execution_id,
+                &UnifiedWorkflowState::completion_complete(),
+            );
 
             // Mark task as completed (verification passed)
             self.mark_task_completed(&config.execution_id).await;
@@ -468,7 +514,10 @@ impl LoopController {
                 // Persist workflow state: Stopped
                 self.persist_workflow_state(
                     &config.execution_id,
-                    &UnifiedWorkflowState::stopped_in_phase("verification", Some(loop_result.iterations_run)),
+                    &UnifiedWorkflowState::stopped_in_phase(
+                        "verification",
+                        Some(loop_result.iterations_run),
+                    ),
                 );
                 // Don't mark as failed - stop_ai_analysis already marked it as "stopped"
             } else {
@@ -480,7 +529,11 @@ impl LoopController {
                 // Persist workflow state: Failed
                 self.persist_workflow_state(
                     &config.execution_id,
-                    &UnifiedWorkflowState::failed_in_phase(reason, "verification", Some(loop_result.iterations_run)),
+                    &UnifiedWorkflowState::failed_in_phase(
+                        reason,
+                        "verification",
+                        Some(loop_result.iterations_run),
+                    ),
                 );
                 self.mark_task_failed(&config.execution_id, reason).await;
                 info!("=== WORKFLOW FAILED ===");
@@ -531,7 +584,11 @@ impl LoopController {
                 "--- LOOP ITERATION {} of {} ---{}",
                 iteration,
                 config.max_iterations,
-                if config.starting_iteration > 0 { " (resumed)" } else { "" }
+                if config.starting_iteration > 0 {
+                    " (resumed)"
+                } else {
+                    ""
+                }
             );
 
             // Check if the task has been stopped externally (e.g., user clicked Stop button)
@@ -551,7 +608,10 @@ impl LoopController {
             // This ensures that any external modifications (e.g., AI calling APIs) don't
             // prematurely mark the task as complete or failed. The loop controller is
             // the ONLY authority on task completion in unified workflows.
-            if let Err(e) = self.checkpoint_db.update_task_run_status(&config.execution_id, "running") {
+            if let Err(e) = self
+                .checkpoint_db
+                .update_task_run_status(&config.execution_id, "running")
+            {
                 warn!(
                     "Failed to reset task status to running for iteration {}: {}",
                     iteration, e
@@ -633,7 +693,10 @@ impl LoopController {
             // Persist workflow state: VerificationComplete
             self.persist_workflow_state(
                 &config.execution_id,
-                &UnifiedWorkflowState::verification_complete(iteration, verification_result.all_passed),
+                &UnifiedWorkflowState::verification_complete(
+                    iteration,
+                    verification_result.all_passed,
+                ),
             );
 
             // Check verification outcome
@@ -724,7 +787,13 @@ impl LoopController {
 
             let agentic_outcome = self
                 .agentic_executor
-                .run_agentic(config, iteration, &failure_context, has_agentic_steps, logger)
+                .run_agentic(
+                    config,
+                    iteration,
+                    &failure_context,
+                    has_agentic_steps,
+                    logger,
+                )
                 .await;
 
             // Persist workflow state: AgenticComplete
@@ -1092,7 +1161,11 @@ pub async fn resume_interrupted_workflows(
     info!(
         "Found {} interrupted unified workflow(s) to {}",
         running_workflows.len(),
-        if config.resume_enabled { "resume" } else { "mark as failed" }
+        if config.resume_enabled {
+            "resume"
+        } else {
+            "mark as failed"
+        }
     );
 
     let mut processed_count = 0;
@@ -1160,35 +1233,59 @@ pub async fn resume_interrupted_workflows(
 
                             info!(
                                 "Starting resume of workflow '{}' from iteration {}",
-                                task_name, starting_iteration + 1
+                                task_name,
+                                starting_iteration + 1
                             );
 
                             // Build execution steps from workflow definition with explicit phase assignment
-                            let setup_automation_steps = convert_json_steps_with_phase(&workflow.setup_steps, 0, Some("setup"));
-                            let setup_prompt_steps = extract_prompt_steps_with_phase(&workflow.setup_steps, Some("setup"));
-                            let verification_steps = convert_json_steps_with_phase(&workflow.verification_steps, 0, Some("verification"));
+                            let setup_automation_steps = convert_json_steps_with_phase(
+                                &workflow.setup_steps,
+                                0,
+                                Some("setup"),
+                            );
+                            let setup_prompt_steps = extract_prompt_steps_with_phase(
+                                &workflow.setup_steps,
+                                Some("setup"),
+                            );
+                            let verification_steps = convert_json_steps_with_phase(
+                                &workflow.verification_steps,
+                                0,
+                                Some("verification"),
+                            );
                             // Prepend health check steps if enabled (default: true)
                             // Health checks run BEFORE log_watch to catch server down before scanning logs
-                            let verification_steps = crate::unified_workflows::prepend_health_check_steps(
-                                verification_steps,
-                                workflow.health_check_enabled,
-                                &workflow.health_check_urls,
-                            );
+                            let verification_steps =
+                                crate::unified_workflows::prepend_health_check_steps(
+                                    verification_steps,
+                                    workflow.health_check_enabled,
+                                    &workflow.health_check_urls,
+                                );
                             // Prepend log_watch step if enabled (default: true)
-                            let verification_steps = crate::unified_workflows::prepend_log_watch_step(
-                                verification_steps,
-                                workflow.log_watch_enabled,
-                            );
+                            let verification_steps =
+                                crate::unified_workflows::prepend_log_watch_step(
+                                    verification_steps,
+                                    workflow.log_watch_enabled,
+                                );
                             // Agentic steps are prompt-type steps, use extract_prompt_steps_with_phase
                             // (convert_json_steps_with_phase filters out prompt steps)
-                            let agentic_steps = extract_prompt_steps_with_phase(&workflow.agentic_steps, Some("agentic"));
-                            let completion_automation_steps = convert_json_steps_with_phase(&workflow.completion_steps, 0, Some("completion"));
-                            let completion_prompt_steps = extract_prompt_steps_with_phase(&workflow.completion_steps, Some("completion"));
+                            let agentic_steps = extract_prompt_steps_with_phase(
+                                &workflow.agentic_steps,
+                                Some("agentic"),
+                            );
+                            let completion_automation_steps = convert_json_steps_with_phase(
+                                &workflow.completion_steps,
+                                0,
+                                Some("completion"),
+                            );
+                            let completion_prompt_steps = extract_prompt_steps_with_phase(
+                                &workflow.completion_steps,
+                                Some("completion"),
+                            );
 
                             let loop_config = super::types::LoopConfig {
                                 max_iterations: workflow.max_iterations,
                                 timeout_seconds: workflow.timeout_seconds, // Use workflow setting
-                                base_prompt: String::new(), // Not used for resume
+                                base_prompt: String::new(),                // Not used for resume
                                 workflow_name: task_name.clone(),
                                 workflow_id: wf_id_for_spawn.to_string(),
                                 execution_id: task_id.clone(),
@@ -1249,7 +1346,10 @@ pub async fn resume_interrupted_workflows(
 
                     info!(
                         "Resuming workflow '{}' (task_id: {}, workflow_id: {}, iteration: {})",
-                        task_name, task_id, wf_id, starting_iteration + 1
+                        task_name,
+                        task_id,
+                        wf_id,
+                        starting_iteration + 1
                     );
 
                     super::spawn_workflow_with_panic_guard(
@@ -1265,21 +1365,44 @@ pub async fn resume_interrupted_workflows(
                             );
 
                             // Build execution steps from workflow definition with explicit phase assignment
-                            let setup_automation_steps = convert_json_steps_with_phase(&workflow.setup_steps, 0, Some("setup"));
-                            let setup_prompt_steps = extract_prompt_steps_with_phase(&workflow.setup_steps, Some("setup"));
-                            let verification_steps = convert_json_steps_with_phase(&workflow.verification_steps, 0, Some("verification"));
-                            let verification_steps = crate::unified_workflows::prepend_health_check_steps(
-                                verification_steps,
-                                workflow.health_check_enabled,
-                                &workflow.health_check_urls,
+                            let setup_automation_steps = convert_json_steps_with_phase(
+                                &workflow.setup_steps,
+                                0,
+                                Some("setup"),
                             );
-                            let verification_steps = crate::unified_workflows::prepend_log_watch_step(
-                                verification_steps,
-                                workflow.log_watch_enabled,
+                            let setup_prompt_steps = extract_prompt_steps_with_phase(
+                                &workflow.setup_steps,
+                                Some("setup"),
                             );
-                            let agentic_steps = extract_prompt_steps_with_phase(&workflow.agentic_steps, Some("agentic"));
-                            let completion_automation_steps = convert_json_steps_with_phase(&workflow.completion_steps, 0, Some("completion"));
-                            let completion_prompt_steps = extract_prompt_steps_with_phase(&workflow.completion_steps, Some("completion"));
+                            let verification_steps = convert_json_steps_with_phase(
+                                &workflow.verification_steps,
+                                0,
+                                Some("verification"),
+                            );
+                            let verification_steps =
+                                crate::unified_workflows::prepend_health_check_steps(
+                                    verification_steps,
+                                    workflow.health_check_enabled,
+                                    &workflow.health_check_urls,
+                                );
+                            let verification_steps =
+                                crate::unified_workflows::prepend_log_watch_step(
+                                    verification_steps,
+                                    workflow.log_watch_enabled,
+                                );
+                            let agentic_steps = extract_prompt_steps_with_phase(
+                                &workflow.agentic_steps,
+                                Some("agentic"),
+                            );
+                            let completion_automation_steps = convert_json_steps_with_phase(
+                                &workflow.completion_steps,
+                                0,
+                                Some("completion"),
+                            );
+                            let completion_prompt_steps = extract_prompt_steps_with_phase(
+                                &workflow.completion_steps,
+                                Some("completion"),
+                            );
 
                             let loop_config = super::types::LoopConfig {
                                 max_iterations: workflow.max_iterations,
@@ -1315,7 +1438,10 @@ pub async fn resume_interrupted_workflows(
                     );
                 }
                 Err(e) => {
-                    error!("Failed to fetch workflow by name '{}' for resume: {}", wf_name, e);
+                    error!(
+                        "Failed to fetch workflow by name '{}' for resume: {}",
+                        wf_name, e
+                    );
                 }
             }
         } else {
@@ -1395,7 +1521,10 @@ pub fn convert_json_steps_with_phase(
                 let step_type = step.get("type").and_then(|t| t.as_str())?;
                 ExecutionStepConfig {
                     step_type: step_type.to_string(),
-                    name: step.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()),
+                    name: step
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string()),
                     monitor_index: Some(monitor),
                     ..Default::default()
                 }
@@ -1419,9 +1548,7 @@ pub fn convert_json_steps_with_phase(
 ///
 /// If `explicit_phase` is provided, it will be set on all steps that don't
 /// already have a phase specified.
-pub fn extract_prompt_steps_from_json(
-    steps: &[serde_json::Value],
-) -> Vec<ExecutionStepConfig> {
+pub fn extract_prompt_steps_from_json(steps: &[serde_json::Value]) -> Vec<ExecutionStepConfig> {
     extract_prompt_steps_with_phase(steps, None)
 }
 

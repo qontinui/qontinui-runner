@@ -32,7 +32,10 @@ import type {
   TimelineStats,
   StepType,
 } from "../components/active-dashboard/widgets/execution-timeline/types";
-import type { StepStats, StepExecutionStatus } from "../components/active-dashboard/widgets/shared/types";
+import type {
+  StepStats,
+  StepExecutionStatus,
+} from "../components/active-dashboard/widgets/shared/types";
 import {
   useUnifiedEvents,
   type OrchestratorStateChangePayload,
@@ -402,7 +405,9 @@ function buildPhaseGroups(steps: TimelineStep[], currentStage: WorkflowStage | n
 
   return PHASE_ORDER.filter((phase) => groups.has(phase)).map((phase) => {
     const phaseSteps = groups.get(phase) || [];
-    const completed = phaseSteps.filter((s) => s.status === "success" || s.status === "failed").length;
+    const completed = phaseSteps.filter(
+      (s) => s.status === "success" || s.status === "failed",
+    ).length;
     const successful = phaseSteps.filter((s) => s.status === "success").length;
     const failed = phaseSteps.filter((s) => s.status === "failed").length;
     const isActive = phase === currentStage;
@@ -417,7 +422,10 @@ function buildPhaseGroups(steps: TimelineStep[], currentStage: WorkflowStage | n
       steps: phaseSteps.sort((a, b) => (a.startTime ?? 0) - (b.startTime ?? 0)),
       iterationGroups,
       hasIterations,
-      currentIteration: iterationGroups.length > 0 ? Math.max(...iterationGroups.map((g) => g.iteration)) : undefined,
+      currentIteration:
+        iterationGroups.length > 0
+          ? Math.max(...iterationGroups.map((g) => g.iteration))
+          : undefined,
       isActive,
       isComplete,
       stats: {
@@ -435,7 +443,7 @@ function buildPhaseGroups(steps: TimelineStep[], currentStage: WorkflowStage | n
  */
 function buildIterationGroups(
   steps: TimelineStep[],
-  isActivePhase: boolean
+  isActivePhase: boolean,
 ): PhaseGroup["iterationGroups"] {
   const iterMap = new Map<number, TimelineStep[]>();
 
@@ -451,7 +459,9 @@ function buildIterationGroups(
 
   return iterations.map((iteration) => {
     const iterSteps = iterMap.get(iteration) || [];
-    const completed = iterSteps.filter((s) => s.status === "success" || s.status === "failed").length;
+    const completed = iterSteps.filter(
+      (s) => s.status === "success" || s.status === "failed",
+    ).length;
     const successful = iterSteps.filter((s) => s.status === "success").length;
     const failed = iterSteps.filter((s) => s.status === "failed").length;
     const isActive = isActivePhase && iteration === maxIter;
@@ -497,24 +507,26 @@ function calculateStepStats(steps: TimelineStep[], elapsedTime: number): StepSta
 /**
  * Calculate timeline statistics.
  */
-function calculateTimelineStats(
-  phaseGroups: PhaseGroup[],
-  elapsedTime: number
-): TimelineStats {
+function calculateTimelineStats(phaseGroups: PhaseGroup[], elapsedTime: number): TimelineStats {
   const verificationGroup = phaseGroups.find((g) => g.phase === "verification");
   const verificationIterations = verificationGroup?.iterationGroups || [];
-  const maxIteration = verificationIterations.length > 0
-    ? Math.max(...verificationIterations.map((g) => g.iteration))
-    : 0;
+  const maxIteration =
+    verificationIterations.length > 0
+      ? Math.max(...verificationIterations.map((g) => g.iteration))
+      : 0;
 
   const currentIteration = verificationGroup?.isActive
-    ? verificationIterations.find((g) => g.isActive)?.iteration ?? maxIteration
+    ? (verificationIterations.find((g) => g.isActive)?.iteration ?? maxIteration)
     : null;
 
   // Calculate verification results per iteration
   const verificationResults = verificationIterations.map((iter) => {
     const checkSteps = iter.steps.filter(
-      (s) => s.type === "check" || s.type === "test" || s.type === "playwright" || s.type === "check_group"
+      (s) =>
+        s.type === "check" ||
+        s.type === "test" ||
+        s.type === "playwright" ||
+        s.type === "check_group",
     );
     const passed = checkSteps.filter((s) => s.status === "success").length;
     const total = checkSteps.length;
@@ -619,11 +631,12 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
 
       // Find last completed checkpoint
       const completedCheckpoints = checkpoints.filter(
-        (cp) => cp.status === "success" || cp.status === "failed"
+        (cp) => cp.status === "success" || cp.status === "failed",
       );
-      const lastCompletedCheckpoint = completedCheckpoints.length > 0
-        ? completedCheckpoints[completedCheckpoints.length - 1]
-        : null;
+      const lastCompletedCheckpoint =
+        completedCheckpoints.length > 0
+          ? completedCheckpoints[completedCheckpoints.length - 1]
+          : null;
 
       // Convert resume point
       const resumePoint: ResumePoint = {
@@ -741,7 +754,7 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
         }));
       }
     },
-    [effectiveSelectedRunId, fetchFullState]
+    [effectiveSelectedRunId, fetchFullState],
   );
 
   const handleStepProgress = useCallback(
@@ -764,7 +777,7 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
         }));
       }
     },
-    [effectiveSelectedRunId]
+    [effectiveSelectedRunId],
   );
 
   const handleTaskRunUpdate = useCallback(
@@ -778,7 +791,7 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
         }));
       }
     },
-    [effectiveSelectedRunId, fetchFullState]
+    [effectiveSelectedRunId, fetchFullState],
   );
 
   const handleConnected = useCallback(() => {
@@ -807,22 +820,24 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
   const handleExecutorEvent = useCallback(
     (payload: ExecutorEventPayload) => {
       // Extract the tree event data
-      const eventData = payload.data?.data as {
-        event_type?: string;
-        node?: {
-          id?: string;
-          name?: string;
-          status?: string;
-          duration_ms?: number;
-          error?: string;
-          metadata?: {
-            task_run_id?: string;
-            phase?: string;
-            step_index?: number;
-            step_type?: string;
-          };
-        };
-      } | undefined;
+      const eventData = payload.data?.data as
+        | {
+            event_type?: string;
+            node?: {
+              id?: string;
+              name?: string;
+              status?: string;
+              duration_ms?: number;
+              error?: string;
+              metadata?: {
+                task_run_id?: string;
+                phase?: string;
+                step_index?: number;
+                step_type?: string;
+              };
+            };
+          }
+        | undefined;
 
       if (!eventData?.node) return;
 
@@ -833,7 +848,11 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
       const eventType = eventData.event_type;
 
       // Handle step execution events
-      if (eventType === "action_started" || eventType === "action_completed" || eventType === "action_failed") {
+      if (
+        eventType === "action_started" ||
+        eventType === "action_completed" ||
+        eventType === "action_failed"
+      ) {
         // Trigger full fetch to get updated checkpoint data
         // This ensures the timeline reflects the latest step status
         if (effectiveSelectedRunId) {
@@ -846,11 +865,15 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
         }));
       }
     },
-    [effectiveSelectedRunId, fetchFullState]
+    [effectiveSelectedRunId, fetchFullState],
   );
 
   // Subscribe to unified events
-  const { isConnected, isTauri, connectionMethod: _connectionMethod } = useUnifiedEvents({
+  const {
+    isConnected,
+    isTauri,
+    connectionMethod: _connectionMethod,
+  } = useUnifiedEvents({
     enabled: !!effectiveSelectedRunId,
     onOrchestratorStateChange: handleOrchestratorStateChange,
     onStepProgress: handleStepProgress,
@@ -865,7 +888,7 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
     setState((prev) => ({
       ...prev,
       isConnected,
-      connectionMethod: isTauri ? "tauri" : (isConnected ? "websocket" : null),
+      connectionMethod: isTauri ? "tauri" : isConnected ? "websocket" : null,
     }));
   }, [isConnected, isTauri]);
 
@@ -919,13 +942,11 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
       refresh,
       selectRun,
     }),
-    [state, refresh, selectRun]
+    [state, refresh, selectRun],
   );
 
   return (
-    <WorkflowExecutionContext.Provider value={value}>
-      {children}
-    </WorkflowExecutionContext.Provider>
+    <WorkflowExecutionContext.Provider value={value}>{children}</WorkflowExecutionContext.Provider>
   );
 }
 

@@ -5,10 +5,7 @@
  * into the GUI automation config format used by qontinui.
  */
 
-import type {
-  CooccurrenceExport,
-  ElementFingerprint,
-} from "../../hooks/useExternalUIBridge";
+import type { CooccurrenceExport, ElementFingerprint } from "../../hooks/useExternalUIBridge";
 import type { FingerprintDiscoveryResult } from "../../components/ui-bridge/StateDiscoveryPanel";
 
 /**
@@ -131,7 +128,7 @@ function generateStateCandidateId(index: number): string {
  */
 function getDominantZone(
   fingerprints: string[],
-  fingerprintDetails: Record<string, ElementFingerprint>
+  fingerprintDetails: Record<string, ElementFingerprint>,
 ): string {
   const zoneCounts: Record<string, number> = {};
 
@@ -151,15 +148,14 @@ function getDominantZone(
  */
 function getDominantLandmark(
   fingerprints: string[],
-  fingerprintDetails: Record<string, ElementFingerprint>
+  fingerprintDetails: Record<string, ElementFingerprint>,
 ): string {
   const landmarkCounts: Record<string, number> = {};
 
   fingerprints.forEach((hash) => {
     const fp = fingerprintDetails[hash];
     if (fp?.landmarkContext) {
-      landmarkCounts[fp.landmarkContext] =
-        (landmarkCounts[fp.landmarkContext] || 0) + 1;
+      landmarkCounts[fp.landmarkContext] = (landmarkCounts[fp.landmarkContext] || 0) + 1;
     }
   });
 
@@ -170,9 +166,7 @@ function getDominantLandmark(
 /**
  * Classify a state candidate as global, modal, or content based on zone
  */
-function classifyStateType(
-  zone: string
-): { isGlobal: boolean; isModal: boolean } {
+function classifyStateType(zone: string): { isGlobal: boolean; isModal: boolean } {
   if (zone === "header" || zone === "footer") {
     return { isGlobal: true, isModal: false };
   }
@@ -188,7 +182,7 @@ function classifyStateType(
 function buildElements(
   fingerprints: string[],
   fingerprintDetails: Record<string, ElementFingerprint>,
-  includeDetails: boolean
+  includeDetails: boolean,
 ): AutomationElement[] {
   return fingerprints.map((hash) => {
     const fp = fingerprintDetails[hash];
@@ -219,10 +213,15 @@ function buildElements(
  */
 export function exportStateCandidatesToConfig(
   cooccurrenceData: CooccurrenceExport,
-  options: StateExportOptions
+  options: StateExportOptions,
 ): AutomationConfig {
-  const { configName, includeGlobalStates, includeModalStates, selectedStateIds, includeElementDetails } =
-    options;
+  const {
+    configName,
+    includeGlobalStates,
+    includeModalStates,
+    selectedStateIds,
+    includeElementDetails,
+  } = options;
 
   const states: AutomationState[] = [];
 
@@ -234,13 +233,10 @@ export function exportStateCandidatesToConfig(
       return;
     }
 
-    const zone = getDominantZone(
-      candidate.fingerprints,
-      cooccurrenceData.fingerprintDetails
-    );
+    const zone = getDominantZone(candidate.fingerprints, cooccurrenceData.fingerprintDetails);
     const landmark = getDominantLandmark(
       candidate.fingerprints,
-      cooccurrenceData.fingerprintDetails
+      cooccurrenceData.fingerprintDetails,
     );
     const { isGlobal, isModal } = classifyStateType(zone);
 
@@ -264,7 +260,7 @@ export function exportStateCandidatesToConfig(
       state.elements = buildElements(
         candidate.fingerprints,
         cooccurrenceData.fingerprintDetails,
-        true
+        true,
       );
     }
 
@@ -272,21 +268,19 @@ export function exportStateCandidatesToConfig(
   });
 
   // Build transitions from co-occurrence transition data
-  const transitions: AutomationTransition[] = cooccurrenceData.transitions.map(
-    (t, index) => ({
-      id: `transition-${index + 1}`,
-      from: "unknown", // Raw transitions don't have state-to-state mapping yet
-      to: "unknown",
-      action: {
-        type: t.actionType,
-        element: t.targetFingerprint,
-        params: {
-          appearedFingerprints: t.appearedFingerprints,
-          disappearedFingerprints: t.disappearedFingerprints,
-        },
+  const transitions: AutomationTransition[] = cooccurrenceData.transitions.map((t, index) => ({
+    id: `transition-${index + 1}`,
+    from: "unknown", // Raw transitions don't have state-to-state mapping yet
+    to: "unknown",
+    action: {
+      type: t.actionType,
+      element: t.targetFingerprint,
+      params: {
+        appearedFingerprints: t.appearedFingerprints,
+        disappearedFingerprints: t.disappearedFingerprints,
       },
-    })
-  );
+    },
+  }));
 
   return {
     name: configName,
@@ -302,9 +296,7 @@ export function exportStateCandidatesToConfig(
     },
     states,
     transitions,
-    fingerprintDetails: includeElementDetails
-      ? cooccurrenceData.fingerprintDetails
-      : undefined,
+    fingerprintDetails: includeElementDetails ? cooccurrenceData.fingerprintDetails : undefined,
   };
 }
 
@@ -314,10 +306,15 @@ export function exportStateCandidatesToConfig(
 export function exportDiscoveredStatesToConfig(
   discoveryResult: FingerprintDiscoveryResult,
   fingerprintDetails: Record<string, ElementFingerprint>,
-  options: StateExportOptions
+  options: StateExportOptions,
 ): AutomationConfig {
-  const { configName, includeGlobalStates, includeModalStates, selectedStateIds, includeElementDetails } =
-    options;
+  const {
+    configName,
+    includeGlobalStates,
+    includeModalStates,
+    selectedStateIds,
+    includeElementDetails,
+  } = options;
 
   const states: AutomationState[] = [];
 
@@ -344,28 +341,22 @@ export function exportDiscoveredStatesToConfig(
     };
 
     if (includeElementDetails) {
-      automationState.elements = buildElements(
-        state.fingerprintHashes,
-        fingerprintDetails,
-        true
-      );
+      automationState.elements = buildElements(state.fingerprintHashes, fingerprintDetails, true);
     }
 
     states.push(automationState);
   });
 
   // Build transitions from discovered transition data
-  const transitions: AutomationTransition[] = discoveryResult.transitions.map(
-    (t, index) => ({
-      id: `transition-${index + 1}`,
-      from: t.fromStateId,
-      to: t.toStateId,
-      action: {
-        type: t.actionType,
-      },
-      count: t.count,
-    })
-  );
+  const transitions: AutomationTransition[] = discoveryResult.transitions.map((t, index) => ({
+    id: `transition-${index + 1}`,
+    from: t.fromStateId,
+    to: t.toStateId,
+    action: {
+      type: t.actionType,
+    },
+    count: t.count,
+  }));
 
   return {
     name: configName,
@@ -390,16 +381,12 @@ export function exportDiscoveredStatesToConfig(
 export function exportToAutomationConfig(
   cooccurrenceData: CooccurrenceExport | null,
   discoveryResult: FingerprintDiscoveryResult | null,
-  options: StateExportOptions
+  options: StateExportOptions,
 ): AutomationConfig {
   // Prefer discovered states if available
   if (discoveryResult && discoveryResult.states.length > 0) {
     const fingerprintDetails = cooccurrenceData?.fingerprintDetails || {};
-    return exportDiscoveredStatesToConfig(
-      discoveryResult,
-      fingerprintDetails,
-      options
-    );
+    return exportDiscoveredStatesToConfig(discoveryResult, fingerprintDetails, options);
   }
 
   // Fall back to raw state candidates
@@ -427,7 +414,7 @@ export function exportToAutomationConfig(
  */
 export function getAvailableStatesForExport(
   cooccurrenceData: CooccurrenceExport | null,
-  discoveryResult: FingerprintDiscoveryResult | null
+  discoveryResult: FingerprintDiscoveryResult | null,
 ): Array<{ id: string; name: string; isGlobal: boolean; isModal: boolean; elementCount: number }> {
   // Prefer discovered states
   if (discoveryResult && discoveryResult.states.length > 0) {
@@ -443,10 +430,7 @@ export function getAvailableStatesForExport(
   // Fall back to raw state candidates
   if (cooccurrenceData) {
     return cooccurrenceData.stateCandidates.map((candidate, index) => {
-      const zone = getDominantZone(
-        candidate.fingerprints,
-        cooccurrenceData.fingerprintDetails
-      );
+      const zone = getDominantZone(candidate.fingerprints, cooccurrenceData.fingerprintDetails);
       const { isGlobal, isModal } = classifyStateType(zone);
 
       return {

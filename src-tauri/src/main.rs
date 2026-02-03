@@ -21,8 +21,8 @@ mod debug_lifecycle;
 mod discoveries;
 mod display;
 mod dom_capture;
-mod error_monitor; // Must be declared before error (error re-exports ErrorSeverity from error_monitor)
 mod error;
+mod error_monitor; // Must be declared before error (error re-exports ErrorSeverity from error_monitor)
 mod event_system;
 mod execution_context;
 mod execution_core;

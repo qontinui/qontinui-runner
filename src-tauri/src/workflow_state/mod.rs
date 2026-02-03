@@ -59,7 +59,9 @@ use crate::database::CheckpointDb;
 ///
 /// Each workflow type (Unified, Orchestrator, GUI) defines its own state enum
 /// that implements this trait.
-pub trait WorkflowState: Send + Sync + Clone + Serialize + DeserializeOwned + std::fmt::Debug {
+pub trait WorkflowState:
+    Send + Sync + Clone + Serialize + DeserializeOwned + std::fmt::Debug
+{
     /// Get the name of the current state (for logging and persistence).
     fn name(&self) -> &'static str;
 
@@ -325,12 +327,7 @@ mod tests {
     #[test]
     fn test_state_machine_transitions() {
         let db = CheckpointDb::new_in_memory().expect("Failed to create in-memory db");
-        let mut sm = StateMachine::new(
-            Arc::new(db),
-            "test-exec-1",
-            "test",
-            TestState::Created,
-        );
+        let mut sm = StateMachine::new(Arc::new(db), "test-exec-1", "test", TestState::Created);
 
         assert_eq!(sm.current_state().name(), "created");
         assert!(!sm.is_terminal());
@@ -350,12 +347,7 @@ mod tests {
     #[test]
     fn test_state_machine_with_reason() {
         let db = CheckpointDb::new_in_memory().expect("Failed to create in-memory db");
-        let mut sm = StateMachine::new(
-            Arc::new(db),
-            "test-exec-2",
-            "test",
-            TestState::Created,
-        );
+        let mut sm = StateMachine::new(Arc::new(db), "test-exec-2", "test", TestState::Created);
 
         sm.transition_to_with_reason(
             TestState::Failed {
@@ -367,6 +359,9 @@ mod tests {
 
         assert!(sm.is_terminal());
         let last_transition = sm.transition_history().last().unwrap();
-        assert_eq!(last_transition.reason, Some("Intentional test failure".to_string()));
+        assert_eq!(
+            last_transition.reason,
+            Some("Intentional test failure".to_string())
+        );
     }
 }

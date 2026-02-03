@@ -83,25 +83,25 @@ from event_translator import EventTranslator  # noqa: E402
 from execution_tree import ExecutionNode, ExecutionTree  # noqa: E402
 from executor_core import ExecutorCore  # noqa: E402
 from gui_automation import GUIAutomation  # noqa: E402
-from services.input_monitor_service import InputMonitorService  # noqa: E402
-from services.screenshot_service import ScreenshotService  # noqa: E402
-from services.ai_test_generator import AiTestGeneratorService  # noqa: E402
-from services.ai_shell_command_generator import AiShellCommandGeneratorService  # noqa: E402
+from services.accessibility_capture_service import AccessibilityCaptureService  # noqa: E402
 from services.ai_builder_generator import AiBuilderGeneratorService  # noqa: E402
+from services.ai_shell_command_generator import AiShellCommandGeneratorService  # noqa: E402
+from services.ai_test_generator import AiTestGeneratorService  # noqa: E402
+from services.input_monitor_service import InputMonitorService  # noqa: E402
 from services.integration_testing_service import IntegrationTestingService  # noqa: E402
+from services.model_manager import get_model_manager  # noqa: E402
+from services.pattern_matching_service import get_pattern_matching_service  # noqa: E402
+from services.playwright_collector_service import PlaywrightCollectorService  # noqa: E402
+from services.screenshot_service import ScreenshotService  # noqa: E402
 from services.test_analysis_service import TestAnalysisService  # noqa: E402
+from services.ui_bridge_explorer_service import UIBridgeExplorerService  # noqa: E402
+from services.uitars_extraction_service import (  # noqa: E402
+    UITarsExtractionService,
+    get_uitars_extraction_service,
+)
 from services.unified_data_collector import UnifiedDataCollector  # noqa: E402
 from services.vision_extraction_service import VisionExtractionService  # noqa: E402
 from services.web_extraction_service import WebExtractionService  # noqa: E402
-from services.playwright_collector_service import PlaywrightCollectorService  # noqa: E402
-from services.pattern_matching_service import get_pattern_matching_service  # noqa: E402
-from services.model_manager import get_model_manager  # noqa: E402
-from services.accessibility_capture_service import AccessibilityCaptureService  # noqa: E402
-from services.uitars_extraction_service import (  # noqa: E402
-    get_uitars_extraction_service,
-    UITarsExtractionService,
-)
-from services.ui_bridge_explorer_service import UIBridgeExplorerService  # noqa: E402
 from test_results_handler import TestResultsHandler  # noqa: E402
 from training_export import TrainingExportCoordinator  # noqa: E402
 from websocket_handler import WebSocketHandler  # noqa: E402
@@ -3441,8 +3441,8 @@ class QontinuiExecutor:
                     - cooccurrence_export: Raw export data
                 - error: Error message (if failed)
         """
-        import sys
         import asyncio
+        import sys
 
         print(
             "[info    ] EXECUTOR: _handle_run_ui_bridge_exploration called",
@@ -3467,10 +3467,10 @@ class QontinuiExecutor:
             )
 
             # Import explorer
+            from qontinui.discovery.target_connection import ExplorationConfig
             from qontinui.discovery.ui_bridge_explorer import (
                 UIBridgeExplorer,
             )
-            from qontinui.discovery.target_connection import ExplorationConfig
 
             # Build exploration config
             config = ExplorationConfig(

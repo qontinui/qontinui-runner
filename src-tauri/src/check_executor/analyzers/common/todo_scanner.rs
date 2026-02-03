@@ -99,14 +99,32 @@ impl CompiledPatterns {
         // Then the marker word
         // Then : or whitespace or end of line
         let markers = [
-            (MarkerType::Todo, r"(?i)(?://|#|/\*|\*|<!--)\s*TODO(?:\s|:|$)"),
-            (MarkerType::Fixme, r"(?i)(?://|#|/\*|\*|<!--)\s*FIXME(?:\s|:|$)"),
-            (MarkerType::Hack, r"(?i)(?://|#|/\*|\*|<!--)\s*HACK(?:\s|:|$)"),
+            (
+                MarkerType::Todo,
+                r"(?i)(?://|#|/\*|\*|<!--)\s*TODO(?:\s|:|$)",
+            ),
+            (
+                MarkerType::Fixme,
+                r"(?i)(?://|#|/\*|\*|<!--)\s*FIXME(?:\s|:|$)",
+            ),
+            (
+                MarkerType::Hack,
+                r"(?i)(?://|#|/\*|\*|<!--)\s*HACK(?:\s|:|$)",
+            ),
             (MarkerType::Xxx, r"(?i)(?://|#|/\*|\*|<!--)\s*XXX(?:\s|:|$)"),
-            (MarkerType::Note, r"(?i)(?://|#|/\*|\*|<!--)\s*NOTE(?:\s|:|$)"),
-            (MarkerType::Optimize, r"(?i)(?://|#|/\*|\*|<!--)\s*OPTIMIZE(?:\s|:|$)"),
+            (
+                MarkerType::Note,
+                r"(?i)(?://|#|/\*|\*|<!--)\s*NOTE(?:\s|:|$)",
+            ),
+            (
+                MarkerType::Optimize,
+                r"(?i)(?://|#|/\*|\*|<!--)\s*OPTIMIZE(?:\s|:|$)",
+            ),
             (MarkerType::Bug, r"(?i)(?://|#|/\*|\*|<!--)\s*BUG(?:\s|:|$)"),
-            (MarkerType::Review, r"(?i)(?://|#|/\*|\*|<!--)\s*REVIEW(?:\s|:|$)"),
+            (
+                MarkerType::Review,
+                r"(?i)(?://|#|/\*|\*|<!--)\s*REVIEW(?:\s|:|$)",
+            ),
         ];
 
         let patterns = markers

@@ -1754,7 +1754,9 @@ impl CheckpointDb {
     ///
     /// # Errors
     /// Returns `AppError::PoolError` if unable to get a connection from the pool.
-    pub fn get_conn(&self) -> Result<PooledConnection<SqliteConnectionManager>, crate::error::AppError> {
+    pub fn get_conn(
+        &self,
+    ) -> Result<PooledConnection<SqliteConnectionManager>, crate::error::AppError> {
         Ok(self.pool.get()?)
     }
 
@@ -1775,7 +1777,9 @@ impl CheckpointDb {
     ///
     /// # Errors
     /// Returns `AppError::PoolError` if unable to get a connection from the pool.
-    pub fn connection(&self) -> Result<PooledConnection<SqliteConnectionManager>, crate::error::AppError> {
+    pub fn connection(
+        &self,
+    ) -> Result<PooledConnection<SqliteConnectionManager>, crate::error::AppError> {
         self.get_conn()
     }
 
@@ -3715,9 +3719,7 @@ impl CheckpointDb {
         // before modifying its status. Unified workflows should only have status
         // modified by the LoopController, not by TaskMonitor or legacy session code.
         if current_version < 38 {
-            info!(
-                "Migrating database to version 38 (adding workflow_type to task_runs)"
-            );
+            info!("Migrating database to version 38 (adding workflow_type to task_runs)");
 
             conn.execute_batch(
                 r#"
@@ -3736,9 +3738,7 @@ impl CheckpointDb {
         // Migration to version 39: Add task hierarchy fields to task_runs
         // Enables nested subtasks with parent/root/depth tracking for complex workflows
         if current_version < 39 {
-            info!(
-                "Migrating database to version 39 (adding task hierarchy fields to task_runs)"
-            );
+            info!("Migrating database to version 39 (adding task hierarchy fields to task_runs)");
 
             conn.execute_batch(
                 r#"
@@ -3856,9 +3856,7 @@ impl CheckpointDb {
         // Migration to version 44: Add error monitoring system
         // Captures errors from user-configured application logs for debug agent integration
         if current_version < 44 {
-            info!(
-                "Migrating database to version 44 (adding error monitoring system)"
-            );
+            info!("Migrating database to version 44 (adding error monitoring system)");
 
             conn.execute_batch(
                 r#"
@@ -3963,10 +3961,7 @@ impl CheckpointDb {
 
         // Version 45: Add bridge_id to task_runs for multi-bridge support
         if current_version < 45 {
-            let _ = conn.execute(
-                "ALTER TABLE task_runs ADD COLUMN bridge_id TEXT",
-                [],
-            );
+            let _ = conn.execute("ALTER TABLE task_runs ADD COLUMN bridge_id TEXT", []);
 
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_task_runs_bridge_id ON task_runs(bridge_id)",
@@ -4028,7 +4023,9 @@ impl CheckpointDb {
             )
             .map_err(|e| format!("Failed to migrate to version 47: {}", e))?;
 
-            info!("Successfully migrated to version 47 (timeout_seconds added to unified_workflows)");
+            info!(
+                "Successfully migrated to version 47 (timeout_seconds added to unified_workflows)"
+            );
         }
 
         // Migration to version 48: Add workflow state management tables
@@ -4839,8 +4836,7 @@ impl CheckpointDb {
         execution_steps_json: Option<String>,
         log_sources_json: Option<String>,
     ) -> Result<TaskRun, String> {
-        let mut input = CreateTaskRunInput::new(id, task_name)
-            .with_task_type(task_type);
+        let mut input = CreateTaskRunInput::new(id, task_name).with_task_type(task_type);
         if let Some(p) = prompt {
             input = input.with_prompt(p);
         }
@@ -4887,8 +4883,7 @@ impl CheckpointDb {
         log_sources_json: Option<String>,
         workflow_type: Option<&str>,
     ) -> Result<TaskRun, String> {
-        let mut input = CreateTaskRunInput::new(id, task_name)
-            .with_task_type(task_type);
+        let mut input = CreateTaskRunInput::new(id, task_name).with_task_type(task_type);
         if let Some(p) = prompt {
             input = input.with_prompt(p);
         }
@@ -5094,7 +5089,9 @@ impl CheckpointDb {
                     id: row.get(0)?,
                     task_name: row.get(1)?,
                     prompt: row.get(2)?,
-                    task_type: row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "task".to_string()),
+                    task_type: row
+                        .get::<_, Option<String>>(3)?
+                        .unwrap_or_else(|| "task".to_string()),
                     status: row.get(4)?,
                     sessions_count: row.get::<_, i64>(5)? as u32,
                     max_sessions: row.get::<_, Option<i64>>(6)?.map(|v| v as u32),
@@ -5169,7 +5166,9 @@ impl CheckpointDb {
                     id: row.get(0)?,
                     task_name: row.get(1)?,
                     prompt: row.get(2)?,
-                    task_type: row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "task".to_string()),
+                    task_type: row
+                        .get::<_, Option<String>>(3)?
+                        .unwrap_or_else(|| "task".to_string()),
                     status: row.get(4)?,
                     sessions_count: row.get::<_, i64>(5)? as u32,
                     max_sessions: row.get::<_, Option<i64>>(6)?.map(|v| v as u32),
@@ -5637,7 +5636,7 @@ impl CheckpointDb {
                     remaining_work: row.get(13)?,
                     summary_generated_at: row.get(14)?,
                     transition_history_json: None,
-                    workflow_type: None,      // Not queried for performance
+                    workflow_type: None, // Not queried for performance
                     workspace_id: row.get(15)?,
                     triggered_by: row.get(16)?,
                     parent_task_run_id: None, // Not queried for performance
@@ -5813,7 +5812,7 @@ impl CheckpointDb {
                     remaining_work: row.get(14)?,
                     summary_generated_at: row.get(15)?,
                     transition_history_json: None,
-                    workflow_type: None,      // Not queried for performance
+                    workflow_type: None, // Not queried for performance
                     workspace_id: row.get(16)?,
                     triggered_by: row.get(17)?,
                     parent_task_run_id: None, // Not queried for performance
@@ -9394,7 +9393,10 @@ impl CheckpointDb {
         )
         .map_err(|e| format!("Failed to delete verification phase results: {}", e))?;
 
-        info!("Deleted verification phase results for task {}", task_run_id);
+        info!(
+            "Deleted verification phase results for task {}",
+            task_run_id
+        );
         Ok(())
     }
 
@@ -10210,8 +10212,8 @@ impl CheckpointDb {
             serde_json::to_string(&request.context_ids).unwrap_or_else(|_| "[]".to_string());
         let disabled_context_ids_json = serde_json::to_string(&request.disabled_context_ids)
             .unwrap_or_else(|_| "[]".to_string());
-        let health_check_urls_json = serde_json::to_string(&request.health_check_urls)
-            .unwrap_or_else(|_| "[]".to_string());
+        let health_check_urls_json =
+            serde_json::to_string(&request.health_check_urls).unwrap_or_else(|_| "[]".to_string());
 
         conn.execute(
             r#"
@@ -10280,8 +10282,8 @@ impl CheckpointDb {
             serde_json::to_string(&request.context_ids).unwrap_or_else(|_| "[]".to_string());
         let disabled_context_ids_json = serde_json::to_string(&request.disabled_context_ids)
             .unwrap_or_else(|_| "[]".to_string());
-        let health_check_urls_json = serde_json::to_string(&request.health_check_urls)
-            .unwrap_or_else(|_| "[]".to_string());
+        let health_check_urls_json =
+            serde_json::to_string(&request.health_check_urls).unwrap_or_else(|_| "[]".to_string());
 
         conn.execute(
             r#"
@@ -10370,7 +10372,7 @@ impl CheckpointDb {
         // - Some(None): Explicitly disable timeout
         // - Some(Some(N)): Set timeout to N seconds
         let timeout_seconds: Option<u64> = match &request.timeout_seconds {
-            Some(val) => val.clone(),   // Use provided value (including None to disable)
+            Some(val) => val.clone(), // Use provided value (including None to disable)
             None => existing.timeout_seconds, // Not provided, keep existing
         };
         let provider = request.provider.as_ref().or(existing.provider.as_ref());
@@ -11909,8 +11911,8 @@ impl CheckpointDb {
             params![flow_id, version],
             |row| {
                 let definition_str: String = row.get(3)?;
-                let definition: serde_json::Value = serde_json::from_str(&definition_str)
-                    .unwrap_or(serde_json::Value::Null);
+                let definition: serde_json::Value =
+                    serde_json::from_str(&definition_str).unwrap_or(serde_json::Value::Null);
 
                 Ok(serde_json::json!({
                     "id": row.get::<_, String>(0)?,
@@ -14858,32 +14860,34 @@ impl CheckpointDb {
             .prepare(query)
             .map_err(|e| format!("Failed to prepare statement: {}", e))?;
 
-        let row_mapper = |row: &rusqlite::Row| -> rusqlite::Result<crate::workflow_state::StepCheckpoint> {
-            let status_str: String = row.get(8)?;
-            let status = status_str
-                .parse()
-                .unwrap_or(crate::workflow_state::StepCheckpointStatus::Pending);
+        let row_mapper =
+            |row: &rusqlite::Row| -> rusqlite::Result<crate::workflow_state::StepCheckpoint> {
+                let status_str: String = row.get(8)?;
+                let status = status_str
+                    .parse()
+                    .unwrap_or(crate::workflow_state::StepCheckpointStatus::Pending);
 
-            Ok(crate::workflow_state::StepCheckpoint {
-                id: row.get(0)?,
-                execution_id: row.get(1)?,
-                workflow_type: row.get(2)?,
-                phase: row.get(3)?,
-                iteration: row.get::<_, Option<i64>>(4)?.map(|i| i as u32),
-                step_index: row.get::<_, i64>(5)? as usize,
-                step_type: row.get(6)?,
-                step_name: row.get(7)?,
-                status,
-                result_json: row.get(9)?,
-                step_config_json: row.get(10)?,
-                started_at: row.get(11)?,
-                completed_at: row.get(12)?,
-                duration_ms: row.get(13)?,
-                error: row.get(14)?,
-            })
-        };
+                Ok(crate::workflow_state::StepCheckpoint {
+                    id: row.get(0)?,
+                    execution_id: row.get(1)?,
+                    workflow_type: row.get(2)?,
+                    phase: row.get(3)?,
+                    iteration: row.get::<_, Option<i64>>(4)?.map(|i| i as u32),
+                    step_index: row.get::<_, i64>(5)? as usize,
+                    step_type: row.get(6)?,
+                    step_name: row.get(7)?,
+                    status,
+                    result_json: row.get(9)?,
+                    step_config_json: row.get(10)?,
+                    started_at: row.get(11)?,
+                    completed_at: row.get(12)?,
+                    duration_ms: row.get(13)?,
+                    error: row.get(14)?,
+                })
+            };
 
-        let checkpoints: Vec<crate::workflow_state::StepCheckpoint> = if let Some(iter) = iteration {
+        let checkpoints: Vec<crate::workflow_state::StepCheckpoint> = if let Some(iter) = iteration
+        {
             stmt.query_map(params![execution_id, phase, iter as i64], row_mapper)
                 .map_err(|e| format!("Failed to get step checkpoints: {}", e))?
                 .filter_map(|r| r.ok())
@@ -14946,45 +14950,47 @@ impl CheckpointDb {
             .prepare(query)
             .map_err(|e| format!("Failed to prepare statement: {}", e))?;
 
-        let row_mapper = |row: &rusqlite::Row| -> rusqlite::Result<crate::workflow_state::StepCheckpoint> {
-            let status_str: String = row.get(8)?;
-            let status = status_str
-                .parse()
-                .unwrap_or(crate::workflow_state::StepCheckpointStatus::Pending);
+        let row_mapper =
+            |row: &rusqlite::Row| -> rusqlite::Result<crate::workflow_state::StepCheckpoint> {
+                let status_str: String = row.get(8)?;
+                let status = status_str
+                    .parse()
+                    .unwrap_or(crate::workflow_state::StepCheckpointStatus::Pending);
 
-            Ok(crate::workflow_state::StepCheckpoint {
-                id: row.get(0)?,
-                execution_id: row.get(1)?,
-                workflow_type: row.get(2)?,
-                phase: row.get(3)?,
-                iteration: row.get::<_, Option<i64>>(4)?.map(|i| i as u32),
-                step_index: row.get::<_, i64>(5)? as usize,
-                step_type: row.get(6)?,
-                step_name: row.get(7)?,
-                status,
-                result_json: row.get(9)?,
-                step_config_json: row.get(10)?,
-                started_at: row.get(11)?,
-                completed_at: row.get(12)?,
-                duration_ms: row.get(13)?,
-                error: row.get(14)?,
-            })
-        };
+                Ok(crate::workflow_state::StepCheckpoint {
+                    id: row.get(0)?,
+                    execution_id: row.get(1)?,
+                    workflow_type: row.get(2)?,
+                    phase: row.get(3)?,
+                    iteration: row.get::<_, Option<i64>>(4)?.map(|i| i as u32),
+                    step_index: row.get::<_, i64>(5)? as usize,
+                    step_type: row.get(6)?,
+                    step_name: row.get(7)?,
+                    status,
+                    result_json: row.get(9)?,
+                    step_config_json: row.get(10)?,
+                    started_at: row.get(11)?,
+                    completed_at: row.get(12)?,
+                    duration_ms: row.get(13)?,
+                    error: row.get(14)?,
+                })
+            };
 
         // Request one more than limit to check if there are more results
         let fetch_limit = (limit + 1) as i64;
 
-        let checkpoints: Vec<crate::workflow_state::StepCheckpoint> = if let Some(cursor_val) = cursor {
-            stmt.query_map(params![execution_id, cursor_val, fetch_limit], row_mapper)
-                .map_err(|e| format!("Failed to get step checkpoints: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-        } else {
-            stmt.query_map(params![execution_id, fetch_limit], row_mapper)
-                .map_err(|e| format!("Failed to get step checkpoints: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-        };
+        let checkpoints: Vec<crate::workflow_state::StepCheckpoint> =
+            if let Some(cursor_val) = cursor {
+                stmt.query_map(params![execution_id, cursor_val, fetch_limit], row_mapper)
+                    .map_err(|e| format!("Failed to get step checkpoints: {}", e))?
+                    .filter_map(|r| r.ok())
+                    .collect()
+            } else {
+                stmt.query_map(params![execution_id, fetch_limit], row_mapper)
+                    .map_err(|e| format!("Failed to get step checkpoints: {}", e))?
+                    .filter_map(|r| r.ok())
+                    .collect()
+            };
 
         // Determine if there are more results and what the next cursor should be
         let (result_checkpoints, next_cursor) = if checkpoints.len() > limit {
@@ -15088,9 +15094,8 @@ impl CheckpointDb {
     ) -> Result<Option<crate::workflow_state::StepProgressMarker>, String> {
         let conn = self.get_conn()?;
 
-        let result = conn
-            .query_row(
-                r#"
+        let result = conn.query_row(
+            r#"
                 SELECT id, checkpoint_id, marker_type, current_value, total_value,
                        description, data_json, created_at
                 FROM step_progress_markers
@@ -15098,20 +15103,20 @@ impl CheckpointDb {
                 ORDER BY id DESC
                 LIMIT 1
                 "#,
-                params![checkpoint_id],
-                |row| {
-                    Ok(crate::workflow_state::StepProgressMarker {
-                        id: row.get(0)?,
-                        checkpoint_id: row.get(1)?,
-                        marker_type: row.get(2)?,
-                        current_value: row.get::<_, i64>(3)? as u64,
-                        total_value: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
-                        description: row.get(5)?,
-                        data_json: row.get(6)?,
-                        created_at: row.get(7)?,
-                    })
-                },
-            );
+            params![checkpoint_id],
+            |row| {
+                Ok(crate::workflow_state::StepProgressMarker {
+                    id: row.get(0)?,
+                    checkpoint_id: row.get(1)?,
+                    marker_type: row.get(2)?,
+                    current_value: row.get::<_, i64>(3)? as u64,
+                    total_value: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+                    description: row.get(5)?,
+                    data_json: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            },
+        );
 
         match result {
             Ok(marker) => Ok(Some(marker)),
@@ -15201,30 +15206,31 @@ impl CheckpointDb {
             )
             .map_err(|e| format!("Failed to prepare statement: {}", e))?;
 
-        let row_mapper = |row: &rusqlite::Row| -> rusqlite::Result<crate::workflow_state::StepCheckpoint> {
-            let status_str: String = row.get(8)?;
-            let status = status_str
-                .parse()
-                .unwrap_or(crate::workflow_state::StepCheckpointStatus::Pending);
+        let row_mapper =
+            |row: &rusqlite::Row| -> rusqlite::Result<crate::workflow_state::StepCheckpoint> {
+                let status_str: String = row.get(8)?;
+                let status = status_str
+                    .parse()
+                    .unwrap_or(crate::workflow_state::StepCheckpointStatus::Pending);
 
-            Ok(crate::workflow_state::StepCheckpoint {
-                id: row.get(0)?,
-                execution_id: row.get(1)?,
-                workflow_type: row.get(2)?,
-                phase: row.get(3)?,
-                iteration: row.get::<_, Option<i64>>(4)?.map(|i| i as u32),
-                step_index: row.get::<_, i64>(5)? as usize,
-                step_type: row.get(6)?,
-                step_name: row.get(7)?,
-                status,
-                result_json: row.get(9)?,
-                step_config_json: row.get(10)?,
-                started_at: row.get(11)?,
-                completed_at: row.get(12)?,
-                duration_ms: row.get(13)?,
-                error: row.get(14)?,
-            })
-        };
+                Ok(crate::workflow_state::StepCheckpoint {
+                    id: row.get(0)?,
+                    execution_id: row.get(1)?,
+                    workflow_type: row.get(2)?,
+                    phase: row.get(3)?,
+                    iteration: row.get::<_, Option<i64>>(4)?.map(|i| i as u32),
+                    step_index: row.get::<_, i64>(5)? as usize,
+                    step_type: row.get(6)?,
+                    step_name: row.get(7)?,
+                    status,
+                    result_json: row.get(9)?,
+                    step_config_json: row.get(10)?,
+                    started_at: row.get(11)?,
+                    completed_at: row.get(12)?,
+                    duration_ms: row.get(13)?,
+                    error: row.get(14)?,
+                })
+            };
 
         let checkpoints: Vec<crate::workflow_state::StepCheckpoint> = stmt
             .query_map(params![execution_id], row_mapper)
@@ -15422,8 +15428,7 @@ mod tests {
         let (db, _temp) = create_test_db();
 
         // Create task run with default auto_continue (true)
-        let input = CreateTaskRunInput::new("test-task-1", "Test Task")
-            .with_prompt("Do something");
+        let input = CreateTaskRunInput::new("test-task-1", "Test Task").with_prompt("Do something");
         let task_run = db.create_task_run(&input).unwrap();
         assert!(task_run.auto_continue);
 

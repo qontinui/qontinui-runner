@@ -123,14 +123,13 @@ impl LogSourceStorage {
                     name: row.get(1)?,
                     description: row.get(2)?,
                     path: row.get(3)?,
-                    path_type: PathType::from_str(&row.get::<_, String>(4)?)
-                        .unwrap_or_default(),
-                    format: LogFormat::from_str(&row.get::<_, String>(5)?)
-                        .unwrap_or_default(),
-                    parser: ParserType::from_str(&row.get::<_, String>(6)?)
-                        .unwrap_or_default(),
+                    path_type: PathType::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
+                    format: LogFormat::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
+                    parser: ParserType::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
                     timestamp_pattern: row.get(7)?,
-                    timezone: row.get::<_, Option<String>>(8)?.unwrap_or_else(|| "local".to_string()),
+                    timezone: row
+                        .get::<_, Option<String>>(8)?
+                        .unwrap_or_else(|| "local".to_string()),
                     error_patterns: row
                         .get::<_, Option<String>>(9)?
                         .and_then(|s| serde_json::from_str(&s).ok()),
@@ -171,14 +170,13 @@ impl LogSourceStorage {
                     name: row.get(1)?,
                     description: row.get(2)?,
                     path: row.get(3)?,
-                    path_type: PathType::from_str(&row.get::<_, String>(4)?)
-                        .unwrap_or_default(),
-                    format: LogFormat::from_str(&row.get::<_, String>(5)?)
-                        .unwrap_or_default(),
-                    parser: ParserType::from_str(&row.get::<_, String>(6)?)
-                        .unwrap_or_default(),
+                    path_type: PathType::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
+                    format: LogFormat::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
+                    parser: ParserType::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
                     timestamp_pattern: row.get(7)?,
-                    timezone: row.get::<_, Option<String>>(8)?.unwrap_or_else(|| "local".to_string()),
+                    timezone: row
+                        .get::<_, Option<String>>(8)?
+                        .unwrap_or_else(|| "local".to_string()),
                     error_patterns: row
                         .get::<_, Option<String>>(9)?
                         .and_then(|s| serde_json::from_str(&s).ok()),
@@ -239,14 +237,13 @@ impl LogSourceStorage {
                     name: row.get(1)?,
                     description: row.get(2)?,
                     path: row.get(3)?,
-                    path_type: PathType::from_str(&row.get::<_, String>(4)?)
-                        .unwrap_or_default(),
-                    format: LogFormat::from_str(&row.get::<_, String>(5)?)
-                        .unwrap_or_default(),
-                    parser: ParserType::from_str(&row.get::<_, String>(6)?)
-                        .unwrap_or_default(),
+                    path_type: PathType::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
+                    format: LogFormat::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
+                    parser: ParserType::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
                     timestamp_pattern: row.get(7)?,
-                    timezone: row.get::<_, Option<String>>(8)?.unwrap_or_else(|| "local".to_string()),
+                    timezone: row
+                        .get::<_, Option<String>>(8)?
+                        .unwrap_or_else(|| "local".to_string()),
                     error_patterns: row
                         .get::<_, Option<String>>(9)?
                         .and_then(|s| serde_json::from_str(&s).ok()),
@@ -374,7 +371,10 @@ impl ErrorEventStorage {
                     event.location.as_ref().map(|l| &l.file_path),
                     event.location.as_ref().and_then(|l| l.line_number),
                     event.location.as_ref().and_then(|l| l.column_number),
-                    event.location.as_ref().and_then(|l| l.function_name.as_ref()),
+                    event
+                        .location
+                        .as_ref()
+                        .and_then(|l| l.function_name.as_ref()),
                     signature_hash,
                 ],
             )
@@ -564,7 +564,11 @@ impl ErrorEventStorage {
     }
 
     /// Link an error event to a finding
-    pub fn link_to_finding(conn: &Connection, error_id: i64, finding_id: i64) -> Result<(), String> {
+    pub fn link_to_finding(
+        conn: &Connection,
+        error_id: i64,
+        finding_id: i64,
+    ) -> Result<(), String> {
         conn.execute(
             r#"
             UPDATE error_events SET
@@ -603,10 +607,11 @@ impl ErrorEventStorage {
     }
 
     /// Get error summary statistics
-    pub fn get_summary(conn: &Connection, task_run_id: Option<&str>) -> Result<ErrorSummary, String> {
-        let where_clause = task_run_id
-            .map(|_| "WHERE task_run_id = ?1")
-            .unwrap_or("");
+    pub fn get_summary(
+        conn: &Connection,
+        task_run_id: Option<&str>,
+    ) -> Result<ErrorSummary, String> {
+        let where_clause = task_run_id.map(|_| "WHERE task_run_id = ?1").unwrap_or("");
 
         let sql = format!(
             r#"
@@ -795,8 +800,7 @@ impl ErrorEventStorage {
             occurrence_count: row.get(19)?,
             first_seen_at: row.get(20)?,
             last_seen_at: row.get(21)?,
-            status: ErrorStatus::from_str(&row.get::<_, String>(22)?)
-                .unwrap_or(ErrorStatus::New),
+            status: ErrorStatus::from_str(&row.get::<_, String>(22)?).unwrap_or(ErrorStatus::New),
             finding_id: row.get(23)?,
             resolved_by_task_run_id: row.get(24)?,
             resolution_notes: row.get(25)?,

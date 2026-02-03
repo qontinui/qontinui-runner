@@ -191,11 +191,7 @@ function StepProgressMarkerInner({
   if (compact) {
     return (
       <div className={cn("flex items-center gap-2", className)}>
-        <InlineProgressBar
-          current={currentValue}
-          total={totalValue}
-          progressType={progressType}
-        />
+        <InlineProgressBar current={currentValue} total={totalValue} progressType={progressType} />
         <span className="text-xs text-muted-foreground">{typeLabel}</span>
       </div>
     );
@@ -233,10 +229,7 @@ function StepProgressMarkerInner({
  */
 export function StepProgressMarker(props: StepProgressMarkerProps) {
   return (
-    <ProgressErrorBoundary
-      compact={props.compact}
-      componentName="StepProgressMarker"
-    >
+    <ProgressErrorBoundary compact={props.compact} componentName="StepProgressMarker">
       <StepProgressMarkerInner {...props} />
     </ProgressErrorBoundary>
   );

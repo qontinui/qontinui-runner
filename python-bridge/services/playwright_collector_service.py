@@ -21,10 +21,10 @@ logger = logging.getLogger(__name__)
 # Try to import the Playwright collector from qontinui library
 try:
     from qontinui.extraction.web.playwright_collector import (
-        SafePlaywrightStateCollector,
         CollectionResult,
+        SafePlaywrightStateCollector,
     )
-    from qontinui.extraction.web.safety import SafetyConfig, ActionRisk
+    from qontinui.extraction.web.safety import ActionRisk, SafetyConfig
 
     HAS_PLAYWRIGHT_COLLECTOR = True
 except ImportError as e:

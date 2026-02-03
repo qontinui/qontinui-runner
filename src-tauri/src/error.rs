@@ -50,7 +50,6 @@ pub enum AppError {
     // =============================================================================
     // New error variants for unified error handling
     // =============================================================================
-
     #[error("Database error: {0}")]
     DatabaseError(String),
 
@@ -287,7 +286,8 @@ impl AppError {
                 severity: ErrorSeverity::Error,
                 recoverable: true,
                 suggested_action: Some(
-                    "Try the operation again. If the problem persists, check database integrity.".to_string(),
+                    "Try the operation again. If the problem persists, check database integrity."
+                        .to_string(),
                 ),
             },
 
@@ -322,9 +322,7 @@ impl AppError {
                 error_code: "REGEX_001".to_string(),
                 severity: ErrorSeverity::Warning,
                 recoverable: true,
-                suggested_action: Some(
-                    "Check the pattern syntax and try again.".to_string(),
-                ),
+                suggested_action: Some("Check the pattern syntax and try again.".to_string()),
             },
 
             AppError::EncodingError(msg) => UserFacingError {
@@ -358,9 +356,7 @@ impl AppError {
                 error_code: "NET_001".to_string(),
                 severity: ErrorSeverity::Warning,
                 recoverable: true,
-                suggested_action: Some(
-                    "Check your network connection and try again.".to_string(),
-                ),
+                suggested_action: Some("Check your network connection and try again.".to_string()),
             },
         }
     }
@@ -392,7 +388,10 @@ impl From<AppError> for String {
 ///     .map_err(|e| wrap_io_error("reading configuration file", e))?;
 /// ```
 pub fn wrap_io_error(context: &str, err: std::io::Error) -> AppError {
-    AppError::IoError(std::io::Error::new(err.kind(), format!("{}: {}", context, err)))
+    AppError::IoError(std::io::Error::new(
+        err.kind(),
+        format!("{}: {}", context, err),
+    ))
 }
 
 /// Wrap a JSON parsing error with additional context about what was being parsed.

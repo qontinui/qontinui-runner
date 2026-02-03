@@ -127,7 +127,9 @@ impl EventEmitter {
         timestamp: i64,
         sequence: u32,
     ) {
-        self.emit_or_warn(AppEvent::tree_event(event_type, node, path, timestamp, sequence));
+        self.emit_or_warn(AppEvent::tree_event(
+            event_type, node, path, timestamp, sequence,
+        ));
     }
 
     /// Emit an image recognition event.
@@ -218,7 +220,11 @@ impl EventEmitter {
 
     /// Emit an AI output event with content type.
     pub fn ai_output_with_type(&self, session_id: &str, content: &str, content_type: &str) {
-        self.emit_or_warn(AppEvent::ai_output_with_type(session_id, content, content_type));
+        self.emit_or_warn(AppEvent::ai_output_with_type(
+            session_id,
+            content,
+            content_type,
+        ));
     }
 
     /// Emit a generic error event.

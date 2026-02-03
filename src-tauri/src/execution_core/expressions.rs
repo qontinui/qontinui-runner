@@ -107,10 +107,7 @@ fn get_nested_value(value: &serde_json::Value, key: &str) -> Option<serde_json::
 /// let result = resolve_template(template, &context);
 /// assert_eq!(result, "Hello, Alice! You have 5 messages.");
 /// ```
-pub fn resolve_template(
-    template: &str,
-    context: &HashMap<String, serde_json::Value>,
-) -> String {
+pub fn resolve_template(template: &str, context: &HashMap<String, serde_json::Value>) -> String {
     let mut result = template.to_string();
 
     // Resolve ${...} syntax

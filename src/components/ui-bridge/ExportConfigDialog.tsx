@@ -6,16 +6,7 @@
  */
 
 import { useState, useMemo, useCallback } from "react";
-import {
-  X,
-  Download,
-  Copy,
-  Check,
-  FileJson,
-  ChevronDown,
-  ChevronRight,
-  Eye,
-} from "lucide-react";
+import { X, Download, Copy, Check, FileJson, ChevronDown, ChevronRight, Eye } from "lucide-react";
 import { Badge } from "../ui/Badge";
 import { Button } from "../ui/Button";
 import { getStatusColors } from "@/design-system";
@@ -49,13 +40,13 @@ export function ExportConfigDialog({
   // Get list of available states for selection
   const availableStates = useMemo(
     () => getAvailableStatesForExport(cooccurrenceData, discoveryResult),
-    [cooccurrenceData, discoveryResult]
+    [cooccurrenceData, discoveryResult],
   );
 
   // Generate the export config
   const exportConfig = useMemo(
     () => exportToAutomationConfig(cooccurrenceData, discoveryResult, options),
-    [cooccurrenceData, discoveryResult, options]
+    [cooccurrenceData, discoveryResult, options],
   );
 
   // Handle option changes
@@ -63,7 +54,7 @@ export function ExportConfigDialog({
     <K extends keyof StateExportOptions>(key: K, value: StateExportOptions[K]) => {
       setOptions((prev) => ({ ...prev, [key]: value }));
     },
-    []
+    [],
   );
 
   // Toggle state selection
@@ -219,7 +210,9 @@ export function ExportConfigDialog({
           <div className="space-y-2">
             <div className="flex items-center justify-between">
               <label className="text-sm font-medium">
-                Select States ({options.selectedStateIds.length === 0 ? "All" : options.selectedStateIds.length} selected)
+                Select States (
+                {options.selectedStateIds.length === 0 ? "All" : options.selectedStateIds.length}{" "}
+                selected)
               </label>
               <div className="flex gap-2">
                 <button

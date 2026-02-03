@@ -33,7 +33,9 @@ use crate::iteration_bundle::{
     RelevantLogSources,
 };
 use crate::mcp_client::CreateMcpCallInput;
-use crate::orchestrator::context_propagation::{ExpressionEvaluator, RuntimeContext, SharedVariableStore};
+use crate::orchestrator::context_propagation::{
+    ExpressionEvaluator, RuntimeContext, SharedVariableStore,
+};
 use crate::unified_workflow_executor::get_parent_task_id;
 
 // Handler system imports
@@ -1744,9 +1746,7 @@ impl StepExecutor {
     /// can be referenced in subsequent requests.
     fn expand_with_shared_vars(&self, text: &str) -> String {
         use once_cell::sync::Lazy;
-        static VAR_PATTERN: Lazy<Regex> = Lazy::new(|| {
-            Regex::new(r"\{\{([^}]+)\}\}").unwrap()
-        });
+        static VAR_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"\{\{([^}]+)\}\}").unwrap());
 
         let mut result = text.to_string();
         for cap in VAR_PATTERN.captures_iter(text) {
@@ -1786,10 +1786,7 @@ impl StepExecutor {
         // Format matches StepEventBuilder: {phase}-{step_type}-{task_run_id}-{step_index}
         // This ensures start/complete events for the same step are merged in the Timeline
         let phase = step.phase.as_deref().unwrap_or("setup");
-        let action_id = format!(
-            "{}-{}-{}-{}",
-            phase, step.step_type, parent_id, step_index
-        );
+        let action_id = format!("{}-{}-{}-{}", phase, step.step_type, parent_id, step_index);
 
         // Build data JSON with step details (include original task_run_id for context)
         let data = json!({
@@ -1810,7 +1807,7 @@ impl StepExecutor {
         });
 
         let event_input = CreateTaskRunEventInput {
-            task_run_id: parent_id,  // Use parent ID for FK constraint
+            task_run_id: parent_id, // Use parent ID for FK constraint
             event_type: "step_execution".to_string(),
             event_subtype: Some(event_subtype.to_string()),
             message: message.to_string(),
@@ -2799,7 +2796,6 @@ impl StepExecutor {
             // - "workflow", "state", "action", "screenshot", "shell_command", "prompt"
             // The handler registry dispatch above will handle them.
             // The match arms remain as fallback but should never be reached.
-
             "workflow" => {
                 if let Some(ref workflow_name) = step.name {
                     match self
@@ -3540,17 +3536,14 @@ impl StepExecutor {
             // ================================================================
             // Log Watch Step Type (deterministic error detection from logs)
             // ================================================================
-            "log_watch" => {
-                self.execute_log_watch_step(step).await
-            }
+            "log_watch" => self.execute_log_watch_step(step).await,
             // ================================================================
             // Shell Step Type (execute shell command)
             // ================================================================
             "shell" => {
                 // Timeouts are disabled by default
                 let timeout = step.timeout_seconds;
-                let (success, error, output) =
-                    self.execute_shell_command_step(step, timeout).await;
+                let (success, error, output) = self.execute_shell_command_step(step, timeout).await;
                 // Return output as the third element for potential logging
                 (success, error, output)
             }
@@ -3855,7 +3848,8 @@ impl StepExecutor {
         execution_id: &str,
         iteration: u32,
     ) -> VerificationPhaseResult {
-        self.execute_verification_steps_with_events(steps, execution_id, iteration, None).await
+        self.execute_verification_steps_with_events(steps, execution_id, iteration, None)
+            .await
     }
 
     /// Run verification phase steps with optional event emission.
@@ -3879,10 +3873,10 @@ impl StepExecutor {
         iteration: u32,
         workflow_name: Option<&str>,
     ) -> VerificationPhaseResult {
-        use crate::test_executor::TestStatus;
-        use crate::step_metadata::{StepMetadata, StepDetails};
-        use crate::step_types::StepType;
         use crate::step_event_builder::StepEventBuilder;
+        use crate::step_metadata::{StepDetails, StepMetadata};
+        use crate::step_types::StepType;
+        use crate::test_executor::TestStatus;
         use std::time::Instant;
 
         // For workflow sequence children, use parent ID for event logging (FK constraint)
@@ -4166,9 +4160,10 @@ impl StepExecutor {
             // Emit completion event for this step (real-time UI update)
             // This allows the frontend to show progress as each step finishes
             if workflow_name.is_some() {
-                let step_type_enum = StepType::from_str_compat(&step.step_type).unwrap_or(StepType::CheckGroup);
+                let step_type_enum =
+                    StepType::from_str_compat(&step.step_type).unwrap_or(StepType::CheckGroup);
                 let metadata = StepMetadata::verification(
-                    &event_execution_id,  // Use parent ID for FK constraint
+                    &event_execution_id, // Use parent ID for FK constraint
                     step_type_enum,
                     &result.step_name,
                     index,
@@ -4183,7 +4178,7 @@ impl StepExecutor {
                         .with_error(result.error.clone().unwrap_or_default())
                 };
 
-                let builder = StepEventBuilder::new(&event_execution_id, metadata)  // Use parent ID
+                let builder = StepEventBuilder::new(&event_execution_id, metadata) // Use parent ID
                     .with_details(details)
                     .with_workflow_name(workflow_name.unwrap_or_default());
 
@@ -5205,7 +5200,10 @@ impl StepExecutor {
 
         // Treat Null as "not found" - the field doesn't exist in the JSON
         if data.is_null() {
-            warn!("JSON path '{}' resolved to null (field not found)", json_path);
+            warn!(
+                "JSON path '{}' resolved to null (field not found)",
+                json_path
+            );
             return None;
         }
 
@@ -5214,7 +5212,7 @@ impl StepExecutor {
             serde_json::Value::Number(n) => n.to_string(),
             serde_json::Value::Bool(b) => b.to_string(),
             serde_json::Value::Null => unreachable!(), // Already handled above
-            other => other.to_string(), // Arrays/objects become JSON strings
+            other => other.to_string(),                // Arrays/objects become JSON strings
         };
 
         Some(value)
@@ -5296,9 +5294,10 @@ impl StepExecutor {
         });
 
         // Expand variables in body
-        let body = step.api_body.as_ref().map(|b| {
-            evaluator.evaluate(b, &self.runtime_context)
-        });
+        let body = step
+            .api_body
+            .as_ref()
+            .map(|b| evaluator.evaluate(b, &self.runtime_context));
 
         // Build extractions list - combine api_extractions with legacy api_output_variable
         let mut extractions = step.api_extractions.clone().unwrap_or_default();
@@ -5315,7 +5314,8 @@ impl StepExecutor {
         }
 
         // Determine timeout: use step-specific, then function parameter, then default
-        let timeout_ms = step.api_timeout_ms
+        let timeout_ms = step
+            .api_timeout_ms
             .or_else(|| timeout_secs.map(|s| s * 1000))
             .unwrap_or(30_000);
 
@@ -5332,7 +5332,11 @@ impl StepExecutor {
             timeout_ms: Some(timeout_ms),
             follow_redirects: Some(true),
             credential_id: None,
-            extractions: if extractions.is_empty() { None } else { Some(extractions) },
+            extractions: if extractions.is_empty() {
+                None
+            } else {
+                Some(extractions)
+            },
             assertions: None,
         };
 
@@ -5361,7 +5365,10 @@ impl StepExecutor {
                             };
                             info!(
                                 "Extracted '{}' using JSON path '{}' -> '{}' ({} chars)",
-                                ext.variable_name, ext.json_path, preview, value.len()
+                                ext.variable_name,
+                                ext.json_path,
+                                preview,
+                                value.len()
                             );
                         }
                     } else if let Some(ref error) = ext.error {
@@ -5374,7 +5381,10 @@ impl StepExecutor {
 
                 info!(
                     "API request '{}' completed: status={}, duration={}ms, extractions={}",
-                    step_name, result.status_code, result.response_time_ms, result.extractions.len()
+                    step_name,
+                    result.status_code,
+                    result.response_time_ms,
+                    result.extractions.len()
                 );
 
                 if result.success {
@@ -5384,7 +5394,8 @@ impl StepExecutor {
                         format!(
                             "HTTP {}: {}",
                             result.status_code,
-                            result.response_body
+                            result
+                                .response_body
                                 .as_ref()
                                 .map(|b| b.chars().take(500).collect::<String>())
                                 .unwrap_or_default()
@@ -5788,7 +5799,9 @@ impl StepExecutor {
         let start = std::time::Instant::now();
 
         // Helper to process command output
-        let process_output = |output: std::process::Output, duration_ms: u64| -> (bool, Option<String>, Option<String>) {
+        let process_output = |output: std::process::Output,
+                              duration_ms: u64|
+         -> (bool, Option<String>, Option<String>) {
             let exit_code = output.status.code();
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -5852,10 +5865,16 @@ impl StepExecutor {
                     (false, Some(format!("Failed to execute check: {}", e)), None)
                 }
                 Err(_) => {
-                    warn!("Check '{}' timed out after {}s", step_name, timeout_secs_val);
+                    warn!(
+                        "Check '{}' timed out after {}s",
+                        step_name, timeout_secs_val
+                    );
                     (
                         false,
-                        Some(format!("Check timed out after {} seconds", timeout_secs_val)),
+                        Some(format!(
+                            "Check timed out after {} seconds",
+                            timeout_secs_val
+                        )),
                         None,
                     )
                 }
@@ -5961,10 +5980,7 @@ impl StepExecutor {
 
         info!(
             "Executing HTTP status check '{}': url={}, expected_status={}, timeout={}",
-            step_name,
-            url,
-            expected_status,
-            timeout_str
+            step_name, url, expected_status, timeout_str
         );
 
         // Generate sequence number and timestamp for tree events
@@ -6156,7 +6172,12 @@ impl StepExecutor {
         &self,
         step: &ExecutionStepConfig,
         _timeout_secs: Option<u64>,
-    ) -> (bool, Option<String>, Option<String>, Option<Vec<IndividualCheckResult>>) {
+    ) -> (
+        bool,
+        Option<String>,
+        Option<String>,
+        Option<Vec<IndividualCheckResult>>,
+    ) {
         let step_name = step.name.as_deref().unwrap_or("Check Group");
         let group_id = match &step.check_group_id {
             Some(id) => id.clone(),
@@ -6526,7 +6547,9 @@ impl StepExecutor {
         step: &ExecutionStepConfig,
     ) -> (bool, Option<String>, Option<String>) {
         let step_name = step.name.as_deref().unwrap_or("Log Watch");
-        let time_window = step.time_window_seconds.unwrap_or(DEFAULT_TIME_WINDOW_SECONDS);
+        let time_window = step
+            .time_window_seconds
+            .unwrap_or(DEFAULT_TIME_WINDOW_SECONDS);
 
         // Get log sources - use configured or global settings defaults
         let log_sources: Vec<String> = step
@@ -6777,10 +6800,7 @@ pub(crate) fn format_log_errors_for_ai(errors: &[LogError]) -> String {
     let mut report = String::new();
 
     report.push_str("## Log Errors Detected\n\n");
-    report.push_str(&format!(
-        "**Total errors found:** {}\n\n",
-        errors.len()
-    ));
+    report.push_str(&format!("**Total errors found:** {}\n\n", errors.len()));
 
     // Group errors by source
     let mut by_source: std::collections::HashMap<String, Vec<&LogError>> =
@@ -6793,7 +6813,11 @@ pub(crate) fn format_log_errors_for_ai(errors: &[LogError]) -> String {
     }
 
     for (source, source_errors) in by_source {
-        report.push_str(&format!("### {} ({} errors)\n\n", source, source_errors.len()));
+        report.push_str(&format!(
+            "### {} ({} errors)\n\n",
+            source,
+            source_errors.len()
+        ));
 
         for error in source_errors {
             report.push_str(&format!(
@@ -6938,7 +6962,8 @@ mod tests {
 
     #[test]
     fn test_parse_output_variable_spec_nested_path() {
-        let (var_name, json_path) = StepExecutor::parse_output_variable_spec("response.data.user.id");
+        let (var_name, json_path) =
+            StepExecutor::parse_output_variable_spec("response.data.user.id");
         assert_eq!(var_name, "response");
         assert_eq!(json_path, Some("$.data.user.id".to_string()));
     }

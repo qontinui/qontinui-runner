@@ -199,15 +199,11 @@ impl DebugContextCurator {
         let focus_areas = self.generate_focus_areas(&critical_errors, &regular_errors, &patterns);
 
         // Generate summary
-        let summary = self.generate_summary(
-            &critical_errors,
-            &regular_errors,
-            &warnings,
-            &patterns,
-        );
+        let summary =
+            self.generate_summary(&critical_errors, &regular_errors, &warnings, &patterns);
 
-        let requires_immediate_action = !critical_errors.is_empty()
-            || regular_errors.iter().any(|e| e.occurrence_count >= 5);
+        let requires_immediate_action =
+            !critical_errors.is_empty() || regular_errors.iter().any(|e| e.occurrence_count >= 5);
 
         Ok(DebugContext {
             summary,
@@ -222,7 +218,11 @@ impl DebugContextCurator {
     }
 
     /// Curate a single error with additional context.
-    fn curate_error(&self, error: &StoredErrorEvent, all_errors: &[StoredErrorEvent]) -> CuratedError {
+    fn curate_error(
+        &self,
+        error: &StoredErrorEvent,
+        all_errors: &[StoredErrorEvent],
+    ) -> CuratedError {
         // Extract location string
         let location = error.location.as_ref().map(|loc| {
             let mut s = loc.file_path.clone();
@@ -351,7 +351,11 @@ impl DebugContextCurator {
     }
 
     /// Find errors related to a given error.
-    fn find_related_errors(&self, error: &StoredErrorEvent, all_errors: &[StoredErrorEvent]) -> Vec<i64> {
+    fn find_related_errors(
+        &self,
+        error: &StoredErrorEvent,
+        all_errors: &[StoredErrorEvent],
+    ) -> Vec<i64> {
         let mut related = Vec::new();
 
         for other in all_errors {
@@ -454,10 +458,7 @@ impl DebugContextCurator {
                     error_ids: ids.clone(),
                     frequency: ids.len() as u32,
                     pattern_type: PatternType::SameSource,
-                    suggested_cause: Some(format!(
-                        "The {} component may need attention",
-                        source
-                    )),
+                    suggested_cause: Some(format!("The {} component may need attention", source)),
                 });
             }
         }
@@ -481,7 +482,11 @@ impl DebugContextCurator {
             if let Some(ref loc) = error.location {
                 areas.push(format!("CRITICAL: {}", loc));
             } else if let Some(ref error_type) = error.error_type {
-                areas.push(format!("CRITICAL: {} - {}", error_type, &error.message[..50.min(error.message.len())]));
+                areas.push(format!(
+                    "CRITICAL: {} - {}",
+                    error_type,
+                    &error.message[..50.min(error.message.len())]
+                ));
             }
         }
 
@@ -580,7 +585,10 @@ impl DebugContextCurator {
                 self.format_error_for_ai(&mut output, error);
             }
             if context.errors.len() > 10 {
-                output.push_str(&format!("... and {} more errors\n", context.errors.len() - 10));
+                output.push_str(&format!(
+                    "... and {} more errors\n",
+                    context.errors.len() - 10
+                ));
             }
             output.push('\n');
         }
@@ -604,7 +612,10 @@ impl DebugContextCurator {
 
     /// Format a single error for AI consumption.
     fn format_error_for_ai(&self, output: &mut String, error: &CuratedError) {
-        output.push_str(&format!("### {}\n", error.error_type.as_deref().unwrap_or("Error")));
+        output.push_str(&format!(
+            "### {}\n",
+            error.error_type.as_deref().unwrap_or("Error")
+        ));
         output.push_str(&format!("**Message:** {}\n", error.message));
 
         if let Some(ref loc) = error.location {
@@ -642,7 +653,12 @@ mod tests {
     use super::*;
     use crate::error_monitor::types::ErrorLocation;
 
-    fn make_test_error(id: i64, severity: ErrorSeverity, error_type: &str, message: &str) -> StoredErrorEvent {
+    fn make_test_error(
+        id: i64,
+        severity: ErrorSeverity,
+        error_type: &str,
+        message: &str,
+    ) -> StoredErrorEvent {
         StoredErrorEvent {
             id,
             log_source_id: Some(1),
@@ -714,10 +730,17 @@ mod tests {
     fn test_investigation_hints() {
         let curator = DebugContextCurator::new();
 
-        let error = make_test_error(1, ErrorSeverity::Error, "TypeError", "cannot add str and int");
+        let error = make_test_error(
+            1,
+            ErrorSeverity::Error,
+            "TypeError",
+            "cannot add str and int",
+        );
         let hints = curator.generate_investigation_hints(&error);
 
         assert!(!hints.is_empty());
-        assert!(hints.iter().any(|h| h.contains("None/null") || h.contains("types")));
+        assert!(hints
+            .iter()
+            .any(|h| h.contains("None/null") || h.contains("types")));
     }
 }

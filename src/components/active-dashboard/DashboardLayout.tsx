@@ -5,7 +5,7 @@
  * Active widget takes 65%, summaries stack on the right (35%).
  */
 
-import { useCallback, useMemo, memo } from "react";
+import { useCallback, useMemo, memo, useState, useRef, useEffect } from "react";
 import { cn } from "../../lib/utils";
 import type { ActivityType, ActivityStatus } from "../../types/dashboard/activity-types";
 import type { DashboardLayoutState } from "../../hooks/dashboard/useDashboardLayout";
@@ -207,6 +207,65 @@ const PlaywrightRenderer = memo(function PlaywrightRenderer({
 });
 
 /**
+ * Copy button for AI Conversation widget header.
+ */
+function CopyConversationButton({ entries }: { entries: { line: string }[] }) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = useCallback(() => {
+    if (entries.length === 0) return;
+    const text = entries.map((e) => e.line).join("\n");
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  }, [entries]);
+
+  if (entries.length === 0) return null;
+
+  return (
+    <button
+      onClick={handleCopy}
+      className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+      title="Copy conversation"
+    >
+      {copied ? (
+        <>
+          <svg
+            className="w-3.5 h-3.5"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <polyline points="20 6 9 17 4 12" />
+          </svg>
+          <span>Copied</span>
+        </>
+      ) : (
+        <>
+          <svg
+            className="w-3.5 h-3.5"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+          </svg>
+          <span>Copy</span>
+        </>
+      )}
+    </button>
+  );
+}
+
+/**
  * AI Conversation widget renderer - calls useAiConversationData statically.
  */
 const AiConversationRenderer = memo(function AiConversationRenderer({
@@ -234,6 +293,7 @@ const AiConversationRenderer = memo(function AiConversationRenderer({
         isActive={true}
         detailRoute={config.detailRoute}
         onViewAll={onNavigateToDetail}
+        actions={<CopyConversationButton entries={data.entries} />}
       />
       <div className="h-[calc(100%-48px)] overflow-hidden">
         <FullComponent
@@ -1085,6 +1145,69 @@ export function DashboardLayout({
     }
   }, [runningWidget, onWidgetClick]);
 
+  // Resizable panel state
+  const STORAGE_KEY = "qontinui-dashboard-panel-width";
+  const MIN_WIDTH = 30;
+  const MAX_WIDTH = 80;
+  const HANDLE_WIDTH = 6;
+
+  const [leftWidthPercent, setLeftWidthPercent] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (saved) {
+        const parsed = parseFloat(saved);
+        if (!isNaN(parsed) && parsed >= MIN_WIDTH && parsed <= MAX_WIDTH) return parsed;
+      }
+    } catch {
+      // localStorage may be unavailable
+    }
+    return 65;
+  });
+
+  const containerRef = useRef<HTMLDivElement>(null);
+  const isDragging = useRef(false);
+
+  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    isDragging.current = true;
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  }, []);
+
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!isDragging.current || !containerRef.current) return;
+      const rect = containerRef.current.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const pct = (x / rect.width) * 100;
+      const clamped = Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, pct));
+      setLeftWidthPercent(clamped);
+    };
+
+    const handleMouseUp = () => {
+      if (!isDragging.current) return;
+      isDragging.current = false;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+    };
+  }, []);
+
+  // Persist width to localStorage
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, String(leftWidthPercent));
+    } catch {
+      // localStorage may be unavailable
+    }
+  }, [leftWidthPercent]);
+
   // Show idle state if no widgets detected
   if (detectedWidgets.length === 0 || isIdle) {
     return (
@@ -1109,12 +1232,12 @@ export function DashboardLayout({
     );
   }
 
-  // Multiple widgets - 65% active, 35% summaries
+  // Multiple widgets - resizable active + summaries
   return (
-    <div className="flex h-full gap-4 p-4">
-      {/* Active Widget - 65% */}
+    <div ref={containerRef} className="flex h-full p-4" style={{ gap: 0 }}>
+      {/* Active Widget - resizable left panel */}
       {activeWidget && (
-        <div className="w-[65%]">
+        <div style={{ width: `${leftWidthPercent}%`, flexShrink: 0 }} className="pr-1">
           <ActiveWidget
             type={activeWidget}
             status={getStatus(activeWidget)}
@@ -1123,8 +1246,17 @@ export function DashboardLayout({
         </div>
       )}
 
-      {/* Summary Widgets - 35% */}
-      <div className="w-[35%] flex flex-col gap-3 overflow-y-auto">
+      {/* Drag Handle */}
+      <div
+        onMouseDown={handleMouseDown}
+        className="flex-shrink-0 flex items-center justify-center cursor-col-resize group"
+        style={{ width: HANDLE_WIDTH }}
+      >
+        <div className="w-[2px] h-8 rounded-full bg-white/10 group-hover:bg-white/30 transition-colors" />
+      </div>
+
+      {/* Summary Widgets - fills remaining space */}
+      <div className="flex-1 min-w-0 flex flex-col gap-3 overflow-y-auto pl-1">
         {/* Restore to Active Process button */}
         {showRestoreButton && (
           <button

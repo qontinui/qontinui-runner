@@ -24,16 +24,16 @@
 
 #![allow(dead_code)]
 
-use std::sync::Arc;
 use async_trait::async_trait;
+use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, instrument, warn};
 
 use crate::config_storage::ConfigStorage;
 use crate::database::CheckpointDb;
 use crate::executor::{
-    prompt_builder, timeout_helper, ExecutorContext, Executor, ExecutorError, FromContext,
-    ExecutionOutcome, IntoOutcome,
+    prompt_builder, timeout_helper, ExecutionOutcome, Executor, ExecutorContext, ExecutorError,
+    FromContext, IntoOutcome,
 };
 use crate::step_executor::{
     ExecutionStepConfig, StepExecutionResult, StepExecutor, VerificationPhaseResult,
@@ -46,8 +46,8 @@ use crate::workflow_state::{CheckpointManager, StepCheckpoint};
 use crate::AppState;
 
 use super::phase_configs::{
-    SetupConfig, SetupResult, VerificationConfig, VerificationResult,
-    AgenticConfig, CompletionConfig, CompletionResult,
+    AgenticConfig, CompletionConfig, CompletionResult, SetupConfig, SetupResult,
+    VerificationConfig, VerificationResult,
 };
 use super::types::{AgenticOutcome, LoopConfig};
 
@@ -79,11 +79,7 @@ impl SetupExecutor {
                 config_storage,
                 app_handle.clone(),
             ),
-            ai_executor: UnifiedAiSessionExecutor::new(
-                app_state,
-                app_handle,
-                pid_tracker,
-            ),
+            ai_executor: UnifiedAiSessionExecutor::new(app_state, app_handle, pid_tracker),
             checkpoint_db,
         }
     }
@@ -130,18 +126,21 @@ impl SetupExecutor {
 
             // Checkpoint each automation step
             for (idx, step) in automation_steps.iter().enumerate() {
-                let step_type = StepType::from_str_compat(&step.step_type)
-                    .unwrap_or(StepType::ShellCommand);
+                let step_type =
+                    StepType::from_str_compat(&step.step_type).unwrap_or(StepType::ShellCommand);
                 let step_name = step.name.as_deref().unwrap_or(&step.step_type);
 
+                // Use Some(0) instead of None for iteration to ensure SQLite's
+                // UNIQUE constraint works correctly (NULL != NULL in SQLite)
                 let mut checkpoint = StepCheckpoint::new(
                     execution_id,
                     "unified",
                     "setup",
-                    None,
+                    Some(0),
                     idx,
                     step_type.as_str(),
-                ).with_step_name(step_name);
+                )
+                .with_step_name(step_name);
                 checkpoint.mark_started();
                 if let Err(e) = checkpoint_mgr.save_step(&checkpoint) {
                     warn!("Failed to save setup step checkpoint: {}", e);
@@ -156,25 +155,25 @@ impl SetupExecutor {
             // Checkpoint completion for each step
             for (idx, step_result) in result.steps.iter().enumerate() {
                 let step = &automation_steps[idx];
-                let step_type = StepType::from_str_compat(&step.step_type)
-                    .unwrap_or(StepType::ShellCommand);
+                let step_type =
+                    StepType::from_str_compat(&step.step_type).unwrap_or(StepType::ShellCommand);
                 let step_name = step.name.as_deref().unwrap_or(&step.step_type);
 
+                // Use Some(0) instead of None for iteration to ensure SQLite's
+                // UNIQUE constraint works correctly (NULL != NULL in SQLite)
                 let mut checkpoint = StepCheckpoint::new(
                     execution_id,
                     "unified",
                     "setup",
-                    None,
+                    Some(0),
                     idx,
                     step_type.as_str(),
-                ).with_step_name(step_name);
+                )
+                .with_step_name(step_name);
 
                 let duration_ms = step_result.duration_ms as i64;
                 if step_result.success {
-                    checkpoint.mark_success(
-                        serde_json::to_string(step_result).ok(),
-                        duration_ms,
-                    );
+                    checkpoint.mark_success(serde_json::to_string(step_result).ok(), duration_ms);
                 } else {
                     checkpoint.mark_failed(
                         step_result.error.as_deref().unwrap_or("Unknown error"),
@@ -208,14 +207,17 @@ impl SetupExecutor {
             let step_name =
                 prompt_builder::consolidate_step_names_with_default(prompt_steps, "Setup AI Task");
 
+            // Use Some(0) instead of None for iteration to ensure SQLite's
+            // UNIQUE constraint works correctly (NULL != NULL in SQLite)
             let mut ai_checkpoint = StepCheckpoint::new(
                 execution_id,
                 "unified",
                 "setup",
-                None,
+                Some(0),
                 ai_step_idx,
                 "ai_session",
-            ).with_step_name(&step_name);
+            )
+            .with_step_name(&step_name);
             ai_checkpoint.mark_started();
             if let Err(e) = checkpoint_mgr.save_step(&ai_checkpoint) {
                 warn!("Failed to save setup AI step checkpoint: {}", e);
@@ -227,26 +229,27 @@ impl SetupExecutor {
 
             if !setup_prompt.is_empty() {
                 // Use the unified AI session executor with sub-step metadata
-                let config = AiSessionConfig::setup(
-                    execution_id,
-                    workflow_name,
-                    &step_name,
-                ).with_timeout(timeout_seconds)
-                 .with_sub_step_metadata(sub_step_metadata);
+                let config = AiSessionConfig::setup(execution_id, workflow_name, &step_name)
+                    .with_timeout(timeout_seconds)
+                    .with_sub_step_metadata(sub_step_metadata);
 
                 let (result, duration_ms) = timeout_helper::timed_result_async(
-                    self.ai_executor.execute(&config, &setup_prompt, logger)
-                ).await;
+                    self.ai_executor.execute(&config, &setup_prompt, logger),
+                )
+                .await;
                 let duration_ms = duration_ms as i64;
                 overall_success = overall_success && result.success;
+                // Use Some(0) instead of None for iteration to ensure SQLite's
+                // UNIQUE constraint works correctly (NULL != NULL in SQLite)
                 let mut ai_checkpoint = StepCheckpoint::new(
                     execution_id,
                     "unified",
                     "setup",
-                    None,
+                    Some(0),
                     ai_step_idx,
                     "ai_session",
-                ).with_step_name(&step_name);
+                )
+                .with_step_name(&step_name);
 
                 if result.success {
                     ai_checkpoint.mark_success(Some(result.output.clone()), duration_ms);
@@ -291,19 +294,24 @@ impl SetupExecutor {
     ) -> ExecutionOutcome {
         let start = std::time::Instant::now();
 
-        let (success, step_results) = self.run_setup(
-            &config.automation_steps,
-            &config.prompt_steps,
-            &config.execution_id,
-            &config.workflow_name,
-            config.timeout_seconds,
-            logger,
-        ).await;
+        let (success, step_results) = self
+            .run_setup(
+                &config.automation_steps,
+                &config.prompt_steps,
+                &config.execution_id,
+                &config.workflow_name,
+                config.timeout_seconds,
+                logger,
+            )
+            .await;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
         // Use the IntoOutcome trait for consistent conversion
-        let result = SetupResult { success, step_results };
+        let result = SetupResult {
+            success,
+            step_results,
+        };
         result.into_outcome(duration_ms)
     }
 }
@@ -393,10 +401,18 @@ impl VerificationExecutor {
             let step_type =
                 StepType::from_str_compat(&step.step_type).unwrap_or(StepType::Playwright);
             let step_name = step.name.as_deref().unwrap_or(&step.step_type);
-            let metadata = StepMetadata::verification(execution_id, step_type.clone(), step_name, idx, iteration);
+            let metadata = StepMetadata::verification(
+                execution_id,
+                step_type.clone(),
+                step_name,
+                idx,
+                iteration,
+            );
             let details = StepDetails::default();
 
-            if let Err(e) = logger.log_start(StepEventKind::VerificationStepStart, metadata, details) {
+            if let Err(e) =
+                logger.log_start(StepEventKind::VerificationStepStart, metadata, details)
+            {
                 warn!("Failed to log verification step start event: {}", e);
             }
 
@@ -408,7 +424,8 @@ impl VerificationExecutor {
                 Some(iteration),
                 idx,
                 step_type.as_str(),
-            ).with_step_name(step_name);
+            )
+            .with_step_name(step_name);
             checkpoint.mark_started();
             if let Err(e) = checkpoint_mgr.save_step(&checkpoint) {
                 warn!("Failed to save verification step checkpoint: {}", e);
@@ -419,7 +436,12 @@ impl VerificationExecutor {
         // This allows the UI to show real-time progress instead of waiting for all steps
         let result = self
             .executor
-            .execute_verification_steps_with_events(steps, execution_id, iteration, Some(workflow_name))
+            .execute_verification_steps_with_events(
+                steps,
+                execution_id,
+                iteration,
+                Some(workflow_name),
+            )
             .await;
 
         info!(
@@ -435,7 +457,8 @@ impl VerificationExecutor {
         // Save completion checkpoints for each step
         for (idx, step_result) in result.step_results.iter().enumerate() {
             let step = &steps[idx];
-            let step_type = StepType::from_str_compat(&step.step_type).unwrap_or(StepType::Playwright);
+            let step_type =
+                StepType::from_str_compat(&step.step_type).unwrap_or(StepType::Playwright);
             let step_name = step.name.as_deref().unwrap_or(&step.step_type);
 
             let mut checkpoint = StepCheckpoint::new(
@@ -445,14 +468,12 @@ impl VerificationExecutor {
                 Some(iteration),
                 idx,
                 step_type.as_str(),
-            ).with_step_name(step_name);
+            )
+            .with_step_name(step_name);
 
             let duration_ms = step_result.duration_ms as i64;
             if step_result.success {
-                checkpoint.mark_success(
-                    serde_json::to_string(step_result).ok(),
-                    duration_ms,
-                );
+                checkpoint.mark_success(serde_json::to_string(step_result).ok(), duration_ms);
             } else {
                 checkpoint.mark_failed(
                     step_result.error.as_deref().unwrap_or("Unknown error"),
@@ -461,7 +482,10 @@ impl VerificationExecutor {
             }
 
             if let Err(e) = checkpoint_mgr.save_step(&checkpoint) {
-                warn!("Failed to save verification step completion checkpoint: {}", e);
+                warn!(
+                    "Failed to save verification step completion checkpoint: {}",
+                    e
+                );
             }
         }
 
@@ -487,18 +511,23 @@ impl VerificationExecutor {
     ) -> ExecutionOutcome {
         let start = std::time::Instant::now();
 
-        let (phase_result, step_results) = self.run_verification(
-            &config.steps,
-            &config.execution_id,
-            config.iteration,
-            &config.workflow_name,
-            logger,
-        ).await;
+        let (phase_result, step_results) = self
+            .run_verification(
+                &config.steps,
+                &config.execution_id,
+                config.iteration,
+                &config.workflow_name,
+                logger,
+            )
+            .await;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
         // Use the IntoOutcome trait for consistent conversion
-        let result = VerificationResult { phase_result, step_results };
+        let result = VerificationResult {
+            phase_result,
+            step_results,
+        };
         result.into_outcome(duration_ms)
     }
 }
@@ -576,7 +605,8 @@ impl AgenticExecutor {
             Some(iteration),
             0, // Agentic is a single-step phase
             "ai_session",
-        ).with_step_name("AI Fixing Issues");
+        )
+        .with_step_name("AI Fixing Issues");
         checkpoint.mark_started();
         if let Err(e) = checkpoint_mgr.save_step(&checkpoint) {
             warn!("Failed to save agentic step checkpoint: {}", e);
@@ -617,15 +647,16 @@ impl AgenticExecutor {
         };
 
         // Use the unified AI session executor with timing
-        let ai_config = AiSessionConfig::agentic(
-            &config.execution_id,
-            &config.workflow_name,
-            iteration,
-        ).with_timeout(config.timeout_seconds);
+        let ai_config =
+            AiSessionConfig::agentic(&config.execution_id, &config.workflow_name, iteration)
+                .with_timeout(config.timeout_seconds);
 
-        let (result, duration_ms) = timeout_helper::timed_result_async(
-            self.ai_executor.execute(&ai_config, &enhanced_prompt, logger)
-        ).await;
+        let (result, duration_ms) = timeout_helper::timed_result_async(self.ai_executor.execute(
+            &ai_config,
+            &enhanced_prompt,
+            logger,
+        ))
+        .await;
         let duration_ms = duration_ms as i64;
 
         // Checkpoint completion
@@ -636,7 +667,8 @@ impl AgenticExecutor {
             Some(iteration),
             0,
             "ai_session",
-        ).with_step_name("AI Fixing Issues");
+        )
+        .with_step_name("AI Fixing Issues");
 
         let outcome = if result.success {
             completion_checkpoint.mark_success(Some(result.output.clone()), duration_ms);
@@ -709,7 +741,9 @@ impl AgenticExecutor {
             "AGENTIC-PHASE: Including progress marker context: {} {}/{}",
             marker_type,
             progress_marker.current_value,
-            progress_marker.total_value.map_or("?".to_string(), |v| v.to_string())
+            progress_marker
+                .total_value
+                .map_or("?".to_string(), |v| v.to_string())
         );
 
         Some(message)
@@ -794,18 +828,21 @@ impl CompletionExecutor {
 
             // Checkpoint each automation step
             for (idx, step) in automation_steps.iter().enumerate() {
-                let step_type = StepType::from_str_compat(&step.step_type)
-                    .unwrap_or(StepType::ShellCommand);
+                let step_type =
+                    StepType::from_str_compat(&step.step_type).unwrap_or(StepType::ShellCommand);
                 let step_name = step.name.as_deref().unwrap_or(&step.step_type);
 
+                // Use Some(0) instead of None for iteration to ensure SQLite's
+                // UNIQUE constraint works correctly (NULL != NULL in SQLite)
                 let mut checkpoint = StepCheckpoint::new(
                     execution_id,
                     "unified",
                     "completion",
-                    None,
+                    Some(0),
                     idx,
                     step_type.as_str(),
-                ).with_step_name(step_name);
+                )
+                .with_step_name(step_name);
                 checkpoint.mark_started();
                 if let Err(e) = checkpoint_mgr.save_step(&checkpoint) {
                     warn!("Failed to save completion step checkpoint: {}", e);
@@ -820,25 +857,25 @@ impl CompletionExecutor {
             // Checkpoint completion for each step
             for (idx, step_result) in result.steps.iter().enumerate() {
                 let step = &automation_steps[idx];
-                let step_type = StepType::from_str_compat(&step.step_type)
-                    .unwrap_or(StepType::ShellCommand);
+                let step_type =
+                    StepType::from_str_compat(&step.step_type).unwrap_or(StepType::ShellCommand);
                 let step_name = step.name.as_deref().unwrap_or(&step.step_type);
 
+                // Use Some(0) instead of None for iteration to ensure SQLite's
+                // UNIQUE constraint works correctly (NULL != NULL in SQLite)
                 let mut checkpoint = StepCheckpoint::new(
                     execution_id,
                     "unified",
                     "completion",
-                    None,
+                    Some(0),
                     idx,
                     step_type.as_str(),
-                ).with_step_name(step_name);
+                )
+                .with_step_name(step_name);
 
                 let duration_ms = step_result.duration_ms as i64;
                 if step_result.success {
-                    checkpoint.mark_success(
-                        serde_json::to_string(step_result).ok(),
-                        duration_ms,
-                    );
+                    checkpoint.mark_success(serde_json::to_string(step_result).ok(), duration_ms);
                 } else {
                     checkpoint.mark_failed(
                         step_result.error.as_deref().unwrap_or("Unknown error"),
@@ -847,7 +884,10 @@ impl CompletionExecutor {
                 }
 
                 if let Err(e) = checkpoint_mgr.save_step(&checkpoint) {
-                    warn!("Failed to save completion step completion checkpoint: {}", e);
+                    warn!(
+                        "Failed to save completion step completion checkpoint: {}",
+                        e
+                    );
                 }
             }
 
@@ -873,14 +913,17 @@ impl CompletionExecutor {
                 "Completion AI Task",
             );
 
+            // Use Some(0) instead of None for iteration to ensure SQLite's
+            // UNIQUE constraint works correctly (NULL != NULL in SQLite)
             let mut ai_checkpoint = StepCheckpoint::new(
                 execution_id,
                 "unified",
                 "completion",
-                None,
+                Some(0),
                 ai_step_idx,
                 "ai_session",
-            ).with_step_name(&step_name);
+            )
+            .with_step_name(&step_name);
             ai_checkpoint.mark_started();
             if let Err(e) = checkpoint_mgr.save_step(&ai_checkpoint) {
                 warn!("Failed to save completion AI step checkpoint: {}", e);
@@ -897,21 +940,27 @@ impl CompletionExecutor {
                     workflow_name,
                     &step_name,
                     iterations_run,
-                ).with_timeout(timeout_seconds)
-                 .with_sub_step_metadata(sub_step_metadata);
+                )
+                .with_timeout(timeout_seconds)
+                .with_sub_step_metadata(sub_step_metadata);
 
                 let (result, duration_ms) = timeout_helper::timed_result_async(
-                    self.ai_executor.execute(&config, &completion_prompt, logger)
-                ).await;
+                    self.ai_executor
+                        .execute(&config, &completion_prompt, logger),
+                )
+                .await;
                 let duration_ms = duration_ms as i64;
+                // Use Some(0) instead of None for iteration to ensure SQLite's
+                // UNIQUE constraint works correctly (NULL != NULL in SQLite)
                 let mut ai_completion_checkpoint = StepCheckpoint::new(
                     execution_id,
                     "unified",
                     "completion",
-                    None,
+                    Some(0),
                     ai_step_idx,
                     "ai_session",
-                ).with_step_name(&step_name);
+                )
+                .with_step_name(&step_name);
 
                 if result.success {
                     ai_completion_checkpoint.mark_success(Some(result.output.clone()), duration_ms);
@@ -920,7 +969,10 @@ impl CompletionExecutor {
                 }
 
                 if let Err(e) = checkpoint_mgr.save_step(&ai_completion_checkpoint) {
-                    warn!("Failed to save completion AI step completion checkpoint: {}", e);
+                    warn!(
+                        "Failed to save completion AI step completion checkpoint: {}",
+                        e
+                    );
                 }
 
                 // Save the AI output as the task summary (only on success)
@@ -966,20 +1018,25 @@ impl CompletionExecutor {
     ) -> ExecutionOutcome {
         let start = std::time::Instant::now();
 
-        let (success, step_results) = self.run_completion(
-            &config.automation_steps,
-            &config.prompt_steps,
-            &config.execution_id,
-            &config.workflow_name,
-            config.timeout_seconds,
-            config.iterations_run,
-            logger,
-        ).await;
+        let (success, step_results) = self
+            .run_completion(
+                &config.automation_steps,
+                &config.prompt_steps,
+                &config.execution_id,
+                &config.workflow_name,
+                config.timeout_seconds,
+                config.iterations_run,
+                logger,
+            )
+            .await;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
         // Use the IntoOutcome trait for consistent conversion
-        let result = CompletionResult { success, step_results };
+        let result = CompletionResult {
+            success,
+            step_results,
+        };
         result.into_outcome(duration_ms)
     }
 }

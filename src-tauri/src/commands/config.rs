@@ -119,9 +119,7 @@ pub async fn load_configuration(
                     }
                 }); // Ignore errors for debug settings
 
-                manager_clone.with_default_bridge(|bridge| {
-                    bridge.load_configuration(&path_clone)
-                })
+                manager_clone.with_default_bridge(|bridge| bridge.load_configuration(&path_clone))
             })
             .await
             .map_err(|e| format!("Task join error: {}", e))?

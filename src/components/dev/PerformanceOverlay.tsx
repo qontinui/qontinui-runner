@@ -14,10 +14,7 @@ import {
   type RenderMetrics,
 } from "../../lib/performance";
 import { getNetworkMonitor, type NetworkMonitorStats } from "../../lib/network-monitor";
-import {
-  logPerformanceSummary,
-  downloadReport,
-} from "../../lib/performance-report";
+import { logPerformanceSummary, downloadReport } from "../../lib/performance-report";
 import { cn } from "../../lib/utils";
 
 // ============================================================================
@@ -71,7 +68,7 @@ function TabButton({
       onClick={onClick}
       className={cn(
         "px-2 py-1 text-[10px] rounded transition-colors",
-        active ? "bg-gray-600 text-white" : "text-gray-400 hover:text-gray-200 hover:bg-gray-700"
+        active ? "bg-gray-600 text-white" : "text-gray-400 hover:text-gray-200 hover:bg-gray-700",
       )}
     >
       {children}
@@ -105,32 +102,32 @@ function OverviewTab({
 
   return (
     <div className="grid grid-cols-3 gap-3">
-      <MetricCard
-        label="Uptime"
-        value={formatUptime(metrics.uptime)}
-        color="blue"
-      />
+      <MetricCard label="Uptime" value={formatUptime(metrics.uptime)} color="blue" />
       <MetricCard
         label="Req/min"
         value={networkStats.requestsPerMinute}
-        color={networkStats.requestsPerMinute > 60 ? "red" : networkStats.requestsPerMinute > 30 ? "yellow" : "green"}
+        color={
+          networkStats.requestsPerMinute > 60
+            ? "red"
+            : networkStats.requestsPerMinute > 30
+              ? "yellow"
+              : "green"
+        }
       />
       <MetricCard
         label="Avg Latency"
         value={Math.round(networkStats.averageLatency)}
         unit="ms"
-        color={networkStats.averageLatency > 500 ? "red" : networkStats.averageLatency > 200 ? "yellow" : "green"}
+        color={
+          networkStats.averageLatency > 500
+            ? "red"
+            : networkStats.averageLatency > 200
+              ? "yellow"
+              : "green"
+        }
       />
-      <MetricCard
-        label="Components"
-        value={metrics.renders.size}
-        color="blue"
-      />
-      <MetricCard
-        label="WS Messages"
-        value={metrics.webSocket.messagesReceived}
-        color="blue"
-      />
+      <MetricCard label="Components" value={metrics.renders.size} color="blue" />
+      <MetricCard label="WS Messages" value={metrics.webSocket.messagesReceived} color="blue" />
       <MetricCard
         label="Memory"
         value={metrics.memory ? Math.round(metrics.memory.usedJSHeapSize / 1024 / 1024) : "N/A"}
@@ -153,11 +150,7 @@ function NetworkTab({ networkStats }: { networkStats: NetworkMonitorStats | null
   return (
     <div className="space-y-3">
       <div className="grid grid-cols-3 gap-3">
-        <MetricCard
-          label="Total Requests"
-          value={networkStats.totalRequests}
-          color="blue"
-        />
+        <MetricCard label="Total Requests" value={networkStats.totalRequests} color="blue" />
         <MetricCard
           label="Active"
           value={networkStats.activeRequests}
@@ -201,9 +194,7 @@ function RendersTab({ renders }: { renders: Map<string, RenderMetrics> }) {
   const avgTime =
     renderList.reduce((sum, r) => sum + r.totalRenderTime, 0) / Math.max(totalRenders, 1);
 
-  const topRenderers = [...renderList]
-    .sort((a, b) => b.renderCount - a.renderCount)
-    .slice(0, 5);
+  const topRenderers = [...renderList].sort((a, b) => b.renderCount - a.renderCount).slice(0, 5);
 
   const slowest = [...renderList]
     .sort((a, b) => b.averageRenderTime - a.averageRenderTime)
@@ -268,7 +259,11 @@ function WebSocketTab({ metrics }: { metrics: AggregatedMetrics | null }) {
           value={ws.isConnected ? "Connected" : "Disconnected"}
           color={ws.isConnected ? "green" : "red"}
         />
-        <MetricCard label="Reconnects" value={ws.reconnectCount} color={ws.reconnectCount > 5 ? "red" : "green"} />
+        <MetricCard
+          label="Reconnects"
+          value={ws.reconnectCount}
+          color={ws.reconnectCount > 5 ? "red" : "green"}
+        />
         <MetricCard label="Messages" value={ws.messagesReceived} color="blue" />
         <MetricCard label="Msg/min" value={messageRate} color="blue" />
         <MetricCard
@@ -425,7 +420,7 @@ export function PerformanceOverlay({
         "fixed z-[9999] bg-gray-900/95 backdrop-blur-sm rounded-lg shadow-2xl border border-gray-700",
         "text-white font-sans",
         positionClasses[position],
-        isMinimized ? "w-auto" : "w-72"
+        isMinimized ? "w-auto" : "w-72",
       )}
     >
       {/* Header */}

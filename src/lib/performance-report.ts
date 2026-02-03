@@ -105,9 +105,8 @@ export function generatePerformanceReport(): PerformanceReport {
   const renderStats = calculateRenderStats(metrics);
 
   // Calculate WebSocket message rate
-  const wsMessageRate = metrics.uptime > 0
-    ? (metrics.webSocket.messagesReceived / (metrics.uptime / 60000))
-    : 0;
+  const wsMessageRate =
+    metrics.uptime > 0 ? metrics.webSocket.messagesReceived / (metrics.uptime / 60000) : 0;
 
   // Generate recommendations
   const recommendations = generateRecommendations(metrics, networkStats, pollingAnalysis);
@@ -237,7 +236,7 @@ function calculateMemoryEfficiency(scrollMetrics: {
 }
 
 function calculatePotentialSavings(
-  pollingAnalysis: { endpoint: string; estimatedInterval: number; requestsPerMinute: number }[]
+  pollingAnalysis: { endpoint: string; estimatedInterval: number; requestsPerMinute: number }[],
 ): string {
   // Estimate how many requests could be saved by using WebSocket
   const totalPollingPerMinute = pollingAnalysis.reduce((sum, p) => sum + p.requestsPerMinute, 0);
@@ -256,26 +255,26 @@ function calculatePotentialSavings(
 function generateRecommendations(
   metrics: AggregatedMetrics,
   networkStats: NetworkMonitorStats,
-  pollingAnalysis: { endpoint: string; estimatedInterval: number; requestsPerMinute: number }[]
+  pollingAnalysis: { endpoint: string; estimatedInterval: number; requestsPerMinute: number }[],
 ): string[] {
   const recommendations: string[] = [];
 
   // Network recommendations
   if (networkStats.requestsPerMinute > 60) {
     recommendations.push(
-      `High request rate (${networkStats.requestsPerMinute}/min). Consider reducing polling frequency or using WebSocket.`
+      `High request rate (${networkStats.requestsPerMinute}/min). Consider reducing polling frequency or using WebSocket.`,
     );
   }
 
   if (networkStats.averageLatency > 500) {
     recommendations.push(
-      `High average latency (${Math.round(networkStats.averageLatency)}ms). Check network conditions or backend performance.`
+      `High average latency (${Math.round(networkStats.averageLatency)}ms). Check network conditions or backend performance.`,
     );
   }
 
   if (networkStats.errorRate > 0.05) {
     recommendations.push(
-      `High error rate (${Math.round(networkStats.errorRate * 100)}%). Investigate failing endpoints.`
+      `High error rate (${Math.round(networkStats.errorRate * 100)}%). Investigate failing endpoints.`,
     );
   }
 
@@ -283,7 +282,7 @@ function generateRecommendations(
   const frequentPolling = pollingAnalysis.filter((p) => p.estimatedInterval < 5000);
   if (frequentPolling.length > 0) {
     recommendations.push(
-      `${frequentPolling.length} endpoints polling faster than 5s. Consider WebSocket for real-time updates.`
+      `${frequentPolling.length} endpoints polling faster than 5s. Consider WebSocket for real-time updates.`,
     );
   }
 
@@ -292,41 +291,41 @@ function generateRecommendations(
   const slowRenders = renders.filter((r) => r.averageRenderTime > 16);
   if (slowRenders.length > 0) {
     recommendations.push(
-      `${slowRenders.length} components rendering slower than 16ms. Consider memoization or virtualization.`
+      `${slowRenders.length} components rendering slower than 16ms. Consider memoization or virtualization.`,
     );
   }
 
   const frequentRenders = renders.filter((r) => r.renderCount > 100);
   if (frequentRenders.length > 0) {
     recommendations.push(
-      `${frequentRenders.length} components with 100+ renders. Check for unnecessary re-renders.`
+      `${frequentRenders.length} components with 100+ renders. Check for unnecessary re-renders.`,
     );
   }
 
   // Virtual scroll recommendations
   if (metrics.virtualScroll.totalItems > 100 && metrics.virtualScroll.visibleRatio > 0.5) {
     recommendations.push(
-      `Virtual scrolling only rendering ${Math.round(metrics.virtualScroll.visibleRatio * 100)}% of items. Check virtualization settings.`
+      `Virtual scrolling only rendering ${Math.round(metrics.virtualScroll.visibleRatio * 100)}% of items. Check virtualization settings.`,
     );
   }
 
   if (metrics.virtualScroll.scrollFps < 30 && metrics.virtualScroll.scrollFps > 0) {
     recommendations.push(
-      `Scroll FPS is ${metrics.virtualScroll.scrollFps}. Consider reducing item complexity or increasing overscan.`
+      `Scroll FPS is ${metrics.virtualScroll.scrollFps}. Consider reducing item complexity or increasing overscan.`,
     );
   }
 
   // WebSocket recommendations
   if (metrics.webSocket.reconnectCount > 5) {
     recommendations.push(
-      `WebSocket reconnected ${metrics.webSocket.reconnectCount} times. Check connection stability.`
+      `WebSocket reconnected ${metrics.webSocket.reconnectCount} times. Check connection stability.`,
     );
   }
 
   // Memory recommendations
   if (metrics.memory && metrics.memory.heapUtilization > 0.8) {
     recommendations.push(
-      `High memory utilization (${Math.round(metrics.memory.heapUtilization * 100)}%). Consider cleaning up unused data.`
+      `High memory utilization (${Math.round(metrics.memory.heapUtilization * 100)}%). Consider cleaning up unused data.`,
     );
   }
 

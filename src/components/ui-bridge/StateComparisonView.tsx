@@ -57,7 +57,7 @@ function jaccardSimilarity(setA: Set<string>, setB: Set<string>): number {
  */
 function compareStates(
   stateA: FingerprintDiscoveryResult["states"][0],
-  stateB: FingerprintDiscoveryResult["states"][0]
+  stateB: FingerprintDiscoveryResult["states"][0],
 ): StateComparisonResult {
   const fingerprintsA = new Set(stateA.fingerprintHashes);
   const fingerprintsB = new Set(stateB.fingerprintHashes);

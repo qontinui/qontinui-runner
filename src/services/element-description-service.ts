@@ -130,9 +130,7 @@ export const ElementDescriptionService = {
       result.set(elementId, desc);
     }
 
-    console.log(
-      `[ElementDescriptionService] Loaded ${result.size} descriptions for ${pageKey}`,
-    );
+    console.log(`[ElementDescriptionService] Loaded ${result.size} descriptions for ${pageKey}`);
     return result;
   },
 

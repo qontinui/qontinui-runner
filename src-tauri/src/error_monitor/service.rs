@@ -403,7 +403,8 @@ impl ErrorMonitorService {
             };
 
             // Use path as key for file state
-            self.file_states.insert(path.to_string_lossy().to_string(), state);
+            self.file_states
+                .insert(path.to_string_lossy().to_string(), state);
         }
 
         // Ensure parser is cached
@@ -416,7 +417,8 @@ impl ErrorMonitorService {
     /// Remove a source from monitoring.
     async fn remove_source(&mut self, name: &str) {
         // Remove from file states
-        self.file_states.retain(|_, state| state.source_name != name);
+        self.file_states
+            .retain(|_, state| state.source_name != name);
 
         // Remove from database
         let db = self.db.clone();
@@ -443,11 +445,9 @@ impl ErrorMonitorService {
     fn resolve_paths(&self, source: &LogSourceConfig) -> Vec<PathBuf> {
         match source.path_type {
             PathType::File => vec![PathBuf::from(&source.path)],
-            PathType::Glob => {
-                glob::glob(&source.path)
-                    .map(|paths| paths.filter_map(|p| p.ok()).collect())
-                    .unwrap_or_default()
-            }
+            PathType::Glob => glob::glob(&source.path)
+                .map(|paths| paths.filter_map(|p| p.ok()).collect())
+                .unwrap_or_default(),
             PathType::Directory => {
                 // Watch all files in directory
                 std::fs::read_dir(&source.path)
@@ -493,7 +493,10 @@ impl ErrorMonitorService {
                 Some(w)
             }
             Err(e) => {
-                tracing::warn!("Failed to create file watcher: {}. Falling back to polling.", e);
+                tracing::warn!(
+                    "Failed to create file watcher: {}. Falling back to polling.",
+                    e
+                );
                 None
             }
         }
@@ -516,7 +519,13 @@ impl ErrorMonitorService {
 
         if let Some((position, file_path, source_name, parser_type, format)) = state_data {
             match self
-                .process_file_changes_inner(&file_path, position, &source_name, &parser_type, &format)
+                .process_file_changes_inner(
+                    &file_path,
+                    position,
+                    &source_name,
+                    &parser_type,
+                    &format,
+                )
                 .await
             {
                 Ok(new_position) => {
@@ -557,7 +566,13 @@ impl ErrorMonitorService {
 
         for (path_str, position, file_path, source_name, parser_type, format) in states_data {
             match self
-                .process_file_changes_inner(&file_path, position, &source_name, &parser_type, &format)
+                .process_file_changes_inner(
+                    &file_path,
+                    position,
+                    &source_name,
+                    &parser_type,
+                    &format,
+                )
                 .await
             {
                 Ok(new_position) => {
@@ -644,7 +659,9 @@ impl ErrorMonitorService {
         if stored_errors.len() == 1 {
             let _ = self
                 .event_tx
-                .send(ErrorMonitorEvent::NewError(stored_errors.into_iter().next().unwrap()))
+                .send(ErrorMonitorEvent::NewError(
+                    stored_errors.into_iter().next().unwrap(),
+                ))
                 .await;
         } else if !stored_errors.is_empty() {
             let _ = self
@@ -692,7 +709,14 @@ impl ErrorMonitorService {
     /// Returns None for success events, Some(message) for error events.
     fn extract_jsonl_error(&self, json: &serde_json::Value) -> Option<String> {
         // Check for status fields that indicate success - skip these
-        let success_statuses = ["success", "completed", "pending", "running", "started", "ok"];
+        let success_statuses = [
+            "success",
+            "completed",
+            "pending",
+            "running",
+            "started",
+            "ok",
+        ];
 
         // Check status at various common nesting levels
         let status = self.find_status_field(json);
@@ -770,9 +794,19 @@ impl ErrorMonitorService {
         }
 
         // Add name if available (check various locations)
-        let name = json.get("name").and_then(|v| v.as_str())
-            .or_else(|| json.get("node").and_then(|n| n.get("name")).and_then(|v| v.as_str()))
-            .or_else(|| json.get("action").and_then(|a| a.get("name")).and_then(|v| v.as_str()));
+        let name = json
+            .get("name")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                json.get("node")
+                    .and_then(|n| n.get("name"))
+                    .and_then(|v| v.as_str())
+            })
+            .or_else(|| {
+                json.get("action")
+                    .and_then(|a| a.get("name"))
+                    .and_then(|v| v.as_str())
+            });
         if let Some(name) = name {
             parts.push(name.to_string());
         }
@@ -781,12 +815,27 @@ impl ErrorMonitorService {
         parts.push(format!("status={}", status));
 
         // Add error message if available (check various locations)
-        let error_msg = json.get("error").and_then(|v| v.as_str())
+        let error_msg = json
+            .get("error")
+            .and_then(|v| v.as_str())
             .or_else(|| json.get("message").and_then(|v| v.as_str()))
             .or_else(|| json.get("error_message").and_then(|v| v.as_str()))
-            .or_else(|| json.get("node").and_then(|n| n.get("error")).and_then(|v| v.as_str()))
-            .or_else(|| json.get("node").and_then(|n| n.get("metadata")).and_then(|m| m.get("error")).and_then(|v| v.as_str()))
-            .or_else(|| json.get("result").and_then(|r| r.get("error")).and_then(|v| v.as_str()));
+            .or_else(|| {
+                json.get("node")
+                    .and_then(|n| n.get("error"))
+                    .and_then(|v| v.as_str())
+            })
+            .or_else(|| {
+                json.get("node")
+                    .and_then(|n| n.get("metadata"))
+                    .and_then(|m| m.get("error"))
+                    .and_then(|v| v.as_str())
+            })
+            .or_else(|| {
+                json.get("result")
+                    .and_then(|r| r.get("error"))
+                    .and_then(|v| v.as_str())
+            });
         if let Some(err) = error_msg {
             parts.push(err.to_string());
         }
@@ -957,7 +1006,9 @@ mod tests {
         };
 
         // Read only new content
-        let content = service.read_file_from_position(&log_path, initial_size).unwrap();
+        let content = service
+            .read_file_from_position(&log_path, initial_size)
+            .unwrap();
         assert!(content.contains("ERROR: Something went wrong"));
         assert!(!content.contains("Initial content"));
     }
@@ -984,7 +1035,11 @@ mod tests {
 {"id":"act-3","node":{"status":"running","name":"Running Action"},"event_type":"action_progress"}"#;
 
         let result = service.preprocess_jsonl_content(jsonl_content);
-        assert!(result.is_empty(), "Success events should be filtered out: '{}'", result);
+        assert!(
+            result.is_empty(),
+            "Success events should be filtered out: '{}'",
+            result
+        );
     }
 
     #[test]
@@ -1032,7 +1087,10 @@ mod tests {
 
         let result = service.preprocess_jsonl_content(jsonl_content);
         assert!(!result.is_empty(), "Error events should be kept");
-        assert!(result.contains("Connection timeout"), "Should extract error message");
+        assert!(
+            result.contains("Connection timeout"),
+            "Should extract error message"
+        );
     }
 
     #[test]
@@ -1060,7 +1118,12 @@ mod tests {
 
         // Should only contain the failed event
         let lines: Vec<&str> = result.lines().collect();
-        assert_eq!(lines.len(), 1, "Should only have 1 error line, got: {:?}", lines);
+        assert_eq!(
+            lines.len(),
+            1,
+            "Should only have 1 error line, got: {:?}",
+            lines
+        );
         assert!(lines[0].contains("ERROR:"), "Should be formatted as ERROR");
     }
 }

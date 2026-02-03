@@ -215,11 +215,17 @@ impl RecordingStorage {
     pub fn delete_recording(&self, id: &str) -> Result<(), String> {
         let conn = self.db.get_conn()?;
 
-        conn.execute("DELETE FROM recording_actions WHERE recording_id = ?1", params![id])
-            .map_err(|e| format!("Failed to delete recording actions: {}", e))?;
+        conn.execute(
+            "DELETE FROM recording_actions WHERE recording_id = ?1",
+            params![id],
+        )
+        .map_err(|e| format!("Failed to delete recording actions: {}", e))?;
 
-        conn.execute("DELETE FROM recording_exports WHERE recording_id = ?1", params![id])
-            .map_err(|e| format!("Failed to delete recording exports: {}", e))?;
+        conn.execute(
+            "DELETE FROM recording_exports WHERE recording_id = ?1",
+            params![id],
+        )
+        .map_err(|e| format!("Failed to delete recording exports: {}", e))?;
 
         conn.execute("DELETE FROM recordings WHERE id = ?1", params![id])
             .map_err(|e| format!("Failed to delete recording: {}", e))?;
@@ -246,8 +252,8 @@ impl RecordingStorage {
             )
             .unwrap_or(1);
 
-        let target_json =
-            serde_json::to_string(&input.target).map_err(|e| format!("Failed to serialize target: {}", e))?;
+        let target_json = serde_json::to_string(&input.target)
+            .map_err(|e| format!("Failed to serialize target: {}", e))?;
 
         let action_data_json = input
             .action_data
@@ -438,7 +444,10 @@ impl RecordingStorage {
     }
 
     /// Get exports for a recording
-    pub fn get_recording_exports(&self, recording_id: &str) -> Result<Vec<RecordingExport>, String> {
+    pub fn get_recording_exports(
+        &self,
+        recording_id: &str,
+    ) -> Result<Vec<RecordingExport>, String> {
         let conn = self.db.get_conn()?;
 
         let mut stmt = conn

@@ -370,7 +370,11 @@ impl PythonBridge {
     }
 
     /// Send a command to the Python executor (async version).
-    pub async fn send_command_async(&self, command: &str, params: Option<Value>) -> Result<(), String> {
+    pub async fn send_command_async(
+        &self,
+        command: &str,
+        params: Option<Value>,
+    ) -> Result<(), String> {
         let cmd = ExecutorCommand {
             cmd_type: "command".to_string(),
             id: uuid::Uuid::new_v4().to_string(),
@@ -574,7 +578,10 @@ impl PythonBridge {
     pub async fn is_running_async(&self) -> bool {
         debug!("[PYTHON_BRIDGE] is_running_async() called");
         let state = self.lifecycle.read().await.get_state().await;
-        debug!("[PYTHON_BRIDGE] is_running_async() - got state: {}", state.name());
+        debug!(
+            "[PYTHON_BRIDGE] is_running_async() - got state: {}",
+            state.name()
+        );
         let can_accept = state.can_accept_commands();
         debug!(
             "[PYTHON_BRIDGE] is_running_async() - can_accept_commands: {}",
@@ -673,7 +680,10 @@ impl PythonBridge {
     pub async fn get_state_async(&self) -> ExecutorState {
         debug!("[PYTHON_BRIDGE] get_state_async() called");
         let state = self.lifecycle.read().await.get_state().await;
-        debug!("[PYTHON_BRIDGE] get_state_async() returning: {}", state.name());
+        debug!(
+            "[PYTHON_BRIDGE] get_state_async() returning: {}",
+            state.name()
+        );
         state
     }
 

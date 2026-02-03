@@ -380,9 +380,7 @@ pub async fn suggest_exploration_strategy_with_ai(
                 if response.success {
                     Ok(CommandResponse {
                         success: true,
-                        message: Some(
-                            "Exploration strategy suggested successfully".to_string(),
-                        ),
+                        message: Some("Exploration strategy suggested successfully".to_string()),
                         data: response.data,
                     })
                 } else {
@@ -515,9 +513,7 @@ pub async fn generate_test_and_agentic_step(
                 if response.success {
                     Ok(CommandResponse {
                         success: true,
-                        message: Some(
-                            "Test and agentic step generated successfully".to_string(),
-                        ),
+                        message: Some("Test and agentic step generated successfully".to_string()),
                         data: response.data,
                     })
                 } else {
@@ -860,7 +856,9 @@ async fn call_claude_api_for_description(
     let api_key = ai_keychain()
         .get("claude_api")
         .map_err(|e| format!("Failed to retrieve API key: {}", e))?
-        .ok_or_else(|| "No Claude API key configured. Please enter your API key in Settings.".to_string())?;
+        .ok_or_else(|| {
+            "No Claude API key configured. Please enter your API key in Settings.".to_string()
+        })?;
 
     let client = reqwest::Client::new();
     let response = client
@@ -911,7 +909,9 @@ async fn call_gemini_api_for_description(
     let api_key = ai_keychain()
         .get("gemini_api")
         .map_err(|e| format!("Failed to retrieve API key: {}", e))?
-        .ok_or_else(|| "No Gemini API key configured. Please enter your API key in Settings.".to_string())?;
+        .ok_or_else(|| {
+            "No Gemini API key configured. Please enter your API key in Settings.".to_string()
+        })?;
 
     let client = reqwest::Client::new();
     let url = format!(
@@ -982,8 +982,12 @@ fn parse_ai_description_response(content: &str) -> Result<ElementAiDescription, 
         content_trimmed
     };
 
-    let parsed: serde_json::Value =
-        serde_json::from_str(json_str).map_err(|e| format!("Failed to parse AI response as JSON: {}. Response: {}", e, content))?;
+    let parsed: serde_json::Value = serde_json::from_str(json_str).map_err(|e| {
+        format!(
+            "Failed to parse AI response as JSON: {}. Response: {}",
+            e, content
+        )
+    })?;
 
     Ok(ElementAiDescription {
         description: parsed["description"]

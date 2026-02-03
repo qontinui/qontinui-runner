@@ -152,9 +152,7 @@ impl ApiRequestExecutor {
         debug!("Executing API request: {} {}", config.method, resolved_url);
 
         // 2. Build request
-        let mut request = self
-            .client
-            .request(config.method.into(), &resolved_url);
+        let mut request = self.client.request(config.method.into(), &resolved_url);
 
         // Only set timeout if explicitly configured (None = no timeout)
         if let Some(timeout_ms) = config.timeout_ms {

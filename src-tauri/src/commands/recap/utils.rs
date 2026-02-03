@@ -263,10 +263,9 @@ fn extract_markdown_summary_section(text: &str) -> Option<String> {
         if let Some(pos) = text_lower.rfind(&pattern.to_lowercase()) {
             // Check that it's at the start of a line
             let is_line_start = pos == 0 || text.as_bytes().get(pos - 1) == Some(&b'\n');
-            if is_line_start
-                && (best_pos.is_none() || pos > best_pos.unwrap()) {
-                    best_pos = Some(pos);
-                }
+            if is_line_start && (best_pos.is_none() || pos > best_pos.unwrap()) {
+                best_pos = Some(pos);
+            }
         }
     }
 

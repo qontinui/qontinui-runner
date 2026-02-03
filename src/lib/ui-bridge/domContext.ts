@@ -405,7 +405,8 @@ export function formatPathSegment(segment: PathSegment): string {
   if (segment.label) {
     // Truncate long labels
     const maxLen = 20;
-    const label = segment.label.length > maxLen ? segment.label.slice(0, maxLen) + "..." : segment.label;
+    const label =
+      segment.label.length > maxLen ? segment.label.slice(0, maxLen) + "..." : segment.label;
     parts.push(`"${label}"`);
   }
 

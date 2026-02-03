@@ -57,10 +57,8 @@ function StateListItem({
       <Circle
         className="w-2 h-2 flex-shrink-0"
         style={{
-          fill:
-            stateType === "global" ? "#3b82f6" : stateType === "modal" ? "#f97316" : "#22c55e",
-          color:
-            stateType === "global" ? "#3b82f6" : stateType === "modal" ? "#f97316" : "#22c55e",
+          fill: stateType === "global" ? "#3b82f6" : stateType === "modal" ? "#f97316" : "#22c55e",
+          color: stateType === "global" ? "#3b82f6" : stateType === "modal" ? "#f97316" : "#22c55e",
         }}
       />
       <div className="flex-1 min-w-0">
@@ -105,9 +103,7 @@ function FingerprintStatesPanelComponent({
 
   if (!fingerprint) {
     return (
-      <div className="p-3 text-center text-muted-foreground text-sm">
-        Fingerprint not found
-      </div>
+      <div className="p-3 text-center text-muted-foreground text-sm">Fingerprint not found</div>
     );
   }
 

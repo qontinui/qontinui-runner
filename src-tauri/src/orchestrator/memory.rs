@@ -369,10 +369,7 @@ impl LongTermMemory {
         self.learnings.push(learning);
 
         // Update index
-        self.category_index
-            .entry(category)
-            .or_default()
-            .push(idx);
+        self.category_index.entry(category).or_default().push(idx);
     }
 
     /// Get learnings by category.

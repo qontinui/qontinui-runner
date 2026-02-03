@@ -43,7 +43,9 @@ impl StepHandler for GuiActionHandler {
                         StepHandlerResult::success()
                     } else {
                         StepHandlerResult::failure(
-                            result.message.unwrap_or_else(|| "GUI action failed".to_string()),
+                            result
+                                .message
+                                .unwrap_or_else(|| "GUI action failed".to_string()),
                         )
                     }
                 }
@@ -56,9 +58,7 @@ impl StepHandler for GuiActionHandler {
                     "GUI action '{}' not yet implemented in step executor",
                     action_type
                 )),
-                _ => {
-                    StepHandlerResult::failure("No target image ID specified for GUI action")
-                }
+                _ => StepHandlerResult::failure("No target image ID specified for GUI action"),
             }
         }
     }

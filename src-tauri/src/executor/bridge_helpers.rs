@@ -77,7 +77,8 @@ where
 {
     let manager = get_bridge_manager(state)?;
 
-    let bridge_id = manager.default_bridge_id_sync()
+    let bridge_id = manager
+        .default_bridge_id_sync()
         .ok_or_else(|| NO_BRIDGE_ERROR.to_string())?;
 
     let bid = super::gui_lock::BridgeId::from_string(bridge_id);

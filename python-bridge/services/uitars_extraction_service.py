@@ -9,11 +9,11 @@ import asyncio
 import threading
 import time
 import traceback
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
-from collections.abc import Callable
 
 
 class UITarsExtractionStatus(str, Enum):
@@ -350,10 +350,10 @@ class UITarsExtractionService:
 
         try:
             from qontinui.extraction.runtime.uitars import (
-                UITARSSettings,
-                UITARSExplorer,
-                UITARSExplorationConfig,
                 TrajectoryConverter,
+                UITARSExplorationConfig,
+                UITARSExplorer,
+                UITARSSettings,
             )
 
             # Create settings from config

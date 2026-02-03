@@ -52,10 +52,7 @@ impl LoopResult {
     /// Get a human-readable summary of the loop result.
     pub fn summary(&self) -> String {
         if self.was_stopped {
-            format!(
-                "STOPPED by user after {} iteration(s)",
-                self.iterations_run
-            )
+            format!("STOPPED by user after {} iteration(s)", self.iterations_run)
         } else if self.verification_passed {
             format!(
                 "Verification PASSED after {} iteration(s)",

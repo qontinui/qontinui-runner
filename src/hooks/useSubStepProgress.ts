@@ -130,7 +130,7 @@ export function useSubStepProgress(): UseSubStepProgressReturn {
             if (isMounted) {
               handleSubStepComplete(event.payload);
             }
-          }
+          },
         );
 
         // Listen for sub_step_started events (if backend emits them)
@@ -140,7 +140,7 @@ export function useSubStepProgress(): UseSubStepProgressReturn {
             if (isMounted) {
               handleSubStepStarted(event.payload);
             }
-          }
+          },
         );
 
         if (isMounted) {

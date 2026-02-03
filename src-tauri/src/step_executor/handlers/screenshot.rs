@@ -118,8 +118,10 @@ impl StepHandler for ScreenshotHandler {
                 if res.success {
                     StepHandlerResult::success_with_screenshot(file_path)
                 } else {
-                    StepHandlerResult::failure(res.error.unwrap_or_else(|| "Screenshot failed".to_string()))
-                        .with_screenshot(file_path)
+                    StepHandlerResult::failure(
+                        res.error.unwrap_or_else(|| "Screenshot failed".to_string()),
+                    )
+                    .with_screenshot(file_path)
                 }
             }
             Err(e) => {

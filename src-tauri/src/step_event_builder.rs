@@ -290,7 +290,6 @@ mod tests {
     use super::*;
     use crate::execution_context::ExecutionContext;
     use crate::step_types::StepType;
-    
 
     #[test]
     fn test_build_start_event() {
@@ -323,7 +322,8 @@ mod tests {
 
     #[test]
     fn test_build_complete_event() {
-        let metadata = StepMetadata::verification("task-123", StepType::Playwright, "Login Test", 2, 1);
+        let metadata =
+            StepMetadata::verification("task-123", StepType::Playwright, "Login Test", 2, 1);
         let details = StepDetails::playwright("script-456".to_string());
 
         let event = StepEventBuilder::new("task-123", metadata)

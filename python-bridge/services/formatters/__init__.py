@@ -21,16 +21,16 @@ Usage:
     fields = formatter.get_assertable_fields(output_data)
 """
 
-from .base import AnalysisFormatter, AssertableField, FormatterRegistry
 from .api_request import ApiRequestFormatter
-from .gui_action import GuiActionFormatter
-from .shell_command import ShellCommandFormatter
-from .mcp_call import McpCallFormatter
-from .screenshot import ScreenshotFormatter
-from .workflow_ref import WorkflowRefFormatter
-from .playwright_script import PlaywrightScriptFormatter
-from .state_navigation import StateNavigationFormatter
+from .base import AnalysisFormatter, AssertableField, FormatterRegistry
 from .check import CheckFormatter
+from .gui_action import GuiActionFormatter
+from .mcp_call import McpCallFormatter
+from .playwright_script import PlaywrightScriptFormatter
+from .screenshot import ScreenshotFormatter
+from .shell_command import ShellCommandFormatter
+from .state_navigation import StateNavigationFormatter
+from .workflow_ref import WorkflowRefFormatter
 
 # Create and populate the global registry
 formatter_registry = FormatterRegistry()

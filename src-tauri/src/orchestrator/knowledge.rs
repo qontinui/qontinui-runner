@@ -769,12 +769,7 @@ fn build_timing_section(spans: &[ExecutionSpan]) -> Option<String> {
         section.push_str("**Phase Timings:**\n");
         for (name, duration, success) in &phase_timings {
             let status = if *success { "" } else { " (failed)" };
-            section.push_str(&format!(
-                "- {}: {}ms{}\n",
-                name,
-                duration,
-                status
-            ));
+            section.push_str(&format!("- {}: {}ms{}\n", name, duration, status));
         }
         section.push('\n');
     }
@@ -793,7 +788,10 @@ fn build_timing_section(spans: &[ExecutionSpan]) -> Option<String> {
         let avg = total_ai_time / count as u64;
         let failed = ai_sessions.iter().filter(|(_, s)| !s).count();
 
-        section.push_str(&format!("- Total: {} sessions, {}ms total\n", count, total_ai_time));
+        section.push_str(&format!(
+            "- Total: {} sessions, {}ms total\n",
+            count, total_ai_time
+        ));
         section.push_str(&format!("- Average: {}ms per session\n", avg));
         if failed > 0 {
             section.push_str(&format!("- Failed: {} sessions\n", failed));

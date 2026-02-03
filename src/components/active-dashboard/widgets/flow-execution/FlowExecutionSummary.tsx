@@ -92,8 +92,14 @@ function FlowProgressBar({
 
   // Prevent division issues
   const denominator = Math.max(safeTotal, safeCompleted, 1);
-  const successPercent = Math.min(100, Math.max(0, ((safeCompleted - safeFailed) / denominator) * 100));
-  const failedPercent = Math.min(100 - successPercent, Math.max(0, (safeFailed / denominator) * 100));
+  const successPercent = Math.min(
+    100,
+    Math.max(0, ((safeCompleted - safeFailed) / denominator) * 100),
+  );
+  const failedPercent = Math.min(
+    100 - successPercent,
+    Math.max(0, (safeFailed / denominator) * 100),
+  );
 
   return (
     <div className="w-full h-1.5 bg-muted/50 rounded-full overflow-hidden">

@@ -733,10 +733,7 @@ pub async fn pause_flow_execution(
     if let Some(state) = storage.executions.get_mut(&instance_id) {
         // Only pause if running
         if state.status != FlowStatus::Running {
-            return Err(format!(
-                "Cannot pause flow in {:?} status",
-                state.status
-            ));
+            return Err(format!("Cannot pause flow in {:?} status", state.status));
         }
 
         // For now, we'll use WaitingForInput as a "paused" state
@@ -797,10 +794,7 @@ pub async fn resume_flow_execution(
 
         // Check if flow is paused (using WaitingForInput as paused state for now)
         if state.status != FlowStatus::WaitingForInput {
-            return Err(format!(
-                "Cannot resume flow in {:?} status",
-                state.status
-            ));
+            return Err(format!("Cannot resume flow in {:?} status", state.status));
         }
 
         // Set back to running
@@ -1203,14 +1197,13 @@ pub fn import_flow_json(
     generate_new_id: bool,
 ) -> Result<Flow, String> {
     // Try to parse as FlowExport first
-    let flow_json: serde_json::Value = if let Ok(export) =
-        serde_json::from_str::<FlowExport>(&content)
-    {
-        export.flow
-    } else {
-        // Fall back to parsing as raw Flow
-        serde_json::from_str(&content).map_err(|e| format!("Invalid JSON: {}", e))?
-    };
+    let flow_json: serde_json::Value =
+        if let Ok(export) = serde_json::from_str::<FlowExport>(&content) {
+            export.flow
+        } else {
+            // Fall back to parsing as raw Flow
+            serde_json::from_str(&content).map_err(|e| format!("Invalid JSON: {}", e))?
+        };
 
     // Deserialize to Flow to validate structure
     let mut flow: Flow =
@@ -1239,19 +1232,20 @@ pub fn import_flow_yaml(
     generate_new_id: bool,
 ) -> Result<Flow, String> {
     // Try to parse as FlowExport first
-    let flow_value: serde_json::Value =
-        if let Ok(export) = serde_yaml::from_str::<FlowExport>(&content) {
-            export.flow
-        } else {
-            // Fall back to parsing as raw Flow
-            let yaml_value: serde_yaml::Value =
-                serde_yaml::from_str(&content).map_err(|e| format!("Invalid YAML: {}", e))?;
-            serde_json::to_value(yaml_value).map_err(|e| format!("Failed to convert YAML: {}", e))?
-        };
+    let flow_value: serde_json::Value = if let Ok(export) =
+        serde_yaml::from_str::<FlowExport>(&content)
+    {
+        export.flow
+    } else {
+        // Fall back to parsing as raw Flow
+        let yaml_value: serde_yaml::Value =
+            serde_yaml::from_str(&content).map_err(|e| format!("Invalid YAML: {}", e))?;
+        serde_json::to_value(yaml_value).map_err(|e| format!("Failed to convert YAML: {}", e))?
+    };
 
     // Deserialize to Flow to validate structure
-    let mut flow: Flow = serde_json::from_value(flow_value)
-        .map_err(|e| format!("Invalid flow structure: {}", e))?;
+    let mut flow: Flow =
+        serde_json::from_value(flow_value).map_err(|e| format!("Invalid flow structure: {}", e))?;
 
     // Generate new ID if requested
     if generate_new_id {
