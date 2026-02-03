@@ -18,6 +18,8 @@
 //! ├── channels: ChannelsConfig          // Typed state channels (#8)
 //! ├── events: EventBusConfig            // Event bus (#9)
 //! ├── subflows: SubflowsConfig          // Nested workflows (#10)
+
+#![allow(dead_code)]
 //! ├── parallel: ParallelConfig          // Parallel execution (#11)
 //! ├── agent_tools: AgentToolsConfig     // Agent-as-tool (#12)
 //! ├── checkpoint: CheckpointConfig      // Time-travel debugging (#13)
@@ -59,6 +61,7 @@ use super::parallel::MergeStrategy;
 /// This combines all feature configurations into a single structure
 /// that can be serialized, stored, and loaded.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct EnhancedOrchestratorConfig {
     /// Base orchestrator configuration
     pub base: BaseConfig,
@@ -92,27 +95,6 @@ pub struct EnhancedOrchestratorConfig {
     pub learning: LearningSystemConfig,
 }
 
-impl Default for EnhancedOrchestratorConfig {
-    fn default() -> Self {
-        Self {
-            base: BaseConfig::default(),
-            context: ContextConfig::default(),
-            ledger: LedgerConfig::default(),
-            layers: LayersConfig::default(),
-            interrupt: InterruptConfig::default(),
-            memory: MemoryConfig::default(),
-            roles: RolesConfig::default(),
-            channels: ChannelsConfig::default(),
-            events: EventBusConfig::default(),
-            subflows: SubflowsConfig::default(),
-            parallel: ParallelConfig::default(),
-            agent_tools: AgentToolsConfig::default(),
-            checkpoint: CheckpointConfig::default(),
-            flow: FlowConfig::default(),
-            learning: LearningSystemConfig::default(),
-        }
-    }
-}
 
 impl EnhancedOrchestratorConfig {
     /// Create a minimal configuration with only essential features.

@@ -367,7 +367,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = VideoRecordingConfig::default();
-        assert_eq!(config.enabled, false);
+        assert!(!config.enabled);
         assert_eq!(config.start_delay_seconds, 0);
         assert_eq!(config.max_duration_seconds, 300);
         assert_eq!(config.fps, 15);
@@ -379,7 +379,7 @@ mod tests {
     fn test_service_creation() {
         let service = VideoRecordingService::new();
         let status = service.get_status().unwrap();
-        assert_eq!(status.recording, false);
+        assert!(!status.recording);
         assert_eq!(status.duration, 0);
     }
 }

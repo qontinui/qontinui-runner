@@ -14,6 +14,8 @@
 //! 2. Including AWAS elements in unified discovery responses
 //! 3. Routing AWAS action execution through ui-bridge infrastructure
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 
 use crate::commands::ui_bridge::{ElementIdentifier, ElementRect, ElementState, UIBridgeElement};

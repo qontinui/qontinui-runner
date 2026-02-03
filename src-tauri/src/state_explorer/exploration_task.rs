@@ -20,6 +20,7 @@ use super::types::{
 };
 
 use crate::commands::AppState;
+use crate::executor::with_default_bridge;
 
 /// Events emitted during exploration for real-time updates
 #[derive(Debug, Clone, serde::Serialize)]
@@ -347,26 +348,21 @@ impl ExplorationTask {
     async fn load_config(&self) -> Result<Value, String> {
         let config_path = self.config.config_path.clone();
 
-        // Load config via Python bridge - use a separate scope to ensure lock is dropped before await
-        {
-            let mut bridge_lock = crate::safe_lock::safe_lock_or_recover(
-                &self.app_state.python_bridge,
-                "python_bridge",
-            );
-            if let Some(ref mut bridge) = *bridge_lock {
+        // Load config via Python bridge
+        let app_state = self.app_state.clone();
+        let config_path_clone = config_path.clone();
+        tokio::task::spawn_blocking(move || {
+            with_default_bridge(&app_state, |bridge| {
                 if !bridge.is_running() {
                     return Err("Python executor not running".to_string());
                 }
-
-                // Send load command
                 bridge
-                    .load_configuration(&config_path)
-                    .map_err(|e| format!("Failed to load config: {}", e))?;
-            } else {
-                return Err("Python executor not initialized".to_string());
-            }
-            // bridge_lock is dropped here at end of scope
-        }
+                    .load_configuration(&config_path_clone)
+                    .map_err(|e| format!("Failed to load config: {}", e))
+            })?
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking error: {}", e))??;
 
         // Wait a bit for config to load (lock is now released)
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -619,39 +615,30 @@ impl ExplorationTask {
             "capture_screenshot": self.config.capture_screenshots,
         });
 
-        // Use a separate scope to ensure lock is dropped before await
-        let result = {
-            let mut bridge_lock = crate::safe_lock::safe_lock_or_recover(
-                &self.app_state.python_bridge,
-                "python_bridge",
-            );
-            if let Some(ref mut bridge) = *bridge_lock {
+        let app_state = self.app_state.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            with_default_bridge(&app_state, |bridge| {
                 if !bridge.is_running() {
                     return Err("Python executor not running".to_string());
                 }
+                bridge
+                    .send_command_and_wait(
+                        "detect_current_states",
+                        Some(params),
+                        Duration::from_secs(30),
+                    )
+                    .map_err(|e| format!("Command error: {}", e))
+            })?
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking error: {}", e))??;
 
-                // Send command and wait for response
-                bridge.send_command_and_wait(
-                    "detect_current_states",
-                    Some(params),
-                    Duration::from_secs(30),
-                )
-            } else {
-                return Err("Python executor not initialized".to_string());
-            }
-        };
-
-        match result {
-            Ok(response) => {
-                if response.success {
-                    Ok(response.data.unwrap_or(serde_json::json!({})))
-                } else {
-                    Err(response
-                        .error
-                        .unwrap_or_else(|| "Unknown error".to_string()))
-                }
-            }
-            Err(e) => Err(e),
+        if result.success {
+            Ok(result.data.unwrap_or(serde_json::json!({})))
+        } else {
+            Err(result
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string()))
         }
     }
 
@@ -666,39 +653,30 @@ impl ExplorationTask {
             "unexpected_elements": unexpected_elements,
         });
 
-        // Use a separate scope to ensure lock is dropped before await
-        let result = {
-            let mut bridge_lock = crate::safe_lock::safe_lock_or_recover(
-                &self.app_state.python_bridge,
-                "python_bridge",
-            );
-            if let Some(ref mut bridge) = *bridge_lock {
+        let app_state = self.app_state.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            with_default_bridge(&app_state, |bridge| {
                 if !bridge.is_running() {
                     return Err("Python executor not running".to_string());
                 }
+                bridge
+                    .send_command_and_wait(
+                        "verify_elements",
+                        Some(params),
+                        Duration::from_secs(30),
+                    )
+                    .map_err(|e| format!("Command error: {}", e))
+            })?
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking error: {}", e))??;
 
-                // Send command and wait for response
-                bridge.send_command_and_wait(
-                    "verify_elements",
-                    Some(params),
-                    Duration::from_secs(30),
-                )
-            } else {
-                return Err("Python executor not initialized".to_string());
-            }
-        };
-
-        match result {
-            Ok(response) => {
-                if response.success {
-                    Ok(response.data.unwrap_or(serde_json::json!({})))
-                } else {
-                    Err(response
-                        .error
-                        .unwrap_or_else(|| "Unknown error".to_string()))
-                }
-            }
-            Err(e) => Err(e),
+        if result.success {
+            Ok(result.data.unwrap_or(serde_json::json!({})))
+        } else {
+            Err(result
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string()))
         }
     }
 
@@ -782,30 +760,25 @@ impl ExplorationTask {
         });
 
         // Use Python bridge to capture actual screenshot
-        let result = {
-            let mut bridge_lock = crate::safe_lock::safe_lock_or_recover(
-                &self.app_state.python_bridge,
-                "python_bridge",
-            );
-            if let Some(ref mut bridge) = *bridge_lock {
+        let app_state = self.app_state.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            with_default_bridge(&app_state, |bridge| {
                 if !bridge.is_running() {
-                    warn!("Python executor not running, cannot capture screenshot");
-                    return None;
+                    return Err("Python executor not running".to_string());
                 }
-
-                bridge.send_command_and_wait(
-                    "verification_capture_screenshot",
-                    Some(params),
-                    Duration::from_secs(10),
-                )
-            } else {
-                warn!("Python executor not initialized, cannot capture screenshot");
-                return None;
-            }
-        };
+                bridge
+                    .send_command_and_wait(
+                        "verification_capture_screenshot",
+                        Some(params),
+                        Duration::from_secs(10),
+                    )
+                    .map_err(|e| format!("Command failed: {}", e))
+            })
+        })
+        .await;
 
         match result {
-            Ok(response) => {
+            Ok(Ok(Ok(response))) => {
                 if response.success {
                     // Extract file_path from response data
                     if let Some(data) = response.data {
@@ -821,6 +794,14 @@ impl ExplorationTask {
                     None
                 }
             }
+            Ok(Ok(Err(e))) => {
+                warn!("Python executor error: {}", e);
+                None
+            }
+            Ok(Err(e)) => {
+                warn!("Bridge error: {}", e);
+                None
+            }
             Err(e) => {
                 error!("Error capturing screenshot: {}", e);
                 None
@@ -830,23 +811,23 @@ impl ExplorationTask {
 
     /// Execute a transition via Python bridge
     async fn execute_transition(&self, transition_id: &str) -> Result<(), String> {
-        let mut bridge_lock =
-            crate::safe_lock::safe_lock_or_recover(&self.app_state.python_bridge, "python_bridge");
-        if let Some(ref mut bridge) = *bridge_lock {
-            if !bridge.is_running() {
-                return Err("Python executor not running".to_string());
-            }
+        let params = serde_json::json!({
+            "transition_id": transition_id
+        });
 
-            let params = serde_json::json!({
-                "transition_id": transition_id
-            });
-
-            bridge
-                .send_command("execute_transition", Some(params))
-                .map_err(|e| format!("Failed to execute transition: {}", e))
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        let app_state = self.app_state.clone();
+        tokio::task::spawn_blocking(move || {
+            with_default_bridge(&app_state, |bridge| {
+                if !bridge.is_running() {
+                    return Err("Python executor not running".to_string());
+                }
+                bridge
+                    .send_command("execute_transition", Some(params))
+                    .map_err(|e| format!("Failed to execute transition: {}", e))
+            })?
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking error: {}", e))?
     }
 
     /// Send an event if event sender is configured

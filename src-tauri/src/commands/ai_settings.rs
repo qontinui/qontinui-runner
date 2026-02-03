@@ -2,24 +2,21 @@
 //!
 //! This module handles AI configuration operations:
 //! - Getting and setting AI provider settings
-//! - Secure API key storage in OS keychain
+//! - Secure API key storage in OS keychain (using KeychainHelper from config_facade)
 //! - Testing AI connections
 
 use crate::ai_router::RoutingConfig;
+use crate::config_facade::ai_keychain;
 use crate::orchestrator::{CompressionConfig, RetryConfig};
 use crate::settings::{
     self, AiProvider, AiSettings, ClaudeApiSettings, ClaudeCliSettings, CliExecutionMode,
     GeminiApiSettings, GeminiAuthMethod, GeminiCliSettings,
 };
-use anyhow::{Context, Result};
-use keyring::Entry;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use super::CommandResponse;
-
-/// Service name for AI API keys in the keychain
-const AI_SERVICE_NAME: &str = "com.qontinui.runner.ai";
 
 // ============================================================================
 // Keychain Operations for API Keys
@@ -27,41 +24,17 @@ const AI_SERVICE_NAME: &str = "com.qontinui.runner.ai";
 
 /// Stores an AI API key in the OS keychain
 fn store_ai_api_key(provider: &str, api_key: &str) -> Result<()> {
-    let entry = Entry::new(AI_SERVICE_NAME, provider)
-        .context("Failed to create keychain entry for AI API key")?;
-    entry
-        .set_password(api_key)
-        .context("Failed to store AI API key in keychain")?;
-    info!("AI API key stored for provider: {}", provider);
-    Ok(())
+    ai_keychain().store(provider, api_key)
 }
 
 /// Retrieves an AI API key from the OS keychain
 fn get_ai_api_key(provider: &str) -> Result<Option<String>> {
-    let entry = Entry::new(AI_SERVICE_NAME, provider)
-        .context("Failed to create keychain entry for AI API key")?;
-    match entry.get_password() {
-        Ok(key) => Ok(Some(key)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(anyhow::anyhow!("Failed to retrieve AI API key: {}", e)),
-    }
+    ai_keychain().get(provider)
 }
 
 /// Deletes an AI API key from the OS keychain
 fn delete_ai_api_key(provider: &str) -> Result<()> {
-    let entry = Entry::new(AI_SERVICE_NAME, provider)
-        .context("Failed to create keychain entry for AI API key")?;
-    match entry.delete_credential() {
-        Ok(_) => {
-            info!("AI API key deleted for provider: {}", provider);
-            Ok(())
-        }
-        Err(keyring::Error::NoEntry) => {
-            info!("No AI API key found for provider: {}", provider);
-            Ok(())
-        }
-        Err(e) => Err(anyhow::anyhow!("Failed to delete AI API key: {}", e)),
-    }
+    ai_keychain().delete(provider)
 }
 
 // ============================================================================

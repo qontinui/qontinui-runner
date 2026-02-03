@@ -28,6 +28,8 @@
 //! });
 //! ```
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -369,7 +371,7 @@ impl LongTermMemory {
         // Update index
         self.category_index
             .entry(category)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(idx);
     }
 
@@ -609,7 +611,7 @@ impl EntityMemory {
         self.name_index.insert(name, id.clone());
         self.type_index
             .entry(entity_type)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(id.clone());
 
         // Insert or update

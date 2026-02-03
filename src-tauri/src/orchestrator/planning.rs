@@ -6,6 +6,8 @@
 //! 3. Creating a verification plan with deterministic and AI-evaluated criteria
 //! 4. Suggesting worker configuration (single vs multi-worker)
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -371,7 +373,7 @@ pub fn parse_planning_response(response: &str) -> Result<VerificationPlan, Strin
 
     let execution_steps = parsed["execution_steps"]
         .as_array()
-        .map(|arr| arr.iter().cloned().collect())
+        .map(|arr| arr.to_vec())
         .unwrap_or_default();
 
     let suggested_worker_count = parsed["suggested_worker_count"].as_u64().unwrap_or(1) as u32;

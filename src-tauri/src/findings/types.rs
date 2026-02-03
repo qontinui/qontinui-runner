@@ -19,6 +19,8 @@ pub enum FindingCategory {
     RuntimeIssue,
     AlreadyFixed,
     ExpectedBehavior,
+    Warning,
+    DataMigration,
 }
 
 impl FindingCategory {
@@ -35,6 +37,8 @@ impl FindingCategory {
             Self::RuntimeIssue => "runtime_issue",
             Self::AlreadyFixed => "already_fixed",
             Self::ExpectedBehavior => "expected_behavior",
+            Self::Warning => "warning",
+            Self::DataMigration => "data_migration",
         }
     }
 
@@ -51,6 +55,8 @@ impl FindingCategory {
             "runtime_issue" => Some(Self::RuntimeIssue),
             "already_fixed" => Some(Self::AlreadyFixed),
             "expected_behavior" => Some(Self::ExpectedBehavior),
+            "warning" => Some(Self::Warning),
+            "data_migration" => Some(Self::DataMigration),
             _ => None,
         }
     }

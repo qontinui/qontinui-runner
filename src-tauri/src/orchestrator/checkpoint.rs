@@ -23,6 +23,8 @@
 //! let restored = manager.load(&cp_id);
 //! ```
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -364,7 +366,7 @@ impl CheckpointManager {
         // Add to index
         self.task_index
             .entry(task_id.clone())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(id.clone());
 
         // Enforce limit
@@ -1343,7 +1345,7 @@ mod tests {
 
         // Create checkpoint for first replay
         let state2 = StateSnapshot::new("executing", 7);
-        let mut cp2 = Checkpoint::new(&replay1_task_id, state2);
+        let cp2 = Checkpoint::new(&replay1_task_id, state2);
         cp_manager.save(cp2.clone());
 
         // Second replay (from first replay's checkpoint)

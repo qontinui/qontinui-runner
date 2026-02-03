@@ -275,8 +275,10 @@ fn collect_from_node(
             }
         }
         // Assignments (variable definitions)
+        // Note: Top-level assignments are at depth 2 because they're wrapped in expression_statement
+        // module (0) -> expression_statement (1) -> assignment (2)
         "assignment" => {
-            if depth <= 1 {
+            if depth <= 2 {
                 // Only top-level or class-level assignments
                 if let Some(left) = node.child_by_field_name("left") {
                     collect_assignment_targets(left, source, file_path, definitions, exports);

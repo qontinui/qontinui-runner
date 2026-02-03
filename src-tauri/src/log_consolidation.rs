@@ -7,6 +7,8 @@
 //! - AI Data Viewer (frontend display)
 //! - Continuation prompts (multi-iteration task context)
 
+#![allow(dead_code)]
+
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::Serialize;
 use std::fs;

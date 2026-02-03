@@ -7,6 +7,8 @@
 //! When a `task_run_id` is set on the recorder, metrics are written to the
 //! `task_run_automation` table as a child of the parent TaskRun.
 
+#![allow(dead_code)]
+
 use crate::database::CheckpointDb;
 use crate::tiered_info::{
     update_statistics_after_run, Anomaly, AnomalySeverity, AnomalyType, RunDetails, RunStatus,
@@ -237,6 +239,15 @@ impl RunRecorder {
     }
 
     /// Record a template match result.
+    #[tracing::instrument(
+        name = "image.recognition.record",
+        skip(self),
+        fields(
+            template_name = %template,
+            confidence = %confidence,
+            match_success = %success
+        )
+    )]
     pub fn record_template_match(&mut self, template: &str, confidence: f32, success: bool) {
         debug!(
             "Recording template match: {} (confidence={:.2}, success={})",

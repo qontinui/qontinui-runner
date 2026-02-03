@@ -6,6 +6,7 @@
 //! - Querying executor status
 //! - Monitor detection
 //! - System operations (updates, folder opening)
+//! - Bridge-specific workflow execution and GUI lock management
 //!
 //! # Module Organization
 //!
@@ -13,8 +14,10 @@
 //! - `executor_status` - Status queries and input validation
 //! - `workflow_execution` - Workflow start/stop and initial states resolution
 //! - `system_ops` - System-level operations (updates, folder opening, error handling)
+//! - `bridge_execution` - Bridge-specific workflow execution and GUI lock transfer
 
 // Make submodules public so tauri::generate_handler! can access macro-generated items
+pub mod bridge_execution;
 pub mod executor_status;
 pub mod python_executor;
 pub mod system_ops;

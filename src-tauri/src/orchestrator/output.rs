@@ -5,12 +5,15 @@
 //!
 //! Output is streamed to the frontend via the `ai-output` event.
 
+#![allow(dead_code)]
+
 use tracing::debug;
 
 use super::types::{
     CriterionType, Finding, IterationVerificationResults, VerificationPlan, VerificationResult,
 };
-use crate::mcp_api::{emit_ai_output, AiOutputSessionContext};
+use crate::execution_context::AiSessionContext;
+use crate::mcp_api::emit_ai_output;
 
 // ============================================================================
 // Output Source Constants
@@ -36,7 +39,7 @@ pub const SOURCE_ORCHESTRATOR: &str = "orchestrator";
 pub fn emit_planning_start(
     app_handle: &tauri::AppHandle,
     goal: &str,
-    session_ctx: Option<&AiOutputSessionContext>,
+    session_ctx: Option<&AiSessionContext>,
 ) {
     emit_ai_output(
         app_handle,
@@ -52,7 +55,7 @@ pub fn emit_planning_start(
 pub fn emit_plan_created(
     app_handle: &tauri::AppHandle,
     plan: &VerificationPlan,
-    session_ctx: Option<&AiOutputSessionContext>,
+    session_ctx: Option<&AiSessionContext>,
 ) {
     let deterministic_count = plan.deterministic_criteria().len();
     let ai_count = plan.ai_criteria().len();
@@ -109,7 +112,7 @@ pub fn emit_plan_created(
 pub fn emit_replanning(
     app_handle: &tauri::AppHandle,
     reason: &str,
-    session_ctx: Option<&AiOutputSessionContext>,
+    session_ctx: Option<&AiSessionContext>,
 ) {
     emit_ai_output(
         app_handle,
@@ -128,7 +131,7 @@ pub fn emit_replanning(
 pub fn emit_planning_complete(
     app_handle: &tauri::AppHandle,
     plan_version: u32,
-    session_ctx: Option<&AiOutputSessionContext>,
+    session_ctx: Option<&AiSessionContext>,
 ) {
     emit_ai_output(
         app_handle,
@@ -152,7 +155,7 @@ pub fn emit_verification_start(
     iteration: u32,
     deterministic_count: usize,
     ai_count: usize,
-    session_ctx: Option<&AiOutputSessionContext>,
+    session_ctx: Option<&AiSessionContext>,
 ) {
     emit_ai_output(
         app_handle,
@@ -174,7 +177,7 @@ pub fn emit_verification_start(
 pub fn emit_deterministic_result(
     app_handle: &tauri::AppHandle,
     result: &VerificationResult,
-    session_ctx: Option<&AiOutputSessionContext>,
+    session_ctx: Option<&AiSessionContext>,
 ) {
     let status = if result.passed { "PASS" } else { "FAIL" };
     let icon = if result.passed { "[PASS]" } else { "[FAIL]" };
@@ -211,7 +214,7 @@ pub fn emit_ai_verification_start(
     app_handle: &tauri::AppHandle,
     criterion_id: &str,
     evaluation_prompt: Option<&str>,
-    session_ctx: Option<&AiOutputSessionContext>,
+    session_ctx: Option<&AiSessionContext>,
 ) {
     let prompt_preview = evaluation_prompt
         .map(|p| format!(": {}", truncate(p, 50)))
@@ -231,7 +234,7 @@ pub fn emit_ai_verification_start(
 pub fn emit_ai_verification_result(
     app_handle: &tauri::AppHandle,
     result: &VerificationResult,
-    session_ctx: Option<&AiOutputSessionContext>,
+    session_ctx: Option<&AiSessionContext>,
 ) {
     let status = if result.passed { "PASS" } else { "FAIL" };
     let icon = if result.passed { "[PASS]" } else { "[FAIL]" };
@@ -275,7 +278,7 @@ pub fn emit_ai_verification_result(
 pub fn emit_verification_complete(
     app_handle: &tauri::AppHandle,
     results: &IterationVerificationResults,
-    session_ctx: Option<&AiOutputSessionContext>,
+    session_ctx: Option<&AiSessionContext>,
 ) {
     let total_det = results.deterministic_results.len();
     let passed_det = results
@@ -343,7 +346,7 @@ pub fn emit_verification_complete(
 pub fn emit_finding_recorded(
     app_handle: &tauri::AppHandle,
     finding: &Finding,
-    session_ctx: Option<&AiOutputSessionContext>,
+    session_ctx: Option<&AiSessionContext>,
 ) {
     let confidence_str = format!("{:?}", finding.confidence).to_lowercase();
 
@@ -391,7 +394,7 @@ pub fn emit_verification_feedback_recorded(
     app_handle: &tauri::AppHandle,
     iteration: u32,
     failed_criteria_count: usize,
-    session_ctx: Option<&AiOutputSessionContext>,
+    session_ctx: Option<&AiSessionContext>,
 ) {
     emit_ai_output(
         app_handle,
@@ -411,7 +414,7 @@ pub fn emit_context_injection(
     findings_count: usize,
     feedback_count: usize,
     observations_count: usize,
-    session_ctx: Option<&AiOutputSessionContext>,
+    session_ctx: Option<&AiSessionContext>,
 ) {
     let total = findings_count + feedback_count + observations_count;
     if total == 0 {
@@ -441,7 +444,7 @@ pub fn emit_finding_resolved(
     app_handle: &tauri::AppHandle,
     finding_id: &str,
     notes: Option<&str>,
-    session_ctx: Option<&AiOutputSessionContext>,
+    session_ctx: Option<&AiSessionContext>,
 ) {
     let notes_str = notes
         .map(|n| format!(": {}", truncate(n, 50)))
@@ -468,7 +471,7 @@ pub fn emit_orchestrator_task_start(
     app_handle: &tauri::AppHandle,
     task_run_id: &str,
     goal: &str,
-    session_ctx: Option<&AiOutputSessionContext>,
+    session_ctx: Option<&AiSessionContext>,
 ) {
     emit_ai_output(
         app_handle,
@@ -491,7 +494,7 @@ pub fn emit_iteration_start(
     app_handle: &tauri::AppHandle,
     iteration: u32,
     max_iterations: u32,
-    session_ctx: Option<&AiOutputSessionContext>,
+    session_ctx: Option<&AiSessionContext>,
 ) {
     emit_ai_output(
         app_handle,
@@ -511,7 +514,7 @@ pub fn emit_orchestrator_task_complete(
     success: bool,
     iterations: u32,
     reason: Option<&str>,
-    session_ctx: Option<&AiOutputSessionContext>,
+    session_ctx: Option<&AiSessionContext>,
 ) {
     if success {
         emit_ai_output(
@@ -545,7 +548,7 @@ pub fn emit_worker_signal(
     app_handle: &tauri::AppHandle,
     signal_type: &str,
     reason: Option<&str>,
-    session_ctx: Option<&AiOutputSessionContext>,
+    session_ctx: Option<&AiSessionContext>,
 ) {
     let reason_str = reason
         .map(|r| format!(": {}", truncate(r, 60)))
@@ -572,7 +575,7 @@ pub fn emit_override_detected(
     app_handle: &tauri::AppHandle,
     criterion_id: &str,
     item: &str,
-    session_ctx: Option<&AiOutputSessionContext>,
+    session_ctx: Option<&AiSessionContext>,
 ) {
     emit_ai_output(
         app_handle,
@@ -597,7 +600,7 @@ pub fn emit_override_applied(
     criterion_id: &str,
     item: &str,
     justification: &str,
-    session_ctx: Option<&AiOutputSessionContext>,
+    session_ctx: Option<&AiSessionContext>,
 ) {
     emit_ai_output(
         app_handle,
@@ -622,7 +625,7 @@ pub fn emit_overrides_summary(
     app_handle: &tauri::AppHandle,
     override_count: usize,
     criteria_ids: &[String],
-    session_ctx: Option<&AiOutputSessionContext>,
+    session_ctx: Option<&AiSessionContext>,
 ) {
     if override_count == 0 {
         return;
@@ -665,7 +668,7 @@ pub fn emit_phase_transition(
     from_phase: &str,
     to_phase: &str,
     iteration: u32,
-    session_ctx: Option<&AiOutputSessionContext>,
+    session_ctx: Option<&AiSessionContext>,
 ) {
     let message = match (from_phase, to_phase) {
         ("setup", "verification") => {

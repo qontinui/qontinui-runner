@@ -274,7 +274,7 @@ fn detect_project(dir: &Path, base_path: &Path) -> Option<DetectedProject> {
             if pattern.contains('*') {
                 // Glob pattern - check if any file matches
                 let prefix = pattern.split('*').next().unwrap_or("");
-                let suffix = pattern.split('*').last().unwrap_or("");
+                let suffix = pattern.split('*').next_back().unwrap_or("");
 
                 if found_files.iter().any(|f| {
                     (prefix.is_empty() || f.starts_with(prefix))
@@ -344,7 +344,7 @@ fn is_config_file(name: &str) -> bool {
     CONFIG_FILE_PATTERNS.iter().any(|pattern| {
         if pattern.contains('*') {
             let prefix = pattern.split('*').next().unwrap_or("");
-            let suffix = pattern.split('*').last().unwrap_or("");
+            let suffix = pattern.split('*').next_back().unwrap_or("");
             (prefix.is_empty() || name.starts_with(prefix))
                 && (suffix.is_empty() || name.ends_with(suffix))
         } else {

@@ -444,7 +444,15 @@ impl TestOrchestrator {
 
         match results.len() {
             0 => None,
-            1 => Some(results[0].clone().to_data()),
+            1 => {
+                let value = results[0].clone().to_data();
+                // JSONPath library returns Null for non-existent paths; treat as None
+                if value.is_null() {
+                    None
+                } else {
+                    Some(value)
+                }
+            }
             _ => {
                 let values: Vec<serde_json::Value> =
                     results.into_iter().map(|r| r.to_data()).collect();

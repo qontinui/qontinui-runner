@@ -36,10 +36,12 @@
 //! 7. Runner can search RAG data by project_id + query
 
 pub mod embeddings;
+pub mod find;
 pub mod search;
 pub mod storage;
 
 pub use embeddings::{EmbeddingGenerator, EmbeddingStatus};
+pub use find::FindError;
 pub use search::{SearchError, SemanticSearch};
 pub use storage::RAGStorage;
 

@@ -89,17 +89,24 @@ struct CompiledPatterns {
 
 impl CompiledPatterns {
     fn new() -> Self {
-        // Pattern matches: TODO, FIXME, etc. followed by optional colon and text
-        // Handles common comment prefixes: //, #, /*, *, <!--
+        // Pattern matches: TODO, FIXME, etc. that appear as comment markers
+        // Requires the marker to appear after a comment prefix (// # /* * <!--)
+        // followed by optional space, then the marker followed by : or space or end of line
+        // This prevents matching "bug" in "for bug #123" (mid-sentence)
+        //
+        // The comment prefix is: //, #, /*, *, or <!--
+        // Followed by optional whitespace
+        // Then the marker word
+        // Then : or whitespace or end of line
         let markers = [
-            (MarkerType::Todo, r"(?i)\bTODO\b"),
-            (MarkerType::Fixme, r"(?i)\bFIXME\b"),
-            (MarkerType::Hack, r"(?i)\bHACK\b"),
-            (MarkerType::Xxx, r"(?i)\bXXX\b"),
-            (MarkerType::Note, r"(?i)\bNOTE\b"),
-            (MarkerType::Optimize, r"(?i)\bOPTIMIZE\b"),
-            (MarkerType::Bug, r"(?i)\bBUG\b"),
-            (MarkerType::Review, r"(?i)\bREVIEW\b"),
+            (MarkerType::Todo, r"(?i)(?://|#|/\*|\*|<!--)\s*TODO(?:\s|:|$)"),
+            (MarkerType::Fixme, r"(?i)(?://|#|/\*|\*|<!--)\s*FIXME(?:\s|:|$)"),
+            (MarkerType::Hack, r"(?i)(?://|#|/\*|\*|<!--)\s*HACK(?:\s|:|$)"),
+            (MarkerType::Xxx, r"(?i)(?://|#|/\*|\*|<!--)\s*XXX(?:\s|:|$)"),
+            (MarkerType::Note, r"(?i)(?://|#|/\*|\*|<!--)\s*NOTE(?:\s|:|$)"),
+            (MarkerType::Optimize, r"(?i)(?://|#|/\*|\*|<!--)\s*OPTIMIZE(?:\s|:|$)"),
+            (MarkerType::Bug, r"(?i)(?://|#|/\*|\*|<!--)\s*BUG(?:\s|:|$)"),
+            (MarkerType::Review, r"(?i)(?://|#|/\*|\*|<!--)\s*REVIEW(?:\s|:|$)"),
         ];
 
         let patterns = markers
@@ -114,21 +121,6 @@ impl CompiledPatterns {
 
     fn find_markers(&self, line: &str, line_num: u32) -> Vec<FoundMarker> {
         let mut markers = Vec::new();
-
-        // Check if this line looks like a comment
-        let trimmed = line.trim();
-        let is_comment = trimmed.starts_with("//")
-            || trimmed.starts_with('#')
-            || trimmed.starts_with('*')
-            || trimmed.starts_with("/*")
-            || trimmed.starts_with("<!--")
-            || trimmed.contains("//")
-            || trimmed.contains("/*");
-
-        // Only scan comment-like lines to reduce false positives
-        if !is_comment {
-            return markers;
-        }
 
         for (marker_type, regex) in &self.patterns {
             if let Some(mat) = regex.find(line) {

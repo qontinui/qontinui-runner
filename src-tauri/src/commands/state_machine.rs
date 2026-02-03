@@ -7,6 +7,7 @@
 //! - Getting available transitions
 //! - Action log viewing and management
 
+use crate::executor::{require_running_bridge, with_default_bridge};
 use crate::safe_eprintln;
 use std::sync::Arc;
 use tauri::State;
@@ -33,32 +34,27 @@ pub async fn execute_transition(
     transition_id: String,
 ) -> Result<CommandResponse, String> {
     info!("Executing transition: {}", transition_id);
-    let mut bridge = crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
 
-    if let Some(ref mut bridge) = *bridge {
-        if !bridge.is_running() {
-            return Err("Python executor not running".to_string());
-        }
+    require_running_bridge(&state)?;
 
-        let params = serde_json::json!({
-            "transition_id": transition_id
-        });
+    let params = serde_json::json!({
+        "transition_id": transition_id
+    });
 
+    with_default_bridge(&state, |bridge| {
         bridge
             .send_command("execute_transition", Some(params))
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())
+    })??;
 
-        Ok(CommandResponse {
-            success: true,
-            message: Some(format!(
-                "Transition {} execution command sent",
-                transition_id
-            )),
-            data: None,
-        })
-    } else {
-        Err("Python executor not initialized".to_string())
-    }
+    Ok(CommandResponse {
+        success: true,
+        message: Some(format!(
+            "Transition {} execution command sent",
+            transition_id
+        )),
+        data: None,
+    })
 }
 
 /// Navigate to a specific state in the state machine.
@@ -79,29 +75,24 @@ pub async fn navigate_to_state(
     state_id: String,
 ) -> Result<CommandResponse, String> {
     info!("Navigating to state: {}", state_id);
-    let mut bridge = crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
 
-    if let Some(ref mut bridge) = *bridge {
-        if !bridge.is_running() {
-            return Err("Python executor not running".to_string());
-        }
+    require_running_bridge(&state)?;
 
-        let params = serde_json::json!({
-            "state_id": state_id
-        });
+    let params = serde_json::json!({
+        "state_id": state_id
+    });
 
+    with_default_bridge(&state, |bridge| {
         bridge
             .send_command("navigate_to_state", Some(params))
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())
+    })??;
 
-        Ok(CommandResponse {
-            success: true,
-            message: Some(format!("Navigate to state {} command sent", state_id)),
-            data: None,
-        })
-    } else {
-        Err("Python executor not initialized".to_string())
-    }
+    Ok(CommandResponse {
+        success: true,
+        message: Some(format!("Navigate to state {} command sent", state_id)),
+        data: None,
+    })
 }
 
 /// Navigate to multiple states simultaneously in the state machine.
@@ -123,32 +114,28 @@ pub async fn navigate_to_multiple_states(
     state_ids: Vec<String>,
 ) -> Result<CommandResponse, String> {
     info!("Navigating to multiple states: {:?}", state_ids);
-    let mut bridge = crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
 
-    if let Some(ref mut bridge) = *bridge {
-        if !bridge.is_running() {
-            return Err("Python executor not running".to_string());
-        }
+    require_running_bridge(&state)?;
 
-        let params = serde_json::json!({
-            "state_ids": state_ids
-        });
+    let state_ids_len = state_ids.len();
+    let params = serde_json::json!({
+        "state_ids": state_ids
+    });
 
+    with_default_bridge(&state, |bridge| {
         bridge
             .send_command("navigate_to_multiple_states", Some(params))
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())
+    })??;
 
-        Ok(CommandResponse {
-            success: true,
-            message: Some(format!(
-                "Navigate to {} states command sent",
-                state_ids.len()
-            )),
-            data: None,
-        })
-    } else {
-        Err("Python executor not initialized".to_string())
-    }
+    Ok(CommandResponse {
+        success: true,
+        message: Some(format!(
+            "Navigate to {} states command sent",
+            state_ids_len
+        )),
+        data: None,
+    })
 }
 
 /// Get the currently active states from the state machine.
@@ -165,27 +152,22 @@ pub async fn navigate_to_multiple_states(
 #[tauri::command]
 pub async fn get_active_states(state: State<'_, Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Getting active states");
-    let mut bridge = crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
 
-    if let Some(ref mut bridge) = *bridge {
-        if !bridge.is_running() {
-            return Err("Python executor not running".to_string());
-        }
+    require_running_bridge(&state)?;
 
-        let params = serde_json::json!({});
+    let params = serde_json::json!({});
 
+    with_default_bridge(&state, |bridge| {
         bridge
             .send_command("get_active_states", Some(params))
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())
+    })??;
 
-        Ok(CommandResponse {
-            success: true,
-            message: Some("Get active states command sent".to_string()),
-            data: None,
-        })
-    } else {
-        Err("Python executor not initialized".to_string())
-    }
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Get active states command sent".to_string()),
+        data: None,
+    })
 }
 
 /// Get available transitions from the current state(s).
@@ -205,27 +187,22 @@ pub async fn get_available_transitions(
     state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
     info!("Getting available transitions");
-    let mut bridge = crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
 
-    if let Some(ref mut bridge) = *bridge {
-        if !bridge.is_running() {
-            return Err("Python executor not running".to_string());
-        }
+    require_running_bridge(&state)?;
 
-        let params = serde_json::json!({});
+    let params = serde_json::json!({});
 
+    with_default_bridge(&state, |bridge| {
         bridge
             .send_command("get_available_transitions", Some(params))
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())
+    })??;
 
-        Ok(CommandResponse {
-            success: true,
-            message: Some("Get available transitions command sent".to_string()),
-            data: None,
-        })
-    } else {
-        Err("Python executor not initialized".to_string())
-    }
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Get available transitions command sent".to_string()),
+        data: None,
+    })
 }
 
 /// Get action log view data from the display processor.

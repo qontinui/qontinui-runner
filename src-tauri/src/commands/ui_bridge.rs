@@ -26,10 +26,13 @@
 //! - `ui_bridge_execute_component_action` - Execute an action on a component
 //! - `ui_bridge_discover` - Discover controllable elements in the UI
 //! - `ui_bridge_get_snapshot` - Get a full snapshot of the UI bridge state
+//! - `ui_bridge_discover_states_from_fingerprints` - Discover states from fingerprint co-occurrence data
 
 use serde::{Deserialize, Serialize};
-use tauri::Emitter;
-use tracing::info;
+use serde_json::json;
+use std::sync::Arc;
+use tauri::{Emitter, State};
+use tracing::{error, info};
 
 use super::CommandResponse;
 
@@ -458,4 +461,310 @@ pub async fn ui_bridge_get_snapshot(app: tauri::AppHandle) -> Result<CommandResp
         message: Some("Snapshot request sent".to_string()),
         data: None,
     })
+}
+
+/// Configuration for fingerprint state discovery
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FingerprintDiscoveryConfig {
+    /// Minimum co-occurrence rate for grouping (0.0-1.0)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_cooccurrence_rate: Option<f64>,
+}
+
+/// Discovered state from fingerprint analysis
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveredFingerprintState {
+    pub state_id: String,
+    pub name: String,
+    pub fingerprint_hashes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub element_ids: Option<Vec<String>>,
+    pub position_zone: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub landmark_context: Option<String>,
+    pub is_global: bool,
+    pub is_modal: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repeat_pattern_count: Option<i32>,
+    pub confidence: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observation_count: Option<i32>,
+}
+
+/// State transition from fingerprint analysis
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveredStateTransition {
+    pub from_state_id: String,
+    pub to_state_id: String,
+    pub action_type: String,
+    pub count: i32,
+}
+
+/// Discovery statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveryStatistics {
+    pub total_captures: i32,
+    pub total_transitions: i32,
+    pub unique_fingerprints: i32,
+    pub discovered_states: i32,
+    pub global_states: i32,
+    pub modal_states: i32,
+    pub discovered_transitions: i32,
+}
+
+/// Response from fingerprint state discovery
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FingerprintDiscoveryResult {
+    pub states: Vec<DiscoveredFingerprintState>,
+    pub transitions: Vec<DiscoveredStateTransition>,
+    pub statistics: DiscoveryStatistics,
+}
+
+/// Discover states from fingerprint co-occurrence data.
+///
+/// This command takes co-occurrence export data from the UI Bridge capture session
+/// and runs the FingerprintStateDiscovery algorithm from the qontinui library
+/// to discover states based on element fingerprints.
+///
+/// # Arguments
+/// * `state` - The application state containing the extraction executor
+/// * `cooccurrence_export` - The co-occurrence export data from UI Bridge
+/// * `config` - Optional discovery configuration
+///
+/// # Returns
+/// * `Ok(CommandResponse)` - Success with discovered states and transitions
+/// * `Err(String)` - Error message if discovery fails
+#[tauri::command]
+pub async fn ui_bridge_discover_states_from_fingerprints(
+    state: State<'_, Arc<super::AppState>>,
+    cooccurrence_export: serde_json::Value,
+    config: Option<FingerprintDiscoveryConfig>,
+) -> Result<CommandResponse, String> {
+    info!("UI Bridge: Discovering states from fingerprints");
+
+    let mut executor_lock = state
+        .extraction_executor
+        .lock()
+        .map_err(|e| format!("Failed to acquire lock: {}", e))?;
+
+    if let Some(ref mut executor) = *executor_lock {
+        // Start executor on-demand if not running
+        executor.ensure_started().map_err(|e| {
+            error!("Failed to start extraction executor: {}", e);
+            e
+        })?;
+
+        // Build config object for Python
+        let config_params = config.map(|c| {
+            json!({
+                "minCooccurrenceRate": c.min_cooccurrence_rate.unwrap_or(0.95),
+            })
+        });
+
+        let params = json!({
+            "cooccurrence_export": cooccurrence_export,
+            "config": config_params,
+        });
+
+        // Send command and wait for response
+        let response_result = executor
+            .send_command_and_wait(
+                "discover_states_from_fingerprints",
+                Some(params),
+                std::time::Duration::from_secs(60),
+            )
+            .map_err(|e| e.to_string())?;
+
+        // Check if the response indicates success
+        if response_result.success {
+            Ok(CommandResponse {
+                success: true,
+                message: Some("Fingerprint state discovery complete".to_string()),
+                data: response_result.data,
+            })
+        } else {
+            let error_msg = response_result
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string());
+            Err(format!("Discovery failed: {}", error_msg))
+        }
+    } else {
+        Err("Extraction executor not initialized".to_string())
+    }
+}
+
+/// Configuration for UI Bridge exploration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UIBridgeExplorationConfig {
+    /// Maximum navigation depth from starting page
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_depth: Option<i32>,
+    /// Maximum elements to interact with per page
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_elements_per_page: Option<i32>,
+    /// Maximum total elements to explore
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_total_elements: Option<i32>,
+    /// Delay between actions in milliseconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_delay_ms: Option<i32>,
+    /// Keywords in element text/id to skip (e.g., "delete", "logout")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_keywords: Option<Vec<String>>,
+    /// Keywords that are always safe to interact with
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safe_keywords: Option<Vec<String>>,
+    /// Whether to capture screenshots with snapshots
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_screenshots: Option<bool>,
+}
+
+/// Result of UI Bridge exploration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UIBridgeExplorationResult {
+    /// Unique identifier for this exploration
+    pub exploration_id: String,
+    /// Total unique elements discovered
+    pub elements_discovered: i32,
+    /// Total elements interacted with
+    pub elements_explored: i32,
+    /// Errors encountered during exploration
+    pub errors: Vec<String>,
+    /// State discovery result (if successful)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_discovery_result: Option<serde_json::Value>,
+    /// Raw cooccurrence export data (for further processing)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooccurrence_export: Option<serde_json::Value>,
+}
+
+/// Run automatic UI Bridge exploration via the Python library
+///
+/// This command connects to the browser via the extension and systematically
+/// explores interactive elements, building a co-occurrence export for
+/// fingerprint-based state discovery.
+///
+/// # Arguments
+/// * `runner_url` - URL of the runner (default: http://localhost:9876)
+/// * `config` - Optional exploration configuration
+///
+/// # Returns
+/// Exploration result with discovered states and statistics
+#[tauri::command]
+pub async fn ui_bridge_run_exploration(
+    state: State<'_, Arc<super::AppState>>,
+    runner_url: Option<String>,
+    config: Option<UIBridgeExplorationConfig>,
+) -> Result<CommandResponse, String> {
+    info!("UI Bridge: Running automatic exploration");
+
+    let mut executor_lock = state
+        .extraction_executor
+        .lock()
+        .map_err(|e| format!("Failed to acquire lock: {}", e))?;
+
+    if let Some(ref mut executor) = *executor_lock {
+        // Start executor on-demand if not running
+        executor.ensure_started().map_err(|e| {
+            error!("Failed to start extraction executor: {}", e);
+            e
+        })?;
+
+        // Build parameters for Python
+        let params = json!({
+            "runner_url": runner_url.unwrap_or_else(|| "http://localhost:9876".to_string()),
+            "config": config.map(|c| json!({
+                "max_depth": c.max_depth.unwrap_or(2),
+                "max_elements_per_page": c.max_elements_per_page.unwrap_or(20),
+                "max_total_elements": c.max_total_elements.unwrap_or(100),
+                "action_delay_ms": c.action_delay_ms.unwrap_or(500),
+                "blocked_keywords": c.blocked_keywords.unwrap_or_default(),
+                "safe_keywords": c.safe_keywords.unwrap_or_default(),
+                "capture_screenshots": c.capture_screenshots.unwrap_or(false),
+            })),
+        });
+
+        // Send command and wait for response (longer timeout for exploration)
+        let response_result = executor
+            .send_command_and_wait(
+                "run_ui_bridge_exploration",
+                Some(params),
+                std::time::Duration::from_secs(300), // 5 minute timeout
+            )
+            .map_err(|e| e.to_string())?;
+
+        // Check if the response indicates success
+        if response_result.success {
+            Ok(CommandResponse {
+                success: true,
+                message: Some("UI Bridge exploration complete".to_string()),
+                data: response_result.data,
+            })
+        } else {
+            let error_msg = response_result
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string());
+            Err(format!("Exploration failed: {}", error_msg))
+        }
+    } else {
+        Err("Extraction executor not initialized".to_string())
+    }
+}
+
+/// Stop a running UI Bridge exploration
+///
+/// Signals the Python exploration process to stop gracefully.
+/// The exploration will complete its current action, export any partial results,
+/// and return what was discovered so far.
+///
+/// # Returns
+/// * `Ok(CommandResponse)` - Success if stop was requested
+/// * `Err(String)` - Error if stop could not be initiated
+#[tauri::command]
+pub async fn ui_bridge_stop_exploration(
+    state: State<'_, Arc<super::AppState>>,
+) -> Result<CommandResponse, String> {
+    info!("UI Bridge: Stopping exploration");
+
+    let mut executor_lock = state
+        .extraction_executor
+        .lock()
+        .map_err(|e| format!("Failed to acquire lock: {}", e))?;
+
+    if let Some(ref mut executor) = *executor_lock {
+        if !executor.is_running() {
+            return Err("Extraction executor not running".to_string());
+        }
+
+        // Send stop command to Python
+        let response_result = executor
+            .send_command_and_wait(
+                "stop_ui_bridge_exploration",
+                None,
+                std::time::Duration::from_secs(10),
+            )
+            .map_err(|e| e.to_string())?;
+
+        if response_result.success {
+            Ok(CommandResponse {
+                success: true,
+                message: Some("Exploration stop requested".to_string()),
+                data: response_result.data,
+            })
+        } else {
+            let error_msg = response_result
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string());
+            Err(format!("Failed to stop exploration: {}", error_msg))
+        }
+    } else {
+        Err("Extraction executor not initialized".to_string())
+    }
 }

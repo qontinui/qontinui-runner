@@ -16,7 +16,7 @@ use crate::check_executor::{
     CHECK_TOOLS, CHECK_TYPE_INFO,
 };
 use crate::database::{
-    Check, CheckGroup, CreateCheckGroupInput, CreateCheckInput, UpdateCheckGroupInput,
+    Check, CreateCheckGroupInput, CreateCheckInput, UpdateCheckGroupInput,
     UpdateCheckInput,
 };
 use crate::AppState;
@@ -751,4 +751,38 @@ pub async fn execute_check_group(
             "summary": summary
         })),
     })
+}
+
+/// Repair check-group associations based on naming convention.
+///
+/// Checks are named with format "{group_name} - {tool_name}" (e.g., "multistate - Ruff Linting").
+/// This command finds checks that match groups by this pattern and ensures they are linked.
+#[tauri::command]
+pub async fn repair_check_group_associations(
+    state: State<'_, Arc<AppState>>,
+) -> Result<CommandResponse, String> {
+    let db = &state.checkpoint_db;
+
+    info!("Repairing check-group associations based on naming convention");
+
+    match db.repair_check_group_associations() {
+        Ok(count) => {
+            let message = if count > 0 {
+                format!("Repaired {} check-group associations", count)
+            } else {
+                "All check-group associations are already correct".to_string()
+            };
+            info!("{}", message);
+            Ok(CommandResponse {
+                success: true,
+                message: Some(message),
+                data: Some(serde_json::json!({ "associations_created": count })),
+            })
+        }
+        Err(e) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Failed to repair associations: {}", e)),
+            data: None,
+        }),
+    }
 }

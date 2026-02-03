@@ -11,9 +11,94 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use super::types::{api_error, ApiResponse, ApiState};
+use crate::executor::with_default_bridge;
+
+/// Request to start vision extraction
+#[derive(Debug, Deserialize)]
+pub struct StartVisionExtractionRequest {
+    /// Base64-encoded screenshot or file path
+    pub screenshot: String,
+    /// Techniques to run: ["edge", "sam3", "ocr"]
+    #[serde(default = "default_vision_techniques")]
+    pub techniques: Vec<String>,
+    /// Edge detection: Canny low threshold
+    #[serde(default = "default_canny_low")]
+    pub canny_low: i32,
+    /// Edge detection: Canny high threshold
+    #[serde(default = "default_canny_high")]
+    pub canny_high: i32,
+    /// Edge detection: minimum contour area
+    #[serde(default = "default_min_contour_area")]
+    pub min_contour_area: i32,
+    /// SAM3: points per side
+    #[serde(default = "default_points_per_side")]
+    pub points_per_side: i32,
+    /// SAM3: predicted IoU threshold
+    #[serde(default = "default_pred_iou_thresh")]
+    pub pred_iou_thresh: f64,
+    /// SAM3: stability score threshold
+    #[serde(default = "default_stability_score_thresh")]
+    pub stability_score_thresh: f64,
+    /// OCR: engine ("easyocr" or "tesseract")
+    #[serde(default = "default_ocr_engine")]
+    pub ocr_engine: String,
+    /// OCR: languages
+    #[serde(default = "default_ocr_languages")]
+    pub ocr_languages: Vec<String>,
+    /// OCR: confidence threshold
+    #[serde(default = "default_ocr_confidence")]
+    pub ocr_confidence_threshold: f64,
+    /// Fusion: IoU threshold for deduplication
+    #[serde(default = "default_iou_threshold")]
+    pub iou_threshold: f64,
+}
+
+fn default_vision_techniques() -> Vec<String> {
+    vec!["edge".to_string(), "ocr".to_string()]
+}
+
+fn default_canny_low() -> i32 {
+    50
+}
+
+fn default_canny_high() -> i32 {
+    150
+}
+
+fn default_min_contour_area() -> i32 {
+    100
+}
+
+fn default_points_per_side() -> i32 {
+    32
+}
+
+fn default_pred_iou_thresh() -> f64 {
+    0.88
+}
+
+fn default_stability_score_thresh() -> f64 {
+    0.95
+}
+
+fn default_ocr_engine() -> String {
+    "easyocr".to_string()
+}
+
+fn default_ocr_languages() -> Vec<String> {
+    vec!["en".to_string()]
+}
+
+fn default_ocr_confidence() -> f64 {
+    0.6
+}
+
+fn default_iou_threshold() -> f64 {
+    0.5
+}
 
 /// Request to start web extraction
 #[derive(Debug, Deserialize)]
@@ -100,16 +185,9 @@ pub async fn start_web_extraction(
     let app_state = state.app_state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             bridge.send_command("start_web_extraction", Some(params))
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -135,6 +213,62 @@ pub async fn start_web_extraction(
     }
 }
 
+/// Start vision extraction
+pub async fn start_vision_extraction(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<StartVisionExtractionRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("MCP API: Starting vision extraction");
+
+    // Build extraction params
+    let params = serde_json::json!({
+        "config": {
+            "screenshot": request.screenshot,
+            "techniques": request.techniques,
+            "canny_low": request.canny_low,
+            "canny_high": request.canny_high,
+            "min_contour_area": request.min_contour_area,
+            "points_per_side": request.points_per_side,
+            "pred_iou_thresh": request.pred_iou_thresh,
+            "stability_score_thresh": request.stability_score_thresh,
+            "ocr_engine": request.ocr_engine,
+            "ocr_languages": request.ocr_languages,
+            "ocr_confidence_threshold": request.ocr_confidence_threshold,
+            "iou_threshold": request.iou_threshold,
+        }
+    });
+
+    let app_state = state.app_state.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        with_default_bridge(&app_state, |bridge| {
+            bridge.send_command("run_vision_extraction", Some(params))
+        })?
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(_) => {
+            info!("MCP API: Vision extraction started");
+            Ok(Json(ApiResponse::success(serde_json::json!({
+                "started": true,
+                "message": "Vision extraction started"
+            }))))
+        }
+        Err(e) => {
+            error!("MCP API: Failed to start vision extraction: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
 /// Stop web extraction
 pub async fn stop_web_extraction(
     State(state): State<Arc<ApiState>>,
@@ -144,16 +278,9 @@ pub async fn stop_web_extraction(
     let app_state = state.app_state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             bridge.send_command("stop_web_extraction", None)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -185,16 +312,9 @@ pub async fn get_extraction_status(
     let app_state = state.app_state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             bridge.send_command("get_extraction_status", None)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {

@@ -4,6 +4,7 @@
 //! RAG configs contain pattern screenshots and element annotations for visual automation.
 
 use crate::auth::AuthManager;
+use crate::event_system::EventEmitter;
 use crate::rag::{
     EmbeddingGenerator, EmbeddingStatus, ImportResult, QontinuiConfig, RAGStorage, SearchFilters,
     SearchResult, SemanticSearch,
@@ -12,9 +13,9 @@ use base64::Engine as _;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 use tokio::sync::Mutex as TokioMutex;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 /// Get API base URL for qontinui-web backend
 fn get_api_base_url() -> String {
@@ -548,35 +549,21 @@ pub async fn search_rag_elements_semantic(
         }
     }
 
-    // Clone the Arc before spawning blocking task
-    let semantic_search_arc = state.semantic_search.clone();
+    // Lock the semantic search and perform the search
+    // Note: search() is a CPU-bound operation that doesn't need spawn_blocking
+    let semantic_search = state.semantic_search.lock().await;
+    let results = semantic_search
+        .search(&project_id, &query, limit, min_similarity)
+        .map_err(|e| match e {
+            crate::rag::SearchError::EmbeddingsNotFound(msg) => {
+                format!(
+                    "Embeddings not found. Please generate embeddings first. Details: {}",
+                    msg
+                )
+            }
+            _ => format!("Semantic search failed: {}", e),
+        })?;
 
-    let results = tokio::task::spawn_blocking({
-        let project_id = project_id.clone();
-        let query = query.clone();
-
-        move || -> Result<_, String> {
-            // Lock inside the blocking task
-            let runtime = tokio::runtime::Runtime::new()
-                .map_err(|e| format!("Failed to create runtime: {}", e))?;
-            let semantic_search = runtime.block_on(semantic_search_arc.lock());
-            semantic_search
-                .search(&project_id, &query, limit, min_similarity)
-                .map_err(|e| match e {
-                    crate::rag::SearchError::EmbeddingsNotFound(msg) => {
-                        format!(
-                            "Embeddings not found. Please generate embeddings first. Details: {}",
-                            msg
-                        )
-                    }
-                    _ => format!("Semantic search failed: {}", e),
-                })
-        }
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))??;
-
-    // Results have already been error-mapped inside the closure
     let results_for_response = results;
 
     Ok(CommandResponse {
@@ -782,8 +769,8 @@ pub async fn start_rag_processing(
     let mut progress_rx = embedding_generator.generate_embeddings_async(project_id.clone());
     drop(embedding_generator);
 
-    // Spawn task to listen for progress and emit events
-    let app_handle_clone = app_handle.clone();
+    // Spawn task to listen for progress and emit events via EventEmitter
+    let emitter = EventEmitter::new(app_handle.clone());
     let project_id_clone = project_id.clone();
 
     tokio::spawn(async move {
@@ -796,32 +783,26 @@ pub async fn start_rag_processing(
                 EmbeddingStatus::Failed(_) => "failed",
             };
 
-            // Build event payload
-            let mut payload = serde_json::json!({
+            // Extract error message if failed
+            let error_msg = if let EmbeddingStatus::Failed(err) = &progress.status {
+                Some(err.clone())
+            } else {
+                None
+            };
+
+            // Emit progress event via EventEmitter
+            // Note: Using raw emit for now since AppEvent::RagProgress has a different structure
+            // that includes the error field. This demonstrates compatibility with existing payloads.
+            let payload = serde_json::json!({
                 "project_id": project_id_clone,
                 "status": status_str,
                 "message": progress.message,
+                "percent": progress.percent,
+                "elements_processed": progress.elements_processed,
+                "total_elements": progress.total_elements,
+                "error": error_msg,
             });
-
-            if let Some(percent) = progress.percent {
-                payload["percent"] = serde_json::json!(percent);
-            }
-            if let Some(elements_processed) = progress.elements_processed {
-                payload["elements_processed"] = serde_json::json!(elements_processed);
-            }
-            if let Some(total_elements) = progress.total_elements {
-                payload["total_elements"] = serde_json::json!(total_elements);
-            }
-
-            // Add error message if failed
-            if let EmbeddingStatus::Failed(err) = &progress.status {
-                payload["error"] = serde_json::json!(err);
-            }
-
-            // Emit progress event
-            if let Err(e) = app_handle_clone.emit("rag-progress", &payload) {
-                error!("Failed to emit rag-progress event: {}", e);
-            }
+            emitter.emit_raw_or_error("rag-progress", &payload);
 
             // If completed or failed, emit completion event and send to web
             if matches!(
@@ -858,24 +839,24 @@ pub async fn start_rag_processing(
                     }
                 }
 
-                let completion_payload = serde_json::json!({
-                    "project_id": project_id_clone,
-                    "success": is_success,
-                    "total_processed": progress.elements_processed.unwrap_or(0),
-                    "successful": if is_success {
-                        progress.elements_processed.unwrap_or(0)
-                    } else { 0 },
-                    "failed": if matches!(progress.status, EmbeddingStatus::Failed(_)) {
-                        progress.total_elements.unwrap_or(0)
-                    } else { 0 },
-                    "results": [],
-                    "web_sync_success": web_sync_success,
-                    "web_sync_error": web_sync_error,
-                });
+                // Emit completion event via EventEmitter
+                let total_processed = progress.elements_processed.unwrap_or(0) as i32;
+                let successful = if is_success { total_processed } else { 0 };
+                let failed = if matches!(progress.status, EmbeddingStatus::Failed(_)) {
+                    progress.total_elements.unwrap_or(0) as i32
+                } else {
+                    0
+                };
 
-                if let Err(e) = app_handle_clone.emit("rag-completion", &completion_payload) {
-                    error!("Failed to emit rag-completion event: {}", e);
-                }
+                emitter.rag_completion_with_sync(
+                    &project_id_clone,
+                    is_success,
+                    total_processed,
+                    successful,
+                    failed,
+                    web_sync_success,
+                    web_sync_error,
+                );
 
                 break;
             }

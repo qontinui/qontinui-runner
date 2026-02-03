@@ -22,6 +22,8 @@
 //! }
 //! ```
 
+#![allow(dead_code)]
+
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use tracing::debug;
@@ -144,6 +146,12 @@ pub fn get_render_log_path() -> PathBuf {
 /// Get the DOM capture log path (`<dev_logs>/dom-capture.jsonl`).
 pub fn get_dom_capture_log_path() -> PathBuf {
     get_dev_logs_dir().join("dom-capture.jsonl")
+}
+
+/// Get the tracing spans JSONL path (`<dev_logs>/runner-spans.jsonl`).
+/// Contains all tracing spans for real-time debugging and performance analysis.
+pub fn get_runner_spans_jsonl_path() -> PathBuf {
+    get_dev_logs_dir().join("runner-spans.jsonl")
 }
 
 /// Clear the cached dev logs directory.

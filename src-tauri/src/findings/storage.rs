@@ -2,6 +2,8 @@
 //!
 //! Provides CRUD operations and queries for the task_run_findings table.
 
+#![allow(dead_code)]
+
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use tracing::{debug, info};

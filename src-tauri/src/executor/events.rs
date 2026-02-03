@@ -7,6 +7,7 @@ use crate::safe_eprintln;
 use serde_json::json;
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
+use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 /// Handles event forwarding from Python executor to Tauri frontend and WebSocket clients
@@ -214,11 +215,146 @@ impl EventForwarder {
         }
     }
 
+    /// Emits a message to a headless bridge's dedicated event channel.
+    ///
+    /// This is used for headless bridges that don't emit to the Tauri frontend.
+    /// Events are still logged to files and processed for run recording, but
+    /// skip the Tauri app.emit() calls. Instead, events go to the dedicated
+    /// broadcast channel for that bridge.
+    pub async fn emit_message_to_headless_channel(
+        app_handle: &tauri::AppHandle,
+        message: ExecutorMessage,
+        headless_tx: &broadcast::Sender<serde_json::Value>,
+    ) {
+        // Feed tree events to RunRecordingHandler (skip DisplayProcessor for headless)
+        if let ExecutorMessage::TreeEvent {
+            ref event_type,
+            ref node,
+            ..
+        } = message
+        {
+            if let Some(app_state) = app_handle.try_state::<std::sync::Arc<AppState>>() {
+                app_state
+                    .run_recording_handler
+                    .on_tree_event(event_type, node)
+                    .await;
+            }
+        }
+
+        // Feed execution_completed events to RunRecordingHandler
+        if let ExecutorMessage::Event {
+            ref event,
+            ref data,
+            ..
+        } = message
+        {
+            if event == "execution_completed" {
+                if let Some(app_state) = app_handle.try_state::<std::sync::Arc<AppState>>() {
+                    app_state
+                        .run_recording_handler
+                        .on_execution_completed(data)
+                        .await;
+                }
+            }
+        }
+
+        // Feed image recognition events to RunRecordingHandler
+        if let ExecutorMessage::ImageRecognition { ref data } = message {
+            if let Some(app_state) = app_handle.try_state::<std::sync::Arc<AppState>>() {
+                app_state
+                    .run_recording_handler
+                    .on_image_recognition(data)
+                    .await;
+            }
+        }
+
+        // Process events - log to file and send to headless channel
+        match message {
+            ExecutorMessage::Event {
+                event,
+                data,
+                timestamp,
+                sequence,
+            } => {
+                FileLogger::log_general_event(&event, &data, timestamp);
+
+                let event_obj = json!({
+                    "event_type": "event",
+                    "event": event,
+                    "timestamp": timestamp,
+                    "sequence": sequence,
+                    "data": data,
+                });
+                let _ = headless_tx.send(event_obj);
+            }
+            ExecutorMessage::TreeEvent {
+                event_type,
+                node,
+                path,
+                timestamp,
+                sequence,
+            } => {
+                FileLogger::log_tree_event(&event_type, &node, &path, timestamp, sequence);
+
+                let tree_event = json!({
+                    "type": "tree_event",
+                    "event_type": event_type,
+                    "node": node,
+                    "path": path,
+                    "timestamp": timestamp,
+                    "sequence": sequence,
+                });
+                let _ = headless_tx.send(tree_event);
+            }
+            ExecutorMessage::Response {
+                id,
+                success,
+                data,
+                error,
+            } => {
+                let response = json!({
+                    "resp_type": "response",
+                    "id": id,
+                    "success": success,
+                    "data": data,
+                    "error": error,
+                });
+                let _ = headless_tx.send(response);
+            }
+            ExecutorMessage::Error { message, details } => {
+                FileLogger::log_error(&message, details.as_deref());
+
+                let error_event = json!({
+                    "type": "error",
+                    "error": "executor_error",
+                    "message": message,
+                    "details": details,
+                });
+                let _ = headless_tx.send(error_event);
+            }
+            ExecutorMessage::ImageRecognition { data } => {
+                FileLogger::log_image_recognition(&data);
+
+                let image_recognition_event = json!({
+                    "event": "image_recognition",
+                    "data": data,
+                });
+                let _ = headless_tx.send(image_recognition_event);
+            }
+            _ => {
+                debug!("Unhandled headless message type: {:?}", message);
+            }
+        }
+    }
+
     /// Emits an extraction message to the Tauri frontend.
     ///
     /// This is a simplified version of emit_message_to_frontend for the extraction executor.
     /// It emits to "extraction-event" instead of "executor-event" and doesn't process
     /// tree events or display processor updates since extraction doesn't use GUI automation.
+    ///
+    /// UI Bridge exploration progress events are also emitted to a dedicated "exploration-progress"
+    /// channel for real-time progress updates.
     pub async fn emit_extraction_message_to_frontend(
         app_handle: &tauri::AppHandle,
         message: ExecutorMessage,
@@ -230,6 +366,22 @@ impl EventForwarder {
                 timestamp,
                 sequence,
             } => {
+                // Check if this is a UI Bridge exploration progress event
+                // If so, also emit to the dedicated exploration-progress channel
+                if event == "ui_bridge_exploration_progress" {
+                    if let Err(e) = app_handle.emit("exploration-progress", &data) {
+                        error!("Failed to emit exploration-progress event: {}", e);
+                    }
+                }
+
+                // Also check for exploration started/completed/failed events
+                if event.starts_with("ui_bridge_exploration_") {
+                    let channel_name = format!("{}", event.replace('_', "-"));
+                    if let Err(e) = app_handle.emit(&channel_name, &data) {
+                        debug!("Failed to emit {}: {}", channel_name, e);
+                    }
+                }
+
                 let event_obj = ExecutorEvent {
                     event_type: "event".to_string(),
                     event,

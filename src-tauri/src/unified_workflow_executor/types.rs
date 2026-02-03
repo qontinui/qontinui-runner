@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Result of a single iteration of the verification-agentic loop.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IterationResult {
     /// Iteration number (1-indexed)
     pub iteration: u32,
@@ -26,7 +26,7 @@ pub struct IterationResult {
 }
 
 /// Final result of the entire verification-agentic loop.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopResult {
     /// Total number of iterations executed
     pub iterations_run: u32,
@@ -36,20 +36,27 @@ pub struct LoopResult {
     pub max_iterations_reached: bool,
     /// Whether the loop exited due to a critical failure
     pub critical_failure: bool,
+    /// Whether the loop was stopped externally (via stop_ai_analysis endpoint)
+    pub was_stopped: bool,
     /// All iteration results
     pub iteration_results: Vec<IterationResult>,
 }
 
 impl LoopResult {
     /// Check if the workflow should proceed to completion phase.
-    /// Only proceeds if verification passed (not max_iterations or critical failure).
+    /// Only proceeds if verification passed (not max_iterations, critical failure, or stopped).
     pub fn should_run_completion(&self) -> bool {
-        self.verification_passed && !self.critical_failure
+        self.verification_passed && !self.critical_failure && !self.was_stopped
     }
 
     /// Get a human-readable summary of the loop result.
     pub fn summary(&self) -> String {
-        if self.verification_passed {
+        if self.was_stopped {
+            format!(
+                "STOPPED by user after {} iteration(s)",
+                self.iterations_run
+            )
+        } else if self.verification_passed {
             format!(
                 "Verification PASSED after {} iteration(s)",
                 self.iterations_run
@@ -75,8 +82,9 @@ impl LoopResult {
 pub struct LoopConfig {
     /// Maximum number of iterations before giving up
     pub max_iterations: u32,
-    /// Timeout in seconds for AI execution
-    pub timeout_seconds: u64,
+    /// Optional inactivity timeout in seconds for AI execution.
+    /// None = no timeout (recommended), Some(N) = kill AI after N seconds of inactivity.
+    pub timeout_seconds: Option<u64>,
     /// The base prompt for the AI
     pub base_prompt: String,
     /// Workflow name (for logging)
@@ -85,10 +93,16 @@ pub struct LoopConfig {
     pub workflow_id: String,
     /// Execution ID (task_run_id)
     pub execution_id: String,
+    /// Error IDs targeted by this workflow (for auto-resolution on success).
+    /// When the workflow completes successfully, these errors will be marked as resolved.
+    pub targeted_error_ids: Vec<i64>,
+    /// Starting iteration for resumed workflows (0 = start fresh, N = resume from iteration N)
+    pub starting_iteration: u32,
 }
 
 /// Phase of workflow execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WorkflowPhase {
     Setup,
     Verification,
@@ -132,4 +146,52 @@ impl AgenticOutcome {
             _ => None,
         }
     }
+}
+
+/// Extract the parent task ID from a workflow sequence child ID.
+///
+/// For workflow sequences, individual workflows have IDs like:
+/// `workflow-sequence-{timestamp}-workflow-{n}`
+///
+/// But only the parent `workflow-sequence-{timestamp}` exists in task_runs.
+/// This function extracts the parent ID for use in database operations that
+/// reference task_runs (step checkpoints, task_run_events, etc.).
+///
+/// For non-sequence IDs (e.g., `unified-workflow-{id}-{timestamp}`), returns
+/// the original ID unchanged.
+///
+/// # Examples
+///
+/// ```
+/// use qontinui_runner::unified_workflow_executor::get_parent_task_id;
+///
+/// // Sequence child → parent
+/// assert_eq!(
+///     get_parent_task_id("workflow-sequence-1234567890-workflow-1"),
+///     "workflow-sequence-1234567890"
+/// );
+///
+/// // Non-sequence → unchanged
+/// assert_eq!(
+///     get_parent_task_id("unified-workflow-abc-1234567890"),
+///     "unified-workflow-abc-1234567890"
+/// );
+/// ```
+pub fn get_parent_task_id(execution_id: &str) -> String {
+    // Check if this is a sequence child: workflow-sequence-{timestamp}-workflow-{n}
+    if let Some(pos) = execution_id.rfind("-workflow-") {
+        let potential_parent = &execution_id[..pos];
+        // Verify it looks like a sequence parent (starts with workflow-sequence-)
+        if potential_parent.starts_with("workflow-sequence-") {
+            return potential_parent.to_string();
+        }
+    }
+    execution_id.to_string()
+}
+
+/// Check if an execution ID is a workflow sequence child.
+///
+/// Returns true for IDs like `workflow-sequence-{timestamp}-workflow-{n}`.
+pub fn is_sequence_child(execution_id: &str) -> bool {
+    get_parent_task_id(execution_id) != execution_id
 }

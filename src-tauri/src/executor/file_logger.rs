@@ -3,6 +3,8 @@
 //! Writes runner events to .dev-logs/ for access by Claude Code.
 //! Includes saving annotated screenshots from image recognition.
 
+#![allow(dead_code)]
+
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -377,6 +379,15 @@ impl FileLogger {
     }
 
     /// Log an image recognition event, saving images to files
+    #[tracing::instrument(
+        name = "image.recognition.log",
+        skip(data),
+        fields(
+            template = %data.get("template_name").and_then(|v| v.as_str()).or_else(|| data.get("template").and_then(|v| v.as_str())).unwrap_or("unknown"),
+            confidence = %data.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            found = %data.get("found").and_then(|v| v.as_bool()).unwrap_or(false)
+        )
+    )]
     pub fn log_image_recognition(data: &serde_json::Value) {
         if let Err(e) = ensure_dirs() {
             error!("Failed to ensure log directories: {}", e);

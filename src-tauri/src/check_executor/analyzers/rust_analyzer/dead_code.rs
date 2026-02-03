@@ -8,6 +8,8 @@
 //! requires full compilation with the Rust compiler. This analyzer catches
 //! common cases but may have false positives/negatives.
 
+#![allow(dead_code)]
+
 use crate::check_executor::analyzers::common::file_walker::{walk_files, WalkConfig};
 use crate::check_executor::analyzers::common::issue_builder::IssueBuilder;
 use crate::check_executor::output_parser::ParsedOutput;

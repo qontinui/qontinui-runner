@@ -710,3 +710,619 @@ fn emit_flow_event(app_handle: &AppHandle, event: FlowEvent) {
         }
     }
 }
+
+// ============================================================================
+// Pause/Resume Flow Execution
+// ============================================================================
+
+/// Pause a running flow execution.
+///
+/// Sets the flow status to a paused state and stores the current step.
+/// The flow can be resumed with resume_flow_execution.
+#[tauri::command]
+pub async fn pause_flow_execution(
+    app_state: State<'_, Arc<AppState>>,
+    app_handle: AppHandle,
+    instance_id: String,
+) -> Result<bool, String> {
+    let mut storage = EXECUTION_STORAGE.lock().await;
+
+    // Get flow_id first (immutable borrow)
+    let flow_id = storage.flows.get(&instance_id).map(|f| f.id.clone());
+
+    if let Some(state) = storage.executions.get_mut(&instance_id) {
+        // Only pause if running
+        if state.status != FlowStatus::Running {
+            return Err(format!(
+                "Cannot pause flow in {:?} status",
+                state.status
+            ));
+        }
+
+        // For now, we'll use WaitingForInput as a "paused" state
+        // In a full implementation, we'd add a Paused status to FlowStatus
+        state.status = FlowStatus::WaitingForInput;
+
+        let current_step = state.current_step.clone();
+
+        // Persist updated state
+        if let Ok(state_json) = serde_json::to_value(&*state) {
+            let _ = app_state.checkpoint_db.save_flow_execution(&state_json);
+        }
+
+        // Emit pause event (using flow_id captured before mutable borrow)
+        if let Some(flow_id) = flow_id {
+            let _ = app_handle.emit(
+                "flow-event",
+                serde_json::json!({
+                    "type": "flow_paused",
+                    "instance_id": instance_id,
+                    "flow_id": flow_id,
+                    "step_id": current_step,
+                }),
+            );
+        }
+
+        info!(instance_id = %instance_id, "Flow execution paused");
+        Ok(true)
+    } else {
+        Err(format!("Execution '{}' not found", instance_id))
+    }
+}
+
+/// Resume a paused flow execution.
+///
+/// Continues execution from where it was paused.
+#[tauri::command]
+pub async fn resume_flow_execution(
+    app_state: State<'_, Arc<AppState>>,
+    app_handle: AppHandle,
+    instance_id: String,
+) -> Result<bool, String> {
+    let (flow, mut state) = {
+        let mut storage = EXECUTION_STORAGE.lock().await;
+
+        // Get flow first (immutable borrow)
+        let flow = storage
+            .flows
+            .get(&instance_id)
+            .ok_or_else(|| format!("Flow for execution '{}' not found", instance_id))?
+            .clone();
+
+        // Now get mutable reference to state
+        let state = storage
+            .executions
+            .get_mut(&instance_id)
+            .ok_or_else(|| format!("Execution '{}' not found", instance_id))?;
+
+        // Check if flow is paused (using WaitingForInput as paused state for now)
+        if state.status != FlowStatus::WaitingForInput {
+            return Err(format!(
+                "Cannot resume flow in {:?} status",
+                state.status
+            ));
+        }
+
+        // Set back to running
+        state.status = FlowStatus::Running;
+
+        (flow, state.clone())
+    };
+
+    // Emit resume event
+    let _ = app_handle.emit(
+        "flow-event",
+        serde_json::json!({
+            "type": "flow_resumed",
+            "instance_id": instance_id,
+            "flow_id": flow.id,
+            "step_id": state.current_step,
+        }),
+    );
+
+    // Create executor with event emitter
+    let app_handle_clone = app_handle.clone();
+    let executor = FlowExecutor::new().with_event_callback(move |event| {
+        emit_flow_event(&app_handle_clone, event);
+    });
+
+    // Continue execution
+    let result = executor.execute(&flow, &mut state).await;
+
+    // Update storage with final state
+    {
+        let mut storage = EXECUTION_STORAGE.lock().await;
+        storage
+            .executions
+            .insert(instance_id.clone(), state.clone());
+    }
+
+    // Persist final state
+    if let Ok(state_json) = serde_json::to_value(&state) {
+        let _ = app_state.checkpoint_db.save_flow_execution(&state_json);
+    }
+
+    match result {
+        Ok(()) => {
+            info!(
+                instance_id = %instance_id,
+                "Flow execution resumed and completed"
+            );
+            Ok(true)
+        }
+        Err(e) => {
+            warn!(
+                instance_id = %instance_id,
+                error = %e,
+                "Flow execution resumed but failed"
+            );
+            Err(e)
+        }
+    }
+}
+
+/// Step into a paused flow (execute one step and pause again).
+#[tauri::command]
+pub async fn step_into_flow(
+    app_state: State<'_, Arc<AppState>>,
+    app_handle: AppHandle,
+    instance_id: String,
+) -> Result<StepExecutionResult, String> {
+    let mut storage = EXECUTION_STORAGE.lock().await;
+
+    // Get flow and state
+    let flow = storage
+        .flows
+        .get(&instance_id)
+        .ok_or_else(|| format!("Flow for execution '{}' not found", instance_id))?
+        .clone();
+
+    let state = storage
+        .executions
+        .get_mut(&instance_id)
+        .ok_or_else(|| format!("Execution '{}' not found", instance_id))?;
+
+    // Check if flow is paused (using WaitingForInput as paused state)
+    if state.status != FlowStatus::WaitingForInput {
+        return Err(format!(
+            "Cannot step into flow in {:?} status",
+            state.status
+        ));
+    }
+
+    // Temporarily set to running
+    state.status = FlowStatus::Running;
+
+    // Create executor with event emitter
+    let app_handle_clone = app_handle.clone();
+    let executor = FlowExecutor::new().with_event_callback(move |event| {
+        emit_flow_event(&app_handle_clone, event);
+    });
+
+    // Execute one step
+    let result = executor.step_once(&flow, state).await;
+
+    // If not finished, pause again
+    if !state.is_finished() {
+        state.status = FlowStatus::WaitingForInput;
+    }
+
+    // Persist updated state
+    if let Ok(state_json) = serde_json::to_value(&*state) {
+        let _ = app_state.checkpoint_db.save_flow_execution(&state_json);
+    }
+
+    match result {
+        Ok(step_result) => Ok(StepExecutionResult {
+            step_id: Some(step_result.step_id),
+            success: step_result.success,
+            flow_completed: state.is_finished(),
+            outputs: step_result.outputs,
+            error: step_result.error,
+            next_step: state.current_step.clone(),
+        }),
+        Err(e) => Err(e),
+    }
+}
+
+// ============================================================================
+// Flow Version History
+// ============================================================================
+
+/// Summary of a flow version (without full definition).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlowVersionSummary {
+    pub id: String,
+    pub flow_id: String,
+    pub version: i32,
+    pub message: Option<String>,
+    pub created_by: Option<String>,
+    pub created_at: String,
+}
+
+/// Full flow version data including definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlowVersion {
+    pub id: String,
+    pub flow_id: String,
+    pub version: i32,
+    pub definition: serde_json::Value,
+    pub message: Option<String>,
+    pub created_by: Option<String>,
+    pub created_at: String,
+}
+
+/// Result of comparing two versions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlowVersionComparison {
+    pub flow_id: String,
+    pub version1: FlowVersionDetail,
+    pub version2: FlowVersionDetail,
+}
+
+/// Version detail for comparison.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlowVersionDetail {
+    pub version: i32,
+    pub definition: serde_json::Value,
+    pub message: Option<String>,
+    pub created_at: String,
+    pub created_by: Option<String>,
+}
+
+/// Create a new version snapshot of a flow.
+///
+/// This stores the current state of the flow as a version, which can be
+/// restored later. Version numbers are automatically incremented.
+#[tauri::command]
+pub fn create_flow_version(
+    state: State<'_, Arc<AppState>>,
+    flow_id: String,
+    message: Option<String>,
+    created_by: Option<String>,
+) -> Result<FlowVersionSummary, String> {
+    // Get current flow definition
+    let flow_json = state
+        .checkpoint_db
+        .get_flow(&flow_id)?
+        .ok_or_else(|| format!("Flow '{}' not found", flow_id))?;
+
+    // Create version
+    let version = state.checkpoint_db.create_flow_version(
+        &flow_id,
+        &flow_json,
+        message.as_deref(),
+        created_by.as_deref(),
+    )?;
+
+    Ok(FlowVersionSummary {
+        id: version["id"].as_str().unwrap_or("").to_string(),
+        flow_id: version["flow_id"].as_str().unwrap_or("").to_string(),
+        version: version["version"].as_i64().unwrap_or(0) as i32,
+        message: version["message"].as_str().map(|s| s.to_string()),
+        created_by: version["created_by"].as_str().map(|s| s.to_string()),
+        created_at: version["created_at"].as_str().unwrap_or("").to_string(),
+    })
+}
+
+/// List all versions of a flow.
+///
+/// Returns version summaries (without full definitions) in descending order.
+#[tauri::command]
+pub fn list_flow_versions(
+    state: State<'_, Arc<AppState>>,
+    flow_id: String,
+) -> Result<Vec<FlowVersionSummary>, String> {
+    let versions_json = state.checkpoint_db.list_flow_versions(&flow_id)?;
+
+    let summaries = versions_json
+        .into_iter()
+        .map(|v| FlowVersionSummary {
+            id: v["id"].as_str().unwrap_or("").to_string(),
+            flow_id: v["flow_id"].as_str().unwrap_or("").to_string(),
+            version: v["version"].as_i64().unwrap_or(0) as i32,
+            message: v["message"].as_str().map(|s| s.to_string()),
+            created_by: v["created_by"].as_str().map(|s| s.to_string()),
+            created_at: v["created_at"].as_str().unwrap_or("").to_string(),
+        })
+        .collect();
+
+    Ok(summaries)
+}
+
+/// Get a specific version of a flow.
+///
+/// Returns the full version data including the flow definition.
+#[tauri::command]
+pub fn get_flow_version(
+    state: State<'_, Arc<AppState>>,
+    flow_id: String,
+    version: i32,
+) -> Result<Option<FlowVersion>, String> {
+    let version_json = state.checkpoint_db.get_flow_version(&flow_id, version)?;
+
+    Ok(version_json.map(|v| FlowVersion {
+        id: v["id"].as_str().unwrap_or("").to_string(),
+        flow_id: v["flow_id"].as_str().unwrap_or("").to_string(),
+        version: v["version"].as_i64().unwrap_or(0) as i32,
+        definition: v["definition"].clone(),
+        message: v["message"].as_str().map(|s| s.to_string()),
+        created_by: v["created_by"].as_str().map(|s| s.to_string()),
+        created_at: v["created_at"].as_str().unwrap_or("").to_string(),
+    }))
+}
+
+/// Restore a flow to a specific version.
+///
+/// This creates a backup of the current state, then restores the flow
+/// to the specified version. Returns the new version number created.
+#[tauri::command]
+pub fn restore_flow_version(
+    state: State<'_, Arc<AppState>>,
+    flow_id: String,
+    version: i32,
+    created_by: Option<String>,
+) -> Result<serde_json::Value, String> {
+    state
+        .checkpoint_db
+        .restore_flow_version(&flow_id, version, created_by.as_deref())
+}
+
+/// Compare two versions of a flow.
+///
+/// Returns the full definitions of both versions for client-side comparison.
+#[tauri::command]
+pub fn compare_flow_versions(
+    state: State<'_, Arc<AppState>>,
+    flow_id: String,
+    version1: i32,
+    version2: i32,
+) -> Result<FlowVersionComparison, String> {
+    let comparison = state
+        .checkpoint_db
+        .compare_flow_versions(&flow_id, version1, version2)?;
+
+    Ok(FlowVersionComparison {
+        flow_id: comparison["flow_id"].as_str().unwrap_or("").to_string(),
+        version1: FlowVersionDetail {
+            version: comparison["version1"]["version"].as_i64().unwrap_or(0) as i32,
+            definition: comparison["version1"]["definition"].clone(),
+            message: comparison["version1"]["message"]
+                .as_str()
+                .map(|s| s.to_string()),
+            created_at: comparison["version1"]["created_at"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
+            created_by: comparison["version1"]["created_by"]
+                .as_str()
+                .map(|s| s.to_string()),
+        },
+        version2: FlowVersionDetail {
+            version: comparison["version2"]["version"].as_i64().unwrap_or(0) as i32,
+            definition: comparison["version2"]["definition"].clone(),
+            message: comparison["version2"]["message"]
+                .as_str()
+                .map(|s| s.to_string()),
+            created_at: comparison["version2"]["created_at"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
+            created_by: comparison["version2"]["created_by"]
+                .as_str()
+                .map(|s| s.to_string()),
+        },
+    })
+}
+
+/// Delete a specific version of a flow.
+#[tauri::command]
+pub fn delete_flow_version(
+    state: State<'_, Arc<AppState>>,
+    flow_id: String,
+    version: i32,
+) -> Result<bool, String> {
+    state.checkpoint_db.delete_flow_version(&flow_id, version)
+}
+
+/// Get the latest version number of a flow.
+#[tauri::command]
+pub fn get_latest_flow_version(
+    state: State<'_, Arc<AppState>>,
+    flow_id: String,
+) -> Result<Option<i32>, String> {
+    state.checkpoint_db.get_latest_flow_version(&flow_id)
+}
+
+// ============================================================================
+// Flow Import/Export
+// ============================================================================
+
+/// Export format for flows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlowExport {
+    /// Export format version for compatibility.
+    pub format_version: String,
+    /// Export timestamp.
+    pub exported_at: String,
+    /// The flow definition.
+    pub flow: serde_json::Value,
+}
+
+/// Export a flow to JSON format.
+///
+/// Returns a JSON string that can be saved to a file.
+#[tauri::command]
+pub fn export_flow_json(
+    state: State<'_, Arc<AppState>>,
+    flow_id: String,
+) -> Result<String, String> {
+    let flow_json = state
+        .checkpoint_db
+        .get_flow(&flow_id)?
+        .ok_or_else(|| format!("Flow '{}' not found", flow_id))?;
+
+    let export = FlowExport {
+        format_version: "1.0.0".to_string(),
+        exported_at: chrono::Utc::now().to_rfc3339(),
+        flow: flow_json,
+    };
+
+    serde_json::to_string_pretty(&export).map_err(|e| format!("Failed to serialize flow: {}", e))
+}
+
+/// Export a flow to YAML format.
+///
+/// Returns a YAML string that can be saved to a file.
+#[tauri::command]
+pub fn export_flow_yaml(
+    state: State<'_, Arc<AppState>>,
+    flow_id: String,
+) -> Result<String, String> {
+    let flow_json = state
+        .checkpoint_db
+        .get_flow(&flow_id)?
+        .ok_or_else(|| format!("Flow '{}' not found", flow_id))?;
+
+    let export = FlowExport {
+        format_version: "1.0.0".to_string(),
+        exported_at: chrono::Utc::now().to_rfc3339(),
+        flow: flow_json,
+    };
+
+    serde_yaml::to_string(&export).map_err(|e| format!("Failed to serialize flow to YAML: {}", e))
+}
+
+/// Import a flow from JSON format.
+///
+/// Returns the ID of the imported flow.
+#[tauri::command]
+pub fn import_flow_json(
+    state: State<'_, Arc<AppState>>,
+    content: String,
+    generate_new_id: bool,
+) -> Result<Flow, String> {
+    // Try to parse as FlowExport first
+    let flow_json: serde_json::Value = if let Ok(export) =
+        serde_json::from_str::<FlowExport>(&content)
+    {
+        export.flow
+    } else {
+        // Fall back to parsing as raw Flow
+        serde_json::from_str(&content).map_err(|e| format!("Invalid JSON: {}", e))?
+    };
+
+    // Deserialize to Flow to validate structure
+    let mut flow: Flow =
+        serde_json::from_value(flow_json).map_err(|e| format!("Invalid flow structure: {}", e))?;
+
+    // Generate new ID if requested
+    if generate_new_id {
+        flow.id = format!("flow-{}", chrono::Utc::now().timestamp_millis());
+    }
+
+    // Save to database
+    let flow_json =
+        serde_json::to_value(&flow).map_err(|e| format!("Failed to serialize flow: {}", e))?;
+    state.checkpoint_db.save_flow(&flow_json)?;
+
+    Ok(flow)
+}
+
+/// Import a flow from YAML format.
+///
+/// Returns the imported flow.
+#[tauri::command]
+pub fn import_flow_yaml(
+    state: State<'_, Arc<AppState>>,
+    content: String,
+    generate_new_id: bool,
+) -> Result<Flow, String> {
+    // Try to parse as FlowExport first
+    let flow_value: serde_json::Value =
+        if let Ok(export) = serde_yaml::from_str::<FlowExport>(&content) {
+            export.flow
+        } else {
+            // Fall back to parsing as raw Flow
+            let yaml_value: serde_yaml::Value =
+                serde_yaml::from_str(&content).map_err(|e| format!("Invalid YAML: {}", e))?;
+            serde_json::to_value(yaml_value).map_err(|e| format!("Failed to convert YAML: {}", e))?
+        };
+
+    // Deserialize to Flow to validate structure
+    let mut flow: Flow = serde_json::from_value(flow_value)
+        .map_err(|e| format!("Invalid flow structure: {}", e))?;
+
+    // Generate new ID if requested
+    if generate_new_id {
+        flow.id = format!("flow-{}", chrono::Utc::now().timestamp_millis());
+    }
+
+    // Save to database
+    let flow_json =
+        serde_json::to_value(&flow).map_err(|e| format!("Failed to serialize flow: {}", e))?;
+    state.checkpoint_db.save_flow(&flow_json)?;
+
+    Ok(flow)
+}
+
+/// Export multiple flows to a single JSON file.
+#[tauri::command]
+pub fn export_flows_bulk(
+    state: State<'_, Arc<AppState>>,
+    flow_ids: Vec<String>,
+) -> Result<String, String> {
+    let mut flows = Vec::new();
+
+    for flow_id in flow_ids {
+        if let Some(flow_json) = state.checkpoint_db.get_flow(&flow_id)? {
+            flows.push(flow_json);
+        }
+    }
+
+    let export = serde_json::json!({
+        "format_version": "1.0.0",
+        "exported_at": chrono::Utc::now().to_rfc3339(),
+        "flows": flows,
+    });
+
+    serde_json::to_string_pretty(&export).map_err(|e| format!("Failed to serialize flows: {}", e))
+}
+
+/// Import multiple flows from a bulk export.
+#[tauri::command]
+pub fn import_flows_bulk(
+    state: State<'_, Arc<AppState>>,
+    content: String,
+    generate_new_ids: bool,
+) -> Result<Vec<Flow>, String> {
+    let import: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| format!("Invalid JSON: {}", e))?;
+
+    let flows_array = import["flows"]
+        .as_array()
+        .ok_or("Expected 'flows' array in import file")?;
+
+    let mut imported_flows = Vec::new();
+
+    for flow_value in flows_array {
+        let mut flow: Flow = serde_json::from_value(flow_value.clone())
+            .map_err(|e| format!("Invalid flow structure: {}", e))?;
+
+        if generate_new_ids {
+            flow.id = format!(
+                "flow-{}-{}",
+                chrono::Utc::now().timestamp_millis(),
+                imported_flows.len()
+            );
+        }
+
+        let flow_json =
+            serde_json::to_value(&flow).map_err(|e| format!("Failed to serialize flow: {}", e))?;
+        state.checkpoint_db.save_flow(&flow_json)?;
+
+        imported_flows.push(flow);
+    }
+
+    Ok(imported_flows)
+}

@@ -51,7 +51,7 @@ pub fn parse_curl(curl_command: &str) -> Result<ParsedCurl, CurlParseError> {
     let mut method = HttpMethod::Get;
     let mut headers: HashMap<String, String> = HashMap::new();
     let mut body: Option<String> = None;
-    let url: Option<String>;
+    
 
     // Parse method (-X or --request)
     let method_re = Regex::new(r#"(?:-X|--request)\s+['""]?(\w+)['""]?"#).unwrap();
@@ -91,10 +91,10 @@ pub fn parse_curl(curl_command: &str) -> Result<ParsedCurl, CurlParseError> {
     // Also try to match @- (stdin) data format
     let data_at_re = Regex::new(r#"(?:-d|--data(?:-raw)?)\s+@-"#).unwrap();
     if data_at_re.is_match(&normalized) {
-        // Look for a heredoc or subsequent data
-        let heredoc_re = Regex::new(r#"<<\s*['""]?(\w+)['""]?\s*([\s\S]*?)\1"#).unwrap();
-        if let Some(caps) = heredoc_re.captures(&normalized) {
-            body = Some(caps[2].trim().to_string());
+        // Look for a heredoc - common delimiters are EOF, END, HEREDOC
+        // We can't use backreferences in Rust regex, so we try common delimiters
+        if let Some(heredoc_body) = extract_heredoc(&normalized) {
+            body = Some(heredoc_body);
             if method == HttpMethod::Get {
                 method = HttpMethod::Post;
             }
@@ -112,7 +112,7 @@ pub fn parse_curl(curl_command: &str) -> Result<ParsedCurl, CurlParseError> {
     }
 
     // Parse URL - try multiple patterns
-    url = extract_url(&normalized);
+    let url: Option<String> = extract_url(&normalized);
 
     let url = url.ok_or(CurlParseError::MissingUrl)?;
 
@@ -207,6 +207,25 @@ fn unescape_json(s: &str) -> String {
         .replace("\\n", "\n")
         .replace("\\t", "\t")
         .replace("\\\\", "\\")
+}
+
+/// Extract heredoc body from curl command
+/// Supports common delimiters: EOF, END, HEREDOC
+fn extract_heredoc(cmd: &str) -> Option<String> {
+    // Common heredoc delimiters
+    let delimiters = ["EOF", "END", "HEREDOC"];
+
+    for delimiter in delimiters {
+        // Match <<DELIMITER or <<'DELIMITER' patterns
+        let pattern = format!(r"<<'?{}'?\s*(.+?)\s*{}", delimiter, delimiter);
+        if let Ok(re) = Regex::new(&pattern) {
+            if let Some(caps) = re.captures(cmd) {
+                return Some(caps[1].trim().to_string());
+            }
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]

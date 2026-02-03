@@ -55,7 +55,7 @@ fn find_recent_screenshot(max_age: Duration) -> Option<String> {
                 let path = entry.path();
 
                 // Only consider PNG files
-                if path.extension().map_or(false, |ext| ext == "png") {
+                if path.extension().is_some_and(|ext| ext == "png") {
                     if let Ok(metadata) = path.metadata() {
                         if let Ok(modified) = metadata.modified() {
                             // Check if within max_age

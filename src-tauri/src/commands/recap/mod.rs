@@ -65,6 +65,13 @@ pub async fn get_task_run_recap(
             Vec::new()
         });
 
+    info!(
+        "get_task_run_recap: task_run_id='{}', events_count={}, automations_count={}",
+        task_run_id,
+        events.len(),
+        automations.len()
+    );
+
     // Get orchestrator verification results for this task run (criterion-based)
     let verification_results = state
         .checkpoint_db

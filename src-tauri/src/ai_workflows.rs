@@ -7,6 +7,10 @@
 //! - Execution steps (GUI automation, Playwright tests, prompts, state visits)
 //! - Screenshot capture settings
 //! - Goal description
+//!
+//! NOTE: This module is intentionally kept for future workflow persistence features.
+
+#![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 use std::fs;

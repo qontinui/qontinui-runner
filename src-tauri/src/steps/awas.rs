@@ -9,6 +9,8 @@
 //!
 //! These steps use the Python bridge AWAS commands already implemented.
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -85,8 +87,10 @@ pub struct AwasExtractElementsStepConfig {
     pub base_url: Option<String>,
 }
 
+/// Default timeout for AWAS operations.
+/// Returns 0 to indicate no timeout (run until completion).
 fn default_timeout() -> u64 {
-    30
+    0 // No timeout - run until completion
 }
 
 // ============================================================================

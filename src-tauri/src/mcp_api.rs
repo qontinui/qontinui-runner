@@ -27,6 +27,8 @@
 //!
 //! When a CLICK action targets the FIND result, pyautogui needs **absolute virtual
 //! desktop coordinates** to position the mouse correctly.
+
+#![allow(dead_code)]
 //!
 //! ## The Offset Calculation
 //!
@@ -77,7 +79,6 @@ use tracing::{debug, error, info, warn};
 use regex::Regex;
 
 use crate::action_service::UnifiedActionService;
-use crate::commands::project_logs;
 use crate::commands::rag::{send_embeddings_to_web, RAGState};
 use crate::commands::AppState;
 use crate::config::ConfigLoader;
@@ -88,24 +89,25 @@ use crate::dom_capture::{
 };
 use crate::findings::storage as finding_storage;
 use crate::findings::{Finding, FindingParser, ParsedFinding};
+use crate::workflow_state::{ParsedProgress, ProgressParser};
 use crate::mcp::awas::{
     awas_check_support, awas_discover, awas_execute, awas_extract_elements, awas_list_actions,
 };
 use crate::mcp::types::{GoToStateRequest, GoToStateResult};
 use crate::orchestrator::{
-    CompressionConfig, DeterministicVerifier, Orchestrator, OrchestratorConfig, OrchestratorState,
-    RetryConfig, RetryService, RetryState, WorkerOutputAction, WorkerSignal,
+    DeterministicVerifier, OrchestratorState,
+    RetryConfig, RetryService, RetryState, WorkerSignal,
 };
 use crate::rag::{ImportResult, QontinuiConfig, RAGConfigSummary};
 use crate::scriptlets;
-use crate::session::SessionManager;
 use crate::settings;
 use crate::step_event_builder::categorize_steps;
 use crate::summary_generator;
-use crate::task_monitor::TaskMonitor;
 use crate::task_recorder::{TaskConfig, TaskRecorder};
 use crate::tiered_info::{self, RunDetails};
 use crate::workflow_generation;
+use crate::executor::with_default_bridge;
+use crate::timeout_config::Timeouts;
 // WorkflowManager import removed - using unified SessionManager instead
 use axum::routing::{delete, put};
 use tauri::{Emitter, Manager};
@@ -401,7 +403,7 @@ fn extract_text_from_stream_json(json_line: &str) -> Option<String> {
 
 /// Structured finding output instructions with few-shot examples.
 /// This is injected into prompts so the AI outputs findings in a parseable format.
-const FINDING_INSTRUCTIONS: &str = r#"
+pub const FINDING_INSTRUCTIONS: &str = r#"
 ---
 
 ## MANDATORY: Structured Finding Output Format
@@ -509,16 +511,21 @@ Line: 12
 /// If `finding_ctx` is provided, the function will parse AI output for [FINDING:...] markers
 /// and store detected findings in the database, emitting events for each finding.
 ///
+/// If `progress_ctx` is provided, the function will parse AI output for progress markers
+/// and store them in the database, emitting events for each progress update.
+///
 /// If `pid_tracker` is provided, the child process PID will be stored there so it can be
 /// killed by the stop_ai_analysis endpoint.
+#[allow(clippy::too_many_arguments)]
 fn run_claude_session_inline(
     working_dir: &str,
     prompt: &str,
     session_id: &str,
     app_handle: &tauri::AppHandle,
-    timeout_seconds: u64,
-    session_ctx: Option<AiOutputSessionContext>,
+    timeout_seconds: Option<u64>,
+    session_ctx: Option<AiSessionContext>,
     finding_ctx: Option<FindingContext>,
+    progress_ctx: Option<ProgressContext>,
     pid_tracker: Option<Arc<std::sync::Mutex<Vec<u32>>>>,
 ) -> Result<(bool, String), String> {
     use std::io::{BufRead, BufReader, Read, Write};
@@ -527,9 +534,13 @@ fn run_claude_session_inline(
     use std::thread;
     use std::time::{Duration, Instant};
 
+    let timeout_msg = match timeout_seconds {
+        Some(t) => format!("timeout: {}s", t),
+        None => "no timeout".to_string(),
+    };
     info!(
-        "Running Claude session inline: {} (timeout: {}s)",
-        session_id, timeout_seconds
+        "Running Claude session inline: {} ({})",
+        session_id, timeout_msg
     );
 
     // Write prompt to temp file
@@ -666,12 +677,16 @@ fn run_claude_session_inline(
     // Channel for parsed findings (sent from stdout thread to finding processor thread)
     let (finding_tx, finding_rx) = mpsc::channel::<ParsedFinding>();
 
+    // Channel for parsed progress markers (sent from stdout thread to progress processor thread)
+    let (progress_tx, progress_rx) = mpsc::channel::<ParsedProgress>();
+
     // Stdout reader thread
     let stdout = child.stdout.take();
     let app_handle_stdout = app_handle.clone();
     let has_output_stdout = has_output.clone();
     let session_ctx_stdout = session_ctx.clone();
     let finding_ctx_for_stdout = finding_ctx.clone();
+    let progress_ctx_for_stdout = progress_ctx.clone();
 
     let stdout_handle = thread::spawn(move || {
         let mut all_text = String::new();
@@ -682,10 +697,17 @@ fn run_claude_session_inline(
             None
         };
 
-        // Buffer to accumulate text until we have complete lines for finding parsing.
+        // Create progress parser if we have a progress context
+        let mut progress_parser = if progress_ctx_for_stdout.is_some() {
+            Some(ProgressParser::new())
+        } else {
+            None
+        };
+
+        // Buffer to accumulate text until we have complete lines for finding/progress parsing.
         // Stream-json sends partial text chunks (content_block_delta), so markers like
-        // [FINDING:code_bug:high] can be split across multiple events. We need to buffer
-        // and only parse complete lines (ending with \n) for findings.
+        // [FINDING:code_bug:high] or [PROGRESS: 50/100] can be split across multiple events.
+        // We need to buffer and only parse complete lines (ending with \n).
         let mut line_buffer = String::new();
 
         if let Some(stdout) = stdout {
@@ -712,20 +734,27 @@ fn run_claude_session_inline(
                             );
                         }));
 
-                        // Parse complete lines for findings
-                        // We buffer text until we encounter newlines, then process
-                        // complete lines through the finding parser
-                        if let Some(ref mut parser) = finding_parser {
-                            line_buffer.push_str(&text);
+                        // Buffer text and parse complete lines for findings and progress
+                        line_buffer.push_str(&text);
 
-                            // Process complete lines from the buffer
-                            while let Some(newline_pos) = line_buffer.find('\n') {
-                                let complete_line = line_buffer[..newline_pos].to_string();
-                                line_buffer = line_buffer[newline_pos + 1..].to_string();
+                        // Process complete lines from the buffer
+                        while let Some(newline_pos) = line_buffer.find('\n') {
+                            let complete_line = line_buffer[..newline_pos].to_string();
+                            line_buffer = line_buffer[newline_pos + 1..].to_string();
 
+                            // Parse for findings
+                            if let Some(ref mut parser) = finding_parser {
                                 if let Some(parsed_finding) = parser.process_line(&complete_line) {
                                     // Send the parsed finding to the processor thread
                                     let _ = finding_tx.send(parsed_finding);
+                                }
+                            }
+
+                            // Parse for progress markers
+                            if let Some(ref mut parser) = progress_parser {
+                                if let Some(parsed_progress) = parser.parse_line(&complete_line) {
+                                    // Send the parsed progress to the processor thread
+                                    let _ = progress_tx.send(parsed_progress);
                                 }
                             }
                         }
@@ -737,10 +766,15 @@ fn run_claude_session_inline(
         }
 
         // Process any remaining text in the buffer (final line without trailing newline)
-        if let Some(ref mut parser) = finding_parser {
-            if !line_buffer.is_empty() {
+        if !line_buffer.is_empty() {
+            if let Some(ref mut parser) = finding_parser {
                 if let Some(parsed_finding) = parser.process_line(&line_buffer) {
                     let _ = finding_tx.send(parsed_finding);
+                }
+            }
+            if let Some(ref mut parser) = progress_parser {
+                if let Some(parsed_progress) = parser.parse_line(&line_buffer) {
+                    let _ = progress_tx.send(parsed_progress);
                 }
             }
         }
@@ -853,6 +887,147 @@ fn run_claude_session_inline(
         detected_findings
     });
 
+    // Progress processor thread - stores progress markers in DB and emits events
+    let app_handle_progress = app_handle.clone();
+    let progress_ctx_for_processor = progress_ctx.clone();
+    let session_ctx_for_progress = session_ctx.clone();
+
+    let progress_processor_handle = thread::spawn(move || {
+        let mut progress_count: u32 = 0;
+
+        // Only process if we have a progress context
+        if let Some(ctx) = progress_ctx_for_processor {
+            // Open a database connection for this thread
+            let db = match CheckpointDb::new() {
+                Ok(db) => Some(db),
+                Err(e) => {
+                    warn!("Failed to open database for progress storage: {}", e);
+                    None
+                }
+            };
+
+            // Process incoming progress markers from the channel
+            while let Ok(parsed_progress) = progress_rx.recv() {
+                // Log the detection
+                debug!(
+                    "Detected progress: {} - {}/{}",
+                    parsed_progress.marker_type,
+                    parsed_progress.current,
+                    parsed_progress.total.map(|t| t.to_string()).unwrap_or_else(|| "?".to_string())
+                );
+
+                // Handle STEP_COMPLETE markers specially for granular checkpointing
+                let is_step_complete = parsed_progress.marker_type == crate::workflow_state::progress_markers::STEP_COMPLETE;
+
+                // Build extra JSON data for step_complete markers (includes sub_step_id)
+                let data_json = if is_step_complete {
+                    parsed_progress.sub_step_id.as_ref().map(|id| {
+                        serde_json::json!({ "sub_step_id": id }).to_string()
+                    })
+                } else {
+                    None
+                };
+
+                // Store in database if connection is available
+                if let Some(ref db) = db {
+                    match db.save_step_progress_marker(
+                        &ctx.checkpoint_id,
+                        &parsed_progress.marker_type,
+                        parsed_progress.current,
+                        parsed_progress.total,
+                        parsed_progress.description.as_deref(),
+                        data_json.as_deref(),
+                    ) {
+                        Ok(_marker_id) => {
+                            progress_count += 1;
+
+                            // Emit progress event to frontend
+                            let progress_event = serde_json::json!({
+                                "checkpoint_id": ctx.checkpoint_id,
+                                "task_run_id": ctx.task_run_id,
+                                "marker_type": parsed_progress.marker_type,
+                                "current": parsed_progress.current,
+                                "total": parsed_progress.total,
+                                "percentage": parsed_progress.percentage(),
+                                "description": parsed_progress.description,
+                            });
+
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                if let Err(e) = app_handle_progress.emit("step_progress", &progress_event) {
+                                    warn!("Failed to emit step_progress event: {}", e);
+                                }
+                            }));
+
+                            // Emit special event for STEP_COMPLETE markers (sub-step granular checkpointing)
+                            if is_step_complete {
+                                if let Some(ref sub_step_id) = parsed_progress.sub_step_id {
+                                    let sub_step_event = serde_json::json!({
+                                        "checkpoint_id": ctx.checkpoint_id,
+                                        "task_run_id": ctx.task_run_id,
+                                        "sub_step_id": sub_step_id,
+                                        "description": parsed_progress.description,
+                                    });
+                                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        if let Err(e) = app_handle_progress.emit("sub_step_complete", &sub_step_event) {
+                                            warn!("Failed to emit sub_step_complete event: {}", e);
+                                        }
+                                    }));
+                                    info!(
+                                        "Sub-step completed: {} (checkpoint: {})",
+                                        sub_step_id, ctx.checkpoint_id
+                                    );
+                                }
+                            }
+
+                            // Emit as AI output for visibility in the session log
+                            let progress_msg = if let Some(total) = parsed_progress.total {
+                                let pct = if total > 0 {
+                                    (parsed_progress.current as f64 / total as f64 * 100.0) as u32
+                                } else {
+                                    0
+                                };
+                                format!(
+                                    "📊 Progress: {}/{} ({}%) - {}",
+                                    parsed_progress.current,
+                                    total,
+                                    pct,
+                                    parsed_progress.marker_type
+                                )
+                            } else {
+                                format!(
+                                    "📊 Progress: {} - {}",
+                                    parsed_progress.current,
+                                    parsed_progress.marker_type
+                                )
+                            };
+
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                emit_ai_output(
+                                    &app_handle_progress,
+                                    &progress_msg,
+                                    "progress",
+                                    None,
+                                    session_ctx_for_progress.as_ref(),
+                                );
+                            }));
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to store progress marker '{}': {}",
+                                parsed_progress.marker_type, e
+                            );
+                        }
+                    }
+                }
+            }
+        } else {
+            // No progress context - just drain the channel to avoid blocking
+            while progress_rx.recv().is_ok() {}
+        }
+
+        progress_count
+    });
+
     // Stderr reader thread
     let stderr = child.stderr.take();
     let stderr_handle = thread::spawn(move || {
@@ -863,30 +1038,33 @@ fn run_claude_session_inline(
         output
     });
 
-    // Wait for process with inactivity timeout
+    // Wait for process with optional inactivity timeout
     let status = loop {
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let last_activity_secs = last_activity.load(Ordering::Relaxed);
-        let inactive_secs = now_secs.saturating_sub(last_activity_secs);
+        // Only check timeout if one is configured
+        if let Some(timeout) = timeout_seconds {
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let last_activity_secs = last_activity.load(Ordering::Relaxed);
+            let inactive_secs = now_secs.saturating_sub(last_activity_secs);
 
-        if inactive_secs > timeout_seconds {
-            warn!(
-                "Session {} timed out after {}s of inactivity",
-                session_id, inactive_secs
-            );
-            let _ = child.kill();
-            thread::sleep(Duration::from_millis(500));
-            let _ = child.try_wait();
-            let _ = stop_tx.send(());
-            let _ = heartbeat_handle.join();
-            let _ = std::fs::remove_file(&prompt_file);
-            return Err(format!(
-                "Session timed out after {}s of inactivity",
-                inactive_secs
-            ));
+            if inactive_secs > timeout {
+                warn!(
+                    "Session {} timed out after {}s of inactivity",
+                    session_id, inactive_secs
+                );
+                let _ = child.kill();
+                thread::sleep(Duration::from_millis(500));
+                let _ = child.try_wait();
+                let _ = stop_tx.send(());
+                let _ = heartbeat_handle.join();
+                let _ = std::fs::remove_file(&prompt_file);
+                return Err(format!(
+                    "Session timed out after {}s of inactivity",
+                    inactive_secs
+                ));
+            }
         }
 
         match child.try_wait() {
@@ -909,6 +1087,8 @@ fn run_claude_session_inline(
     // Wait for the finding processor thread to complete
     // (it will exit when the stdout thread closes the channel sender)
     let detected_findings = finding_processor_handle.join().unwrap_or_default();
+    // Wait for the progress processor thread to complete
+    let progress_count = progress_processor_handle.join().unwrap_or_default();
     let _ = std::fs::remove_file(&prompt_file);
 
     // Log summary of detected findings
@@ -917,6 +1097,15 @@ fn run_claude_session_inline(
             "Session {} detected {} findings",
             session_id,
             detected_findings.len()
+        );
+    }
+
+    // Log summary of progress markers
+    if progress_count > 0 {
+        info!(
+            "Session {} recorded {} progress markers",
+            session_id,
+            progress_count
         );
     }
 
@@ -937,11 +1126,12 @@ fn run_claude_session_inline(
 
     let success = status.success();
     info!(
-        "Session {} completed: success={}, output_len={}, findings={}",
+        "Session {} completed: success={}, output_len={}, findings={}, progress_markers={}",
         session_id,
         success,
         all_output.len(),
-        detected_findings.len()
+        detected_findings.len(),
+        progress_count
     );
 
     // Remove PID from tracker now that session is complete
@@ -967,9 +1157,10 @@ pub fn run_claude_session_with_retry(
     prompt: &str,
     session_id: &str,
     app_handle: &tauri::AppHandle,
-    timeout_seconds: u64,
-    session_ctx: Option<AiOutputSessionContext>,
+    timeout_seconds: Option<u64>,
+    session_ctx: Option<AiSessionContext>,
     finding_ctx: Option<FindingContext>,
+    progress_ctx: Option<ProgressContext>,
     pid_tracker: Option<Arc<std::sync::Mutex<Vec<u32>>>>,
     retry_config: Option<&RetryConfig>,
 ) -> Result<(bool, String, Option<RetryState>), String> {
@@ -988,6 +1179,7 @@ pub fn run_claude_session_with_retry(
                 timeout_seconds,
                 session_ctx,
                 finding_ctx,
+                progress_ctx,
                 pid_tracker,
             )?;
             return Ok((result.0, result.1, None));
@@ -1000,9 +1192,20 @@ pub fn run_claude_session_with_retry(
 
     loop {
         // Clone contexts for each attempt (they might be consumed)
-        let ctx_clone = session_ctx.clone();
+        let mut ctx_clone = session_ctx.clone();
         let finding_ctx_clone = finding_ctx.clone();
+        let progress_ctx_clone = progress_ctx.clone();
         let pid_tracker_clone = pid_tracker.clone();
+
+        // Update retry information on the context if this is a retry attempt
+        if retry_state.attempt > 0 {
+            if let Some(ref mut ctx) = ctx_clone {
+                // Update the inner ExecutionContext with retry information
+                ctx.context.retry_attempt = retry_state.attempt;
+                // Set retry_of to the session_id to indicate which session is being retried
+                ctx.context.retry_of = Some(session_id.to_string());
+            }
+        }
 
         // Try to run the session
         let result = run_claude_session_inline(
@@ -1013,6 +1216,7 @@ pub fn run_claude_session_with_retry(
             timeout_seconds,
             ctx_clone,
             finding_ctx_clone,
+            progress_ctx_clone,
             pid_tracker_clone,
         );
 
@@ -1085,10 +1289,6 @@ pub struct ApiState {
     pub app_state: Arc<AppState>,
     pub rag_state: Arc<RAGState>,
     pub app_handle: tauri::AppHandle,
-    /// Unified session manager for all AI sessions (Prompt Library + AI Builder)
-    pub session: Arc<SessionManager>,
-    /// Task monitor for watching Claude session output
-    pub task_monitor: Arc<TaskMonitor>,
     /// Currently loaded config ID (for tracking which config is active)
     pub current_config_id: std::sync::Mutex<Option<String>>,
     /// Persistent storage for configurations
@@ -1139,6 +1339,14 @@ impl<T: Serialize> ApiResponse<T> {
             success: true,
             data: Some(data),
             error: None,
+        }
+    }
+
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            data: None,
+            error: Some(message.into()),
         }
     }
 }
@@ -1216,17 +1424,9 @@ pub struct RunWorkflowRequest {
     pub workflow_name: String,
     #[serde(default)]
     pub monitor_index: Option<i32>,
-    /// Timeout in seconds for execution completion (default: 300)
-    #[serde(default = "default_timeout")]
-    pub timeout_seconds: u64,
-}
-
-fn default_timeout() -> u64 {
-    300 // 5 minutes default timeout
-}
-
-fn default_action_timeout() -> u64 {
-    30 // 30 seconds default timeout for single action
+    /// Timeout in seconds for execution completion (None = disabled, no timeout)
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
 }
 
 /// Execute single action request
@@ -1240,9 +1440,9 @@ pub struct ExecuteActionRequest {
     /// Optional monitor index
     #[serde(default)]
     pub monitor_index: Option<i32>,
-    /// Timeout in seconds for action completion (default: 30)
-    #[serde(default = "default_action_timeout")]
-    pub timeout_seconds: u64,
+    /// Timeout in seconds for action completion (None = disabled, no timeout)
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
     /// Text to type (for "type" action)
     #[serde(default)]
     pub text_input: Option<String>,
@@ -1541,6 +1741,10 @@ async fn handle_extension_message(msg: serde_json::Value, state: Arc<ApiState>) 
                 warn!("No pending request found for response {}", request_id);
             }
         }
+        "RECORDING_SNAPSHOT" => {
+            // Snapshot from the recorder during a recording session
+            handle_recording_snapshot(msg, state).await;
+        }
         "PONG" => {
             debug!("Received pong from extension");
         }
@@ -1548,8 +1752,154 @@ async fn handle_extension_message(msg: serde_json::Value, state: Arc<ApiState>) 
             // Extension is sending a request to the runner (future use)
             debug!("Received extension request: {:?}", msg);
         }
+        "FULL_PAGE_CAPTURE_PROGRESS" => {
+            // Progress update from full-page screenshot capture
+            if let Some(progress) = msg.get("progress") {
+                debug!(
+                    "Full-page capture progress: {:?}",
+                    progress
+                );
+                // Note: Tauri event emission removed - AppState doesn't have app_handle
+                // Progress is logged for debugging purposes
+            }
+        }
         _ => {
             debug!("Unknown extension message type: {}", msg_type);
+        }
+    }
+}
+
+/// Handle a recording snapshot from the browser extension
+async fn handle_recording_snapshot(msg: serde_json::Value, state: Arc<ApiState>) {
+    // Extract snapshot data
+    let snapshot = match msg.get("snapshot") {
+        Some(s) => s,
+        None => {
+            warn!("RECORDING_SNAPSHOT missing snapshot field");
+            return;
+        }
+    };
+
+    // Parse the snapshot
+    let parsed: Result<crate::recording::RecordingSnapshot, _> =
+        serde_json::from_value(snapshot.clone());
+
+    match parsed {
+        Ok(snapshot_data) => {
+            debug!(
+                "Received recording snapshot: trigger={}, url={}, elements={}",
+                snapshot_data.trigger,
+                snapshot_data.url,
+                snapshot_data.element_count
+            );
+
+            // If the snapshot has enhanced action capture data, we can auto-add to active recording
+            if let Some(action) = &snapshot_data.action {
+                // Look for an active recording that matches this tab
+                let tab_id = msg.get("sessionTabId").and_then(|t| t.as_i64()).map(|t| t as i32);
+
+                if let Some(tab_id) = tab_id {
+                    // Try to find an active recording for this tab
+                    let storage =
+                        crate::recording::RecordingStorage::new(state.app_state.checkpoint_db.clone());
+
+                    match storage.list_recordings(Some(crate::recording::RecordingStatus::Recording), Some(10)) {
+                        Ok(recordings) => {
+                            // Find recording for this tab
+                            if let Some(recording) = recordings.iter().find(|r| r.tab_id == Some(tab_id)) {
+                                // Parse action type
+                                let action_type: Result<crate::recording::ActionType, _> =
+                                    action.action_type.parse();
+
+                                if let Ok(action_type) = action_type {
+                                    // Build action data based on type
+                                    let action_data = match action_type {
+                                        crate::recording::ActionType::Click => {
+                                            action.click.as_ref().map(|c| {
+                                                serde_json::to_value(c).unwrap_or(serde_json::Value::Null)
+                                            })
+                                        }
+                                        crate::recording::ActionType::Type => {
+                                            action.type_data.as_ref().map(|t| {
+                                                serde_json::to_value(t).unwrap_or(serde_json::Value::Null)
+                                            })
+                                        }
+                                        crate::recording::ActionType::Navigate => {
+                                            action.navigate.as_ref().map(|n| {
+                                                serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+                                            })
+                                        }
+                                        crate::recording::ActionType::Select => {
+                                            action.select.as_ref().map(|s| {
+                                                serde_json::to_value(s).unwrap_or(serde_json::Value::Null)
+                                            })
+                                        }
+                                        crate::recording::ActionType::Scroll => {
+                                            action.scroll.as_ref().map(|s| {
+                                                serde_json::to_value(s).unwrap_or(serde_json::Value::Null)
+                                            })
+                                        }
+                                        crate::recording::ActionType::Keypress => {
+                                            action.keypress.as_ref().map(|k| {
+                                                serde_json::to_value(k).unwrap_or(serde_json::Value::Null)
+                                            })
+                                        }
+                                        crate::recording::ActionType::Hover => None,
+                                    };
+
+                                    let input = crate::recording::AddActionInput {
+                                        action_type,
+                                        url: action.url.clone(),
+                                        page_title: snapshot_data.title.clone(),
+                                        target: action.target.clone(),
+                                        action_data,
+                                        timestamp: action.timestamp.clone(),
+                                        duration_ms: None,
+                                    };
+
+                                    match storage.add_action(&recording.id, input) {
+                                        Ok(recorded_action) => {
+                                            info!(
+                                                "Auto-recorded action {} for recording {}",
+                                                recorded_action.sequence_number, recording.id
+                                            );
+
+                                            // Emit event to frontend
+                                            if let Err(e) = state.app_handle.emit(
+                                                "recording-action-added",
+                                                serde_json::json!({
+                                                    "recording_id": recording.id,
+                                                    "action": recorded_action,
+                                                }),
+                                            ) {
+                                                warn!("Failed to emit recording-action-added event: {}", e);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("Failed to auto-record action: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to list active recordings: {}", e);
+                        }
+                    }
+                }
+            }
+
+            // Broadcast the snapshot to connected clients (for real-time monitoring)
+            let _ = state.app_state.event_broadcast.send(serde_json::json!({
+                "type": "recording_snapshot",
+                "snapshot": snapshot_data,
+                "tab_id": msg.get("sessionTabId"),
+                "total_snapshots": msg.get("totalSnapshots"),
+            }));
+        }
+        Err(e) => {
+            warn!("Failed to parse recording snapshot: {}", e);
+            debug!("Raw snapshot: {:?}", snapshot);
         }
     }
 }
@@ -1665,8 +2015,10 @@ struct ExtensionCommandRequest {
     timeout_secs: u64,
 }
 
+/// Default timeout for extension commands.
+/// Returns 0 to indicate no timeout (run until completion).
 fn default_extension_timeout() -> u64 {
-    30
+    0 // No timeout - run until completion
 }
 
 /// Get extension connection status
@@ -1776,6 +2128,266 @@ async fn health() -> Json<ApiResponse<String>> {
 }
 
 // ============================================================================
+// Bridge Management Endpoints
+// ============================================================================
+
+use crate::executor::{BridgeInfo, BridgeMode, CreateBridgeResult, GuiLockInfo};
+
+/// Request body for creating a new bridge
+#[derive(Debug, Deserialize)]
+struct CreateBridgeRequest {
+    /// Operating mode: "gui" or "headless"
+    #[serde(default)]
+    mode: BridgeMode,
+    /// Optional task run ID to associate with this bridge
+    run_id: Option<String>,
+    /// Monitor indices for GUI mode (default: [0])
+    #[serde(default)]
+    monitor_indices: Vec<i32>,
+    /// Force acquire GUI lock even if held by another bridge
+    #[serde(default)]
+    force_gui_lock: bool,
+}
+
+/// Request body for running a workflow on a specific bridge
+#[derive(Debug, Deserialize)]
+struct BridgeWorkflowRequest {
+    /// Workflow name to run
+    workflow_name: Option<String>,
+    /// Config path to load (optional if already loaded)
+    config_path: Option<String>,
+    /// Workflow parameters
+    params: Option<serde_json::Value>,
+}
+
+/// List all active bridges
+async fn list_bridges(State(state): State<Arc<ApiState>>) -> Json<ApiResponse<Vec<BridgeInfo>>> {
+    let bridge_manager_guard = state.app_state.bridge_manager.lock().await;
+
+    if let Some(ref bridge_manager) = *bridge_manager_guard {
+        let bridges = bridge_manager.list_bridges().await;
+        Json(ApiResponse::success(bridges))
+    } else {
+        Json(ApiResponse::<Vec<BridgeInfo>>::error("Bridge manager not initialized"))
+    }
+}
+
+/// Create a new bridge
+async fn create_bridge(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<CreateBridgeRequest>,
+) -> Json<ApiResponse<CreateBridgeResult>> {
+    info!("Creating new bridge: mode={:?}, run_id={:?}", request.mode, request.run_id);
+
+    let bridge_manager_guard = state.app_state.bridge_manager.lock().await;
+
+    if let Some(ref bridge_manager) = *bridge_manager_guard {
+        let monitor_indices = if request.monitor_indices.is_empty() {
+            vec![0]
+        } else {
+            request.monitor_indices
+        };
+
+        match bridge_manager.create_bridge(
+            request.mode,
+            request.run_id,
+            monitor_indices,
+            request.force_gui_lock,
+        ).await {
+            Ok(result) => Json(ApiResponse::success(result)),
+            Err(e) => Json(ApiResponse::<CreateBridgeResult>::error(&e)),
+        }
+    } else {
+        Json(ApiResponse::<CreateBridgeResult>::error("Bridge manager not initialized"))
+    }
+}
+
+/// Get info for a specific bridge
+async fn get_bridge(
+    State(state): State<Arc<ApiState>>,
+    Path(bridge_id): Path<String>,
+) -> Json<ApiResponse<Option<BridgeInfo>>> {
+    let bridge_manager_guard = state.app_state.bridge_manager.lock().await;
+
+    if let Some(ref bridge_manager) = *bridge_manager_guard {
+        let info = bridge_manager.get_bridge_info(&bridge_id).await;
+        Json(ApiResponse::success(info))
+    } else {
+        Json(ApiResponse::<Option<BridgeInfo>>::error("Bridge manager not initialized"))
+    }
+}
+
+/// Remove a bridge
+async fn remove_bridge(
+    State(state): State<Arc<ApiState>>,
+    Path(bridge_id): Path<String>,
+) -> Json<ApiResponse<()>> {
+    info!("Removing bridge: {}", bridge_id);
+
+    let bridge_manager_guard = state.app_state.bridge_manager.lock().await;
+
+    if let Some(ref bridge_manager) = *bridge_manager_guard {
+        match bridge_manager.remove_bridge(&bridge_id).await {
+            Ok(()) => Json(ApiResponse::success(())),
+            Err(e) => Json(ApiResponse::<()>::error(&e)),
+        }
+    } else {
+        Json(ApiResponse::<()>::error("Bridge manager not initialized"))
+    }
+}
+
+/// Run a workflow on a specific bridge
+async fn run_bridge_workflow(
+    State(state): State<Arc<ApiState>>,
+    Path(bridge_id): Path<String>,
+    Json(request): Json<BridgeWorkflowRequest>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    info!("Running workflow on bridge {}: {:?}", bridge_id, request.workflow_name);
+
+    let bridge_manager_guard = state.app_state.bridge_manager.lock().await;
+
+    if let Some(ref bridge_manager) = *bridge_manager_guard {
+        // Load config if provided
+        if let Some(config_path) = request.config_path {
+            let load_result = bridge_manager.with_bridge(&bridge_id, |bridge| {
+                bridge.load_configuration(&config_path)
+            });
+
+            if let Err(e) = load_result {
+                return Json(ApiResponse::<serde_json::Value>::error(&format!("Failed to access bridge: {}", e)));
+            }
+
+            if let Ok(Err(e)) = load_result {
+                return Json(ApiResponse::<serde_json::Value>::error(&format!("Failed to load config: {}", e)));
+            }
+        }
+
+        // Build execution params
+        let params = if request.workflow_name.is_some() || request.params.is_some() {
+            Some(serde_json::json!({
+                "workflow_name": request.workflow_name,
+                "params": request.params,
+            }))
+        } else {
+            None
+        };
+
+        // Start execution
+        let start_result = bridge_manager.with_bridge(&bridge_id, |bridge| {
+            bridge.start_execution_with_params(params)
+        });
+
+        match start_result {
+            Ok(Ok(())) => Json(ApiResponse::success(serde_json::json!({
+                "message": "Workflow started",
+                "bridge_id": bridge_id,
+            }))),
+            Ok(Err(e)) => Json(ApiResponse::<serde_json::Value>::error(&format!("Failed to start workflow: {}", e))),
+            Err(e) => Json(ApiResponse::<serde_json::Value>::error(&e)),
+        }
+    } else {
+        Json(ApiResponse::<serde_json::Value>::error("Bridge manager not initialized"))
+    }
+}
+
+/// Get current GUI lock holder
+async fn get_gui_lock(State(state): State<Arc<ApiState>>) -> Json<ApiResponse<GuiLockInfo>> {
+    let bridge_manager_guard = state.app_state.bridge_manager.lock().await;
+
+    if let Some(ref bridge_manager) = *bridge_manager_guard {
+        let info = bridge_manager.get_gui_lock_info().await;
+        Json(ApiResponse::success(info))
+    } else {
+        Json(ApiResponse::<GuiLockInfo>::error("Bridge manager not initialized"))
+    }
+}
+
+// ============================================================================
+// Headless-Only Mode Endpoints
+// ============================================================================
+
+/// Response for headless-only mode status
+#[derive(Debug, Serialize)]
+struct HeadlessOnlyResponse {
+    /// Whether headless-only mode is enabled
+    enabled: bool,
+    /// Description of what this mode does
+    description: String,
+}
+
+/// Request body for setting headless-only mode
+#[derive(Debug, Deserialize)]
+struct SetHeadlessOnlyRequest {
+    /// Whether to enable headless-only mode
+    enabled: bool,
+}
+
+/// Get headless-only mode status
+///
+/// When headless-only mode is enabled, GUI bridges cannot be created.
+/// This is intended for server deployments without GUI access.
+async fn get_headless_only(
+    State(state): State<Arc<ApiState>>,
+) -> Json<ApiResponse<HeadlessOnlyResponse>> {
+    let bridge_manager_guard = state.app_state.bridge_manager.lock().await;
+
+    if let Some(ref bridge_manager) = *bridge_manager_guard {
+        let enabled = bridge_manager.is_headless_only();
+        Json(ApiResponse::success(HeadlessOnlyResponse {
+            enabled,
+            description: if enabled {
+                "Headless-only mode is ENABLED. All bridges must be headless. \
+                GUI mode bridges cannot be created. This is intended for server deployments."
+                    .to_string()
+            } else {
+                "Headless-only mode is DISABLED. Both GUI and headless bridges can be created."
+                    .to_string()
+            },
+        }))
+    } else {
+        Json(ApiResponse::<HeadlessOnlyResponse>::error(
+            "Bridge manager not initialized",
+        ))
+    }
+}
+
+/// Set headless-only mode
+///
+/// When enabled, all bridges must be created in headless mode.
+/// GUI mode requests will be rejected with an error.
+async fn set_headless_only(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<SetHeadlessOnlyRequest>,
+) -> Json<ApiResponse<HeadlessOnlyResponse>> {
+    info!(
+        "Setting headless-only mode to: {}",
+        request.enabled
+    );
+
+    let bridge_manager_guard = state.app_state.bridge_manager.lock().await;
+
+    if let Some(ref bridge_manager) = *bridge_manager_guard {
+        bridge_manager.set_headless_only(request.enabled);
+
+        Json(ApiResponse::success(HeadlessOnlyResponse {
+            enabled: request.enabled,
+            description: if request.enabled {
+                "Headless-only mode is now ENABLED. All bridges must be headless. \
+                GUI mode bridges cannot be created."
+                    .to_string()
+            } else {
+                "Headless-only mode is now DISABLED. Both GUI and headless bridges can be created."
+                    .to_string()
+            },
+        }))
+    } else {
+        Json(ApiResponse::<HeadlessOnlyResponse>::error(
+            "Bridge manager not initialized",
+        ))
+    }
+}
+
+// ============================================================================
 // Debug Endpoints
 // ============================================================================
 
@@ -1849,13 +2461,33 @@ async fn get_debug_errors(
     let limit = query.limit.unwrap_or(50);
     let mut all_errors: Vec<DebugError> = Vec::new();
 
-    // Log files to scan with their service names
-    let log_files = [
-        ("backend.log", "backend"),
-        ("frontend.log", "frontend"),
-        ("runner-tauri.log", "runner"),
-        ("runner-actions.jsonl", "runner-actions"),
-    ];
+    // Build log file list from global settings
+    let global_settings = crate::settings::get_global_log_source_settings();
+    let log_files: Vec<(String, String)> = if global_settings.sources.is_empty() {
+        // Fallback if no sources configured
+        vec![
+            ("backend.log".to_string(), "backend".to_string()),
+            ("frontend.log".to_string(), "frontend".to_string()),
+            ("runner-tauri.log".to_string(), "runner".to_string()),
+            ("runner-actions.jsonl".to_string(), "runner-actions".to_string()),
+        ]
+    } else {
+        global_settings
+            .sources
+            .iter()
+            .filter(|s| s.enabled)
+            .map(|s| {
+                let path = std::path::Path::new(&s.path);
+                let filename = if path.is_absolute() {
+                    s.path.clone()
+                } else {
+                    s.path.clone()
+                };
+                let service = s.name.to_lowercase().replace(' ', "-");
+                (filename, service)
+            })
+            .collect()
+    };
 
     // Regex patterns for error detection
     let error_patterns = [
@@ -1875,7 +2507,13 @@ async fn get_debug_errors(
             }
         }
 
-        let file_path = dev_logs_path.join(filename);
+        // If the path is absolute, use it directly; otherwise join with dev_logs_path
+        let source_path = std::path::Path::new(filename);
+        let file_path = if source_path.is_absolute() {
+            source_path.to_path_buf()
+        } else {
+            dev_logs_path.join(filename)
+        };
         if !file_path.exists() {
             continue;
         }
@@ -1987,9 +2625,14 @@ async fn get_debug_errors(
 /// Get findings summary from database
 ///
 /// Returns a summary of issues detected in previous sessions.
-/// Note: Findings are stored per-task-run. This endpoint returns findings
-/// from the most recent task runs.
-async fn get_findings_summary() -> Json<ApiResponse<serde_json::Value>> {
+/// If task_run_id query parameter is provided, returns findings only for that task run.
+/// Otherwise returns findings from the most recent task runs.
+async fn get_findings_summary(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    // Get optional task_run_id filter
+    let task_run_id_filter = params.get("task_run_id").cloned();
+
     // Get the database path using the same pattern as context.rs
     let app_data_dir = match dirs::config_dir() {
         Some(config_dir) => config_dir.join("com.qontinui.runner"),
@@ -2003,7 +2646,7 @@ async fn get_findings_summary() -> Json<ApiResponse<serde_json::Value>> {
             })));
         }
     };
-    let db_path = app_data_dir.join("qontinui-runner.db");
+    let db_path = app_data_dir.join("runner.db");
 
     let db = match rusqlite::Connection::open(&db_path) {
         Ok(conn) => conn,
@@ -2018,21 +2661,29 @@ async fn get_findings_summary() -> Json<ApiResponse<serde_json::Value>> {
         }
     };
 
-    // Get recent task run IDs
-    let task_run_ids: Vec<String> =
-        match db.prepare("SELECT id FROM task_runs ORDER BY created_at DESC LIMIT 5") {
-            Ok(mut stmt) => stmt
-                .query_map([], |row| row.get(0))
-                .ok()
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default(),
-            Err(_) => vec![],
-        };
-
+    // Get findings based on filter
     let mut all_findings = Vec::new();
-    for task_run_id in &task_run_ids {
-        if let Ok(findings) = finding_storage::get_findings_for_task(&db, task_run_id) {
+    if let Some(task_run_id) = task_run_id_filter {
+        // Filter to specific task run
+        if let Ok(findings) = finding_storage::get_findings_for_task(&db, &task_run_id) {
             all_findings.extend(findings);
+        }
+    } else {
+        // Get recent task run IDs (fallback for when no specific run is requested)
+        let task_run_ids: Vec<String> =
+            match db.prepare("SELECT id FROM task_runs ORDER BY created_at DESC LIMIT 5") {
+                Ok(mut stmt) => stmt
+                    .query_map([], |row| row.get(0))
+                    .ok()
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                    .unwrap_or_default(),
+                Err(_) => vec![],
+            };
+
+        for task_run_id in &task_run_ids {
+            if let Ok(findings) = finding_storage::get_findings_for_task(&db, task_run_id) {
+                all_findings.extend(findings);
+            }
         }
     }
 
@@ -2246,18 +2897,13 @@ async fn get_status(
 
     // Run blocking operations in a separate thread to avoid blocking the async runtime
     let result = tokio::task::spawn_blocking(move || {
-        // Use unwrap_or_else to recover from poisoned mutex (after a panic)
-        let bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        let (executor_running, executor_state) = if let Some(ref bridge) = *bridge_lock {
+        // Use with_default_bridge helper for bridge access
+        let (executor_running, executor_state) = match with_default_bridge(&app_state, |bridge| {
             (bridge.is_running(), bridge.get_state().name().to_string())
-        } else {
-            (false, "not_started".to_string())
+        }) {
+            Ok(result) => result,
+            Err(_) => (false, "not_started".to_string()),
         };
-        drop(bridge_lock);
 
         // Use unwrap_or_else to recover from poisoned mutex
         let config_lock = app_state.current_config.lock().unwrap_or_else(|poisoned| {
@@ -2368,6 +3014,14 @@ pub fn load_config_internal(
     let summary = config.summary();
     info!("load_config_internal: Configuration validated: {}", summary);
 
+    // Set project context for runtime environment
+    crate::runtime_env::set_project_context(crate::runtime_env::ProjectContext {
+        project_id: config.metadata.project_id.clone(),
+        workspace_id: None,   // TODO: Add workspace_id to ConfigMetadata if needed
+        name: Some(config.metadata.name.clone()),
+        triggered_by: None,   // Set dynamically when task is triggered via API
+    });
+
     // Step 2: Store the configuration in app state
     *app_state.current_config.lock().unwrap_or_else(|poisoned| {
         warn!("load_config_internal: current_config mutex was poisoned, recovering");
@@ -2376,15 +3030,12 @@ pub fn load_config_internal(
     info!("load_config_internal: Configuration stored in app state");
 
     // Step 3: Send debug settings and configuration to Python bridge
-    let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-        warn!("load_config_internal: python_bridge mutex was poisoned, recovering");
-        poisoned.into_inner()
-    });
-
-    if let Some(ref mut bridge) = *bridge_lock {
+    let config_path_owned = config_path.to_string();
+    let summary_clone = summary.clone();
+    match with_default_bridge(app_state, |bridge| {
         if !bridge.is_running() {
             warn!("load_config_internal: Python executor not running, config stored but not sent to executor");
-            return Ok(summary);
+            return Ok(summary_clone.clone());
         }
 
         // Send debug settings first (before config execution)
@@ -2402,7 +3053,7 @@ pub fn load_config_internal(
         }
 
         // Send configuration to Python
-        bridge.load_configuration(config_path).map_err(|e| {
+        bridge.load_configuration(&config_path_owned).map_err(|e| {
             error!(
                 "load_config_internal: Failed to send configuration to Python: {}",
                 e
@@ -2411,11 +3062,14 @@ pub fn load_config_internal(
         })?;
 
         info!("load_config_internal: Configuration sent to Python executor");
-    } else {
-        warn!("load_config_internal: Python executor not initialized, config stored but not sent");
+        Ok(summary_clone.clone())
+    }) {
+        Ok(result) => result,
+        Err(_) => {
+            warn!("load_config_internal: Python executor not initialized, config stored but not sent");
+            Ok(summary)
+        }
     }
-
-    Ok(summary)
 }
 
 /// Load a configuration file
@@ -2426,6 +3080,15 @@ pub fn load_config_internal(
 /// 3. Saves the path for auto-load functionality
 /// 4. Sends debug settings to the Python executor
 /// 5. Sends the configuration to the Python executor
+#[tracing::instrument(
+    name = "api.request.load_config",
+    skip(state, request),
+    fields(
+        endpoint = "/load-config",
+        method = "POST",
+        config_path = %request.config_path
+    )
+)]
 async fn load_config(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<LoadConfigRequest>,
@@ -2471,12 +3134,7 @@ async fn load_config(
         }
 
         // Step 4 & 5: Send debug settings and configuration to Python bridge
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
@@ -2502,10 +3160,8 @@ async fn load_config(
             })?;
 
             info!("MCP API: Configuration sent to Python executor");
-            Ok((summary, config_data))
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+            Ok((summary.clone(), config_data.clone()))
+        })?
     })
     .await
     .map_err(|e| {
@@ -2597,12 +3253,23 @@ async fn load_config(
 ///
 /// Creates a TaskRun record (task_type='automation') to ensure all automation
 /// runs are tracked in the unified TaskRun system.
+#[tracing::instrument(
+    name = "api.request.run_workflow",
+    skip(state, request),
+    fields(
+        endpoint = "/run-workflow",
+        method = "POST",
+        workflow_name = %request.workflow_name,
+        monitor_index = ?request.monitor_index,
+        timeout_seconds = ?request.timeout_seconds
+    )
+)]
 async fn run_workflow(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<RunWorkflowRequest>,
 ) -> Result<Json<ApiResponse<WorkflowExecutionResult>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!(
-        "MCP API: Running workflow: {} (timeout: {}s)",
+        "MCP API: Running workflow: {} (timeout: {:?})",
         request.workflow_name, request.timeout_seconds
     );
     safe_eprintln!(
@@ -2760,6 +3427,16 @@ struct ExecuteStepsRequest {
 ///
 /// Running a single workflow from the Run page is just:
 /// `{ "steps": [{ "type": "workflow", "name": "MyWorkflow" }] }`
+#[tracing::instrument(
+    name = "api.request.execute_steps",
+    skip(state, request),
+    fields(
+        endpoint = "/execute-steps",
+        method = "POST",
+        step_count = %request.steps.len(),
+        execution_id = ?request.execution_id
+    )
+)]
 async fn execute_steps(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<ExecuteStepsRequest>,
@@ -2892,12 +3569,7 @@ async fn load_last_config(
         info!("MCP API: Configuration stored in app state");
 
         // Send debug settings and configuration to Python bridge
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
@@ -2918,10 +3590,8 @@ async fn load_last_config(
             })?;
 
             info!("MCP API: Configuration sent to Python executor");
-            Ok((summary, config_data))
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+            Ok((summary.clone(), config_data.clone()))
+        })?
     })
     .await
     .map_err(|e| {
@@ -2976,19 +3646,12 @@ async fn stop_execution(
     let app_state = state.app_state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             match bridge.stop_execution() {
                 Ok(_) => Ok(()),
                 Err(e) => Err(format!("Failed to stop execution: {}", e)),
             }
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -3033,31 +3696,26 @@ async fn execute_python_command(
 
     // Use spawn_blocking for the synchronous bridge operation
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
             // Convert params to Option<Value> (None if params is null or empty object)
             let params_option = if params.is_null()
-                || (params.is_object() && params.as_object().map_or(true, |o| o.is_empty()))
+                || (params.is_object() && params.as_object().is_none_or(|o| o.is_empty()))
             {
                 None
             } else {
                 Some(params)
             };
 
-            // Send command and wait for response (60 second timeout for most commands)
-            let timeout_duration = std::time::Duration::from_secs(60);
+            // Use configurable timeout (default: disabled)
+            // Falls back to 1 hour to prevent infinite IPC hangs
+            let timeout_duration = Timeouts::python_command()
+                .unwrap_or_else(|| std::time::Duration::from_secs(3600));
             bridge.send_command_and_wait(&cmd_type, params_option, timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -3092,12 +3750,23 @@ async fn execute_python_command(
 /// This endpoint allows executing individual GUI actions without running a full workflow.
 /// Uses the UnifiedActionService for deterministic execution, ensuring both
 /// manual API calls and AI task execution use the same code path.
+#[tracing::instrument(
+    name = "api.request.execute_action",
+    skip(state, request),
+    fields(
+        endpoint = "/execute-action",
+        method = "POST",
+        action_type = %request.action_type,
+        image_id = %request.image_id,
+        monitor_index = ?request.monitor_index
+    )
+)]
 async fn execute_action(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<ExecuteActionRequest>,
 ) -> Result<Json<ApiResponse<ExecuteActionResult>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!(
-        "MCP API: Executing action: {} (image: {}, text: {:?}, hotkey: {:?}, timeout: {}s)",
+        "MCP API: Executing action: {} (image: {}, text: {:?}, hotkey: {:?}, timeout: {:?})",
         request.action_type,
         request.image_id,
         request.text_input,
@@ -3178,6 +3847,16 @@ async fn execute_action(
 ///
 /// This endpoint uses the state machine to find and execute the path
 /// from the current state to the target state.
+#[tracing::instrument(
+    name = "api.request.go_to_state",
+    skip(state, request),
+    fields(
+        endpoint = "/go-to-state",
+        method = "POST",
+        state_id = %request.state_id,
+        timeout_seconds = %request.timeout_seconds
+    )
+)]
 async fn go_to_state(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<GoToStateRequest>,
@@ -3196,7 +3875,7 @@ async fn go_to_state(
             &request.state_id,
             None, // No additional config
             request.monitor_index,
-            request.timeout_seconds,
+            Some(request.timeout_seconds),
         )
         .await
     {
@@ -3250,6 +3929,16 @@ async fn go_to_state(
 /// This endpoint is used by both:
 /// 1. Dedicated screenshot actions in the AI Automation Builder
 /// 2. Post-step screenshots (takeScreenshot toggle on other step types)
+#[tracing::instrument(
+    name = "api.request.capture_screenshot",
+    skip(state, request),
+    fields(
+        endpoint = "/capture-screenshot",
+        method = "POST",
+        monitor = ?request.monitor,
+        delay_seconds = ?request.delay_seconds
+    )
+)]
 async fn capture_screenshot_step(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<CaptureScreenshotRequest>,
@@ -3421,8 +4110,11 @@ async fn capture_screenshot_step(
         ),
         source: "runner".to_string(),
         action_id: Some(format!("screenshot-{}", step_part)),
+        task_run_id: None,
         session_id: None,
         session_name: None,
+        phase: None,
+        phase_iteration: None,
         screenshot_path: Some(relative_path.clone()),
         screenshot_width: width,
         screenshot_height: height,
@@ -3662,8 +4354,11 @@ struct UIBridgeDiscoveryRequest {
     selector: Option<String>,
 }
 
-/// Default timeout for UI Bridge requests (5 seconds)
-const UI_BRIDGE_TIMEOUT_MS: u64 = 5000;
+/// UI Bridge timeout is fetched from centralized config
+/// This needs a reasonable timeout since it's synchronous communication with the frontend.
+fn get_ui_bridge_timeout_ms() -> u64 {
+    Timeouts::ui_bridge_ipc().as_millis() as u64
+}
 
 /// Send a UI Bridge request and wait for the response synchronously.
 ///
@@ -3710,7 +4405,7 @@ async fn ui_bridge_request_sync(
     }
 
     // Wait for response with timeout
-    let timeout_duration = std::time::Duration::from_millis(UI_BRIDGE_TIMEOUT_MS);
+    let timeout_duration = std::time::Duration::from_millis(get_ui_bridge_timeout_ms());
     match tokio::time::timeout(timeout_duration, rx).await {
         Ok(Ok(response)) => Ok(response),
         Ok(Err(_)) => {
@@ -3723,7 +4418,7 @@ async fn ui_bridge_request_sync(
             pending.remove(&request_id);
             Err(format!(
                 "UI Bridge request timed out after {}ms. Is the frontend running?",
-                UI_BRIDGE_TIMEOUT_MS
+                get_ui_bridge_timeout_ms()
             ))
         }
     }
@@ -4163,8 +4858,10 @@ fn default_max_steps() -> u32 {
     50
 }
 
+/// Default timeout for UI-TARS extraction.
+/// Returns 0 to indicate no timeout (run until completion).
 fn default_uitars_timeout() -> u32 {
-    600
+    0 // No timeout - run until completion
 }
 
 /// Response from UI-TARS extraction status endpoint
@@ -4212,6 +4909,15 @@ pub struct UITarsDiscoveredTransition {
 }
 
 /// Start web extraction
+#[tracing::instrument(
+    name = "api.request.start_web_extraction",
+    skip(state, request),
+    fields(
+        endpoint = "/extraction/start",
+        method = "POST",
+        url_count = %request.urls.len()
+    )
+)]
 async fn start_web_extraction(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<StartExtractionRequest>,
@@ -4246,16 +4952,9 @@ async fn start_web_extraction(
     let extraction_id_for_state = extraction_id.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             bridge.send_command("start_web_extraction", Some(params))
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -4287,6 +4986,146 @@ async fn start_web_extraction(
     }
 }
 
+/// Request to start vision extraction
+#[derive(Debug, Deserialize)]
+struct StartVisionExtractionRequest {
+    /// Base64-encoded screenshot or file path
+    screenshot: String,
+    /// Techniques to run: ["edge", "sam3", "ocr"]
+    #[serde(default = "default_vision_techniques")]
+    techniques: Vec<String>,
+    /// Edge detection: Canny low threshold
+    #[serde(default = "default_canny_low")]
+    canny_low: i32,
+    /// Edge detection: Canny high threshold
+    #[serde(default = "default_canny_high")]
+    canny_high: i32,
+    /// Edge detection: minimum contour area
+    #[serde(default = "default_min_contour_area")]
+    min_contour_area: i32,
+    /// SAM3: points per side
+    #[serde(default = "default_points_per_side")]
+    points_per_side: i32,
+    /// SAM3: predicted IoU threshold
+    #[serde(default = "default_pred_iou_thresh")]
+    pred_iou_thresh: f64,
+    /// SAM3: stability score threshold
+    #[serde(default = "default_stability_score_thresh")]
+    stability_score_thresh: f64,
+    /// OCR: engine ("easyocr" or "tesseract")
+    #[serde(default = "default_ocr_engine")]
+    ocr_engine: String,
+    /// OCR: languages
+    #[serde(default = "default_ocr_languages")]
+    ocr_languages: Vec<String>,
+    /// OCR: confidence threshold
+    #[serde(default = "default_ocr_confidence")]
+    ocr_confidence_threshold: f64,
+    /// Fusion: IoU threshold for deduplication
+    #[serde(default = "default_iou_threshold")]
+    iou_threshold: f64,
+}
+
+fn default_vision_techniques() -> Vec<String> {
+    vec!["edge".to_string(), "ocr".to_string()]
+}
+
+fn default_canny_low() -> i32 {
+    50
+}
+
+fn default_canny_high() -> i32 {
+    150
+}
+
+fn default_min_contour_area() -> i32 {
+    100
+}
+
+fn default_points_per_side() -> i32 {
+    32
+}
+
+fn default_pred_iou_thresh() -> f64 {
+    0.88
+}
+
+fn default_stability_score_thresh() -> f64 {
+    0.95
+}
+
+fn default_ocr_engine() -> String {
+    "easyocr".to_string()
+}
+
+fn default_ocr_languages() -> Vec<String> {
+    vec!["en".to_string()]
+}
+
+fn default_ocr_confidence() -> f64 {
+    0.6
+}
+
+fn default_iou_threshold() -> f64 {
+    0.5
+}
+
+/// Start vision extraction
+async fn start_vision_extraction(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<StartVisionExtractionRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("MCP API: Starting vision extraction");
+
+    // Build extraction params
+    let params = serde_json::json!({
+        "config": {
+            "screenshot": request.screenshot,
+            "techniques": request.techniques,
+            "canny_low": request.canny_low,
+            "canny_high": request.canny_high,
+            "min_contour_area": request.min_contour_area,
+            "points_per_side": request.points_per_side,
+            "pred_iou_thresh": request.pred_iou_thresh,
+            "stability_score_thresh": request.stability_score_thresh,
+            "ocr_engine": request.ocr_engine,
+            "ocr_languages": request.ocr_languages,
+            "ocr_confidence_threshold": request.ocr_confidence_threshold,
+            "iou_threshold": request.iou_threshold,
+        }
+    });
+
+    let app_state = state.app_state.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        with_default_bridge(&app_state, |bridge| {
+            bridge.send_command("run_vision_extraction", Some(params))
+        })?
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(_) => {
+            info!("MCP API: Vision extraction started");
+            Ok(Json(ApiResponse::success(serde_json::json!({
+                "started": true,
+                "message": "Vision extraction started"
+            }))))
+        }
+        Err(e) => {
+            error!("MCP API: Failed to start vision extraction: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
 /// Stop web extraction
 async fn stop_web_extraction(
     State(state): State<Arc<ApiState>>,
@@ -4297,16 +5136,9 @@ async fn stop_web_extraction(
     let extraction_state = state.extraction_state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             bridge.send_command("stop_web_extraction", None)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -4471,16 +5303,9 @@ async fn start_uitars_extraction(
     let app_state = state.app_state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             bridge.send_command("start_uitars_extraction", Some(params))
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -4515,16 +5340,9 @@ async fn stop_uitars_extraction(
     let app_state = state.app_state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             bridge.send_command("stop_uitars_extraction", None)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -4556,20 +5374,14 @@ async fn get_uitars_extraction_status(
     let app_state = state.app_state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
-            let timeout = std::time::Duration::from_secs(10);
+            // 60 second timeout for status check
+            let timeout = std::time::Duration::from_secs(60);
             bridge.send_command_and_wait("get_uitars_extraction_status", None, timeout)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -4624,20 +5436,14 @@ async fn get_uitars_extraction_results(
     let app_state = state.app_state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
-            let timeout = std::time::Duration::from_secs(30);
+            // 5 minute timeout for results fetch (may involve processing)
+            let timeout = std::time::Duration::from_secs(300);
             bridge.send_command_and_wait("get_uitars_extraction_results", None, timeout)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -5019,21 +5825,14 @@ async fn get_rag_availability(
 
     // Check SAM availability via Python bridge
     // SAM3 runs via the Python executor's segment_screenshot command
-    let app_state = state.app_state.clone();
-    let sam_available = tokio::task::spawn_blocking(move || {
-        let bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref bridge) = *bridge_lock {
-            bridge.is_running()
+    let sam_available = {
+        let manager_guard = state.app_state.bridge_manager.lock().await;
+        if let Some(ref manager) = *manager_guard {
+            manager.is_default_bridge_running()
         } else {
             false
         }
-    })
-    .await
-    .unwrap_or(false);
+    };
 
     // Overall availability: at least one model must be available
     let available = clip_available || text_available || sam_available;
@@ -5098,6 +5897,17 @@ pub struct SegmentScreenshotResponse {
 /// This endpoint receives a base64-encoded screenshot and returns
 /// the detected segments with their bounding boxes and cropped images.
 /// SAM3 runs locally on the user's machine via the Python executor.
+#[tracing::instrument(
+    name = "api.request.segment_screenshot",
+    skip(state, request),
+    fields(
+        endpoint = "/segment-screenshot",
+        method = "POST",
+        screenshot_size = %request.screenshot_base64.len(),
+        min_area = ?request.min_area,
+        model = ?request.model
+    )
+)]
 async fn segment_screenshot(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<SegmentScreenshotRequest>,
@@ -5119,22 +5929,17 @@ async fn segment_screenshot(
 
     // Use spawn_blocking for the synchronous bridge operation
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
-            // Send command and wait for response (2 minute timeout for SAM3 processing)
-            let timeout_duration = std::time::Duration::from_secs(120);
+            // Use configurable timeout for vision analysis (default: disabled)
+            // Falls back to 1 hour to prevent infinite IPC hangs
+            let timeout_duration = Timeouts::vision_analysis()
+                .unwrap_or_else(|| std::time::Duration::from_secs(3600));
             bridge.send_command_and_wait("segment_screenshot", Some(params), timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -5257,55 +6062,11 @@ pub struct VisionExtractionRequest {
     #[serde(default = "default_ocr_languages")]
     pub ocr_languages: Vec<String>,
     /// OCR: confidence threshold
-    #[serde(default = "default_ocr_confidence_threshold")]
+    #[serde(default = "default_ocr_confidence")]
     pub ocr_confidence_threshold: f64,
     /// Fusion: IoU threshold for merging results
     #[serde(default = "default_iou_threshold")]
     pub iou_threshold: f64,
-}
-
-fn default_vision_techniques() -> Vec<String> {
-    vec!["edge".to_string(), "sam3".to_string(), "ocr".to_string()]
-}
-
-fn default_canny_low() -> i32 {
-    50
-}
-
-fn default_canny_high() -> i32 {
-    150
-}
-
-fn default_min_contour_area() -> i32 {
-    100
-}
-
-fn default_points_per_side() -> i32 {
-    32
-}
-
-fn default_pred_iou_thresh() -> f64 {
-    0.88
-}
-
-fn default_stability_score_thresh() -> f64 {
-    0.95
-}
-
-fn default_ocr_engine() -> String {
-    "easyocr".to_string()
-}
-
-fn default_ocr_languages() -> Vec<String> {
-    vec!["en".to_string()]
-}
-
-fn default_ocr_confidence_threshold() -> f64 {
-    0.5
-}
-
-fn default_iou_threshold() -> f64 {
-    0.5
 }
 
 /// Run vision extraction on a screenshot
@@ -5343,12 +6104,7 @@ async fn run_vision_extraction(
 
     // Use spawn_blocking for the synchronous bridge operation
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
@@ -5356,9 +6112,7 @@ async fn run_vision_extraction(
             // Send command and wait for response (3 minute timeout for vision processing)
             let timeout_duration = std::time::Duration::from_secs(180);
             bridge.send_command_and_wait("run_vision_extraction", Some(params), timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -5474,6 +6228,17 @@ pub struct PatternMatchResponse {
 }
 
 /// Find best match of template in screenshot
+#[tracing::instrument(
+    name = "api.request.pattern_find",
+    skip(state, request),
+    fields(
+        endpoint = "/pattern/find",
+        method = "POST",
+        screenshot_size = %request.screenshot.len(),
+        template_size = %request.template.len(),
+        similarity = %request.similarity
+    )
+)]
 async fn pattern_find(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<PatternMatchRequest>,
@@ -5498,12 +6263,7 @@ async fn pattern_find(
 
     // Use spawn_blocking for the synchronous bridge operation
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
@@ -5511,9 +6271,7 @@ async fn pattern_find(
             // Send command and wait for response (30 second timeout)
             let timeout_duration = std::time::Duration::from_secs(30);
             bridge.send_command_and_wait("pattern_find", Some(params), timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -5565,6 +6323,18 @@ async fn pattern_find(
 }
 
 /// Find all matches of template in screenshot
+#[tracing::instrument(
+    name = "api.request.pattern_find_all",
+    skip(state, request),
+    fields(
+        endpoint = "/pattern/find-all",
+        method = "POST",
+        screenshot_size = %request.screenshot.len(),
+        template_size = %request.template.len(),
+        similarity = %request.similarity,
+        max_matches = ?request.max_matches
+    )
+)]
 async fn pattern_find_all(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<PatternMatchRequest>,
@@ -5591,12 +6361,7 @@ async fn pattern_find_all(
 
     // Use spawn_blocking for the synchronous bridge operation
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
@@ -5604,9 +6369,7 @@ async fn pattern_find_all(
             // Send command and wait for response (30 second timeout)
             let timeout_duration = std::time::Duration::from_secs(30);
             bridge.send_command_and_wait("pattern_find_all", Some(params), timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -5673,21 +6436,14 @@ async fn capture_screenshot_ipc(
     });
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("IPC: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
             let timeout_duration = std::time::Duration::from_secs(30);
             bridge.send_command_and_wait("capture_screenshot", Some(params), timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| format!("spawn_blocking error: {}", e))?;
@@ -5711,21 +6467,14 @@ async fn capture_screenshot_ipc(
 /// Get monitors via Python IPC (physical pixel coordinates)
 async fn get_monitors_ipc(app_state: Arc<crate::AppState>) -> Result<serde_json::Value, String> {
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("IPC: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
             let timeout_duration = std::time::Duration::from_secs(30);
             bridge.send_command_and_wait("get_monitors", None, timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| format!("spawn_blocking error: {}", e))?;
@@ -5798,21 +6547,14 @@ async fn list_models(
     let app_state = state.app_state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
             let timeout_duration = std::time::Duration::from_secs(30);
             bridge.send_command_and_wait("models_list", None, timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -5870,21 +6612,17 @@ async fn download_model(
 
     // Model downloads can take a long time, use 10 minute timeout
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
-            let timeout_duration = std::time::Duration::from_secs(600); // 10 minutes
+            // Use configurable timeout for python commands (default: disabled)
+            // Falls back to 1 hour to prevent infinite IPC hangs
+            let timeout_duration = Timeouts::python_command()
+                .unwrap_or_else(|| std::time::Duration::from_secs(3600));
             bridge.send_command_and_wait("models_download", Some(params), timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -5937,21 +6675,14 @@ async fn delete_model(
     });
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
             let timeout_duration = std::time::Duration::from_secs(30);
             bridge.send_command_and_wait("models_delete", Some(params), timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -6004,21 +6735,14 @@ async fn get_model_status(
     });
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
             let timeout_duration = std::time::Duration::from_secs(30);
             bridge.send_command_and_wait("models_status", Some(params), timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -6067,21 +6791,14 @@ async fn get_models_disk_usage(
     let app_state = state.app_state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
             let timeout_duration = std::time::Duration::from_secs(30);
             bridge.send_command_and_wait("models_disk_usage", None, timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -6273,21 +6990,14 @@ async fn start_integration_test(
     });
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
             let timeout_duration = std::time::Duration::from_secs(30);
             bridge.send_command_and_wait("testing_start_run", Some(params), timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -6336,21 +7046,14 @@ async fn get_test_run_status(
     });
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state
-            .python_bridge
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
             let timeout_duration = std::time::Duration::from_secs(10);
             bridge.send_command_and_wait("testing_get_status", Some(params), timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -6386,21 +7089,14 @@ async fn get_integration_test_results(
     });
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state
-            .python_bridge
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
             let timeout_duration = std::time::Duration::from_secs(30);
             bridge.send_command_and_wait("testing_get_results", Some(params), timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -6440,21 +7136,14 @@ async fn list_integration_test_runs(
     });
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state
-            .python_bridge
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
             let timeout_duration = std::time::Duration::from_secs(10);
             bridge.send_command_and_wait("testing_list_runs", Some(params), timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -6520,21 +7209,14 @@ async fn mock_gui_action(
     };
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state
-            .python_bridge
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
             let timeout_duration = std::time::Duration::from_secs(10);
             bridge.send_command_and_wait(command, Some(params), timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -6566,21 +7248,14 @@ async fn get_testing_states(
     let app_state = state.app_state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state
-            .python_bridge
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
             let timeout_duration = std::time::Duration::from_secs(10);
             bridge.send_command_and_wait("testing_get_states", None, timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -6611,21 +7286,14 @@ async fn get_testing_transitions(
     let app_state = state.app_state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state
-            .python_bridge
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
             let timeout_duration = std::time::Duration::from_secs(10);
             bridge.send_command_and_wait("testing_get_transitions", None, timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -6662,21 +7330,14 @@ async fn find_testing_path(
     });
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state
-            .python_bridge
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
             let timeout_duration = std::time::Duration::from_secs(30);
             bridge.send_command_and_wait("testing_find_path", Some(params), timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -6714,12 +7375,7 @@ async fn traverse_to_state(
     });
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state
-            .python_bridge
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
@@ -6730,9 +7386,7 @@ async fn traverse_to_state(
                 Some(params),
                 timeout_duration,
             )
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -6763,21 +7417,14 @@ async fn get_testing_active_states(
     let app_state = state.app_state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state
-            .python_bridge
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
             let timeout_duration = std::time::Duration::from_secs(10);
             bridge.send_command_and_wait("testing_get_active_states", None, timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -6813,21 +7460,14 @@ async fn set_testing_mock_mode(
     });
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state
-            .python_bridge
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
             let timeout_duration = std::time::Duration::from_secs(10);
             bridge.send_command_and_wait("testing_set_mock_mode", Some(params), timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -6858,21 +7498,14 @@ async fn get_mocked_actions(
     let app_state = state.app_state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state
-            .python_bridge
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
             let timeout_duration = std::time::Duration::from_secs(10);
             bridge.send_command_and_wait("testing_get_mocked_actions", None, timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -6903,21 +7536,14 @@ async fn clear_mocked_actions(
     let app_state = state.app_state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state
-            .python_bridge
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
             let timeout_duration = std::time::Duration::from_secs(10);
             bridge.send_command_and_wait("testing_clear_mocked_actions", None, timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -6956,21 +7582,14 @@ async fn run_testing_assertion(
     });
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state
-            .python_bridge
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
             let timeout_duration = std::time::Duration::from_secs(60);
             bridge.send_command_and_wait("testing_run_assertion", Some(params), timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -7002,21 +7621,14 @@ async fn end_integration_test(
     let app_state = state.app_state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state
-            .python_bridge
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
             let timeout_duration = std::time::Duration::from_secs(30);
             bridge.send_command_and_wait("testing_end_run", None, timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -7167,19 +7779,12 @@ async fn start_ui_bridge_exploration(
     let timeout = std::time::Duration::from_secs(30);
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
             bridge.send_command_and_wait("start_ui_bridge_exploration", Some(params), timeout)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -7242,19 +7847,12 @@ async fn get_ui_bridge_exploration_status(
     let timeout = std::time::Duration::from_secs(10);
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
             bridge.send_command_and_wait("get_ui_bridge_exploration_status", Some(params), timeout)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -7306,19 +7904,12 @@ async fn get_ui_bridge_exploration_results(
     let timeout = std::time::Duration::from_secs(30);
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
             bridge.send_command_and_wait("get_ui_bridge_exploration_results", Some(params), timeout)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -7370,19 +7961,12 @@ async fn stop_ui_bridge_exploration(
     let timeout = std::time::Duration::from_secs(10);
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
             bridge.send_command_and_wait("stop_ui_bridge_exploration", None, timeout)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -7446,19 +8030,12 @@ async fn discover_states_from_renders(
     let timeout = std::time::Duration::from_secs(60);
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
             bridge.send_command_and_wait("discover_states_from_renders", Some(params), timeout)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -7502,6 +8079,190 @@ async fn discover_states_from_renders(
     }
 }
 
+// ============================================================================
+// Error Monitor Endpoints (Application Log Error Detection)
+// ============================================================================
+
+/// Get errors from the error monitor
+async fn get_error_monitor_errors(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<ApiResponse<Vec<crate::error_monitor::StoredErrorEvent>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let task_run_id = query.get("task_run_id").cloned();
+    let limit = query
+        .get("limit")
+        .and_then(|l| l.parse::<usize>().ok())
+        .unwrap_or(100);
+
+    let conn = state.app_state.checkpoint_db.connection().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Database error: {}", e))),
+        )
+    })?;
+
+    let errors = crate::error_monitor::ErrorEventStorage::get_unresolved(
+        &conn,
+        task_run_id.as_deref(),
+        limit,
+    )
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to get errors: {}", e))),
+        )
+    })?;
+
+    Ok(Json(ApiResponse::success(errors)))
+}
+
+/// Get error summary from the error monitor
+async fn get_error_monitor_summary(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<ApiResponse<crate::error_monitor::ErrorSummary>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let task_run_id = query.get("task_run_id").cloned();
+
+    let conn = state.app_state.checkpoint_db.connection().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Database error: {}", e))),
+        )
+    })?;
+
+    let summary = crate::error_monitor::ErrorEventStorage::get_summary(&conn, task_run_id.as_deref())
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to get summary: {}", e))),
+            )
+        })?;
+
+    Ok(Json(ApiResponse::success(summary)))
+}
+
+/// Get curated debug context for AI
+async fn get_error_debug_context(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let task_run_id = query.get("task_run_id").cloned();
+
+    let conn = state.app_state.checkpoint_db.connection().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Database error: {}", e))),
+        )
+    })?;
+
+    let curator = crate::error_monitor::DebugContextCurator::new();
+    let context = curator.build_context(&conn, task_run_id.as_deref()).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to build debug context: {}", e))),
+        )
+    })?;
+
+    let formatted = curator.format_for_ai(&context);
+    Ok(Json(ApiResponse::success(formatted)))
+}
+
+/// Request body for resolving an error
+#[derive(Debug, Deserialize)]
+struct ResolveErrorRequest {
+    resolution_notes: Option<String>,
+    resolved_by_task_run_id: Option<String>,
+}
+
+/// Resolve an error (mark as fixed)
+async fn resolve_error_monitor_error(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<i64>,
+    Json(request): Json<ResolveErrorRequest>,
+) -> Json<ApiResponse<()>> {
+    match state.app_state.checkpoint_db.connection() {
+        Ok(conn) => {
+            let result = if let Some(ref task_run_id) = request.resolved_by_task_run_id {
+                crate::error_monitor::ErrorEventStorage::mark_resolved_by_task(
+                    &conn,
+                    id,
+                    task_run_id,
+                    request.resolution_notes.as_deref(),
+                )
+            } else {
+                crate::error_monitor::ErrorEventStorage::update_status(
+                    &conn,
+                    id,
+                    crate::error_monitor::ErrorStatus::Resolved,
+                    request.resolution_notes.as_deref(),
+                )
+            };
+            match result {
+                Ok(()) => Json(ApiResponse::success(())),
+                Err(e) => Json(api_error(format!("Failed to resolve error: {}", e))),
+            }
+        }
+        Err(e) => Json(api_error(format!("Database error: {}", e))),
+    }
+}
+
+/// Acknowledge an error (mark as seen)
+async fn acknowledge_error_monitor_error(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<i64>,
+) -> Json<ApiResponse<()>> {
+    match state.app_state.checkpoint_db.connection() {
+        Ok(conn) => {
+            let result = crate::error_monitor::ErrorEventStorage::update_status(
+                &conn,
+                id,
+                crate::error_monitor::ErrorStatus::Acknowledged,
+                None,
+            );
+            match result {
+                Ok(()) => Json(ApiResponse::success(())),
+                Err(e) => Json(api_error(format!("Failed to acknowledge error: {}", e))),
+            }
+        }
+        Err(e) => Json(api_error(format!("Database error: {}", e))),
+    }
+}
+
+/// Request body for generating fix workflow
+#[derive(Debug, Deserialize)]
+struct GenerateFixWorkflowRequest {
+    task_run_id: Option<String>,
+    max_iterations: Option<u32>,
+}
+
+/// Generate a workflow to fix detected errors
+async fn generate_fix_workflow(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<GenerateFixWorkflowRequest>,
+) -> Result<Json<ApiResponse<crate::error_monitor::GeneratedWorkflow>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let conn = state.app_state.checkpoint_db.connection().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Database error: {}", e))),
+        )
+    })?;
+
+    let config = crate::error_monitor::ErrorFixWorkflowConfig {
+        task_run_id: request.task_run_id,
+        max_iterations: request.max_iterations.unwrap_or(10),
+        ..Default::default()
+    };
+    let generator = crate::error_monitor::ErrorFixWorkflowGenerator::with_config(config);
+    let workflow = generator.generate(&conn).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to generate workflow: {}", e))),
+        )
+    })?;
+
+    Ok(Json(ApiResponse::success(workflow)))
+}
+
 /// Start Playwright state collection
 async fn start_playwright_collection(
     State(state): State<Arc<ApiState>>,
@@ -7531,19 +8292,12 @@ async fn start_playwright_collection(
     let timeout = std::time::Duration::from_secs(30);
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
             bridge.send_command_and_wait("start_playwright_collection", Some(params), timeout)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -7601,20 +8355,13 @@ async fn get_playwright_collection_status(
     let timeout = std::time::Duration::from_secs(10);
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             bridge.send_command_and_wait(
                 "get_playwright_collection_status",
                 Some(cmd_params),
                 timeout,
             )
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -7667,12 +8414,7 @@ async fn get_playwright_collection_results(
     });
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             // Use longer timeout for getting results (may include large screenshots)
             let timeout = std::time::Duration::from_secs(60);
             bridge.send_command_and_wait(
@@ -7680,9 +8422,7 @@ async fn get_playwright_collection_results(
                 Some(cmd_params),
                 timeout,
             )
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -7733,16 +8473,9 @@ async fn stop_playwright_collection(
     let app_state = state.app_state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             bridge.send_command("stop_playwright_collection", None)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -7971,20 +8704,24 @@ pub struct AiOutputEvent {
     pub source: String, // "prompt" or "claude"
     #[serde(rename = "actionId")]
     pub action_id: Option<String>, // Unique ID per AI loop/action within a session
+    /// Parent task run ID (matches task_runs.id in database)
+    #[serde(rename = "taskRunId")]
+    pub task_run_id: Option<String>,
+    /// Session ID for grouping output (may include phase suffix like "-agentic-1")
     #[serde(rename = "sessionId")]
-    pub session_id: Option<String>, // Session ID for grouping output across continuations
+    pub session_id: Option<String>,
     #[serde(rename = "sessionName")]
     pub session_name: Option<String>, // Human-readable session name
-    pub phase: Option<String>, // Workflow phase: setup, verification, agentic, or completion
+    /// Workflow phase: setup, verification, agentic, or completion
+    pub phase: Option<String>,
+    /// Iteration number within the phase (1, 2, 3...)
+    #[serde(rename = "phaseIteration")]
+    pub phase_iteration: Option<u32>,
 }
 
-/// Session context for AI output events
-#[derive(Debug, Clone, Default)]
-pub struct AiOutputSessionContext {
-    pub session_id: Option<String>,
-    pub session_name: Option<String>,
-    pub phase: Option<String>, // Workflow phase: setup, verification, agentic, or completion
-}
+// Re-export AiSessionContext from the canonical location
+pub use crate::execution_context::AiSessionContext;
+use crate::runtime_env::{AiSessionContextExt, ExecutionContextExt};
 
 /// Context for finding detection during AI sessions.
 /// Contains the information needed to store findings in the database.
@@ -7994,6 +8731,17 @@ pub struct FindingContext {
     pub task_run_id: String,
     /// The current session/phase number within the task run
     pub session_num: u32,
+}
+
+/// Context for progress marker detection during AI sessions.
+/// Contains the information needed to store progress markers in the database.
+#[derive(Debug, Clone)]
+pub struct ProgressContext {
+    /// The checkpoint_id for storing progress markers.
+    /// This links progress markers to a specific step checkpoint.
+    pub checkpoint_id: String,
+    /// The task_run_id for context (used in event emission)
+    pub task_run_id: String,
 }
 
 // ============================================================================
@@ -8146,48 +8894,13 @@ pub struct InlinePythonResponse {
     pub duration_ms: u64,
 }
 
-// ============================================================================
-// Agent Spawning Types
-// ============================================================================
-
-/// Request to spawn a sub-agent
-#[derive(Debug, Deserialize)]
-pub struct SpawnSubAgentRequest {
-    /// Task description for the sub-agent
-    pub task: String,
-    /// List of tool names the sub-agent can use (default: all)
-    #[serde(default)]
-    pub tools: Option<Vec<String>>,
-    /// Maximum iterations for the sub-agent (default: 10)
-    #[serde(default)]
-    pub max_iterations: Option<u32>,
-    /// Additional context to provide to the sub-agent
-    #[serde(default)]
-    pub context: Option<String>,
-}
-
-/// Response from spawning a sub-agent
-#[derive(Debug, Serialize)]
-pub struct SpawnSubAgentResponse {
-    /// Session ID of the spawned agent
-    pub session_id: String,
-    /// Whether the sub-agent completed successfully
-    pub success: bool,
-    /// Output from the sub-agent
-    pub output: String,
-    /// Number of iterations used
-    pub iterations_used: u32,
-    /// Findings reported by the sub-agent
-    pub findings: Vec<serde_json::Value>,
-}
-
 /// Emit AI output event to frontend
 pub fn emit_ai_output(
     app_handle: &tauri::AppHandle,
     line: &str,
     source: &str,
     action_id: Option<&str>,
-    session_ctx: Option<&AiOutputSessionContext>,
+    session_ctx: Option<&AiSessionContext>,
 ) {
     let event = AiOutputEvent {
         id: format!(
@@ -8199,9 +8912,11 @@ pub fn emit_ai_output(
         line: line.to_string(),
         source: source.to_string(),
         action_id: action_id.map(|s| s.to_string()),
-        session_id: session_ctx.and_then(|ctx| ctx.session_id.clone()),
-        session_name: session_ctx.and_then(|ctx| ctx.session_name.clone()),
-        phase: session_ctx.and_then(|ctx| ctx.phase.clone()),
+        task_run_id: session_ctx.map(|ctx| ctx.task_run_id().to_string()),
+        session_id: session_ctx.map(|ctx| ctx.session_id.clone()),
+        session_name: session_ctx.map(|ctx| ctx.session_name.clone()),
+        phase: session_ctx.map(|ctx| ctx.phase().as_str().to_string()),
+        phase_iteration: session_ctx.and_then(|ctx| ctx.iteration()),
     };
 
     if let Err(e) = app_handle.emit("ai-output", &event) {
@@ -8329,13 +9044,7 @@ async fn stop_ai_analysis(
     }
 
     // Stop each running task
-    let task_monitor = &state.task_monitor;
     for task in &running_tasks {
-        // Stop monitoring
-        if let Err(e) = task_monitor.stop_monitoring(&task.id).await {
-            warn!("MCP API: Failed to stop monitoring for {}: {}", task.id, e);
-        }
-
         // Mark as stopped in database
         if let Err(e) = db.stop_task_run(&task.id) {
             warn!("MCP API: Failed to stop task run {}: {}", task.id, e);
@@ -8529,6 +9238,8 @@ async fn migrate_logs_for_task(
 /// Retries up to 3 times with exponential backoff (100ms, 200ms, 400ms).
 /// Returns true if successfully marked complete, false otherwise.
 /// Also triggers log migration to persist JSONL logs to SQLite.
+///
+/// Uses gated function - unified workflows have status managed by LoopController only.
 async fn complete_task_run_with_retry(db: Arc<CheckpointDb>, task_id: &str) -> bool {
     let task_id_owned = task_id.to_string();
     let max_retries = 3;
@@ -8544,8 +9255,14 @@ async fn complete_task_run_with_retry(db: Arc<CheckpointDb>, task_id: &str) -> b
         let db_clone = db.clone();
         let id = task_id_owned.clone();
 
-        match tokio::task::spawn_blocking(move || db_clone.complete_task_run(&id)).await {
-            Ok(Ok(())) => {
+        // Use gated function - unified workflows have status managed by LoopController
+        match tokio::task::spawn_blocking(move || {
+            db_clone.complete_task_run_if_allowed(&id, "complete_task_run_with_retry")
+        })
+        .await
+        {
+            Ok(Ok(true)) => {
+                // Successfully marked complete
                 if retry > 0 {
                     info!(
                         "Task run {} marked complete after {} retries",
@@ -8556,6 +9273,10 @@ async fn complete_task_run_with_retry(db: Arc<CheckpointDb>, task_id: &str) -> b
                 // Migrate logs to SQLite after successful completion
                 migrate_logs_for_task(db.clone(), &task_id_owned, workflow_name).await;
 
+                return true;
+            }
+            Ok(Ok(false)) => {
+                // Unified workflow - status managed by LoopController, not an error
                 return true;
             }
             Ok(Err(e)) => {
@@ -8853,9 +9574,9 @@ async fn run_prompt(
         prompt_id,
         prompt_max_sessions,
         requires_orchestrator,
-        orchestrator_goal,
-        orchestrator_max_iterations,
-        orchestrator_verification_first,
+        _orchestrator_goal,
+        _orchestrator_max_iterations,
+        _orchestrator_verification_first,
     ) = if let Some(ref id) = request.prompt_id {
         // Mode 1: Lookup from database
         let prompt = prompts::get_prompt(id).ok_or_else(|| {
@@ -9112,26 +9833,18 @@ Tell the user: "The qontinui-runner needs to be restarted manually to apply chan
     );
     enhanced_prompt = format!("{}{}", service_restart_section, enhanced_prompt);
 
-    // Inject configured log sources from active profile if available
+    // Inject configured log sources from global settings
     // This tells the AI where to find logs for debugging
-    if let Ok(configs) = project_logs::list_project_configs_internal() {
-        let all_sources: Vec<_> = configs
+    {
+        let global_settings = crate::settings::get_global_log_source_settings();
+        let enabled_sources: Vec<_> = global_settings
+            .sources
             .iter()
-            .flat_map(|c| {
-                // Get sources from active profile (or legacy fallback)
-                let profile_name = c
-                    .get_active_profile()
-                    .map(|p| p.name.as_str())
-                    .unwrap_or("Default");
-                c.get_active_log_sources()
-                    .iter()
-                    .filter(|s| s.enabled)
-                    .map(|s| format!("- **{}** ({}): `{}`", s.name, profile_name, s.path))
-                    .collect::<Vec<_>>()
-            })
+            .filter(|s| s.enabled)
+            .map(|s| format!("- **{}**: `{}`", s.name, s.path))
             .collect();
 
-        if !all_sources.is_empty() {
+        if !enabled_sources.is_empty() {
             let log_sources_section = format!(
                 r#"## Configured Log Sources
 
@@ -9142,7 +9855,7 @@ The following log files have been configured for monitoring. Use these paths to 
 ---
 
 "#,
-                all_sources.join("\n")
+                enabled_sources.join("\n")
             );
             enhanced_prompt = format!("{}{}", log_sources_section, enhanced_prompt);
         }
@@ -9227,18 +9940,15 @@ If your task requires running visual automation, use the Runner API to execute w
         )
     })?;
 
-    db.create_task_run_with_config(
-        &task_run_id,
-        &prompt_name,
-        Some(&enhanced_prompt),
-        "task", // task_type
-        None,   // config_id
-        None,   // workflow_name
-        max_sessions,
-        None, // auto_continue
-        None, // execution_steps_json
-        None, // log_sources_json
-    )
+    {
+        let mut input = CreateTaskRunInput::new(&task_run_id, &prompt_name)
+            .with_prompt(&enhanced_prompt)
+            .with_task_type("task");
+        if let Some(ms) = max_sessions {
+            input = input.with_max_sessions(ms);
+        }
+        db.create_task_run(&input)
+    }
     .map_err(|e| {
         error!("MCP API: Failed to create task run: {}", e);
         (
@@ -9250,11 +9960,12 @@ If your task requires running visual automation, use the Runner API to execute w
     info!("MCP API: Created task run with ID: {}", task_run_id);
 
     // Create session context for AI output events so frontend can display the task name
-    let session_ctx = AiOutputSessionContext {
-        session_id: Some(task_run_id.clone()),
-        session_name: Some(prompt_name.clone()),
-        phase: None,
-    };
+    // This is the first turn (iteration 1), so turn_count = 1
+    let session_ctx = AiSessionContext::agentic(&task_run_id, &prompt_name, 1)
+        .with_runtime_env()
+        .with_new_trace()
+        .with_ai_settings()
+        .with_turn_count(1);
 
     // Emit prompt to frontend (use original prompt content for display)
     emit_ai_output(
@@ -9287,298 +9998,25 @@ If your task requires running visual automation, use the Runner API to execute w
     // When false, use the simpler direct spawn path.
     // =========================================================================
 
+    // NOTE: The orchestrator path was removed when run_unified_session_loop was deleted.
+    // All paths now use the direct spawn path. Orchestrator functionality will be
+    // re-integrated via LoopController in a future update.
     if requires_orchestrator {
-        // =====================================================================
-        // ORCHESTRATOR PATH
-        // =====================================================================
-        // Use the unified session API with full orchestrator support.
-        // This path provides:
-        // - Planning agent: Creates verification plan with success criteria
-        // - Verification agent: Runs deterministic checks and AI verification
-        // - Knowledge base: Accumulates findings across iterations
-        // - Feedback loops: Provides guidance when verification fails
-        // =====================================================================
-
-        info!(
-            "MCP API: Using orchestrator path for prompt '{}' (session: {})",
+        warn!(
+            "MCP API: Orchestrator path requested but session loop was removed. Falling through to direct spawn path for prompt '{}' (session: {})",
             prompt_name, session_id
         );
+    }
 
-        // Create session config for the unified session API
-        let session_config = SessionConfig {
-            prompt: enhanced_prompt.clone(),
-            continuation_prompt: None,
-            total_phases: 0, // Unlimited phases within session
-            uses_gui: false,
-            timeout_seconds: 1800, // 30 minutes
-            stall_threshold_seconds: 300,
-            name: prompt_name.clone(),
-            description: String::new(),
-            custom_config: serde_json::json!({}),
-            provider: None,
-            model: None,
-        };
-
-        // Start the session via session manager
-        let session = state
-            .session
-            .start_session(session_config)
-            .await
-            .map_err(|e| {
-                error!("MCP API: Failed to start orchestrator session: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(api_error(format!("Failed to start session: {}", e))),
-                )
-            })?;
-
-        let orchestrator_session_id = session.id.clone();
-        info!(
-            "MCP API: Started orchestrator session: {}",
-            orchestrator_session_id
-        );
-
-        // Initialize the orchestrator
-        let orch_goal = orchestrator_goal
-            .clone()
-            .unwrap_or_else(|| prompt_content.clone());
-        let orch_max_iterations = orchestrator_max_iterations.unwrap_or(10);
-
-        info!(
-            "MCP API: Initializing orchestrator with goal: {}",
-            &orch_goal[..orch_goal.len().min(100)]
-        );
-
-        let workspace_root_for_orchestrator = get_workspace_paths_internal()
-            .map(|(root, _, _)| root.to_string_lossy().to_string())
-            .unwrap_or_else(|_| ".".to_string());
-
-        // Determine if this workflow should run verification before the first worker
-        let verification_first = orchestrator_verification_first.unwrap_or(false);
-
-        let orchestrator_config = OrchestratorConfig {
-            max_iterations: orch_max_iterations,
-            ai_timeout_seconds: 300,
-            working_directory: workspace_root_for_orchestrator.clone(),
-            enable_planning: true,
-            enable_ai_verification: true,
-            run_initial_verification: verification_first,
-            compression: Some(CompressionConfig::default()),
-            enable_checkpointing: true,
-        };
-
-        let orchestrator =
-            Orchestrator::new(orchestrator_config, state.app_state.checkpoint_db.clone());
-
-        // Initialize the orchestrator state with planning
-        match orchestrator.initialize_task(&orchestrator_session_id, &orch_goal) {
-            Ok(mut orch_state) => {
-                info!(
-                    "MCP API: Orchestrator initialized for session {} with {} success criteria",
-                    orchestrator_session_id,
-                    orch_state
-                        .plan
-                        .as_ref()
-                        .map(|p| p.success_criteria.len())
-                        .unwrap_or(0)
-                );
-
-                // Run initial verification if configured (for verification-first workflows)
-                if verification_first && orch_state.plan.is_some() {
-                    info!(
-                        "MCP API: Running initial verification for session {} (verification-first mode)",
-                        orchestrator_session_id
-                    );
-
-                    // Need to create orchestrator with output support for emissions
-                    let orchestrator_with_output = Orchestrator::new_with_output(
-                        OrchestratorConfig {
-                            max_iterations: orch_max_iterations,
-                            ai_timeout_seconds: 300,
-                            working_directory: workspace_root_for_orchestrator.clone(),
-                            enable_planning: true,
-                            enable_ai_verification: true,
-                            run_initial_verification: true,
-                            compression: Some(CompressionConfig::default()),
-                            enable_checkpointing: true,
-                        },
-                        state.app_state.checkpoint_db.clone(),
-                        state.app_handle.clone(),
-                        Some(AiOutputSessionContext {
-                            session_id: Some(orchestrator_session_id.clone()),
-                            session_name: Some(prompt_name.clone()),
-                            phase: None,
-                        }),
-                    );
-
-                    match orchestrator_with_output
-                        .run_initial_verification(&mut orch_state)
-                        .await
-                    {
-                        Ok(results) => {
-                            info!(
-                                "MCP API: Initial verification complete for session {}: {} passed, {} failed",
-                                orchestrator_session_id,
-                                results.deterministic_results.iter().filter(|r| r.passed).count(),
-                                results.deterministic_results.iter().filter(|r| !r.passed).count()
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                "MCP API: Initial verification failed for session {}: {}. Continuing without initial results.",
-                                orchestrator_session_id, e
-                            );
-                        }
-                    }
-                }
-
-                // Store the orchestrator state
-                let mut states = state.orchestrator_states.lock().await;
-                states.insert(orchestrator_session_id.clone(), orch_state);
-            }
-            Err(e) => {
-                warn!(
-                    "MCP API: Failed to initialize orchestrator for session {}: {}. Continuing without orchestrator.",
-                    orchestrator_session_id, e
-                );
-            }
-        }
-
-        // Get workspace root for execution loop
-        let workspace_root = get_workspace_paths_internal()
-            .map(|(root, _, _)| root.to_string_lossy().to_string())
-            .unwrap_or_else(|_| ".".to_string());
-
-        // Clone values for the spawned task
-        let state_clone = state.clone();
-        let session_id_for_loop = orchestrator_session_id.clone();
-        let session_name_for_loop = prompt_name.clone();
-
-        // Spawn the unified session execution loop with orchestrator support
-        tokio::spawn(async move {
-            info!(
-                "MCP API: Starting orchestrator session '{}' (id: {})",
-                session_name_for_loop, session_id_for_loop
-            );
-
-            // Create session context for grouping output
-            let session_ctx = AiOutputSessionContext {
-                session_id: Some(session_id_for_loop.clone()),
-                session_name: Some(session_name_for_loop.clone()),
-                phase: None,
-            };
-
-            // Run the unified session loop (which integrates with orchestrator)
-            run_unified_session_loop(
-                state_clone.clone(),
-                session_id_for_loop.clone(),
-                workspace_root.clone(),
-                None, // No external checkpoint
-                Some(session_ctx.clone()),
-                None, // Use session_id as task_run_id
-                1,    // First iteration
-            )
-            .await;
-
-            // Cross-session continuation loop for orchestrator tasks
-            loop {
-                let db = match CheckpointDb::new() {
-                    Ok(d) => d,
-                    Err(e) => {
-                        warn!(
-                            "Failed to open database for orchestrator session check: {}",
-                            e
-                        );
-                        break;
-                    }
-                };
-
-                let task = match db.get_task_run(&session_id_for_loop) {
-                    Ok(Some(t)) => t,
-                    Ok(None) => {
-                        info!(
-                            "Orchestrator task {} not found, exiting loop",
-                            session_id_for_loop
-                        );
-                        break;
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to get orchestrator task {}: {}",
-                            session_id_for_loop, e
-                        );
-                        break;
-                    }
-                };
-
-                // Check if task is complete or stopped
-                if task.status == "completed" || task.status == "failed" || task.status == "stopped"
-                {
-                    info!(
-                        "Orchestrator task {} finished with status: {}",
-                        session_id_for_loop, task.status
-                    );
-                    break;
-                }
-
-                // Check max sessions limit
-                if let Some(max) = max_sessions {
-                    if task.sessions_count >= max {
-                        info!(
-                            "Orchestrator task {} reached max sessions ({})",
-                            session_id_for_loop, max
-                        );
-                        break;
-                    }
-                }
-
-                // Continue with next iteration
-                let next_iteration = task.sessions_count + 1;
-                info!(
-                    "Orchestrator task {} continuing to iteration {}",
-                    session_id_for_loop, next_iteration
-                );
-
-                run_unified_session_loop(
-                    state_clone.clone(),
-                    session_id_for_loop.clone(),
-                    workspace_root.clone(),
-                    None,
-                    Some(session_ctx.clone()),
-                    Some(session_id_for_loop.clone()),
-                    next_iteration,
-                )
-                .await;
-            }
-        });
-
-        // Return response for orchestrator path
-        let (_, dev_logs_path, _) = get_workspace_paths_internal().map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to get workspace paths: {}", e))),
-            )
-        })?;
-
-        let state_file =
-            dev_logs_path.join(format!("ai-developer-{}.json", orchestrator_session_id));
-        let log_file =
-            dev_logs_path.join(format!("claude-session-{}.log", orchestrator_session_id));
-
-        Ok(Json(ApiResponse::success(RunPromptResponse {
-            task_run_id: orchestrator_session_id.clone(),
-            action_id: orchestrator_session_id.clone(),
-            session_id: orchestrator_session_id,
-            state_file: state_file.to_string_lossy().to_string(),
-            log_file: log_file.to_string_lossy().to_string(),
-            pid: None, // No PID for session-based execution
-        })))
-    } else {
+    // Always use the direct spawn path for now
+    {
         // =====================================================================
         // DIRECT SPAWN PATH
         // =====================================================================
-        // Use the simpler direct spawn path without orchestrator.
-        // This is faster for simple prompts that don't need verification.
+        // DIRECT SPAWN PATH
+        // =====================================================================
+        // Use the simpler direct spawn path.
+        // Orchestrator functionality will be re-integrated via LoopController.
         // =====================================================================
 
         info!(
@@ -9681,23 +10119,8 @@ If your task requires running visual automation, use the Runner API to execute w
         })?;
 
         match result {
-            Ok((response, log_file, dev_logs_path)) => {
-                // Start monitoring the task for [TASK_COMPLETE] marker
-                let task_monitor = state.task_monitor.clone();
-                let task_run_id = response.task_run_id.clone();
-
-                // Spawn monitoring in background
-                tokio::spawn(async move {
-                    if let Err(e) = task_monitor
-                        .start_monitoring(&task_run_id, log_file, dev_logs_path)
-                        .await
-                    {
-                        error!("Failed to start task monitoring for {}: {}", task_run_id, e);
-                    } else {
-                        info!("Started task monitoring for {}", task_run_id);
-                    }
-                });
-
+            Ok((response, _log_file, _dev_logs_path)) => {
+                // NOTE: TaskMonitor was removed - task completion is now tracked by LoopController
                 Ok(Json(ApiResponse::success(response)))
             }
             Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
@@ -9973,7 +10396,8 @@ async fn run_macro(
                 if let Some(ref state_ids) = step.target_state_ids {
                     if let Some(first_state_id) = state_ids.first() {
                         // Use go_to_state via action service
-                        let timeout = step.timeout_seconds.unwrap_or(60);
+                        // Timeouts are disabled by default
+                        let timeout = step.timeout_seconds;
                         match action_service
                             .go_to_state(first_state_id, None, step.monitor_index, timeout)
                             .await
@@ -10301,13 +10725,14 @@ async fn execute_inline_python(
     use tokio::time::timeout;
 
     let start = Instant::now();
-    let timeout_secs = request.timeout_seconds.unwrap_or(30);
+    // Timeouts are disabled by default
+    let timeout_secs = request.timeout_seconds;
 
     // Determine working directory
     let working_dir = request
         .working_directory
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir());
+        .unwrap_or_else(std::env::temp_dir);
 
     // Create a temporary script file
     let script_id = uuid::Uuid::new_v4();
@@ -10351,6 +10776,19 @@ if __name__ == "__main__":
     }
 
     // Build the command - use uvx if dependencies are specified
+    // Helper to run with or without timeout
+    async fn run_with_optional_timeout(
+        mut cmd: tokio::process::Command,
+        timeout_secs: Option<u64>,
+    ) -> Result<Result<std::process::Output, std::io::Error>, tokio::time::error::Elapsed> {
+        if let Some(secs) = timeout_secs {
+            timeout(std::time::Duration::from_secs(secs), cmd.output()).await
+        } else {
+            // No timeout - wrap in Ok to match the return type
+            Ok(cmd.output().await)
+        }
+    }
+
     let output_result = if let Some(deps) = &request.dependencies {
         if !deps.is_empty() {
             // Use uvx for dependency isolation
@@ -10360,7 +10798,7 @@ if __name__ == "__main__":
                 .current_dir(&working_dir)
                 .kill_on_drop(true);
 
-            timeout(std::time::Duration::from_secs(timeout_secs), cmd.output()).await
+            run_with_optional_timeout(cmd, timeout_secs).await
         } else {
             // No dependencies, use python directly
             let mut cmd = Command::new("python");
@@ -10368,7 +10806,7 @@ if __name__ == "__main__":
                 .current_dir(&working_dir)
                 .kill_on_drop(true);
 
-            timeout(std::time::Duration::from_secs(timeout_secs), cmd.output()).await
+            run_with_optional_timeout(cmd, timeout_secs).await
         }
     } else {
         // No dependencies, use python directly
@@ -10377,7 +10815,7 @@ if __name__ == "__main__":
             .current_dir(&working_dir)
             .kill_on_drop(true);
 
-        timeout(std::time::Duration::from_secs(timeout_secs), cmd.output()).await
+        run_with_optional_timeout(cmd, timeout_secs).await
     };
 
     // Cleanup the temp script
@@ -10422,10 +10860,13 @@ if __name__ == "__main__":
         }
         Err(_) => {
             // Timeout
+            let timeout_msg = timeout_secs
+                .map(|t| format!("Execution timed out after {} seconds", t))
+                .unwrap_or_else(|| "Execution timed out".to_string());
             Ok(Json(ApiResponse::success(InlinePythonResponse {
                 success: false,
                 stdout: String::new(),
-                stderr: format!("Execution timed out after {} seconds", timeout_secs),
+                stderr: timeout_msg,
                 return_value: None,
                 duration_ms,
             })))
@@ -10434,168 +10875,6 @@ if __name__ == "__main__":
 }
 
 // ============================================================================
-// Agent Spawning
-// ============================================================================
-
-/// Spawn a sub-agent with a specific task
-///
-/// This handler creates a new AI session with a focused task and optionally
-/// restricted tool access. The sub-agent runs autonomously via the session
-/// manager and returns when complete.
-async fn spawn_sub_agent(
-    State(state): State<Arc<ApiState>>,
-    Json(request): Json<SpawnSubAgentRequest>,
-) -> Result<Json<ApiResponse<SpawnSubAgentResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let max_iterations = request.max_iterations.unwrap_or(10);
-
-    // Build the sub-agent prompt with tool restrictions
-    let tool_instructions = if let Some(tools) = &request.tools {
-        if tools.is_empty() {
-            "You have access to all available tools.".to_string()
-        } else {
-            format!(
-                "You have access ONLY to these tools: {}. Do not attempt to use other tools.",
-                tools.join(", ")
-            )
-        }
-    } else {
-        "You have access to all available tools.".to_string()
-    };
-
-    let context_section = request
-        .context
-        .as_ref()
-        .map(|c| format!("\n## Additional Context\n{}\n", c))
-        .unwrap_or_default();
-
-    let prompt = format!(
-        r#"You are a sub-agent with a specific task. Complete the task and report your findings.
-
-## Task
-{task}
-{context_section}
-## Tool Access
-{tool_instructions}
-
-## Instructions
-1. Complete the task using available tools
-2. Be thorough but efficient
-3. Report any findings or issues discovered
-4. When done, summarize what was accomplished
-
-## Output Format
-When you complete the task, include a summary line starting with [TASK_COMPLETE] followed by a brief summary.
-If you encounter issues, include them in your response.
-"#,
-        task = request.task,
-        context_section = context_section,
-        tool_instructions = tool_instructions,
-    );
-
-    info!(
-        "Spawning sub-agent with task: {} (max_iterations: {})",
-        request.task.chars().take(100).collect::<String>(),
-        max_iterations
-    );
-
-    // Create a new session via the session manager
-    let session_manager = &state.session;
-
-    // Generate a session name
-    let session_name = format!("sub-agent-{}", uuid::Uuid::new_v4());
-
-    // Create session config
-    let session_config = SessionConfig {
-        prompt,
-        continuation_prompt: None,
-        total_phases: max_iterations,
-        uses_gui: false,
-        timeout_seconds: 300, // 5 minutes per iteration
-        stall_threshold_seconds: 60,
-        name: session_name.clone(),
-        description: format!(
-            "Sub-agent task: {}",
-            request.task.chars().take(50).collect::<String>()
-        ),
-        custom_config: serde_json::json!({}),
-        provider: None,
-        model: None,
-    };
-
-    // Start the session
-    match session_manager.start_session(session_config).await {
-        Ok(session) => {
-            let session_id = session.id.clone();
-
-            // Wait for session completion
-            let mut iterations_used = 0u32;
-            let mut output = String::new();
-            let mut success = false;
-
-            // Poll for completion (simplified - in production you'd use proper async waiting)
-            for i in 0..max_iterations {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                iterations_used = i + 1;
-
-                // Check session status
-                if let Some(session_info) = session_manager.get_session(&session_id).await {
-                    // Collect output from event log
-                    output = session_info
-                        .event_log
-                        .iter()
-                        .map(|event| event.message.clone())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-
-                    match session_info.status {
-                        crate::session::SessionStatus::Completed
-                        | crate::session::SessionStatus::Stopped => {
-                            success = output.contains("[TASK_COMPLETE]");
-                            break;
-                        }
-                        crate::session::SessionStatus::Failed => {
-                            success = false;
-                            break;
-                        }
-                        _ => {
-                            // Still running, continue waiting
-                        }
-                    }
-                } else {
-                    // Session not found
-                    break;
-                }
-            }
-
-            // Parse findings from output (look for [FINDING:...] patterns)
-            let findings: Vec<serde_json::Value> = output
-                .lines()
-                .filter(|line| line.contains("[FINDING:"))
-                .map(|line| {
-                    serde_json::json!({
-                        "raw": line.trim()
-                    })
-                })
-                .collect();
-
-            Ok(Json(ApiResponse::success(SpawnSubAgentResponse {
-                session_id,
-                success,
-                output,
-                iterations_used,
-                findings,
-            })))
-        }
-        Err(e) => {
-            error!("Failed to spawn sub-agent: {}", e);
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to spawn sub-agent: {}", e))),
-            ))
-        }
-    }
-}
-
 /// Search scriptlets
 async fn search_scriptlets(
     State(_state): State<Arc<ApiState>>,
@@ -10942,1000 +11221,8 @@ fn collect_images_for_analysis(
 // and execute_claude_api functions were removed. They implemented synchronous execution
 // which has been replaced by the TaskRun model using spawn-independent-claude.py.
 
-// ============================================================================
-// Unified Session API Handlers
-// ============================================================================
-
-use crate::iteration_bundle::{self, IterationBundle, RelevantLogSources};
-use crate::log_consolidation;
-use crate::session::{Session, SessionConfig, SessionStatus};
-use crate::step_executor::{ExecutionResult, ExecutionStepConfig, LogSourceConfig, StepExecutor};
-
-/// Request to start a new unified session
-#[derive(Debug, Deserialize)]
-struct StartSessionRequest {
-    /// Session name (for display)
-    name: String,
-    /// Initial prompt content
-    prompt: String,
-    /// Prompt for continuation (if different)
-    continuation_prompt: Option<String>,
-    /// Total phases/iterations (0 = unlimited)
-    #[serde(default)]
-    total_phases: u32,
-    /// Whether this session uses GUI automation
-    #[serde(default)]
-    uses_gui: bool,
-    /// Timeout per phase in seconds (default 1800 = 30 min)
-    #[serde(default = "default_session_timeout")]
-    timeout_seconds: u64,
-
-    /// Execution steps to run BEFORE spawning AI (deterministic)
-    #[serde(default)]
-    execution_steps: Vec<ExecutionStepConfig>,
-
-    /// Log sources to capture during execution steps
-    #[serde(default)]
-    log_sources: Vec<LogSourceConfig>,
-
-    // Multi-session workflow configuration
-    /// Path to external checkpoint file for cross-session workflows
-    #[serde(default)]
-    checkpoint_path: Option<String>,
-    /// JSON field name in checkpoint that tracks current phase (default: "current_phase")
-    #[serde(default = "default_phase_field")]
-    phase_field: String,
-    /// Workflow is complete when phase_field reaches this value
-    #[serde(default)]
-    completion_value: Option<u32>,
-
-    // Context injection
-    /// Context IDs to explicitly include in the prompt
-    #[serde(default)]
-    context_ids: Vec<String>,
-    /// Whether to auto-detect and include relevant contexts
-    #[serde(default)]
-    auto_include_contexts: bool,
-
-    // AI provider override
-    /// AI provider override (e.g., "claude_cli", "gemini_api")
-    #[serde(default)]
-    provider: Option<String>,
-    /// AI model override (e.g., "claude-sonnet-4-20250514", "gemini-2.0-flash")
-    #[serde(default)]
-    model: Option<String>,
-
-    /// Whether to capture input for validation (comparing reported vs actual positions)
-    #[serde(default)]
-    capture_input_validation: bool,
-
-    /// Maximum number of cross-session iterations (None = unlimited)
-    #[serde(default)]
-    max_sessions: Option<u32>,
-
-    // Orchestrator configuration
-    /// Enable the task orchestrator for planning and verification
-    /// When enabled, the orchestrator will:
-    /// - Create a verification plan at task start
-    /// - Inject plan context into worker prompts
-    /// - Process worker signals (WORK_COMPLETE, NEED_REPLAN, findings)
-    /// - Run verification when work is complete
-    /// - Provide feedback for failed verification
-    #[serde(default)]
-    enable_orchestrator: bool,
-    /// Goal description for the orchestrator (used for planning)
-    /// If not provided, the prompt will be used as the goal
-    #[serde(default)]
-    orchestrator_goal: Option<String>,
-    /// Maximum iterations for the orchestrator (default: 10)
-    #[serde(default)]
-    orchestrator_max_iterations: Option<u32>,
-    /// Whether to run verification before the first worker iteration
-    /// For non-automation workflows, verification identifies what needs fixing
-    #[serde(default)]
-    orchestrator_verification_first: Option<bool>,
-}
-
-fn default_phase_field() -> String {
-    "current_phase".to_string()
-}
-
-fn default_session_timeout() -> u64 {
-    1800
-}
-
-/// Response from starting a session
-#[derive(Debug, Serialize)]
-struct StartSessionResponse {
-    session: Session,
-}
-
-/// List all unified sessions
-async fn list_sessions(
-    State(state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<Vec<Session>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let sessions = state.session.list_sessions().await;
-    Ok(Json(ApiResponse::success(sessions)))
-}
-
-/// Get a specific session
-async fn get_session(
-    State(state): State<Arc<ApiState>>,
-    axum::extract::Path(session_id): axum::extract::Path<String>,
-) -> Result<Json<ApiResponse<Session>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match state.session.get_session(&session_id).await {
-        Some(session) => Ok(Json(ApiResponse::success(session))),
-        None => Err((
-            StatusCode::NOT_FOUND,
-            Json(api_error(format!("Session {} not found", session_id))),
-        )),
-    }
-}
-
-/// Start a new unified session
-async fn start_session(
-    State(state): State<Arc<ApiState>>,
-    Json(request): Json<StartSessionRequest>,
-) -> Result<Json<ApiResponse<StartSessionResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // Clone values BEFORE moving them into config
-    let session_name = request.name.clone();
-    let prompt_for_task_run = request.prompt.clone();
-
-    // Serialize execution steps for storage (used for re-execution on resume)
-    let execution_steps_json = if !request.execution_steps.is_empty() {
-        serde_json::to_string(&request.execution_steps).ok()
-    } else {
-        None
-    };
-    let log_sources_json = if !request.log_sources.is_empty() {
-        serde_json::to_string(&request.log_sources).ok()
-    } else {
-        None
-    };
-
-    // Multi-session workflow config
-    let workflow_checkpoint_path = request.checkpoint_path.clone();
-    let workflow_phase_field = request.phase_field.clone();
-    let workflow_completion_value = request.completion_value;
-
-    // Debug: Log the workflow config values received
-    info!(
-        "Session workflow config: checkpoint_path={:?}, phase_field={:?}, completion_value={:?}",
-        workflow_checkpoint_path, workflow_phase_field, workflow_completion_value
-    );
-
-    // Clear existing checkpoint file for fresh workflow start
-    // This ensures new workflow runs don't resume from old checkpoints
-    if let Some(ref cp_path) = workflow_checkpoint_path {
-        let checkpoint_path = std::path::PathBuf::from(cp_path);
-        if checkpoint_path.exists() {
-            info!(
-                "Clearing existing checkpoint file for fresh workflow start: {:?}",
-                checkpoint_path
-            );
-            if let Err(e) = std::fs::remove_file(&checkpoint_path) {
-                warn!("Failed to remove old checkpoint file: {}", e);
-            }
-        }
-    }
-
-    // Execute deterministic steps BEFORE spawning AI session
-    // This runs workflows, actions, screenshots, etc. and collects results
-    // Uses the unified StepExecutor module (same code path as /execute-steps endpoint)
-    let execution_result = if !request.execution_steps.is_empty() {
-        info!(
-            "Executing {} deterministic steps before AI session",
-            request.execution_steps.len()
-        );
-        // Use a temporary session ID for screenshot naming
-        let temp_session_id = format!(
-            "pre-{}-{}",
-            chrono::Utc::now().format("%Y%m%d%H%M%S"),
-            uuid::Uuid::new_v4()
-                .to_string()
-                .split('-')
-                .next()
-                .unwrap_or("0000")
-        );
-        let executor = StepExecutor::with_app_handle(
-            state.app_state.clone(),
-            state.config_storage.clone(),
-            state.app_handle.clone(),
-        );
-        executor
-            .execute_steps_with_log_sources(
-                &request.execution_steps,
-                &temp_session_id,
-                &request.log_sources,
-            )
-            .await
-    } else {
-        ExecutionResult {
-            success: true,
-            total_steps: 0,
-            successful_steps: 0,
-            failed_steps: 0,
-            total_duration_ms: 0,
-            steps: Vec::new(),
-            captured_logs: None,
-            captured_runner_logs: None,
-        }
-    };
-
-    // Generate execution summary using iteration bundle
-    // This provides structured, filtered data with step-linked screenshots
-    let execution_summary = if !execution_result.steps.is_empty() {
-        // Determine which logs are relevant based on step types
-        let relevant_logs = RelevantLogSources::from_steps(&request.execution_steps);
-
-        // New session starts at iteration 1
-        let iteration = 1u32;
-
-        // Use session name as temporary ID (actual ID will be assigned when session starts)
-        let temp_task_id = session_name.clone();
-
-        // Create the iteration bundle
-        let timestamp_now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let mut bundle = IterationBundle::new(
-            iteration,
-            temp_task_id,
-            timestamp_now.clone(),
-            timestamp_now,
-            &execution_result,
-            &relevant_logs,
-        );
-
-        // Add application logs if captured
-        if let Some(ref captured) = execution_result.captured_logs {
-            bundle.add_application_logs(&captured.sources, &request.log_sources);
-        }
-
-        // Add runner logs if captured (GUI automation events)
-        if let Some(ref runner_logs) = execution_result.captured_runner_logs {
-            bundle.add_gui_automation_logs(
-                runner_logs.actions.clone(),
-                runner_logs.image_recognition.clone(),
-            );
-
-            // Add input validation data if enabled
-            if request.capture_input_validation {
-                let input_validation = iteration_bundle::collect_input_validation_from_actions(
-                    &runner_logs.actions,
-                    &session_name,
-                );
-                bundle.add_input_validation_logs(input_validation);
-            }
-        }
-
-        // Render to markdown
-        bundle.to_markdown()
-    } else {
-        String::new()
-    };
-
-    // Inject contexts into the prompt if requested
-    let final_prompt = if !request.context_ids.is_empty() || request.auto_include_contexts {
-        // Extract action types from loaded config for auto-detection
-        let action_types: Vec<String> = {
-            let config_lock =
-                safe_lock_or_recover(&state.app_state.current_config, "current_config");
-            if let Some(ref config) = *config_lock {
-                config
-                    .workflows
-                    .iter()
-                    .flat_map(|w| {
-                        w.get("actions")
-                            .and_then(|a| a.as_array())
-                            .map(|actions| {
-                                actions
-                                    .iter()
-                                    .filter_map(|action| {
-                                        action
-                                            .get("type")
-                                            .and_then(|t| t.as_str())
-                                            .map(String::from)
-                                    })
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_default()
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            }
-        };
-
-        let recent_errors: Vec<String> = Vec::new();
-
-        let (enhanced_prompt, used_context_ids) = context::inject_contexts(
-            &request.prompt,
-            &request.context_ids,
-            request.auto_include_contexts,
-            &request.prompt, // Use prompt for auto-detection matching
-            &action_types,
-            &recent_errors,
-        );
-
-        if !used_context_ids.is_empty() {
-            info!(
-                "Session start: Injected {} contexts into prompt: {:?}",
-                used_context_ids.len(),
-                used_context_ids
-            );
-        }
-
-        enhanced_prompt
-    } else {
-        request.prompt.clone()
-    };
-
-    // Append execution summary to prompt if steps were executed
-    // If no steps were configured, add a warning so the AI knows
-    let final_prompt_with_results = if !execution_summary.is_empty() {
-        format!("{}\n{}", final_prompt, execution_summary)
-    } else if request.execution_steps.is_empty() {
-        // No execution steps were configured - this may be intentional or a bug
-        format!(
-            "{}\n\n\
-            ## ⚠️ No Pre-Execution Steps Configured\n\n\
-            This task was started WITHOUT execution steps. This means:\n\
-            - No GUI automation, screenshots, or tests were run\n\
-            - There is no Iteration Bundle with pre-execution results\n\n\
-            If this task SHOULD have pre-execution steps (e.g., clicking buttons, \
-            capturing screenshots, running Playwright tests), the UI that started \
-            this task needs to include the `execution_steps` parameter.\n\n\
-            If this is intentional (e.g., a pure code analysis task), ignore this warning.\n",
-            final_prompt
-        )
-    } else {
-        // Steps were configured but produced no summary (execution failed?)
-        format!(
-            "{}\n\n\
-            ## ⚠️ Pre-Execution Steps Produced No Results\n\n\
-            Execution steps were configured but produced no Iteration Bundle. \
-            This may indicate the steps failed or returned empty output.\n\
-            Check the runner logs at `.dev-logs/runner-*.jsonl` for details.\n",
-            final_prompt
-        )
-    };
-
-    // When execution_steps are configured, limit to 1 phase per session
-    // This allows the cross-session loop to re-run automation between each phase
-    // giving the AI fresh data (new screenshots) to verify its changes worked
-    let effective_total_phases = if !request.execution_steps.is_empty() {
-        // With execution steps, each session should only run 1 phase
-        // so automation is re-run before the next AI session
-        1
-    } else {
-        // Without execution steps, use the requested total_phases
-        request.total_phases
-    };
-
-    let config = SessionConfig {
-        prompt: final_prompt_with_results,
-        continuation_prompt: request.continuation_prompt,
-        total_phases: effective_total_phases,
-        uses_gui: request.uses_gui,
-        timeout_seconds: request.timeout_seconds,
-        stall_threshold_seconds: 300,
-        name: request.name,
-        description: String::new(),
-        custom_config: serde_json::json!({}),
-        provider: request.provider,
-        model: request.model,
-    };
-
-    match state.session.start_session(config).await {
-        Ok(session) => {
-            info!("Started unified session: {}", session.id);
-
-            // Create task_run record for auto-continue tracking
-            // This is critical - without this, auto-continue won't work
-            // Store execution_steps_json and log_sources_json so they can be re-executed on resume
-            let task_run_id = session.id.clone();
-            if let Err(e) = state.app_state.checkpoint_db.create_task_run_with_config(
-                &task_run_id,
-                &session_name,
-                Some(&prompt_for_task_run),
-                "task",               // task_type
-                None,                 // config_id
-                None,                 // workflow_name
-                request.max_sessions, // max_sessions from request (None = unlimited)
-                None,                 // auto_continue - defaults to true
-                execution_steps_json.clone(),
-                log_sources_json.clone(),
-            ) {
-                warn!(
-                    "Failed to create task_run for session {}: {}",
-                    task_run_id, e
-                );
-                // Continue anyway - session will still run, just without auto-continue tracking
-            } else {
-                info!("Created task_run {} for session tracking", task_run_id);
-            }
-
-            // Initialize orchestrator if enabled
-            let enable_orchestrator = request.enable_orchestrator;
-            let orchestrator_goal = request
-                .orchestrator_goal
-                .clone()
-                .unwrap_or_else(|| prompt_for_task_run.clone());
-            let orchestrator_max_iterations = request.orchestrator_max_iterations.unwrap_or(10);
-
-            if enable_orchestrator {
-                info!(
-                    "Initializing orchestrator for task {} with goal: {}",
-                    task_run_id,
-                    &orchestrator_goal[..orchestrator_goal.len().min(100)]
-                );
-
-                let workspace_root_for_orchestrator = get_workspace_paths_internal()
-                    .map(|(root, _, _)| root.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| ".".to_string());
-
-                let verification_first = request.orchestrator_verification_first.unwrap_or(false);
-
-                let orchestrator_config = OrchestratorConfig {
-                    max_iterations: orchestrator_max_iterations,
-                    ai_timeout_seconds: 300,
-                    working_directory: workspace_root_for_orchestrator.clone(),
-                    enable_planning: true,
-                    enable_ai_verification: true,
-                    run_initial_verification: verification_first,
-                    compression: Some(CompressionConfig::default()),
-                    enable_checkpointing: true,
-                };
-
-                let orchestrator =
-                    Orchestrator::new(orchestrator_config, state.app_state.checkpoint_db.clone());
-
-                // Initialize the orchestrator state with planning
-                match orchestrator.initialize_task(&task_run_id, &orchestrator_goal) {
-                    Ok(orch_state) => {
-                        info!(
-                            "Orchestrator initialized for task {} with {} success criteria",
-                            task_run_id,
-                            orch_state
-                                .plan
-                                .as_ref()
-                                .map(|p| p.success_criteria.len())
-                                .unwrap_or(0)
-                        );
-
-                        // Run initial verification if configured (for verification-first workflows)
-                        // Note: This is a blocking call because we're in a synchronous context
-                        if verification_first && orch_state.plan.is_some() {
-                            info!(
-                                "Running initial verification for task {} (verification-first mode)",
-                                task_run_id
-                            );
-                            // Initial verification will be run when the orchestrator state is loaded
-                            // in the async context of the session loop
-                        }
-
-                        // Store the orchestrator state
-                        let mut states = state.orchestrator_states.blocking_lock();
-                        states.insert(task_run_id.clone(), orch_state);
-                    }
-                    Err(e) => {
-                        // Log error but continue without orchestrator
-                        warn!(
-                            "Failed to initialize orchestrator for task {}: {}. Continuing without orchestrator.",
-                            task_run_id, e
-                        );
-                    }
-                }
-            }
-
-            // Spawn the execution loop
-            let session_id = session.id.clone();
-            let state_clone = state.clone();
-            let workspace_root = get_workspace_paths_internal()
-                .map(|(root, _, _)| root.to_string_lossy().to_string())
-                .unwrap_or_else(|_| ".".to_string());
-
-            tokio::spawn(async move {
-                // =====================================================================
-                // CROSS-SESSION CONTINUATION LOOP (Deterministic, Runner-Managed)
-                // =====================================================================
-                //
-                // This outer loop handles continuation ACROSS sessions (spawning new
-                // sessions when one ends). This is different from the inner phase loop
-                // in run_unified_session_loop which handles phases WITHIN a single session.
-                //
-                // Why this is here (not in the AI):
-                // - The AI might crash, timeout, or hit context limits mid-work
-                // - The runner ALWAYS runs after the session ends
-                // - The runner can reliably check the checkpoint and continue
-                // - The AI just needs to save progress; the runner handles continuation
-                //
-                // Multi-session workflows are configured with:
-                // - checkpoint_path: Path to the checkpoint JSON file
-                // - phase_field: JSON field name containing current phase (e.g., "current_phase")
-                // - completion_value: Workflow is complete when phase_field >= this value
-                //
-                // Max sessions is a safety limit to prevent infinite loops.
-                // =====================================================================
-
-                info!("Starting session '{}' (id: {})", session_name, session_id);
-
-                // Log session start
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(crate::paths::get_workflow_debug_log_path())
-                {
-                    use std::io::Write;
-                    let _ = writeln!(
-                        f,
-                        "[{}] START_SESSION: name={}, id={}",
-                        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
-                        session_name,
-                        session_id
-                    );
-                }
-
-                // Track the current task_id for this session
-                let task_id = session_id.clone();
-
-                // Create initial session context for grouping output
-                let session_ctx = AiOutputSessionContext {
-                    session_id: Some(session_id.clone()),
-                    session_name: Some(session_name.clone()),
-                    phase: None,
-                };
-
-                // Run the FIRST session with the original prompt (which already includes pre-execution results)
-                run_unified_session_loop(
-                    state_clone.clone(),
-                    session_id.clone(),
-                    workspace_root.clone(),
-                    None, // No external checkpoint - database tracks state
-                    Some(session_ctx.clone()),
-                    None, // No task_run_id - use session_id
-                    1,    // First iteration
-                )
-                .await;
-
-                // Cross-session continuation loop
-                // After the first session, this loop handles continuation across sessions
-                // re-executing automation between each to get fresh data
-                loop {
-                    // Check if task was stopped or completed
-                    let db = match CheckpointDb::new() {
-                        Ok(d) => d,
-                        Err(e) => {
-                            warn!("Failed to open database for session check: {}", e);
-                            break;
-                        }
-                    };
-
-                    let task = match db.get_task_run(&task_id) {
-                        Ok(Some(t)) => t,
-                        Ok(None) => {
-                            info!("Task {} not found, exiting continuation loop", task_id);
-                            break;
-                        }
-                        Err(e) => {
-                            warn!("Failed to get task {}: {}", task_id, e);
-                            break;
-                        }
-                    };
-
-                    // Check termination conditions with detailed logging
-                    info!(
-                        "Cross-session loop check: task={}, status={}, auto_continue={}, sessions_count={}, max_sessions={:?}",
-                        task_id, task.status, task.auto_continue, task.sessions_count, task.max_sessions
-                    );
-
-                    if task.status == "completed" || task.status == "stopped" {
-                        info!(
-                            "Task {} is {}, exiting continuation loop (this is expected after verification passes)",
-                            task_id, task.status
-                        );
-                        break;
-                    }
-
-                    if !task.auto_continue {
-                        info!(
-                            "Task {} has auto_continue=false, exiting continuation loop and marking complete",
-                            task_id
-                        );
-                        // Mark as completed since we're not continuing
-                        if let Err(e) = db.complete_task_run(&task_id) {
-                            warn!("Failed to mark task {} as complete: {}", task_id, e);
-                        }
-                        break;
-                    }
-
-                    // Check max_sessions limit
-                    if let Some(max) = task.max_sessions {
-                        if task.sessions_count >= max {
-                            info!(
-                                "Task {} reached max sessions ({}/{}), exiting and marking complete",
-                                task_id, task.sessions_count, max
-                            );
-                            if let Err(e) = db.complete_task_run(&task_id) {
-                                warn!("Failed to mark task {} as complete: {}", task_id, e);
-                            }
-                            break;
-                        }
-                    }
-
-                    // Log that we're continuing to next iteration (verification must have failed)
-                    info!(
-                        "Task {} status is '{}' - continuing to iteration {} (previous verification likely failed)",
-                        task_id, task.status, task.sessions_count + 1
-                    );
-
-                    // =====================================================================
-                    // Re-execute deterministic steps BEFORE starting AI session
-                    // =====================================================================
-                    let iteration = task.sessions_count + 1;
-                    info!(
-                        "Cross-session continuation: Starting iteration {} for task '{}'",
-                        iteration, task.task_name
-                    );
-
-                    // Log iteration start
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(crate::paths::get_workflow_debug_log_path())
-                    {
-                        use std::io::Write;
-                        let _ = writeln!(
-                            f,
-                            "[{}] CROSS_SESSION_ITERATION: task={}, iteration={}",
-                            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
-                            task_id,
-                            iteration
-                        );
-                    }
-
-                    // Re-fetch unified workflow steps to ensure all fields are present
-                    let execution_steps_json = refetch_unified_workflow_steps(
-                        &task_id,
-                        task.execution_steps_json.clone(),
-                        &db,
-                    );
-                    let execution_summary = if let Some(ref steps_json) = execution_steps_json {
-                        match serde_json::from_str::<Vec<ExecutionStepConfig>>(steps_json) {
-                            Ok(execution_steps) if !execution_steps.is_empty() => {
-                                info!(
-                                    "Re-executing {} deterministic steps for iteration {}",
-                                    execution_steps.len(),
-                                    iteration
-                                );
-
-                                // Parse log sources if present
-                                let log_sources: Vec<LogSourceConfig> = task
-                                    .log_sources_json
-                                    .as_ref()
-                                    .and_then(|json| serde_json::from_str(json).ok())
-                                    .unwrap_or_default();
-
-                                // Create a temp session ID for screenshot naming
-                                let temp_session_id = format!(
-                                    "iter-{}-{}",
-                                    iteration,
-                                    uuid::Uuid::new_v4()
-                                        .to_string()
-                                        .split('-')
-                                        .next()
-                                        .unwrap_or("0000")
-                                );
-
-                                // Execute steps using StepExecutor
-                                let executor = StepExecutor::with_app_handle(
-                                    state_clone.app_state.clone(),
-                                    state_clone.config_storage.clone(),
-                                    state_clone.app_handle.clone(),
-                                )
-                                .with_task_run_id(task_id.clone());
-                                let execution_result = executor
-                                    .execute_steps_for_iteration(
-                                        &execution_steps,
-                                        &temp_session_id,
-                                        &log_sources,
-                                        iteration,
-                                    )
-                                    .await;
-
-                                // Generate execution summary using IterationBundle
-                                if !execution_result.steps.is_empty() {
-                                    let relevant_logs =
-                                        RelevantLogSources::from_steps(&execution_steps);
-                                    let timestamp_now =
-                                        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-
-                                    let mut bundle = IterationBundle::new(
-                                        iteration,
-                                        task_id.clone(),
-                                        timestamp_now.clone(),
-                                        timestamp_now,
-                                        &execution_result,
-                                        &relevant_logs,
-                                    );
-
-                                    // Add application logs if captured
-                                    if let Some(ref captured) = execution_result.captured_logs {
-                                        bundle
-                                            .add_application_logs(&captured.sources, &log_sources);
-                                    }
-
-                                    // Add runner logs if captured
-                                    if let Some(ref runner_logs) =
-                                        execution_result.captured_runner_logs
-                                    {
-                                        bundle.add_gui_automation_logs(
-                                            runner_logs.actions.clone(),
-                                            runner_logs.image_recognition.clone(),
-                                        );
-                                    }
-
-                                    bundle.to_markdown()
-                                } else {
-                                    String::new()
-                                }
-                            }
-                            Ok(_) => String::new(),
-                            Err(e) => {
-                                warn!("Failed to parse execution_steps_json: {}", e);
-                                String::new()
-                            }
-                        }
-                    } else {
-                        String::new()
-                    };
-
-                    // Build continuation prompt
-                    let consolidated_output = log_consolidation::get_consolidated_output_for_task(
-                        &task.created_at,
-                        task.completed_at.as_deref(),
-                    );
-
-                    // Get findings context from database
-                    let findings_context = db
-                        .format_findings_for_continuation_prompt(&task_id)
-                        .unwrap_or_else(|e| {
-                            warn!("Failed to get findings context: {}", e);
-                            String::new()
-                        });
-
-                    let has_execution_steps =
-                        task.execution_steps_json.as_ref().is_some_and(|json| {
-                            serde_json::from_str::<Vec<serde_json::Value>>(json)
-                                .is_ok_and(|steps| !steps.is_empty())
-                        });
-
-                    let pre_execution_message = if has_execution_steps
-                        && !execution_summary.is_empty()
-                    {
-                        "\
-                        **IMPORTANT:** Pre-execution steps (GUI automation, screenshots, tests) were re-run. \
-                        The Pre-Execution Results section below shows FRESH results from this iteration.\n\n\
-                        Review these NEW results to verify if your previous changes worked.\n\n"
-                            .to_string()
-                    } else if has_execution_steps {
-                        "\
-                        **NOTE:** Pre-execution steps were configured but produced no results.\n\n"
-                            .to_string()
-                    } else {
-                        String::new()
-                    };
-
-                    let mut continuation_prompt = format!(
-                        "{}\n\n## Cross-Session Continuation (Iteration #{})\n\n{}\
-                        Previous session output:\n\n{}\n\n",
-                        task.prompt.as_deref().unwrap_or(""),
-                        iteration,
-                        pre_execution_message,
-                        consolidated_output
-                    );
-
-                    if !findings_context.is_empty() {
-                        continuation_prompt.push_str(&findings_context);
-                        continuation_prompt.push_str("\n\n");
-                    }
-
-                    if !execution_summary.is_empty() {
-                        continuation_prompt.push_str(&execution_summary);
-                        continuation_prompt.push_str("\n\n");
-                    }
-
-                    continuation_prompt.push_str(FINDING_INSTRUCTIONS);
-                    continuation_prompt.push_str("\nContinue the task. When the goal is VERIFIED achieved, print [TASK_COMPLETE].\n");
-
-                    // Each continuation session runs exactly 1 phase
-                    // This ensures automation is re-run before the next AI session
-                    // giving fresh data (new screenshots) to verify changes worked
-
-                    // Create new session config
-                    let session_config = SessionConfig {
-                        prompt: continuation_prompt,
-                        continuation_prompt: None,
-                        total_phases: 1, // Always 1 phase - automation re-runs between sessions
-                        uses_gui: false,
-                        timeout_seconds: 600,
-                        stall_threshold_seconds: 300,
-                        name: format!("{} (iteration {})", task.task_name, iteration),
-                        description: format!(
-                            "Cross-session continuation - iteration #{}",
-                            iteration
-                        ),
-                        custom_config: serde_json::json!({}),
-                        provider: None,
-                        model: None,
-                    };
-
-                    // Create session context
-                    let session_ctx = AiOutputSessionContext {
-                        session_id: Some(task_id.clone()),
-                        session_name: Some(task.task_name.clone()),
-                        phase: None,
-                    };
-
-                    // Start the new session
-                    match state_clone.session.start_session(session_config).await {
-                        Ok(new_session) => {
-                            info!(
-                                "Started iteration {} session {} for task '{}'",
-                                iteration, new_session.id, task.task_name
-                            );
-
-                            emit_ai_output(
-                                &state_clone.app_handle,
-                                &format!(
-                                    "🔄 Starting iteration {} for '{}'",
-                                    iteration, task.task_name
-                                ),
-                                "status",
-                                None,
-                                Some(&session_ctx),
-                            );
-
-                            // Increment session count
-                            if let Err(e) = db.append_task_output(&task_id, "", true) {
-                                warn!("Failed to increment session count: {}", e);
-                            }
-
-                            // Run the session loop
-                            run_unified_session_loop(
-                                state_clone.clone(),
-                                new_session.id.clone(),
-                                workspace_root.clone(),
-                                None,
-                                Some(session_ctx.clone()),
-                                Some(task_id.clone()), // Use original task ID
-                                iteration,             // Pass iteration number for display
-                            )
-                            .await;
-
-                            info!(
-                                "Iteration {} session completed. Looping back to check task status for potential retry.",
-                                iteration
-                            );
-
-                            // Re-check task status to log what happened
-                            if let Ok(Some(updated_task)) = db.get_task_run(&task_id) {
-                                info!(
-                                    "Post-iteration {} task status: status={}, sessions_count={}",
-                                    iteration, updated_task.status, updated_task.sessions_count
-                                );
-                            }
-
-                            // Continue the loop - will check task status and decide if more iterations needed
-                        }
-                        Err(e) => {
-                            error!("Failed to start iteration {} session: {}", iteration, e);
-                            emit_ai_output(
-                                &state_clone.app_handle,
-                                &format!("❌ Failed to start iteration {}: {}", iteration, e),
-                                "error",
-                                None,
-                                Some(&session_ctx),
-                            );
-                            break;
-                        }
-                    }
-                }
-
-                info!("Session '{}' cross-session loop completed", session_name);
-            });
-
-            Ok(Json(ApiResponse::success(StartSessionResponse { session })))
-        }
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Failed to start session: {}", e))),
-        )),
-    }
-}
-
-/// Stop a unified session
-async fn stop_session(
-    State(state): State<Arc<ApiState>>,
-    axum::extract::Path(session_id): axum::extract::Path<String>,
-) -> Result<Json<ApiResponse<Option<Session>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("Stopping session: {}", session_id);
-
-    // Kill all tracked AI processes (same logic as stop_ai_analysis)
-    // This ensures the actual Claude CLI process is terminated
-    let pids_to_kill: Vec<u32> = {
-        let mut pids = safe_lock_or_recover(&state.current_ai_pids, "current_ai_pids");
-        let pids_copy = pids.clone();
-        pids.clear();
-        pids_copy
-    };
-
-    let mut killed_count = 0;
-    for pid in &pids_to_kill {
-        info!("Killing AI process PID {} for session {}", pid, session_id);
-        let result = std::process::Command::new("taskkill")
-            .args(["/F", "/T", "/PID", &pid.to_string()])
-            .output();
-
-        match result {
-            Ok(output) => {
-                if output.status.success() {
-                    info!("Successfully killed process tree for PID {}", pid);
-                    killed_count += 1;
-                } else {
-                    // Process may have already exited
-                    killed_count += 1;
-                }
-            }
-            Err(e) => {
-                error!("Failed to execute taskkill for PID {}: {}", pid, e);
-            }
-        }
-    }
-
-    // Stop monitoring for this task
-    if let Err(e) = state.task_monitor.stop_monitoring(&session_id).await {
-        warn!("Failed to stop monitoring for {}: {}", session_id, e);
-    }
-
-    // Mark task_run as stopped in database (session_id == task_run_id for unified sessions)
-    if let Err(e) = state.app_state.checkpoint_db.stop_task_run(&session_id) {
-        warn!("Failed to stop task_run {}: {}", session_id, e);
-    }
-
-    // Stop the session
-    let session = state
-        .session
-        .stop_session(&session_id, "Stopped by user")
-        .await;
-
-    // Emit status to frontend
-    emit_ai_output(
-        &state.app_handle,
-        &format!(
-            "🛑 Session {} stopped (killed {} process(es))",
-            session_id, killed_count
-        ),
-        "status",
-        Some(&session_id),
-        None,
-    );
-
-    info!(
-        "Session {} stopped, killed {} process(es)",
-        session_id, killed_count
-    );
-
-    Ok(Json(ApiResponse::success(session)))
-}
-
-/// Delete a unified session
-async fn delete_session(
-    State(state): State<Arc<ApiState>>,
-    axum::extract::Path(session_id): axum::extract::Path<String>,
-) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    state.session.remove_session(&session_id).await;
-    Ok(Json(ApiResponse::success(())))
-}
+// NOTE: Unified Session API and start_session, stop_session, delete_session functions removed
+// These are now handled by the LoopController
 
 /// Result of parsing worker output for signals
 #[derive(Debug, Clone)]
@@ -12339,496 +11626,9 @@ struct ActiveSessionInfo {
     uses_gui: bool,
 }
 
-/// Response for resumable workflow check
-#[derive(Debug, Serialize)]
-struct ResumableWorkflowInfo {
-    /// Whether a resumable workflow exists
-    has_resumable: bool,
-    /// Whether an AI workflow is currently running (prevents Continue button)
-    is_running: bool,
-    /// Whether auto-continue on restart is enabled (global setting)
-    auto_continue_enabled: bool,
-    /// Workflow name (if resumable)
-    name: Option<String>,
-    /// Current phase/iteration
-    current_phase: Option<u32>,
-    /// Total phases (0 = unlimited)
-    total_phases: Option<u32>,
-    /// When the workflow was started
-    started_at: Option<String>,
-    /// Number of cross-session continuations
-    cross_session_count: Option<u32>,
-    /// Status from checkpoint
-    status: Option<String>,
-    /// All currently active sessions (for concurrent session display)
-    #[serde(default)]
-    active_sessions: Vec<ActiveSessionInfo>,
-}
-
-/// Get information about any resumable workflow
-/// Uses task_runs table from database - no more external checkpoint files
-async fn get_resumable_workflow(
-    State(state): State<Arc<ApiState>>,
-) -> Json<ApiResponse<ResumableWorkflowInfo>> {
-    // Check if AI is currently running (use async version to avoid blocking)
-    let has_running_tasks = has_running_ai_tasks_async(state.app_state.checkpoint_db.clone()).await;
-
-    // Also check session manager for running sessions
-    let sessions = state.session.list_sessions().await;
-    let has_running_session = sessions.iter().any(|s| {
-        matches!(
-            s.status,
-            crate::session::SessionStatus::Running
-                | crate::session::SessionStatus::WaitingForContinuation
-        )
-    });
-
-    let is_running = has_running_tasks || has_running_session;
-
-    // Get the global auto-continue setting
-    let auto_continue_enabled = settings::get_auto_continue_ai_workflow();
-
-    // Get running tasks from database
-    let db = match CheckpointDb::new() {
-        Ok(db) => db,
-        Err(_) => {
-            return Json(ApiResponse::success(ResumableWorkflowInfo {
-                has_resumable: false,
-                is_running,
-                auto_continue_enabled,
-                name: None,
-                current_phase: None,
-                total_phases: None,
-                started_at: None,
-                cross_session_count: None,
-                status: None,
-                active_sessions: vec![],
-            }));
-        }
-    };
-
-    let running_tasks = db.get_running_task_runs().unwrap_or_default();
-
-    // Build active_sessions from database running tasks (uses task_run_id which matches AI output)
-    let active_sessions: Vec<ActiveSessionInfo> = running_tasks
-        .iter()
-        .map(|t| ActiveSessionInfo {
-            id: t.id.clone(),
-            name: t.task_name.clone(),
-            status: t.status.clone(),
-            started_at: t.created_at.clone(),
-            uses_gui: false, // Database doesn't track this, default to false
-        })
-        .collect();
-
-    if running_tasks.is_empty() {
-        return Json(ApiResponse::success(ResumableWorkflowInfo {
-            has_resumable: false,
-            is_running,
-            auto_continue_enabled,
-            name: None,
-            current_phase: None,
-            total_phases: None,
-            started_at: None,
-            cross_session_count: None,
-            status: None,
-            active_sessions,
-        }));
-    }
-
-    // Return info about the most recent running task
-    let task = &running_tasks[0];
-    Json(ApiResponse::success(ResumableWorkflowInfo {
-        has_resumable: true,
-        is_running,
-        auto_continue_enabled,
-        name: Some(task.task_name.clone()),
-        current_phase: Some(task.sessions_count),
-        total_phases: task.max_sessions,
-        started_at: Some(task.created_at.clone()),
-        cross_session_count: Some(task.sessions_count),
-        status: Some(task.status.clone()),
-        active_sessions,
-    }))
-}
-
-/// Response type for resume workflow
-#[derive(Debug, Serialize)]
-struct ResumeWorkflowResponse {
-    message: String,
-    name: String,
-}
-
-/// Manually resume running tasks from database
-async fn resume_workflow(
-    State(state): State<Arc<ApiState>>,
-) -> Json<ApiResponse<ResumeWorkflowResponse>> {
-    // Check if AI analysis is already running (use async version to avoid blocking)
-    if has_running_ai_tasks_async(state.app_state.checkpoint_db.clone()).await {
-        return Json(ApiResponse {
-            success: false,
-            data: None,
-            error: Some(
-                "AI analysis is already running. Stop it first before resuming.".to_string(),
-            ),
-        });
-    }
-
-    // Get running tasks from database
-    let db = match CheckpointDb::new() {
-        Ok(db) => db,
-        Err(e) => {
-            return Json(ApiResponse {
-                success: false,
-                data: None,
-                error: Some(format!("Failed to open database: {}", e)),
-            });
-        }
-    };
-
-    let running_tasks = match db.get_running_task_runs() {
-        Ok(tasks) => tasks,
-        Err(e) => {
-            return Json(ApiResponse {
-                success: false,
-                data: None,
-                error: Some(format!("Failed to get running tasks: {}", e)),
-            });
-        }
-    };
-
-    if running_tasks.is_empty() {
-        return Json(ApiResponse {
-            success: false,
-            data: None,
-            error: Some("No running tasks to resume".to_string()),
-        });
-    }
-
-    let task_name = running_tasks[0].task_name.clone();
-    info!("Manually resuming {} running task(s)", running_tasks.len());
-
-    // Resume all running tasks
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        resume_all_running_tasks_on_startup(state_clone).await;
-    });
-
-    Json(ApiResponse::success(ResumeWorkflowResponse {
-        message: format!("Resuming {} task(s)", running_tasks.len()),
-        name: task_name,
-    }))
-}
-
-/// Request body for force continue
-#[derive(Debug, Deserialize)]
-struct ForceContinueRequest {
-    /// Optional task run ID to continue (if not provided, continues most recent running task)
-    #[serde(default)]
-    task_run_id: Option<String>,
-    /// Optional custom continuation prompt (if not provided, uses a default)
-    #[serde(default)]
-    prompt: Option<String>,
-}
-
-/// Response type for force continue
-#[derive(Debug, Serialize)]
-struct ForceContinueResponse {
-    message: String,
-    session_id: String,
-}
-
-/// Force continue a session that stopped unexpectedly
-/// This creates a new session with context from the last AI output
-/// If an active workflow exists, it uses the checkpoint system for proper cross-session continuation
-async fn force_continue_session(
-    State(state): State<Arc<ApiState>>,
-    Json(request): Json<ForceContinueRequest>,
-) -> Json<ApiResponse<ForceContinueResponse>> {
-    // Check if AI analysis is already running (use async version to avoid blocking)
-    if has_running_ai_tasks_async(state.app_state.checkpoint_db.clone()).await {
-        return Json(ApiResponse {
-            success: false,
-            data: None,
-            error: Some("AI is already running. Stop it first.".to_string()),
-        });
-    }
-
-    // Check session manager for running sessions
-    let sessions = state.session.list_sessions().await;
-    let has_running = sessions.iter().any(|s| {
-        matches!(
-            s.status,
-            crate::session::SessionStatus::Running
-                | crate::session::SessionStatus::WaitingForContinuation
-        )
-    });
-    if has_running {
-        return Json(ApiResponse {
-            success: false,
-            data: None,
-            error: Some("A session is already running.".to_string()),
-        });
-    }
-
-    // Check for running tasks in the database - use output_log for context
-    let db = match CheckpointDb::new() {
-        Ok(d) => d,
-        Err(e) => {
-            warn!("Could not open database: {}", e);
-            // Fall through to simple continuation
-            return force_continue_simple(state, request).await;
-        }
-    };
-
-    // If a specific task_run_id is provided, look up that task
-    // Otherwise, fall back to the most recent running task
-    let task = if let Some(ref task_run_id) = request.task_run_id {
-        match db.get_task_run(task_run_id) {
-            Ok(Some(t)) => Some(t),
-            Ok(None) => {
-                warn!("Task run with id '{}' not found", task_run_id);
-                None
-            }
-            Err(e) => {
-                warn!("Failed to get task run '{}': {}", task_run_id, e);
-                None
-            }
-        }
-    } else {
-        // Fall back to most recent running task
-        db.get_running_task_runs()
-            .unwrap_or_default()
-            .into_iter()
-            .next()
-    };
-
-    if let Some(task) = task {
-        info!(
-            "Force continue: Using task '{}' (id: {}), using consolidated AI output for context",
-            task.task_name, task.id
-        );
-
-        let workspace_root = get_workspace_paths_internal()
-            .map(|(root, _, _)| root.to_string_lossy().to_string())
-            .unwrap_or_else(|_| ".".to_string());
-
-        // Get consolidated AI output for the task run
-        // This groups output by source (claude, prompt) with timestamps for better readability
-        let consolidated_output = log_consolidation::get_consolidated_output_for_task(
-            &task.created_at,
-            task.completed_at.as_deref(),
-        );
-
-        // Get findings context from database for this task run
-        let findings_context = state
-            .app_state
-            .checkpoint_db
-            .format_findings_for_continuation_prompt(&task.id)
-            .unwrap_or_else(|e| {
-                warn!("Failed to get findings context: {}", e);
-                String::new()
-            });
-
-        // Create continuation prompt using task's prompt, consolidated output, and findings
-        let continuation_prompt = request.prompt.unwrap_or_else(|| {
-            let mut prompt = format!(
-                "{}\n\n## Force Continue (Session #{})\n\n\
-                The previous session was interrupted. Here's the output from the previous session:\n\n\
-                {}\n\n",
-                task.prompt.as_deref().unwrap_or(""),
-                task.sessions_count + 1,
-                consolidated_output
-            );
-
-            // Include findings context if there are any findings
-            if !findings_context.is_empty() {
-                prompt.push_str(&findings_context);
-                prompt.push_str("\n\n");
-            }
-
-            prompt.push_str(FINDING_INSTRUCTIONS);
-            prompt.push_str("\nContinue the task from where you left off. When complete, print [TASK_COMPLETE].");
-            prompt
-        });
-
-        // Create session name
-        let session_name = format!(
-            "{} (Force Continue #{})",
-            task.task_name,
-            task.sessions_count + 1
-        );
-
-        // Use 1 phase so the cross-session loop can re-run automation between each session
-        let config = crate::session::SessionConfig {
-            prompt: continuation_prompt,
-            continuation_prompt: None,
-            total_phases: 1, // Always 1 phase - cross-session loop handles continuation
-            uses_gui: false,
-            timeout_seconds: 1800,
-            stall_threshold_seconds: 300,
-            name: session_name.clone(),
-            description: format!("Force continued session #{}", task.sessions_count + 1),
-            custom_config: serde_json::json!({}),
-            provider: None, // Use default provider for continued sessions
-            model: None,
-        };
-
-        // Get task_id and iteration for context grouping
-        let task_id = task.id.clone();
-        let iteration = task.sessions_count + 1;
-
-        // Note: sessions_count will be incremented when output is appended via append_task_output
-
-        match state.session.start_session(config).await {
-            Ok(session) => {
-                let session_id = session.id.clone();
-                let state_clone = state.clone();
-                let sid = session_id.clone();
-
-                // Create session context for grouping output
-                let run_ctx = AiOutputSessionContext {
-                    session_id: Some(task_id),
-                    session_name: Some(session_name),
-                    phase: None,
-                };
-
-                // Spawn the execution
-                tokio::spawn(async move {
-                    run_unified_session_loop(
-                        state_clone,
-                        sid,
-                        workspace_root,
-                        None,
-                        Some(run_ctx),
-                        None,
-                        iteration, // Pass iteration number for display
-                    )
-                    .await;
-                });
-
-                return Json(ApiResponse::success(ForceContinueResponse {
-                    message: "Force continue from running task".to_string(),
-                    session_id,
-                }));
-            }
-            Err(e) => {
-                return Json(ApiResponse {
-                    success: false,
-                    data: None,
-                    error: Some(format!("Failed to start session: {}", e)),
-                });
-            }
-        }
-    }
-
-    // No running tasks - use simple one-shot continuation
-    force_continue_simple(state, request).await
-}
-
-/// Simple force continue without task context - reads ai-output.jsonl for context
-async fn force_continue_simple(
-    state: Arc<ApiState>,
-    request: ForceContinueRequest,
-) -> Json<ApiResponse<ForceContinueResponse>> {
-    // Fallback: No running task - use simple one-shot continuation
-    info!("Force continue: No active workflow config found. Using simple one-shot continuation.");
-
-    // Read the last AI output to provide context
-    let ai_output_path = crate::paths::get_ai_output_jsonl_path();
-    let last_lines = if ai_output_path.exists() {
-        match std::fs::read_to_string(&ai_output_path) {
-            Ok(content) => {
-                // Get the last 50 lines of AI output for context
-                let lines: Vec<&str> = content.lines().collect();
-                let start = if lines.len() > 50 {
-                    lines.len() - 50
-                } else {
-                    0
-                };
-                let recent_output: Vec<String> = lines[start..]
-                    .iter()
-                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-                    .filter_map(|v| {
-                        v.get("line")
-                            .and_then(|l| l.as_str())
-                            .map(|s| s.to_string())
-                    })
-                    .collect();
-                recent_output.join("\n")
-            }
-            Err(_) => String::new(),
-        }
-    } else {
-        String::new()
-    };
-
-    // Create continuation prompt
-    let continuation_prompt = request.prompt.unwrap_or_else(|| {
-        if last_lines.is_empty() {
-            "Continue from where you left off. If you're unsure, check the last few messages in the conversation.".to_string()
-        } else {
-            format!(
-                "The previous session was cut off. Here's the recent context:\n\n---\n{}\n---\n\nPlease continue from where you left off. Complete any unfinished work.",
-                if last_lines.len() > 3000 {
-                    format!("...{}", &last_lines[last_lines.len() - 3000..])
-                } else {
-                    last_lines
-                }
-            )
-        }
-    });
-
-    info!(
-        "Force continuing session with {} chars of context",
-        continuation_prompt.len()
-    );
-
-    // Create a session to continue
-    // Note: total_phases is 1 because we have no task context to determine remaining phases.
-    // This is the fallback path when no running task is found in the database.
-    let config = crate::session::SessionConfig {
-        prompt: continuation_prompt,
-        continuation_prompt: None,
-        total_phases: 1,
-        uses_gui: false,
-        timeout_seconds: 1800,
-        stall_threshold_seconds: 300,
-        name: "Force Continue".to_string(),
-        description: "Manually continued session".to_string(),
-        custom_config: serde_json::json!({}),
-        provider: None, // Use default provider for force continue
-        model: None,
-    };
-
-    match state.session.start_session(config).await {
-        Ok(session) => {
-            let session_id = session.id.clone();
-
-            // Spawn the execution loop
-            let state_clone = state.clone();
-            let sid = session_id.clone();
-            let workspace_root = get_workspace_paths_internal()
-                .map(|(root, _, _)| root.to_string_lossy().to_string())
-                .unwrap_or_else(|_| ".".to_string());
-
-            tokio::spawn(async move {
-                run_unified_session_loop(state_clone, sid, workspace_root, None, None, None, 1)
-                    .await;
-            });
-
-            Json(ApiResponse::success(ForceContinueResponse {
-                message: "Force continue session started".to_string(),
-                session_id,
-            }))
-        }
-        Err(e) => Json(ApiResponse {
-            success: false,
-            data: None,
-            error: Some(format!("Failed to start session: {}", e)),
-        }),
-    }
-}
+// NOTE: ResumableWorkflowInfo, get_resumable_workflow, ResumeWorkflowResponse, resume_workflow,
+// ForceContinueRequest, ForceContinueResponse, force_continue_session, force_continue_simple
+// functions removed - these are now handled by the LoopController
 
 /// Response for auto-continue setting
 #[derive(Debug, Serialize)]
@@ -12945,2059 +11745,14 @@ fn check_supervisor_available() -> bool {
     .is_ok()
 }
 
-/// Resume ALL running tasks from the database on startup.
-///
-/// This is the single, clean system for auto-continue:
-/// 1. Query task_runs WHERE status = 'running'
-/// 2. For EACH running task, spawn a continuation session
-/// 3. The AI reads output_log to understand context and continue
-///
-/// Returns the number of tasks resumed.
-pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize {
-    // Open the database
-    let db = match CheckpointDb::new() {
-        Ok(db) => db,
-        Err(e) => {
-            warn!("Failed to open database for task resume: {}", e);
-            return 0;
-        }
-    };
+// NOTE: resume_all_running_tasks_on_startup function removed - now handled by LoopController
 
-    // Get all running task runs
-    let running_tasks = match db.get_running_task_runs() {
-        Ok(tasks) => tasks,
-        Err(e) => {
-            warn!("Failed to get running task runs: {}", e);
-            return 0;
-        }
-    };
-
-    if running_tasks.is_empty() {
-        info!("No running tasks found in database to resume");
-        return 0;
-    }
-
-    // Log to debug file
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(crate::paths::get_workflow_debug_log_path())
-    {
-        use std::io::Write;
-        let _ = writeln!(
-            f,
-            "[{}] STARTUP_RESUME: Found {} running task(s) in database",
-            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
-            running_tasks.len()
-        );
-    }
-
-    info!("Found {} running task(s) to resume", running_tasks.len());
-
-    // Load the last configuration before resuming (for visual automation)
-    // Must use spawn_blocking because load_config_internal accesses python_bridge
-    // which uses block_on internally - cannot call block_on from async context
-    if let Some(config_path) = settings::get_last_config_path() {
-        info!("Loading last config before resume: {}", config_path);
-        let app_state_clone = state.app_state.clone();
-        let config_path_clone = config_path.clone();
-        let load_result = tokio::task::spawn_blocking(move || {
-            load_config_internal(&app_state_clone, &config_path_clone)
-        })
-        .await;
-
-        match load_result {
-            Ok(Ok(_)) => {
-                info!("Successfully loaded config for resume");
-            }
-            Ok(Err(e)) => {
-                warn!(
-                    "Failed to load last config: {}. Visual automation may fail.",
-                    e
-                );
-            }
-            Err(e) => {
-                warn!(
-                    "spawn_blocking failed for config load: {}. Visual automation may fail.",
-                    e
-                );
-            }
-        }
-    }
-
-    let mut resumed_count = 0;
-
-    // Resume EACH running task
-    for task in &running_tasks {
-        // Check if this task is already being resumed (prevent duplicate resumes)
-        {
-            let mut resuming_ids =
-                safe_lock_or_recover(&state.resuming_task_ids, "resuming_task_ids");
-            if resuming_ids.contains(&task.id) {
-                info!(
-                    "Task '{}' (id: {}) is already being resumed, skipping duplicate",
-                    task.task_name, task.id
-                );
-                continue;
-            }
-            // Mark this task as being resumed
-            resuming_ids.insert(task.id.clone());
-        }
-
-        info!(
-            "Resuming task '{}' (id: {}, session #{})",
-            task.task_name,
-            task.id,
-            task.sessions_count + 1
-        );
-
-        // =====================================================================
-        // Re-execute deterministic steps BEFORE resuming AI session
-        // =====================================================================
-        // For unified workflow tasks, re-fetch steps from the workflow definition
-        // to ensure we have the latest step configuration (including check_type, etc.)
-        // Task IDs for unified workflows follow pattern: unified-workflow-{workflow_id}-{timestamp}
-        info!(
-            "DEBUG: Checking task_id '{}' starts_with 'unified-workflow-': {}",
-            task.id,
-            task.id.starts_with("unified-workflow-")
-        );
-        let execution_steps_json = if task.id.starts_with("unified-workflow-") {
-            // Extract workflow ID from task ID (format: unified-workflow-{uuid}-{timestamp})
-            let parts: Vec<&str> = task.id.split('-').collect();
-            // UUID is parts 2-6 (indices 2,3,4,5,6 = 5 parts of UUID)
-            if parts.len() >= 7 {
-                let workflow_id = format!(
-                    "{}-{}-{}-{}-{}",
-                    parts[2], parts[3], parts[4], parts[5], parts[6]
-                );
-                info!(
-                    "Unified workflow task detected, re-fetching steps from workflow {}",
-                    workflow_id
-                );
-
-                // Re-fetch workflow from database to get latest step definitions
-                match state
-                    .app_state
-                    .checkpoint_db
-                    .get_unified_workflow(&workflow_id)
-                {
-                    Ok(Some(workflow)) => {
-                        // Convert workflow steps to ExecutionStepConfig using the same logic
-                        // as the run_unified_workflow endpoint
-                        let monitor = 0; // Default monitor
-                        let mut all_steps: Vec<ExecutionStepConfig> = Vec::new();
-
-                        // Helper closure to convert step
-                        let convert_step_inline =
-                            |step: &serde_json::Value| -> Option<ExecutionStepConfig> {
-                                // Try direct deserialization first
-                                if let Ok(mut config) =
-                                    serde_json::from_value::<ExecutionStepConfig>(step.clone())
-                                {
-                                    if config.monitor_index.is_none() {
-                                        config.monitor_index = Some(monitor);
-                                    }
-                                    return Some(config);
-                                }
-
-                                // Fall back to manual extraction
-                                let step_type = step.get("type").and_then(|t| t.as_str())?;
-                                let name = step
-                                    .get("name")
-                                    .and_then(|n| n.as_str())
-                                    .map(|s| s.to_string());
-
-                                // Helper to get string from either snake_case or camelCase
-                                let get_str = |keys: &[&str]| -> Option<String> {
-                                    keys.iter()
-                                        .find_map(|k| step.get(*k).and_then(|v| v.as_str()))
-                                        .map(|s| s.to_string())
-                                };
-                                let get_bool = |keys: &[&str]| -> Option<bool> {
-                                    keys.iter()
-                                        .find_map(|k| step.get(*k).and_then(|v| v.as_bool()))
-                                };
-
-                                Some(ExecutionStepConfig {
-                                    step_type: step_type.to_string(),
-                                    name,
-                                    monitor_index: Some(monitor),
-                                    check_type: get_str(&["check_type", "checkType"]),
-                                    check_command: get_str(&[
-                                        "command",
-                                        "check_command",
-                                        "checkCommand",
-                                    ]),
-                                    check_working_directory: get_str(&[
-                                        "working_directory",
-                                        "workingDirectory",
-                                        "check_working_directory",
-                                        "checkWorkingDirectory",
-                                    ]),
-                                    check_auto_fix: get_bool(&[
-                                        "auto_fix",
-                                        "autoFix",
-                                        "check_auto_fix",
-                                        "checkAutoFix",
-                                    ]),
-                                    test_id: get_str(&["test_id", "testId"]),
-                                    test_type: get_str(&["test_type", "testType"]),
-                                    test_is_critical: get_bool(&["is_critical", "isCritical"]),
-                                    shell_command: get_str(&[
-                                        "command",
-                                        "shell_command",
-                                        "shellCommand",
-                                    ]),
-                                    shell_command_working_directory: get_str(&[
-                                        "working_directory",
-                                        "workingDirectory",
-                                        "shell_command_working_directory",
-                                        "shellCommandWorkingDirectory",
-                                    ]),
-                                    shell_command_fail_on_error: get_bool(&[
-                                        "fail_on_error",
-                                        "failOnError",
-                                        "shell_command_fail_on_error",
-                                        "shellCommandFailOnError",
-                                    ]),
-                                    prompt_content: get_str(&[
-                                        "content",
-                                        "prompt_content",
-                                        "promptContent",
-                                    ]),
-                                    is_setup: get_bool(&["isSetup", "is_setup"]),
-                                    ..Default::default()
-                                })
-                            };
-
-                        // Add setup steps (mark as setup phase)
-                        for step in &workflow.setup_steps {
-                            if let Some(mut config) = convert_step_inline(step) {
-                                config.is_setup = Some(true);
-                                config.phase = Some("setup".to_string());
-                                all_steps.push(config);
-                            }
-                        }
-
-                        // Add verification steps
-                        for step in &workflow.verification_steps {
-                            if let Some(mut config) = convert_step_inline(step) {
-                                config.phase = Some("verification".to_string());
-                                all_steps.push(config);
-                            }
-                        }
-
-                        // Add agentic steps (if any)
-                        for step in &workflow.agentic_steps {
-                            if let Some(mut config) = convert_step_inline(step) {
-                                config.phase = Some("agentic".to_string());
-                                all_steps.push(config);
-                            }
-                        }
-
-                        // Add completion steps (mark as completion phase)
-                        for step in &workflow.completion_steps {
-                            if let Some(mut config) = convert_step_inline(step) {
-                                config.phase = Some("completion".to_string());
-                                all_steps.push(config);
-                            }
-                        }
-
-                        info!(
-                            "Re-fetched {} steps from unified workflow definition",
-                            all_steps.len()
-                        );
-
-                        // Also update the task_run with the correct execution_steps_json
-                        // so future resumes don't need to re-fetch
-                        if let Ok(new_json) = serde_json::to_string(&all_steps) {
-                            if let Err(e) = state
-                                .app_state
-                                .checkpoint_db
-                                .update_task_run_execution_steps(
-                                    &task.id,
-                                    Some(new_json.clone()),
-                                    None,
-                                )
-                            {
-                                warn!(
-                                    "Failed to update execution_steps_json for task {}: {}",
-                                    task.id, e
-                                );
-                            }
-                            Some(new_json)
-                        } else {
-                            task.execution_steps_json.clone()
-                        }
-                    }
-                    Ok(None) => {
-                        warn!(
-                            "Unified workflow {} not found, using cached execution_steps_json",
-                            workflow_id
-                        );
-                        task.execution_steps_json.clone()
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to fetch unified workflow {}: {}, using cached execution_steps_json",
-                            workflow_id, e
-                        );
-                        task.execution_steps_json.clone()
-                    }
-                }
-            } else {
-                // Couldn't parse workflow ID from task ID
-                task.execution_steps_json.clone()
-            }
-        } else {
-            // Not a unified workflow task, use cached steps
-            task.execution_steps_json.clone()
-        };
-
-        // Parse and re-execute execution_steps_json if present
-        // This ensures the AI sees fresh results from workflows/actions/screenshots
-        let execution_summary = if let Some(ref steps_json) = execution_steps_json {
-            match serde_json::from_str::<Vec<ExecutionStepConfig>>(steps_json) {
-                Ok(execution_steps) if !execution_steps.is_empty() => {
-                    info!(
-                        "Re-executing {} deterministic steps for resumed task",
-                        execution_steps.len()
-                    );
-
-                    // Parse log sources if present
-                    let log_sources: Vec<LogSourceConfig> = task
-                        .log_sources_json
-                        .as_ref()
-                        .and_then(|json| serde_json::from_str(json).ok())
-                        .unwrap_or_default();
-
-                    // Create a temp session ID for screenshot naming
-                    let temp_session_id = format!(
-                        "resume-{}-{}",
-                        chrono::Utc::now().format("%Y%m%d%H%M%S"),
-                        uuid::Uuid::new_v4()
-                            .to_string()
-                            .split('-')
-                            .next()
-                            .unwrap_or("0000")
-                    );
-
-                    // Calculate iteration number BEFORE execution so we can use it for filtering
-                    let iteration = task.sessions_count + 1;
-
-                    // Execute steps using StepExecutor (iteration-aware)
-                    // For iterations > 1, this filters out setup steps that aren't marked to run
-                    let executor = StepExecutor::with_app_handle(
-                        state.app_state.clone(),
-                        state.config_storage.clone(),
-                        state.app_handle.clone(),
-                    )
-                    .with_task_run_id(task.id.clone());
-                    let execution_result = executor
-                        .execute_steps_for_iteration(
-                            &execution_steps,
-                            &temp_session_id,
-                            &log_sources,
-                            iteration,
-                        )
-                        .await;
-
-                    // Generate execution summary using IterationBundle
-                    if !execution_result.steps.is_empty() {
-                        let relevant_logs = RelevantLogSources::from_steps(&execution_steps);
-                        let timestamp_now =
-                            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-
-                        let mut bundle = IterationBundle::new(
-                            iteration,
-                            task.id.clone(),
-                            timestamp_now.clone(),
-                            timestamp_now,
-                            &execution_result,
-                            &relevant_logs,
-                        );
-
-                        // Add application logs if captured
-                        if let Some(ref captured) = execution_result.captured_logs {
-                            bundle.add_application_logs(&captured.sources, &log_sources);
-                        }
-
-                        // Add runner logs if captured
-                        if let Some(ref runner_logs) = execution_result.captured_runner_logs {
-                            bundle.add_gui_automation_logs(
-                                runner_logs.actions.clone(),
-                                runner_logs.image_recognition.clone(),
-                            );
-                        }
-
-                        bundle.to_markdown()
-                    } else {
-                        String::new()
-                    }
-                }
-                Ok(_) => {
-                    // Empty steps array
-                    String::new()
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to parse execution_steps_json for task {}: {}",
-                        task.id, e
-                    );
-                    String::new()
-                }
-            }
-        } else {
-            String::new()
-        };
-
-        // Build continuation prompt with consolidated AI output
-        // The AI reads this to understand where to continue from
-        // Uses the consolidated format which groups output by source (claude, prompt)
-        // with timestamps for better readability
-        let consolidated_output = log_consolidation::get_consolidated_output_for_task(
-            &task.created_at,
-            task.completed_at.as_deref(),
-        );
-
-        // Get findings context from database for this task run
-        let findings_context = db
-            .format_findings_for_continuation_prompt(&task.id)
-            .unwrap_or_else(|e| {
-                warn!("Failed to get findings context for resume: {}", e);
-                String::new()
-            });
-
-        // Build continuation prompt including findings context
-        // Check if task has execution steps configured (even if summary is empty due to failure)
-        let has_execution_steps = task.execution_steps_json.as_ref().is_some_and(|json| {
-            serde_json::from_str::<Vec<serde_json::Value>>(json)
-                .is_ok_and(|steps| !steps.is_empty())
-        });
-
-        // Build appropriate pre-execution message based on:
-        // 1. Whether steps are configured (has_execution_steps)
-        // 2. Whether execution produced actual results (execution_summary not empty)
-        let pre_execution_message = if has_execution_steps && !execution_summary.is_empty() {
-            // Steps configured AND produced results - tell AI to look at them
-            "\
-            **IMPORTANT:** Pre-execution steps (GUI automation, screenshots, tests) were re-run. \
-            The Pre-Execution Results section below shows fresh results from this iteration.\n\n\
-            Read the previous output below to understand context and continue from where the last session left off.\n\n"
-                .to_string()
-        } else if has_execution_steps {
-            // Steps configured but no results (execution failed or produced empty output)
-            "\
-            **NOTE:** Pre-execution steps were configured but produced no results. \
-            This may indicate execution failed or steps returned empty output. \
-            Check the runner logs for details.\n\n\
-            Read the previous output below to understand context and continue from where the last session left off.\n\n"
-                .to_string()
-        } else {
-            // No steps configured at all - execution_steps_json is NULL
-            // This is a BUG - the task was created without execution steps!
-            "\
-            **⚠️ WARNING: No execution steps configured (execution_steps_json is NULL)**\n\n\
-            This task has NO pre-execution steps. This likely means:\n\
-            - The workflow was started from a UI component that doesn't pass execution_steps\n\
-            - Or the task was created before the execution_steps fix was applied\n\n\
-            **Impact:** No GUI automation, screenshots, or tests were run. You won't have an Iteration Bundle.\n\n\
-            **What to do:** Check the task configuration. If this task SHOULD have pre-execution steps, \
-            the UI code that started this task needs to include the `execution_steps` parameter.\n\n\
-            Read the previous output below to understand context and continue from where the last session left off.\n\n"
-                .to_string()
-        };
-
-        let mut continuation_prompt = format!(
-            "{}\n\n\
-            ## Session #{} - Continuation\n\n\
-            Pre-execution steps were re-run before this session started.\n\n\
-            {}\
-            {}\n\n",
-            task.prompt.as_deref().unwrap_or(""),
-            task.sessions_count + 1,
-            pre_execution_message,
-            consolidated_output
-        );
-
-        // Include findings context if there are any findings
-        if !findings_context.is_empty() {
-            continuation_prompt.push_str(&findings_context);
-            continuation_prompt.push_str("\n\n");
-        }
-
-        // Include pre-execution results if steps were re-executed
-        if !execution_summary.is_empty() {
-            continuation_prompt.push_str(&execution_summary);
-            continuation_prompt.push_str("\n\n");
-        }
-
-        continuation_prompt.push_str(FINDING_INSTRUCTIONS);
-        continuation_prompt
-            .push_str("\nContinue the task. When complete, print [TASK_COMPLETE].\n");
-
-        // Create session config
-        // Use 1 phase so the cross-session loop can re-run automation between each session
-        let session_config = SessionConfig {
-            prompt: continuation_prompt,
-            continuation_prompt: None,
-            total_phases: 1, // Always 1 phase - cross-session loop handles continuation
-            uses_gui: false,
-            timeout_seconds: 600,
-            stall_threshold_seconds: 300,
-            name: format!("{} (resumed)", task.task_name),
-            description: format!(
-                "Resumed after restart - session #{}",
-                task.sessions_count + 1
-            ),
-            custom_config: serde_json::json!({}),
-            provider: None, // Use default provider for resumed sessions
-            model: None,
-        };
-
-        // Create session context for AI output events so frontend can display the task name
-        let session_ctx = AiOutputSessionContext {
-            session_id: Some(task.id.clone()),
-            session_name: Some(task.task_name.clone()),
-            phase: None,
-        };
-
-        // Start the session
-        match state.session.start_session(session_config).await {
-            Ok(session) => {
-                info!(
-                    "Started resume session {} for task '{}'",
-                    session.id, task.task_name
-                );
-
-                emit_ai_output(
-                    &state.app_handle,
-                    &format!(
-                        "🔄 Resuming '{}' (session #{})",
-                        task.task_name,
-                        task.sessions_count + 1
-                    ),
-                    "status",
-                    None,
-                    Some(&session_ctx),
-                );
-
-                // Increment session count
-                if let Err(e) = db.append_task_output(&task.id, "", true) {
-                    warn!(
-                        "Failed to increment session count for task {}: {}",
-                        task.id, e
-                    );
-                }
-
-                // Run the session loop in background with cross-session continuation
-                let session_id = session.id.clone();
-                let workspace_root = get_workspace_paths_internal()
-                    .map(|(root, _, _)| root.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| ".".to_string());
-
-                let state_clone = state.clone();
-                let task_name = task.task_name.clone();
-                let task_id = task.id.clone();
-                let run_ctx = session_ctx.clone();
-                // Capture additional fields needed for cross-session continuation
-                // Re-fetch unified workflow steps to ensure all fields (check_type, etc.) are present
-                let execution_steps_json = refetch_unified_workflow_steps(
-                    &task.id,
-                    task.execution_steps_json.clone(),
-                    &db,
-                );
-                let log_sources_json = task.log_sources_json.clone();
-                let original_prompt = task.prompt.clone();
-                let first_iteration = task.sessions_count + 1; // Iteration number for display
-
-                // Capture resuming_task_ids reference for cleanup when spawned task finishes
-                let resuming_ids_clone = state.resuming_task_ids.clone();
-                let task_id_for_cleanup = task.id.clone();
-
-                tokio::spawn(async move {
-                    // Run the FIRST resumed session
-                    run_unified_session_loop(
-                        state_clone.clone(),
-                        session_id.clone(),
-                        workspace_root.clone(),
-                        None,
-                        Some(run_ctx.clone()),
-                        Some(task_id.clone()), // Use original task ID for resumed tasks
-                        first_iteration,       // Iteration number for display
-                    )
-                    .await;
-                    info!(
-                        "Resumed session {} completed for '{}'",
-                        session_id, task_name
-                    );
-
-                    // =====================================================================
-                    // Cross-session continuation loop (same logic as start_session)
-                    // After the first session, this loop handles continuation across sessions
-                    // re-executing automation between each to get fresh data
-                    // =====================================================================
-                    loop {
-                        // Check if task was stopped or completed
-                        let db = match CheckpointDb::new() {
-                            Ok(d) => d,
-                            Err(e) => {
-                                warn!(
-                                    "Failed to open database for resume continuation check: {}",
-                                    e
-                                );
-                                break;
-                            }
-                        };
-
-                        let task = match db.get_task_run(&task_id) {
-                            Ok(Some(t)) => t,
-                            Ok(None) => {
-                                info!("Task {} not found in resume continuation, exiting", task_id);
-                                break;
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to get task {} in resume continuation: {}",
-                                    task_id, e
-                                );
-                                break;
-                            }
-                        };
-
-                        // Check termination conditions
-                        if task.status == "completed" || task.status == "stopped" {
-                            info!(
-                                "Task {} is {}, exiting resume continuation loop",
-                                task_id, task.status
-                            );
-                            break;
-                        }
-
-                        if !task.auto_continue {
-                            info!(
-                                "Task {} has auto_continue disabled, exiting resume continuation",
-                                task_id
-                            );
-                            if let Err(e) = db.complete_task_run(&task_id) {
-                                warn!("Failed to mark task {} as complete: {}", task_id, e);
-                            }
-                            break;
-                        }
-
-                        // Check max_sessions limit
-                        if let Some(max) = task.max_sessions {
-                            if task.sessions_count >= max {
-                                info!("Task {} reached max sessions ({}/{}), exiting resume continuation", task_id, task.sessions_count, max);
-                                if let Err(e) = db.complete_task_run(&task_id) {
-                                    warn!("Failed to mark task {} as complete: {}", task_id, e);
-                                }
-                                break;
-                            }
-                        }
-
-                        // =====================================================================
-                        // Re-execute deterministic steps BEFORE starting next AI session
-                        // =====================================================================
-                        let iteration = task.sessions_count + 1;
-                        info!("Resume cross-session continuation: Starting iteration {} for task '{}'", iteration, task.task_name);
-
-                        // Log iteration start
-                        if let Ok(mut f) = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(crate::paths::get_workflow_debug_log_path())
-                        {
-                            use std::io::Write;
-                            let _ = writeln!(
-                                f,
-                                "[{}] RESUME_CROSS_SESSION_ITERATION: task={}, iteration={}",
-                                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
-                                task_id,
-                                iteration
-                            );
-                        }
-
-                        let execution_summary = if let Some(ref steps_json) = execution_steps_json {
-                            match serde_json::from_str::<Vec<ExecutionStepConfig>>(steps_json) {
-                                Ok(execution_steps) if !execution_steps.is_empty() => {
-                                    info!(
-                                        "Re-executing {} deterministic steps for iteration {}",
-                                        execution_steps.len(),
-                                        iteration
-                                    );
-
-                                    // Parse log sources if present
-                                    let log_sources: Vec<LogSourceConfig> = log_sources_json
-                                        .as_ref()
-                                        .and_then(|json| serde_json::from_str(json).ok())
-                                        .unwrap_or_default();
-
-                                    // Create a temp session ID for screenshot naming
-                                    let temp_session_id = format!(
-                                        "iter-{}-{}",
-                                        iteration,
-                                        uuid::Uuid::new_v4()
-                                            .to_string()
-                                            .split('-')
-                                            .next()
-                                            .unwrap_or("0000")
-                                    );
-
-                                    // Execute steps using StepExecutor
-                                    let executor = StepExecutor::with_app_handle(
-                                        state_clone.app_state.clone(),
-                                        state_clone.config_storage.clone(),
-                                        state_clone.app_handle.clone(),
-                                    )
-                                    .with_task_run_id(task_id.clone());
-                                    let execution_result = executor
-                                        .execute_steps_for_iteration(
-                                            &execution_steps,
-                                            &temp_session_id,
-                                            &log_sources,
-                                            iteration,
-                                        )
-                                        .await;
-
-                                    // Generate execution summary using IterationBundle
-                                    if !execution_result.steps.is_empty() {
-                                        let relevant_logs =
-                                            RelevantLogSources::from_steps(&execution_steps);
-                                        let timestamp_now = chrono::Utc::now()
-                                            .format("%Y-%m-%dT%H:%M:%SZ")
-                                            .to_string();
-
-                                        let mut bundle = IterationBundle::new(
-                                            iteration,
-                                            task_id.clone(),
-                                            timestamp_now.clone(),
-                                            timestamp_now,
-                                            &execution_result,
-                                            &relevant_logs,
-                                        );
-
-                                        // Add application logs if captured
-                                        if let Some(ref captured) = execution_result.captured_logs {
-                                            bundle.add_application_logs(
-                                                &captured.sources,
-                                                &log_sources,
-                                            );
-                                        }
-
-                                        // Add runner logs if captured
-                                        if let Some(ref runner_logs) =
-                                            execution_result.captured_runner_logs
-                                        {
-                                            bundle.add_gui_automation_logs(
-                                                runner_logs.actions.clone(),
-                                                runner_logs.image_recognition.clone(),
-                                            );
-                                        }
-
-                                        bundle.to_markdown()
-                                    } else {
-                                        String::new()
-                                    }
-                                }
-                                Ok(_) => String::new(),
-                                Err(e) => {
-                                    warn!("Failed to parse execution_steps_json in resume continuation: {}", e);
-                                    String::new()
-                                }
-                            }
-                        } else {
-                            String::new()
-                        };
-
-                        // Build continuation prompt
-                        let consolidated_output =
-                            log_consolidation::get_consolidated_output_for_task(
-                                &task.created_at,
-                                task.completed_at.as_deref(),
-                            );
-
-                        // Get findings context from database
-                        let findings_context = db
-                            .format_findings_for_continuation_prompt(&task_id)
-                            .unwrap_or_else(|e| {
-                                warn!("Failed to get findings context: {}", e);
-                                String::new()
-                            });
-
-                        let has_execution_steps =
-                            execution_steps_json.as_ref().is_some_and(|json| {
-                                serde_json::from_str::<Vec<serde_json::Value>>(json)
-                                    .is_ok_and(|steps| !steps.is_empty())
-                            });
-
-                        let pre_execution_message = if has_execution_steps
-                            && !execution_summary.is_empty()
-                        {
-                            "\
-                            **IMPORTANT:** Pre-execution steps (GUI automation, screenshots, tests) were re-run. \
-                            The Pre-Execution Results section below shows FRESH results from this iteration.\n\n\
-                            Review these NEW results to verify if your previous changes worked.\n\n"
-                                .to_string()
-                        } else if has_execution_steps {
-                            "\
-                            **NOTE:** Pre-execution steps were configured but produced no results.\n\n"
-                                .to_string()
-                        } else {
-                            String::new()
-                        };
-
-                        let mut continuation_prompt = format!(
-                            "{}\n\n## Cross-Session Continuation (Iteration #{})\n\n{}\
-                            Previous session output:\n\n{}\n\n",
-                            original_prompt.as_deref().unwrap_or(""),
-                            iteration,
-                            pre_execution_message,
-                            consolidated_output
-                        );
-
-                        if !findings_context.is_empty() {
-                            continuation_prompt.push_str(&findings_context);
-                            continuation_prompt.push_str("\n\n");
-                        }
-
-                        if !execution_summary.is_empty() {
-                            continuation_prompt.push_str(&execution_summary);
-                            continuation_prompt.push_str("\n\n");
-                        }
-
-                        continuation_prompt.push_str(FINDING_INSTRUCTIONS);
-                        continuation_prompt.push_str("\nContinue the task. When the goal is VERIFIED achieved, print [TASK_COMPLETE].\n");
-
-                        // Each continuation session runs exactly 1 phase
-                        let session_config = SessionConfig {
-                            prompt: continuation_prompt,
-                            continuation_prompt: None,
-                            total_phases: 1, // Always 1 phase - automation re-runs between sessions
-                            uses_gui: false,
-                            timeout_seconds: 600,
-                            stall_threshold_seconds: 300,
-                            name: format!("{} (iteration {})", task.task_name, iteration),
-                            description: format!(
-                                "Cross-session continuation - iteration #{}",
-                                iteration
-                            ),
-                            custom_config: serde_json::json!({}),
-                            provider: None,
-                            model: None,
-                        };
-
-                        // Create session context
-                        let session_ctx = AiOutputSessionContext {
-                            session_id: Some(task_id.clone()),
-                            session_name: Some(task.task_name.clone()),
-                            phase: None,
-                        };
-
-                        // Start the new session
-                        match state_clone.session.start_session(session_config).await {
-                            Ok(new_session) => {
-                                info!(
-                                    "Started iteration {} session {} for task '{}' (from resume)",
-                                    iteration, new_session.id, task.task_name
-                                );
-
-                                emit_ai_output(
-                                    &state_clone.app_handle,
-                                    &format!(
-                                        "🔄 Starting iteration {} for '{}'",
-                                        iteration, task.task_name
-                                    ),
-                                    "status",
-                                    None,
-                                    Some(&session_ctx),
-                                );
-
-                                // Increment session count
-                                if let Err(e) = db.append_task_output(&task_id, "", true) {
-                                    warn!("Failed to increment session count: {}", e);
-                                }
-
-                                // Run the session loop
-                                run_unified_session_loop(
-                                    state_clone.clone(),
-                                    new_session.id.clone(),
-                                    workspace_root.clone(),
-                                    None,
-                                    Some(session_ctx.clone()),
-                                    Some(task_id.clone()),
-                                    iteration, // Pass iteration number for display
-                                )
-                                .await;
-
-                                info!("Iteration {} session completed (from resume)", iteration);
-
-                                // Continue the loop - will check task status and decide if more iterations needed
-                            }
-                            Err(e) => {
-                                error!(
-                                    "Failed to start iteration {} session (from resume): {}",
-                                    iteration, e
-                                );
-                                emit_ai_output(
-                                    &state_clone.app_handle,
-                                    &format!("❌ Failed to start iteration {}: {}", iteration, e),
-                                    "error",
-                                    None,
-                                    Some(&session_ctx),
-                                );
-                                break;
-                            }
-                        }
-                    }
-
-                    info!("Resume cross-session loop completed for '{}'", task_name);
-
-                    // Remove task from resuming set now that it's finished
-                    if let Ok(mut resuming_ids) = resuming_ids_clone.lock() {
-                        resuming_ids.remove(&task_id_for_cleanup);
-                        info!(
-                            "Removed task '{}' from resuming set (loop completed)",
-                            task_id_for_cleanup
-                        );
-                    }
-                });
-
-                resumed_count += 1;
-            }
-            Err(e) => {
-                error!("Failed to resume task '{}': {}", task.task_name, e);
-                emit_ai_output(
-                    &state.app_handle,
-                    &format!("❌ Failed to resume '{}': {}", task.task_name, e),
-                    "error",
-                    None,
-                    Some(&session_ctx),
-                );
-                // Remove task from resuming set on failure so it can be retried
-                if let Ok(mut resuming_ids) = state.resuming_task_ids.lock() {
-                    resuming_ids.remove(&task.id);
-                    info!(
-                        "Removed task '{}' from resuming set (start failed)",
-                        task.id
-                    );
-                }
-            }
-        }
-    }
-
-    resumed_count
-}
-
-/// Run the unified session execution loop
-///
-/// For multi-session workflows, pass the external checkpoint info so the loop
-/// can exit when the external checkpoint advances, allowing cross-session continuation.
-///
-/// The `task_run_id` parameter is used for database operations (append_task_output,
-/// complete_task_run, fail_task_run). When resuming a task, the session_id is a NEW
-/// session but we need to update the ORIGINAL task_run record. Pass `Some(task.id)`
-/// for resumed tasks, or `None` to use session_id as the task_run_id.
-///
-/// The `iteration` parameter indicates which cross-session iteration this is (1, 2, 3, etc.)
-/// for display purposes. Pass 1 for the first session, 2 for the second, etc.
-async fn run_unified_session_loop(
-    state: Arc<ApiState>,
-    session_id: String,
-    workspace_root: String,
-    external_checkpoint: Option<(std::path::PathBuf, String, u32)>, // (path, phase_field, initial_phase)
-    run_ctx: Option<AiOutputSessionContext>, // Context for grouping output into a single Run
-    task_run_id: Option<String>, // ID to use for database task_run operations (for resumed tasks)
-    iteration: u32,              // Cross-session iteration number for display (1, 2, 3, ...)
-) {
-    // Use task_run_id if provided (for resumed tasks), otherwise use session_id
-    let db_task_id = task_run_id.unwrap_or_else(|| session_id.clone());
-    let session = match state.session.get_session(&session_id).await {
-        Some(s) => s,
-        None => {
-            error!("Session {} not found for execution", session_id);
-            return;
-        }
-    };
-
-    let config = session.config.clone();
-    let timeout = config.timeout_seconds;
-    let mut current_prompt = config.prompt.clone();
-    let continuation_prompt = config.continuation_prompt.clone();
-    let app_handle = state.app_handle.clone();
-
-    // Use provided run context for grouping output, or create a default one for single sessions
-    // For multi-session workflows, run_ctx should have the workflow_run_id
-    // For single sessions, we use the session_id as the run identifier
-    let session_ctx = run_ctx.unwrap_or_else(|| AiOutputSessionContext {
-        session_id: Some(session_id.clone()),
-        session_name: Some(config.name.clone()),
-        phase: None,
-    });
-
-    info!(
-        "Starting unified session loop for {}, run_id: {:?}",
-        session_id, session_ctx.session_id
-    );
-
-    let mut phase = 0u32;
-
-    loop {
-        phase += 1;
-
-        // Check if task was stopped BEFORE starting a new phase
-        // This prevents multi-step tasks from restarting after the Stop button is clicked
-        if let Ok(Some(task)) = state.app_state.checkpoint_db.get_task_run(&db_task_id) {
-            if task.status == "stopped" || !task.auto_continue {
-                info!(
-                    "Task {} was stopped or auto_continue disabled, exiting session loop (status={}, auto_continue={})",
-                    db_task_id, task.status, task.auto_continue
-                );
-                emit_ai_output(
-                    &app_handle,
-                    &format!("🛑 Session {} stopped by user", session_id),
-                    "status",
-                    Some(&session_id),
-                    Some(&session_ctx),
-                );
-                return;
-            }
-        }
-
-        let phase_session_id = if phase == 1 {
-            format!("session-{}", &session_id[..8.min(session_id.len())])
-        } else {
-            format!(
-                "session-{}-phase-{}",
-                &session_id[..8.min(session_id.len())],
-                phase
-            )
-        };
-
-        // Update session state to running
-        if let Some(mut s) = state.session.get_session(&session_id).await {
-            s.status = SessionStatus::Running;
-            s.checkpoint.current_phase = phase;
-            s.checkpoint.sessions_spawned += 1;
-            s.checkpoint.status = "running".to_string();
-            s.log_event("phase_started", &format!("Phase {} started", phase));
-            let _ = state.session.update_session(s).await;
-        }
-
-        // Increment sessions_count in database for this phase
-        // This keeps task_run.sessions_count in sync with session.checkpoint.sessions_spawned
-        // Use db_task_id (not session_id) for database operations - critical for resumed tasks
-        if let Err(e) = state
-            .app_state
-            .checkpoint_db
-            .append_task_output(&db_task_id, "", true)
-        {
-            warn!(
-                "Failed to increment sessions_count for task {}: {}",
-                db_task_id, e
-            );
-        }
-
-        emit_ai_output(
-            &app_handle,
-            &format!(
-                "🚀 Running iteration {} (session {})...",
-                iteration, phase_session_id
-            ),
-            "status",
-            Some(&session_id),
-            Some(&session_ctx),
-        );
-
-        // Run Claude session
-        let workspace = workspace_root.clone();
-        let sid = phase_session_id.clone();
-        let handle = app_handle.clone();
-        let timeout_secs = timeout;
-        let ctx_for_claude = Some(session_ctx.clone());
-
-        // =====================================================================
-        // ORCHESTRATOR INTEGRATION: Build prompt with plan context
-        // =====================================================================
-        // If orchestrator is enabled for this task, inject verification plan
-        // and cross-iteration context into the worker prompt
-        let prompt = {
-            let orchestrator_states = state.orchestrator_states.lock().await;
-            if let Some(orch_state) = orchestrator_states.get(&db_task_id) {
-                // Build prompt with orchestrator context
-                let workspace_for_orch = workspace_root.clone();
-                let orch_config = OrchestratorConfig {
-                    max_iterations: 10,
-                    ai_timeout_seconds: 300,
-                    working_directory: workspace_for_orch,
-                    enable_planning: true,
-                    enable_ai_verification: true,
-                    run_initial_verification: orch_state.initial_verification_run,
-                    compression: Some(CompressionConfig::default()),
-                    enable_checkpointing: true,
-                };
-                let orchestrator =
-                    Orchestrator::new(orch_config, state.app_state.checkpoint_db.clone());
-
-                match orchestrator.build_worker_prompt(orch_state, &current_prompt) {
-                    Ok(enhanced_prompt) => {
-                        info!(
-                            "Orchestrator enhanced prompt for task {} (iteration {}), added {} chars of context",
-                            db_task_id,
-                            orch_state.iteration + 1,
-                            enhanced_prompt.len().saturating_sub(current_prompt.len())
-                        );
-                        enhanced_prompt
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to build orchestrator prompt for task {}: {}. Using original prompt.",
-                            db_task_id, e
-                        );
-                        current_prompt.clone()
-                    }
-                }
-            } else {
-                // No orchestrator state, use original prompt
-                current_prompt.clone()
-            }
-        };
-
-        // Create finding context for this phase
-        // Use db_task_id for finding storage - critical for resumed tasks
-        let finding_ctx_for_claude = Some(FindingContext {
-            task_run_id: db_task_id.clone(),
-            session_num: phase,
-        });
-
-        // Clone PID tracker for the blocking task
-        let pid_tracker = state.current_ai_pids.clone();
-
-        // Get retry config from AI settings
-        let retry_config = crate::settings::get_ai_settings().retry;
-
-        let result = tokio::task::spawn_blocking(move || {
-            run_claude_session_with_retry(
-                &workspace,
-                &prompt,
-                &sid,
-                &handle,
-                timeout_secs,
-                ctx_for_claude,
-                finding_ctx_for_claude,
-                Some(pid_tracker),
-                Some(&retry_config),
-            )
-        })
-        .await;
-
-        let session_result = match result {
-            Ok(Ok((success, output, retry_state))) => {
-                // Log if retries occurred
-                if let Some(ref rs) = retry_state {
-                    if rs.attempt > 0 {
-                        info!(
-                            "Session completed after {} retries (total delay: {}ms)",
-                            rs.attempt, rs.total_delay_ms
-                        );
-                    }
-                }
-                Ok((success, output))
-            }
-            Ok(Err(e)) => Err(e),
-            Err(e) => Err(format!("Task join error: {}", e)),
-        };
-
-        match session_result {
-            Ok((success, output)) => {
-                if !success {
-                    warn!("Phase {} completed with errors, continuing...", phase);
-                }
-
-                // Append session output to task_run.output_log in database
-                // This preserves output across restarts and enables debugging
-                // Limit output to last 50KB to prevent database bloat
-                // Use db_task_id (not session_id) - critical for resumed tasks
-                let output_to_store = if output.len() > 50_000 {
-                    format!(
-                        "\n\n=== Phase {} Output (truncated, last 50KB) ===\n{}",
-                        phase,
-                        &output[output.len() - 50_000..]
-                    )
-                } else {
-                    format!("\n\n=== Phase {} Output ===\n{}", phase, output)
-                };
-                if let Err(e) = state.app_state.checkpoint_db.append_task_output(
-                    &db_task_id,
-                    &output_to_store,
-                    false,
-                ) {
-                    warn!("Failed to append output for task {}: {}", db_task_id, e);
-                }
-
-                // Note: External checkpoint is now checked by the CROSS-SESSION loop
-                // (in start_session's tokio::spawn), not here. This allows:
-                // - Better separation of concerns: within-session vs cross-session
-                // - The cross-session loop uses configurable completion_value
-                // - Sessions end naturally via total_phases or goal markers
-
-                // Check session checkpoint for explicit completion
-                // NOTE: We check s.checkpoint.completed directly, NOT is_complete()
-                // is_complete() returns true when current_phase >= total_phases, which would
-                // prematurely mark the task as complete before the cross-session loop can continue.
-                // We only want to mark the task complete when:
-                // 1. The checkpoint's `completed` flag is explicitly true
-                // 2. The checkpoint status is explicitly "COMPLETED"/"DONE"/etc.
-                // 3. AI output contains [TASK_COMPLETE] (checked below)
-                // Phase-based completion is handled by line 10339 which does NOT mark the task complete.
-                if let Some(mut s) = state.session.get_session(&session_id).await {
-                    let explicit_completion = s.checkpoint.completed || {
-                        let status_upper = s.checkpoint.status.to_uppercase();
-                        matches!(
-                            status_upper.as_str(),
-                            "COMPLETE" | "COMPLETED" | "DONE" | "FINISHED"
-                        )
-                    };
-
-                    if explicit_completion {
-                        s.status = SessionStatus::Completed;
-                        s.checkpoint.mark_completed();
-                        let _ = state.session.update_session(s).await;
-
-                        // Update task_run in database to match session status (with retry)
-                        // Use db_task_id (not session_id) - critical for resumed tasks
-                        if !complete_task_run_with_retry(
-                            state.app_state.checkpoint_db.clone(),
-                            &db_task_id,
-                        )
-                        .await
-                        {
-                            error!(
-                                "Failed to mark task_run {} as complete in database - AI status may be stale",
-                                db_task_id
-                            );
-                        }
-
-                        emit_ai_output(
-                            &app_handle,
-                            &format!("✅ Session {} completed successfully", session_id),
-                            "status",
-                            Some(&session_id),
-                            Some(&session_ctx),
-                        );
-                        info!(
-                            "Session {} completed after {} phases (explicit completion)",
-                            session_id, phase
-                        );
-                        return;
-                    }
-
-                    // =====================================================================
-                    // ORCHESTRATOR INTEGRATION: Process worker output
-                    // =====================================================================
-                    // If orchestrator is enabled, process output through orchestrator
-                    // to handle signals (WORK_COMPLETE, NEED_REPLAN, FINDING) and
-                    // run verification when appropriate.
-
-                    let has_orchestrator = {
-                        let states = state.orchestrator_states.lock().await;
-                        states.contains_key(&db_task_id)
-                    };
-
-                    if has_orchestrator {
-                        // Use orchestrator for output processing and verification
-                        let workspace_for_orch = workspace_root.clone();
-
-                        // Get initial_verification_run from state
-                        let initial_verification_run = {
-                            let states = state.orchestrator_states.lock().await;
-                            states
-                                .get(&db_task_id)
-                                .map(|s| s.initial_verification_run)
-                                .unwrap_or(false)
-                        };
-
-                        let orch_config = OrchestratorConfig {
-                            max_iterations: 10,
-                            ai_timeout_seconds: 300,
-                            working_directory: workspace_for_orch.clone(),
-                            enable_planning: true,
-                            enable_ai_verification: true,
-                            run_initial_verification: initial_verification_run,
-                            compression: Some(CompressionConfig::default()),
-                            enable_checkpointing: true,
-                        };
-                        let orchestrator =
-                            Orchestrator::new(orch_config, state.app_state.checkpoint_db.clone());
-
-                        // Process output and get action
-                        let action = {
-                            let mut states = state.orchestrator_states.lock().await;
-                            if let Some(orch_state) = states.get_mut(&db_task_id) {
-                                orchestrator.process_worker_output(orch_state, &output)
-                            } else {
-                                Err("Orchestrator state not found".to_string())
-                            }
-                        };
-
-                        match action {
-                            Ok(WorkerOutputAction::RunVerification) => {
-                                info!("Orchestrator: Worker signaled WORK_COMPLETE - running verification");
-
-                                // Run orchestrator verification (includes both deterministic and AI)
-                                let verification_results = {
-                                    let mut states = state.orchestrator_states.lock().await;
-                                    if let Some(orch_state) = states.get_mut(&db_task_id) {
-                                        // Try to load latest screenshot for AI verification
-                                        let screenshot =
-                                            crate::orchestrator::load_latest_screenshot_as_base64()
-                                                .ok();
-                                        orchestrator
-                                            .run_verification(orch_state, screenshot.as_deref())
-                                            .await
-                                    } else {
-                                        Err("Orchestrator state not found".to_string())
-                                    }
-                                };
-
-                                match verification_results {
-                                    Ok(results) => {
-                                        if results.all_passed {
-                                            info!("Orchestrator verification PASSED - also checking workflow verification_steps");
-
-                                            // IMPORTANT: Also run the workflow's verification_steps (check groups)
-                                            // The orchestrator's verification uses a different system than check groups
-                                            let workflow_verification =
-                                                run_workflow_verification_for_task(
-                                                    &state.app_state,
-                                                    &state.config_storage,
-                                                    &db_task_id,
-                                                    &workspace_root,
-                                                )
-                                                .await;
-
-                                            if !workflow_verification.all_passed {
-                                                // Workflow verification_steps failed - don't complete
-                                                info!(
-                                                    "ORCHESTRATOR: Orchestrator verification passed but workflow verification_steps FAILED ({} failures). Ending session for retry.",
-                                                    workflow_verification.critical_failures.len()
-                                                );
-
-                                                s.status = SessionStatus::Completed;
-                                                s.checkpoint.completed = false;
-                                                s.checkpoint.status =
-                                                    "workflow_verification_failed".to_string();
-                                                let _ = state.session.update_session(s).await;
-
-                                                emit_ai_output(
-                                                    &app_handle,
-                                                    &format!(
-                                                        "⚠️ Session {} work complete but workflow verification_steps failed - will retry. Failures: {}",
-                                                        session_id,
-                                                        workflow_verification.critical_failures.join(", ")
-                                                    ),
-                                                    "status",
-                                                    Some(&session_id),
-                                                    Some(&session_ctx),
-                                                );
-                                                return;
-                                            }
-
-                                            info!("Both orchestrator and workflow verification PASSED - checking for completion steps");
-
-                                            // Get completion steps from the task's execution_steps_json
-                                            // Completion steps are marked with phase="completion"
-                                            let completion_steps: Vec<ExecutionStepConfig> = {
-                                                match state
-                                                    .app_state
-                                                    .checkpoint_db
-                                                    .get_task_run(&db_task_id)
-                                                {
-                                                    Ok(Some(task)) => task
-                                                        .execution_steps_json
-                                                        .as_ref()
-                                                        .and_then(|json| {
-                                                            serde_json::from_str::<
-                                                                Vec<ExecutionStepConfig>,
-                                                            >(
-                                                                json
-                                                            )
-                                                            .ok()
-                                                        })
-                                                        .map(|steps| {
-                                                            steps
-                                                                .into_iter()
-                                                                .filter(|s| {
-                                                                    s.phase.as_deref()
-                                                                        == Some("completion")
-                                                                })
-                                                                .collect()
-                                                        })
-                                                        .unwrap_or_default(),
-                                                    _ => Vec::new(),
-                                                }
-                                            };
-
-                                            // Run completion steps if they exist
-                                            if !completion_steps.is_empty() {
-                                                info!(
-                                                    "Running {} completion steps for task {}",
-                                                    completion_steps.len(),
-                                                    db_task_id
-                                                );
-                                                emit_ai_output(
-                                                    &app_handle,
-                                                    &format!(
-                                                        "🏁 Session {} verification passed - running {} completion steps",
-                                                        session_id, completion_steps.len()
-                                                    ),
-                                                    "status",
-                                                    Some(&session_id),
-                                                    Some(&session_ctx),
-                                                );
-
-                                                // Get log sources from task
-                                                let log_sources: Vec<LogSourceConfig> = state
-                                                    .app_state
-                                                    .checkpoint_db
-                                                    .get_task_run(&db_task_id)
-                                                    .ok()
-                                                    .flatten()
-                                                    .and_then(|t| t.log_sources_json)
-                                                    .and_then(|json| {
-                                                        serde_json::from_str(&json).ok()
-                                                    })
-                                                    .unwrap_or_default();
-
-                                                // Execute completion steps
-                                                let executor = StepExecutor::with_app_handle(
-                                                    state.app_state.clone(),
-                                                    state.config_storage.clone(),
-                                                    state.app_handle.clone(),
-                                                )
-                                                .with_task_run_id(db_task_id.clone());
-
-                                                let completion_result = executor
-                                                    .execute_completion_phase(
-                                                        &completion_steps,
-                                                        &session_id,
-                                                        &log_sources,
-                                                    )
-                                                    .await;
-
-                                                if !completion_result.success {
-                                                    warn!(
-                                                        "Completion steps had failures for task {}",
-                                                        db_task_id
-                                                    );
-                                                } else {
-                                                    info!("Completion steps executed successfully for task {}", db_task_id);
-                                                }
-                                            } else {
-                                                info!(
-                                                    "No completion steps defined for task {}",
-                                                    db_task_id
-                                                );
-                                            }
-
-                                            s.status = SessionStatus::Completed;
-                                            s.checkpoint.completed = true;
-                                            s.checkpoint.status =
-                                                "orchestrator_verified_complete".to_string();
-                                            let _ = state.session.update_session(s).await;
-
-                                            // Mark task complete
-                                            if !complete_task_run_with_retry(
-                                                state.app_state.checkpoint_db.clone(),
-                                                &db_task_id,
-                                            )
-                                            .await
-                                            {
-                                                error!(
-                                                    "Failed to mark task_run {} as complete",
-                                                    db_task_id
-                                                );
-                                            }
-
-                                            // Clean up orchestrator state
-                                            {
-                                                let mut states =
-                                                    state.orchestrator_states.lock().await;
-                                                states.remove(&db_task_id);
-                                            }
-
-                                            emit_ai_output(
-                                                &app_handle,
-                                                &format!(
-                                                    "✅ Session {} orchestrator verified - all {} criteria passed after {} phases",
-                                                    session_id,
-                                                    results.deterministic_results.len() + results.ai_results.len(),
-                                                    phase
-                                                ),
-                                                "status",
-                                                Some(&session_id),
-                                                Some(&session_ctx),
-                                            );
-                                            return;
-                                        } else {
-                                            // Verification failed - feedback is already recorded by orchestrator
-                                            let det_failures = results
-                                                .deterministic_results
-                                                .iter()
-                                                .filter(|r| !r.passed)
-                                                .count();
-                                            let ai_failures = results
-                                                .ai_results
-                                                .iter()
-                                                .filter(|r| !r.passed)
-                                                .count();
-                                            info!(
-                                                "Orchestrator verification FAILED - {} deterministic, {} AI failures. Task status remains 'running' for retry.",
-                                                det_failures, ai_failures
-                                            );
-
-                                            // Log detailed failure info for debugging
-                                            for result in results
-                                                .deterministic_results
-                                                .iter()
-                                                .filter(|r| !r.passed)
-                                            {
-                                                let issues_str = if result.issues.is_empty() {
-                                                    "no issues recorded".to_string()
-                                                } else {
-                                                    result.issues.join("; ")
-                                                };
-                                                info!(
-                                                    "  FAILED deterministic check: {} - {}",
-                                                    result.criterion_id, issues_str
-                                                );
-                                            }
-                                            for result in
-                                                results.ai_results.iter().filter(|r| !r.passed)
-                                            {
-                                                let issues_str = if result.issues.is_empty() {
-                                                    "no issues recorded".to_string()
-                                                } else {
-                                                    result.issues.join("; ")
-                                                };
-                                                info!(
-                                                    "  FAILED AI check: {} - {}",
-                                                    result.criterion_id, issues_str
-                                                );
-                                            }
-
-                                            s.status = SessionStatus::Completed;
-                                            s.checkpoint.completed = false;
-                                            s.checkpoint.status =
-                                                "orchestrator_verification_failed".to_string();
-                                            let _ = state.session.update_session(s).await;
-
-                                            // NOTE: We do NOT call complete_task_run here.
-                                            // The task status remains "running" in the database,
-                                            // which allows the cross-session loop to continue.
-                                            info!(
-                                                "Session {} returning with completed=false. Cross-session loop will check task status and retry.",
-                                                session_id
-                                            );
-
-                                            emit_ai_output(
-                                                &app_handle,
-                                                &format!(
-                                                    "⚠️ Session {} verification failed ({} det, {} AI failures) - will retry in next iteration",
-                                                    session_id, det_failures, ai_failures
-                                                ),
-                                                "status",
-                                                Some(&session_id),
-                                                Some(&session_ctx),
-                                            );
-                                            return;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!("Orchestrator verification failed: {}. Falling back to legacy verification.", e);
-                                        // Fall through to legacy verification below
-                                    }
-                                }
-                            }
-                            Ok(WorkerOutputAction::Replan { reason }) => {
-                                info!("Orchestrator: Worker requested REPLAN: {}", reason);
-
-                                // Handle replan through orchestrator
-                                {
-                                    let mut states = state.orchestrator_states.lock().await;
-                                    if let Some(orch_state) = states.get_mut(&db_task_id) {
-                                        if let Err(e) =
-                                            orchestrator.handle_replan(orch_state, &reason)
-                                        {
-                                            warn!("Failed to handle replan: {}", e);
-                                        }
-                                    }
-                                }
-
-                                s.status = SessionStatus::Completed;
-                                s.checkpoint.completed = false;
-                                s.checkpoint.status = format!(
-                                    "orchestrator_replan:{}",
-                                    reason.chars().take(100).collect::<String>()
-                                );
-                                let _ = state.session.update_session(s).await;
-
-                                emit_ai_output(
-                                    &app_handle,
-                                    &format!(
-                                        "🔄 Session {} orchestrator replan requested: {}",
-                                        session_id, reason
-                                    ),
-                                    "status",
-                                    Some(&session_id),
-                                    Some(&session_ctx),
-                                );
-                                return;
-                            }
-                            Ok(WorkerOutputAction::MaxIterationsReached) => {
-                                info!(
-                                    "Orchestrator: Max iterations reached for task {}",
-                                    db_task_id
-                                );
-                                s.status = SessionStatus::Completed;
-                                s.checkpoint.completed = false;
-                                s.checkpoint.status = "orchestrator_max_iterations".to_string();
-                                let _ = state.session.update_session(s).await;
-
-                                emit_ai_output(
-                                    &app_handle,
-                                    &format!("⏸️ Session {} paused - orchestrator max iterations reached", session_id),
-                                    "status",
-                                    Some(&session_id),
-                                    Some(&session_ctx),
-                                );
-                                return;
-                            }
-                            Ok(WorkerOutputAction::Continue) => {
-                                // Continue processing - fall through to legacy signal checking
-                                // This handles cases where orchestrator says continue but
-                                // legacy markers might still be present
-                            }
-                            Ok(WorkerOutputAction::SetupPhaseComplete) => {
-                                info!("Orchestrator: Setup phase complete - transitioning to verification");
-
-                                // Transition to verification phase
-                                {
-                                    let mut states = state.orchestrator_states.lock().await;
-                                    if let Some(orch_state) = states.get_mut(&db_task_id) {
-                                        orchestrator.complete_setup_phase(orch_state);
-                                    }
-                                }
-
-                                emit_ai_output(
-                                    &app_handle,
-                                    &format!(
-                                        "✅ Session {} setup phase complete - transitioning to verification",
-                                        session_id
-                                    ),
-                                    "status",
-                                    Some(&session_id),
-                                    Some(&session_ctx),
-                                );
-                                // Continue to next iteration with verification phase
-                            }
-                            Ok(WorkerOutputAction::CompletionPhaseComplete) => {
-                                info!(
-                                    "Orchestrator: Completion phase complete for task {}",
-                                    db_task_id
-                                );
-
-                                // Mark as complete through orchestrator
-                                let success = {
-                                    let mut states = state.orchestrator_states.lock().await;
-                                    if let Some(orch_state) = states.get_mut(&db_task_id) {
-                                        let success = orch_state
-                                            .last_verification
-                                            .as_ref()
-                                            .map(|v| v.all_passed)
-                                            .unwrap_or(false);
-                                        let _result = orchestrator
-                                            .complete_completion_phase(orch_state, success);
-                                        success
-                                    } else {
-                                        false
-                                    }
-                                };
-
-                                s.status = SessionStatus::Completed;
-                                s.checkpoint.completed = true;
-                                s.checkpoint.status = if success {
-                                    "completion_phase_done_success".to_string()
-                                } else {
-                                    "completion_phase_done_failed".to_string()
-                                };
-                                let _ = state.session.update_session(s).await;
-
-                                // Mark task complete
-                                if !complete_task_run_with_retry(
-                                    state.app_state.checkpoint_db.clone(),
-                                    &db_task_id,
-                                )
-                                .await
-                                {
-                                    error!("Failed to mark task_run {} as complete", db_task_id);
-                                }
-
-                                // Clean up orchestrator state
-                                {
-                                    let mut states = state.orchestrator_states.lock().await;
-                                    states.remove(&db_task_id);
-                                }
-
-                                emit_ai_output(
-                                    &app_handle,
-                                    &format!(
-                                        "✅ Session {} completion phase done - task finished (success={})",
-                                        session_id, success
-                                    ),
-                                    "status",
-                                    Some(&session_id),
-                                    Some(&session_ctx),
-                                );
-                                return;
-                            }
-                            Err(e) => {
-                                warn!("Orchestrator process_worker_output failed: {}. Using legacy handling.", e);
-                                // Fall through to legacy handling
-                            }
-                        }
-                    }
-
-                    // Legacy handling: Check if AI output indicates work completion
-                    // This is used when orchestrator is disabled or as a fallback
-                    let worker_signal = parse_worker_output_signal(&output);
-                    match worker_signal {
-                        WorkerOutputSignal::WorkComplete { reason } => {
-                            info!(
-                                "Worker signaled WORK_COMPLETE (reason: {:?}) - running workflow verification",
-                                reason
-                            );
-
-                            // Run the workflow's actual verification steps (not just build checks)
-                            let verification_result = run_workflow_verification_for_task(
-                                &state.app_state,
-                                &state.config_storage,
-                                &db_task_id,
-                                &workspace_root,
-                            )
-                            .await;
-
-                            if verification_result.all_passed {
-                                info!("Workflow verification PASSED - marking task complete");
-                                s.status = SessionStatus::Completed;
-                                s.checkpoint.completed = true;
-                                s.checkpoint.status = "verified_complete".to_string();
-                                let _ = state.session.update_session(s).await;
-
-                                // Update task_run in database to match session status (with retry)
-                                // Use db_task_id (not session_id) - critical for resumed tasks
-                                if !complete_task_run_with_retry(
-                                    state.app_state.checkpoint_db.clone(),
-                                    &db_task_id,
-                                )
-                                .await
-                                {
-                                    error!(
-                                        "Failed to mark task_run {} as complete in database - AI status may be stale",
-                                        db_task_id
-                                    );
-                                }
-
-                                emit_ai_output(
-                                    &app_handle,
-                                    &format!(
-                                        "✅ Session {} verified and completed - all checks passed after {} phases",
-                                        session_id, phase
-                                    ),
-                                    "status",
-                                    Some(&session_id),
-                                    Some(&session_ctx),
-                                );
-                                info!(
-                                    "Session {} verified complete after {} phases",
-                                    session_id, phase
-                                );
-                                return;
-                            } else {
-                                // Verification failed - end session but don't mark task complete
-                                // The continuation loop will start a new iteration with feedback
-                                info!(
-                                    "Legacy deterministic verification FAILED - ending session for retry. Critical failures: {:?}",
-                                    verification_result.critical_failures
-                                );
-                                s.status = SessionStatus::Completed;
-                                s.checkpoint.completed = false; // NOT complete - verification failed
-                                s.checkpoint.status = "verification_failed".to_string();
-
-                                // Generate feedback for logging/display
-                                // The continuation loop will re-run verification and generate feedback
-                                let _feedback =
-                                    generate_verification_feedback(&verification_result);
-
-                                let _ = state.session.update_session(s).await;
-
-                                emit_ai_output(
-                                    &app_handle,
-                                    &format!(
-                                        "⚠️ Session {} work complete but verification failed - will retry. Critical failures: {}",
-                                        session_id,
-                                        verification_result.critical_failures.join(", ")
-                                    ),
-                                    "status",
-                                    Some(&session_id),
-                                    Some(&session_ctx),
-                                );
-                                info!(
-                                    "Session {} ended after {} phases - verification failed, will retry",
-                                    session_id, phase
-                                );
-                                return;
-                            }
-                        }
-                        WorkerOutputSignal::NeedReplan { reason } => {
-                            // Worker requested replan - end session and flag for replanning
-                            info!("Worker requested REPLAN: {}", reason);
-                            s.status = SessionStatus::Completed;
-                            s.checkpoint.completed = false;
-                            // Use a special status format to encode the reason
-                            s.checkpoint.status = format!(
-                                "replan_requested:{}",
-                                reason.chars().take(100).collect::<String>()
-                            );
-                            let _ = state.session.update_session(s).await;
-
-                            emit_ai_output(
-                                &app_handle,
-                                &format!("🔄 Session {} requested replan: {}", session_id, reason),
-                                "status",
-                                Some(&session_id),
-                                Some(&session_ctx),
-                            );
-                            info!(
-                                "Session {} ended after {} phases - replan requested",
-                                session_id, phase
-                            );
-                            return;
-                        }
-                        WorkerOutputSignal::TaskComplete => {
-                            // Legacy TASK_COMPLETE marker - treat same as WorkComplete
-                            warn!("Legacy [TASK_COMPLETE] marker detected - running workflow verification");
-
-                            // Run the workflow's actual verification steps (not just build checks)
-                            let verification_result = run_workflow_verification_for_task(
-                                &state.app_state,
-                                &state.config_storage,
-                                &db_task_id,
-                                &workspace_root,
-                            )
-                            .await;
-
-                            if verification_result.all_passed {
-                                info!("Workflow verification PASSED after [TASK_COMPLETE] - marking task complete");
-                                s.status = SessionStatus::Completed;
-                                s.checkpoint.completed = true;
-                                s.checkpoint.status = "verified_complete".to_string();
-                                let _ = state.session.update_session(s).await;
-
-                                if !complete_task_run_with_retry(
-                                    state.app_state.checkpoint_db.clone(),
-                                    &db_task_id,
-                                )
-                                .await
-                                {
-                                    error!(
-                                        "Failed to mark task_run {} as complete in database",
-                                        db_task_id
-                                    );
-                                }
-
-                                emit_ai_output(
-                                    &app_handle,
-                                    &format!(
-                                        "✅ Session {} verified and completed after {} phases",
-                                        session_id, phase
-                                    ),
-                                    "status",
-                                    Some(&session_id),
-                                    Some(&session_ctx),
-                                );
-                                return;
-                            } else {
-                                // Verification failed - end session but don't mark task complete
-                                info!(
-                                    "Legacy verification FAILED after [TASK_COMPLETE] - ending session for retry. Critical failures: {:?}",
-                                    verification_result.critical_failures
-                                );
-                                s.status = SessionStatus::Completed;
-                                s.checkpoint.completed = false;
-                                s.checkpoint.status = "verification_failed".to_string();
-                                let _ = state.session.update_session(s).await;
-
-                                emit_ai_output(
-                                    &app_handle,
-                                    &format!(
-                                        "⚠️ Session {} [TASK_COMPLETE] but verification failed - will retry",
-                                        session_id
-                                    ),
-                                    "status",
-                                    Some(&session_id),
-                                    Some(&session_ctx),
-                                );
-                                return;
-                            }
-                        }
-                        WorkerOutputSignal::Continue => {
-                            // No completion signal - session continues normally
-                        }
-                    }
-
-                    // Check if max phases reached for THIS SESSION
-                    // Note: This only ends the current session, NOT the entire task.
-                    // The cross-session continuation loop will decide if more iterations are needed.
-                    // The task is only marked complete when [TASK_COMPLETE] is detected (above).
-                    if config.total_phases > 0 && phase >= config.total_phases {
-                        s.status = SessionStatus::Completed;
-                        s.checkpoint.completed = false; // Session ended, but task may continue
-                        s.checkpoint.status = "session_phases_complete".to_string();
-                        let _ = state.session.update_session(s).await;
-
-                        // DO NOT mark task as completed here!
-                        // The cross-session loop will check if more iterations are needed
-                        // and will mark the task complete when appropriate (max_sessions reached
-                        // or [TASK_COMPLETE] detected in a subsequent iteration)
-
-                        emit_ai_output(
-                            &app_handle,
-                            &format!(
-                                "📤 Session {} ended (reached {} phases). Cross-session loop will continue if needed.",
-                                session_id, phase
-                            ),
-                            "status",
-                            Some(&session_id),
-                            Some(&session_ctx),
-                        );
-                        info!(
-                            "Session {} ended after {} phases. Task remains running for cross-session continuation.",
-                            session_id, phase
-                        );
-                        return;
-                    }
-
-                    // Check if external checkpoint has advanced (for multi-session workflows)
-                    // This allows the cross-session continuation loop to take over
-                    if let Some((ref ext_path, ref ext_field, initial_phase)) = external_checkpoint
-                    {
-                        if ext_path.exists() {
-                            if let Ok(contents) = std::fs::read_to_string(ext_path) {
-                                if let Ok(json) =
-                                    serde_json::from_str::<serde_json::Value>(&contents)
-                                {
-                                    let current_ext_phase =
-                                        json.get(ext_field).and_then(|v| v.as_u64()).unwrap_or(0)
-                                            as u32;
-
-                                    if current_ext_phase > initial_phase {
-                                        info!(
-                                            "External checkpoint advanced: {} {} -> {}. Exiting internal loop for cross-session continuation.",
-                                            ext_field, initial_phase, current_ext_phase
-                                        );
-                                        s.status = SessionStatus::Completed;
-                                        s.checkpoint.completed = true;
-                                        s.checkpoint.status = "phase_advanced".to_string();
-                                        let _ = state.session.update_session(s.clone()).await;
-
-                                        emit_ai_output(
-                                            &app_handle,
-                                            &format!(
-                                                "📤 Session {} completed phase {} -> {}. Ready for cross-session continuation.",
-                                                session_id, initial_phase, current_ext_phase
-                                            ),
-                                            "status",
-                                            Some(&session_id),
-                                            Some(&session_ctx),
-                                        );
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Prepare continuation prompt
-                    if let Some(ref cont_prompt) = continuation_prompt {
-                        current_prompt = cont_prompt
-                            .replace("{phase}", &phase.to_string())
-                            .replace("{output}", &output);
-                    }
-
-                    s.status = SessionStatus::WaitingForContinuation;
-                    s.log_event(
-                        "phase_completed",
-                        &format!("Phase {} completed, continuing...", phase),
-                    );
-                    let _ = state.session.update_session(s).await;
-                }
-            }
-            Err(e) => {
-                error!("Phase {} failed: {}", phase, e);
-
-                if let Some(mut s) = state.session.get_session(&session_id).await {
-                    s.status = SessionStatus::Failed;
-                    s.checkpoint.mark_failed(&e);
-                    let _ = state.session.update_session(s).await;
-                }
-
-                // Update task_run in database to match session status
-                // Use db_task_id (not session_id) - critical for resumed tasks
-                if let Err(db_err) = state.app_state.checkpoint_db.fail_task_run(&db_task_id, &e) {
-                    warn!(
-                        "Failed to mark task_run {} as failed: {}",
-                        db_task_id, db_err
-                    );
-                }
-
-                // Migrate logs to SQLite even on failure (for debugging/analysis)
-                let workflow_name = state
-                    .app_state
-                    .checkpoint_db
-                    .get_task_run(&db_task_id)
-                    .ok()
-                    .flatten()
-                    .and_then(|t| t.workflow_name);
-                migrate_logs_for_task(
-                    state.app_state.checkpoint_db.clone(),
-                    &db_task_id,
-                    workflow_name,
-                )
-                .await;
-
-                emit_ai_output(
-                    &app_handle,
-                    &format!("❌ Session {} failed: {}", session_id, e),
-                    "error",
-                    Some(&session_id),
-                    Some(&session_ctx),
-                );
-                return;
-            }
-        }
-
-        // Persist state for restart recovery
-        let _ = state.session.persist_state().await;
-    }
-}
 
 // ============================================================================
 // Checkpoint HTTP API Handlers
 // ============================================================================
 
-use crate::database::{CheckpointData, CheckpointDb, SessionEvent, TaskRun};
+use crate::database::{CheckpointData, CheckpointDb, CreateTaskRunInput, SessionEvent, TaskRun};
 
 /// List all active (non-completed) checkpoints.
 async fn list_checkpoints(
@@ -15250,21 +12005,34 @@ async fn create_task_run(
     let id = uuid::Uuid::new_v4().to_string();
     let task_type = req.task_type.as_deref().unwrap_or("task");
 
+    let mut input = CreateTaskRunInput::new(&id, &req.task_name)
+        .with_task_type(task_type);
+    if let Some(ref p) = req.prompt {
+        input = input.with_prompt(p);
+    }
+    if let Some(ref cid) = req.config_id {
+        input = input.with_config_id(cid);
+    }
+    if let Some(ref wn) = req.workflow_name {
+        input = input.with_workflow_name(wn);
+    }
+    if let Some(ms) = req.max_sessions {
+        input = input.with_max_sessions(ms);
+    }
+    if let Some(ac) = req.auto_continue {
+        input = input.with_auto_continue(ac);
+    }
+    if let Some(ref esj) = req.execution_steps_json {
+        input = input.with_execution_steps_json(esj);
+    }
+    if let Some(ref lsj) = req.log_sources_json {
+        input = input.with_log_sources_json(lsj);
+    }
+
     state
         .app_state
         .checkpoint_db
-        .create_task_run_with_config(
-            &id,
-            &req.task_name,
-            req.prompt.as_deref(),
-            task_type,
-            req.config_id.as_deref(),
-            req.workflow_name.as_deref(),
-            req.max_sessions,
-            req.auto_continue,
-            req.execution_steps_json,
-            req.log_sources_json,
-        )
+        .create_task_run(&input)
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
 }
@@ -15280,6 +12048,419 @@ async fn get_task_run(
         .get_task_run(&id)
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+/// Response for workflow state endpoint.
+#[derive(Debug, Serialize)]
+struct WorkflowStateResponse {
+    task_run_id: String,
+    workflow_type: String,
+    current_state: String,
+    phase: Option<String>,
+    iteration: Option<u32>,
+    max_iterations: Option<u32>,
+    is_complete: bool,
+    is_stopped: bool,
+    is_paused: bool,
+    has_verification_plan: bool,
+    workflow_start_time: String,
+    state_data: Option<serde_json::Value>,
+    /// Workflow stage for UI display (setup, verification, agentic, completion)
+    workflow_stage: Option<String>,
+    /// Human-readable display name for the workflow stage
+    workflow_stage_display: Option<String>,
+}
+
+/// Map a workflow state name to a stage for UI display.
+fn state_name_to_stage(state_name: &str) -> (Option<String>, Option<String>) {
+    // State names are like: setup_running, setup_complete, verification_running, etc.
+    let (stage, display) = if state_name.starts_with("setup") {
+        ("setup", "Setup")
+    } else if state_name.starts_with("verification") {
+        ("verification", "Verification")
+    } else if state_name.starts_with("agentic") {
+        ("agentic", "Agentic")
+    } else if state_name.starts_with("completion") {
+        ("completion", "Completion")
+    } else if state_name == "running" {
+        // Legacy running state - no explicit stage
+        return (None, None);
+    } else {
+        return (None, None);
+    };
+    (Some(stage.to_string()), Some(display.to_string()))
+}
+
+/// Get workflow state for a task run.
+///
+/// This endpoint provides explicit workflow state tracking that replaces
+/// implicit state inference from task_runs status fields.
+///
+/// Works for all workflow types: unified, orchestrator, gui_automation.
+async fn get_workflow_state(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<WorkflowStateResponse>, (StatusCode, String)> {
+    // First get the task run for metadata
+    let task_run = state
+        .app_state
+        .checkpoint_db
+        .get_task_run(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
+
+    // Try to get explicit workflow state
+    let explicit_state = state
+        .app_state
+        .checkpoint_db
+        .get_workflow_execution_state(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Try to get max_iterations from the workflow definition
+    let max_iterations = if let Some(ref workflow_name) = task_run.workflow_name {
+        state
+            .app_state
+            .checkpoint_db
+            .get_unified_workflow_by_name(workflow_name)
+            .ok()
+            .flatten()
+            .map(|w| w.max_iterations)
+    } else {
+        None
+    };
+
+    if let Some(ws) = explicit_state {
+        // Return explicit state
+        let state_data: Option<serde_json::Value> = ws
+            .state_data
+            .as_ref()
+            .and_then(|s| serde_json::from_str(s).ok());
+
+        let is_terminal = matches!(
+            ws.state_name.as_str(),
+            "completion_complete" | "failed" | "stopped"
+        );
+        let is_stopped = ws.state_name == "stopped";
+
+        // Map state name to stage for UI
+        let (workflow_stage, workflow_stage_display) = state_name_to_stage(&ws.state_name);
+
+        Ok(Json(WorkflowStateResponse {
+            task_run_id: id,
+            workflow_type: ws.workflow_type,
+            current_state: ws.state_name,
+            phase: ws.phase,
+            iteration: ws.iteration,
+            max_iterations,
+            is_complete: is_terminal,
+            is_stopped,
+            is_paused: false, // TODO: Track paused state
+            has_verification_plan: false, // TODO: Check if verification plan exists
+            workflow_start_time: task_run.created_at,
+            state_data,
+            workflow_stage,
+            workflow_stage_display,
+        }))
+    } else {
+        // Fallback: Infer state from task_run for backward compatibility
+        let workflow_type = task_run
+            .workflow_type
+            .clone()
+            .unwrap_or_else(|| "legacy_session".to_string());
+
+        let (current_state, is_complete, is_stopped) = match task_run.status.as_str() {
+            "running" => ("running".to_string(), false, false),
+            "complete" => ("complete".to_string(), true, false),
+            "failed" => ("failed".to_string(), true, false),
+            "stopped" => ("stopped".to_string(), true, true),
+            other => (other.to_string(), false, false),
+        };
+
+        Ok(Json(WorkflowStateResponse {
+            task_run_id: id,
+            workflow_type,
+            current_state,
+            phase: None,
+            iteration: None,
+            max_iterations,
+            is_complete,
+            is_stopped,
+            is_paused: false,
+            has_verification_plan: false,
+            workflow_start_time: task_run.created_at,
+            state_data: None,
+            workflow_stage: None,
+            workflow_stage_display: None,
+        }))
+    }
+}
+
+// =============================================================================
+// Full Workflow State (for frontend restart recovery)
+// =============================================================================
+
+/// Full workflow state response for restart recovery.
+///
+/// This endpoint returns authoritative state from the database, including:
+/// - Orchestrator state (phase, iteration, state name)
+/// - All step checkpoints (which steps completed)
+/// - Progress markers for the current step (intra-step progress)
+/// - Resume point (where execution will continue)
+#[derive(Debug, Serialize)]
+struct FullWorkflowStateResponse {
+    /// Task run metadata
+    task_run: TaskRunSummary,
+    /// Orchestrator state from workflow_execution_state table
+    orchestrator_state: Option<OrchestratorStateData>,
+    /// All step checkpoints for this execution
+    checkpoints: Vec<StepCheckpointData>,
+    /// Progress marker for the currently running step (if any)
+    current_step_progress: Option<StepProgressData>,
+    /// Computed resume point
+    resume_point: ResumePointData,
+}
+
+/// Task run summary for full state response.
+#[derive(Debug, Serialize)]
+struct TaskRunSummary {
+    id: String,
+    status: String,
+    task_name: String,
+    workflow_type: Option<String>,
+    workflow_name: Option<String>,
+    started_at: String,
+    sessions_count: u32,
+}
+
+/// Orchestrator state data from workflow_execution_state table.
+#[derive(Debug, Serialize)]
+struct OrchestratorStateData {
+    state_name: String,
+    state_data: Option<serde_json::Value>,
+    phase: Option<String>,
+    iteration: Option<u32>,
+    updated_at: String,
+    /// Mapped workflow stage for UI display
+    workflow_stage: Option<String>,
+    workflow_stage_display: Option<String>,
+}
+
+/// Step checkpoint data for full state response.
+#[derive(Debug, Serialize)]
+struct StepCheckpointData {
+    id: String,
+    execution_id: String,
+    phase: String,
+    iteration: Option<u32>,
+    step_index: usize,
+    step_type: String,
+    step_name: Option<String>,
+    status: String,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    duration_ms: Option<i64>,
+    error: Option<String>,
+}
+
+/// Step progress marker data for full state response.
+#[derive(Debug, Serialize)]
+struct StepProgressData {
+    checkpoint_id: String,
+    marker_type: String,
+    current_value: u64,
+    total_value: Option<u64>,
+    description: Option<String>,
+    data_json: Option<serde_json::Value>,
+    created_at: String,
+}
+
+/// Resume point data for full state response.
+#[derive(Debug, Serialize)]
+struct ResumePointData {
+    /// Type of resume point
+    #[serde(rename = "type")]
+    resume_type: String,
+    /// Iteration number (for verification/agentic phases)
+    iteration: Option<u32>,
+    /// Step index to resume from
+    from_step: Option<usize>,
+    /// Human-readable description
+    description: String,
+}
+
+/// Get full workflow state for restart recovery.
+///
+/// This endpoint returns authoritative state from the database for the frontend
+/// to use when recovering from a restart. It consolidates data from:
+/// - task_runs table
+/// - workflow_execution_state table
+/// - workflow_step_checkpoints table
+/// - step_progress_markers table
+async fn get_full_workflow_state(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<FullWorkflowStateResponse>, (StatusCode, String)> {
+    // Get task run
+    let task_run = state
+        .app_state
+        .checkpoint_db
+        .get_task_run(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
+
+    // Get orchestrator state
+    let explicit_state = state
+        .app_state
+        .checkpoint_db
+        .get_workflow_execution_state(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let orchestrator_state = explicit_state.map(|ws| {
+        let state_data: Option<serde_json::Value> = ws
+            .state_data
+            .as_ref()
+            .and_then(|s| serde_json::from_str(s).ok());
+        let (workflow_stage, workflow_stage_display) = state_name_to_stage(&ws.state_name);
+
+        OrchestratorStateData {
+            state_name: ws.state_name,
+            state_data,
+            phase: ws.phase,
+            iteration: ws.iteration,
+            updated_at: ws.updated_at,
+            workflow_stage,
+            workflow_stage_display,
+        }
+    });
+
+    // Get all step checkpoints
+    let checkpoints_raw = state
+        .app_state
+        .checkpoint_db
+        .get_all_workflow_step_checkpoints(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let checkpoints: Vec<StepCheckpointData> = checkpoints_raw
+        .iter()
+        .map(|cp| StepCheckpointData {
+            id: cp.id.clone(),
+            execution_id: cp.execution_id.clone(),
+            phase: cp.phase.clone(),
+            iteration: cp.iteration,
+            step_index: cp.step_index,
+            step_type: cp.step_type.clone(),
+            step_name: cp.step_name.clone(),
+            status: cp.status.to_string(),
+            started_at: cp.started_at.clone(),
+            completed_at: cp.completed_at.clone(),
+            duration_ms: cp.duration_ms,
+            error: cp.error.clone(),
+        })
+        .collect();
+
+    // Get current step progress
+    let progress_raw = state
+        .app_state
+        .checkpoint_db
+        .get_current_step_progress(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let current_step_progress = progress_raw.map(|p| StepProgressData {
+        checkpoint_id: p.checkpoint_id,
+        marker_type: p.marker_type,
+        current_value: p.current_value,
+        total_value: p.total_value,
+        description: p.description,
+        data_json: p.data_json.as_ref().and_then(|s| serde_json::from_str(s).ok()),
+        created_at: p.created_at,
+    });
+
+    // Compute resume point using ResumeManager
+    let resume_point = compute_resume_point(state.app_state.checkpoint_db.clone(), &id, &orchestrator_state);
+
+    Ok(Json(FullWorkflowStateResponse {
+        task_run: TaskRunSummary {
+            id: task_run.id,
+            status: task_run.status,
+            task_name: task_run.task_name,
+            workflow_type: task_run.workflow_type,
+            workflow_name: task_run.workflow_name,
+            started_at: task_run.created_at,
+            sessions_count: task_run.sessions_count,
+        },
+        orchestrator_state,
+        checkpoints,
+        current_step_progress,
+        resume_point,
+    }))
+}
+
+/// Compute the resume point for a workflow execution.
+fn compute_resume_point(
+    db: std::sync::Arc<crate::database::CheckpointDb>,
+    execution_id: &str,
+    orchestrator_state: &Option<OrchestratorStateData>,
+) -> ResumePointData {
+    // Try to use the ResumeManager for accurate resume point calculation
+    use crate::unified_workflow_executor::ResumeManager;
+
+    let resume_mgr = ResumeManager::new(db);
+    match resume_mgr.determine_resume_point(execution_id) {
+        Ok(resume_point) => {
+            use crate::unified_workflow_executor::ResumePoint;
+            match resume_point {
+                ResumePoint::FromStart => ResumePointData {
+                    resume_type: "from_start".to_string(),
+                    iteration: None,
+                    from_step: None,
+                    description: resume_point.description(),
+                },
+                ResumePoint::SetupPhase { from_step } => ResumePointData {
+                    resume_type: "setup_phase".to_string(),
+                    iteration: None,
+                    from_step: Some(from_step),
+                    description: resume_point.description(),
+                },
+                ResumePoint::VerificationPhase { iteration, from_step } => ResumePointData {
+                    resume_type: "verification_phase".to_string(),
+                    iteration: Some(iteration),
+                    from_step: Some(from_step),
+                    description: resume_point.description(),
+                },
+                ResumePoint::AgenticPhase { iteration } => ResumePointData {
+                    resume_type: "agentic_phase".to_string(),
+                    iteration: Some(iteration),
+                    from_step: None,
+                    description: resume_point.description(),
+                },
+                ResumePoint::CompletionPhase { from_step } => ResumePointData {
+                    resume_type: "completion_phase".to_string(),
+                    iteration: None,
+                    from_step: Some(from_step),
+                    description: resume_point.description(),
+                },
+            }
+        }
+        Err(e) => {
+            // Fall back to basic inference from orchestrator state
+            warn!("Failed to determine resume point: {}, using fallback", e);
+            if let Some(orch) = orchestrator_state {
+                ResumePointData {
+                    resume_type: orch.phase.clone().unwrap_or_else(|| "unknown".to_string()),
+                    iteration: orch.iteration,
+                    from_step: Some(0),
+                    description: format!("Resume from {} (fallback)", orch.state_name),
+                }
+            } else {
+                ResumePointData {
+                    resume_type: "from_start".to_string(),
+                    iteration: None,
+                    from_step: None,
+                    description: "No state found, start from beginning".to_string(),
+                }
+            }
+        }
+    }
 }
 
 /// Query params for getting task output.
@@ -15373,11 +12554,6 @@ async fn stop_task_run(
                 error!("Failed to execute taskkill for PID {}: {}", pid, e);
             }
         }
-    }
-
-    // Stop monitoring
-    if let Err(e) = state.task_monitor.stop_monitoring(&id).await {
-        warn!("Failed to stop monitoring for {}: {}", id, e);
     }
 
     // Mark as stopped in database
@@ -15509,6 +12685,176 @@ async fn set_task_auto_continue(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
+/// Request body for resuming a task run.
+#[derive(Debug, Deserialize)]
+struct ResumeTaskRunRequest {
+    /// Additional sessions to add (if not already reopened). Default: 1
+    additional_sessions: Option<u32>,
+}
+
+/// Resume a task run that was previously completed or interrupted.
+///
+/// This endpoint combines reopening the task in the database with actually
+/// triggering the workflow execution. It handles:
+/// 1. Reopening the task if it's not already running
+/// 2. Extracting the workflow ID from the task ID
+/// 3. Starting LoopController to execute the workflow
+async fn resume_task_run(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(request): Json<ResumeTaskRunRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use crate::unified_workflow_executor::{
+        convert_json_steps_with_phase, extract_prompt_steps_with_phase,
+        extract_workflow_id_from_task_id, LoopConfig, LoopController,
+    };
+
+    info!("Resume task run request: {}", id);
+
+    // Get the task run
+    let task_run = state
+        .app_state
+        .checkpoint_db
+        .get_task_run(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
+
+    // If not already running, reopen it
+    let task_run = if task_run.status != "running" {
+        let additional_sessions = request.additional_sessions.unwrap_or(1);
+        state
+            .app_state
+            .checkpoint_db
+            .reopen_task_run(&id, additional_sessions)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+    } else {
+        task_run
+    };
+
+    // Try to get the workflow definition - first by extracting ID from task ID, then by name
+    let (workflow_id, workflow) = if let Some(wf_id) = extract_workflow_id_from_task_id(&id) {
+        // Old format: unified-workflow-{uuid}-{timestamp}
+        let wf = state
+            .app_state
+            .checkpoint_db
+            .get_unified_workflow(&wf_id)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("Workflow definition not found: {}", wf_id),
+                )
+            })?;
+        (wf_id, wf)
+    } else if let Some(ref wf_name) = task_run.workflow_name {
+        // New format: workflow-sequence-{timestamp}-workflow-{n}
+        // Look up workflow by name instead
+        let wf = state
+            .app_state
+            .checkpoint_db
+            .get_unified_workflow_by_name(wf_name)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("Workflow definition not found with name: {}", wf_name),
+                )
+            })?;
+        (wf.id.clone(), wf)
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Cannot determine workflow for task ID '{}'. Task has no workflow_name and ID format is not recognized.",
+                id
+            ),
+        ));
+    };
+
+    info!(
+        "Resuming workflow '{}' (task_id: {}, workflow_id: {}, iteration: {})",
+        task_run.task_name,
+        id,
+        workflow_id,
+        task_run.sessions_count + 1
+    );
+
+    // Convert steps for LoopController with explicit phase assignment
+    let setup_automation_steps = convert_json_steps_with_phase(&workflow.setup_steps, 0, Some("setup"));
+    let setup_prompt_steps = extract_prompt_steps_with_phase(&workflow.setup_steps, Some("setup"));
+    let verification_steps = convert_json_steps_with_phase(&workflow.verification_steps, 0, Some("verification"));
+    // Prepend health check steps if enabled and URLs configured
+    // Health checks run BEFORE log_watch to catch server down before scanning logs
+    let verification_steps = crate::unified_workflows::prepend_health_check_steps(
+        verification_steps,
+        workflow.health_check_enabled,
+        &workflow.health_check_urls,
+    );
+    // Prepend log_watch step if enabled (default: true)
+    let verification_steps = crate::unified_workflows::prepend_log_watch_step(
+        verification_steps,
+        workflow.log_watch_enabled,
+    );
+    let agentic_steps = extract_prompt_steps_with_phase(&workflow.agentic_steps, Some("agentic"));
+    let completion_automation_steps =
+        convert_json_steps_with_phase(&workflow.completion_steps, 0, Some("completion"));
+    let completion_prompt_steps = extract_prompt_steps_with_phase(&workflow.completion_steps, Some("completion"));
+
+    // Calculate starting iteration for resume (sessions_count is the number of completed iterations)
+    let starting_iteration = task_run.sessions_count as u32;
+
+    let loop_config = LoopConfig {
+        max_iterations: workflow.max_iterations,
+        timeout_seconds: workflow.timeout_seconds, // Use workflow setting
+        base_prompt: String::new(),
+        workflow_name: task_run.task_name.clone(),
+        workflow_id: workflow_id.clone(),
+        execution_id: id.clone(),
+        targeted_error_ids: workflow.targeted_error_ids.clone(),
+        starting_iteration,
+    };
+
+    // Spawn the workflow execution in background with panic protection
+    let app_state = state.app_state.clone();
+    let config_storage = state.config_storage.clone();
+    let app_handle = state.app_handle.clone();
+    let pid_tracker = state.current_ai_pids.clone();
+    let checkpoint_db = state.app_state.checkpoint_db.clone();
+    let task_name = task_run.task_name.clone();
+    let execution_id_for_guard = id.clone();
+
+    // Use panic-safe spawning to ensure task is marked as failed if workflow panics
+    crate::unified_workflow_executor::spawn_workflow_with_panic_guard(
+        checkpoint_db,
+        execution_id_for_guard,
+        task_name.clone(),
+        async move {
+            let mut controller =
+                LoopController::new(app_state, config_storage, app_handle, pid_tracker);
+
+            controller
+                .run(
+                    loop_config,
+                    setup_automation_steps,
+                    setup_prompt_steps,
+                    verification_steps,
+                    agentic_steps,
+                    completion_automation_steps,
+                    completion_prompt_steps,
+                )
+                .await
+        },
+    );
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": format!("Task run '{}' resumed successfully", task_run.task_name),
+        "task_run_id": id,
+        "workflow_id": workflow_id,
+        "iteration": task_run.sessions_count + 1
+    })))
+}
+
 /// Query parameters for task run events.
 #[derive(Debug, Deserialize)]
 struct TaskRunEventsQuery {
@@ -15543,6 +12889,94 @@ async fn get_task_run_events(
     })))
 }
 
+/// Query parameters for paginated checkpoints.
+#[derive(Debug, Deserialize)]
+struct CheckpointsQuery {
+    /// Cursor for pagination (step_index to start from, exclusive).
+    cursor: Option<i64>,
+    /// Maximum number of checkpoints to return (default: 50).
+    limit: Option<usize>,
+}
+
+/// Get step checkpoints for a task run with cursor-based pagination.
+///
+/// This endpoint supports efficient pagination for runs with 1000+ steps.
+/// Use the `next_cursor` from the response to fetch the next page.
+async fn get_task_run_checkpoints(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<CheckpointsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Verify task exists
+    state
+        .app_state
+        .checkpoint_db
+        .get_task_run(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
+
+    let limit = query.limit.unwrap_or(50).min(100); // Cap at 100 per page
+
+    let (checkpoints, next_cursor) = state
+        .app_state
+        .checkpoint_db
+        .get_workflow_step_checkpoints_paginated(&id, query.cursor, limit)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(serde_json::json!({
+        "task_run_id": id,
+        "checkpoints": checkpoints,
+        "count": checkpoints.len(),
+        "cursor": query.cursor,
+        "next_cursor": next_cursor,
+        "has_more": next_cursor.is_some()
+    })))
+}
+
+/// Path parameters for step progress endpoint.
+#[derive(Debug, Deserialize)]
+struct StepProgressPath {
+    id: String,
+    checkpoint_id: String,
+}
+
+/// Get progress markers for a specific step checkpoint.
+///
+/// Progress markers track intra-step progress (e.g., "analyzed 50/100 files").
+async fn get_step_progress_markers(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(path): axum::extract::Path<StepProgressPath>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Verify task exists
+    state
+        .app_state
+        .checkpoint_db
+        .get_task_run(&path.id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", path.id)))?;
+
+    // Get progress markers for this checkpoint
+    let markers = state
+        .app_state
+        .checkpoint_db
+        .get_step_progress_markers(&path.checkpoint_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Also get the latest marker for quick access
+    let latest = state
+        .app_state
+        .checkpoint_db
+        .get_latest_step_progress_marker(&path.checkpoint_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(serde_json::json!({
+        "checkpoint_id": path.checkpoint_id,
+        "markers": markers,
+        "count": markers.len(),
+        "latest": latest
+    })))
+}
+
 /// Query parameters for current execution steps.
 #[derive(Debug, Deserialize)]
 struct CurrentExecutionStepsQuery {
@@ -15563,6 +12997,8 @@ struct StepExecutionData {
     phase: Option<String>,
     /// Step index within the phase
     step_index: Option<i64>,
+    /// Iteration number for verification/agentic phases (1-indexed)
+    iteration: Option<i64>,
     start_time: Option<i64>,
     end_time: Option<i64>,
     duration_ms: Option<i64>,
@@ -15620,9 +13056,10 @@ async fn get_current_execution_steps(
         .get_task_run_events(&task.id, None, query.limit)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    // Aggregate events by step_name + step_index to merge start/complete events
-    // Key: (step_name, step_index) -> merged StepExecutionData
-    let mut step_map: HashMap<(String, i64), StepExecutionData> = HashMap::new();
+    // Aggregate events by action_id (preferred) or step_name + step_index to merge start/complete events
+    // Using action_id is more reliable because it's generated from metadata and consistent across events
+    // Key: String (action_id or synthesized from step_name + step_index)
+    let mut step_map: HashMap<String, StepExecutionData> = HashMap::new();
 
     for event in events {
         // Only process step-related events
@@ -15670,7 +13107,22 @@ async fn get_current_execution_steps(
             }
         }
 
-        let key = (step_name.clone(), step_index);
+        // Extract iteration early for use in fallback key
+        let iteration_for_key = data
+            .as_ref()
+            .and_then(|d| d.get("iteration"))
+            .and_then(|v| v.as_i64());
+
+        // Use action_id as the primary key for aggregation (most reliable)
+        // Fall back to synthesized key from step_name + step_index + iteration
+        // Including iteration in fallback prevents merging steps from different iterations
+        let key = event.action_id.clone().unwrap_or_else(|| {
+            if let Some(iter) = iteration_for_key {
+                format!("{}:{}:{}", step_name, step_index, iter)
+            } else {
+                format!("{}:{}", step_name, step_index)
+            }
+        });
 
         // Get the timestamp for this event
         let event_timestamp = chrono::DateTime::parse_from_rfc3339(&event.timestamp)
@@ -15689,8 +13141,23 @@ async fn get_current_execution_steps(
         // Check if we already have an entry for this step
         if let Some(existing) = step_map.get_mut(&key) {
             // Merge: prefer completion data over start data
-            // Status: complete/success/failed takes precedence over running
-            if status != "running" {
+            // Status priority: failed > success > running > pending
+            // Once a step is marked as failed, it stays failed (even if we see a "complete" event)
+            // This handles duplicate events where one might be error and one complete
+            let should_update_status = match (existing.status.as_str(), status.as_str()) {
+                // Never downgrade from failed (failed is highest priority)
+                ("failed", _) => false,
+                // Upgrade running/pending to anything terminal
+                ("running", "success") | ("running", "failed") => true,
+                ("pending", "success") | ("pending", "failed") => true,
+                // Upgrade success only to failed (if somehow we get conflicting events)
+                ("success", "failed") => true,
+                // Don't change success to success (no-op) or downgrade success to running
+                ("success", "success") | ("success", "running") => false,
+                // Other cases: update
+                _ => status != "running",
+            };
+            if should_update_status {
                 existing.status = status;
             }
 
@@ -15702,8 +13169,18 @@ async fn get_current_execution_steps(
                         existing.phase = Some(v.to_string());
                     }
                 }
+                // Update iteration if not already set
+                if existing.iteration.is_none() {
+                    if let Some(v) = d.get("iteration").and_then(|v| v.as_i64()) {
+                        existing.iteration = Some(v);
+                    }
+                }
+                // Try JSON data first, then fall back to event's top-level duration_ms
                 if let Some(v) = d.get("duration_ms").and_then(|v| v.as_i64()) {
                     existing.duration_ms = Some(v);
+                } else if existing.duration_ms.is_none() {
+                    // Fall back to event's top-level duration_ms field
+                    existing.duration_ms = event.duration_ms;
                 }
                 if let Some(v) = d.get("end_time").and_then(|v| v.as_i64()) {
                     existing.end_time = Some(v);
@@ -15732,6 +13209,12 @@ async fn get_current_execution_steps(
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
 
+            // Extract iteration from event data (for verification/agentic phases)
+            let iteration = data
+                .as_ref()
+                .and_then(|d| d.get("iteration"))
+                .and_then(|v| v.as_i64());
+
             // Create new entry
             let step_data = StepExecutionData {
                 id: event.id.to_string(),
@@ -15744,15 +13227,18 @@ async fn get_current_execution_steps(
                 } else {
                     None
                 },
+                iteration,
                 start_time: event_timestamp,
                 end_time: data
                     .as_ref()
                     .and_then(|d| d.get("end_time"))
                     .and_then(|v| v.as_i64()),
+                // Try JSON data first, then fall back to event's top-level duration_ms
                 duration_ms: data
                     .as_ref()
                     .and_then(|d| d.get("duration_ms"))
-                    .and_then(|v| v.as_i64()),
+                    .and_then(|v| v.as_i64())
+                    .or(event.duration_ms),
                 error: data
                     .as_ref()
                     .and_then(|d| d.get("error"))
@@ -15803,17 +13289,130 @@ async fn get_current_execution_steps(
         }
     }
 
-    // Convert map to vector, sorted by step_index
+    // Get completed iterations from verification_phase_results
+    // Steps from completed iterations should not show as "running"
+    let completed_iterations: std::collections::HashSet<i64> = state
+        .app_state
+        .checkpoint_db
+        .get_all_verification_phase_results(&task.id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| v.get("iteration").and_then(|i| i.as_i64()))
+        .collect();
+
+    // Find the maximum iteration number across all steps
+    // This helps detect stale "running" steps in older iterations
+    let max_iteration: i64 = step_map
+        .values()
+        .filter_map(|s| s.iteration)
+        .max()
+        .unwrap_or(1);
+
+    // Get current time for timeout detection
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    // Steps running for more than 30 minutes are considered stuck
+    const STEP_TIMEOUT_MS: i64 = 30 * 60 * 1000;
+
+    // Determine which phases have completed steps (for stale detection of non-iterated phases)
+    let has_completed_verification_step = step_map.values().any(|s| {
+        s.phase.as_deref() == Some("verification") &&
+        (s.status == "success" || s.status == "failed")
+    });
+    let has_completed_agentic_step = step_map.values().any(|s| {
+        s.phase.as_deref() == Some("agentic") &&
+        (s.status == "success" || s.status == "failed")
+    });
+    let has_completed_completion_step = step_map.values().any(|s| {
+        s.phase.as_deref() == Some("completion") &&
+        (s.status == "success" || s.status == "failed")
+    });
+
+    // Fix stale "running" status for steps
+    // A step is stale if:
+    // 1. Its iteration has a verification_phase_result (iteration completed), OR
+    // 2. Its iteration is less than the current max iteration (we've moved on), OR
+    // 3. It has been running for more than 30 minutes (timeout), OR
+    // 4. For setup steps without iteration: the loop has started (verification/agentic has run), OR
+    // 5. For any step without iteration: a later phase has completed
+    for step_data in step_map.values_mut() {
+        if step_data.status == "running" {
+            // Check for timeout
+            let is_timed_out = step_data
+                .start_time
+                .map(|start| (now_ms - start) > STEP_TIMEOUT_MS)
+                .unwrap_or(false);
+
+            // Check for stale based on iteration or phase progression
+            let is_stale = if let Some(iter) = step_data.iteration {
+                // For steps with iteration: check iteration-based staleness
+                completed_iterations.contains(&iter) || iter < max_iteration
+            } else {
+                // For steps without iteration: check phase-based staleness
+                // Setup steps are stale if verification/agentic/completion has started
+                // Verification/agentic steps without iteration are stale if completion has started
+                match step_data.phase.as_deref() {
+                    Some("setup") => {
+                        // Setup is stale if loop has started or later phases have completed
+                        max_iteration > 1 || has_completed_verification_step ||
+                        has_completed_agentic_step || has_completed_completion_step
+                    }
+                    Some("verification") | Some("agentic") => {
+                        // These phases normally have iterations, but if not, check if completion ran
+                        has_completed_completion_step
+                    }
+                    Some("completion") => {
+                        // Completion rarely gets stale, but timeout will catch it
+                        false
+                    }
+                    _ => false,
+                }
+            };
+
+            if is_stale || is_timed_out {
+                // This iteration completed, we've moved past it, or it timed out.
+                // Mark it as "failed" since something went wrong (no completion event).
+                step_data.status = "failed".to_string();
+                if step_data.error.is_none() {
+                    if is_timed_out {
+                        step_data.error = Some("Step timed out (running for more than 30 minutes)".to_string());
+                    } else {
+                        step_data.error = Some("Step did not complete properly (missing end event)".to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Convert map to vector, sorted by start_time
     let mut executions: Vec<StepExecutionData> = step_map.into_values().collect();
     executions.sort_by(|a, b| {
         // Sort by start_time to maintain execution order
         a.start_time.cmp(&b.start_time)
     });
 
+    // Determine current workflow stage from the most recent step event's phase
+    // Priority: Find a step that is currently running, or fall back to the most recent step
+    let current_stage: Option<String> = executions
+        .iter()
+        .filter(|e| e.status == "running")
+        .filter_map(|e| e.phase.clone())
+        .last()
+        .or_else(|| {
+            // Fall back to the most recent step's phase (by start_time, already sorted)
+            executions
+                .iter()
+                .rev()
+                .filter_map(|e| e.phase.clone())
+                .next()
+        });
+
     Ok(Json(serde_json::json!({
         "success": true,
         "task_run_id": task.id,
         "workflow_name": task.workflow_name,
+        "workflow_type": task.workflow_type,
+        "workflow_start_time": task.created_at,
+        "current_stage": current_stage,
         "executions": executions,
         "count": executions.len()
     })))
@@ -15868,6 +13467,49 @@ async fn get_task_run_playwright_results(
         "task_run_id": id,
         "playwright_results": results,
         "count": results.len()
+    })))
+}
+
+/// Query parameters for execution spans.
+#[derive(Debug, Deserialize)]
+struct ExecutionSpansQuery {
+    /// Filter by execution/task ID
+    execution_id: Option<String>,
+    /// Filter span names using SQL LIKE pattern (e.g., "workflow.%")
+    name_pattern: Option<String>,
+    /// Filter spans with duration >= this value
+    min_duration_ms: Option<i64>,
+    /// Maximum number of spans to return (default: 100)
+    limit: Option<u32>,
+}
+
+/// Get execution spans from SQLite (tracing data).
+///
+/// Supports filtering by execution_id, name pattern, and minimum duration.
+async fn get_execution_spans(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Query(query): axum::extract::Query<ExecutionSpansQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let spans = state
+        .app_state
+        .checkpoint_db
+        .get_execution_spans(
+            query.execution_id.as_deref(),
+            query.name_pattern.as_deref(),
+            query.min_duration_ms,
+            query.limit,
+        )
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(serde_json::json!({
+        "spans": spans,
+        "count": spans.len(),
+        "filters": {
+            "execution_id": query.execution_id,
+            "name_pattern": query.name_pattern,
+            "min_duration_ms": query.min_duration_ms,
+            "limit": query.limit.unwrap_or(100)
+        }
     })))
 }
 
@@ -15963,7 +13605,7 @@ async fn list_automation_runs(
         .app_state
         .checkpoint_db
         .connection()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let limit = query.limit.unwrap_or(20);
 
@@ -16065,7 +13707,7 @@ async fn get_automation_run(
         .app_state
         .checkpoint_db
         .connection()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let result: Result<Option<RunDetails>, String> = conn
         .query_row(
@@ -17109,7 +14751,7 @@ fn db_test_to_definition(test: &crate::database::VerificationTest) -> TestDefini
         vision_config,
         python_code: test.python_code.clone(),
         repo_test_config,
-        timeout_seconds: test.timeout_seconds,
+        timeout_seconds: test.timeout_seconds.unwrap_or(60),
         is_critical: test.is_critical,
         config: test.config.clone(),
     }
@@ -18807,6 +16449,7 @@ async fn import_unified_workflow(
         agentic_steps: workflow.agentic_steps.clone(),
         completion_steps: workflow.completion_steps.clone(),
         max_iterations: workflow.max_iterations,
+        timeout_seconds: workflow.timeout_seconds,
         provider: workflow.provider.clone(),
         model: workflow.model.clone(),
         skip_ai_summary: workflow.skip_ai_summary,
@@ -18815,6 +16458,9 @@ async fn import_unified_workflow(
         disabled_context_ids: workflow.disabled_context_ids.clone(),
         auto_include_contexts: workflow.auto_include_contexts,
         prompt_template: workflow.prompt_template.clone(),
+        log_watch_enabled: workflow.log_watch_enabled,
+        health_check_enabled: workflow.health_check_enabled,
+        health_check_urls: workflow.health_check_urls.clone(),
     };
 
     // Use the database's create function but with our custom ID
@@ -18917,6 +16563,58 @@ struct RunUnifiedWorkflowRequest {
     /// Timeout in seconds (defaults to 300)
     #[serde(default)]
     timeout_seconds: Option<u64>,
+    /// Optional task_run_id for resuming an existing execution.
+    /// If provided, the workflow will resume from where it left off.
+    /// If not provided, the system will check for incomplete task_runs and auto-resume,
+    /// or create a new execution if none exist.
+    #[serde(default)]
+    task_run_id: Option<String>,
+    /// Force a fresh start even if there's an incomplete task_run.
+    /// When true, creates a new execution_id instead of resuming.
+    #[serde(default)]
+    force_fresh_start: bool,
+}
+
+/// Request body for executing an inline workflow (without saving to database)
+/// Used by Quick Fix to run a workflow directly without cluttering the library
+#[derive(Debug, Deserialize)]
+struct ExecuteInlineWorkflowRequest {
+    /// Workflow name
+    name: String,
+    /// Description
+    #[serde(default)]
+    description: String,
+    /// Setup phase steps
+    #[serde(default)]
+    setup_steps: Vec<serde_json::Value>,
+    /// Verification phase steps
+    #[serde(default)]
+    verification_steps: Vec<serde_json::Value>,
+    /// Agentic phase steps
+    #[serde(default)]
+    agentic_steps: Vec<serde_json::Value>,
+    /// Completion phase steps
+    #[serde(default)]
+    completion_steps: Vec<serde_json::Value>,
+    /// Maximum iterations for agentic phase
+    #[serde(default = "default_max_iterations")]
+    max_iterations: u32,
+    /// Timeout in seconds
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
+    /// Monitor index to use (defaults to 0)
+    #[serde(default)]
+    monitor_index: Option<i32>,
+    /// Error IDs targeted by this workflow
+    #[serde(default)]
+    targeted_error_ids: Vec<i64>,
+    /// Workflow settings (optional, extracted from generated workflow)
+    #[serde(default)]
+    settings: Option<serde_json::Value>,
+}
+
+fn default_max_iterations() -> u32 {
+    10
 }
 
 /// Run a unified workflow by ID
@@ -19087,6 +16785,10 @@ async fn run_unified_workflow(
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
             test_is_critical: step.get("is_critical").and_then(|v| v.as_bool()),
+            sub_step_id: step
+                .get("subStepId")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             awas_url: step
                 .get("awasUrl")
                 .and_then(|v| v.as_str())
@@ -19147,6 +16849,19 @@ async fn run_unified_workflow(
                 .get("content_type")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
+            api_output_variable: step
+                .get("output_variable")
+                .or_else(|| step.get("apiOutputVariable"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            api_extractions: step
+                .get("extractions")
+                .or_else(|| step.get("apiExtractions"))
+                .and_then(|v| serde_json::from_value(v.clone()).ok()),
+            api_timeout_ms: step
+                .get("timeout_ms")
+                .or_else(|| step.get("apiTimeoutMs"))
+                .and_then(|v| v.as_u64()),
             // Check fields - support both snake_case and camelCase
             check_type: step
                 .get("check_type")
@@ -19172,6 +16887,16 @@ async fn run_unified_workflow(
                 .or_else(|| step.get("check_auto_fix"))
                 .or_else(|| step.get("checkAutoFix"))
                 .and_then(|v| v.as_bool()),
+            check_url: step
+                .get("check_url")
+                .or_else(|| step.get("checkUrl"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            expected_status: step
+                .get("expected_status")
+                .or_else(|| step.get("expectedStatus"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u16),
             // Macro fields
             macro_id: step
                 .get("macro_id")
@@ -19184,6 +16909,29 @@ async fn run_unified_workflow(
                 .or_else(|| step.get("checkGroupId"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
+            // Log watch fields
+            log_sources: step
+                .get("logSources")
+                .or_else(|| step.get("log_sources"))
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                }),
+            time_window_seconds: step
+                .get("timeWindowSeconds")
+                .or_else(|| step.get("time_window_seconds"))
+                .and_then(|v| v.as_u64()),
+            error_patterns: step
+                .get("errorPatterns")
+                .or_else(|| step.get("error_patterns"))
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                }),
         })
     };
 
@@ -19231,6 +16979,9 @@ async fn run_unified_workflow(
                 steps: vec![],
                 captured_logs: None,
                 captured_runner_logs: None,
+                verification_passed: None,
+                loop_result: None,
+                task_summary: None,
             },
         )));
     }
@@ -19240,11 +16991,55 @@ async fn run_unified_workflow(
     let (automation_steps, prompt_steps) = categorize_steps(all_steps, |s| &s.step_type);
     let has_prompt_steps = !prompt_steps.is_empty();
 
-    let execution_id = format!(
-        "unified-workflow-{}-{}",
-        id,
-        chrono::Utc::now().timestamp_millis()
-    );
+    // Determine execution_id for resume support:
+    // 1. If task_run_id is explicitly provided, use it (explicit resume)
+    // 2. If force_fresh_start is false, check for incomplete task_run (auto-resume)
+    // 3. Otherwise, generate a new execution_id
+    let execution_id = if let Some(ref provided_id) = request.task_run_id {
+        info!("Using provided task_run_id for explicit resume: {}", provided_id);
+        provided_id.clone()
+    } else if !request.force_fresh_start {
+        // Check for incomplete task_run to auto-resume
+        match state.app_state.checkpoint_db.get_incomplete_task_run_for_workflow(&id) {
+            Ok(Some(existing_id)) => {
+                info!(
+                    "Found incomplete task_run {} for workflow {} - auto-resuming",
+                    existing_id, id
+                );
+                existing_id
+            }
+            Ok(None) => {
+                // No incomplete run found, generate new execution_id
+                let new_id = format!(
+                    "unified-workflow-{}-{}",
+                    id,
+                    chrono::Utc::now().timestamp_millis()
+                );
+                info!("No incomplete task_run found, starting fresh: {}", new_id);
+                new_id
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to check for incomplete task_run: {} - starting fresh",
+                    e
+                );
+                format!(
+                    "unified-workflow-{}-{}",
+                    id,
+                    chrono::Utc::now().timestamp_millis()
+                )
+            }
+        }
+    } else {
+        // force_fresh_start = true
+        let new_id = format!(
+            "unified-workflow-{}-{}",
+            id,
+            chrono::Utc::now().timestamp_millis()
+        );
+        info!("Force fresh start requested, new execution_id: {}", new_id);
+        new_id
+    };
 
     // If workflow has prompt steps, use AI-based execution
     if has_prompt_steps {
@@ -19322,6 +17117,20 @@ async fn run_unified_workflow(
                 .cloned()
                 .collect();
 
+            // Prepend health check steps if enabled and URLs configured
+            // Health checks run BEFORE log_watch to catch server down before scanning logs
+            let verification_steps = crate::unified_workflows::prepend_health_check_steps(
+                verification_steps,
+                workflow.health_check_enabled,
+                &workflow.health_check_urls,
+            );
+
+            // Prepend log_watch step if enabled (default: true)
+            let verification_steps = crate::unified_workflows::prepend_log_watch_step(
+                verification_steps,
+                workflow.log_watch_enabled,
+            );
+
             // Warn if verification_steps is empty but workflow had verification steps
             // This can happen if all verification steps were prompt-type (which shouldn't happen)
             if verification_steps.is_empty() && !workflow.verification_steps.is_empty() {
@@ -19353,20 +17162,20 @@ async fn run_unified_workflow(
                     .cloned(),
             );
 
-            // Create task_run for tracking
+            // Create task_run for tracking with workflow_type="unified"
+            // This prevents TaskMonitor and legacy session code from modifying status
             let execution_steps_json = serde_json::to_string(&automation_steps).ok();
-            if let Err(e) = state.app_state.checkpoint_db.create_task_run_with_config(
-                &execution_id,
-                &workflow.name,
-                Some(&combined_prompt),
-                "ai",
-                None,
-                Some(&workflow.name),
-                Some(workflow.max_iterations),
-                Some(true),
-                execution_steps_json,
-                None,
-            ) {
+            let mut input = CreateTaskRunInput::new(&execution_id, &workflow.name)
+                .with_prompt(&combined_prompt)
+                .with_task_type("ai")
+                .with_workflow_name(&workflow.name)
+                .with_max_sessions(workflow.max_iterations)
+                .with_auto_continue(true)
+                .with_workflow_type("unified"); // LoopController is sole authority on status
+            if let Some(esj) = execution_steps_json {
+                input = input.with_execution_steps_json(esj);
+            }
+            if let Err(e) = state.app_state.checkpoint_db.create_task_run(&input) {
                 warn!(
                     "Failed to create task_run for unified workflow {}: {}",
                     execution_id, e
@@ -19378,18 +17187,20 @@ async fn run_unified_workflow(
                 categorize_steps(completion_steps, |s| &s.step_type);
 
             // Run the verification-agentic loop using the new modular architecture
-            let timeout_seconds = request.timeout_seconds.unwrap_or(1800);
-
+            // Timeout priority: request override > workflow setting > None (no timeout)
+            let timeout_seconds = request.timeout_seconds.or(workflow.timeout_seconds);
             let loop_config = crate::unified_workflow_executor::LoopConfig {
                 max_iterations: workflow.max_iterations,
-                timeout_seconds,
+                timeout_seconds, // None = no timeout (default)
                 base_prompt: combined_prompt,
                 workflow_name: workflow.name.clone(),
                 workflow_id: workflow.id.clone(),
                 execution_id: execution_id.clone(),
+                targeted_error_ids: workflow.targeted_error_ids.clone(),
+                starting_iteration: 0, // Fresh start
             };
 
-            let controller = crate::unified_workflow_executor::LoopController::new(
+            let mut controller = crate::unified_workflow_executor::LoopController::new(
                 state.app_state.clone(),
                 state.config_storage.clone(),
                 state.app_handle.clone(),
@@ -19417,18 +17228,13 @@ async fn run_unified_workflow(
     let execution_steps_json = serde_json::to_string(&automation_steps).ok();
 
     // Create task_run to track this execution (enables Active page monitoring)
-    if let Err(e) = state.app_state.checkpoint_db.create_task_run_with_config(
-        &execution_id,
-        &workflow.name,
-        None,                 // no prompt
-        "automation",         // task_type - identifies as automation task
-        None,                 // config_id
-        Some(&workflow.name), // workflow_name - helps identify this in the dashboard
-        None,                 // max_sessions
-        None,                 // auto_continue
-        execution_steps_json, // execution_steps_json - for activity detection
-        None,                 // log_sources_json
-    ) {
+    let mut input = CreateTaskRunInput::new(&execution_id, &workflow.name)
+        .with_task_type("automation") // identifies as automation task
+        .with_workflow_name(&workflow.name); // helps identify this in the dashboard
+    if let Some(esj) = execution_steps_json {
+        input = input.with_execution_steps_json(esj);
+    }
+    if let Err(e) = state.app_state.checkpoint_db.create_task_run(&input) {
         warn!(
             "Failed to create task_run for unified workflow {}: {}",
             execution_id, e
@@ -19482,6 +17288,885 @@ async fn run_unified_workflow(
     }
 
     Ok(Json(ApiResponse::success(result)))
+}
+
+/// Execute an inline workflow without saving to the database
+///
+/// This endpoint is used by Quick Fix to run a generated workflow directly
+/// without cluttering the workflow library. The workflow is executed with
+/// a temporary ID and is not persisted.
+async fn execute_inline_workflow(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<ExecuteInlineWorkflowRequest>,
+) -> Result<
+    Json<ApiResponse<crate::step_executor::ExecutionResult>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    info!("Executing inline workflow: {}", request.name);
+
+    // Create a temporary workflow object (not saved to DB)
+    let execution_id = uuid::Uuid::new_v4().to_string();
+    let workflow = crate::unified_workflows::UnifiedWorkflow {
+        id: format!("inline-{}", execution_id),
+        name: request.name.clone(),
+        description: request.description,
+        category: "error-fix".to_string(),
+        tags: vec!["inline".to_string(), "quick-fix".to_string()],
+        setup_steps: request.setup_steps,
+        verification_steps: request.verification_steps,
+        agentic_steps: request.agentic_steps,
+        completion_steps: request.completion_steps,
+        max_iterations: request.max_iterations,
+        timeout_seconds: request.timeout_seconds,
+        provider: None,
+        model: None,
+        skip_ai_summary: false,
+        targeted_error_ids: request.targeted_error_ids,
+        log_source_selection: Default::default(),
+        context_ids: vec![],
+        disabled_context_ids: vec![],
+        auto_include_contexts: true,
+        prompt_template: None,
+        log_watch_enabled: true,
+        health_check_enabled: false,
+        health_check_urls: vec![],
+        created_at: chrono::Utc::now().to_rfc3339(),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    info!(
+        "Inline workflow '{}' has {} setup, {} verification, {} agentic, {} completion steps",
+        workflow.name,
+        workflow.setup_steps.len(),
+        workflow.verification_steps.len(),
+        workflow.agentic_steps.len(),
+        workflow.completion_steps.len()
+    );
+
+    // Save unified workflow config to .dev-logs for debugging (uses inline- prefix)
+    if let Ok(workflow_json) = serde_json::to_value(&workflow) {
+        crate::executor::file_logger::save_unified_workflow_config(&workflow_json, &workflow.name);
+    }
+
+    let monitor_index = request.monitor_index.unwrap_or(0);
+
+    // Convert JSON steps to ExecutionStepConfig
+    let mut all_steps: Vec<crate::step_executor::ExecutionStepConfig> = Vec::new();
+
+    // Helper to convert Value steps to ExecutionStepConfig
+    let convert_step = |step: &serde_json::Value,
+                        monitor: i32|
+     -> Option<crate::step_executor::ExecutionStepConfig> {
+        if let Ok(mut config) =
+            serde_json::from_value::<crate::step_executor::ExecutionStepConfig>(step.clone())
+        {
+            if config.monitor_index.is_none() {
+                config.monitor_index = Some(monitor);
+            }
+            if let Some(command) = step.get("command").and_then(|v| v.as_str()) {
+                let cmd = command.to_string();
+                match config.step_type.as_str() {
+                    "shell_command" => {
+                        if config.shell_command.is_none() {
+                            config.shell_command = Some(cmd);
+                        }
+                    }
+                    "check" => {
+                        if config.check_command.is_none() {
+                            config.check_command = Some(cmd);
+                        }
+                    }
+                    "test" => {
+                        if config.shell_command.is_none() {
+                            config.shell_command = Some(cmd);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if config.step_type == "prompt" && config.prompt_content.is_none() {
+                if let Some(content) = step.get("content").and_then(|v| v.as_str()) {
+                    config.prompt_content = Some(content.to_string());
+                }
+            }
+            return Some(config);
+        }
+        let step_type = step.get("type").and_then(|t| t.as_str())?;
+        let name = step
+            .get("name")
+            .and_then(|n| n.as_str())
+            .map(|s| s.to_string());
+        Some(crate::step_executor::ExecutionStepConfig {
+            step_type: step_type.to_string(),
+            name,
+            monitor_index: Some(monitor),
+            ..Default::default()
+        })
+    };
+
+    // Convert all phase steps with phase markers
+    for step in &workflow.setup_steps {
+        if let Some(mut config) = convert_step(step, monitor_index) {
+            config.phase = Some("setup".to_string());
+            all_steps.push(config);
+        }
+    }
+    for step in &workflow.verification_steps {
+        if let Some(mut config) = convert_step(step, monitor_index) {
+            config.phase = Some("verification".to_string());
+            all_steps.push(config);
+        }
+    }
+    for step in &workflow.agentic_steps {
+        if let Some(mut config) = convert_step(step, monitor_index) {
+            config.phase = Some("agentic".to_string());
+            all_steps.push(config);
+        }
+    }
+    for step in &workflow.completion_steps {
+        if let Some(mut config) = convert_step(step, monitor_index) {
+            config.phase = Some("completion".to_string());
+            all_steps.push(config);
+        }
+    }
+
+    info!(
+        "Converted {} total steps for inline workflow",
+        all_steps.len()
+    );
+
+    // Separate steps by type
+    let (automation_steps, prompt_steps) = categorize_steps(all_steps, |s| &s.step_type);
+
+    // If there are prompt steps, use the verification-agentic loop
+    if !prompt_steps.is_empty() {
+        let combined_prompt = prompt_steps
+            .iter()
+            .filter_map(|s| s.prompt_content.as_ref())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n");
+
+        if combined_prompt.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error(
+                    "Workflow has prompt steps but no prompt content".to_string(),
+                )),
+            ));
+        }
+
+        // Separate steps by phase
+        let setup_automation_steps: Vec<_> = automation_steps
+            .iter()
+            .filter(|s| s.phase.as_deref() == Some("setup"))
+            .cloned()
+            .collect();
+        let setup_prompt_steps: Vec<_> = prompt_steps
+            .iter()
+            .filter(|s| s.phase.as_deref() == Some("setup"))
+            .cloned()
+            .collect();
+        let verification_steps: Vec<_> = automation_steps
+            .iter()
+            .filter(|s| s.phase.as_deref() == Some("verification"))
+            .cloned()
+            .collect();
+
+        // Prepend log_watch step
+        let verification_steps = crate::unified_workflows::prepend_log_watch_step(
+            verification_steps,
+            workflow.log_watch_enabled,
+        );
+
+        let agentic_steps: Vec<_> = prompt_steps
+            .iter()
+            .filter(|s| s.phase.as_deref() == Some("agentic"))
+            .cloned()
+            .collect();
+        let mut completion_steps: Vec<_> = automation_steps
+            .iter()
+            .filter(|s| s.phase.as_deref() == Some("completion"))
+            .cloned()
+            .collect();
+        completion_steps.extend(
+            prompt_steps
+                .iter()
+                .filter(|s| s.phase.as_deref() == Some("completion"))
+                .cloned(),
+        );
+
+        // Create task_run for tracking (marked as inline/temporary)
+        let execution_steps_json = serde_json::to_string(&automation_steps).ok();
+        let mut input = crate::database::CreateTaskRunInput::new(&execution_id, &workflow.name)
+            .with_prompt(&combined_prompt)
+            .with_task_type("ai")
+            .with_workflow_name(&format!("[Inline] {}", workflow.name))
+            .with_max_sessions(workflow.max_iterations)
+            .with_auto_continue(true)
+            .with_workflow_type("unified");
+        if let Some(esj) = execution_steps_json {
+            input = input.with_execution_steps_json(esj);
+        }
+        if let Err(e) = state.app_state.checkpoint_db.create_task_run(&input) {
+            warn!(
+                "Failed to create task_run for inline workflow {}: {}",
+                execution_id, e
+            );
+        }
+
+        let (completion_automation_steps, completion_prompt_steps) =
+            categorize_steps(completion_steps, |s| &s.step_type);
+
+        let loop_config = crate::unified_workflow_executor::LoopConfig {
+            max_iterations: workflow.max_iterations,
+            timeout_seconds: request.timeout_seconds,
+            base_prompt: combined_prompt,
+            workflow_name: workflow.name.clone(),
+            workflow_id: workflow.id.clone(),
+            execution_id: execution_id.clone(),
+            targeted_error_ids: workflow.targeted_error_ids.clone(),
+            starting_iteration: 0,
+        };
+
+        let mut controller = crate::unified_workflow_executor::LoopController::new(
+            state.app_state.clone(),
+            state.config_storage.clone(),
+            state.app_handle.clone(),
+            state.current_ai_pids.clone(),
+        );
+
+        let result = controller
+            .run(
+                loop_config,
+                setup_automation_steps,
+                setup_prompt_steps,
+                verification_steps,
+                agentic_steps,
+                completion_automation_steps,
+                completion_prompt_steps,
+            )
+            .await;
+
+        return Ok(Json(ApiResponse::success(result.to_execution_result())));
+    }
+
+    // No prompt steps - use step_executor for automation-only workflow
+    let execution_steps_json = serde_json::to_string(&automation_steps).ok();
+    let mut input = crate::database::CreateTaskRunInput::new(&execution_id, &workflow.name)
+        .with_task_type("automation")
+        .with_workflow_name(&format!("[Inline] {}", workflow.name));
+    if let Some(esj) = execution_steps_json {
+        input = input.with_execution_steps_json(esj);
+    }
+    if let Err(e) = state.app_state.checkpoint_db.create_task_run(&input) {
+        warn!(
+            "Failed to create task_run for inline workflow {}: {}",
+            execution_id, e
+        );
+    }
+
+    let executor = crate::step_executor::StepExecutor::with_app_handle(
+        state.app_state.clone(),
+        state.config_storage.clone(),
+        state.app_handle.clone(),
+    );
+
+    let result = executor
+        .execute_steps_with_log_sources(&automation_steps, &execution_id, &[])
+        .await;
+
+    info!(
+        "Inline workflow '{}' completed: {} of {} steps succeeded",
+        workflow.name, result.successful_steps, result.total_steps
+    );
+
+    // Update task_run status
+    if result.success {
+        if let Err(e) = state
+            .app_state
+            .checkpoint_db
+            .complete_task_run(&execution_id)
+        {
+            warn!(
+                "Failed to mark task_run {} as completed: {}",
+                execution_id, e
+            );
+        }
+    } else {
+        let error_msg = result
+            .steps
+            .iter()
+            .find(|s| !s.success)
+            .and_then(|s| s.error.as_ref())
+            .map(|s| s.as_str())
+            .unwrap_or("Unknown error");
+        if let Err(e) = state
+            .app_state
+            .checkpoint_db
+            .fail_task_run(&execution_id, error_msg)
+        {
+            warn!("Failed to mark task_run {} as failed: {}", execution_id, e);
+        }
+    }
+
+    Ok(Json(ApiResponse::success(result)))
+}
+
+/// Workflow execution statistics
+#[derive(Serialize)]
+struct WorkflowStats {
+    #[serde(rename = "totalRuns")]
+    total_runs: u32,
+    #[serde(rename = "successCount")]
+    success_count: u32,
+    #[serde(rename = "failureCount")]
+    failure_count: u32,
+    #[serde(rename = "lastRunAt")]
+    last_run_at: Option<String>,
+    #[serde(rename = "lastRunStatus")]
+    last_run_status: Option<String>,
+    #[serde(rename = "avgDurationMs")]
+    avg_duration_ms: Option<i64>,
+}
+
+/// Get execution statistics for a unified workflow
+async fn get_unified_workflow_stats(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<WorkflowStats>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // First verify the workflow exists
+    let workflow = match state.app_state.checkpoint_db.get_unified_workflow(&id) {
+        Ok(Some(w)) => w,
+        Ok(None) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(api_error(format!("Unified workflow not found: {}", id))),
+            ));
+        }
+        Err(e) => {
+            error!("Failed to get unified workflow: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to get unified workflow: {}", e))),
+            ));
+        }
+    };
+
+    // Query stats from task_runs table by workflow_name
+    let conn = match state.app_state.checkpoint_db.connection() {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Failed to get database connection: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to get database connection: {}", e))),
+            ));
+        }
+    };
+
+    let stats_result: Result<WorkflowStats, rusqlite::Error> = conn.query_row(
+        r#"
+        SELECT
+            COUNT(*) as total_runs,
+            SUM(CASE WHEN status = 'complete' THEN 1 ELSE 0 END) as success_count,
+            SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failure_count,
+            MAX(created_at) as last_run_at,
+            (SELECT status FROM task_runs WHERE workflow_name = ?1
+             ORDER BY created_at DESC LIMIT 1) as last_run_status,
+            AVG(CASE WHEN completed_at IS NOT NULL
+                THEN (julianday(completed_at) - julianday(created_at)) * 86400000
+                END) as avg_duration_ms
+        FROM task_runs
+        WHERE workflow_name = ?1
+        "#,
+        [&workflow.name],
+        |row| {
+            Ok(WorkflowStats {
+                total_runs: row.get::<_, i64>(0)? as u32,
+                success_count: row.get::<_, i64>(1)? as u32,
+                failure_count: row.get::<_, i64>(2)? as u32,
+                last_run_at: row.get(3)?,
+                last_run_status: row.get(4)?,
+                // AVG() returns a float, so we need to convert it to i64
+                avg_duration_ms: row.get::<_, Option<f64>>(5)?.map(|f| f as i64),
+            })
+        },
+    );
+
+    match stats_result {
+        Ok(stats) => Ok(Json(ApiResponse::success(stats))),
+        Err(e) => {
+            // If no rows found, return empty stats
+            if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
+                Ok(Json(ApiResponse::success(WorkflowStats {
+                    total_runs: 0,
+                    success_count: 0,
+                    failure_count: 0,
+                    last_run_at: None,
+                    last_run_status: None,
+                    avg_duration_ms: None,
+                })))
+            } else {
+                error!("Failed to query workflow stats: {}", e);
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Failed to query workflow stats: {}", e))),
+                ))
+            }
+        }
+    }
+}
+
+/// Request body for running a sequence of workflows
+#[derive(Deserialize)]
+struct RunWorkflowSequenceRequest {
+    workflow_ids: Vec<String>,
+    #[serde(default = "default_stop_on_failure")]
+    stop_on_failure: bool,
+}
+
+fn default_stop_on_failure() -> bool {
+    true
+}
+
+/// Response for workflow sequence execution
+#[derive(Serialize)]
+struct WorkflowSequenceResponse {
+    task_run_id: String,
+    workflow_count: usize,
+    workflow_names: Vec<String>,
+}
+
+/// Run a sequence of unified workflows
+async fn run_workflow_sequence(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<RunWorkflowSequenceRequest>,
+) -> Result<Json<ApiResponse<WorkflowSequenceResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    if request.workflow_ids.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error("workflow_ids cannot be empty".to_string())),
+        ));
+    }
+
+    info!(
+        "Running workflow sequence: {} workflows, stop_on_failure={}",
+        request.workflow_ids.len(),
+        request.stop_on_failure
+    );
+
+    // Fetch all workflows and validate they exist
+    let mut workflows: Vec<crate::unified_workflows::UnifiedWorkflow> = Vec::new();
+    for id in &request.workflow_ids {
+        match state.app_state.checkpoint_db.get_unified_workflow(id) {
+            Ok(Some(w)) => workflows.push(w),
+            Ok(None) => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(api_error(format!("Workflow not found: {}", id))),
+                ));
+            }
+            Err(e) => {
+                error!("Failed to get workflow {}: {}", id, e);
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Failed to get workflow: {}", e))),
+                ));
+            }
+        }
+    }
+
+    let workflow_names: Vec<String> = workflows.iter().map(|w| w.name.clone()).collect();
+    let sequence_name = if workflows.len() == 1 {
+        workflows[0].name.clone()
+    } else {
+        format!(
+            "Sequence: {} + {} more",
+            workflows[0].name,
+            workflows.len() - 1
+        )
+    };
+
+    // Create a combined prompt describing the sequence
+    let sequence_description = workflows
+        .iter()
+        .enumerate()
+        .map(|(i, w)| format!("{}. {} - {}", i + 1, w.name, w.description))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let combined_prompt = format!(
+        "Execute the following workflow sequence{}:\n\n{}\n\nTotal workflows: {}",
+        if request.stop_on_failure {
+            " (stopping on first failure)"
+        } else {
+            ""
+        },
+        sequence_description,
+        workflows.len()
+    );
+
+    // Create a single task run for the sequence
+    let execution_id = format!(
+        "workflow-sequence-{}",
+        chrono::Utc::now().timestamp_millis()
+    );
+
+    // Build combined steps from all workflows
+    let mut all_steps: Vec<crate::step_executor::ExecutionStepConfig> = Vec::new();
+    let monitor_index = 0i32;
+
+    for (workflow_idx, workflow) in workflows.iter().enumerate() {
+        info!(
+            "Adding workflow {}/{}: {} ({} setup, {} verification, {} agentic, {} completion steps)",
+            workflow_idx + 1,
+            workflows.len(),
+            workflow.name,
+            workflow.setup_steps.len(),
+            workflow.verification_steps.len(),
+            workflow.agentic_steps.len(),
+            workflow.completion_steps.len()
+        );
+
+        // Helper to convert Value steps to ExecutionStepConfig (same as run_unified_workflow)
+        let convert_step = |step: &serde_json::Value,
+                            monitor: i32|
+         -> Option<crate::step_executor::ExecutionStepConfig> {
+            if let Ok(mut config) =
+                serde_json::from_value::<crate::step_executor::ExecutionStepConfig>(step.clone())
+            {
+                if config.monitor_index.is_none() {
+                    config.monitor_index = Some(monitor);
+                }
+                return Some(config);
+            }
+
+            let step_type = step.get("type").and_then(|t| t.as_str())?;
+            let name = step
+                .get("name")
+                .and_then(|n| n.as_str())
+                .map(|s| s.to_string());
+
+            Some(crate::step_executor::ExecutionStepConfig {
+                step_type: step_type.to_string(),
+                name,
+                monitor_index: Some(monitor),
+                ..Default::default()
+            })
+        };
+
+        // Add steps from each phase
+        for step in &workflow.setup_steps {
+            if let Some(mut config) = convert_step(step, monitor_index) {
+                config.phase = Some("setup".to_string());
+                all_steps.push(config);
+            }
+        }
+
+        for step in &workflow.verification_steps {
+            if let Some(mut config) = convert_step(step, monitor_index) {
+                config.phase = Some("verification".to_string());
+                all_steps.push(config);
+            }
+        }
+
+        for step in &workflow.agentic_steps {
+            if let Some(mut config) = convert_step(step, monitor_index) {
+                config.phase = Some("agentic".to_string());
+                all_steps.push(config);
+            }
+        }
+
+        for step in &workflow.completion_steps {
+            if let Some(mut config) = convert_step(step, monitor_index) {
+                config.phase = Some("completion".to_string());
+                all_steps.push(config);
+            }
+        }
+    }
+
+    // Create task run for tracking
+    let execution_steps_json = serde_json::to_string(&all_steps).ok();
+    let mut input = CreateTaskRunInput::new(&execution_id, &sequence_name)
+        .with_prompt(&combined_prompt)
+        .with_task_type("ai")
+        .with_workflow_name(workflow_names.join(", "))
+        .with_auto_continue(true)
+        .with_workflow_type("unified");
+    if let Some(esj) = execution_steps_json {
+        input = input.with_execution_steps_json(esj);
+    }
+    if let Err(e) = state.app_state.checkpoint_db.create_task_run(&input) {
+        warn!("Failed to create task_run for sequence: {}", e);
+    }
+
+    // Capture values for response before moving workflows into the async block
+    let workflow_count = workflows.len();
+    let workflow_names_response = workflow_names.clone();
+
+    // Spawn background task to execute workflow sequence with panic protection
+    let state_clone = state.clone();
+    let execution_id_clone = execution_id.clone();
+    let stop_on_failure = request.stop_on_failure;
+    let checkpoint_db_for_guard = state.app_state.checkpoint_db.clone();
+    let sequence_name_for_guard = format!("Workflow Sequence ({} workflows)", workflow_count);
+    let execution_id_for_guard = execution_id.clone();
+
+    // Use panic-safe spawning to ensure task is marked as failed if sequence panics
+    crate::unified_workflow_executor::spawn_sequence_with_panic_guard(
+        checkpoint_db_for_guard,
+        execution_id_for_guard,
+        sequence_name_for_guard,
+        async move {
+        info!(
+            "Starting workflow sequence execution: {} workflows",
+            workflow_count
+        );
+
+        let mut controller = crate::unified_workflow_executor::LoopController::new(
+            state_clone.app_state.clone(),
+            state_clone.config_storage.clone(),
+            state_clone.app_handle.clone(),
+            state_clone.current_ai_pids.clone(),
+        );
+
+        let mut all_results: Vec<crate::step_executor::StepExecutionResult> = Vec::new();
+        let mut sequence_success = true;
+        let mut failed_workflow: Option<String> = None;
+
+        for (idx, workflow) in workflows.iter().enumerate() {
+            info!(
+                "=== Executing workflow {}/{}: {} ===",
+                idx + 1,
+                workflow_count,
+                workflow.name
+            );
+
+            // Convert workflow steps to ExecutionStepConfig
+            let monitor_index = 0i32;
+            let convert_step = |step: &serde_json::Value,
+                                monitor: i32|
+             -> Option<crate::step_executor::ExecutionStepConfig> {
+                if let Ok(mut config) =
+                    serde_json::from_value::<crate::step_executor::ExecutionStepConfig>(step.clone())
+                {
+                    if config.monitor_index.is_none() {
+                        config.monitor_index = Some(monitor);
+                    }
+                    return Some(config);
+                }
+
+                let step_type = step.get("type").and_then(|t| t.as_str())?;
+                let name = step
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string());
+
+                Some(crate::step_executor::ExecutionStepConfig {
+                    step_type: step_type.to_string(),
+                    name,
+                    monitor_index: Some(monitor),
+                    ..Default::default()
+                })
+            };
+
+            // Collect all steps with phases
+            let mut workflow_steps: Vec<crate::step_executor::ExecutionStepConfig> = Vec::new();
+
+            for step in &workflow.setup_steps {
+                if let Some(mut config) = convert_step(step, monitor_index) {
+                    config.phase = Some("setup".to_string());
+                    workflow_steps.push(config);
+                }
+            }
+            for step in &workflow.verification_steps {
+                if let Some(mut config) = convert_step(step, monitor_index) {
+                    config.phase = Some("verification".to_string());
+                    workflow_steps.push(config);
+                }
+            }
+            for step in &workflow.agentic_steps {
+                if let Some(mut config) = convert_step(step, monitor_index) {
+                    config.phase = Some("agentic".to_string());
+                    workflow_steps.push(config);
+                }
+            }
+            for step in &workflow.completion_steps {
+                if let Some(mut config) = convert_step(step, monitor_index) {
+                    config.phase = Some("completion".to_string());
+                    workflow_steps.push(config);
+                }
+            }
+
+            // Separate automation from prompt steps
+            let (automation_steps, prompt_steps) =
+                categorize_steps(workflow_steps, |s| &s.step_type);
+
+            // Check if this is an AI workflow (has prompt steps)
+            let has_prompt_steps = !prompt_steps.is_empty();
+
+            if has_prompt_steps {
+                // Separate by phase
+                let setup_automation: Vec<_> = automation_steps
+                    .iter()
+                    .filter(|s| s.phase.as_deref() == Some("setup"))
+                    .cloned()
+                    .collect();
+                let setup_prompts: Vec<_> = prompt_steps
+                    .iter()
+                    .filter(|s| s.phase.as_deref() == Some("setup"))
+                    .cloned()
+                    .collect();
+                let verification: Vec<_> = automation_steps
+                    .iter()
+                    .filter(|s| s.phase.as_deref() == Some("verification"))
+                    .cloned()
+                    .collect();
+                let agentic: Vec<_> = prompt_steps
+                    .iter()
+                    .filter(|s| s.phase.as_deref() == Some("agentic"))
+                    .cloned()
+                    .collect();
+                let completion_automation: Vec<_> = automation_steps
+                    .iter()
+                    .filter(|s| s.phase.as_deref() == Some("completion"))
+                    .cloned()
+                    .collect();
+                let completion_prompts: Vec<_> = prompt_steps
+                    .iter()
+                    .filter(|s| s.phase.as_deref() == Some("completion"))
+                    .cloned()
+                    .collect();
+
+                // Build prompt content
+                let prompt_content = prompt_steps
+                    .iter()
+                    .filter_map(|s| s.prompt_content.as_ref())
+                    .map(|c| c.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n\n---\n\n");
+
+                // Create workflow-specific execution ID for internal tracking
+                // Note: We don't create a separate task_run row for each workflow in a sequence
+                // The parent sequence task_run is sufficient for tracking. Creating child task_runs
+                // caused duplicate entries to appear in the running tasks list.
+                let workflow_exec_id = format!(
+                    "{}-workflow-{}",
+                    execution_id_clone,
+                    idx + 1
+                );
+
+                let loop_config = crate::unified_workflow_executor::LoopConfig {
+                    max_iterations: workflow.max_iterations,
+                    timeout_seconds: workflow.timeout_seconds, // Use workflow setting
+                    base_prompt: prompt_content,
+                    workflow_name: workflow.name.clone(),
+                    workflow_id: workflow.id.clone(),
+                    execution_id: workflow_exec_id,
+                    targeted_error_ids: workflow.targeted_error_ids.clone(),
+                    starting_iteration: 0, // Fresh start
+                };
+
+                let result = controller
+                    .run(
+                        loop_config,
+                        setup_automation,
+                        setup_prompts,
+                        verification,
+                        agentic,
+                        completion_automation,
+                        completion_prompts,
+                    )
+                    .await;
+
+                all_results.extend(result.step_results);
+
+                if !result.success {
+                    sequence_success = false;
+                    failed_workflow = Some(workflow.name.clone());
+                    error!(
+                        "Workflow '{}' failed in sequence",
+                        workflow.name
+                    );
+
+                    if stop_on_failure {
+                        info!("Stopping sequence due to workflow failure (stop_on_failure=true)");
+                        break;
+                    }
+                } else {
+                    info!(
+                        "Workflow '{}' completed successfully",
+                        workflow.name
+                    );
+                }
+            } else {
+                // Automation-only workflow - use StepExecutor
+                let executor = crate::step_executor::StepExecutor::with_app_handle(
+                    state_clone.app_state.clone(),
+                    state_clone.config_storage.clone(),
+                    state_clone.app_handle.clone(),
+                );
+
+                let workflow_exec_id = format!(
+                    "{}-workflow-{}",
+                    execution_id_clone,
+                    idx + 1
+                );
+
+                let result = executor
+                    .execute_steps_with_log_sources(&automation_steps, &workflow_exec_id, &[])
+                    .await;
+
+                all_results.extend(result.steps);
+
+                if !result.success {
+                    sequence_success = false;
+                    failed_workflow = Some(workflow.name.clone());
+                    error!(
+                        "Automation workflow '{}' failed in sequence",
+                        workflow.name
+                    );
+
+                    if stop_on_failure {
+                        info!("Stopping sequence due to workflow failure (stop_on_failure=true)");
+                        break;
+                    }
+                } else {
+                    info!(
+                        "Automation workflow '{}' completed successfully",
+                        workflow.name
+                    );
+                }
+            }
+        }
+
+        // Update task_run status
+        if sequence_success {
+            info!("Workflow sequence completed successfully");
+            let _ = state_clone
+                .app_state
+                .checkpoint_db
+                .complete_task_run(&execution_id_clone);
+        } else {
+            let error_msg = match failed_workflow {
+                Some(name) => format!("Workflow '{}' failed", name),
+                None => "Sequence failed".to_string(),
+            };
+            error!("Workflow sequence failed: {}", error_msg);
+            let _ = state_clone
+                .app_state
+                .checkpoint_db
+                .fail_task_run(&execution_id_clone, &error_msg);
+        }
+        },
+    );
+
+    Ok(Json(ApiResponse::success(WorkflowSequenceResponse {
+        task_run_id: execution_id,
+        workflow_count,
+        workflow_names: workflow_names_response,
+    })))
 }
 
 // ============================================================================
@@ -19567,8 +18252,342 @@ async fn generate_checks_handler(
     Ok(Json(ApiResponse::success(result)))
 }
 
+/// Repair check-group associations based on naming convention
+///
+/// Checks are named with format "{group_name} - {tool_name}" (e.g., "multistate - Ruff Linting").
+/// This endpoint finds checks that match groups by this pattern and ensures they are linked.
+async fn repair_check_associations_handler(
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("Repairing check-group associations via MCP API");
+
+    let db = CheckpointDb::new().map_err(|e| {
+        error!("Failed to open database: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to open database: {}", e))),
+        )
+    })?;
+
+    match db.repair_check_group_associations() {
+        Ok(count) => {
+            let message = if count > 0 {
+                format!("Repaired {} check-group associations", count)
+            } else {
+                "All check-group associations are already correct".to_string()
+            };
+            info!("{}", message);
+            Ok(Json(ApiResponse::success(serde_json::json!({
+                "message": message,
+                "associations_created": count
+            }))))
+        }
+        Err(e) => {
+            error!("Failed to repair associations: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to repair associations: {}", e))),
+            ))
+        }
+    }
+}
+
 // ============================================================================
 // End Check Generation HTTP API Handlers
+// ============================================================================
+
+// ============================================================================
+// Recording & Playback HTTP API Handlers
+// ============================================================================
+
+use crate::recording::{
+    AddActionInput, CreateRecordingInput, ExportFormat, ExportOptions,
+    RecordedAction, Recording, RecordingStatus, RecordingStorage,
+    ScriptGenerator,
+};
+
+/// List all recordings
+async fn list_recordings_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<ApiResponse<Vec<Recording>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let storage = RecordingStorage::new(state.app_state.checkpoint_db.clone());
+
+    let status_filter = params
+        .get("status")
+        .and_then(|s| s.parse::<RecordingStatus>().ok());
+    let limit = params.get("limit").and_then(|l| l.parse::<i32>().ok());
+
+    match storage.list_recordings(status_filter, limit) {
+        Ok(recordings) => Ok(Json(ApiResponse::success(recordings))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to list recordings: {}", e))),
+        )),
+    }
+}
+
+/// Create a new recording
+async fn create_recording_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(input): Json<CreateRecordingInput>,
+) -> Result<Json<ApiResponse<Recording>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let storage = RecordingStorage::new(state.app_state.checkpoint_db.clone());
+
+    match storage.create_recording(input) {
+        Ok(recording) => {
+            info!("Created recording: {} ({})", recording.name, recording.id);
+            Ok(Json(ApiResponse::success(recording)))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to create recording: {}", e))),
+        )),
+    }
+}
+
+/// Get a specific recording
+async fn get_recording_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<Recording>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let storage = RecordingStorage::new(state.app_state.checkpoint_db.clone());
+
+    match storage.get_recording(&id) {
+        Ok(Some(recording)) => Ok(Json(ApiResponse::success(recording))),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Recording not found: {}", id))),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to get recording: {}", e))),
+        )),
+    }
+}
+
+/// Delete a recording
+async fn delete_recording_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Json<ApiResponse<()>> {
+    let storage = RecordingStorage::new(state.app_state.checkpoint_db.clone());
+
+    match storage.delete_recording(&id) {
+        Ok(()) => {
+            info!("Deleted recording: {}", id);
+            Json(ApiResponse::success(()))
+        }
+        Err(e) => Json(api_error(format!("Failed to delete recording: {}", e))),
+    }
+}
+
+/// Get actions for a recording
+async fn get_recording_actions_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<Vec<RecordedAction>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let storage = RecordingStorage::new(state.app_state.checkpoint_db.clone());
+
+    match storage.get_recording_actions(&id) {
+        Ok(actions) => Ok(Json(ApiResponse::success(actions))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to get recording actions: {}", e))),
+        )),
+    }
+}
+
+/// Add an action to a recording
+async fn add_recording_action_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Json(input): Json<AddActionInput>,
+) -> Result<Json<ApiResponse<RecordedAction>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let storage = RecordingStorage::new(state.app_state.checkpoint_db.clone());
+
+    // Verify recording exists and is in recording status
+    match storage.get_recording(&id) {
+        Ok(Some(recording)) => {
+            if recording.status != RecordingStatus::Recording {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(api_error(format!(
+                        "Cannot add actions to recording with status: {}",
+                        recording.status
+                    ))),
+                ));
+            }
+        }
+        Ok(None) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(api_error(format!("Recording not found: {}", id))),
+            ));
+        }
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to get recording: {}", e))),
+            ));
+        }
+    }
+
+    match storage.add_action(&id, input) {
+        Ok(action) => {
+            debug!("Added action to recording {}: {:?}", id, action.action_type);
+            Ok(Json(ApiResponse::success(action)))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to add action: {}", e))),
+        )),
+    }
+}
+
+/// Update recording status
+#[derive(Debug, Deserialize)]
+struct UpdateRecordingStatusInput {
+    status: RecordingStatus,
+}
+
+async fn update_recording_status_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Json(input): Json<UpdateRecordingStatusInput>,
+) -> Result<Json<ApiResponse<Recording>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let storage = RecordingStorage::new(state.app_state.checkpoint_db.clone());
+
+    match storage.update_recording_status(&id, input.status) {
+        Ok(recording) => {
+            info!("Updated recording {} status to: {}", id, input.status);
+            Ok(Json(ApiResponse::success(recording)))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to update recording status: {}", e))),
+        )),
+    }
+}
+
+/// Export a recording to script
+async fn export_recording_handler(
+    State(state): State<Arc<ApiState>>,
+    Path((id, format)): Path<(String, String)>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let storage = RecordingStorage::new(state.app_state.checkpoint_db.clone());
+
+    // Parse export format
+    let export_format: ExportFormat = format.parse().map_err(|e: String| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!("Invalid export format: {}", e))),
+        )
+    })?;
+
+    // Get recording
+    let recording = storage
+        .get_recording(&id)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to get recording: {}", e))),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(api_error(format!("Recording not found: {}", id))),
+            )
+        })?;
+
+    // Get actions
+    let actions = storage.get_recording_actions(&id).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to get actions: {}", e))),
+        )
+    })?;
+
+    // Build export options from query params
+    let options = ExportOptions {
+        wait_strategy: params
+            .get("wait_strategy")
+            .cloned()
+            .unwrap_or_else(|| "networkidle".to_string()),
+        fixed_wait_ms: params
+            .get("fixed_wait_ms")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000),
+        selector_priority: params
+            .get("selector_priority")
+            .map(|s| s.split(',').map(|p| p.trim().to_string()).collect())
+            .unwrap_or_else(|| vec!["ui_id".to_string(), "css".to_string(), "xpath".to_string()]),
+        include_visibility_assertions: params
+            .get("include_visibility_assertions")
+            .map(|s| s == "true")
+            .unwrap_or(false),
+        include_timing_assertions: params
+            .get("include_timing_assertions")
+            .map(|s| s == "true")
+            .unwrap_or(false),
+        test_name: params.get("test_name").cloned(),
+        test_description: params.get("test_description").cloned(),
+    };
+
+    // Generate script
+    let script_content =
+        ScriptGenerator::generate(&recording, &actions, export_format, &options).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to generate script: {}", e))),
+            )
+        })?;
+
+    let file_name = ScriptGenerator::default_file_name(&recording, export_format);
+
+    // Save export record
+    let export = storage
+        .save_export(&id, export_format, &script_content, &file_name, Some(&options))
+        .map_err(|e| {
+            warn!("Failed to save export record: {}", e);
+            // Continue even if save fails
+        })
+        .ok();
+
+    info!(
+        "Exported recording {} to {} format",
+        id,
+        export_format
+    );
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "recording_id": id,
+        "format": export_format.to_string(),
+        "file_name": file_name,
+        "script_content": script_content,
+        "export_id": export.map(|e| e.id),
+    }))))
+}
+
+/// Get exports for a recording
+async fn get_recording_exports_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<Vec<crate::recording::RecordingExport>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let storage = RecordingStorage::new(state.app_state.checkpoint_db.clone());
+
+    match storage.get_recording_exports(&id) {
+        Ok(exports) => Ok(Json(ApiResponse::success(exports))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to get recording exports: {}", e))),
+        )),
+    }
+}
+
+// ============================================================================
+// End Recording & Playback HTTP API Handlers
 // ============================================================================
 
 /// Create the API router
@@ -19584,12 +18603,6 @@ pub fn create_router(
 
     // Ensure dev_logs directory exists
     let _ = std::fs::create_dir_all(&dev_logs_path);
-
-    // Create database and task monitor
-    let db = Arc::new(
-        CheckpointDb::new().expect("Failed to initialize checkpoint database for task monitoring"),
-    );
-    let task_monitor = Arc::new(TaskMonitor::new(db));
 
     // Initialize config storage (graceful degradation if directory creation fails)
     let config_storage = match ConfigStorage::new() {
@@ -19616,8 +18629,6 @@ pub fn create_router(
         app_state,
         rag_state,
         app_handle: app_handle.clone(),
-        session: Arc::new(SessionManager::new(dev_logs_path)),
-        task_monitor,
         current_config_id: std::sync::Mutex::new(None),
         config_storage,
         action_service,
@@ -19642,7 +18653,7 @@ pub fn create_router(
 
         // We need to use tauri's listen which returns a sync result
         // The listener callback will be called on the main thread
-        use tauri::Emitter;
+        
         use tauri::Listener;
 
         let pending_for_listener = pending.clone();
@@ -19670,41 +18681,17 @@ pub fn create_router(
         info!("UI Bridge: Response listener set up");
     }
 
-    // Restore persisted session state on startup
-    let state_for_restore = api_state.clone();
+    // Resume interrupted unified workflows on startup
+    let state_for_resume = api_state.clone();
+    let resume_config_storage = api_state.config_storage.clone();
+    let resume_pid_tracker = api_state.current_ai_pids.clone();
     tokio::spawn(async move {
         // Small delay to let the server fully start
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-        // Restore unified session manager state
-        if let Err(e) = state_for_restore.session.restore_state().await {
-            warn!("Failed to restore session state: {}", e);
-        } else {
-            let sessions = state_for_restore.session.list_sessions().await;
-            let active_count = sessions
-                .iter()
-                .filter(|s| {
-                    matches!(
-                        s.status,
-                        crate::session::SessionStatus::Running
-                            | crate::session::SessionStatus::WaitingForContinuation
-                    )
-                })
-                .count();
-            if active_count > 0 {
-                info!(
-                    "Restored {} session(s), {} active",
-                    sessions.len(),
-                    active_count
-                );
-            }
-        }
-
-        // Resume running tasks from database after runner restart
-        // Simple, clean system: query task_runs WHERE status = 'running'
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-
-        let global_auto_continue = settings::get_auto_continue_ai_workflow();
+        // Note: We no longer use global_auto_continue here.
+        // Each workflow's per-task auto_continue setting determines whether it gets resumed.
+        // The global setting is now only used for the UI toggle, not startup resume logic.
 
         // Log to debug file
         if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -19715,19 +18702,29 @@ pub fn create_router(
             use std::io::Write;
             let _ = writeln!(
                 f,
-                "[{}] STARTUP_RESUME_CHECK: global_auto_continue={}",
-                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
-                global_auto_continue
+                "[{}] STARTUP_RESUME_CHECK: Processing interrupted workflows (per-task auto_continue)",
+                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
             );
         }
 
-        if global_auto_continue {
-            let resumed = resume_all_running_tasks_on_startup(state_for_restore).await;
-            if resumed > 0 {
-                info!("Resumed {} running task(s) from database", resumed);
-            }
-        } else {
-            info!("Global auto-continue is disabled, skipping task resume");
+        // Process interrupted workflows - each workflow's per-task auto_continue setting
+        // determines whether it gets resumed or marked as failed
+        let resume_config = crate::unified_workflow_executor::ResumeConfig {
+            resume_enabled: true, // Let the function check per-task auto_continue
+        };
+
+        let count = crate::unified_workflow_executor::resume_interrupted_workflows(
+            state_for_resume.app_state.checkpoint_db.clone(),
+            state_for_resume.app_state.clone(),
+            resume_config_storage,
+            state_for_resume.app_handle.clone(),
+            resume_pid_tracker,
+            resume_config,
+        )
+        .await;
+
+        if count > 0 {
+            info!("Processed {} interrupted unified workflow(s) on startup", count);
         }
     });
 
@@ -19748,6 +18745,16 @@ pub fn create_router(
         .route("/extension/status", get(get_extension_status))
         .route("/extension/command", post(send_extension_command_handler))
         .route("/health", get(health))
+        // Bridge management endpoints (multi-bridge support)
+        .route("/bridges", get(list_bridges).post(create_bridge))
+        .route("/bridges/:bridge_id", get(get_bridge).delete(remove_bridge))
+        .route("/bridges/:bridge_id/workflow", post(run_bridge_workflow))
+        .route("/gui-lock", get(get_gui_lock))
+        // Headless-only mode configuration (for server deployments)
+        .route(
+            "/config/headless-only",
+            get(get_headless_only).post(set_headless_only),
+        )
         // Debug endpoints for AI sessions
         .route("/debug/app/errors", get(get_debug_errors))
         .route("/findings/summary", get(get_findings_summary))
@@ -19769,6 +18776,7 @@ pub fn create_router(
         .route("/go-to-state", post(go_to_state))
         // Web extraction routes
         .route("/extraction/start", post(start_web_extraction))
+        .route("/extraction/vision", post(start_vision_extraction))
         .route("/extraction/stop", post(stop_web_extraction))
         .route("/extraction/status", get(get_extraction_status))
         .route("/extraction/stats", post(update_extraction_stats))
@@ -19869,11 +18877,6 @@ pub fn create_router(
             get(get_macro).put(update_macro).delete(delete_macro),
         )
         .route("/macros/:id/run", post(run_macro))
-        // Unified Session routes (replaces workflows and ai-developer)
-        .route("/sessions", get(list_sessions))
-        .route("/sessions/start", post(start_session))
-        .route("/sessions/:id", get(get_session).delete(delete_session))
-        .route("/sessions/:id/stop", post(stop_session))
         // Playwright Script Library routes
         .route("/playwright/scripts", get(list_playwright_scripts))
         .route("/playwright/scripts", post(create_playwright_script))
@@ -19906,12 +18909,6 @@ pub fn create_router(
         .route("/scriptlets/:id", delete(delete_scriptlet))
         // Inline Python execution
         .route("/execute-python", post(execute_inline_python))
-        // Agent spawning
-        .route("/spawn-sub-agent", post(spawn_sub_agent))
-        // Workflow resume routes
-        .route("/workflow/resumable", get(get_resumable_workflow))
-        .route("/workflow/resume", post(resume_workflow))
-        .route("/workflow/force-continue", post(force_continue_session))
         // Auto-continue setting routes (global) - combined GET and POST on same route
         .route(
             "/workflow/auto-continue",
@@ -19939,11 +18936,15 @@ pub fn create_router(
         .route("/task-runs/running", get(list_running_task_runs))
         .route("/task-runs/:id", get(get_task_run).delete(delete_task_run))
         .route("/task-runs/:id/output", get(get_task_output))
+        .route("/task-runs/:id/workflow-state", get(get_workflow_state))
+        .route("/task-runs/:id/orchestrator-state", get(get_workflow_state)) // Alias for backward compatibility
+        .route("/task-runs/:id/full-state", get(get_full_workflow_state)) // Full state for restart recovery
         .route("/task-runs/:id/stop", post(stop_task_run))
         .route(
             "/task-runs/:id/auto-continue",
             get(get_task_auto_continue).put(set_task_auto_continue),
         )
+        .route("/task-runs/:id/resume", post(resume_task_run))
         .route(
             "/task-runs/:id/generate-summary",
             post(generate_task_summary),
@@ -19955,7 +18956,15 @@ pub fn create_router(
             "/task-runs/:id/playwright-results",
             get(get_task_run_playwright_results),
         )
+        // Execution spans (tracing data for performance analysis)
+        .route("/execution-spans", get(get_execution_spans))
         .route("/task-runs/:id/migrate-logs", post(migrate_task_run_logs))
+        // Step checkpoint routes (for dashboard progress display)
+        .route("/task-runs/:id/checkpoints", get(get_task_run_checkpoints))
+        .route(
+            "/task-runs/:id/steps/:checkpoint_id/progress",
+            get(get_step_progress_markers),
+        )
         // Current execution steps (for dashboard widgets - no task ID needed)
         .route("/current-execution/steps", get(get_current_execution_steps))
         // Automation Run routes (for MCP/AI access to task_run_automation)
@@ -20078,6 +19087,18 @@ pub fn create_router(
             post(generate_unified_workflow_handler),
         )
         .route("/unified-workflows/:id/run", post(run_unified_workflow))
+        .route(
+            "/unified-workflows/execute-inline",
+            post(execute_inline_workflow),
+        )
+        .route(
+            "/unified-workflows/:id/stats",
+            get(get_unified_workflow_stats),
+        )
+        .route(
+            "/unified-workflows/run-sequence",
+            post(run_workflow_sequence),
+        )
         // AWAS (Application Web Automation Specification) routes
         .route("/awas/discover", post(awas_discover))
         .route("/awas/execute", post(awas_execute))
@@ -20087,6 +19108,8 @@ pub fn create_router(
         // Check generation routes (AI-assisted check configuration)
         .route("/checks/scan-workspace", post(scan_workspace_handler))
         .route("/checks/generate", post(generate_checks_handler))
+        // Check database integrity/repair routes
+        .route("/checks/repair-associations", post(repair_check_associations_handler))
         // Render logging routes (for UI testing)
         .route(
             "/render-log",
@@ -20144,6 +19167,26 @@ pub fn create_router(
             "/ui-bridge/discover-states",
             post(discover_states_from_renders),
         )
+        // Recording & Playback routes (browser interaction recording for script generation)
+        .route("/recordings", get(list_recordings_handler).post(create_recording_handler))
+        .route("/recordings/:id", get(get_recording_handler).delete(delete_recording_handler))
+        .route("/recordings/:id/actions", get(get_recording_actions_handler).post(add_recording_action_handler))
+        .route("/recordings/:id/status", put(update_recording_status_handler))
+        .route("/recordings/:id/export/:format", get(export_recording_handler))
+        .route("/recordings/:id/exports", get(get_recording_exports_handler))
+        // Error Monitor endpoints (application log error detection for debug agent)
+        .route("/error-monitor/errors", get(get_error_monitor_errors))
+        .route("/error-monitor/summary", get(get_error_monitor_summary))
+        .route("/error-monitor/debug-context", get(get_error_debug_context))
+        .route(
+            "/error-monitor/errors/:id/resolve",
+            post(resolve_error_monitor_error),
+        )
+        .route(
+            "/error-monitor/errors/:id/acknowledge",
+            post(acknowledge_error_monitor_error),
+        )
+        .route("/error-monitor/fix-workflow", post(generate_fix_workflow))
         .layer(cors)
         // Allow up to 100MB request bodies for configs with embedded images
         .layer(RequestBodyLimitLayer::new(100 * 1024 * 1024))

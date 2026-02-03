@@ -7,6 +7,8 @@
 //! - Memory compression operations
 //! - Lifecycle hook executions
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 use tracing::{debug, info};

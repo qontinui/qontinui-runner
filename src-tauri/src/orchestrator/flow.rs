@@ -18,6 +18,8 @@
 //! let flow = Flow::new("code_review_flow")
 //!     .add_step(FlowStep::agent("analyze", "code_reviewer", "Review the code"))
 //!     .add_step(FlowStep::conditional("has_issues",
+
+#![allow(dead_code)]
 //!         Condition::output_equals("analyze.issues_count", 0),
 //!         "complete",
 //!         "fix_issues"

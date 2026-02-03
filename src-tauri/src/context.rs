@@ -11,6 +11,8 @@
 //! The core Context type matches qontinui-schemas. Runner-specific fields
 //! (scope, enabled, usage stats) are stored separately in ContextMetadata.
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -1130,6 +1132,20 @@ If you need data NOT in the bundle (rare):
             content: r#"## Multi-Step Task Guide
 
 You are a **Worker Agent** running in the qontinui-runner orchestrator system.
+
+## ⚠️ AUTONOMOUS EXECUTION - NO USER INTERACTION
+
+You are running **autonomously**. There is NO user monitoring this session in real-time.
+
+**DO NOT ask questions expecting a response:**
+- ❌ "Should I delete this file?"
+- ❌ "Which approach do you prefer?"
+
+**Instead, make reasonable decisions and document them as findings:**
+- ✅ `[FINDING:needs_review] Found orphaned file X.tmp - left for user review`
+- ✅ `[FINDING:decision] Chose approach A because [reason]`
+
+The user will review all findings after the workflow completes.
 
 ## ⚠️ CRITICAL: WORKER AGENTS CANNOT MARK TASKS COMPLETE
 

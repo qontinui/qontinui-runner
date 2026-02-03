@@ -5,9 +5,12 @@
 //!
 //! Inspired by n8n's execution context propagation pattern.
 
+#![allow(dead_code)]
+
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use tracing::{debug, warn};
 
 // ============================================================================
@@ -111,6 +114,92 @@ impl RuntimeContext {
     /// Deserialize context from JSON.
     pub fn from_json(json: &str) -> Result<Self, String> {
         serde_json::from_str(json).map_err(|e| format!("Failed to deserialize context: {}", e))
+    }
+
+    /// Import variables from API request execution.
+    ///
+    /// Converts string values to JSON values and adds them to the context.
+    pub fn import_api_variables(&mut self, variables: &std::collections::HashMap<String, String>) {
+        for (name, value) in variables {
+            // Try to parse as JSON, fall back to string
+            let json_value = serde_json::from_str(value)
+                .unwrap_or_else(|_| serde_json::Value::String(value.clone()));
+            self.set_variable(name, json_value);
+        }
+    }
+
+    /// Export variables for use in API requests.
+    ///
+    /// Converts JSON values to strings for the VariableResolver.
+    pub fn export_for_api(&self) -> std::collections::HashMap<String, String> {
+        self.variables
+            .iter()
+            .map(|(name, value)| {
+                let str_value = match value {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    serde_json::Value::Bool(b) => b.to_string(),
+                    serde_json::Value::Null => "null".to_string(),
+                    // For objects/arrays, serialize to JSON string
+                    other => serde_json::to_string(other).unwrap_or_default(),
+                };
+                (name.clone(), str_value)
+            })
+            .collect()
+    }
+}
+
+// ============================================================================
+// Shared Variable Store
+// ============================================================================
+
+/// A thread-safe, clone-friendly variable store for sharing variables between steps.
+///
+/// This enables API request chaining where response data from one request
+/// can be stored and used in subsequent requests via `{{variable_name}}` syntax.
+#[derive(Debug, Clone, Default)]
+pub struct SharedVariableStore {
+    variables: Arc<RwLock<HashMap<String, String>>>,
+}
+
+impl SharedVariableStore {
+    /// Create a new empty variable store.
+    pub fn new() -> Self {
+        Self {
+            variables: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Set a variable in the store.
+    pub fn set(&self, name: &str, value: String) {
+        if let Ok(mut vars) = self.variables.write() {
+            debug!("Setting shared variable: {} = {} chars", name, value.len());
+            vars.insert(name.to_string(), value);
+        }
+    }
+
+    /// Get a variable from the store.
+    pub fn get(&self, name: &str) -> Option<String> {
+        self.variables.read().ok()?.get(name).cloned()
+    }
+
+    /// Get all variables as a HashMap.
+    pub fn get_all(&self) -> HashMap<String, String> {
+        self.variables.read().ok().map(|v| v.clone()).unwrap_or_default()
+    }
+
+    /// Check if a variable exists.
+    pub fn contains(&self, name: &str) -> bool {
+        self.variables.read().ok()
+            .map(|v| v.contains_key(name))
+            .unwrap_or(false)
+    }
+
+    /// Clear all variables.
+    pub fn clear(&self) {
+        if let Ok(mut vars) = self.variables.write() {
+            vars.clear();
+        }
     }
 }
 
@@ -232,8 +321,8 @@ impl ExpressionEvaluator {
             return None;
         }
 
-        if expression.starts_with("$previous.") {
-            let field_path = &expression[10..]; // Skip "$previous."
+        if let Some(field_path) = expression.strip_prefix("$previous.") {
+            // Skip "$previous."
             if let Some(prev) = context.get_previous_output() {
                 return self.extract_field(&prev.output, field_path);
             }
@@ -490,5 +579,43 @@ RESULT: all tests passed
             variables.get("RESULT"),
             Some(&serde_json::Value::String("all tests passed".to_string()))
         );
+    }
+
+    #[test]
+    fn test_import_api_variables() {
+        let mut context = RuntimeContext::new();
+
+        let mut api_vars = std::collections::HashMap::new();
+        api_vars.insert("token".to_string(), "abc123".to_string());
+        api_vars.insert("count".to_string(), "42".to_string());
+        api_vars.insert("obj".to_string(), r#"{"key":"value"}"#.to_string());
+
+        context.import_api_variables(&api_vars);
+
+        assert_eq!(
+            context.get_variable("token"),
+            Some(&serde_json::Value::String("abc123".to_string()))
+        );
+        // "42" as a standalone string gets parsed as a number
+        assert_eq!(context.get_variable("count"), Some(&serde_json::json!(42)));
+        // JSON object gets parsed
+        assert_eq!(
+            context.get_variable("obj"),
+            Some(&serde_json::json!({"key": "value"}))
+        );
+    }
+
+    #[test]
+    fn test_export_for_api() {
+        let mut context = RuntimeContext::new();
+        context.set_variable("name", serde_json::Value::String("Alice".to_string()));
+        context.set_variable("count", serde_json::json!(42));
+        context.set_variable("active", serde_json::json!(true));
+
+        let exported = context.export_for_api();
+
+        assert_eq!(exported.get("name"), Some(&"Alice".to_string()));
+        assert_eq!(exported.get("count"), Some(&"42".to_string()));
+        assert_eq!(exported.get("active"), Some(&"true".to_string()));
     }
 }

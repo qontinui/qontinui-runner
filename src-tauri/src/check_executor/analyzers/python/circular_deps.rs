@@ -3,6 +3,8 @@
 //! Detects circular imports in Python code using tree-sitter for parsing.
 //! Uses Tarjan's algorithm for finding strongly connected components (SCCs).
 
+#![allow(dead_code)]
+
 use crate::check_executor::analyzers::common::file_walker::{walk_files, WalkConfig};
 use crate::check_executor::analyzers::common::issue_builder::IssueBuilder;
 use crate::check_executor::output_parser::ParsedOutput;
@@ -302,22 +304,18 @@ fn extract_from_import(
     // Count leading dots for relative imports
     let mut relative_level = 0u32;
     let mut module_name: Option<String> = None;
+    let mut imported_names: Vec<String> = Vec::new();
 
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        match child.kind() {
-            "import_prefix" => {
-                // Count dots
-                let prefix_text = &source[child.byte_range()];
-                relative_level = prefix_text.chars().filter(|c| *c == '.').count() as u32;
-            }
+    // Try to get module_name field first (tree-sitter-python field name)
+    if let Some(module_node) = node.child_by_field_name("module_name") {
+        match module_node.kind() {
             "dotted_name" => {
-                module_name = Some(source[child.byte_range()].to_string());
+                module_name = Some(source[module_node.byte_range()].to_string());
             }
             "relative_import" => {
                 // Handle relative imports
-                let mut inner_cursor = child.walk();
-                for inner_child in child.children(&mut inner_cursor) {
+                let mut inner_cursor = module_node.walk();
+                for inner_child in module_node.children(&mut inner_cursor) {
                     match inner_child.kind() {
                         "import_prefix" => {
                             let prefix_text = &source[inner_child.byte_range()];
@@ -335,22 +333,127 @@ fn extract_from_import(
         }
     }
 
+    // Fallback: walk children if field name approach didn't work
+    if module_name.is_none() && relative_level == 0 {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "import_prefix" => {
+                    // Count dots
+                    let prefix_text = &source[child.byte_range()];
+                    relative_level = prefix_text.chars().filter(|c| *c == '.').count() as u32;
+                }
+                "dotted_name" => {
+                    module_name = Some(source[child.byte_range()].to_string());
+                }
+                "relative_import" => {
+                    // Handle relative imports
+                    let mut inner_cursor = child.walk();
+                    for inner_child in child.children(&mut inner_cursor) {
+                        match inner_child.kind() {
+                            "import_prefix" => {
+                                let prefix_text = &source[inner_child.byte_range()];
+                                relative_level =
+                                    prefix_text.chars().filter(|c| *c == '.').count() as u32;
+                            }
+                            "dotted_name" => {
+                                module_name = Some(source[inner_child.byte_range()].to_string());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Extract the names being imported (for "from X import a, b, c")
+    // Walk through all children to find imported names
+    let mut cursor = node.walk();
+    let mut past_module = false;
+
+    for child in node.children(&mut cursor) {
+        let kind = child.kind();
+
+        // Skip keywords
+        if kind == "from" || kind == "import" || kind == "," {
+            if kind == "import" {
+                past_module = true;  // Everything after "import" is an imported name
+            }
+            continue;
+        }
+
+        // The module specification is the first dotted_name or relative_import
+        if (kind == "dotted_name" || kind == "relative_import") && !past_module {
+            past_module = true;
+            continue;
+        }
+
+        // After the module, collect imported names
+        if past_module {
+            match kind {
+                "aliased_import" => {
+                    if let Some(name_node) = child.child_by_field_name("name") {
+                        let name = source[name_node.byte_range()].to_string();
+                        if !imported_names.contains(&name) {
+                            imported_names.push(name);
+                        }
+                    }
+                }
+                "dotted_name" | "identifier" => {
+                    let name = source[child.byte_range()].to_string();
+                    if !imported_names.contains(&name) {
+                        imported_names.push(name);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     let is_relative = relative_level > 0;
 
-    // Resolve relative import to absolute module path
-    let resolved_module = if is_relative {
+    // Resolve base module path
+    let base_module = if is_relative {
         resolve_relative_import(root, current_file, relative_level, module_name.as_deref())
     } else {
-        module_name.unwrap_or_default()
+        module_name.clone().unwrap_or_default()
     };
 
-    if !resolved_module.is_empty() {
+    // For "from X import Y", add both X and X.Y as potential dependencies
+    // This handles cases where Y might be a submodule
+    if !base_module.is_empty() {
         imports.push(ImportInfo {
-            module: resolved_module,
+            module: base_module.clone(),
             line,
             is_relative,
             relative_level,
         });
+
+        // Also add X.Y for each imported name (they might be submodules)
+        for name in &imported_names {
+            let submodule = format!("{}.{}", base_module, name);
+            imports.push(ImportInfo {
+                module: submodule,
+                line,
+                is_relative,
+                relative_level,
+            });
+        }
+    } else if !imported_names.is_empty() && is_relative {
+        // For "from . import X", the imported name IS the module
+        for name in &imported_names {
+            let resolved = resolve_relative_import(root, current_file, relative_level, Some(name));
+            if !resolved.is_empty() {
+                imports.push(ImportInfo {
+                    module: resolved,
+                    line,
+                    is_relative,
+                    relative_level,
+                });
+            }
+        }
     }
 }
 
@@ -361,12 +464,16 @@ fn resolve_relative_import(
     level: u32,
     module_name: Option<&str>,
 ) -> String {
-    // Get the current file's directory
+    // Get the current file's directory (this is the current package)
     let current_dir = current_file.parent().unwrap_or(current_file);
 
-    // Navigate up `level` directories
+    // Navigate up (level - 1) directories
+    // In Python:
+    //   . (level=1) = current package (don't go up)
+    //   .. (level=2) = parent package (go up 1 dir)
+    //   ... (level=3) = grandparent package (go up 2 dirs)
     let mut target_dir = current_dir;
-    for _ in 0..level {
+    for _ in 1..level {
         target_dir = target_dir.parent().unwrap_or(target_dir);
     }
 
@@ -394,20 +501,21 @@ fn module_matches_import(module: &ModulePath, import: &ImportInfo, _root: &Path)
     let module_str = module.as_str();
     let import_module = &import.module;
 
-    // Direct match
+    // Direct match - importing exactly this module
     if module_str == import_module {
         return true;
     }
 
-    // Check if import is a prefix (importing a submodule)
+    // Check if import references a submodule of this module
+    // e.g., module="pkg" matches import="pkg.submodule"
+    // This creates a dependency because importing pkg.submodule requires loading pkg
     if import_module.starts_with(&format!("{}.", module_str)) {
         return true;
     }
 
-    // Check if module starts with import (importing from parent package)
-    if module_str.starts_with(&format!("{}.", import_module)) {
-        return true;
-    }
+    // NOTE: We removed the check for module.starts_with(import) because:
+    // If you import "pkg", you depend on "pkg", NOT on "pkg.module_a"
+    // That check was causing false positives in cycle detection
 
     false
 }
@@ -459,12 +567,31 @@ fn build_adjacency_list(
         let mut edges = Vec::new();
 
         for import in &node.imports {
-            // Find which module this import refers to
+            // Find the best matching module for this import
+            // Prefer exact matches over prefix matches
+            let mut best_match: Option<&ModulePath> = None;
+            let mut best_is_exact = false;
+
             for target_module in module_to_file.keys() {
-                if module_matches_import(target_module, import, root) {
-                    edges.push(target_module.clone());
-                    break;
+                let target_str = target_module.as_str();
+                let import_str = &import.module;
+
+                // Check for exact match
+                if target_str == import_str {
+                    best_match = Some(target_module);
+                    best_is_exact = true;
+                    break; // Exact match is the best possible
                 }
+
+                // Check for prefix match (importing a submodule depends on the parent)
+                if !best_is_exact && import_str.starts_with(&format!("{}.", target_str)) {
+                    best_match = Some(target_module);
+                    // Don't break - keep looking for an exact match
+                }
+            }
+
+            if let Some(target) = best_match {
+                edges.push(target.clone());
             }
         }
 

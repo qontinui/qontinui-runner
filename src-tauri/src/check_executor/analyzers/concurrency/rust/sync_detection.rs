@@ -2,6 +2,8 @@
 //!
 //! Detects Mutex, RwLock, and other synchronization primitives.
 
+#![allow(dead_code)]
+
 use crate::check_executor::analyzers::concurrency::types::{AnalysisContext, LockInfo, LockType};
 use syn::{File, Item, ItemStruct};
 

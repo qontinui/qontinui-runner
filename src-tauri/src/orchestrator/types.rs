@@ -3,6 +3,8 @@
 //! These types define the structure of verification plans, success criteria,
 //! and the data exchanged between agents.
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 
 /// A success criterion that must be met for task completion.

@@ -11,6 +11,7 @@
 //! # Module Structure
 //!
 //! - `types` - Core types (TestDefinition, TestResult, TestStatus)
+//! - `diagnostics` - Timeout diagnostic information collection
 //! - `playwright_runner` - Playwright CDP test execution
 //! - `python_runner` - Python verification script execution
 //! - `repo_test_runner` - Repository test execution and result parsing
@@ -32,6 +33,7 @@
 //! println!("Test passed: {}", result.status == TestStatus::Passed);
 //! ```
 
+pub mod diagnostics;
 mod types;
 
 pub mod playwright_runner;

@@ -6,7 +6,9 @@ use std::collections::HashMap;
 /// HTTP methods for API requests
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
+#[derive(Default)]
 pub enum HttpMethod {
+    #[default]
     Get,
     Post,
     Put,
@@ -14,11 +16,6 @@ pub enum HttpMethod {
     Delete,
 }
 
-impl Default for HttpMethod {
-    fn default() -> Self {
-        HttpMethod::Get
-    }
-}
 
 impl From<HttpMethod> for reqwest::Method {
     fn from(method: HttpMethod) -> Self {
@@ -102,7 +99,7 @@ impl Default for ApiRequestConfig {
             headers: None,
             body: None,
             content_type: None,
-            timeout_ms: Some(30000),
+            timeout_ms: None, // No timeout by default
             follow_redirects: Some(true),
             credential_id: None,
             extractions: None,

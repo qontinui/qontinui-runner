@@ -21,6 +21,8 @@
 //!     .with_timeout(Duration::from_secs(300));
 //! ```
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;

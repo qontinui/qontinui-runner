@@ -26,6 +26,8 @@
 //! engine.emit_event(event);
 //! ```
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;
@@ -621,15 +623,12 @@ impl OrchestratorLayer for ExecutionLimitsLayer {
     }
 
     fn on_command(&self, command: &OrchestratorCommand, state: &LayerState) -> bool {
-        match command {
-            OrchestratorCommand::ExtendIterations { additional } => {
-                let new_max = state.iteration + additional;
-                if new_max > 100 {
-                    warn!("Cannot extend beyond 100 iterations");
-                    return false;
-                }
+        if let OrchestratorCommand::ExtendIterations { additional } = command {
+            let new_max = state.iteration + additional;
+            if new_max > 100 {
+                warn!("Cannot extend beyond 100 iterations");
+                return false;
             }
-            _ => {}
         }
         true
     }

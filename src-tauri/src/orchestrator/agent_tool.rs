@@ -24,6 +24,8 @@
 //!     .with_input("file_path", json!("src/auth.rs"));
 //! ```
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

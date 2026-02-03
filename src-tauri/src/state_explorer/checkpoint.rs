@@ -19,6 +19,8 @@
 //! - After runner restart
 //! - For debugging purposes
 
+#![allow(dead_code)]
+
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -372,7 +374,7 @@ impl CheckpointManager {
         // Store in memory
         self.checkpoints
             .entry(run_id)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(checkpoint.clone());
 
         Ok(checkpoint)
@@ -384,7 +386,7 @@ impl CheckpointManager {
             checkpoints
                 .iter()
                 .filter(|c| c.status == CheckpointStatus::Active)
-                .last()
+                .next_back()
         })
     }
 

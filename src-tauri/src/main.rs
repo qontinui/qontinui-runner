@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod action_service;
+mod ai_pricing;
 mod ai_provider;
 mod ai_router;
 mod ai_workflows;
@@ -12,6 +13,7 @@ mod check_executor;
 mod check_generation;
 mod commands;
 mod config;
+mod config_facade;
 mod config_storage;
 mod context;
 mod database;
@@ -19,7 +21,11 @@ mod debug_lifecycle;
 mod discoveries;
 mod display;
 mod dom_capture;
+mod error_monitor; // Must be declared before error (error re-exports ErrorSeverity from error_monitor)
 mod error;
+mod event_system;
+mod execution_context;
+mod execution_core;
 mod executor;
 mod findings;
 mod health_monitor;
@@ -37,37 +43,42 @@ mod paths;
 mod playwright;
 mod prompts;
 mod rag;
+mod recording;
+mod runtime_env;
 mod safe_lock;
 mod saved_api_requests;
 mod scheduler;
 mod scheduler_service;
 mod scriptlets;
 mod secure_storage;
-mod session;
 mod settings;
 mod state_explorer;
 mod step_event_builder;
 mod step_executor;
 mod step_metadata;
+mod step_registry;
 mod step_types;
 mod steps;
 mod storage;
 mod summary_generator;
-mod task_monitor;
 mod task_recorder;
 mod test_executor;
 mod test_orchestrator;
 mod tiered_info;
+mod timeout_config;
+mod tracing_layers;
+mod unified_ai_session;
 mod unified_workflow_executor;
 mod unified_workflows;
 mod video_recorder;
 mod workflow_generation;
-mod workflow_monitor;
+mod workflow_state;
 
 use commands::AppState;
 use database::CheckpointDb;
 use display::profiles::ActionLogProfile;
 use display::DisplayProcessor;
+use error_monitor::{start_error_monitor_async, ErrorMonitorConfig};
 use logging::{init_logging, setup_panic_handler, LoggingConfig};
 use std::sync::{Arc, Mutex};
 use storage::LocalStorage;
@@ -102,7 +113,7 @@ fn main() {
 }
 
 fn run_app() -> Result<(), Box<dyn std::error::Error>> {
-    init_logging(LoggingConfig::default())?;
+    let logging_result = init_logging(LoggingConfig::default())?;
     setup_panic_handler();
 
     // Start health monitoring to detect resource exhaustion
@@ -150,6 +161,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         checkpoint_db.path()
     );
 
+    // Connect the SQLite span layer to the database pool
+    if let Some(ref sqlite_layer) = logging_result.sqlite_span_layer {
+        sqlite_layer.set_db_pool(checkpoint_db.get_pool());
+        info!("SQLite span layer connected to database");
+    }
+
     // Run one-time migration from JSON files (if any exist)
     match checkpoint_db.migrate_from_json_files() {
         Ok(result) => {
@@ -171,6 +188,25 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => {
             warn!("JSON migration failed (non-fatal): {}", e);
         }
+    }
+
+    // Repair check-group associations based on naming convention
+    // This ensures checks named "project - tool" are properly linked to groups named "project"
+    match checkpoint_db.repair_check_group_associations() {
+        Ok(count) if count > 0 => {
+            info!("Repaired {} check-group associations on startup", count);
+        }
+        Ok(_) => {
+            // No repairs needed
+        }
+        Err(e) => {
+            warn!("Check-group association repair failed (non-fatal): {}", e);
+        }
+    }
+
+    // Migrate plaintext API keys to secure keychain storage
+    if let Err(e) = config_facade::migrate_api_keys_to_keychain() {
+        warn!("API key migration to keychain failed (non-fatal): {}", e);
     }
 
     // Initialize RAGState (graceful degradation if dependencies missing)
@@ -201,25 +237,31 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create shared AppState for both Tauri and MCP API
     let shared_app_state = Arc::new(AppState {
-        python_bridge: Mutex::new(None),
+        bridge_manager: TokioMutex::new(None), // Initialized in setup() when app_handle is available
         extraction_executor: Mutex::new(None), // Initialized on-demand
         current_config: Mutex::new(None),
         display_processor,
         local_storage,
         video_recorder,
         event_broadcast,
-        checkpoint_db,
+        checkpoint_db: checkpoint_db.clone(),
         run_recording_handler,
         mcp_client_manager: tokio::sync::Mutex::new(mcp_client_manager),
+        error_monitor_handle: TokioMutex::new(None), // Initialized in setup()
     });
     let mcp_app_state = shared_app_state.clone();
     let mcp_rag_state = rag_state.clone();
 
+    // Create error monitor config for later initialization
+    let error_monitor_db = checkpoint_db.clone();
+
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(shared_app_state)
         .manage(rag_state)
+        .manage(checkpoint_db.clone()) // For error_monitor commands that need direct db access
         .invoke_handler(tauri::generate_handler![
             // Authentication commands
             commands::auth::login,
@@ -257,6 +299,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::execution::workflow_execution::resume_execution,
             commands::execution::workflow_execution::get_resolved_initial_states,
             commands::execution::workflow_execution::get_workflow_required_screens,
+            // Execution commands - bridge_execution
+            commands::execution::bridge_execution::run_workflow_on_bridge,
+            commands::execution::bridge_execution::transfer_gui_lock,
+            commands::execution::bridge_execution::list_bridges,
+            commands::execution::bridge_execution::get_bridge_info,
             // Execution commands - executor_status
             commands::execution::executor_status::get_executor_status,
             commands::execution::executor_status::get_monitors,
@@ -302,6 +349,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::storage::load_findings_data,
             // Web extraction commands
             commands::extraction::start_web_extraction,
+            commands::extraction::start_vision_extraction,
             commands::extraction::stop_web_extraction,
             commands::extraction::get_extraction_status,
             commands::extraction::request_extraction_screenshot,
@@ -356,14 +404,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::project_logs::read_project_logs,
             commands::project_logs::get_project_directories,
             commands::project_logs::append_project_log,
-            // Log source profile commands
-            commands::project_logs::create_log_source_profile,
-            commands::project_logs::update_log_source_profile,
-            commands::project_logs::delete_log_source_profile,
-            commands::project_logs::set_active_profile,
-            commands::project_logs::list_log_source_profiles,
-            commands::project_logs::duplicate_log_source_profile,
-            commands::project_logs::find_log_sources_with_ai,
+            // AI log source discovery (global)
+            commands::global_log_sources::find_log_sources_with_ai,
             // AI settings commands
             commands::ai_settings::get_ai_settings,
             commands::ai_settings::save_ai_settings,
@@ -382,6 +424,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Playwright settings commands
             commands::playwright_settings::get_playwright_settings,
             commands::playwright_settings::save_playwright_settings,
+            commands::playwright_settings::has_playwright_test_password,
+            commands::playwright_settings::delete_playwright_test_password,
             // Self-healing settings commands
             commands::self_healing_settings::get_self_healing_settings,
             commands::self_healing_settings::save_self_healing_settings,
@@ -442,6 +486,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::tiered_info::cleanup_old_runs,
             commands::tiered_info::get_execution_options,
             commands::tiered_info::get_flakiness_summary,
+            // AI Session History commands (for Runs page)
+            commands::tiered_info::get_ai_session_history,
+            commands::tiered_info::delete_ai_session,
             // Discovery Push commands
             commands::discoveries::get_pending_discoveries_cmd,
             commands::discoveries::get_discovery_summary,
@@ -550,6 +597,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::checks::get_checks_in_group,
             commands::checks::set_checks_in_group,
             commands::checks::execute_check_group,
+            commands::checks::repair_check_group_associations,
             // Screenshot listing commands
             commands::screenshots::list_screenshots,
             // Lifecycle Hooks commands
@@ -597,6 +645,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::flow::get_flow_execution,
             commands::flow::list_flow_executions,
             commands::flow::cancel_flow_execution,
+            commands::flow::pause_flow_execution,
+            commands::flow::resume_flow_execution,
+            commands::flow::step_into_flow,
             commands::flow::create_sample_flow,
             commands::flow::add_sample_flow,
             // Enhanced flow queries (tag filtering, execution filtering, pagination)
@@ -604,6 +655,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::flow::get_flow_executions_filtered,
             commands::flow::get_flow_executions_paginated,
             commands::flow::get_flow_executions_count,
+            // Flow version history commands
+            commands::flow::create_flow_version,
+            commands::flow::list_flow_versions,
+            commands::flow::get_flow_version,
+            commands::flow::restore_flow_version,
+            commands::flow::compare_flow_versions,
+            commands::flow::delete_flow_version,
+            commands::flow::get_latest_flow_version,
+            // Flow import/export commands
+            commands::flow::export_flow_json,
+            commands::flow::export_flow_yaml,
+            commands::flow::import_flow_json,
+            commands::flow::import_flow_yaml,
+            commands::flow::export_flows_bulk,
+            commands::flow::import_flows_bulk,
             // Checkpoint browser commands (time-travel debugging)
             commands::checkpoint_browser::list_orchestrator_checkpoints,
             commands::checkpoint_browser::get_orchestrator_checkpoint,
@@ -657,6 +723,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::ai_generation::suggest_exploration_strategy_with_ai,
             commands::ai_generation::generate_test_and_agentic_step,
             commands::ai_generation::explore_flow_step,
+            commands::ai_generation::generate_element_ai_description,
             // MCP client management commands
             commands::mcp::list_mcp_servers,
             commands::mcp::get_mcp_server,
@@ -708,6 +775,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::test_orchestrator::save_orchestration_plan,
             commands::test_orchestrator::list_orchestration_plans,
             commands::test_orchestrator::delete_orchestration_plan,
+            // Performance Metrics Dashboard commands
+            commands::performance_metrics::get_performance_dashboard,
+            commands::performance_metrics::get_action_performance,
+            commands::performance_metrics::get_transition_reliability,
+            commands::performance_metrics::get_element_resolution_metrics,
+            commands::performance_metrics::get_success_rate_trend,
             // UI Bridge commands (AI-driven UI automation)
             commands::ui_bridge::ui_bridge_get_elements,
             commands::ui_bridge::ui_bridge_get_element,
@@ -717,6 +790,29 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::ui_bridge::ui_bridge_execute_component_action,
             commands::ui_bridge::ui_bridge_discover,
             commands::ui_bridge::ui_bridge_get_snapshot,
+            commands::ui_bridge::ui_bridge_discover_states_from_fingerprints,
+            commands::ui_bridge::ui_bridge_run_exploration,
+            commands::ui_bridge::ui_bridge_stop_exploration,
+            // Error Monitor commands (application log error detection)
+            // Note: Log source CRUD is now managed through global_log_sources commands
+            error_monitor::commands::query_error_events,
+            error_monitor::commands::get_error_event,
+            error_monitor::commands::get_unresolved_errors,
+            error_monitor::commands::update_error_status,
+            error_monitor::commands::acknowledge_error,
+            error_monitor::commands::resolve_error,
+            error_monitor::commands::ignore_error,
+            error_monitor::commands::link_error_to_finding,
+            error_monitor::commands::get_error_summary,
+            error_monitor::commands::search_errors,
+            error_monitor::commands::has_actionable_errors,
+            error_monitor::commands::get_recent_errors,
+            error_monitor::commands::acknowledge_all_errors,
+            error_monitor::commands::get_debug_context,
+            error_monitor::commands::get_debug_context_for_ai,
+            error_monitor::workflow::generate_error_fix_workflow,
+            error_monitor::workflow::generate_single_error_fix_workflow,
+            error_monitor::workflow::check_fixable_errors,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");
@@ -725,6 +821,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             executor::FileLogger::clear_logs();
             dom_capture::DomCaptureLogger::clear_captures();
             info!("Cleared previous runner log files");
+
+            // Seed default log sources if none configured
+            settings::seed_default_log_sources_if_empty();
 
             // Position window at top-center of screen and maximize height
             if let Some(window) = app.get_webview_window("main") {
@@ -788,23 +887,53 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 error!("Failed to get main window");
             }
 
-            // Auto-start Python executor for screenshot capture and other features
-            info!("Auto-starting Python executor");
+            // Initialize bridge manager for multi-bridge support
+            // This replaces the legacy single python_bridge with a manager that can handle
+            // multiple concurrent bridges (GUI + headless modes)
+            info!("Initializing bridge manager");
             let app_state = app.state::<Arc<AppState>>();
-            let mut bridge_lock = crate::safe_lock::safe_lock_or_recover(&app_state.python_bridge, "python_bridge");
-            let mut bridge = executor::PythonBridge::new(app.handle().clone());
-            match bridge.start() {
-                Ok(_) => {
-                    info!("Python executor auto-started successfully");
-                    *bridge_lock = Some(bridge);
-                }
-                Err(e) => {
-                    error!("Failed to auto-start Python executor: {}", e);
-                    error!("Screenshot capture and other features will not work until the executor is started");
-                    // Don't fail app startup, just log the error
-                }
+            let bridge_manager = Arc::new(executor::BridgeManager::new(app.handle().clone()));
+
+            // Check for headless-only mode from environment variable
+            // This is intended for server deployments where GUI is not available
+            let headless_only = std::env::var("QONTINUI_HEADLESS_ONLY")
+                .map(|v| v == "1" || v.to_lowercase() == "true")
+                .unwrap_or(false);
+
+            if headless_only {
+                info!("QONTINUI_HEADLESS_ONLY is set - enabling headless-only mode for server deployment");
+                bridge_manager.set_headless_only(true);
             }
-            drop(bridge_lock);
+
+            {
+                let app_state_for_bridge = app.state::<Arc<AppState>>().inner().clone();
+                tauri::async_runtime::block_on(async {
+                    let mut guard = app_state_for_bridge.bridge_manager.lock().await;
+                    *guard = Some(bridge_manager.clone());
+                });
+            }
+            info!("Bridge manager initialized (headless_only={})", headless_only);
+
+            // Auto-start Python executor for screenshot capture and other features
+            // In headless-only mode, creates a headless bridge instead of GUI bridge
+            // In normal mode, creates the default GUI bridge via bridge manager
+            if headless_only {
+                info!("Headless-only mode: skipping default bridge creation (create bridges on-demand via API)");
+            } else {
+                info!("Auto-starting Python executor via bridge manager");
+                tauri::async_runtime::block_on(async {
+                    match bridge_manager.get_or_create_default_bridge().await {
+                        Ok(bridge_id) => {
+                            info!("Python executor auto-started successfully (bridge_id={})", bridge_id);
+                        }
+                        Err(e) => {
+                            error!("Failed to auto-start Python executor: {}", e);
+                            error!("Screenshot capture and other features will not work until the executor is started");
+                            // Don't fail app startup, just log the error
+                        }
+                    }
+                });
+            }
 
             // Initialize extraction executor (starts on-demand when first extraction is requested)
             info!("Initializing extraction executor (will start on-demand)");
@@ -835,6 +964,23 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 scheduler_service::start_scheduler_service().await;
             });
 
+            // Start error monitor service in background
+            info!("Starting error monitor service");
+            let error_monitor_config = ErrorMonitorConfig::default();
+
+            // Start the service and store the handle in AppState (all within async context)
+            let app_state_for_error_monitor = app.state::<Arc<AppState>>().inner().clone();
+            tauri::async_runtime::spawn(async move {
+                // Start the error monitor service (this spawns the service loop internally)
+                let error_monitor_handle =
+                    start_error_monitor_async(error_monitor_db, error_monitor_config).await;
+
+                // Store the handle
+                let mut handle_lock = app_state_for_error_monitor.error_monitor_handle.lock().await;
+                *handle_lock = Some(error_monitor_handle);
+                info!("Error monitor service started and handle stored in AppState");
+            });
+
             info!("Tauri application setup complete");
             Ok(())
         })
@@ -843,12 +989,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 info!("Window close requested");
                 let app_state = window.state::<Arc<AppState>>();
 
-                // Stop Python bridge
-                if let Ok(mut bridge) = app_state.python_bridge.lock() {
-                    if let Some(ref mut pb) = *bridge {
-                        let _ = pb.stop();
+                // Stop all bridges via bridge manager
+                let app_state_clone = app_state.inner().clone();
+                tauri::async_runtime::block_on(async {
+                    let manager_guard = app_state_clone.bridge_manager.lock().await;
+                    if let Some(ref manager) = *manager_guard {
+                        info!("Stopping all bridges via bridge manager");
+                        manager.remove_all().await;
                     }
-                };
+                });
 
                 // Stop extraction executor
                 if let Ok(mut executor) = app_state.extraction_executor.lock() {
@@ -856,6 +1005,20 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         let _ = ee.stop();
                     }
                 };
+
+                // Stop error monitor service
+                let app_state_clone2 = app_state.inner().clone();
+                tauri::async_runtime::spawn(async move {
+                    let handle_lock = app_state_clone2.error_monitor_handle.lock().await;
+                    if let Some(ref handle) = *handle_lock {
+                        info!("Stopping error monitor service");
+                        if let Err(e) = handle.stop().await {
+                            error!("Failed to stop error monitor service: {}", e);
+                        } else {
+                            info!("Error monitor service stopped");
+                        }
+                    }
+                });
             }
         })
         .build(tauri::generate_context!())?;

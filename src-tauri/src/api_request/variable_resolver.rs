@@ -62,6 +62,17 @@ impl VariableResolver {
         }
     }
 
+    /// Import variables from a HashMap, merging with existing variables.
+    ///
+    /// This is useful for syncing variables from an external source like SharedVariableStore.
+    pub fn import_variables(&self, variables: &HashMap<String, String>) {
+        if let Ok(mut vars) = self.variables.write() {
+            for (k, v) in variables {
+                vars.insert(k.clone(), v.clone());
+            }
+        }
+    }
+
     /// Resolve variables in a string
     ///
     /// Replaces {{variable_name}} with the stored value.

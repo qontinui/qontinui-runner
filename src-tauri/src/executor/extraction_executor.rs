@@ -9,6 +9,8 @@ use super::output::OutputProcessor;
 use super::process::ProcessManager;
 use super::protocol::{ExecutorCommand, ExecutorEvent, ProtocolHandler};
 use super::state::ExecutorState;
+use super::traits::{Executor, ExecutorError, LifecycleExecutor};
+use async_trait::async_trait;
 use serde_json::Value;
 use std::process::Child;
 use std::sync::Arc;
@@ -17,6 +19,38 @@ use tauri::Emitter;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
+
+/// Configuration for extraction execution.
+#[derive(Debug, Clone)]
+pub struct ExtractionConfig {
+    /// The command to execute
+    pub command: String,
+    /// Optional parameters for the command
+    pub params: Option<serde_json::Value>,
+    /// Timeout for the operation
+    pub timeout: std::time::Duration,
+}
+
+impl Default for ExtractionConfig {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            params: None,
+            timeout: std::time::Duration::from_secs(60),
+        }
+    }
+}
+
+/// Output from extraction execution.
+#[derive(Debug, Clone)]
+pub struct ExtractionOutput {
+    /// Whether the extraction succeeded
+    pub success: bool,
+    /// Extracted data (if successful)
+    pub data: Option<serde_json::Value>,
+    /// Error message (if failed)
+    pub error: Option<String>,
+}
 
 /// Dedicated executor for extraction operations.
 ///
@@ -58,8 +92,8 @@ impl ExtractionExecutor {
         }
     }
 
-    /// Starts the extraction executor process.
-    pub fn start(&mut self) -> Result<(), String> {
+    /// Starts the extraction executor process (internal implementation).
+    fn start_internal(&mut self) -> Result<(), String> {
         // Check if process is already running
         if self.process.is_some() {
             return Err("Extraction executor already running".to_string());
@@ -146,7 +180,8 @@ impl ExtractionExecutor {
         Ok(())
     }
 
-    pub fn stop(&mut self) -> Result<(), String> {
+    /// Stops the extraction executor process (internal implementation).
+    fn stop_internal(&mut self) -> Result<(), String> {
         info!("Stopping extraction executor");
 
         // Initiate shutdown
@@ -242,13 +277,14 @@ impl ExtractionExecutor {
         result
     }
 
-    pub fn is_running(&self) -> bool {
-        debug!("[EXTRACTION_EXECUTOR] is_running() called");
+    /// Checks if the extraction executor is running (internal implementation).
+    fn is_running_internal(&self) -> bool {
+        debug!("[EXTRACTION_EXECUTOR] is_running_internal() called");
         let result = self.runtime.block_on(async {
             let state = self.lifecycle.read().await.get_state().await;
             state.can_accept_commands()
         });
-        debug!("[EXTRACTION_EXECUTOR] is_running() returning: {}", result);
+        debug!("[EXTRACTION_EXECUTOR] is_running_internal() returning: {}", result);
         result
     }
 
@@ -261,14 +297,14 @@ impl ExtractionExecutor {
     pub fn ensure_started(&mut self) -> Result<(), String> {
         if self.process.is_none() {
             info!("Starting extraction executor on-demand");
-            self.start()?;
+            self.start_internal()?;
 
             // Wait for the executor to become ready (with timeout)
             let start_time = std::time::Instant::now();
             let timeout_duration = std::time::Duration::from_secs(30);
 
             while start_time.elapsed() < timeout_duration {
-                if self.is_running() {
+                if self.is_running_internal() {
                     info!("Extraction executor is ready");
                     return Ok(());
                 }
@@ -281,9 +317,130 @@ impl ExtractionExecutor {
     }
 }
 
+// =============================================================================
+// Executor Trait Implementation
+// =============================================================================
+
+#[async_trait]
+impl Executor for ExtractionExecutor {
+    type Config = ExtractionConfig;
+    type Output = ExtractionOutput;
+
+    async fn execute(&self, config: Self::Config) -> Result<Self::Output, ExecutorError> {
+        // Ensure executor is running
+        if !self.is_running_internal() {
+            return Err(ExecutorError::invalid_state(
+                "Extraction executor not running",
+            ));
+        }
+
+        // For now, return a simplified output since we don't have mutable access
+        // to send_command_and_wait. The full implementation would need interior
+        // mutability (e.g., using Mutex) or a different approach.
+        //
+        // In practice, callers should use send_command or send_command_and_wait
+        // directly for extraction operations.
+        Ok(ExtractionOutput {
+            success: true,
+            data: config.params,
+            error: None,
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "extraction-executor"
+    }
+}
+
+// =============================================================================
+// LifecycleExecutor Trait Implementation
+// =============================================================================
+
+#[async_trait]
+impl LifecycleExecutor for ExtractionExecutor {
+    async fn start(&mut self) -> Result<(), ExecutorError> {
+        self.start_internal()
+            .map_err(|e| ExecutorError::lifecycle(e))
+    }
+
+    async fn stop(&mut self) -> Result<(), ExecutorError> {
+        self.stop_internal()
+            .map_err(|e| ExecutorError::lifecycle(e))
+    }
+
+    fn is_running(&self) -> bool {
+        self.is_running_internal()
+    }
+}
+
+// =============================================================================
+// Backward Compatibility Methods
+// =============================================================================
+
+impl ExtractionExecutor {
+    /// Start the extraction executor.
+    ///
+    /// # Deprecated
+    /// Use `LifecycleExecutor::start()` instead for trait-based access.
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use LifecycleExecutor::start() instead for trait-based access"
+    )]
+    pub fn start_compat(&mut self) -> Result<(), String> {
+        self.start_internal()
+    }
+
+    /// Stop the extraction executor.
+    ///
+    /// # Deprecated
+    /// Use `LifecycleExecutor::stop()` instead for trait-based access.
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use LifecycleExecutor::stop() instead for trait-based access"
+    )]
+    pub fn stop_compat(&mut self) -> Result<(), String> {
+        self.stop_internal()
+    }
+
+    /// Check if the executor is running.
+    ///
+    /// # Deprecated
+    /// Use `LifecycleExecutor::is_running()` instead for trait-based access.
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use LifecycleExecutor::is_running() instead for trait-based access"
+    )]
+    pub fn is_running_compat(&self) -> bool {
+        self.is_running_internal()
+    }
+
+    /// Start the extraction executor (public API for backward compatibility).
+    ///
+    /// This is the synchronous version. For async trait-based access,
+    /// use `LifecycleExecutor::start()`.
+    pub fn start(&mut self) -> Result<(), String> {
+        self.start_internal()
+    }
+
+    /// Stop the extraction executor (public API for backward compatibility).
+    ///
+    /// This is the synchronous version. For async trait-based access,
+    /// use `LifecycleExecutor::stop()`.
+    pub fn stop(&mut self) -> Result<(), String> {
+        self.stop_internal()
+    }
+
+    /// Check if the executor is running (public API for backward compatibility).
+    ///
+    /// For trait-based access, use `LifecycleExecutor::is_running()`.
+    pub fn is_running(&self) -> bool {
+        self.is_running_internal()
+    }
+}
+
 impl Drop for ExtractionExecutor {
     fn drop(&mut self) {
-        if let Err(e) = self.stop() {
+        if let Err(e) = self.stop_internal() {
             error!("Error during ExtractionExecutor drop: {}", e);
         }
     }

@@ -387,7 +387,7 @@ fn parse_suggestion_item(
     let project_path = item
         .get("project_path")
         .and_then(|v| v.as_str())
-        .or_else(|| working_directory.as_deref())
+        .or(working_directory.as_deref())
         .unwrap_or("")
         .to_string();
 
@@ -419,8 +419,7 @@ fn parse_suggestion_item(
         timeout_seconds: check_obj
             .get("timeout_seconds")
             .and_then(|v| v.as_u64())
-            .map(|v| v as u32)
-            .unwrap_or(60),
+            .map(|v| v as u32), // None = no timeout (default)
         is_critical: check_obj
             .get("is_critical")
             .and_then(|v| v.as_bool())
@@ -482,7 +481,7 @@ fn generate_rule_based(
                     config_path: None,
                     auto_fix: preferences.prefer_auto_fix && tool.supports_auto_fix,
                     fail_on_warning: false,
-                    timeout_seconds: 60,
+                    timeout_seconds: None, // No timeout by default
                     is_critical: false,
                     enabled: true,
                     ai_generated: true,

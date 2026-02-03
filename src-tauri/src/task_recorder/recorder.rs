@@ -2,7 +2,9 @@
 //!
 //! Provides the main interface for creating and managing task runs.
 
-use crate::database::CheckpointDb;
+#![allow(dead_code)]
+
+use crate::database::{CheckpointDb, CreateTaskRunInput};
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -50,6 +52,12 @@ pub struct TaskConfig {
     pub execution_steps_json: Option<String>,
     /// JSON-encoded log sources to capture during execution
     pub log_sources_json: Option<String>,
+    /// Workspace/organization ID (from web backend when task is created via API)
+    pub workspace_id: Option<String>,
+    /// User ID who triggered the task (from web backend when task is created via API)
+    pub triggered_by: Option<String>,
+    /// Bridge ID handling this task (for multi-bridge scenarios)
+    pub bridge_id: Option<String>,
 }
 
 impl TaskConfig {
@@ -65,6 +73,9 @@ impl TaskConfig {
             workflow_name: None,
             execution_steps_json: None,
             log_sources_json: None,
+            workspace_id: None,
+            triggered_by: None,
+            bridge_id: None,
         }
     }
 
@@ -80,6 +91,9 @@ impl TaskConfig {
             workflow_name: workflow_name.map(|s| s.to_string()),
             execution_steps_json: None,
             log_sources_json: None,
+            workspace_id: None,
+            triggered_by: None,
+            bridge_id: None,
         }
     }
 
@@ -100,6 +114,9 @@ impl TaskConfig {
             workflow_name: workflow_name.map(|s| s.to_string()),
             execution_steps_json: None,
             log_sources_json: None,
+            workspace_id: None,
+            triggered_by: None,
+            bridge_id: None,
         }
     }
 
@@ -124,6 +141,24 @@ impl TaskConfig {
     /// Set log sources JSON.
     pub fn with_log_sources(mut self, log_sources_json: String) -> Self {
         self.log_sources_json = Some(log_sources_json);
+        self
+    }
+
+    /// Set workspace ID (from web backend).
+    pub fn with_workspace_id(mut self, workspace_id: impl Into<String>) -> Self {
+        self.workspace_id = Some(workspace_id.into());
+        self
+    }
+
+    /// Set the user ID who triggered the task (from web backend).
+    pub fn with_triggered_by(mut self, user_id: impl Into<String>) -> Self {
+        self.triggered_by = Some(user_id.into());
+        self
+    }
+
+    /// Set the bridge ID handling this task (for multi-bridge scenarios).
+    pub fn with_bridge_id(mut self, bridge_id: impl Into<String>) -> Self {
+        self.bridge_id = Some(bridge_id.into());
         self
     }
 }
@@ -227,23 +262,42 @@ impl TaskRecorder {
         config: TaskConfig,
     ) -> Result<TaskRunHandle, String> {
         info!(
-            "Starting task run: id={}, name={}, type={:?}",
-            id, config.task_name, config.task_type
+            "Starting task run: id={}, name={}, type={:?}, workspace_id={:?}, triggered_by={:?}",
+            id, config.task_name, config.task_type, config.workspace_id, config.triggered_by
         );
 
-        // Create the task run in the database
-        self.db.create_task_run_with_config(
-            id,
-            &config.task_name,
-            config.prompt.as_deref(),
-            config.task_type.as_str(),
-            config.config_id.as_deref(),
-            config.workflow_name.as_deref(),
-            config.max_sessions,
-            Some(config.auto_continue),
-            config.execution_steps_json,
-            config.log_sources_json,
-        )?;
+        // Create the task run in the database with all fields including web context
+        let mut input = CreateTaskRunInput::new(id, &config.task_name)
+            .with_task_type(config.task_type.as_str())
+            .with_auto_continue(config.auto_continue);
+        if let Some(ref p) = config.prompt {
+            input = input.with_prompt(p);
+        }
+        if let Some(ref cid) = config.config_id {
+            input = input.with_config_id(cid);
+        }
+        if let Some(ref wn) = config.workflow_name {
+            input = input.with_workflow_name(wn);
+        }
+        if let Some(ms) = config.max_sessions {
+            input = input.with_max_sessions(ms);
+        }
+        if let Some(esj) = config.execution_steps_json {
+            input = input.with_execution_steps_json(esj);
+        }
+        if let Some(lsj) = config.log_sources_json {
+            input = input.with_log_sources_json(lsj);
+        }
+        if let Some(ref wid) = config.workspace_id {
+            input = input.with_workspace_id(wid);
+        }
+        if let Some(ref tb) = config.triggered_by {
+            input = input.with_triggered_by(tb);
+        }
+        if let Some(ref bid) = config.bridge_id {
+            input = input.with_bridge_id(bid);
+        }
+        self.db.create_task_run(&input)?;
 
         debug!("Created task run in database: {}", id);
 

@@ -15,6 +15,8 @@ pub struct ProcessManager {
     app_handle: tauri::AppHandle,
     /// Script name to execute (e.g., "qontinui_executor.py" or "extraction_executor.py")
     script_name: String,
+    /// Whether to run in headless mode (no GUI, no screen capture)
+    headless: bool,
 }
 
 impl ProcessManager {
@@ -22,6 +24,7 @@ impl ProcessManager {
         Self {
             app_handle,
             script_name: "qontinui_executor.py".to_string(),
+            headless: false,
         }
     }
 
@@ -30,7 +33,32 @@ impl ProcessManager {
         Self {
             app_handle,
             script_name: "extraction_executor.py".to_string(),
+            headless: false,
         }
+    }
+
+    /// Creates a ProcessManager configured for headless mode.
+    ///
+    /// In headless mode:
+    /// - No screen capture or GUI interaction
+    /// - Can run in parallel with other headless processes
+    /// - Suitable for API-only or script-based workflows
+    pub fn new_headless(app_handle: tauri::AppHandle) -> Self {
+        Self {
+            app_handle,
+            script_name: "qontinui_executor.py".to_string(),
+            headless: true,
+        }
+    }
+
+    /// Set headless mode.
+    pub fn set_headless(&mut self, headless: bool) {
+        self.headless = headless;
+    }
+
+    /// Check if running in headless mode.
+    pub fn is_headless(&self) -> bool {
+        self.headless
     }
 
     /// Spawns the Python executor process.
@@ -101,6 +129,13 @@ impl ProcessManager {
             );
         }
 
+        // Set headless mode environment variables if enabled
+        if self.headless {
+            info!("Spawning Python process in headless mode");
+            cmd.env("QONTINUI_HEADLESS", "1");
+            cmd.env("QONTINUI_NO_GUI", "1");
+        }
+
         // Spawn Python process
         let child = cmd
             .stdin(Stdio::piped())
@@ -109,7 +144,10 @@ impl ProcessManager {
             .spawn()
             .map_err(|e| format!("Failed to start Python process: {}", e))?;
 
-        info!("Python process spawned successfully");
+        info!(
+            "Python process spawned successfully (headless={})",
+            self.headless
+        );
 
         Ok(child)
     }
@@ -134,6 +172,13 @@ impl ProcessManager {
             );
         }
 
+        // Set headless mode environment variables if enabled
+        if self.headless {
+            info!("Spawning Python process in headless mode");
+            cmd.env("QONTINUI_HEADLESS", "1");
+            cmd.env("QONTINUI_NO_GUI", "1");
+        }
+
         // Spawn Python process
         let child = cmd
             .stdin(Stdio::piped())
@@ -142,7 +187,10 @@ impl ProcessManager {
             .spawn()
             .map_err(|e| format!("Failed to start Python process: {}", e))?;
 
-        info!("Python process spawned successfully");
+        info!(
+            "Python process spawned successfully (headless={})",
+            self.headless
+        );
         Ok(child)
     }
 

@@ -883,7 +883,7 @@ mod tests {
             config_path: None,
             auto_fix: false,
             fail_on_warning: false,
-            timeout_seconds: 60,
+            timeout_seconds: Some(60),
             is_critical: false,
         }
     }

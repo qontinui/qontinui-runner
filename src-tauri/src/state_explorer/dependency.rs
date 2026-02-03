@@ -18,6 +18,8 @@
 //!         // Mark as skipped due to dependency failure
 //!     }
 //! }
+
+#![allow(dead_code)]
 //! ```
 
 use std::collections::{HashMap, HashSet, VecDeque};

@@ -3,7 +3,10 @@
 //! Commands for starting, stopping, and configuring the Python executor.
 
 use crate::config::{ConfigLoader, ScreenshotCaptureSettings};
-use crate::executor::PythonBridge;
+use crate::executor::{
+    get_or_create_default_bridge, is_default_bridge_running, stop_default_bridge,
+    with_default_bridge,
+};
 use crate::settings;
 use std::sync::Arc;
 use tauri::{Emitter, State};
@@ -14,14 +17,14 @@ use super::super::{AppState, CommandResponse};
 /// Start the Python executor.
 ///
 /// This command:
-/// 1. Creates a new Python bridge instance
+/// 1. Creates a new Python bridge instance via BridgeManager
 /// 2. Starts the Python process
 /// 3. Sends previously loaded configuration if available
 /// 4. Applies current debug settings
 ///
 /// # Arguments
 /// * `app_handle` - Tauri application handle for event emission
-/// * `state` - Application state containing the Python bridge
+/// * `state` - Application state containing the bridge manager
 ///
 /// # Returns
 /// * `Ok(CommandResponse)` - Success message
@@ -32,45 +35,43 @@ pub fn start_python_executor(
     state: State<Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
     info!("Starting Python executor");
-    let mut bridge_lock = state
-        .python_bridge
-        .lock()
-        .map_err(|e| format!("Python bridge mutex poisoned: {}", e))?;
 
     // Check if already running
-    if let Some(ref mut bridge) = *bridge_lock {
-        if bridge.is_running() {
-            info!("Python executor already running, checking if config needs to be reloaded");
+    if is_default_bridge_running(&state) {
+        info!("Python executor already running, checking if config needs to be reloaded");
 
-            // When app restarts but Python is still running, we need to reload the config
-            // because the Rust state was cleared but Python might have stale or no config
-            if let Some(config_path) = settings::get_last_config_path() {
-                info!(
-                    "Reloading configuration to Python executor: {}",
-                    config_path
-                );
+        // When app restarts but Python is still running, we need to reload the config
+        // because the Rust state was cleared but Python might have stale or no config
+        if let Some(config_path) = settings::get_last_config_path() {
+            info!(
+                "Reloading configuration to Python executor: {}",
+                config_path
+            );
 
-                // Load and validate the configuration file
-                match ConfigLoader::load_from_file(&config_path) {
-                    Ok(config) => {
-                        // Create config data for event emission
-                        let config_data = serde_json::json!({
-                            "metadata": config.metadata.clone(),
-                            "workflows": config.workflows.clone(),
-                            "states": config.states.clone(),
-                            "transitions": config.transitions.clone(),
-                            "images": config.images.clone()
-                        });
+            // Load and validate the configuration file
+            match ConfigLoader::load_from_file(&config_path) {
+                Ok(config) => {
+                    // Create config data for event emission
+                    let config_data = serde_json::json!({
+                        "metadata": config.metadata.clone(),
+                        "workflows": config.workflows.clone(),
+                        "states": config.states.clone(),
+                        "transitions": config.transitions.clone(),
+                        "images": config.images.clone()
+                    });
 
-                        // Store in app state
-                        match state.current_config.lock() {
-                            Ok(mut guard) => *guard = Some(config),
-                            Err(e) => warn!("Failed to store config (mutex poisoned): {}", e),
-                        }
-                        info!("Configuration stored in app state");
+                    // Store in app state
+                    match state.current_config.lock() {
+                        Ok(mut guard) => *guard = Some(config),
+                        Err(e) => warn!("Failed to store config (mutex poisoned): {}", e),
+                    }
+                    info!("Configuration stored in app state");
 
+                    // Send debug settings and configuration via bridge manager
+                    let debug_settings = settings::get_debug_settings();
+                    let config_path_clone = config_path.clone();
+                    let reload_result = with_default_bridge(&state, |bridge| {
                         // Send debug settings first
-                        let debug_settings = settings::get_debug_settings();
                         if let Err(e) = bridge.set_debug_settings(
                             debug_settings.enable_image_debug,
                             debug_settings.top_matches_count,
@@ -79,50 +80,53 @@ pub fn start_python_executor(
                         }
 
                         // Send configuration to Python
-                        if let Err(e) = bridge.load_configuration(&config_path) {
+                        if let Err(e) = bridge.load_configuration(&config_path_clone) {
                             warn!("Failed to reload configuration to Python executor: {}", e);
                         } else {
                             info!("Configuration reloaded to Python executor successfully");
                         }
+                    });
 
-                        // Get saved workflow and monitor for event
-                        let workflow_id = settings::get_last_workflow_id();
-                        let monitor_index = settings::get_last_monitor_index();
-
-                        // Emit event to notify frontend of config load
-                        let event_payload = serde_json::json!({
-                            "event": "config_loaded",
-                            "data": {
-                                "path": config_path,
-                                "config": config_data,
-                                "workflow_id": workflow_id,
-                                "monitor_index": monitor_index
-                            }
-                        });
-
-                        if let Err(e) = app_handle.emit("executor-event", &event_payload) {
-                            warn!("Failed to emit config_loaded event: {}", e);
-                        } else {
-                            info!("Emitted config_loaded event to frontend");
-                        }
+                    if let Err(e) = reload_result {
+                        warn!("Failed to access bridge for config reload: {}", e);
                     }
-                    Err(e) => {
-                        warn!("Failed to load configuration file {}: {}", config_path, e);
+
+                    // Get saved workflow and monitor for event
+                    let workflow_id = settings::get_last_workflow_id();
+                    let monitor_index = settings::get_last_monitor_index();
+
+                    // Emit event to notify frontend of config load
+                    let event_payload = serde_json::json!({
+                        "event": "config_loaded",
+                        "data": {
+                            "path": config_path,
+                            "config": config_data,
+                            "workflow_id": workflow_id,
+                            "monitor_index": monitor_index
+                        }
+                    });
+
+                    if let Err(e) = app_handle.emit("executor-event", &event_payload) {
+                        warn!("Failed to emit config_loaded event: {}", e);
+                    } else {
+                        info!("Emitted config_loaded event to frontend");
                     }
                 }
+                Err(e) => {
+                    warn!("Failed to load configuration file {}: {}", config_path, e);
+                }
             }
-
-            return Ok(CommandResponse {
-                success: true, // Changed to success since executor is running
-                message: Some("Python executor already running".to_string()),
-                data: None,
-            });
         }
+
+        return Ok(CommandResponse {
+            success: true, // Changed to success since executor is running
+            message: Some("Python executor already running".to_string()),
+            data: None,
+        });
     }
 
-    // Create and start new bridge
-    let mut bridge = PythonBridge::new(app_handle);
-    bridge.start().map_err(|e| {
+    // Create and start new bridge via BridgeManager
+    get_or_create_default_bridge(&state).map_err(|e| {
         error!("Failed to start Python executor: {}", e);
         format!("Failed to start Python executor: {}", e)
     })?;
@@ -141,27 +145,33 @@ pub fn start_python_executor(
                 config_path
             );
 
-            // Send debug settings first
+            // Send debug settings and configuration via bridge manager
             let debug_settings = settings::get_debug_settings();
-            if let Err(e) = bridge.set_debug_settings(
-                debug_settings.enable_image_debug,
-                debug_settings.top_matches_count,
-            ) {
-                warn!("Failed to send debug settings: {}", e);
-            }
+            let send_result = with_default_bridge(&state, |bridge| {
+                // Send debug settings first
+                if let Err(e) = bridge.set_debug_settings(
+                    debug_settings.enable_image_debug,
+                    debug_settings.top_matches_count,
+                ) {
+                    warn!("Failed to send debug settings: {}", e);
+                }
 
-            // Send configuration
-            if let Err(e) = bridge.load_configuration(&config_path) {
-                error!("Failed to send configuration to Python executor: {}", e);
-                // Don't fail the start operation, just warn
-                warn!("Python executor started but configuration could not be sent");
-            } else {
-                info!("Configuration sent to Python executor successfully");
+                // Send configuration
+                if let Err(e) = bridge.load_configuration(&config_path) {
+                    error!("Failed to send configuration to Python executor: {}", e);
+                    // Don't fail the start operation, just warn
+                    warn!("Python executor started but configuration could not be sent");
+                } else {
+                    info!("Configuration sent to Python executor successfully");
+                }
+            });
+
+            if let Err(e) = send_result {
+                warn!("Failed to access bridge for config send: {}", e);
             }
         }
     }
 
-    *bridge_lock = Some(bridge);
     info!("Python executor started successfully");
 
     Ok(CommandResponse {
@@ -188,7 +198,7 @@ pub fn start_python_executor(
 /// restarting the app is simpler than managing executor lifecycle manually.
 ///
 /// # Arguments
-/// * `state` - Application state containing the Python bridge
+/// * `state` - Application state containing the bridge manager
 ///
 /// # Returns
 /// * `Ok(CommandResponse)` - Success message
@@ -196,18 +206,13 @@ pub fn start_python_executor(
 #[tauri::command]
 pub fn stop_python_executor(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Stopping Python executor");
-    let mut bridge_lock =
-        crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
 
-    if let Some(ref mut bridge) = *bridge_lock {
-        bridge.stop().map_err(|e| {
-            error!("Failed to stop Python executor: {}", e);
-            format!("Failed to stop Python executor: {}", e)
-        })?;
-        info!("Python executor stopped successfully");
-    }
+    stop_default_bridge(&state).map_err(|e| {
+        error!("Failed to stop Python executor: {}", e);
+        format!("Failed to stop Python executor: {}", e)
+    })?;
 
-    *bridge_lock = None;
+    info!("Python executor stopped successfully");
 
     Ok(CommandResponse {
         success: true,
@@ -222,7 +227,7 @@ pub fn stop_python_executor(state: State<Arc<AppState>>) -> Result<CommandRespon
 ///
 /// # Arguments
 /// * `settings` - The new screenshot capture settings
-/// * `state` - Application state containing the Python bridge
+/// * `state` - Application state containing the bridge manager
 ///
 /// # Returns
 /// * `Ok(CommandResponse)` - Success message
@@ -236,21 +241,26 @@ pub fn update_capture_settings(
         "Updating screenshot capture settings: enabled={}",
         settings.enabled
     );
-    let bridge_lock = crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
-    if let Some(ref bridge) = *bridge_lock {
-        if !bridge.is_running() {
-            return Err("Python executor is not running. Please start the executor first by clicking 'Start Executor' in the Control tab.".to_string());
-        }
-        bridge.update_capture_settings(settings).map_err(|e| {
-            error!("Failed to update capture settings: {}", e);
-            format!("Failed to update capture settings: {}", e)
-        })?;
-        Ok(CommandResponse {
-            success: true,
-            message: Some("Capture settings updated".to_string()),
-            data: None,
-        })
-    } else {
-        Err("Python executor not initialized. Please start the executor first by clicking 'Start Executor' in the Control tab.".to_string())
+
+    if !is_default_bridge_running(&state) {
+        return Err("Python executor is not running. Please start the executor first by clicking 'Start Executor' in the Control tab.".to_string());
     }
+
+    with_default_bridge(&state, |bridge| {
+        bridge.update_capture_settings(settings.clone())
+    })
+    .map_err(|e| {
+        error!("Failed to access bridge: {}", e);
+        format!("Python executor not initialized. Please start the executor first by clicking 'Start Executor' in the Control tab.")
+    })?
+    .map_err(|e| {
+        error!("Failed to update capture settings: {}", e);
+        format!("Failed to update capture settings: {}", e)
+    })?;
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Capture settings updated".to_string()),
+        data: None,
+    })
 }

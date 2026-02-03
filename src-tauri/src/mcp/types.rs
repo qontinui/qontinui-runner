@@ -12,8 +12,6 @@ use std::sync::Arc;
 use crate::commands::rag::RAGState;
 use crate::commands::AppState;
 use crate::config_storage::ConfigStorage;
-use crate::session::SessionManager;
-use crate::task_monitor::TaskMonitor;
 
 /// Default port for the MCP API server
 pub const MCP_API_PORT: u16 = 9876;
@@ -28,10 +26,6 @@ pub struct ApiState {
     pub app_state: Arc<AppState>,
     pub rag_state: Arc<RAGState>,
     pub app_handle: tauri::AppHandle,
-    /// Unified session manager for all AI sessions (Prompt Library + AI Builder)
-    pub session: Arc<SessionManager>,
-    /// Task monitor for watching Claude session output
-    pub task_monitor: Arc<TaskMonitor>,
     /// Currently loaded config ID (for config storage tracking)
     pub current_config_id: std::sync::Mutex<Option<String>>,
     /// Config storage for persistence
@@ -95,12 +89,16 @@ pub struct RunWorkflowRequest {
     pub timeout_seconds: u64,
 }
 
+/// Default timeout for workflow/state navigation operations.
+/// Returns 0 to indicate no timeout (run until completion).
 pub fn default_timeout() -> u64 {
-    300 // 5 minutes default timeout
+    0 // No timeout - run until completion
 }
 
+/// Default timeout for single action operations.
+/// Returns 0 to indicate no timeout (run until completion).
 pub fn default_action_timeout() -> u64 {
-    30 // 30 seconds default timeout for single action
+    0 // No timeout - run until completion
 }
 
 /// Execute single action request
@@ -227,14 +225,7 @@ pub struct MonitorsResponse {
     pub available_descriptors: Vec<String>,
 }
 
-/// Context for grouping AI output by session/run
-#[derive(Debug, Clone, Default)]
-pub struct AiOutputSessionContext {
-    /// The session/task_run ID for grouping output
-    pub session_id: Option<String>,
-    /// Human-readable session name
-    pub session_name: Option<String>,
-}
+// Re-export AiSessionContext from the canonical location
 
 /// A single execution step to run before AI session
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -343,14 +334,10 @@ pub fn default_phase_field() -> String {
     "current_phase".to_string()
 }
 
+/// Default session inactivity timeout.
+/// Returns 0 to indicate no timeout (run until completion).
 pub fn default_session_timeout() -> u64 {
-    1800
-}
-
-/// Response from starting a session
-#[derive(Debug, Serialize)]
-pub struct StartSessionResponse {
-    pub session: crate::session::Session,
+    0 // No timeout - session runs until completion
 }
 
 /// Information about a single active session

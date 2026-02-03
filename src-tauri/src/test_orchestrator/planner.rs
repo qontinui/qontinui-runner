@@ -261,7 +261,7 @@ fn build_planning_prompt(
             }
         }
 
-        prompt.push_str("\n");
+        prompt.push('\n');
     }
 
     prompt.push_str("## User's Test Goal\n\n");
@@ -449,7 +449,25 @@ fn extract_json_from_response(response: &str) -> Result<String> {
             after_newline.trim().to_string()
         }
     } else if let Some(start) = trimmed.find('{') {
-        trimmed[start..].to_string()
+        // Try to find the matching closing brace by parsing progressively
+        let remainder = &trimmed[start..];
+        let mut best_json = String::new();
+        // Try parsing increasingly larger substrings until we find valid JSON
+        for (i, c) in remainder.char_indices() {
+            if c == '}' {
+                let candidate = &remainder[..=i];
+                if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
+                    best_json = candidate.to_string();
+                    // Continue to find potentially larger valid JSON
+                }
+            }
+        }
+        if !best_json.is_empty() {
+            best_json
+        } else {
+            // Fall back to taking everything from { to end
+            remainder.to_string()
+        }
     } else {
         return Err(anyhow!("Could not find JSON in AI response"));
     };

@@ -5,58 +5,51 @@
 //! - VerificationExecutor: Runs verification/test steps and reports results
 //! - AgenticExecutor: Runs the AI with failure context
 //! - CompletionExecutor: Runs completion steps (only if verification passed)
+//!
+//! All step event logging is done through the StepEventLogger facade, which
+//! ensures consistent event format and prevents duplicate logging.
+//!
+//! AI session execution is delegated to the UnifiedAiSessionExecutor, which
+//! consolidates the common logic for context building, prompt transformation,
+//! and session management.
+//!
+//! ## Executor Trait
+//!
+//! Each phase executor implements the `Executor` trait from `crate::executor::traits`,
+//! providing a uniform interface for execution with typed configuration and results.
+//! This enables:
+//! - Consistent error handling through `ExecutorError`
+//! - Typed configuration via `SetupConfig`, `VerificationConfig`, etc.
+//! - Factory construction via `FromContext`
+
+#![allow(dead_code)]
 
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use async_trait::async_trait;
+use tokio::sync::Mutex as TokioMutex;
+use tracing::{info, instrument, warn};
 
 use crate::config_storage::ConfigStorage;
 use crate::database::CheckpointDb;
-use crate::step_event_builder::StepEventBuilder;
+use crate::executor::{
+    prompt_builder, timeout_helper, ExecutorContext, Executor, ExecutorError, FromContext,
+    ExecutionOutcome, IntoOutcome,
+};
 use crate::step_executor::{
     ExecutionStepConfig, StepExecutionResult, StepExecutor, VerificationPhaseResult,
 };
 use crate::step_metadata::{StepDetails, StepMetadata};
+use crate::step_registry::{StepEventKind, StepEventLogger};
 use crate::step_types::StepType;
+use crate::unified_ai_session::{AiSessionConfig, UnifiedAiSessionExecutor};
+use crate::workflow_state::{CheckpointManager, StepCheckpoint};
 use crate::AppState;
 
+use super::phase_configs::{
+    SetupConfig, SetupResult, VerificationConfig, VerificationResult,
+    AgenticConfig, CompletionConfig, CompletionResult,
+};
 use super::types::{AgenticOutcome, LoopConfig};
-
-// =============================================================================
-// Helper Functions
-// =============================================================================
-
-/// Strip [TASK_COMPLETE] and similar completion marker instructions from prompts.
-///
-/// In unified workflows, verification determines completion, not the AI.
-/// This removes any instructions telling the AI to output completion markers.
-fn strip_completion_marker_instructions(prompt: &str) -> String {
-    // Common patterns that instruct AI to output completion markers
-    let patterns_to_remove = [
-        // Full sentences with marker instructions
-        "When you complete the task, include a summary line starting with [TASK_COMPLETE] followed by a brief summary.",
-        "When complete, print [TASK_COMPLETE].",
-        "When the goal is VERIFIED achieved, print [TASK_COMPLETE].",
-        "Continue the task. When complete, print [TASK_COMPLETE].",
-        "Continue the task. When the goal is VERIFIED achieved, print [TASK_COMPLETE].",
-        "Continue the task from where you left off. When complete, print [TASK_COMPLETE].",
-        // Shorter variations
-        "print [TASK_COMPLETE]",
-        "output [TASK_COMPLETE]",
-        "[TASK_COMPLETE]",
-    ];
-
-    let mut result = prompt.to_string();
-    for pattern in patterns_to_remove {
-        result = result.replace(pattern, "");
-    }
-
-    // Clean up any resulting double newlines
-    while result.contains("\n\n\n") {
-        result = result.replace("\n\n\n", "\n\n");
-    }
-
-    result.trim().to_string()
-}
 
 // =============================================================================
 // Setup Phase Executor
@@ -65,45 +58,68 @@ fn strip_completion_marker_instructions(prompt: &str) -> String {
 /// Executes the setup phase (runs once at the start).
 ///
 /// Handles both automation steps (shell commands, workflows) and prompt steps (AI tasks).
+/// AI session execution is delegated to the UnifiedAiSessionExecutor.
 pub struct SetupExecutor {
     executor: StepExecutor,
-    app_handle: tauri::AppHandle,
-    pid_tracker: Arc<std::sync::Mutex<Vec<u32>>>,
+    ai_executor: UnifiedAiSessionExecutor,
     checkpoint_db: Arc<CheckpointDb>,
 }
 
 impl SetupExecutor {
     pub fn new(
         app_state: Arc<AppState>,
-        config_storage: Arc<tokio::sync::Mutex<ConfigStorage>>,
+        config_storage: Arc<TokioMutex<ConfigStorage>>,
         app_handle: tauri::AppHandle,
         pid_tracker: Arc<std::sync::Mutex<Vec<u32>>>,
     ) -> Self {
+        let checkpoint_db = app_state.checkpoint_db.clone();
         Self {
             executor: StepExecutor::with_app_handle(
                 app_state.clone(),
                 config_storage,
                 app_handle.clone(),
             ),
-            app_handle,
-            pid_tracker,
-            checkpoint_db: app_state.checkpoint_db.clone(),
+            ai_executor: UnifiedAiSessionExecutor::new(
+                app_state,
+                app_handle,
+                pid_tracker,
+            ),
+            checkpoint_db,
         }
     }
 
     /// Run setup steps. Returns true if successful.
     ///
     /// Executes automation steps first (shell commands, etc.), then prompt steps (AI tasks).
-    pub async fn execute(
+    /// The logger is required for consistent step event logging.
+    ///
+    /// `timeout_seconds` is optional - None means no timeout (default, recommended).
+    ///
+    /// Step checkpointing is integrated for resume capability.
+    #[instrument(
+        name = "workflow.phase.setup",
+        skip(self, automation_steps, prompt_steps, logger),
+        fields(
+            execution_id = %execution_id,
+            workflow_name = %workflow_name,
+            automation_step_count = automation_steps.len(),
+            prompt_step_count = prompt_steps.len()
+        )
+    )]
+    pub async fn run_setup(
         &self,
         automation_steps: &[ExecutionStepConfig],
         prompt_steps: &[ExecutionStepConfig],
         execution_id: &str,
         workflow_name: &str,
-        timeout_seconds: u64,
+        timeout_seconds: Option<u64>,
+        logger: &StepEventLogger,
     ) -> (bool, Vec<StepExecutionResult>) {
         let mut all_results = Vec::new();
         let mut overall_success = true;
+
+        // Create checkpoint manager for step-level checkpointing
+        let checkpoint_mgr = CheckpointManager::new(self.checkpoint_db.clone(), "unified");
 
         // Run automation setup steps first
         if !automation_steps.is_empty() {
@@ -112,10 +128,64 @@ impl SetupExecutor {
                 automation_steps.len()
             );
 
+            // Checkpoint each automation step
+            for (idx, step) in automation_steps.iter().enumerate() {
+                let step_type = StepType::from_str_compat(&step.step_type)
+                    .unwrap_or(StepType::ShellCommand);
+                let step_name = step.name.as_deref().unwrap_or(&step.step_type);
+
+                let mut checkpoint = StepCheckpoint::new(
+                    execution_id,
+                    "unified",
+                    "setup",
+                    None,
+                    idx,
+                    step_type.as_str(),
+                ).with_step_name(step_name);
+                checkpoint.mark_started();
+                if let Err(e) = checkpoint_mgr.save_step(&checkpoint) {
+                    warn!("Failed to save setup step checkpoint: {}", e);
+                }
+            }
+
             let (result, _has_gui) = self
                 .executor
                 .execute_setup_phase(automation_steps, execution_id, &[])
                 .await;
+
+            // Checkpoint completion for each step
+            for (idx, step_result) in result.steps.iter().enumerate() {
+                let step = &automation_steps[idx];
+                let step_type = StepType::from_str_compat(&step.step_type)
+                    .unwrap_or(StepType::ShellCommand);
+                let step_name = step.name.as_deref().unwrap_or(&step.step_type);
+
+                let mut checkpoint = StepCheckpoint::new(
+                    execution_id,
+                    "unified",
+                    "setup",
+                    None,
+                    idx,
+                    step_type.as_str(),
+                ).with_step_name(step_name);
+
+                let duration_ms = step_result.duration_ms as i64;
+                if step_result.success {
+                    checkpoint.mark_success(
+                        serde_json::to_string(step_result).ok(),
+                        duration_ms,
+                    );
+                } else {
+                    checkpoint.mark_failed(
+                        step_result.error.as_deref().unwrap_or("Unknown error"),
+                        duration_ms,
+                    );
+                }
+
+                if let Err(e) = checkpoint_mgr.save_step(&checkpoint) {
+                    warn!("Failed to save setup step completion checkpoint: {}", e);
+                }
+            }
 
             overall_success = overall_success && result.success;
             all_results.extend(result.steps);
@@ -133,39 +203,62 @@ impl SetupExecutor {
                 prompt_steps.len()
             );
 
-            // Get the combined step name for display
-            let step_name = prompt_steps
-                .iter()
-                .filter_map(|s| s.name.as_ref())
-                .map(|n| n.as_str())
-                .collect::<Vec<_>>()
-                .join(" + ");
-            let step_name = if step_name.is_empty() {
-                "Setup AI Task".to_string()
-            } else {
-                step_name
-            };
+            // Checkpoint the AI step as a single step
+            let ai_step_idx = automation_steps.len();
+            let step_name =
+                prompt_builder::consolidate_step_names_with_default(prompt_steps, "Setup AI Task");
 
-            let setup_prompt: String = prompt_steps
-                .iter()
-                .filter_map(|s| s.prompt_content.as_ref())
-                .map(|c| c.as_str())
-                .collect::<Vec<_>>()
-                .join("\n\n---\n\n");
+            let mut ai_checkpoint = StepCheckpoint::new(
+                execution_id,
+                "unified",
+                "setup",
+                None,
+                ai_step_idx,
+                "ai_session",
+            ).with_step_name(&step_name);
+            ai_checkpoint.mark_started();
+            if let Err(e) = checkpoint_mgr.save_step(&ai_checkpoint) {
+                warn!("Failed to save setup AI step checkpoint: {}", e);
+            }
+
+            // Use structured prompts for granular sub-step tracking
+            let (setup_prompt, sub_step_metadata) =
+                prompt_builder::consolidate_prompts_structured(prompt_steps, "setup");
 
             if !setup_prompt.is_empty() {
-                let success = self
-                    .run_setup_ai(
-                        &setup_prompt,
-                        execution_id,
-                        workflow_name,
-                        timeout_seconds,
-                        &step_name,
-                    )
-                    .await;
-                overall_success = overall_success && success;
+                // Use the unified AI session executor with sub-step metadata
+                let config = AiSessionConfig::setup(
+                    execution_id,
+                    workflow_name,
+                    &step_name,
+                ).with_timeout(timeout_seconds)
+                 .with_sub_step_metadata(sub_step_metadata);
 
-                if !success {
+                let (result, duration_ms) = timeout_helper::timed_result_async(
+                    self.ai_executor.execute(&config, &setup_prompt, logger)
+                ).await;
+                let duration_ms = duration_ms as i64;
+                overall_success = overall_success && result.success;
+                let mut ai_checkpoint = StepCheckpoint::new(
+                    execution_id,
+                    "unified",
+                    "setup",
+                    None,
+                    ai_step_idx,
+                    "ai_session",
+                ).with_step_name(&step_name);
+
+                if result.success {
+                    ai_checkpoint.mark_success(Some(result.output.clone()), duration_ms);
+                } else {
+                    ai_checkpoint.mark_failed("AI session failed", duration_ms);
+                }
+
+                if let Err(e) = checkpoint_mgr.save_step(&ai_checkpoint) {
+                    warn!("Failed to save setup AI step completion checkpoint: {}", e);
+                }
+
+                if !result.success {
                     warn!("SETUP-PHASE: AI prompt steps failed");
                 }
             }
@@ -180,137 +273,38 @@ impl SetupExecutor {
         (overall_success, all_results)
     }
 
-    async fn run_setup_ai(
+    /// Run setup and return a unified ExecutionOutcome.
+    ///
+    /// This uses the IntoOutcome trait to convert the SetupResult into a
+    /// standardized ExecutionOutcome, which is useful for consistent result handling.
+    ///
+    /// # Arguments
+    /// * `config` - The setup configuration
+    /// * `logger` - Logger for step events
+    ///
+    /// # Returns
+    /// An `ExecutionOutcome` summarizing the setup phase execution.
+    pub async fn run_setup_to_outcome(
         &self,
-        prompt: &str,
-        execution_id: &str,
-        workflow_name: &str,
-        timeout_seconds: u64,
-        step_name: &str,
-    ) -> bool {
-        let session_id = format!("{}-setup", execution_id);
-        let start_time = std::time::Instant::now();
+        config: &SetupConfig,
+        logger: &StepEventLogger,
+    ) -> ExecutionOutcome {
+        let start = std::time::Instant::now();
 
-        let workspace_root = crate::mcp_api::get_workspace_paths_internal()
-            .map(|(root, _, _)| root.to_string_lossy().to_string())
-            .unwrap_or_else(|_| ".".to_string());
+        let (success, step_results) = self.run_setup(
+            &config.automation_steps,
+            &config.prompt_steps,
+            &config.execution_id,
+            &config.workflow_name,
+            config.timeout_seconds,
+            logger,
+        ).await;
 
-        let pid_tracker = self.pid_tracker.clone();
-        let retry_config = crate::settings::get_ai_settings().retry;
-        let app_handle = self.app_handle.clone();
+        let duration_ms = start.elapsed().as_millis() as u64;
 
-        let session_ctx = Some(crate::mcp_api::AiOutputSessionContext {
-            session_id: Some(session_id.clone()),
-            session_name: Some(format!("{} - Setup", workflow_name)),
-            phase: Some("setup".to_string()),
-        });
-
-        let finding_ctx = Some(crate::mcp_api::FindingContext {
-            task_run_id: execution_id.to_string(),
-            session_num: 0, // Setup is session 0
-        });
-
-        info!("SETUP-PHASE: Running setup AI (session: {})", session_id);
-
-        // Create metadata and builder for consistent events
-        let metadata = StepMetadata::setup(StepType::Prompt, step_name, 0);
-        let details = StepDetails::ai_session(session_id.clone());
-        let builder = StepEventBuilder::new(execution_id, metadata)
-            .with_details(details)
-            .with_workflow_name(workflow_name);
-
-        // Log start event
-        let start_event = builder.build_start();
-        if let Err(e) = self.checkpoint_db.create_task_run_event(&start_event) {
-            warn!("Failed to log setup AI start event: {}", e);
-        }
-
-        // Strip completion marker instructions - verification determines completion
-        let prompt_for_claude = strip_completion_marker_instructions(prompt);
-        let workspace_for_claude = workspace_root;
-        let sid_for_claude = session_id.clone();
-
-        let result = tokio::task::spawn_blocking(move || {
-            crate::mcp_api::run_claude_session_with_retry(
-                &workspace_for_claude,
-                &prompt_for_claude,
-                &sid_for_claude,
-                &app_handle,
-                timeout_seconds,
-                session_ctx,
-                finding_ctx,
-                Some(pid_tracker),
-                Some(&retry_config),
-            )
-        })
-        .await;
-
-        let duration_ms = start_time.elapsed().as_millis() as i64;
-
-        // Rebuild builder with updated details for completion event
-        let metadata = StepMetadata::setup(StepType::Prompt, step_name, 0);
-
-        match result {
-            Ok(Ok((success, output, _))) => {
-                info!(
-                    "SETUP-PHASE: AI completed (success={}, output={} chars, duration={}ms)",
-                    success,
-                    output.len(),
-                    duration_ms
-                );
-
-                let details =
-                    StepDetails::ai_session_complete(session_id.clone(), output.len(), duration_ms);
-                let builder = StepEventBuilder::new(execution_id, metadata)
-                    .with_details(details)
-                    .with_workflow_name(workflow_name);
-
-                let event = if success {
-                    builder.build_complete(duration_ms)
-                } else {
-                    builder.build_error(duration_ms, Some("AI reported failure"))
-                };
-
-                if let Err(e) = self.checkpoint_db.create_task_run_event(&event) {
-                    warn!("Failed to log setup AI complete event: {}", e);
-                }
-
-                success
-            }
-            Ok(Err(e)) => {
-                error!("SETUP-PHASE: AI failed: {}", e);
-
-                let details = StepDetails::ai_session(session_id.clone()).with_error(e.to_string());
-                let builder = StepEventBuilder::new(execution_id, metadata)
-                    .with_details(details)
-                    .with_workflow_name(workflow_name);
-
-                let event = builder.build_error(duration_ms, Some(&e));
-
-                if let Err(log_err) = self.checkpoint_db.create_task_run_event(&event) {
-                    warn!("Failed to log setup AI error event: {}", log_err);
-                }
-
-                false
-            }
-            Err(e) => {
-                error!("SETUP-PHASE: Task join error: {}", e);
-
-                let details = StepDetails::ai_session(session_id.clone()).with_error(e.to_string());
-                let builder = StepEventBuilder::new(execution_id, metadata)
-                    .with_details(details)
-                    .with_workflow_name(workflow_name);
-
-                let event =
-                    builder.build_error(duration_ms, Some(&format!("Task join error: {}", e)));
-
-                if let Err(log_err) = self.checkpoint_db.create_task_run_event(&event) {
-                    warn!("Failed to log setup AI error event: {}", log_err);
-                }
-
-                false
-            }
-        }
+        // Use the IntoOutcome trait for consistent conversion
+        let result = SetupResult { success, step_results };
+        result.into_outcome(duration_ms)
     }
 }
 
@@ -330,21 +324,38 @@ impl VerificationExecutor {
         config_storage: Arc<tokio::sync::Mutex<ConfigStorage>>,
         app_handle: tauri::AppHandle,
     ) -> Self {
+        let checkpoint_db = app_state.checkpoint_db.clone();
         Self {
             executor: StepExecutor::with_app_handle(app_state.clone(), config_storage, app_handle),
-            checkpoint_db: app_state.checkpoint_db.clone(),
+            checkpoint_db,
         }
     }
 
     /// Run verification steps.
     ///
     /// Returns (verification_result, step_results)
-    pub async fn execute(
+    /// The logger is required for consistent step event logging.
+    ///
+    /// Step checkpointing is now integrated to enable resume after crashes:
+    /// - Each step is checkpointed before (running) and after (success/failed) execution
+    /// - On resume, completed steps can be skipped based on checkpoint data
+    #[instrument(
+        name = "workflow.phase.verification",
+        skip(self, steps, logger),
+        fields(
+            execution_id = %execution_id,
+            iteration = iteration,
+            workflow_name = %workflow_name,
+            step_count = steps.len()
+        )
+    )]
+    pub async fn run_verification(
         &self,
         steps: &[ExecutionStepConfig],
         execution_id: &str,
         iteration: u32,
         workflow_name: &str,
+        logger: &StepEventLogger,
     ) -> (VerificationPhaseResult, Vec<StepExecutionResult>) {
         if steps.is_empty() {
             info!(
@@ -374,24 +385,41 @@ impl VerificationExecutor {
             iteration
         );
 
-        // Log START events for each step before execution
+        // Create checkpoint manager for step-level checkpointing
+        let checkpoint_mgr = CheckpointManager::new(self.checkpoint_db.clone(), "unified");
+
+        // Log START events and save checkpoints for each step before execution
         for (idx, step) in steps.iter().enumerate() {
             let step_type =
                 StepType::from_str_compat(&step.step_type).unwrap_or(StepType::Playwright);
             let step_name = step.name.as_deref().unwrap_or(&step.step_type);
-            let metadata = StepMetadata::verification(step_type, step_name, idx, iteration);
-            let builder =
-                StepEventBuilder::new(execution_id, metadata).with_workflow_name(workflow_name);
+            let metadata = StepMetadata::verification(execution_id, step_type.clone(), step_name, idx, iteration);
+            let details = StepDetails::default();
 
-            let start_event = builder.build_start();
-            if let Err(e) = self.checkpoint_db.create_task_run_event(&start_event) {
+            if let Err(e) = logger.log_start(StepEventKind::VerificationStepStart, metadata, details) {
                 warn!("Failed to log verification step start event: {}", e);
+            }
+
+            // Save step checkpoint as "running"
+            let mut checkpoint = StepCheckpoint::new(
+                execution_id,
+                "unified",
+                "verification",
+                Some(iteration),
+                idx,
+                step_type.as_str(),
+            ).with_step_name(step_name);
+            checkpoint.mark_started();
+            if let Err(e) = checkpoint_mgr.save_step(&checkpoint) {
+                warn!("Failed to save verification step checkpoint: {}", e);
             }
         }
 
+        // Use the new method that emits completion events as each step finishes
+        // This allows the UI to show real-time progress instead of waiting for all steps
         let result = self
             .executor
-            .execute_verification_steps(steps, execution_id, iteration)
+            .execute_verification_steps_with_events(steps, execution_id, iteration, Some(workflow_name))
             .await;
 
         info!(
@@ -404,42 +432,74 @@ impl VerificationExecutor {
             result.failed_steps
         );
 
-        // Log step_execution completion events for each verification step for Timeline widget
-        for step_result in &result.step_results {
-            let step_type =
-                StepType::from_str_compat(&step_result.step_type).unwrap_or(StepType::Playwright);
-            let metadata = StepMetadata::verification(
-                step_type,
-                &step_result.step_name,
-                step_result.step_index,
-                iteration,
-            );
+        // Save completion checkpoints for each step
+        for (idx, step_result) in result.step_results.iter().enumerate() {
+            let step = &steps[idx];
+            let step_type = StepType::from_str_compat(&step.step_type).unwrap_or(StepType::Playwright);
+            let step_name = step.name.as_deref().unwrap_or(&step.step_type);
 
-            let details = if step_result.success {
-                StepDetails::default().with_duration(step_result.duration_ms as i64)
+            let mut checkpoint = StepCheckpoint::new(
+                execution_id,
+                "unified",
+                "verification",
+                Some(iteration),
+                idx,
+                step_type.as_str(),
+            ).with_step_name(step_name);
+
+            let duration_ms = step_result.duration_ms as i64;
+            if step_result.success {
+                checkpoint.mark_success(
+                    serde_json::to_string(step_result).ok(),
+                    duration_ms,
+                );
             } else {
-                StepDetails::default()
-                    .with_duration(step_result.duration_ms as i64)
-                    .with_error(step_result.error.clone().unwrap_or_default())
-            };
+                checkpoint.mark_failed(
+                    step_result.error.as_deref().unwrap_or("Unknown error"),
+                    duration_ms,
+                );
+            }
 
-            let builder = StepEventBuilder::new(execution_id, metadata)
-                .with_details(details)
-                .with_workflow_name(workflow_name);
-
-            let event = if step_result.success {
-                builder.build_complete(step_result.duration_ms as i64)
-            } else {
-                builder.build_error(step_result.duration_ms as i64, step_result.error.as_deref())
-            };
-
-            if let Err(e) = self.checkpoint_db.create_task_run_event(&event) {
-                warn!("Failed to log verification step event: {}", e);
+            if let Err(e) = checkpoint_mgr.save_step(&checkpoint) {
+                warn!("Failed to save verification step completion checkpoint: {}", e);
             }
         }
 
         let step_results = result.step_results.clone();
         (result, step_results)
+    }
+
+    /// Run verification and return a unified ExecutionOutcome.
+    ///
+    /// This uses the IntoOutcome trait to convert the VerificationResult into a
+    /// standardized ExecutionOutcome, which is useful for consistent result handling.
+    ///
+    /// # Arguments
+    /// * `config` - The verification configuration
+    /// * `logger` - Logger for step events
+    ///
+    /// # Returns
+    /// An `ExecutionOutcome` summarizing the verification phase execution.
+    pub async fn run_verification_to_outcome(
+        &self,
+        config: &VerificationConfig,
+        logger: &StepEventLogger,
+    ) -> ExecutionOutcome {
+        let start = std::time::Instant::now();
+
+        let (phase_result, step_results) = self.run_verification(
+            &config.steps,
+            &config.execution_id,
+            config.iteration,
+            &config.workflow_name,
+            logger,
+        ).await;
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        // Use the IntoOutcome trait for consistent conversion
+        let result = VerificationResult { phase_result, step_results };
+        result.into_outcome(duration_ms)
     }
 }
 
@@ -448,9 +508,9 @@ impl VerificationExecutor {
 // =============================================================================
 
 /// Executes the AI agentic phase with failure context.
+/// AI session execution is delegated to the UnifiedAiSessionExecutor.
 pub struct AgenticExecutor {
-    app_handle: tauri::AppHandle,
-    pid_tracker: Arc<std::sync::Mutex<Vec<u32>>>,
+    ai_executor: UnifiedAiSessionExecutor,
     checkpoint_db: Arc<CheckpointDb>,
 }
 
@@ -460,22 +520,38 @@ impl AgenticExecutor {
         app_handle: tauri::AppHandle,
         pid_tracker: Arc<std::sync::Mutex<Vec<u32>>>,
     ) -> Self {
+        let checkpoint_db = app_state.checkpoint_db.clone();
         Self {
-            app_handle,
-            pid_tracker,
-            checkpoint_db: app_state.checkpoint_db.clone(),
+            ai_executor: UnifiedAiSessionExecutor::new(app_state, app_handle, pid_tracker),
+            checkpoint_db,
         }
     }
 
     /// Run the AI with the given prompt and failure context.
     ///
     /// This calls Claude directly (no session system, no orchestrator).
-    pub async fn execute(
+    /// The logger is required for consistent step event logging.
+    ///
+    /// Step checkpointing is integrated for resume capability.
+    /// Progress markers from previous sessions are included in the context
+    /// to help the AI understand where to resume long operations.
+    #[instrument(
+        name = "workflow.phase.agentic",
+        skip(self, config, failure_context, logger),
+        fields(
+            execution_id = %config.execution_id,
+            iteration = iteration,
+            workflow_name = %config.workflow_name,
+            has_steps = has_agentic_steps
+        )
+    )]
+    pub async fn run_agentic(
         &self,
         config: &LoopConfig,
         iteration: u32,
         failure_context: &str,
         has_agentic_steps: bool,
+        logger: &StepEventLogger,
     ) -> AgenticOutcome {
         if !has_agentic_steps {
             info!(
@@ -485,181 +561,158 @@ impl AgenticExecutor {
             return AgenticOutcome::Skipped;
         }
 
-        // Build enhanced prompt with failure context
-        // Strip any [TASK_COMPLETE] instructions from the base prompt since
-        // in unified workflows, VERIFICATION determines completion, not the AI.
-        let clean_base_prompt = strip_completion_marker_instructions(&config.base_prompt);
+        // Create checkpoint manager for step-level checkpointing
+        let checkpoint_mgr = CheckpointManager::new(self.checkpoint_db.clone(), "unified");
 
+        // Try to get the latest progress marker from previous checkpoints
+        // This helps the AI understand where to resume if a previous session was interrupted
+        let progress_context = self.get_progress_marker_context(&config.execution_id, iteration);
+
+        // Checkpoint the agentic phase as a single step
+        let mut checkpoint = StepCheckpoint::new(
+            &config.execution_id,
+            "unified",
+            "agentic",
+            Some(iteration),
+            0, // Agentic is a single-step phase
+            "ai_session",
+        ).with_step_name("AI Fixing Issues");
+        checkpoint.mark_started();
+        if let Err(e) = checkpoint_mgr.save_step(&checkpoint) {
+            warn!("Failed to save agentic step checkpoint: {}", e);
+        }
+
+        // Build enhanced prompt with failure context and progress marker
+        // Note: The UnifiedAiSessionExecutor will handle:
+        // - Adding autonomous context (configured in AiSessionConfig::agentic)
+        // - Stripping completion markers
+        // - Appending finding instructions
         let enhanced_prompt = if failure_context.is_empty() {
             warn!(
                 "AGENTIC-PHASE: No failure context provided for iteration {} - AI won't know what to fix!",
                 iteration
             );
-            clean_base_prompt
+            // Still include progress context if available
+            if let Some(ref progress) = progress_context {
+                format!("{}\n\n{}", config.base_prompt, progress)
+            } else {
+                config.base_prompt.clone()
+            }
         } else {
             info!(
                 "AGENTIC-PHASE: Building prompt with {} chars of failure context (iteration {})",
                 failure_context.len(),
                 iteration
             );
-            format!(
+            let base = format!(
                 "{}\n\n---\n\nThe following verification checks FAILED. Please fix these issues:\n\n{}\n\nFix the issues above and ensure all checks pass.",
-                clean_base_prompt, failure_context
-            )
+                config.base_prompt, failure_context
+            );
+            // Append progress context if available
+            if let Some(ref progress) = progress_context {
+                format!("{}\n\n{}", base, progress)
+            } else {
+                base
+            }
         };
 
-        let session_id = format!("{}-agentic-{}", config.execution_id, iteration);
-        let step_name = format!("Fix issues (iteration {})", iteration);
-        let start_time = std::time::Instant::now();
+        // Use the unified AI session executor with timing
+        let ai_config = AiSessionConfig::agentic(
+            &config.execution_id,
+            &config.workflow_name,
+            iteration,
+        ).with_timeout(config.timeout_seconds);
 
-        let workspace_root = crate::mcp_api::get_workspace_paths_internal()
-            .map(|(root, _, _)| root.to_string_lossy().to_string())
-            .unwrap_or_else(|_| ".".to_string());
+        let (result, duration_ms) = timeout_helper::timed_result_async(
+            self.ai_executor.execute(&ai_config, &enhanced_prompt, logger)
+        ).await;
+        let duration_ms = duration_ms as i64;
 
-        let pid_tracker = self.pid_tracker.clone();
-        let retry_config = crate::settings::get_ai_settings().retry;
-        let app_handle = self.app_handle.clone();
+        // Checkpoint completion
+        let mut completion_checkpoint = StepCheckpoint::new(
+            &config.execution_id,
+            "unified",
+            "agentic",
+            Some(iteration),
+            0,
+            "ai_session",
+        ).with_step_name("AI Fixing Issues");
 
-        // Create context for output grouping
-        let session_ctx = Some(crate::mcp_api::AiOutputSessionContext {
-            session_id: Some(session_id.clone()),
-            session_name: Some(format!(
-                "{} - Iteration {}",
-                config.workflow_name, iteration
-            )),
-            phase: Some("agentic".to_string()),
-        });
+        let outcome = if result.success {
+            completion_checkpoint.mark_success(Some(result.output.clone()), duration_ms);
+            AgenticOutcome::Success {
+                output: result.output,
+            }
+        } else if result.output.is_empty() {
+            completion_checkpoint.mark_failed("AI session failed", duration_ms);
+            AgenticOutcome::Error {
+                error: "AI session failed".to_string(),
+            }
+        } else {
+            completion_checkpoint.mark_failed("AI reported failure", duration_ms);
+            AgenticOutcome::Failed {
+                output: result.output,
+                error: "AI reported failure".to_string(),
+            }
+        };
 
-        // Create finding context
-        let finding_ctx = Some(crate::mcp_api::FindingContext {
-            task_run_id: config.execution_id.clone(),
-            session_num: iteration,
-        });
+        if let Err(e) = checkpoint_mgr.save_step(&completion_checkpoint) {
+            warn!("Failed to save agentic step completion checkpoint: {}", e);
+        }
+
+        outcome
+    }
+
+    /// Get progress marker context from previous checkpoints.
+    ///
+    /// This queries for the most recent checkpoint from a previous agentic session
+    /// and retrieves its latest progress marker. This information helps the AI
+    /// understand where to resume long operations.
+    ///
+    /// Returns a formatted string like:
+    /// "Last progress: file_progress 50/100. Continue from where you left off."
+    fn get_progress_marker_context(&self, execution_id: &str, iteration: u32) -> Option<String> {
+        // Get checkpoints for the agentic phase at this iteration
+        let checkpoints = self
+            .checkpoint_db
+            .get_workflow_step_checkpoints(execution_id, "agentic", Some(iteration))
+            .ok()?;
+
+        // Find the most recent checkpoint (by step_index descending, or just take the last one)
+        // There should typically only be one checkpoint per iteration, but we want the latest
+        let latest_checkpoint = checkpoints.into_iter().last()?;
+
+        // Query for the latest progress marker using the checkpoint's id
+        let progress_marker = self
+            .checkpoint_db
+            .get_latest_step_progress_marker(&latest_checkpoint.id)
+            .ok()
+            .flatten()?;
+
+        // Format the progress context message
+        let progress_string = progress_marker.progress_string();
+        let marker_type = &progress_marker.marker_type;
+
+        let mut message = format!(
+            "---\n\n**Resume Context:** Last progress: {} {}.",
+            marker_type, progress_string
+        );
+
+        // Add description if available
+        if let Some(description) = &progress_marker.description {
+            message.push_str(&format!(" ({})", description));
+        }
+
+        message.push_str(" Continue from where you left off.");
 
         info!(
-            "AGENTIC-PHASE: Running Claude directly for iteration {} (session: {})",
-            iteration, session_id
+            "AGENTIC-PHASE: Including progress marker context: {} {}/{}",
+            marker_type,
+            progress_marker.current_value,
+            progress_marker.total_value.map_or("?".to_string(), |v| v.to_string())
         );
 
-        // Create metadata and builder for consistent events
-        // Use iteration as step_index for agentic AI steps
-        let metadata = StepMetadata::agentic(
-            StepType::AiSession,
-            &step_name,
-            iteration as usize,
-            iteration,
-        );
-        let details = StepDetails::ai_session(session_id.clone());
-        let builder = StepEventBuilder::new(&config.execution_id, metadata.clone())
-            .with_details(details)
-            .with_workflow_name(&config.workflow_name);
-
-        // Log start event
-        let start_event = builder.build_start();
-        if let Err(e) = self.checkpoint_db.create_task_run_event(&start_event) {
-            warn!("Failed to log agentic AI start event: {}", e);
-        }
-
-        // Run Claude directly - bypasses session system and orchestrator
-        let prompt_for_claude = enhanced_prompt;
-        let workspace_for_claude = workspace_root;
-        let sid_for_claude = session_id.clone();
-        let timeout = config.timeout_seconds;
-
-        let result = tokio::task::spawn_blocking(move || {
-            crate::mcp_api::run_claude_session_with_retry(
-                &workspace_for_claude,
-                &prompt_for_claude,
-                &sid_for_claude,
-                &app_handle,
-                timeout,
-                session_ctx,
-                finding_ctx,
-                Some(pid_tracker),
-                Some(&retry_config),
-            )
-        })
-        .await;
-
-        let duration_ms = start_time.elapsed().as_millis() as i64;
-
-        match result {
-            Ok(Ok((success, output, _retry_state))) => {
-                info!(
-                    "AGENTIC-PHASE: Claude completed (success={}, output={} chars, duration={}ms) for iteration {}",
-                    success,
-                    output.len(),
-                    duration_ms,
-                    iteration
-                );
-
-                let details =
-                    StepDetails::ai_session_complete(session_id.clone(), output.len(), duration_ms);
-                let builder = StepEventBuilder::new(&config.execution_id, metadata)
-                    .with_details(details)
-                    .with_workflow_name(&config.workflow_name);
-
-                let event = if success {
-                    builder.build_complete(duration_ms)
-                } else {
-                    builder.build_error(duration_ms, Some("AI reported failure"))
-                };
-
-                if let Err(e) = self.checkpoint_db.create_task_run_event(&event) {
-                    warn!("Failed to log agentic AI complete event: {}", e);
-                }
-
-                if success {
-                    AgenticOutcome::Success { output }
-                } else {
-                    AgenticOutcome::Failed {
-                        output: output.clone(),
-                        error: "AI reported failure".to_string(),
-                    }
-                }
-            }
-            Ok(Err(e)) => {
-                error!(
-                    "AGENTIC-PHASE: Claude failed with error for iteration {}: {}",
-                    iteration, e
-                );
-
-                let details = StepDetails::ai_session(session_id.clone()).with_error(e.to_string());
-                let builder = StepEventBuilder::new(&config.execution_id, metadata)
-                    .with_details(details)
-                    .with_workflow_name(&config.workflow_name);
-
-                let event = builder.build_error(duration_ms, Some(&e));
-
-                if let Err(log_err) = self.checkpoint_db.create_task_run_event(&event) {
-                    warn!("Failed to log agentic AI error event: {}", log_err);
-                }
-
-                AgenticOutcome::Error { error: e }
-            }
-            Err(e) => {
-                error!(
-                    "AGENTIC-PHASE: Task join error for iteration {}: {}",
-                    iteration, e
-                );
-
-                let details = StepDetails::ai_session(session_id.clone()).with_error(e.to_string());
-                let builder = StepEventBuilder::new(&config.execution_id, metadata)
-                    .with_details(details)
-                    .with_workflow_name(&config.workflow_name);
-
-                let event =
-                    builder.build_error(duration_ms, Some(&format!("Task join error: {}", e)));
-
-                if let Err(log_err) = self.checkpoint_db.create_task_run_event(&event) {
-                    warn!("Failed to log agentic AI error event: {}", log_err);
-                }
-
-                AgenticOutcome::Error {
-                    error: format!("Task join error: {}", e),
-                }
-            }
-        }
+        Some(message)
     }
 }
 
@@ -668,10 +721,10 @@ impl AgenticExecutor {
 // =============================================================================
 
 /// Executes the completion phase (runs once after verification passes).
+/// AI session execution is delegated to the UnifiedAiSessionExecutor.
 pub struct CompletionExecutor {
     executor: StepExecutor,
-    app_handle: tauri::AppHandle,
-    pid_tracker: Arc<std::sync::Mutex<Vec<u32>>>,
+    ai_executor: UnifiedAiSessionExecutor,
     checkpoint_db: Arc<CheckpointDb>,
 }
 
@@ -682,31 +735,55 @@ impl CompletionExecutor {
         app_handle: tauri::AppHandle,
         pid_tracker: Arc<std::sync::Mutex<Vec<u32>>>,
     ) -> Self {
+        let checkpoint_db = app_state.checkpoint_db.clone();
         Self {
             executor: StepExecutor::with_app_handle(
                 app_state.clone(),
                 config_storage,
                 app_handle.clone(),
             ),
-            app_handle,
-            pid_tracker,
-            checkpoint_db: app_state.checkpoint_db.clone(),
+            ai_executor: UnifiedAiSessionExecutor::new(app_state, app_handle, pid_tracker),
+            checkpoint_db,
         }
     }
 
     /// Run completion steps.
     ///
     /// This should ONLY be called when verification has passed.
-    pub async fn execute(
+    ///
+    /// # Arguments
+    /// * `iterations_run` - Number of verification-agentic iterations that were executed.
+    ///   Used to calculate the correct turn number for the completion phase.
+    /// * `timeout_seconds` - Optional inactivity timeout. None means no timeout (default).
+    /// * `logger` - Required logger for consistent step event logging.
+    ///
+    /// Step checkpointing is integrated for resume capability.
+    #[instrument(
+        name = "workflow.phase.completion",
+        skip(self, automation_steps, prompt_steps, logger),
+        fields(
+            execution_id = %execution_id,
+            workflow_name = %workflow_name,
+            automation_step_count = automation_steps.len(),
+            prompt_step_count = prompt_steps.len(),
+            iterations_run = iterations_run
+        )
+    )]
+    pub async fn run_completion(
         &self,
         automation_steps: &[ExecutionStepConfig],
         prompt_steps: &[ExecutionStepConfig],
         execution_id: &str,
         workflow_name: &str,
-        timeout_seconds: u64,
+        timeout_seconds: Option<u64>,
+        iterations_run: u32,
+        logger: &StepEventLogger,
     ) -> (bool, Vec<StepExecutionResult>) {
         let mut all_results = Vec::new();
         let mut overall_success = true;
+
+        // Create checkpoint manager for step-level checkpointing
+        let checkpoint_mgr = CheckpointManager::new(self.checkpoint_db.clone(), "unified");
 
         // Run automation completion steps
         if !automation_steps.is_empty() {
@@ -715,10 +792,64 @@ impl CompletionExecutor {
                 automation_steps.len()
             );
 
+            // Checkpoint each automation step
+            for (idx, step) in automation_steps.iter().enumerate() {
+                let step_type = StepType::from_str_compat(&step.step_type)
+                    .unwrap_or(StepType::ShellCommand);
+                let step_name = step.name.as_deref().unwrap_or(&step.step_type);
+
+                let mut checkpoint = StepCheckpoint::new(
+                    execution_id,
+                    "unified",
+                    "completion",
+                    None,
+                    idx,
+                    step_type.as_str(),
+                ).with_step_name(step_name);
+                checkpoint.mark_started();
+                if let Err(e) = checkpoint_mgr.save_step(&checkpoint) {
+                    warn!("Failed to save completion step checkpoint: {}", e);
+                }
+            }
+
             let result = self
                 .executor
                 .execute_completion_phase(automation_steps, execution_id, &[])
                 .await;
+
+            // Checkpoint completion for each step
+            for (idx, step_result) in result.steps.iter().enumerate() {
+                let step = &automation_steps[idx];
+                let step_type = StepType::from_str_compat(&step.step_type)
+                    .unwrap_or(StepType::ShellCommand);
+                let step_name = step.name.as_deref().unwrap_or(&step.step_type);
+
+                let mut checkpoint = StepCheckpoint::new(
+                    execution_id,
+                    "unified",
+                    "completion",
+                    None,
+                    idx,
+                    step_type.as_str(),
+                ).with_step_name(step_name);
+
+                let duration_ms = step_result.duration_ms as i64;
+                if step_result.success {
+                    checkpoint.mark_success(
+                        serde_json::to_string(step_result).ok(),
+                        duration_ms,
+                    );
+                } else {
+                    checkpoint.mark_failed(
+                        step_result.error.as_deref().unwrap_or("Unknown error"),
+                        duration_ms,
+                    );
+                }
+
+                if let Err(e) = checkpoint_mgr.save_step(&checkpoint) {
+                    warn!("Failed to save completion step completion checkpoint: {}", e);
+                }
+            }
 
             overall_success = overall_success && result.success;
             all_results.extend(result.steps);
@@ -735,145 +866,69 @@ impl CompletionExecutor {
                 prompt_steps.len()
             );
 
-            // Get the combined step name for display
-            let step_name = prompt_steps
-                .iter()
-                .filter_map(|s| s.name.as_ref())
-                .map(|n| n.as_str())
-                .collect::<Vec<_>>()
-                .join(" + ");
-            let step_name = if step_name.is_empty() {
-                "Completion AI Task".to_string()
-            } else {
-                step_name
-            };
+            // Checkpoint the AI step as a single step
+            let ai_step_idx = automation_steps.len();
+            let step_name = prompt_builder::consolidate_step_names_with_default(
+                prompt_steps,
+                "Completion AI Task",
+            );
 
-            let completion_prompt: String = prompt_steps
-                .iter()
-                .filter_map(|s| s.prompt_content.as_ref())
-                .map(|c| c.as_str())
-                .collect::<Vec<_>>()
-                .join("\n\n---\n\n");
+            let mut ai_checkpoint = StepCheckpoint::new(
+                execution_id,
+                "unified",
+                "completion",
+                None,
+                ai_step_idx,
+                "ai_session",
+            ).with_step_name(&step_name);
+            ai_checkpoint.mark_started();
+            if let Err(e) = checkpoint_mgr.save_step(&ai_checkpoint) {
+                warn!("Failed to save completion AI step checkpoint: {}", e);
+            }
+
+            // Use structured prompts for granular sub-step tracking
+            let (completion_prompt, sub_step_metadata) =
+                prompt_builder::consolidate_prompts_structured(prompt_steps, "completion");
 
             if !completion_prompt.is_empty() {
-                let success = self
-                    .run_completion_ai(
-                        &completion_prompt,
-                        execution_id,
-                        workflow_name,
-                        timeout_seconds,
-                        &step_name,
-                    )
-                    .await;
-                overall_success = overall_success && success;
-            }
-        }
+                // Use the unified AI session executor with sub-step metadata
+                let config = AiSessionConfig::completion(
+                    execution_id,
+                    workflow_name,
+                    &step_name,
+                    iterations_run,
+                ).with_timeout(timeout_seconds)
+                 .with_sub_step_metadata(sub_step_metadata);
 
-        (overall_success, all_results)
-    }
+                let (result, duration_ms) = timeout_helper::timed_result_async(
+                    self.ai_executor.execute(&config, &completion_prompt, logger)
+                ).await;
+                let duration_ms = duration_ms as i64;
+                let mut ai_completion_checkpoint = StepCheckpoint::new(
+                    execution_id,
+                    "unified",
+                    "completion",
+                    None,
+                    ai_step_idx,
+                    "ai_session",
+                ).with_step_name(&step_name);
 
-    async fn run_completion_ai(
-        &self,
-        prompt: &str,
-        execution_id: &str,
-        workflow_name: &str,
-        timeout_seconds: u64,
-        step_name: &str,
-    ) -> bool {
-        let session_id = format!("{}-completion", execution_id);
-        let start_time = std::time::Instant::now();
-
-        let workspace_root = crate::mcp_api::get_workspace_paths_internal()
-            .map(|(root, _, _)| root.to_string_lossy().to_string())
-            .unwrap_or_else(|_| ".".to_string());
-
-        let pid_tracker = self.pid_tracker.clone();
-        let retry_config = crate::settings::get_ai_settings().retry;
-        let app_handle = self.app_handle.clone();
-
-        let session_ctx = Some(crate::mcp_api::AiOutputSessionContext {
-            session_id: Some(session_id.clone()),
-            session_name: Some(format!("{} - Completion", workflow_name)),
-            phase: Some("completion".to_string()),
-        });
-
-        let finding_ctx = Some(crate::mcp_api::FindingContext {
-            task_run_id: execution_id.to_string(),
-            session_num: 999,
-        });
-
-        info!(
-            "COMPLETION-PHASE: Running completion AI (session: {})",
-            session_id
-        );
-
-        // Create metadata and builder for consistent events
-        let metadata = StepMetadata::completion(StepType::Prompt, step_name, 0);
-        let details = StepDetails::ai_session(session_id.clone());
-        let builder = StepEventBuilder::new(execution_id, metadata.clone())
-            .with_details(details)
-            .with_workflow_name(workflow_name);
-
-        // Log start event (previously missing!)
-        let start_event = builder.build_start();
-        if let Err(e) = self.checkpoint_db.create_task_run_event(&start_event) {
-            warn!("Failed to log completion AI start event: {}", e);
-        }
-
-        // Strip completion marker instructions for consistency, even though
-        // the completion phase runs after verification passed
-        let prompt_for_claude = strip_completion_marker_instructions(prompt);
-        let workspace_for_claude = workspace_root;
-        let sid_for_claude = session_id.clone();
-
-        let result = tokio::task::spawn_blocking(move || {
-            crate::mcp_api::run_claude_session_with_retry(
-                &workspace_for_claude,
-                &prompt_for_claude,
-                &sid_for_claude,
-                &app_handle,
-                timeout_seconds,
-                session_ctx,
-                finding_ctx,
-                Some(pid_tracker),
-                Some(&retry_config),
-            )
-        })
-        .await;
-
-        let duration_ms = start_time.elapsed().as_millis() as i64;
-
-        match result {
-            Ok(Ok((success, output, _))) => {
-                info!(
-                    "COMPLETION-PHASE: AI completed (success={}, output={} chars, duration={}ms)",
-                    success,
-                    output.len(),
-                    duration_ms
-                );
-
-                let details =
-                    StepDetails::ai_session_complete(session_id.clone(), output.len(), duration_ms);
-                let builder = StepEventBuilder::new(execution_id, metadata)
-                    .with_details(details)
-                    .with_workflow_name(workflow_name);
-
-                let event = if success {
-                    builder.build_complete(duration_ms)
+                if result.success {
+                    ai_completion_checkpoint.mark_success(Some(result.output.clone()), duration_ms);
                 } else {
-                    builder.build_error(duration_ms, Some("AI reported failure"))
-                };
-
-                if let Err(e) = self.checkpoint_db.create_task_run_event(&event) {
-                    warn!("Failed to log completion AI complete event: {}", e);
+                    ai_completion_checkpoint.mark_failed("AI session failed", duration_ms);
                 }
 
-                // Save the AI output as the task summary
+                if let Err(e) = checkpoint_mgr.save_step(&ai_completion_checkpoint) {
+                    warn!("Failed to save completion AI step completion checkpoint: {}", e);
+                }
+
+                // Save the AI output as the task summary (only on success)
                 // The completion AI output should be the summary shown in the recap page
-                if success && !output.is_empty() {
+                if result.success && !result.output.is_empty() {
                     if let Err(e) = self.checkpoint_db.update_task_summary(
                         execution_id,
-                        &output,
+                        &result.output,
                         true, // goal_achieved = true since verification passed
                         None, // remaining_work = None since task is complete
                     ) {
@@ -881,46 +936,260 @@ impl CompletionExecutor {
                     } else {
                         info!(
                             "Saved completion AI output ({} chars) as task summary",
-                            output.len()
+                            result.output.len()
                         );
                     }
                 }
 
-                success
-            }
-            Ok(Err(e)) => {
-                error!("COMPLETION-PHASE: AI failed: {}", e);
-
-                let details = StepDetails::ai_session(session_id.clone()).with_error(e.to_string());
-                let builder = StepEventBuilder::new(execution_id, metadata)
-                    .with_details(details)
-                    .with_workflow_name(workflow_name);
-
-                let event = builder.build_error(duration_ms, Some(&e));
-
-                if let Err(log_err) = self.checkpoint_db.create_task_run_event(&event) {
-                    warn!("Failed to log completion AI error event: {}", log_err);
-                }
-
-                false
-            }
-            Err(e) => {
-                error!("COMPLETION-PHASE: Task join error: {}", e);
-
-                let details = StepDetails::ai_session(session_id.clone()).with_error(e.to_string());
-                let builder = StepEventBuilder::new(execution_id, metadata)
-                    .with_details(details)
-                    .with_workflow_name(workflow_name);
-
-                let event =
-                    builder.build_error(duration_ms, Some(&format!("Task join error: {}", e)));
-
-                if let Err(log_err) = self.checkpoint_db.create_task_run_event(&event) {
-                    warn!("Failed to log completion AI error event: {}", log_err);
-                }
-
-                false
+                overall_success = overall_success && result.success;
             }
         }
+
+        (overall_success, all_results)
+    }
+
+    /// Run completion and return a unified ExecutionOutcome.
+    ///
+    /// This uses the IntoOutcome trait to convert the CompletionResult into a
+    /// standardized ExecutionOutcome, which is useful for consistent result handling.
+    ///
+    /// # Arguments
+    /// * `config` - The completion configuration
+    /// * `logger` - Logger for step events
+    ///
+    /// # Returns
+    /// An `ExecutionOutcome` summarizing the completion phase execution.
+    pub async fn run_completion_to_outcome(
+        &self,
+        config: &CompletionConfig,
+        logger: &StepEventLogger,
+    ) -> ExecutionOutcome {
+        let start = std::time::Instant::now();
+
+        let (success, step_results) = self.run_completion(
+            &config.automation_steps,
+            &config.prompt_steps,
+            &config.execution_id,
+            &config.workflow_name,
+            config.timeout_seconds,
+            config.iterations_run,
+            logger,
+        ).await;
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        // Use the IntoOutcome trait for consistent conversion
+        let result = CompletionResult { success, step_results };
+        result.into_outcome(duration_ms)
+    }
+}
+
+// =============================================================================
+// FromContext Implementations
+// =============================================================================
+
+impl FromContext for SetupExecutor {
+    fn from_context(context: ExecutorContext) -> Result<Self, ExecutorError> {
+        let config_storage = context
+            .config_storage()
+            .cloned()
+            .ok_or(ExecutorError::missing("config_storage"))?;
+        let pid_tracker = context
+            .pid_tracker()
+            .cloned()
+            .ok_or(ExecutorError::missing("pid_tracker"))?;
+
+        Ok(Self::new(
+            context.app_state,
+            config_storage,
+            context.app_handle,
+            pid_tracker,
+        ))
+    }
+}
+
+impl FromContext for VerificationExecutor {
+    fn from_context(context: ExecutorContext) -> Result<Self, ExecutorError> {
+        let config_storage = context
+            .config_storage()
+            .cloned()
+            .ok_or(ExecutorError::missing("config_storage"))?;
+
+        Ok(Self::new(
+            context.app_state,
+            config_storage,
+            context.app_handle,
+        ))
+    }
+}
+
+impl FromContext for AgenticExecutor {
+    fn from_context(context: ExecutorContext) -> Result<Self, ExecutorError> {
+        let pid_tracker = context
+            .pid_tracker()
+            .cloned()
+            .ok_or(ExecutorError::missing("pid_tracker"))?;
+
+        Ok(Self::new(
+            context.app_state,
+            context.app_handle,
+            pid_tracker,
+        ))
+    }
+}
+
+impl FromContext for CompletionExecutor {
+    fn from_context(context: ExecutorContext) -> Result<Self, ExecutorError> {
+        let config_storage = context
+            .config_storage()
+            .cloned()
+            .ok_or(ExecutorError::missing("config_storage"))?;
+        let pid_tracker = context
+            .pid_tracker()
+            .cloned()
+            .ok_or(ExecutorError::missing("pid_tracker"))?;
+
+        Ok(Self::new(
+            context.app_state,
+            config_storage,
+            context.app_handle,
+            pid_tracker,
+        ))
+    }
+}
+
+// =============================================================================
+// Executor Trait Implementations
+// =============================================================================
+
+/// Wrapper to hold a logger for async execution.
+/// Since SetupConfig can't own the logger (it's borrowed), we need a separate
+/// struct that contains everything needed for execution.
+pub struct SetupExecutionRequest<'a> {
+    pub config: SetupConfig,
+    pub logger: &'a StepEventLogger,
+}
+
+#[async_trait]
+impl Executor for SetupExecutor {
+    type Config = SetupConfig;
+    type Output = SetupResult;
+
+    async fn execute(&self, config: Self::Config) -> Result<Self::Output, ExecutorError> {
+        // Create a logger for this execution
+        // Note: This is a simplified version that doesn't use the StepEventLogger
+        // because the trait interface doesn't allow passing borrowed references.
+        // For full logging support, use the direct execute() method with a logger.
+        let (success, step_results) = self
+            .run_setup(
+                &config.automation_steps,
+                &config.prompt_steps,
+                &config.execution_id,
+                &config.workflow_name,
+                config.timeout_seconds,
+                &StepEventLogger::noop(),
+            )
+            .await;
+
+        Ok(SetupResult {
+            success,
+            step_results,
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "setup"
+    }
+}
+
+#[async_trait]
+impl Executor for VerificationExecutor {
+    type Config = VerificationConfig;
+    type Output = VerificationResult;
+
+    async fn execute(&self, config: Self::Config) -> Result<Self::Output, ExecutorError> {
+        let (phase_result, step_results) = self
+            .run_verification(
+                &config.steps,
+                &config.execution_id,
+                config.iteration,
+                &config.workflow_name,
+                &StepEventLogger::noop(),
+            )
+            .await;
+
+        Ok(VerificationResult {
+            phase_result,
+            step_results,
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "verification"
+    }
+}
+
+#[async_trait]
+impl Executor for AgenticExecutor {
+    type Config = AgenticConfig;
+    type Output = AgenticOutcome;
+
+    async fn execute(&self, config: Self::Config) -> Result<Self::Output, ExecutorError> {
+        // Build a LoopConfig from AgenticConfig
+        let loop_config = LoopConfig {
+            max_iterations: config.max_iterations,
+            timeout_seconds: config.timeout_seconds,
+            base_prompt: config.base_prompt,
+            workflow_name: config.workflow_name,
+            workflow_id: config.workflow_id,
+            execution_id: config.execution_id.clone(),
+            targeted_error_ids: Vec::new(),
+            starting_iteration: 0,
+        };
+
+        let outcome = self
+            .run_agentic(
+                &loop_config,
+                config.iteration,
+                &config.failure_context,
+                config.has_agentic_steps,
+                &StepEventLogger::noop(),
+            )
+            .await;
+
+        Ok(outcome)
+    }
+
+    fn name(&self) -> &'static str {
+        "agentic"
+    }
+}
+
+#[async_trait]
+impl Executor for CompletionExecutor {
+    type Config = CompletionConfig;
+    type Output = CompletionResult;
+
+    async fn execute(&self, config: Self::Config) -> Result<Self::Output, ExecutorError> {
+        let (success, step_results) = self
+            .run_completion(
+                &config.automation_steps,
+                &config.prompt_steps,
+                &config.execution_id,
+                &config.workflow_name,
+                config.timeout_seconds,
+                config.iterations_run,
+                &StepEventLogger::noop(),
+            )
+            .await;
+
+        Ok(CompletionResult {
+            success,
+            step_results,
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "completion"
     }
 }

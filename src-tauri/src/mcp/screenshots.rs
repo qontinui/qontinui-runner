@@ -6,10 +6,11 @@
 use axum::{extract::State, http::StatusCode, Json};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use super::sessions::emit_ai_output;
 use super::types::{api_error, ApiResponse, ApiState, CaptureScreenshotRequest, CaptureScreenshotResponse};
+use crate::executor::with_default_bridge;
 
 /// Capture a screenshot via IPC to Python bridge
 async fn capture_screenshot_ipc(
@@ -22,21 +23,14 @@ async fn capture_screenshot_ipc(
     });
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("IPC: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
             let timeout_duration = Duration::from_secs(30);
             bridge.send_command_and_wait("capture_screenshot", Some(params), timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| format!("spawn_blocking error: {}", e))?;

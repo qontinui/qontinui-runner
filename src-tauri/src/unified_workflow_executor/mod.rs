@@ -29,7 +29,7 @@
 //!
 //! let config = LoopConfig {
 //!     max_iterations: 5,
-//!     timeout_seconds: 300,
+//!     timeout_seconds: None, // No timeout (default) - user can stop manually
 //!     base_prompt: "Fix the issues".to_string(),
 //!     workflow_name: "My Workflow".to_string(),
 //!     workflow_id: "wf-123".to_string(),
@@ -53,11 +53,188 @@
 //! ```
 
 mod loop_controller;
+mod phase_configs;
 mod phases;
+mod resume;
+pub mod states;
 mod types;
 
-pub use loop_controller::{LoopController, WorkflowResult};
-pub use types::{AgenticOutcome, IterationResult, LoopConfig, LoopResult, WorkflowPhase};
+// Panic handling imports
+use std::sync::Arc;
+use futures_util::FutureExt;
+use tracing::{error, info};
+
+// Core types used by external code
+pub use loop_controller::{
+    LoopController, ResumeConfig, resume_interrupted_workflows,
+    // Phase-aware versions (preferred for unified workflows)
+    convert_json_steps_with_phase, extract_prompt_steps_with_phase,
+    extract_workflow_id_from_task_id,
+};
+pub use types::{LoopConfig, LoopResult, WorkflowPhase, get_parent_task_id};
+
+// Types exposed for API consumers and advanced usage
+// These may not be directly used in this crate but are part of the public API
+#[allow(unused_imports)]
+pub use loop_controller::WorkflowResult;
+#[allow(unused_imports)]
+pub use types::{AgenticOutcome, IterationResult};
 
 // Re-export phase executors for testing or advanced usage
+// Note: These implement the Executor trait for use with FromContext pattern
+#[allow(unused_imports)]
 pub use phases::{AgenticExecutor, CompletionExecutor, SetupExecutor, VerificationExecutor};
+
+// Re-export phase configs for Executor trait usage
+// Note: Used with the Executor trait implementations in phases.rs
+#[allow(unused_imports)]
+pub use phase_configs::{
+    SetupConfig, SetupResult, VerificationConfig, VerificationResult,
+    AgenticConfig, CompletionConfig, CompletionResult,
+};
+
+// Re-export resume types for restart recovery
+pub use resume::{ResumeManager, ResumePoint};
+
+// =============================================================================
+// Panic-Safe Workflow Execution
+// =============================================================================
+
+/// Spawns a workflow execution with proper panic handling.
+///
+/// This function wraps the workflow execution in a panic-catching layer.
+/// If the workflow panics for any reason, the task is marked as failed
+/// so the user can see the error and use the Continue button.
+///
+/// # Arguments
+/// * `checkpoint_db` - Database for marking the task as failed on panic
+/// * `execution_id` - The task run ID to mark as failed if panic occurs
+/// * `workflow_name` - Name of the workflow (for logging)
+/// * `fut` - The async future that runs the workflow
+///
+/// # Usage
+/// ```ignore
+/// spawn_workflow_with_panic_guard(
+///     checkpoint_db.clone(),
+///     &execution_id,
+///     &workflow_name,
+///     async move {
+///         controller.run(config, ...).await
+///     },
+/// );
+/// ```
+pub fn spawn_workflow_with_panic_guard<F>(
+    checkpoint_db: Arc<crate::database::CheckpointDb>,
+    execution_id: String,
+    workflow_name: String,
+    fut: F,
+)
+where
+    F: std::future::Future<Output = loop_controller::WorkflowResult> + Send + 'static,
+{
+    tokio::spawn(async move {
+        // Wrap the future in AssertUnwindSafe and catch panics
+        let result = std::panic::AssertUnwindSafe(fut).catch_unwind().await;
+
+        match result {
+            Ok(workflow_result) => {
+                info!(
+                    "Workflow '{}' (id: {}) completed: success={}",
+                    workflow_name, execution_id, workflow_result.success
+                );
+            }
+            Err(panic_payload) => {
+                // Extract panic message
+                let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "Unknown panic (no message)".to_string()
+                };
+
+                error!(
+                    "PANIC in workflow '{}' (id: {}): {}",
+                    workflow_name, execution_id, panic_msg
+                );
+
+                // Mark the task as failed so Continue button appears
+                let error_message = format!("Workflow panicked: {}", panic_msg);
+                if let Err(e) = checkpoint_db.fail_task_run(&execution_id, &error_message) {
+                    error!(
+                        "Failed to mark panicked workflow {} as failed: {}",
+                        execution_id, e
+                    );
+                } else {
+                    info!(
+                        "Marked panicked workflow '{}' as failed - Continue button should now be available",
+                        workflow_name
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// Spawns a workflow sequence execution with proper panic handling.
+///
+/// Similar to `spawn_workflow_with_panic_guard` but for workflow sequences
+/// that don't return a WorkflowResult directly.
+///
+/// # Arguments
+/// * `checkpoint_db` - Database for marking the task as failed on panic
+/// * `execution_id` - The task run ID to mark as failed if panic occurs
+/// * `sequence_name` - Name of the sequence (for logging)
+/// * `fut` - The async future that runs the sequence (returns ())
+pub fn spawn_sequence_with_panic_guard<F>(
+    checkpoint_db: Arc<crate::database::CheckpointDb>,
+    execution_id: String,
+    sequence_name: String,
+    fut: F,
+)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        // Wrap the future in AssertUnwindSafe and catch panics
+        let result = std::panic::AssertUnwindSafe(fut).catch_unwind().await;
+
+        match result {
+            Ok(()) => {
+                info!(
+                    "Workflow sequence '{}' (id: {}) completed",
+                    sequence_name, execution_id
+                );
+            }
+            Err(panic_payload) => {
+                // Extract panic message
+                let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "Unknown panic (no message)".to_string()
+                };
+
+                error!(
+                    "PANIC in workflow sequence '{}' (id: {}): {}",
+                    sequence_name, execution_id, panic_msg
+                );
+
+                // Mark the task as failed so Continue button appears
+                let error_message = format!("Workflow sequence panicked: {}", panic_msg);
+                if let Err(e) = checkpoint_db.fail_task_run(&execution_id, &error_message) {
+                    error!(
+                        "Failed to mark panicked sequence {} as failed: {}",
+                        execution_id, e
+                    );
+                } else {
+                    info!(
+                        "Marked panicked sequence '{}' as failed - Continue button should now be available",
+                        sequence_name
+                    );
+                }
+            }
+        }
+    });
+}

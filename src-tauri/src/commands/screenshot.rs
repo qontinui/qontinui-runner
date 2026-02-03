@@ -9,13 +9,14 @@
 
 use super::{AppState, CommandResponse};
 use crate::auth::AuthManager;
+use crate::executor::with_default_bridge;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::State;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 /// Get API base URL for qontinui-web backend
 fn get_api_base_url() -> String {
@@ -97,21 +98,14 @@ pub async fn get_screenshot_monitors(
     let app_state = state.inner().clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
             let timeout_duration = Duration::from_secs(30);
             bridge.send_command_and_wait("get_monitors", None, timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| format!("spawn_blocking error: {}", e))?;
@@ -168,21 +162,14 @@ async fn capture_screenshot_internal(
     });
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
             let timeout_duration = Duration::from_secs(30);
             bridge.send_command_and_wait("capture_screenshot", Some(params), timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| format!("spawn_blocking error: {}", e))?;
@@ -436,12 +423,9 @@ pub fn capture_screenshot_via_python(
         monitor
     );
 
-    let mut bridge_lock = state
-        .python_bridge
-        .lock()
-        .map_err(|e| format!("Failed to acquire lock: {}", e))?;
+    let app_state = state.inner().clone();
 
-    if let Some(ref mut bridge) = *bridge_lock {
+    with_default_bridge(&app_state, |bridge| {
         if !bridge.is_running() {
             return Err("Python executor not running".to_string());
         }
@@ -459,7 +443,5 @@ pub fn capture_screenshot_via_python(
             message: Some("Screenshot capture requested".to_string()),
             data: None,
         })
-    } else {
-        Err("Python executor not initialized".to_string())
-    }
+    })?
 }

@@ -3,6 +3,8 @@
 //! This module processes executor events and feeds them to the RunRecorder
 //! for automatic run recording to the Tiered Information system.
 
+#![allow(dead_code)]
+
 use crate::database::{CheckpointDb, TriggerPoint};
 use crate::safe_eprintln;
 use crate::test_executor::{
@@ -264,6 +266,15 @@ impl RunRecordingHandler {
     }
 
     /// Handle a template match event.
+    #[tracing::instrument(
+        name = "image.recognition.event",
+        skip(self),
+        fields(
+            template_name = %template,
+            confidence = %confidence,
+            match_success = %success
+        )
+    )]
     pub async fn on_template_match(&self, template: &str, confidence: f32, success: bool) {
         if let Some(ref mut recorder) = *self.active_recorder.lock().await {
             recorder.record_template_match(template, confidence, success);

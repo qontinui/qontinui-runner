@@ -11,6 +11,7 @@ use tauri::State;
 use tracing::{error, info};
 
 use super::{AppState, CommandResponse};
+use crate::executor::with_default_bridge;
 
 /// WebSocket configuration structure
 #[derive(Debug, Serialize, Deserialize)]
@@ -46,36 +47,26 @@ pub fn configure_websocket(
         config.enabled, config.url, config.runner_name
     );
 
-    let mut bridge_lock =
-        crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
-    if let Some(ref mut bridge) = *bridge_lock {
-        if !bridge.is_running() {
-            return Err(
-                "Python executor is not running. Please start the executor first.".to_string(),
-            );
-        }
-
+    with_default_bridge(&state, |bridge| {
         bridge
             .configure_websocket(
                 config.enabled,
-                config.url,
-                config.token,
-                config.project_id,
-                config.runner_name,
+                config.url.clone(),
+                config.token.clone(),
+                config.project_id.clone(),
+                config.runner_name.clone(),
             )
             .map_err(|e| {
                 error!("Failed to configure WebSocket: {}", e);
                 format!("Failed to configure WebSocket: {}", e)
-            })?;
+            })
+    })??;
 
-        Ok(CommandResponse {
-            success: true,
-            message: Some("WebSocket configured successfully".to_string()),
-            data: None,
-        })
-    } else {
-        Err("Python executor not initialized. Please start the executor first.".to_string())
-    }
+    Ok(CommandResponse {
+        success: true,
+        message: Some("WebSocket configured successfully".to_string()),
+        data: None,
+    })
 }
 
 /// Connect to the configured WebSocket server.
@@ -92,28 +83,18 @@ pub fn configure_websocket(
 pub fn connect_websocket(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Connecting WebSocket");
 
-    let mut bridge_lock =
-        crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
-    if let Some(ref mut bridge) = *bridge_lock {
-        if !bridge.is_running() {
-            return Err(
-                "Python executor is not running. Please start the executor first.".to_string(),
-            );
-        }
-
+    with_default_bridge(&state, |bridge| {
         bridge.connect_websocket().map_err(|e| {
             error!("Failed to connect WebSocket: {}", e);
             format!("Failed to connect WebSocket: {}", e)
-        })?;
-
-        Ok(CommandResponse {
-            success: true,
-            message: Some("WebSocket connection initiated".to_string()),
-            data: None,
         })
-    } else {
-        Err("Python executor not initialized. Please start the executor first.".to_string())
-    }
+    })??;
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some("WebSocket connection initiated".to_string()),
+        data: None,
+    })
 }
 
 /// Disconnect from the WebSocket server.
@@ -130,26 +111,16 @@ pub fn connect_websocket(state: State<Arc<AppState>>) -> Result<CommandResponse,
 pub fn disconnect_websocket(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Disconnecting WebSocket");
 
-    let mut bridge_lock =
-        crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
-    if let Some(ref mut bridge) = *bridge_lock {
-        if !bridge.is_running() {
-            return Err(
-                "Python executor is not running. Please start the executor first.".to_string(),
-            );
-        }
-
+    with_default_bridge(&state, |bridge| {
         bridge.disconnect_websocket().map_err(|e| {
             error!("Failed to disconnect WebSocket: {}", e);
             format!("Failed to disconnect WebSocket: {}", e)
-        })?;
-
-        Ok(CommandResponse {
-            success: true,
-            message: Some("WebSocket disconnection initiated".to_string()),
-            data: None,
         })
-    } else {
-        Err("Python executor not initialized. Please start the executor first.".to_string())
-    }
+    })??;
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some("WebSocket disconnection initiated".to_string()),
+        data: None,
+    })
 }

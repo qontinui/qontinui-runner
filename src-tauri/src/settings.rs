@@ -439,6 +439,33 @@ pub struct GlobalLogSource {
     /// e.g., ["python", "fastapi", "http", "api"]
     #[serde(default)]
     pub keywords: Vec<String>,
+
+    // --- Error monitoring fields ---
+
+    /// Log format: "plaintext", "json", or "jsonl"
+    #[serde(default = "default_format")]
+    pub format: String,
+    /// Parser type: "python", "javascript", "rust", or "generic"
+    #[serde(default = "default_parser")]
+    pub parser: String,
+    /// Regex pattern to extract timestamps from log lines
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_pattern: Option<String>,
+    /// Timezone for parsing timestamps (default: "local")
+    #[serde(default = "default_timezone")]
+    pub timezone: String,
+    /// Custom regex patterns to identify errors
+    #[serde(default)]
+    pub error_patterns: Vec<String>,
+    /// Custom regex patterns to identify warnings
+    #[serde(default)]
+    pub warning_patterns: Vec<String>,
+    /// Patterns to ignore (suppress false positives)
+    #[serde(default)]
+    pub ignore_patterns: Vec<String>,
+    /// Polling interval in milliseconds for error monitoring
+    #[serde(default = "default_poll_interval_ms")]
+    pub poll_interval_ms: u32,
 }
 
 fn default_tail_lines() -> u32 {
@@ -447,6 +474,22 @@ fn default_tail_lines() -> u32 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_format() -> String {
+    "plaintext".to_string()
+}
+
+fn default_parser() -> String {
+    "generic".to_string()
+}
+
+fn default_timezone() -> String {
+    "local".to_string()
+}
+
+fn default_poll_interval_ms() -> u32 {
+    5000
 }
 
 /// A named profile grouping log source IDs
@@ -709,7 +752,7 @@ fn get_settings_path() -> Result<PathBuf, String> {
 }
 
 /// Load settings from file
-fn load_settings() -> Settings {
+pub fn load_settings() -> Settings {
     match get_settings_path() {
         Ok(path) => {
             if path.exists() {
@@ -738,7 +781,7 @@ fn load_settings() -> Settings {
 }
 
 /// Save settings to file
-fn save_settings(settings: &Settings) -> Result<(), String> {
+pub fn save_settings(settings: &Settings) -> Result<(), String> {
     let path = get_settings_path()?;
     let contents = serde_json::to_string_pretty(settings)
         .map_err(|e| format!("Failed to serialize settings: {}", e))?;
@@ -848,17 +891,12 @@ pub fn save_auto_load_last_config(enabled: bool) -> Result<(), String> {
 
 /// Get the current AI settings
 pub fn get_ai_settings() -> AiSettings {
-    let settings = load_settings();
-    settings.ai
+    crate::config_facade::get_setting::<AiSettings>()
 }
 
 /// Save AI settings
 pub fn save_ai_settings(ai_settings: AiSettings) -> Result<(), String> {
-    info!("Saving AI settings: {:?}", ai_settings);
-    let mut settings = load_settings();
-    settings.ai = ai_settings;
-    save_settings(&settings)?;
-    Ok(())
+    crate::config_facade::save_setting(ai_settings)
 }
 
 /// Get the auto-continue AI workflow setting
@@ -878,17 +916,12 @@ pub fn save_auto_continue_ai_workflow(enabled: bool) -> Result<(), String> {
 
 /// Get the current Playwright settings
 pub fn get_playwright_settings() -> PlaywrightSettings {
-    let settings = load_settings();
-    settings.playwright
+    crate::config_facade::get_setting::<PlaywrightSettings>()
 }
 
 /// Save Playwright settings
 pub fn save_playwright_settings(playwright_settings: PlaywrightSettings) -> Result<(), String> {
-    info!("Saving Playwright settings");
-    let mut settings = load_settings();
-    settings.playwright = playwright_settings;
-    save_settings(&settings)?;
-    Ok(())
+    crate::config_facade::save_setting(playwright_settings)
 }
 
 /// Get the session auto-fix on failure setting
@@ -1072,6 +1105,139 @@ pub fn get_enabled_log_sources(profile_id: Option<&str>) -> Vec<GlobalLogSource>
         settings.sources.into_iter().filter(|s| s.enabled).collect()
     } else {
         Vec::new()
+    }
+}
+
+/// Seed default log sources if the sources list is empty.
+///
+/// Called on startup to ensure there are always some log sources configured.
+/// If the user has any sources (even disabled ones), this is a no-op.
+/// Creates 4 default sources: Backend, Frontend, Runner, Runner Actions.
+pub fn seed_default_log_sources_if_empty() {
+    let settings = get_global_log_source_settings();
+    if !settings.sources.is_empty() {
+        return;
+    }
+
+    info!("No log sources configured, seeding defaults");
+    let dev_logs_dir = crate::paths::get_dev_logs_dir();
+    let dev_logs = dev_logs_dir.to_string_lossy().to_string();
+
+    let defaults = vec![
+        GlobalLogSource {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "Backend".to_string(),
+            description: "FastAPI backend logs including HTTP requests and errors".to_string(),
+            category: LogSourceCategory::Backend,
+            source_type: "file".to_string(),
+            path: format!("{}/backend.log", dev_logs.replace('\\', "/")),
+            pattern: None,
+            tail_lines: 100,
+            enabled: true,
+            color: Some("#22c55e".to_string()),
+            keywords: vec![
+                "python".to_string(),
+                "fastapi".to_string(),
+                "http".to_string(),
+                "api".to_string(),
+            ],
+            format: "plaintext".to_string(),
+            parser: "python".to_string(),
+            timestamp_pattern: None,
+            timezone: "local".to_string(),
+            error_patterns: vec![],
+            warning_patterns: vec![],
+            ignore_patterns: vec![],
+            poll_interval_ms: 5000,
+        },
+        GlobalLogSource {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "Frontend".to_string(),
+            description: "Next.js frontend logs including build and runtime errors".to_string(),
+            category: LogSourceCategory::Frontend,
+            source_type: "file".to_string(),
+            path: format!("{}/frontend.log", dev_logs.replace('\\', "/")),
+            pattern: None,
+            tail_lines: 100,
+            enabled: true,
+            color: Some("#3b82f6".to_string()),
+            keywords: vec![
+                "javascript".to_string(),
+                "nextjs".to_string(),
+                "react".to_string(),
+                "frontend".to_string(),
+            ],
+            format: "plaintext".to_string(),
+            parser: "javascript".to_string(),
+            timestamp_pattern: None,
+            timezone: "local".to_string(),
+            error_patterns: vec![],
+            warning_patterns: vec![],
+            ignore_patterns: vec![],
+            poll_interval_ms: 5000,
+        },
+        GlobalLogSource {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "Runner".to_string(),
+            description: "Qontinui runner Vite + Rust logs".to_string(),
+            category: LogSourceCategory::Runner,
+            source_type: "file".to_string(),
+            path: format!("{}/runner-tauri.log", dev_logs.replace('\\', "/")),
+            pattern: None,
+            tail_lines: 100,
+            enabled: true,
+            color: Some("#f97316".to_string()),
+            keywords: vec![
+                "rust".to_string(),
+                "tauri".to_string(),
+                "runner".to_string(),
+                "vite".to_string(),
+            ],
+            format: "plaintext".to_string(),
+            parser: "rust".to_string(),
+            timestamp_pattern: None,
+            timezone: "local".to_string(),
+            error_patterns: vec![],
+            warning_patterns: vec![],
+            ignore_patterns: vec![],
+            poll_interval_ms: 5000,
+        },
+        GlobalLogSource {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "Runner Actions".to_string(),
+            description: "Workflow action execution events in JSONL format".to_string(),
+            category: LogSourceCategory::Runner,
+            source_type: "file".to_string(),
+            path: format!("{}/runner-actions.jsonl", dev_logs.replace('\\', "/")),
+            pattern: None,
+            tail_lines: 100,
+            enabled: true,
+            color: Some("#a855f7".to_string()),
+            keywords: vec![
+                "actions".to_string(),
+                "workflow".to_string(),
+                "execution".to_string(),
+            ],
+            format: "jsonl".to_string(),
+            parser: "generic".to_string(),
+            timestamp_pattern: None,
+            timezone: "local".to_string(),
+            error_patterns: vec![],
+            warning_patterns: vec![],
+            ignore_patterns: vec![],
+            poll_interval_ms: 5000,
+        },
+    ];
+
+    let new_settings = GlobalLogSourceSettings {
+        sources: defaults,
+        ..settings
+    };
+
+    if let Err(e) = save_global_log_source_settings(new_settings) {
+        tracing::error!("Failed to seed default log sources: {}", e);
+    } else {
+        info!("Seeded 4 default log sources");
     }
 }
 

@@ -67,6 +67,8 @@ pub enum AITaskFindingCategory {
     RuntimeIssue,
     AlreadyFixed,
     ExpectedBehavior,
+    Warning,
+    DataMigration,
 }
 
 impl From<&crate::findings::types::FindingCategory> for AITaskFindingCategory {
@@ -84,6 +86,8 @@ impl From<&crate::findings::types::FindingCategory> for AITaskFindingCategory {
             FindingCategory::RuntimeIssue => Self::RuntimeIssue,
             FindingCategory::AlreadyFixed => Self::AlreadyFixed,
             FindingCategory::ExpectedBehavior => Self::ExpectedBehavior,
+            FindingCategory::Warning => Self::Warning,
+            FindingCategory::DataMigration => Self::DataMigration,
         }
     }
 }
@@ -171,6 +175,12 @@ pub struct AITaskCreateRequest {
     pub project_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runner_id: Option<String>,
+    /// Workspace/organization ID (from web backend)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    /// User ID who triggered the task (from web backend)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub triggered_by: Option<String>,
     pub task_name: String,
     pub prompt: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -297,6 +307,8 @@ impl From<&TaskRun> for AITaskCreateRequest {
             id: Some(task.id.clone()),
             project_id: None, // Set by caller if available
             runner_id: Some(get_runner_id()),
+            workspace_id: task.workspace_id.clone(),
+            triggered_by: task.triggered_by.clone(),
             task_name: task.task_name.clone(),
             prompt: task
                 .prompt

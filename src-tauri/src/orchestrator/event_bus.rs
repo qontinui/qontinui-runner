@@ -22,6 +22,8 @@
 //! bus.emit(OrchestratorEvent::worker_started("worker-1"));
 //! ```
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -405,7 +407,7 @@ impl EventBus {
             crate::safe_lock::safe_write_or_recover(&self.subscribers, "event_bus_subscribers");
         subscribers
             .entry(event_type)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(Arc::new(handler));
     }
 

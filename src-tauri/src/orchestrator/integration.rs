@@ -7,14 +7,17 @@
 //! - Verification: Run checks after work completion
 //! - Iteration: Loop with knowledge accumulation until success or max iterations
 
+#![allow(dead_code)]
+
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 
 use std::collections::HashMap;
 
 use crate::database::CheckpointDb;
-use crate::mcp_api::AiOutputSessionContext;
+use crate::error_monitor::{DebugContextCurator, CuratorConfig};
+use crate::execution_context::AiSessionContext;
 use crate::orchestrator::{
     checkpoint::{
         CheckpointTrigger, CriterionResult, FindingSnapshot, KnowledgeEntry, StateSnapshot,
@@ -263,6 +266,15 @@ pub struct OrchestratorConfig {
     /// - Before and after verification runs
     /// - On errors and task completion
     pub enable_checkpointing: bool,
+    /// Whether to include error monitor debug context in worker prompts.
+    ///
+    /// When enabled, the orchestrator will query the error_events table for
+    /// unresolved errors and include them in the worker's context. This helps
+    /// AI agents be aware of application errors that may be related to their task.
+    ///
+    /// The error context is curated to prioritize critical errors and detect
+    /// patterns across multiple errors.
+    pub include_error_monitor_context: bool,
 }
 
 impl Default for OrchestratorConfig {
@@ -276,6 +288,7 @@ impl Default for OrchestratorConfig {
             run_initial_verification: false,
             compression: Some(CompressionConfig::default()),
             enable_checkpointing: true,
+            include_error_monitor_context: true, // Enable by default for debugging workflows
         }
     }
 }
@@ -359,6 +372,13 @@ pub struct OrchestratorState {
     pub iteration_timings: Vec<IterationTiming>,
     /// When the current iteration started (used to calculate iteration duration)
     pub current_iteration_started_at: Option<Instant>,
+
+    // ========================================================================
+    // Error Monitor Integration
+    // ========================================================================
+    /// Error IDs targeted by this workflow (for auto-resolution on success).
+    /// When the workflow completes successfully, these errors will be marked as resolved.
+    pub targeted_error_ids: Vec<i64>,
 }
 
 impl OrchestratorState {
@@ -387,7 +407,14 @@ impl OrchestratorState {
             completed_at_iso: None,
             iteration_timings: Vec::new(),
             current_iteration_started_at: None,
+            targeted_error_ids: Vec::new(),
         }
+    }
+
+    /// Set the error IDs targeted by this workflow.
+    /// These will be marked as resolved when the workflow completes successfully.
+    pub fn set_targeted_error_ids(&mut self, error_ids: Vec<i64>) {
+        self.targeted_error_ids = error_ids;
     }
 
     /// Record a stage transition for the recap timeline.
@@ -619,7 +646,7 @@ pub struct Orchestrator {
     /// If None, no output events are emitted.
     app_handle: Option<tauri::AppHandle>,
     /// Optional session context for AI output events.
-    session_ctx: Option<AiOutputSessionContext>,
+    session_ctx: Option<AiSessionContext>,
     /// Hook executor for lifecycle events
     hook_executor: HookExecutor,
 }
@@ -649,7 +676,7 @@ impl Orchestrator {
         config: OrchestratorConfig,
         db: Arc<CheckpointDb>,
         app_handle: tauri::AppHandle,
-        session_ctx: Option<AiOutputSessionContext>,
+        session_ctx: Option<AiSessionContext>,
     ) -> Self {
         let knowledge_base = KnowledgeBase::new(Arc::clone(&db));
         let verifier = VerificationOrchestrator::new(
@@ -698,13 +725,136 @@ impl Orchestrator {
     }
 
     /// Set the session context for output events.
-    pub fn set_session_context(&mut self, session_ctx: AiOutputSessionContext) {
+    pub fn set_session_context(&mut self, session_ctx: AiSessionContext) {
         self.session_ctx = Some(session_ctx);
     }
 
     /// Get the session context reference for output calls.
-    fn session_ctx_ref(&self) -> Option<&AiOutputSessionContext> {
+    fn session_ctx_ref(&self) -> Option<&AiSessionContext> {
         self.session_ctx.as_ref()
+    }
+
+    // ========================================================================
+    // Error Monitor Integration
+    // ========================================================================
+
+    /// Get formatted error monitor debug context for injection into AI prompts.
+    ///
+    /// This queries the error_events table for unresolved errors (optionally scoped
+    /// to a specific task_run_id) and returns a formatted string suitable for
+    /// inclusion in AI context.
+    ///
+    /// Returns None if:
+    /// - Error monitor context is disabled in config
+    /// - No errors are found
+    /// - Database query fails (logged as warning)
+    fn get_error_monitor_context(&self, task_run_id: Option<&str>) -> Option<String> {
+        if !self.config.include_error_monitor_context {
+            return None;
+        }
+
+        match self.db.connection() {
+            Ok(conn) => {
+                let config = CuratorConfig {
+                    max_errors: 20, // Limit to avoid overwhelming context
+                    max_stack_lines: 3, // Brief excerpts
+                    ..Default::default()
+                };
+                let curator = DebugContextCurator::with_config(config);
+
+                match curator.build_context(&conn, task_run_id) {
+                    Ok(context) => {
+                        // Only include if there are actionable errors
+                        if context.total_count == 0 {
+                            return None;
+                        }
+
+                        let formatted = curator.format_for_ai(&context);
+
+                        info!(
+                            "Injecting error monitor context: {} errors ({} critical)",
+                            context.total_count,
+                            context.critical_errors.len()
+                        );
+
+                        Some(format!(
+                            "## Application Error Context\n\n\
+                             The following errors have been detected in the application logs. \
+                             Consider these when debugging or if your changes might be related.\n\n\
+                             {}\n\n---\n",
+                            formatted
+                        ))
+                    }
+                    Err(e) => {
+                        warn!("Failed to build error monitor context: {}", e);
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to get database connection for error monitor: {}", e);
+                None
+            }
+        }
+    }
+
+    /// Resolve targeted errors after successful workflow completion.
+    ///
+    /// This marks all errors that were targeted by the workflow as resolved,
+    /// recording the task_run_id that fixed them for traceability.
+    fn resolve_targeted_errors(&self, state: &OrchestratorState) {
+        if state.targeted_error_ids.is_empty() {
+            return;
+        }
+
+        info!(
+            "Resolving {} targeted errors for successful task {}",
+            state.targeted_error_ids.len(),
+            state.task_run_id
+        );
+
+        match self.db.connection() {
+            Ok(conn) => {
+                let mut resolved_count = 0;
+                let mut failed_count = 0;
+
+                for error_id in &state.targeted_error_ids {
+                    let resolution_note = format!(
+                        "Auto-resolved by successful completion of workflow task {}",
+                        state.task_run_id
+                    );
+
+                    match crate::error_monitor::ErrorEventStorage::mark_resolved_by_task(
+                        &conn,
+                        *error_id,
+                        &state.task_run_id,
+                        Some(&resolution_note),
+                    ) {
+                        Ok(_) => {
+                            resolved_count += 1;
+                            debug!("Resolved error {} via task {}", error_id, state.task_run_id);
+                        }
+                        Err(e) => {
+                            failed_count += 1;
+                            warn!("Failed to resolve error {}: {}", error_id, e);
+                        }
+                    }
+                }
+
+                if resolved_count > 0 {
+                    info!(
+                        "Successfully resolved {} errors (failed: {}) for task {}",
+                        resolved_count, failed_count, state.task_run_id
+                    );
+                }
+            }
+            Err(e) => {
+                error!(
+                    "Failed to get database connection for error resolution: {}",
+                    e
+                );
+            }
+        }
     }
 
     // ========================================================================
@@ -900,7 +1050,7 @@ impl Orchestrator {
                     id: k.id.clone(),
                     category: k.category.clone(),
                     content: k.content.clone(),
-                    iteration: k.iteration as u32,
+                    iteration: k.iteration,
                 })
                 .collect();
         }
@@ -1345,7 +1495,8 @@ impl Orchestrator {
     /// 1. Verification plan context (if available)
     /// 2. Initial verification feedback (for verification-first workflows)
     /// 3. Cross-iteration context (findings, feedback from previous iterations)
-    /// 4. Auto-generated orchestrator instructions (completion protocol, verification guidance)
+    /// 4. Error monitor context (if enabled and errors exist)
+    /// 5. Auto-generated orchestrator instructions (completion protocol, verification guidance)
     pub fn build_worker_prompt(
         &self,
         state: &OrchestratorState,
@@ -1429,6 +1580,12 @@ impl Orchestrator {
                     self.session_ctx_ref(),
                 );
             }
+        }
+
+        // Inject error monitor context if available
+        // This provides context about application errors that may be related to the task
+        if let Some(error_context) = self.get_error_monitor_context(Some(&state.task_run_id)) {
+            prompt = format!("{}\n{}", error_context, prompt);
         }
 
         // Append auto-generated orchestrator instructions
@@ -1828,6 +1985,11 @@ impl Orchestrator {
         // Record learning outcome to database for AI learning system
         self.record_learning_outcome(state, &result);
 
+        // Resolve targeted errors on successful completion
+        if is_success && !state.targeted_error_ids.is_empty() {
+            self.resolve_targeted_errors(state);
+        }
+
         // Set completion state (needed before checkpoint to capture final state)
         state.is_complete = true;
         state.completion_result = Some(result.clone());
@@ -2157,7 +2319,7 @@ impl Orchestrator {
                     }
                 }
             }
-            prompt.push_str("\n");
+            prompt.push('\n');
         }
 
         // Add verification plan context (filtered for domain)
@@ -2179,7 +2341,7 @@ impl Orchestrator {
                         criterion.description
                     ));
                 }
-                prompt.push_str("\n");
+                prompt.push('\n');
             }
         }
 

@@ -13,6 +13,7 @@ use super::types::{
     StatusResponse,
 };
 use crate::commands::AppState;
+use crate::executor::with_default_bridge;
 use crate::settings;
 
 /// Health check endpoint
@@ -27,16 +28,10 @@ pub async fn get_status(
     let app_state = state.app_state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        let (executor_running, executor_state) = if let Some(ref bridge) = *bridge_lock {
+        let (executor_running, executor_state) = with_default_bridge(&app_state, |bridge| {
             (bridge.is_running(), bridge.get_state().name().to_string())
-        } else {
-            (false, "not_started".to_string())
-        };
+        })
+        .unwrap_or((false, "not_started".to_string()));
 
         let config_lock = app_state.current_config.lock().unwrap_or_else(|poisoned| {
             warn!("MCP API: current_config mutex was poisoned, recovering");
@@ -216,12 +211,7 @@ pub async fn stop_execution(
     let app_state = state.app_state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
@@ -233,9 +223,7 @@ pub async fn stop_execution(
             Ok(serde_json::json!({
                 "message": "Stop command sent"
             }))
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {

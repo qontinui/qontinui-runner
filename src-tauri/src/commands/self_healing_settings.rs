@@ -2,17 +2,14 @@
 //!
 //! This module handles self-healing configuration operations:
 //! - Getting and setting self-healing settings
-//! - Secure API key storage in OS keychain for remote LLM providers
+//! - Secure API key storage in OS keychain for remote LLM providers (using KeychainHelper)
 
+use crate::config_facade::self_healing_keychain;
 use crate::settings::{self, SelfHealingApiProvider, SelfHealingLlmMode, SelfHealingSettings};
-use anyhow::{Context, Result};
-use keyring::Entry;
+use anyhow::Result;
 use tracing::info;
 
 use super::CommandResponse;
-
-/// Service name for self-healing API keys in the keychain
-const SELF_HEALING_SERVICE_NAME: &str = "com.qontinui.runner.self_healing";
 
 // ============================================================================
 // Keychain Operations for API Keys
@@ -20,47 +17,17 @@ const SELF_HEALING_SERVICE_NAME: &str = "com.qontinui.runner.self_healing";
 
 /// Stores a self-healing API key in the OS keychain
 fn store_self_healing_api_key(provider: &str, api_key: &str) -> Result<()> {
-    let entry = Entry::new(SELF_HEALING_SERVICE_NAME, provider)
-        .context("Failed to create keychain entry for self-healing API key")?;
-    entry
-        .set_password(api_key)
-        .context("Failed to store self-healing API key in keychain")?;
-    info!("Self-healing API key stored for provider: {}", provider);
-    Ok(())
+    self_healing_keychain().store(provider, api_key)
 }
 
 /// Retrieves a self-healing API key from the OS keychain
 fn get_self_healing_api_key(provider: &str) -> Result<Option<String>> {
-    let entry = Entry::new(SELF_HEALING_SERVICE_NAME, provider)
-        .context("Failed to create keychain entry for self-healing API key")?;
-    match entry.get_password() {
-        Ok(key) => Ok(Some(key)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(anyhow::anyhow!(
-            "Failed to retrieve self-healing API key: {}",
-            e
-        )),
-    }
+    self_healing_keychain().get(provider)
 }
 
 /// Deletes a self-healing API key from the OS keychain
 fn delete_api_key_from_keychain(provider: &str) -> Result<()> {
-    let entry = Entry::new(SELF_HEALING_SERVICE_NAME, provider)
-        .context("Failed to create keychain entry for self-healing API key")?;
-    match entry.delete_credential() {
-        Ok(_) => {
-            info!("Self-healing API key deleted for provider: {}", provider);
-            Ok(())
-        }
-        Err(keyring::Error::NoEntry) => {
-            info!("No self-healing API key found for provider: {}", provider);
-            Ok(())
-        }
-        Err(e) => Err(anyhow::anyhow!(
-            "Failed to delete self-healing API key: {}",
-            e
-        )),
-    }
+    self_healing_keychain().delete(provider)
 }
 
 // ============================================================================

@@ -3,6 +3,8 @@
 //! Provides transaction-safe storage for sessions, checkpoints, settings,
 //! prompts, workflows, and scheduler state.
 
+#![allow(dead_code)]
+
 use chrono::Utc;
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
@@ -185,6 +187,49 @@ pub struct TaskRun {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transition_history_json: Option<String>,
 
+    /// Workflow type: 'unified', 'legacy_session', 'automation_only', or NULL (legacy)
+    /// Unified workflows should only have status modified by the LoopController.
+    /// This prevents TaskMonitor and legacy session code from interfering with
+    /// the verification-agentic loop.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_type: Option<String>,
+
+    // ========================================================================
+    // Web Backend Context (for tasks created via API)
+    // ========================================================================
+    /// Workspace/organization ID (from web backend when task is created via API).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+
+    /// User ID who triggered the task (from web backend when task is created via API).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub triggered_by: Option<String>,
+
+    // ========================================================================
+    // Hierarchy Fields (for nested task runs / subtasks)
+    // ========================================================================
+    /// Parent task run ID (for subtasks spawned by a parent task).
+    /// NULL for root-level tasks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_task_run_id: Option<String>,
+
+    /// Root task run ID (top of the task hierarchy).
+    /// Same as `id` for root-level tasks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_task_run_id: Option<String>,
+
+    /// Nesting depth (0 = root/top-level task).
+    #[serde(default)]
+    pub depth: u32,
+
+    // ========================================================================
+    // Multi-Bridge Support (for concurrent execution)
+    // ========================================================================
+    /// Bridge ID handling this task (for multi-bridge scenarios).
+    /// NULL for legacy single-bridge tasks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bridge_id: Option<String>,
+
     pub created_at: String,
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -197,6 +242,153 @@ fn default_task_type() -> String {
 
 fn default_auto_continue() -> bool {
     true
+}
+
+/// Input for creating a task run.
+/// Use the builder pattern to construct this:
+///
+/// ```rust
+/// use crate::database::CreateTaskRunInput;
+///
+/// let input = CreateTaskRunInput::new("task-123", "My Task")
+///     .with_prompt("Do something useful")
+///     .with_config_id("config-456")
+///     .with_workflow_type("unified");
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct CreateTaskRunInput {
+    pub id: String,
+    pub task_name: String,
+    pub prompt: Option<String>,
+    pub task_type: Option<String>,
+    pub config_id: Option<String>,
+    pub workflow_name: Option<String>,
+    pub max_sessions: Option<u32>,
+    pub auto_continue: Option<bool>,
+    pub execution_steps_json: Option<String>,
+    pub log_sources_json: Option<String>,
+    pub workflow_type: Option<String>,
+    pub parent_task_run_id: Option<String>,
+    pub root_task_run_id: Option<String>,
+    pub depth: u32,
+    pub workspace_id: Option<String>,
+    pub triggered_by: Option<String>,
+    pub bridge_id: Option<String>,
+}
+
+impl CreateTaskRunInput {
+    /// Create a new task run input with required fields.
+    pub fn new(id: impl Into<String>, task_name: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            task_name: task_name.into(),
+            prompt: None,
+            task_type: None,
+            config_id: None,
+            workflow_name: None,
+            max_sessions: None,
+            auto_continue: None,
+            execution_steps_json: None,
+            log_sources_json: None,
+            workflow_type: None,
+            parent_task_run_id: None,
+            root_task_run_id: None,
+            depth: 0,
+            workspace_id: None,
+            triggered_by: None,
+            bridge_id: None,
+        }
+    }
+
+    /// Set the task prompt.
+    pub fn with_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.prompt = Some(prompt.into());
+        self
+    }
+
+    /// Set the task type (e.g., "task", "automation", "scheduled").
+    pub fn with_task_type(mut self, task_type: impl Into<String>) -> Self {
+        self.task_type = Some(task_type.into());
+        self
+    }
+
+    /// Set the config ID for automation-enabled tasks.
+    pub fn with_config_id(mut self, config_id: impl Into<String>) -> Self {
+        self.config_id = Some(config_id.into());
+        self
+    }
+
+    /// Set the workflow name being executed.
+    pub fn with_workflow_name(mut self, workflow_name: impl Into<String>) -> Self {
+        self.workflow_name = Some(workflow_name.into());
+        self
+    }
+
+    /// Set the maximum number of AI sessions.
+    pub fn with_max_sessions(mut self, max_sessions: u32) -> Self {
+        self.max_sessions = Some(max_sessions);
+        self
+    }
+
+    /// Set the auto-continue behavior.
+    pub fn with_auto_continue(mut self, auto_continue: bool) -> Self {
+        self.auto_continue = Some(auto_continue);
+        self
+    }
+
+    /// Set the execution steps JSON for re-execution on resume.
+    pub fn with_execution_steps_json(mut self, json: impl Into<String>) -> Self {
+        self.execution_steps_json = Some(json.into());
+        self
+    }
+
+    /// Set the log sources JSON for capturing logs during execution.
+    pub fn with_log_sources_json(mut self, json: impl Into<String>) -> Self {
+        self.log_sources_json = Some(json.into());
+        self
+    }
+
+    /// Set the workflow type ("unified", "legacy_session", "automation_only").
+    pub fn with_workflow_type(mut self, workflow_type: impl Into<String>) -> Self {
+        self.workflow_type = Some(workflow_type.into());
+        self
+    }
+
+    /// Set the parent task run ID for subtasks.
+    pub fn with_parent_task_run_id(mut self, parent_id: impl Into<String>) -> Self {
+        self.parent_task_run_id = Some(parent_id.into());
+        self
+    }
+
+    /// Set the root task run ID for the task hierarchy.
+    pub fn with_root_task_run_id(mut self, root_id: impl Into<String>) -> Self {
+        self.root_task_run_id = Some(root_id.into());
+        self
+    }
+
+    /// Set the nesting depth (0 = root/top-level task).
+    pub fn with_depth(mut self, depth: u32) -> Self {
+        self.depth = depth;
+        self
+    }
+
+    /// Set the workspace/organization ID from the web backend.
+    pub fn with_workspace_id(mut self, workspace_id: impl Into<String>) -> Self {
+        self.workspace_id = Some(workspace_id.into());
+        self
+    }
+
+    /// Set the user ID who triggered the task.
+    pub fn with_triggered_by(mut self, triggered_by: impl Into<String>) -> Self {
+        self.triggered_by = Some(triggered_by.into());
+        self
+    }
+
+    /// Set the bridge ID for multi-bridge scenarios.
+    pub fn with_bridge_id(mut self, bridge_id: impl Into<String>) -> Self {
+        self.bridge_id = Some(bridge_id.into());
+        self
+    }
 }
 
 /// Stored config entry metadata (without the full JSON).
@@ -550,6 +742,42 @@ pub struct CreateTaskRunAwasStepInput {
     pub timestamp: String,
 }
 
+/// Execution span from the tracing system.
+/// Used for querying performance data from the execution_spans table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionSpan {
+    pub id: i64,
+    /// Task/execution ID (may be empty for global spans)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
+    /// Shared trace ID across related spans
+    pub trace_id: String,
+    /// Unique span ID
+    pub span_id: String,
+    /// Parent span ID (None for root spans)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_span_id: Option<String>,
+    /// Span name (e.g., "workflow.execute", "ai.session")
+    pub name: String,
+    /// Start timestamp (ISO 8601)
+    pub start_ts: String,
+    /// End timestamp (ISO 8601)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_ts: Option<String>,
+    /// Duration in milliseconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+    /// JSON object of span attributes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attributes: Option<String>,
+    /// Whether the span completed successfully
+    pub success: bool,
+    /// Error message if failed
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub created_at: String,
+}
+
 /// Test type enum for verification tests.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -700,7 +928,9 @@ pub struct VerificationTest {
     #[serde(default)]
     pub config: serde_json::Value,
 
-    pub timeout_seconds: u32,
+    /// Timeout in seconds (None = disabled by default, no timeout)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
     pub is_critical: bool,
     pub enabled: bool,
 
@@ -899,8 +1129,9 @@ pub struct CreateVerificationTestInput {
     pub success_criteria: Option<String>,
     #[serde(default)]
     pub config: serde_json::Value,
-    #[serde(default = "default_timeout")]
-    pub timeout_seconds: u32,
+    /// Timeout in seconds (None = disabled by default, no timeout)
+    #[serde(default)]
+    pub timeout_seconds: Option<u32>,
     #[serde(default)]
     pub is_critical: bool,
     #[serde(default = "default_true")]
@@ -962,8 +1193,9 @@ pub struct Check {
     pub auto_fix: bool,
     /// Whether to fail on warnings
     pub fail_on_warning: bool,
-    /// Timeout in seconds
-    pub timeout_seconds: u32,
+    /// Timeout in seconds (None = disabled by default, no timeout)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
     /// Whether check failure should fail the entire workflow
     pub is_critical: bool,
     /// Whether check is enabled
@@ -1000,8 +1232,9 @@ pub struct CreateCheckInput {
     pub auto_fix: bool,
     #[serde(default)]
     pub fail_on_warning: bool,
-    #[serde(default = "default_timeout")]
-    pub timeout_seconds: u32,
+    /// Timeout in seconds (None = disabled by default, no timeout)
+    #[serde(default)]
+    pub timeout_seconds: Option<u32>,
     #[serde(default)]
     pub is_critical: bool,
     #[serde(default = "default_true")]
@@ -1469,13 +1702,66 @@ impl CheckpointDb {
         })
     }
 
+    /// Create an in-memory database for testing or no-op logging.
+    ///
+    /// This creates a database that exists only in memory and is not persisted.
+    /// Useful for testing or when you need a valid CheckpointDb instance but
+    /// don't want to actually store anything.
+    pub fn new_in_memory() -> Result<Self, String> {
+        let manager = SqliteConnectionManager::memory().with_init(|conn| {
+            conn.execute_batch(
+                r#"
+                PRAGMA foreign_keys=ON;
+                PRAGMA synchronous=OFF;
+                "#,
+            )?;
+            Ok(())
+        });
+
+        let pool = Pool::builder()
+            .max_size(1)
+            .build(manager)
+            .map_err(|e| format!("Failed to create in-memory connection pool: {}", e))?;
+
+        // Run migrations
+        {
+            let conn = pool
+                .get()
+                .map_err(|e| format!("Failed to get connection from pool: {}", e))?;
+            Self::run_migrations_on_conn(&conn)?;
+        }
+
+        Ok(Self {
+            pool,
+            db_path: PathBuf::from(":memory:"),
+        })
+    }
+
     /// Get the database path.
     pub fn path(&self) -> &PathBuf {
         &self.db_path
     }
 
+    /// Get a clone of the underlying connection pool.
+    ///
+    /// This is primarily used for the tracing span layer which needs
+    /// its own reference to the pool for writing span data.
+    pub fn get_pool(&self) -> Pool<SqliteConnectionManager> {
+        self.pool.clone()
+    }
+
     /// Get a connection from the pool.
-    fn get_conn(&self) -> Result<PooledConnection<SqliteConnectionManager>, String> {
+    ///
+    /// # Errors
+    /// Returns `AppError::PoolError` if unable to get a connection from the pool.
+    pub fn get_conn(&self) -> Result<PooledConnection<SqliteConnectionManager>, crate::error::AppError> {
+        Ok(self.pool.get()?)
+    }
+
+    /// Get a connection from the pool (legacy API returning String error).
+    ///
+    /// Deprecated: Use `get_conn()` instead which returns `AppError`.
+    pub fn get_conn_string(&self) -> Result<PooledConnection<SqliteConnectionManager>, String> {
         self.pool
             .get()
             .map_err(|e| format!("Failed to get connection from pool: {}", e))
@@ -1486,8 +1772,59 @@ impl CheckpointDb {
     ///
     /// Note: The returned reference borrows the PooledConnection, so the caller must
     /// ensure the PooledConnection stays alive while using the Connection.
-    pub fn connection(&self) -> Result<PooledConnection<SqliteConnectionManager>, String> {
+    ///
+    /// # Errors
+    /// Returns `AppError::PoolError` if unable to get a connection from the pool.
+    pub fn connection(&self) -> Result<PooledConnection<SqliteConnectionManager>, crate::error::AppError> {
         self.get_conn()
+    }
+
+    /// Get a connection (legacy API returning String error).
+    ///
+    /// Deprecated: Use `connection()` instead which returns `AppError`.
+    pub fn connection_string(&self) -> Result<PooledConnection<SqliteConnectionManager>, String> {
+        self.get_conn_string()
+    }
+
+    /// Execute a function within a database transaction.
+    ///
+    /// The transaction is automatically committed if the function returns Ok,
+    /// or rolled back if it returns Err or panics.
+    ///
+    /// This ensures atomic updates across multiple tables (e.g., checkpoint + state).
+    ///
+    /// # Example
+    /// ```ignore
+    /// db.transaction(|conn| {
+    ///     conn.execute("UPDATE table1 SET ...", params![...])?;
+    ///     conn.execute("UPDATE table2 SET ...", params![...])?;
+    ///     Ok(())
+    /// })?;
+    /// ```
+    pub fn transaction<F, T>(&self, f: F) -> Result<T, String>
+    where
+        F: FnOnce(&Connection) -> Result<T, rusqlite::Error>,
+    {
+        let conn = self.get_conn_string()?;
+
+        // Start transaction with IMMEDIATE mode for write isolation
+        conn.execute("BEGIN IMMEDIATE", [])
+            .map_err(|e| format!("Failed to begin transaction: {}", e))?;
+
+        // Execute the user function
+        match f(&conn) {
+            Ok(result) => {
+                // Commit on success
+                conn.execute("COMMIT", [])
+                    .map_err(|e| format!("Failed to commit transaction: {}", e))?;
+                Ok(result)
+            }
+            Err(e) => {
+                // Rollback on error
+                let _ = conn.execute("ROLLBACK", []);
+                Err(format!("Transaction failed: {}", e))
+            }
+        }
     }
 
     /// Optimize the database for better performance.
@@ -1680,9 +2017,13 @@ impl CheckpointDb {
 
         if current_version == 0 {
             // Fresh database - create schema
-            info!("Creating database schema (version 5)");
+            // schema.sql contains the complete, up-to-date schema, so no migrations needed
+            info!("Creating database schema from schema.sql (fresh database)");
             conn.execute_batch(include_str!("schema.sql"))
                 .map_err(|e| format!("Failed to create schema: {}", e))?;
+            // Return early - schema.sql is the complete schema at the latest version
+            // No need to run migrations which would try to add columns/tables that already exist
+            return Ok(());
         }
 
         // Migration to version 2: Add task_runs table
@@ -3369,6 +3710,589 @@ impl CheckpointDb {
             info!("Successfully migrated to version 37 (unique constraint for verification phase results)");
         }
 
+        // Migration to version 38: Add workflow_type column to task_runs
+        // This enables external code to check if a task is a "unified" workflow
+        // before modifying its status. Unified workflows should only have status
+        // modified by the LoopController, not by TaskMonitor or legacy session code.
+        if current_version < 38 {
+            info!(
+                "Migrating database to version 38 (adding workflow_type to task_runs)"
+            );
+
+            conn.execute_batch(
+                r#"
+                -- Add workflow_type column: 'unified', 'legacy_session', 'automation_only', or NULL (legacy)
+                -- Unified workflows should only have status modified by LoopController
+                ALTER TABLE task_runs ADD COLUMN workflow_type TEXT;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (38, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 38: {}", e))?;
+
+            info!("Successfully migrated to version 38 (workflow_type column added)");
+        }
+
+        // Migration to version 39: Add task hierarchy fields to task_runs
+        // Enables nested subtasks with parent/root/depth tracking for complex workflows
+        if current_version < 39 {
+            info!(
+                "Migrating database to version 39 (adding task hierarchy fields to task_runs)"
+            );
+
+            conn.execute_batch(
+                r#"
+                -- Add parent_task_run_id column: links subtasks to their parent task
+                ALTER TABLE task_runs ADD COLUMN parent_task_run_id TEXT REFERENCES task_runs(id) ON DELETE SET NULL;
+
+                -- Add root_task_run_id column: links to the root of the task hierarchy (same as id for root tasks)
+                ALTER TABLE task_runs ADD COLUMN root_task_run_id TEXT;
+
+                -- Add depth column: nesting depth (0 = root/top-level)
+                ALTER TABLE task_runs ADD COLUMN depth INTEGER DEFAULT 0;
+
+                -- Create indexes for querying child/subtasks
+                CREATE INDEX IF NOT EXISTS idx_task_runs_parent_task_run_id ON task_runs(parent_task_run_id);
+                CREATE INDEX IF NOT EXISTS idx_task_runs_root_task_run_id ON task_runs(root_task_run_id);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (39, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 39: {}", e))?;
+
+            info!("Successfully migrated to version 39 (task hierarchy fields added)");
+        }
+
+        // Migration to version 40: Add workspace_id and triggered_by to task_runs
+        // Enables integration with qontinui-web backend for multi-tenant workspaces
+        if current_version < 40 {
+            info!(
+                "Migrating database to version 40 (adding workspace_id and triggered_by to task_runs)"
+            );
+
+            conn.execute_batch(
+                r#"
+                -- Add workspace_id column: links task to a workspace/organization from qontinui-web
+                ALTER TABLE task_runs ADD COLUMN workspace_id TEXT;
+
+                -- Add triggered_by column: identifies who/what triggered the task run
+                ALTER TABLE task_runs ADD COLUMN triggered_by TEXT;
+
+                -- Create index for workspace queries
+                CREATE INDEX IF NOT EXISTS idx_task_runs_workspace_id ON task_runs(workspace_id);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (40, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 40: {}", e))?;
+
+            info!("Successfully migrated to version 40 (workspace_id and triggered_by added)");
+        }
+
+        // Migration to version 41: Add log_watch_enabled to unified_workflows
+        // Enables automatic log error detection during verification phase
+        if current_version < 41 {
+            info!(
+                "Migrating database to version 41 (adding log_watch_enabled to unified_workflows)"
+            );
+
+            conn.execute_batch(
+                r#"
+                -- Add log_watch_enabled column: enables automatic log error detection
+                -- Default to 1 (enabled) for all existing and new workflows
+                ALTER TABLE unified_workflows ADD COLUMN log_watch_enabled INTEGER DEFAULT 1;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (41, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 41: {}", e))?;
+
+            info!("Successfully migrated to version 41 (log_watch_enabled added)");
+        }
+
+        // Migration to version 42: Add health_check_enabled to unified_workflows
+        // Enables automatic server health checks (backend/frontend) before verification
+        if current_version < 42 {
+            info!(
+                "Migrating database to version 42 (adding health_check_enabled to unified_workflows)"
+            );
+
+            conn.execute_batch(
+                r#"
+                -- Add health_check_enabled column: enables automatic server health checks
+                -- Default to 1 (enabled) for all existing and new workflows
+                ALTER TABLE unified_workflows ADD COLUMN health_check_enabled INTEGER DEFAULT 1;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (42, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 42: {}", e))?;
+
+            info!("Successfully migrated to version 42 (health_check_enabled added)");
+        }
+
+        // Migration to version 43: Add health_check_urls to unified_workflows
+        // User-configurable health check URLs (replaces hardcoded backend/frontend checks)
+        if current_version < 43 {
+            info!(
+                "Migrating database to version 43 (adding health_check_urls to unified_workflows)"
+            );
+
+            conn.execute_batch(
+                r#"
+                -- Add health_check_urls column: JSON array of health check configurations
+                -- Each entry: { name, url, expected_status, timeout_seconds, is_critical }
+                -- Default to empty array (no health checks configured)
+                ALTER TABLE unified_workflows ADD COLUMN health_check_urls TEXT DEFAULT '[]';
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (43, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 43: {}", e))?;
+
+            info!("Successfully migrated to version 43 (health_check_urls added)");
+        }
+
+        // Migration to version 44: Add error monitoring system
+        // Captures errors from user-configured application logs for debug agent integration
+        if current_version < 44 {
+            info!(
+                "Migrating database to version 44 (adding error monitoring system)"
+            );
+
+            conn.execute_batch(
+                r#"
+                -- Log Sources: User-configured application log files to monitor
+                CREATE TABLE IF NOT EXISTS log_sources (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    description TEXT,
+                    path TEXT NOT NULL,
+                    path_type TEXT DEFAULT 'file',
+                    format TEXT DEFAULT 'plaintext',
+                    parser TEXT DEFAULT 'generic',
+                    timestamp_pattern TEXT,
+                    timezone TEXT DEFAULT 'local',
+                    error_patterns TEXT,
+                    warning_patterns TEXT,
+                    ignore_patterns TEXT,
+                    enabled INTEGER DEFAULT 1,
+                    poll_interval_ms INTEGER DEFAULT 5000,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_log_sources_name ON log_sources(name);
+                CREATE INDEX IF NOT EXISTS idx_log_sources_enabled ON log_sources(enabled);
+
+                -- Error Events: Captured errors from application logs
+                CREATE TABLE IF NOT EXISTS error_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    log_source_id INTEGER REFERENCES log_sources(id) ON DELETE SET NULL,
+                    log_source_name TEXT NOT NULL,
+                    task_run_id TEXT REFERENCES task_runs(id) ON DELETE SET NULL,
+                    workflow_step_id TEXT,
+                    log_timestamp TEXT,
+                    captured_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    severity TEXT NOT NULL DEFAULT 'error',
+                    error_type TEXT,
+                    error_code TEXT,
+                    message TEXT NOT NULL,
+                    stack_trace TEXT,
+                    context_lines TEXT,
+                    raw_entry TEXT,
+                    file_path TEXT,
+                    line_number INTEGER,
+                    column_number INTEGER,
+                    function_name TEXT,
+                    signature_hash TEXT NOT NULL,
+                    occurrence_count INTEGER DEFAULT 1,
+                    first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    status TEXT DEFAULT 'new',
+                    finding_id INTEGER REFERENCES task_run_findings(id) ON DELETE SET NULL,
+                    resolved_by_task_run_id TEXT,
+                    resolution_notes TEXT,
+                    acknowledged_at TEXT,
+                    resolved_at TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_error_events_log_source ON error_events(log_source_id);
+                CREATE INDEX IF NOT EXISTS idx_error_events_task_run ON error_events(task_run_id);
+                CREATE INDEX IF NOT EXISTS idx_error_events_signature ON error_events(signature_hash);
+                CREATE INDEX IF NOT EXISTS idx_error_events_status ON error_events(status);
+                CREATE INDEX IF NOT EXISTS idx_error_events_severity ON error_events(severity);
+                CREATE INDEX IF NOT EXISTS idx_error_events_captured ON error_events(captured_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_error_events_last_seen ON error_events(last_seen_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_error_events_source_name ON error_events(log_source_name);
+
+                -- Full-text search for error messages
+                CREATE VIRTUAL TABLE IF NOT EXISTS error_events_fts USING fts5(
+                    message,
+                    stack_trace,
+                    error_type,
+                    content='error_events',
+                    content_rowid='id'
+                );
+
+                -- FTS sync triggers
+                CREATE TRIGGER IF NOT EXISTS error_events_ai AFTER INSERT ON error_events BEGIN
+                    INSERT INTO error_events_fts(rowid, message, stack_trace, error_type)
+                    VALUES (new.id, new.message, new.stack_trace, new.error_type);
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS error_events_ad AFTER DELETE ON error_events BEGIN
+                    INSERT INTO error_events_fts(error_events_fts, rowid, message, stack_trace, error_type)
+                    VALUES ('delete', old.id, old.message, old.stack_trace, old.error_type);
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS error_events_au AFTER UPDATE ON error_events BEGIN
+                    INSERT INTO error_events_fts(error_events_fts, rowid, message, stack_trace, error_type)
+                    VALUES ('delete', old.id, old.message, old.stack_trace, old.error_type);
+                    INSERT INTO error_events_fts(rowid, message, stack_trace, error_type)
+                    VALUES (new.id, new.message, new.stack_trace, new.error_type);
+                END;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (44, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 44: {}", e))?;
+
+            info!("Successfully migrated to version 44 (error monitoring system added)");
+        }
+
+        // Version 45: Add bridge_id to task_runs for multi-bridge support
+        if current_version < 45 {
+            let _ = conn.execute(
+                "ALTER TABLE task_runs ADD COLUMN bridge_id TEXT",
+                [],
+            );
+
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_task_runs_bridge_id ON task_runs(bridge_id)",
+                [],
+            )
+            .map_err(|e| format!("Failed to create bridge_id index: {}", e))?;
+
+            conn.execute(
+                "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (45, datetime('now'))",
+                [],
+            )
+            .map_err(|e| format!("Failed to migrate to version 45: {}", e))?;
+
+            info!("Successfully migrated to version 45 (bridge_id added to task_runs)");
+        }
+
+        // Migration to version 46: Add flow_versions table for version history
+        if current_version < 46 {
+            info!("Migrating database to version 46 (adding flow_versions table)");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS flow_versions (
+                    id TEXT PRIMARY KEY,
+                    flow_id TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    definition TEXT NOT NULL,
+                    message TEXT,
+                    created_by TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (flow_id) REFERENCES orchestrator_flows(id) ON DELETE CASCADE,
+                    UNIQUE(flow_id, version)
+                );
+                CREATE INDEX IF NOT EXISTS idx_flow_versions_flow_id ON flow_versions(flow_id);
+                CREATE INDEX IF NOT EXISTS idx_flow_versions_flow_version ON flow_versions(flow_id, version);
+                "#,
+            )
+            .map_err(|e| format!("Failed to create flow_versions table: {}", e))?;
+
+            conn.execute(
+                "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (46, datetime('now'))",
+                [],
+            )
+            .map_err(|e| format!("Failed to migrate to version 46: {}", e))?;
+
+            info!("Successfully migrated to version 46 (flow_versions table added)");
+        }
+
+        // Migration to version 47: Add timeout_seconds to unified_workflows
+        if (1..47).contains(&current_version) {
+            info!("Migrating database to version 47 (add timeout_seconds to unified_workflows)");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE unified_workflows ADD COLUMN timeout_seconds INTEGER DEFAULT NULL;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (47, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 47: {}", e))?;
+
+            info!("Successfully migrated to version 47 (timeout_seconds added to unified_workflows)");
+        }
+
+        // Migration to version 48: Add workflow state management tables
+        if (1..48).contains(&current_version) {
+            info!("Migrating database to version 48 (workflow state management tables)");
+
+            conn.execute_batch(
+                r#"
+                -- Workflow Execution State: Explicit state tracking for workflows
+                CREATE TABLE IF NOT EXISTS workflow_execution_state (
+                    execution_id TEXT PRIMARY KEY,
+                    workflow_type TEXT NOT NULL,
+                    state_name TEXT NOT NULL,
+                    state_data TEXT,
+                    phase TEXT,
+                    iteration INTEGER,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (execution_id) REFERENCES task_runs(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_workflow_exec_state_type ON workflow_execution_state(workflow_type);
+                CREATE INDEX IF NOT EXISTS idx_workflow_exec_state_name ON workflow_execution_state(state_name);
+
+                -- Workflow Step Checkpoints: Step-level checkpointing for resume
+                CREATE TABLE IF NOT EXISTS workflow_step_checkpoints (
+                    id TEXT PRIMARY KEY,
+                    execution_id TEXT NOT NULL,
+                    workflow_type TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    iteration INTEGER,
+                    step_index INTEGER NOT NULL,
+                    step_type TEXT NOT NULL,
+                    step_name TEXT,
+                    status TEXT NOT NULL,
+                    result_json TEXT,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    duration_ms INTEGER,
+                    error TEXT,
+                    FOREIGN KEY (execution_id) REFERENCES task_runs(id) ON DELETE CASCADE,
+                    UNIQUE(execution_id, phase, iteration, step_index)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_step_checkpoints_execution ON workflow_step_checkpoints(execution_id);
+                CREATE INDEX IF NOT EXISTS idx_step_checkpoints_lookup ON workflow_step_checkpoints(execution_id, phase, iteration);
+                CREATE INDEX IF NOT EXISTS idx_step_checkpoints_status ON workflow_step_checkpoints(status);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (48, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 48: {}", e))?;
+
+            info!("Successfully migrated to version 48 (workflow state management tables)");
+        }
+
+        // Migration to version 49: Add step_config_json column to workflow_step_checkpoints
+        // This provides a single source of truth for step configuration instead of
+        // duplicating data between checkpoints and task_runs.execution_steps_json
+        if (1..49).contains(&current_version) {
+            info!("Migrating database to version 49 (add step_config_json and cursor index)");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE workflow_step_checkpoints ADD COLUMN step_config_json TEXT;
+
+                -- Add index for cursor-based pagination
+                CREATE INDEX IF NOT EXISTS idx_step_checkpoints_cursor ON workflow_step_checkpoints(execution_id, step_index);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (49, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 49: {}", e))?;
+
+            info!("Successfully migrated to version 49 (step_config_json column added)");
+        }
+
+        // Migration to version 50: Add step_progress_markers table for intra-step progress tracking
+        // This enables tracking progress within long AI operations (e.g., "analyzed 50/100 files")
+        if (1..50).contains(&current_version) {
+            info!("Migrating database to version 50 (add step_progress_markers table)");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS step_progress_markers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    checkpoint_id TEXT NOT NULL,
+                    marker_type TEXT NOT NULL,
+                    current_value INTEGER NOT NULL,
+                    total_value INTEGER,
+                    description TEXT,
+                    data_json TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (checkpoint_id) REFERENCES workflow_step_checkpoints(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_progress_markers_checkpoint ON step_progress_markers(checkpoint_id);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (50, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 50: {}", e))?;
+
+            info!("Successfully migrated to version 50 (step_progress_markers table added)");
+        }
+
+        // Migration to version 51: Change timeout_seconds from NOT NULL to nullable
+        // This disables default timeouts - None means no timeout (user must explicitly set one)
+        // Fixes: "The AI step reports that multiple checks timed out after 60 seconds"
+        //
+        // SQLite doesn't support ALTER COLUMN to remove NOT NULL, so we use the
+        // rename-recreate pattern: create new table, copy data, drop old, rename new.
+        if (1..51).contains(&current_version) {
+            info!("Migrating database to version 51 (disable default timeouts)");
+
+            // Step 1: Recreate 'checks' table without NOT NULL on timeout_seconds
+            conn.execute_batch(
+                r#"
+                -- Create new checks table with nullable timeout_seconds
+                CREATE TABLE IF NOT EXISTS checks_new (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT,
+                    check_type TEXT NOT NULL,
+                    tool TEXT NOT NULL,
+                    command TEXT,
+                    working_directory TEXT,
+                    config_path TEXT,
+                    auto_fix BOOLEAN NOT NULL DEFAULT 0,
+                    fail_on_warning BOOLEAN NOT NULL DEFAULT 0,
+                    timeout_seconds INTEGER,  -- Now nullable (NULL = no timeout)
+                    is_critical BOOLEAN NOT NULL DEFAULT 0,
+                    enabled BOOLEAN NOT NULL DEFAULT 1,
+                    ai_generated BOOLEAN NOT NULL DEFAULT 0,
+                    ai_generation_prompt TEXT,
+                    tags TEXT DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                -- Copy data, converting 60 to NULL
+                INSERT INTO checks_new SELECT
+                    id, name, description, check_type, tool, command,
+                    working_directory, config_path, auto_fix, fail_on_warning,
+                    CASE WHEN timeout_seconds = 60 THEN NULL ELSE timeout_seconds END,
+                    is_critical, enabled, ai_generated, ai_generation_prompt,
+                    tags, created_at, updated_at
+                FROM checks;
+
+                -- Drop old table and rename new
+                DROP TABLE checks;
+                ALTER TABLE checks_new RENAME TO checks;
+
+                -- Recreate indexes
+                CREATE INDEX IF NOT EXISTS idx_checks_check_type ON checks(check_type);
+                CREATE INDEX IF NOT EXISTS idx_checks_tool ON checks(tool);
+                CREATE INDEX IF NOT EXISTS idx_checks_enabled ON checks(enabled);
+                CREATE INDEX IF NOT EXISTS idx_checks_created_at ON checks(created_at);
+                CREATE INDEX IF NOT EXISTS idx_checks_updated_at ON checks(updated_at);
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate checks table to version 51: {}", e))?;
+
+            // Step 2: Recreate 'verification_tests' table without NOT NULL on timeout_seconds
+            conn.execute_batch(
+                r#"
+                -- Create new verification_tests table with nullable timeout_seconds
+                CREATE TABLE IF NOT EXISTS verification_tests_new (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT,
+                    test_type TEXT NOT NULL,
+                    category TEXT,
+                    playwright_code TEXT,
+                    vision_config TEXT,
+                    python_code TEXT,
+                    repo_test_config TEXT,
+                    success_criteria TEXT,
+                    config TEXT DEFAULT '{}',
+                    timeout_seconds INTEGER,  -- Now nullable (NULL = no timeout)
+                    is_critical BOOLEAN NOT NULL DEFAULT 1,
+                    enabled BOOLEAN NOT NULL DEFAULT 1,
+                    ai_generated BOOLEAN NOT NULL DEFAULT 0,
+                    ai_generation_prompt TEXT,
+                    tags TEXT DEFAULT '[]',
+                    source_file TEXT,
+                    last_exported_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                -- Copy data, converting 60 to NULL
+                INSERT INTO verification_tests_new SELECT
+                    id, name, description, test_type, category,
+                    playwright_code, vision_config, python_code, repo_test_config,
+                    success_criteria, config,
+                    CASE WHEN timeout_seconds = 60 THEN NULL ELSE timeout_seconds END,
+                    is_critical, enabled, ai_generated, ai_generation_prompt,
+                    tags, source_file, last_exported_at, created_at, updated_at
+                FROM verification_tests;
+
+                -- Drop old table and rename new
+                DROP TABLE verification_tests;
+                ALTER TABLE verification_tests_new RENAME TO verification_tests;
+
+                -- Recreate indexes
+                CREATE INDEX IF NOT EXISTS idx_verification_tests_test_type ON verification_tests(test_type);
+                CREATE INDEX IF NOT EXISTS idx_verification_tests_category ON verification_tests(category);
+                CREATE INDEX IF NOT EXISTS idx_verification_tests_enabled ON verification_tests(enabled);
+                CREATE INDEX IF NOT EXISTS idx_verification_tests_created_at ON verification_tests(created_at);
+                CREATE INDEX IF NOT EXISTS idx_verification_tests_updated_at ON verification_tests(updated_at);
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate verification_tests table to version 51: {}", e))?;
+
+            // Step 3: Update shell_commands (already allows NULL, just update values)
+            conn.execute_batch(
+                r#"
+                UPDATE shell_commands SET timeout_seconds = NULL WHERE timeout_seconds = 30;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (51, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate shell_commands to version 51: {}", e))?;
+
+            info!("Successfully migrated to version 51 (default timeouts disabled)");
+        }
+
+        // Migration to version 52: Add execution_spans table for tracing
+        if current_version < 52 {
+            info!("Migrating to version 52 (execution spans table)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS execution_spans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    execution_id TEXT,
+                    trace_id TEXT NOT NULL,
+                    span_id TEXT NOT NULL,
+                    parent_span_id TEXT,
+                    name TEXT NOT NULL,
+                    start_ts TEXT NOT NULL,
+                    end_ts TEXT,
+                    duration_ms INTEGER,
+                    attributes TEXT,
+                    success INTEGER DEFAULT 1,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (execution_id) REFERENCES task_runs(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_spans_execution ON execution_spans(execution_id);
+                CREATE INDEX IF NOT EXISTS idx_spans_trace ON execution_spans(trace_id);
+                CREATE INDEX IF NOT EXISTS idx_spans_name ON execution_spans(name);
+                CREATE INDEX IF NOT EXISTS idx_spans_start ON execution_spans(start_ts);
+                CREATE INDEX IF NOT EXISTS idx_spans_duration ON execution_spans(duration_ms);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (52, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to create execution_spans table (version 52): {}", e))?;
+
+            info!("Successfully migrated to version 52 (execution spans table)");
+        }
+
         Ok(())
     }
 
@@ -3758,11 +4682,114 @@ impl CheckpointDb {
     // Task Run Operations (Simplified Task Model)
     // ========================================================================
 
-    /// Create a new task run.
-    /// If `auto_continue` is None, defaults to true.
-    /// `execution_steps_json` and `log_sources_json` are optional JSON strings
-    /// that store the deterministic steps to re-execute on session resume.
-    pub fn create_task_run(
+    /// Create a new task run using the builder pattern.
+    ///
+    /// This is the canonical method for creating task runs. Use `CreateTaskRunInput::new()`
+    /// with builder methods to construct the input.
+    ///
+    /// # Example
+    /// ```rust
+    /// use crate::database::{CheckpointDb, CreateTaskRunInput};
+    ///
+    /// let input = CreateTaskRunInput::new("task-123", "My Task")
+    ///     .with_prompt("Do something useful")
+    ///     .with_config_id("config-456")
+    ///     .with_workflow_type("unified");
+    ///
+    /// let task_run = db.create_task_run(&input)?;
+    /// ```
+    ///
+    /// # Workflow Types
+    /// - `"unified"` - Uses LoopController for verification-agentic loop. External code
+    ///   (TaskMonitor, legacy session code) should NOT modify status.
+    /// - `"legacy_session"` - Legacy session-based execution
+    /// - `"automation_only"` - Pure automation without AI
+    /// - `None` - Legacy/unspecified (for backward compatibility)
+    pub fn create_task_run(&self, input: &CreateTaskRunInput) -> Result<TaskRun, String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+        let auto_continue_val = input.auto_continue.unwrap_or(true);
+        let task_type = input.task_type.as_deref().unwrap_or("task");
+
+        // Default root_task_run_id to self if not provided (root-level task)
+        let effective_root = input.root_task_run_id.as_deref().unwrap_or(&input.id);
+
+        conn.execute(
+            r#"
+            INSERT INTO task_runs (id, task_name, prompt, task_type, status, sessions_count, max_sessions,
+                                   output_log, auto_continue, execution_steps_json, log_sources_json,
+                                   config_id, workflow_name, workflow_type,
+                                   parent_task_run_id, root_task_run_id, depth,
+                                   workspace_id, triggered_by, bridge_id,
+                                   created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, 'running', 0, ?5, '', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?18)
+            "#,
+            params![
+                input.id,
+                input.task_name,
+                input.prompt,
+                task_type,
+                input.max_sessions.map(|v| v as i64),
+                auto_continue_val as i32,
+                input.execution_steps_json,
+                input.log_sources_json,
+                input.config_id,
+                input.workflow_name,
+                input.workflow_type,
+                input.parent_task_run_id,
+                effective_root,
+                input.depth as i64,
+                input.workspace_id,
+                input.triggered_by,
+                input.bridge_id,
+                now
+            ],
+        )
+        .map_err(|e| format!("Failed to create task run: {}", e))?;
+
+        Ok(TaskRun {
+            id: input.id.clone(),
+            task_name: input.task_name.clone(),
+            prompt: input.prompt.clone(),
+            task_type: task_type.to_string(),
+            status: "running".to_string(),
+            sessions_count: 0,
+            max_sessions: input.max_sessions,
+            output_log: String::new(),
+            error_message: None,
+            auto_continue: auto_continue_val,
+            execution_steps_json: input.execution_steps_json.clone(),
+            log_sources_json: input.log_sources_json.clone(),
+            config_id: input.config_id.clone(),
+            workflow_name: input.workflow_name.clone(),
+            summary: None,
+            ai_summary: None,
+            goal_achieved: None,
+            remaining_work: None,
+            summary_generated_at: None,
+            transition_history_json: None,
+            workflow_type: input.workflow_type.clone(),
+            workspace_id: input.workspace_id.clone(),
+            triggered_by: input.triggered_by.clone(),
+            parent_task_run_id: input.parent_task_run_id.clone(),
+            root_task_run_id: Some(effective_root.to_string()),
+            depth: input.depth,
+            bridge_id: input.bridge_id.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+            completed_at: None,
+        })
+    }
+
+    /// Create a new task run with basic parameters.
+    ///
+    /// **Deprecated:** Use `create_task_run` with `CreateTaskRunInput::new()` builder instead.
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use create_task_run with CreateTaskRunInput::new().with_prompt() builder instead"
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_task_run_legacy(
         &self,
         id: &str,
         task_name: &str,
@@ -3772,22 +4799,33 @@ impl CheckpointDb {
         execution_steps_json: Option<String>,
         log_sources_json: Option<String>,
     ) -> Result<TaskRun, String> {
-        self.create_task_run_with_config(
-            id,
-            task_name,
-            prompt,
-            "task", // default task_type
-            None,   // no config_id
-            None,   // no workflow_name
-            max_sessions,
-            auto_continue,
-            execution_steps_json,
-            log_sources_json,
-        )
+        let mut input = CreateTaskRunInput::new(id, task_name);
+        if let Some(p) = prompt {
+            input = input.with_prompt(p);
+        }
+        if let Some(ms) = max_sessions {
+            input = input.with_max_sessions(ms);
+        }
+        if let Some(ac) = auto_continue {
+            input = input.with_auto_continue(ac);
+        }
+        if let Some(esj) = execution_steps_json {
+            input = input.with_execution_steps_json(esj);
+        }
+        if let Some(lsj) = log_sources_json {
+            input = input.with_log_sources_json(lsj);
+        }
+        self.create_task_run(&input)
     }
 
     /// Create a new task run with full configuration options.
-    /// This is the unified entry point for creating any type of task run.
+    ///
+    /// **Deprecated:** Use `create_task_run` with `CreateTaskRunInput::new()` builder instead.
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use create_task_run with CreateTaskRunInput::new().with_*() builder instead"
+    )]
+    #[allow(clippy::too_many_arguments)]
     pub fn create_task_run_with_config(
         &self,
         id: &str,
@@ -3801,58 +4839,154 @@ impl CheckpointDb {
         execution_steps_json: Option<String>,
         log_sources_json: Option<String>,
     ) -> Result<TaskRun, String> {
-        let conn = self.get_conn()?;
-        let now = Utc::now().to_rfc3339();
-        let auto_continue_val = auto_continue.unwrap_or(true);
+        let mut input = CreateTaskRunInput::new(id, task_name)
+            .with_task_type(task_type);
+        if let Some(p) = prompt {
+            input = input.with_prompt(p);
+        }
+        if let Some(cid) = config_id {
+            input = input.with_config_id(cid);
+        }
+        if let Some(wn) = workflow_name {
+            input = input.with_workflow_name(wn);
+        }
+        if let Some(ms) = max_sessions {
+            input = input.with_max_sessions(ms);
+        }
+        if let Some(ac) = auto_continue {
+            input = input.with_auto_continue(ac);
+        }
+        if let Some(esj) = execution_steps_json {
+            input = input.with_execution_steps_json(esj);
+        }
+        if let Some(lsj) = log_sources_json {
+            input = input.with_log_sources_json(lsj);
+        }
+        self.create_task_run(&input)
+    }
 
-        conn.execute(
-            r#"
-            INSERT INTO task_runs (id, task_name, prompt, task_type, status, sessions_count, max_sessions,
-                                   output_log, auto_continue, execution_steps_json, log_sources_json,
-                                   config_id, workflow_name, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, 'running', 0, ?5, '', ?6, ?7, ?8, ?9, ?10, ?11, ?11)
-            "#,
-            params![
-                id,
-                task_name,
-                prompt,
-                task_type,
-                max_sessions.map(|v| v as i64),
-                auto_continue_val as i32,
-                execution_steps_json,
-                log_sources_json,
-                config_id,
-                workflow_name,
-                now
-            ],
-        )
-        .map_err(|e| format!("Failed to create task run: {}", e))?;
+    /// Create a new task run with full configuration options including workflow_type.
+    ///
+    /// **Deprecated:** Use `create_task_run` with `CreateTaskRunInput::new()` builder instead.
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use create_task_run with CreateTaskRunInput::new().with_*() builder instead"
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_task_run_with_workflow_type(
+        &self,
+        id: &str,
+        task_name: &str,
+        prompt: Option<&str>,
+        task_type: &str,
+        config_id: Option<&str>,
+        workflow_name: Option<&str>,
+        max_sessions: Option<u32>,
+        auto_continue: Option<bool>,
+        execution_steps_json: Option<String>,
+        log_sources_json: Option<String>,
+        workflow_type: Option<&str>,
+    ) -> Result<TaskRun, String> {
+        let mut input = CreateTaskRunInput::new(id, task_name)
+            .with_task_type(task_type);
+        if let Some(p) = prompt {
+            input = input.with_prompt(p);
+        }
+        if let Some(cid) = config_id {
+            input = input.with_config_id(cid);
+        }
+        if let Some(wn) = workflow_name {
+            input = input.with_workflow_name(wn);
+        }
+        if let Some(ms) = max_sessions {
+            input = input.with_max_sessions(ms);
+        }
+        if let Some(ac) = auto_continue {
+            input = input.with_auto_continue(ac);
+        }
+        if let Some(esj) = execution_steps_json {
+            input = input.with_execution_steps_json(esj);
+        }
+        if let Some(lsj) = log_sources_json {
+            input = input.with_log_sources_json(lsj);
+        }
+        if let Some(wt) = workflow_type {
+            input = input.with_workflow_type(wt);
+        }
+        self.create_task_run(&input)
+    }
 
-        Ok(TaskRun {
-            id: id.to_string(),
-            task_name: task_name.to_string(),
-            prompt: prompt.map(|s| s.to_string()),
-            task_type: task_type.to_string(),
-            status: "running".to_string(),
-            sessions_count: 0,
-            max_sessions,
-            output_log: String::new(),
-            error_message: None,
-            auto_continue: auto_continue_val,
-            execution_steps_json,
-            log_sources_json,
-            config_id: config_id.map(|s| s.to_string()),
-            workflow_name: workflow_name.map(|s| s.to_string()),
-            summary: None,
-            ai_summary: None,
-            goal_achieved: None,
-            remaining_work: None,
-            summary_generated_at: None,
-            transition_history_json: None,
-            created_at: now.clone(),
-            updated_at: now,
-            completed_at: None,
-        })
+    /// Create a new task run with full configuration options including hierarchy fields.
+    ///
+    /// **Deprecated:** Use `create_task_run` with `CreateTaskRunInput::new()` builder instead.
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use create_task_run with CreateTaskRunInput::new().with_*() builder instead"
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_task_run_with_hierarchy(
+        &self,
+        id: &str,
+        task_name: &str,
+        prompt: Option<&str>,
+        task_type: &str,
+        config_id: Option<&str>,
+        workflow_name: Option<&str>,
+        max_sessions: Option<u32>,
+        auto_continue: Option<bool>,
+        execution_steps_json: Option<String>,
+        log_sources_json: Option<String>,
+        workflow_type: Option<&str>,
+        parent_task_run_id: Option<&str>,
+        root_task_run_id: Option<&str>,
+        depth: u32,
+        workspace_id: Option<&str>,
+        triggered_by: Option<&str>,
+        bridge_id: Option<&str>,
+    ) -> Result<TaskRun, String> {
+        let mut input = CreateTaskRunInput::new(id, task_name)
+            .with_task_type(task_type)
+            .with_depth(depth);
+        if let Some(p) = prompt {
+            input = input.with_prompt(p);
+        }
+        if let Some(cid) = config_id {
+            input = input.with_config_id(cid);
+        }
+        if let Some(wn) = workflow_name {
+            input = input.with_workflow_name(wn);
+        }
+        if let Some(ms) = max_sessions {
+            input = input.with_max_sessions(ms);
+        }
+        if let Some(ac) = auto_continue {
+            input = input.with_auto_continue(ac);
+        }
+        if let Some(esj) = execution_steps_json {
+            input = input.with_execution_steps_json(esj);
+        }
+        if let Some(lsj) = log_sources_json {
+            input = input.with_log_sources_json(lsj);
+        }
+        if let Some(wt) = workflow_type {
+            input = input.with_workflow_type(wt);
+        }
+        if let Some(ptri) = parent_task_run_id {
+            input = input.with_parent_task_run_id(ptri);
+        }
+        if let Some(rtri) = root_task_run_id {
+            input = input.with_root_task_run_id(rtri);
+        }
+        if let Some(wid) = workspace_id {
+            input = input.with_workspace_id(wid);
+        }
+        if let Some(tb) = triggered_by {
+            input = input.with_triggered_by(tb);
+        }
+        if let Some(bid) = bridge_id {
+            input = input.with_bridge_id(bid);
+        }
+        self.create_task_run(&input)
     }
 
     /// Get a task run by ID.
@@ -3866,7 +5000,10 @@ impl CheckpointDb {
             SELECT id, task_name, prompt, task_type, status, sessions_count, max_sessions, error_message, auto_continue,
                    execution_steps_json, log_sources_json, config_id, workflow_name,
                    COALESCE(summary, ai_summary) as summary, ai_summary, goal_achieved, remaining_work,
-                   summary_generated_at, transition_history_json, created_at, updated_at, completed_at
+                   summary_generated_at, transition_history_json, workflow_type,
+                   workspace_id, triggered_by,
+                   parent_task_run_id, root_task_run_id, depth, bridge_id,
+                   created_at, updated_at, completed_at
             FROM task_runs
             WHERE id = ?1
             "#,
@@ -3893,9 +5030,16 @@ impl CheckpointDb {
                     remaining_work: row.get(16)?,
                     summary_generated_at: row.get(17)?,
                     transition_history_json: row.get(18)?,
-                    created_at: row.get(19)?,
-                    updated_at: row.get(20)?,
-                    completed_at: row.get(21)?,
+                    workflow_type: row.get(19)?,
+                    workspace_id: row.get(20)?,
+                    triggered_by: row.get(21)?,
+                    parent_task_run_id: row.get(22)?,
+                    root_task_run_id: row.get(23)?,
+                    depth: row.get::<_, Option<i64>>(24)?.unwrap_or(0) as u32,
+                    bridge_id: row.get(25)?,
+                    created_at: row.get(26)?,
+                    updated_at: row.get(27)?,
+                    completed_at: row.get(28)?,
                 })
             },
         );
@@ -3910,6 +5054,155 @@ impl CheckpointDb {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(format!("Failed to get task run: {}", e)),
         }
+    }
+
+    /// Get all child task runs (direct children) for a parent task.
+    ///
+    /// Returns task runs where `parent_task_run_id` matches the given parent ID.
+    /// This only returns direct children (depth = parent.depth + 1), not all descendants.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let children = db.get_child_task_runs("parent-task-123")?;
+    /// for child in children {
+    ///     println!("Child task: {} (depth: {})", child.task_name, child.depth);
+    /// }
+    /// ```
+    pub fn get_child_task_runs(&self, parent_task_run_id: &str) -> Result<Vec<TaskRun>, String> {
+        let conn = self.get_conn()?;
+
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT id, task_name, prompt, task_type, status, sessions_count, max_sessions, error_message, auto_continue,
+                       execution_steps_json, log_sources_json, config_id, workflow_name,
+                       COALESCE(summary, ai_summary) as summary, ai_summary, goal_achieved, remaining_work,
+                       summary_generated_at, transition_history_json, workflow_type,
+                       workspace_id, triggered_by,
+                       parent_task_run_id, root_task_run_id, depth, bridge_id,
+                       created_at, updated_at, completed_at
+                FROM task_runs
+                WHERE parent_task_run_id = ?1
+                ORDER BY created_at ASC
+                "#,
+            )
+            .map_err(|e| format!("Failed to prepare child task query: {}", e))?;
+
+        let task_runs = stmt
+            .query_map(params![parent_task_run_id], |row| {
+                Ok(TaskRun {
+                    id: row.get(0)?,
+                    task_name: row.get(1)?,
+                    prompt: row.get(2)?,
+                    task_type: row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "task".to_string()),
+                    status: row.get(4)?,
+                    sessions_count: row.get::<_, i64>(5)? as u32,
+                    max_sessions: row.get::<_, Option<i64>>(6)?.map(|v| v as u32),
+                    output_log: String::new(), // Not fetching chunks for performance
+                    error_message: row.get(7)?,
+                    auto_continue: row.get::<_, i32>(8)? != 0,
+                    execution_steps_json: row.get(9)?,
+                    log_sources_json: row.get(10)?,
+                    config_id: row.get(11)?,
+                    workflow_name: row.get(12)?,
+                    summary: row.get(13)?,
+                    ai_summary: row.get(14)?,
+                    goal_achieved: row.get::<_, Option<i32>>(15)?.map(|v| v != 0),
+                    remaining_work: row.get(16)?,
+                    summary_generated_at: row.get(17)?,
+                    transition_history_json: row.get(18)?,
+                    workflow_type: row.get(19)?,
+                    workspace_id: row.get(20)?,
+                    triggered_by: row.get(21)?,
+                    parent_task_run_id: row.get(22)?,
+                    root_task_run_id: row.get(23)?,
+                    depth: row.get::<_, Option<i64>>(24)?.unwrap_or(0) as u32,
+                    bridge_id: row.get(25)?,
+                    created_at: row.get(26)?,
+                    updated_at: row.get(27)?,
+                    completed_at: row.get(28)?,
+                })
+            })
+            .map_err(|e| format!("Failed to query child tasks: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(task_runs)
+    }
+
+    /// Get all task runs in a hierarchy (all descendants of a root task).
+    ///
+    /// Returns task runs where `root_task_run_id` matches the given root ID.
+    /// This includes all descendants at any depth level.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let all_tasks = db.get_task_run_hierarchy("root-task-123")?;
+    /// for task in all_tasks {
+    ///     let indent = "  ".repeat(task.depth as usize);
+    ///     println!("{}Task: {} (depth: {})", indent, task.task_name, task.depth);
+    /// }
+    /// ```
+    pub fn get_task_run_hierarchy(&self, root_task_run_id: &str) -> Result<Vec<TaskRun>, String> {
+        let conn = self.get_conn()?;
+
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT id, task_name, prompt, task_type, status, sessions_count, max_sessions, error_message, auto_continue,
+                       execution_steps_json, log_sources_json, config_id, workflow_name,
+                       COALESCE(summary, ai_summary) as summary, ai_summary, goal_achieved, remaining_work,
+                       summary_generated_at, transition_history_json, workflow_type,
+                       workspace_id, triggered_by,
+                       parent_task_run_id, root_task_run_id, depth, bridge_id,
+                       created_at, updated_at, completed_at
+                FROM task_runs
+                WHERE root_task_run_id = ?1 AND id != ?1
+                ORDER BY depth ASC, created_at ASC
+                "#,
+            )
+            .map_err(|e| format!("Failed to prepare hierarchy query: {}", e))?;
+
+        let task_runs = stmt
+            .query_map(params![root_task_run_id], |row| {
+                Ok(TaskRun {
+                    id: row.get(0)?,
+                    task_name: row.get(1)?,
+                    prompt: row.get(2)?,
+                    task_type: row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "task".to_string()),
+                    status: row.get(4)?,
+                    sessions_count: row.get::<_, i64>(5)? as u32,
+                    max_sessions: row.get::<_, Option<i64>>(6)?.map(|v| v as u32),
+                    output_log: String::new(), // Not fetching chunks for performance
+                    error_message: row.get(7)?,
+                    auto_continue: row.get::<_, i32>(8)? != 0,
+                    execution_steps_json: row.get(9)?,
+                    log_sources_json: row.get(10)?,
+                    config_id: row.get(11)?,
+                    workflow_name: row.get(12)?,
+                    summary: row.get(13)?,
+                    ai_summary: row.get(14)?,
+                    goal_achieved: row.get::<_, Option<i32>>(15)?.map(|v| v != 0),
+                    remaining_work: row.get(16)?,
+                    summary_generated_at: row.get(17)?,
+                    transition_history_json: row.get(18)?,
+                    workflow_type: row.get(19)?,
+                    workspace_id: row.get(20)?,
+                    triggered_by: row.get(21)?,
+                    parent_task_run_id: row.get(22)?,
+                    root_task_run_id: row.get(23)?,
+                    depth: row.get::<_, Option<i64>>(24)?.unwrap_or(0) as u32,
+                    bridge_id: row.get(25)?,
+                    created_at: row.get(26)?,
+                    updated_at: row.get(27)?,
+                    completed_at: row.get(28)?,
+                })
+            })
+            .map_err(|e| format!("Failed to query task hierarchy: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(task_runs)
     }
 
     /// Append output to a task run and increment session count.
@@ -4006,6 +5299,10 @@ impl CheckpointDb {
     }
 
     /// Mark a task run as complete.
+    ///
+    /// For unified workflows, this should ONLY be called by the LoopController.
+    /// Other code paths (TaskMonitor, legacy session code) should check workflow_type
+    /// before calling this method. Consider using `complete_task_run_if_allowed` instead.
     pub fn complete_task_run(&self, id: &str) -> Result<(), String> {
         let conn = self.get_conn()?;
         let now = Utc::now().to_rfc3339();
@@ -4026,7 +5323,86 @@ impl CheckpointDb {
         Ok(())
     }
 
+    /// Mark a task run as complete, but only if it's not a unified workflow.
+    ///
+    /// Unified workflows should only have status modified by the LoopController.
+    /// This method checks workflow_type and skips the update if it's "unified".
+    ///
+    /// # Returns
+    /// - `Ok(true)` if the task was marked complete
+    /// - `Ok(false)` if the task is a unified workflow and was NOT modified
+    /// - `Err(...)` if there was a database error
+    pub fn complete_task_run_if_allowed(&self, id: &str, caller: &str) -> Result<bool, String> {
+        let conn = self.get_conn()?;
+
+        // Check workflow_type first
+        let workflow_type: Option<String> = conn
+            .query_row(
+                "SELECT workflow_type FROM task_runs WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to get workflow_type: {}", e))?
+            .flatten();
+
+        if workflow_type.as_deref() == Some("unified") {
+            warn!(
+                "BLOCKED: {} attempted to complete unified workflow task {} - only LoopController should modify status",
+                caller, id
+            );
+            return Ok(false);
+        }
+
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            r#"
+            UPDATE task_runs SET
+                status = 'completed',
+                updated_at = ?1,
+                completed_at = ?1
+            WHERE id = ?2
+            "#,
+            params![now, id],
+        )
+        .map_err(|e| format!("Failed to complete task run: {}", e))?;
+
+        info!(
+            "Task run {} marked completed by {} (workflow_type={:?})",
+            id, caller, workflow_type
+        );
+        Ok(true)
+    }
+
+    /// Update a task run's status without changing other fields.
+    ///
+    /// Used by the unified workflow loop controller to reset task status to "running"
+    /// at the start of each iteration, preventing external modifications from
+    /// prematurely marking the task as complete or failed.
+    pub fn update_task_run_status(&self, id: &str, status: &str) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        conn.execute(
+            r#"
+            UPDATE task_runs SET
+                status = ?1,
+                updated_at = ?2
+            WHERE id = ?3
+            "#,
+            params![status, now, id],
+        )
+        .map_err(|e| format!("Failed to update task run status: {}", e))?;
+
+        info!("Task run {} status updated to '{}'", id, status);
+        Ok(())
+    }
+
     /// Mark a task run as failed.
+    ///
+    /// For unified workflows, this should ONLY be called by the LoopController.
+    /// Other code paths (TaskMonitor, legacy session code) should check workflow_type
+    /// before calling this method. Consider using `fail_task_run_if_allowed` instead.
     pub fn fail_task_run(&self, id: &str, error_message: &str) -> Result<(), String> {
         let conn = self.get_conn()?;
         let now = Utc::now().to_rfc3339();
@@ -4044,7 +5420,65 @@ impl CheckpointDb {
         )
         .map_err(|e| format!("Failed to fail task run: {}", e))?;
 
+        info!("Task run {} marked failed: {}", id, error_message);
         Ok(())
+    }
+
+    /// Mark a task run as failed, but only if it's not a unified workflow.
+    ///
+    /// Unified workflows should only have status modified by the LoopController.
+    /// This method checks workflow_type and skips the update if it's "unified".
+    ///
+    /// # Returns
+    /// - `Ok(true)` if the task was marked failed
+    /// - `Ok(false)` if the task is a unified workflow and was NOT modified
+    /// - `Err(...)` if there was a database error
+    pub fn fail_task_run_if_allowed(
+        &self,
+        id: &str,
+        error_message: &str,
+        caller: &str,
+    ) -> Result<bool, String> {
+        let conn = self.get_conn()?;
+
+        // Check workflow_type first
+        let workflow_type: Option<String> = conn
+            .query_row(
+                "SELECT workflow_type FROM task_runs WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to get workflow_type: {}", e))?
+            .flatten();
+
+        if workflow_type.as_deref() == Some("unified") {
+            warn!(
+                "BLOCKED: {} attempted to fail unified workflow task {} with error '{}' - only LoopController should modify status",
+                caller, id, error_message
+            );
+            return Ok(false);
+        }
+
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            r#"
+            UPDATE task_runs SET
+                status = 'failed',
+                error_message = ?1,
+                updated_at = ?2,
+                completed_at = ?2
+            WHERE id = ?3
+            "#,
+            params![error_message, now, id],
+        )
+        .map_err(|e| format!("Failed to fail task run: {}", e))?;
+
+        info!(
+            "Task run {} marked failed by {} (workflow_type={:?}): {}",
+            id, caller, workflow_type, error_message
+        );
+        Ok(true)
     }
 
     /// Stop a task run.
@@ -4173,6 +5607,7 @@ impl CheckpointDb {
                        execution_steps_json, log_sources_json,
                        COALESCE(summary, ai_summary) as summary, ai_summary,
                        goal_achieved, remaining_work, summary_generated_at,
+                       workspace_id, triggered_by,
                        created_at, updated_at, completed_at,
                        task_type, config_id, workflow_name
                 FROM task_runs
@@ -4202,12 +5637,19 @@ impl CheckpointDb {
                     remaining_work: row.get(13)?,
                     summary_generated_at: row.get(14)?,
                     transition_history_json: None,
-                    created_at: row.get(15)?,
-                    updated_at: row.get(16)?,
-                    completed_at: row.get(17)?,
-                    task_type: row.get(18)?,
-                    config_id: row.get(19)?,
-                    workflow_name: row.get(20)?,
+                    workflow_type: None,      // Not queried for performance
+                    workspace_id: row.get(15)?,
+                    triggered_by: row.get(16)?,
+                    parent_task_run_id: None, // Not queried for performance
+                    root_task_run_id: None,   // Not queried for performance
+                    depth: 0,                 // Not queried for performance
+                    bridge_id: None,          // Not queried for performance
+                    created_at: row.get(17)?,
+                    updated_at: row.get(18)?,
+                    completed_at: row.get(19)?,
+                    task_type: row.get(20)?,
+                    config_id: row.get(21)?,
+                    workflow_name: row.get(22)?,
                 })
             })
             .map_err(|e| format!("Failed to execute query: {}", e))?
@@ -4215,6 +5657,115 @@ impl CheckpointDb {
             .collect();
 
         Ok(task_runs)
+    }
+
+    /// Get all running unified workflow task runs for resume on startup.
+    /// Returns task runs where status = 'running' AND workflow_type = 'unified'.
+    pub fn get_running_unified_workflows(&self) -> Result<Vec<TaskRun>, String> {
+        let conn = self.get_conn()?;
+
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT id, task_name, prompt, status, sessions_count, max_sessions, error_message, auto_continue,
+                       execution_steps_json, log_sources_json,
+                       COALESCE(summary, ai_summary) as summary, ai_summary,
+                       goal_achieved, remaining_work, summary_generated_at,
+                       workspace_id, triggered_by,
+                       created_at, updated_at, completed_at,
+                       task_type, config_id, workflow_name
+                FROM task_runs
+                WHERE status = 'running' AND workflow_type = 'unified'
+                ORDER BY updated_at DESC
+                "#,
+            )
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+        let task_runs = stmt
+            .query_map([], |row| {
+                Ok(TaskRun {
+                    id: row.get(0)?,
+                    task_name: row.get(1)?,
+                    prompt: row.get(2)?,
+                    status: row.get(3)?,
+                    sessions_count: row.get::<_, i64>(4)? as u32,
+                    max_sessions: row.get::<_, Option<i64>>(5)?.map(|v| v as u32),
+                    output_log: String::new(), // Empty for performance
+                    error_message: row.get(6)?,
+                    auto_continue: row.get::<_, i32>(7)? != 0,
+                    execution_steps_json: row.get(8)?,
+                    log_sources_json: row.get(9)?,
+                    summary: row.get(10)?,
+                    ai_summary: row.get(11)?,
+                    goal_achieved: row.get::<_, Option<i32>>(12)?.map(|v| v != 0),
+                    remaining_work: row.get(13)?,
+                    summary_generated_at: row.get(14)?,
+                    transition_history_json: None,
+                    workflow_type: Some("unified".to_string()), // We know it's unified
+                    workspace_id: row.get(15)?,
+                    triggered_by: row.get(16)?,
+                    parent_task_run_id: None, // Not queried for performance
+                    root_task_run_id: None,   // Not queried for performance
+                    depth: 0,                 // Not queried for performance
+                    bridge_id: None,          // Not queried for performance
+                    created_at: row.get(17)?,
+                    updated_at: row.get(18)?,
+                    completed_at: row.get(19)?,
+                    task_type: row.get(20)?,
+                    config_id: row.get(21)?,
+                    workflow_name: row.get(22)?,
+                })
+            })
+            .map_err(|e| format!("Failed to execute query: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(task_runs)
+    }
+
+    /// Find an incomplete (running) task_run for a specific workflow by config_id.
+    /// Returns the most recent running task_run for the given workflow, if any.
+    /// Used to enable automatic resume when a workflow is re-run after a crash/restart.
+    pub fn get_incomplete_task_run_for_workflow(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Option<String>, String> {
+        let conn = self.get_conn()?;
+
+        let result: Result<String, rusqlite::Error> = conn.query_row(
+            r#"
+            SELECT id
+            FROM task_runs
+            WHERE config_id = ?1
+              AND status = 'running'
+              AND workflow_type = 'unified'
+            ORDER BY updated_at DESC
+            LIMIT 1
+            "#,
+            params![workflow_id],
+            |row| row.get(0),
+        );
+
+        match result {
+            Ok(id) => Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!("Failed to get incomplete task run: {}", e)),
+        }
+    }
+
+    /// Mark an interrupted workflow as failed.
+    /// Used when resume is disabled on startup.
+    pub fn mark_interrupted_workflow_failed(&self, id: &str) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        conn.execute(
+            "UPDATE task_runs SET status = 'failed', error_message = 'Workflow interrupted by runner restart (resume disabled)', completed_at = ?1, updated_at = ?1 WHERE id = ?2",
+            params![now, id],
+        )
+        .map_err(|e| format!("Failed to mark interrupted workflow as failed: {}", e))?;
+
+        Ok(())
     }
 
     /// Get recent task runs (for display in UI).
@@ -4227,7 +5778,9 @@ impl CheckpointDb {
                 r#"
                 SELECT id, task_name, prompt, task_type, status, sessions_count, max_sessions, error_message, auto_continue,
                        config_id, workflow_name, COALESCE(summary, ai_summary) as summary, ai_summary,
-                       goal_achieved, remaining_work, summary_generated_at, created_at, updated_at, completed_at
+                       goal_achieved, remaining_work, summary_generated_at,
+                       workspace_id, triggered_by,
+                       created_at, updated_at, completed_at
                 FROM task_runs
                 ORDER BY updated_at DESC
                 LIMIT ?1
@@ -4260,9 +5813,16 @@ impl CheckpointDb {
                     remaining_work: row.get(14)?,
                     summary_generated_at: row.get(15)?,
                     transition_history_json: None,
-                    created_at: row.get(16)?,
-                    updated_at: row.get(17)?,
-                    completed_at: row.get(18)?,
+                    workflow_type: None,      // Not queried for performance
+                    workspace_id: row.get(16)?,
+                    triggered_by: row.get(17)?,
+                    parent_task_run_id: None, // Not queried for performance
+                    root_task_run_id: None,   // Not queried for performance
+                    depth: 0,                 // Not queried for performance
+                    bridge_id: None,          // Not queried for performance
+                    created_at: row.get(18)?,
+                    updated_at: row.get(19)?,
+                    completed_at: row.get(20)?,
                 })
             })
             .map_err(|e| format!("Failed to execute query: {}", e))?
@@ -4286,7 +5846,11 @@ impl CheckpointDb {
         }
     }
 
-    /// Check if a task run should continue (not complete, not stopped, not at max sessions, auto_continue enabled).
+    /// Check if a task run should continue (not complete, not stopped, not at max sessions).
+    ///
+    /// Note: This does NOT check `auto_continue` because that setting only controls
+    /// whether to resume on startup, not whether to continue after a step finishes.
+    /// Workflows should always continue after steps are finished.
     pub fn should_continue_task(&self, id: &str) -> Result<bool, String> {
         let task_run = self
             .get_task_run(id)?
@@ -4294,11 +5858,6 @@ impl CheckpointDb {
 
         // Already complete or stopped
         if task_run.status != "running" {
-            return Ok(false);
-        }
-
-        // Check if auto_continue is enabled for this task
-        if !task_run.auto_continue {
             return Ok(false);
         }
 
@@ -5367,7 +6926,7 @@ impl CheckpointDb {
                         .get::<_, Option<String>>(10)?
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or(serde_json::json!({})),
-                    timeout_seconds: row.get::<_, i64>(11)? as u32,
+                    timeout_seconds: row.get::<_, Option<i64>>(11)?.map(|v| v as u32),
                     is_critical: row.get::<_, i32>(12)? != 0,
                     enabled: row.get::<_, i32>(13)? != 0,
                     ai_generated: row.get::<_, i32>(14)? != 0,
@@ -5474,7 +7033,7 @@ impl CheckpointDb {
                 .get::<_, Option<String>>(10)?
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or(serde_json::json!({})),
-            timeout_seconds: row.get::<_, i64>(11)? as u32,
+            timeout_seconds: row.get::<_, Option<i64>>(11)?.map(|v| v as u32),
             is_critical: row.get::<_, i32>(12)? != 0,
             enabled: row.get::<_, i32>(13)? != 0,
             ai_generated: row.get::<_, i32>(14)? != 0,
@@ -5979,7 +7538,8 @@ impl CheckpointDb {
             config_path: row.get(7).ok(),
             auto_fix: row.get::<_, i32>(8)? != 0,
             fail_on_warning: row.get::<_, i32>(9)? != 0,
-            timeout_seconds: row.get::<_, i64>(10)? as u32,
+            // Timeout is optional - None means disabled (no timeout)
+            timeout_seconds: row.get::<_, Option<i64>>(10)?.map(|v| v as u32),
             is_critical: row.get::<_, i32>(11)? != 0,
             enabled: row.get::<_, i32>(12)? != 0,
             ai_generated: row.get::<_, i32>(13)? != 0,
@@ -6093,7 +7653,8 @@ impl CheckpointDb {
         let config_path = input.config_path.clone().or(existing.config_path);
         let auto_fix = input.auto_fix.unwrap_or(existing.auto_fix);
         let fail_on_warning = input.fail_on_warning.unwrap_or(existing.fail_on_warning);
-        let timeout_seconds = input.timeout_seconds.unwrap_or(existing.timeout_seconds);
+        // If input specifies a timeout (including None for disabled), use it; otherwise keep existing
+        let timeout_seconds = input.timeout_seconds.or(existing.timeout_seconds);
         let is_critical = input.is_critical.unwrap_or(existing.is_critical);
         let enabled = input.enabled.unwrap_or(existing.enabled);
         let tags = input.tags.clone().unwrap_or(existing.tags);
@@ -6426,6 +7987,48 @@ impl CheckpointDb {
         }
 
         Ok(())
+    }
+
+    /// Repair check-group associations based on naming convention.
+    ///
+    /// Checks are named with format "{group_name} - {tool_name}" (e.g., "multistate - Ruff Linting").
+    /// This function finds checks that match groups by this pattern and ensures they are linked.
+    ///
+    /// Returns the number of associations created.
+    pub fn repair_check_group_associations(&self) -> Result<usize, String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        // Insert missing associations by matching check names that start with "group_name - "
+        // Only insert if the association doesn't already exist
+        let sql = r#"
+            INSERT OR IGNORE INTO check_group_members (id, group_id, check_id, sort_order, created_at)
+            SELECT
+                lower(hex(randomblob(16))),
+                cg.id,
+                c.id,
+                (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM check_group_members WHERE group_id = cg.id),
+                ?1
+            FROM checks c
+            JOIN check_groups cg ON c.name LIKE cg.name || ' - %'
+            WHERE NOT EXISTS (
+                SELECT 1 FROM check_group_members cgm
+                WHERE cgm.group_id = cg.id AND cgm.check_id = c.id
+            )
+        "#;
+
+        let rows = conn
+            .execute(sql, params![now])
+            .map_err(|e| format!("Failed to repair check-group associations: {}", e))?;
+
+        if rows > 0 {
+            tracing::info!(
+                "Repaired {} check-group associations based on naming convention",
+                rows
+            );
+        }
+
+        Ok(rows)
     }
 
     /// Helper to map a row to CheckGroup (without checks populated).
@@ -7780,6 +9383,21 @@ impl CheckpointDb {
         Ok(id)
     }
 
+    /// Delete all verification phase results for a task run.
+    /// Used when starting a fresh run to clear stale data from previous interrupted runs.
+    pub fn delete_verification_phase_results(&self, task_run_id: &str) -> Result<(), String> {
+        let conn = self.get_conn()?;
+
+        conn.execute(
+            "DELETE FROM workflow_verification_phase_results WHERE task_run_id = ?1",
+            params![task_run_id],
+        )
+        .map_err(|e| format!("Failed to delete verification phase results: {}", e))?;
+
+        info!("Deleted verification phase results for task {}", task_run_id);
+        Ok(())
+    }
+
     /// Get verification phase results for a specific iteration.
     pub fn get_verification_phase_result(
         &self,
@@ -8319,7 +9937,8 @@ impl CheckpointDb {
                 SELECT id, name, description, category, tags, setup_steps, verification_steps,
                        agentic_steps, completion_steps, max_iterations, provider, model,
                        skip_ai_summary, created_at, updated_at, log_source_selection,
-                       context_ids, disabled_context_ids, auto_include_contexts, prompt_template
+                       context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
+                       log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds
                 FROM unified_workflows
                 ORDER BY updated_at DESC
                 "#,
@@ -8375,6 +9994,15 @@ impl CheckpointDb {
                         .unwrap_or_default(),
                     auto_include_contexts: row.get::<_, Option<i32>>(18)?.unwrap_or(1) != 0,
                     prompt_template: row.get(19)?,
+                    log_watch_enabled: row.get::<_, Option<i32>>(20)?.unwrap_or(1) != 0,
+                    health_check_enabled: row.get::<_, Option<i32>>(21)?.unwrap_or(1) != 0,
+                    health_check_urls: row
+                        .get::<_, Option<String>>(22)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    timeout_seconds: row.get::<_, Option<i64>>(23)?.map(|v| v as u64),
+                    // targeted_error_ids is a runtime field, not stored in DB
+                    targeted_error_ids: vec![],
                 })
             })
             .map_err(|e| format!("Failed to query unified workflows: {}", e))?
@@ -8396,7 +10024,8 @@ impl CheckpointDb {
             SELECT id, name, description, category, tags, setup_steps, verification_steps,
                    agentic_steps, completion_steps, max_iterations, provider, model,
                    skip_ai_summary, created_at, updated_at, log_source_selection,
-                   context_ids, disabled_context_ids, auto_include_contexts, prompt_template
+                   context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
+                   log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds
             FROM unified_workflows
             WHERE id = ?1
             "#,
@@ -8449,6 +10078,15 @@ impl CheckpointDb {
                         .unwrap_or_default(),
                     auto_include_contexts: row.get::<_, Option<i32>>(18)?.unwrap_or(1) != 0,
                     prompt_template: row.get(19)?,
+                    log_watch_enabled: row.get::<_, Option<i32>>(20)?.unwrap_or(1) != 0,
+                    health_check_enabled: row.get::<_, Option<i32>>(21)?.unwrap_or(1) != 0,
+                    health_check_urls: row
+                        .get::<_, Option<String>>(22)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    timeout_seconds: row.get::<_, Option<i64>>(23)?.map(|v| v as u64),
+                    // targeted_error_ids is a runtime field, not stored in DB
+                    targeted_error_ids: vec![],
                 })
             },
         );
@@ -8457,6 +10095,94 @@ impl CheckpointDb {
             Ok(workflow) => Ok(Some(workflow)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(format!("Failed to get unified workflow: {}", e)),
+        }
+    }
+
+    /// Get a unified workflow by name (returns the first match if multiple exist)
+    pub fn get_unified_workflow_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::unified_workflows::UnifiedWorkflow>, String> {
+        let conn = self.get_conn()?;
+
+        let result = conn.query_row(
+            r#"
+            SELECT id, name, description, category, tags, setup_steps, verification_steps,
+                   agentic_steps, completion_steps, max_iterations, provider, model,
+                   skip_ai_summary, created_at, updated_at, log_source_selection,
+                   context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
+                   log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds
+            FROM unified_workflows
+            WHERE name = ?1
+            ORDER BY updated_at DESC
+            LIMIT 1
+            "#,
+            params![name],
+            |row| {
+                Ok(crate::unified_workflows::UnifiedWorkflow {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    description: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    category: row
+                        .get::<_, Option<String>>(3)?
+                        .unwrap_or_else(|| "general".to_string()),
+                    tags: row
+                        .get::<_, Option<String>>(4)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    setup_steps: row
+                        .get::<_, Option<String>>(5)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    verification_steps: row
+                        .get::<_, Option<String>>(6)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    agentic_steps: row
+                        .get::<_, Option<String>>(7)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    completion_steps: row
+                        .get::<_, Option<String>>(8)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    max_iterations: row.get::<_, i64>(9)? as u32,
+                    provider: row.get(10)?,
+                    model: row.get(11)?,
+                    skip_ai_summary: row.get::<_, i32>(12)? != 0,
+                    created_at: row.get(13)?,
+                    updated_at: row.get(14)?,
+                    log_source_selection: row
+                        .get::<_, Option<String>>(15)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    context_ids: row
+                        .get::<_, Option<String>>(16)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    disabled_context_ids: row
+                        .get::<_, Option<String>>(17)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    auto_include_contexts: row.get::<_, Option<i32>>(18)?.unwrap_or(1) != 0,
+                    prompt_template: row.get(19)?,
+                    log_watch_enabled: row.get::<_, Option<i32>>(20)?.unwrap_or(1) != 0,
+                    health_check_enabled: row.get::<_, Option<i32>>(21)?.unwrap_or(1) != 0,
+                    health_check_urls: row
+                        .get::<_, Option<String>>(22)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    timeout_seconds: row.get::<_, Option<i64>>(23)?.map(|v| v as u64),
+                    // targeted_error_ids is a runtime field, not stored in DB
+                    targeted_error_ids: vec![],
+                })
+            },
+        );
+
+        match result {
+            Ok(workflow) => Ok(Some(workflow)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!("Failed to get unified workflow by name: {}", e)),
         }
     }
 
@@ -8484,15 +10210,18 @@ impl CheckpointDb {
             serde_json::to_string(&request.context_ids).unwrap_or_else(|_| "[]".to_string());
         let disabled_context_ids_json = serde_json::to_string(&request.disabled_context_ids)
             .unwrap_or_else(|_| "[]".to_string());
+        let health_check_urls_json = serde_json::to_string(&request.health_check_urls)
+            .unwrap_or_else(|_| "[]".to_string());
 
         conn.execute(
             r#"
             INSERT INTO unified_workflows (
                 id, name, description, category, tags, setup_steps, verification_steps,
-                agentic_steps, completion_steps, max_iterations, provider, model,
+                agentic_steps, completion_steps, max_iterations, timeout_seconds, provider, model,
                 skip_ai_summary, created_at, updated_at, log_source_selection,
-                context_ids, disabled_context_ids, auto_include_contexts, prompt_template
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+                context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
+                log_watch_enabled, health_check_enabled, health_check_urls
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
             "#,
             params![
                 id,
@@ -8505,6 +10234,7 @@ impl CheckpointDb {
                 agentic_steps_json,
                 completion_steps_json,
                 request.max_iterations as i64,
+                request.timeout_seconds.map(|t| t as i64),
                 request.provider,
                 request.model,
                 request.skip_ai_summary,
@@ -8515,6 +10245,9 @@ impl CheckpointDb {
                 disabled_context_ids_json,
                 request.auto_include_contexts,
                 request.prompt_template,
+                request.log_watch_enabled,
+                request.health_check_enabled,
+                health_check_urls_json,
             ],
         )
         .map_err(|e| format!("Failed to create unified workflow: {}", e))?;
@@ -8547,15 +10280,18 @@ impl CheckpointDb {
             serde_json::to_string(&request.context_ids).unwrap_or_else(|_| "[]".to_string());
         let disabled_context_ids_json = serde_json::to_string(&request.disabled_context_ids)
             .unwrap_or_else(|_| "[]".to_string());
+        let health_check_urls_json = serde_json::to_string(&request.health_check_urls)
+            .unwrap_or_else(|_| "[]".to_string());
 
         conn.execute(
             r#"
             INSERT INTO unified_workflows (
                 id, name, description, category, tags, setup_steps, verification_steps,
-                agentic_steps, completion_steps, max_iterations, provider, model,
+                agentic_steps, completion_steps, max_iterations, timeout_seconds, provider, model,
                 skip_ai_summary, created_at, updated_at, log_source_selection,
-                context_ids, disabled_context_ids, auto_include_contexts, prompt_template
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+                context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
+                log_watch_enabled, health_check_enabled, health_check_urls
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
             "#,
             params![
                 id,
@@ -8568,6 +10304,7 @@ impl CheckpointDb {
                 agentic_steps_json,
                 completion_steps_json,
                 request.max_iterations as i64,
+                request.timeout_seconds.map(|t| t as i64),
                 request.provider,
                 request.model,
                 request.skip_ai_summary,
@@ -8578,6 +10315,9 @@ impl CheckpointDb {
                 disabled_context_ids_json,
                 request.auto_include_contexts,
                 request.prompt_template,
+                request.log_watch_enabled,
+                request.health_check_enabled,
+                health_check_urls_json,
             ],
         )
         .map_err(|e| format!("Failed to create unified workflow: {}", e))?;
@@ -8625,6 +10365,14 @@ impl CheckpointDb {
             .as_ref()
             .unwrap_or(&existing.completion_steps);
         let max_iterations = request.max_iterations.unwrap_or(existing.max_iterations);
+        // For timeout_seconds: Option<Option<u64>> where:
+        // - None: Not updating, keep existing
+        // - Some(None): Explicitly disable timeout
+        // - Some(Some(N)): Set timeout to N seconds
+        let timeout_seconds: Option<u64> = match &request.timeout_seconds {
+            Some(val) => val.clone(),   // Use provided value (including None to disable)
+            None => existing.timeout_seconds, // Not provided, keep existing
+        };
         let provider = request.provider.as_ref().or(existing.provider.as_ref());
         let model = request.model.as_ref().or(existing.model.as_ref());
         let skip_ai_summary = request.skip_ai_summary.unwrap_or(existing.skip_ai_summary);
@@ -8650,6 +10398,16 @@ impl CheckpointDb {
         let auto_include_contexts = request
             .auto_include_contexts
             .unwrap_or(existing.auto_include_contexts);
+        let log_watch_enabled = request
+            .log_watch_enabled
+            .unwrap_or(existing.log_watch_enabled);
+        let health_check_enabled = request
+            .health_check_enabled
+            .unwrap_or(existing.health_check_enabled);
+        let health_check_urls = request
+            .health_check_urls
+            .as_ref()
+            .unwrap_or(&existing.health_check_urls);
 
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
         let setup_steps_json =
@@ -8666,6 +10424,8 @@ impl CheckpointDb {
             serde_json::to_string(context_ids).unwrap_or_else(|_| "[]".to_string());
         let disabled_context_ids_json =
             serde_json::to_string(disabled_context_ids).unwrap_or_else(|_| "[]".to_string());
+        let health_check_urls_json =
+            serde_json::to_string(health_check_urls).unwrap_or_else(|_| "[]".to_string());
 
         conn.execute(
             r#"
@@ -8679,16 +10439,20 @@ impl CheckpointDb {
                 agentic_steps = ?7,
                 completion_steps = ?8,
                 max_iterations = ?9,
-                provider = ?10,
-                model = ?11,
-                skip_ai_summary = ?12,
-                updated_at = ?13,
-                log_source_selection = ?14,
-                prompt_template = ?15,
-                context_ids = ?16,
-                disabled_context_ids = ?17,
-                auto_include_contexts = ?18
-            WHERE id = ?19
+                timeout_seconds = ?10,
+                provider = ?11,
+                model = ?12,
+                skip_ai_summary = ?13,
+                updated_at = ?14,
+                log_source_selection = ?15,
+                prompt_template = ?16,
+                context_ids = ?17,
+                disabled_context_ids = ?18,
+                auto_include_contexts = ?19,
+                log_watch_enabled = ?20,
+                health_check_enabled = ?21,
+                health_check_urls = ?22
+            WHERE id = ?23
             "#,
             params![
                 name,
@@ -8700,6 +10464,7 @@ impl CheckpointDb {
                 agentic_steps_json,
                 completion_steps_json,
                 max_iterations as i64,
+                timeout_seconds.map(|v| v as i64),
                 provider,
                 model,
                 skip_ai_summary,
@@ -8709,6 +10474,9 @@ impl CheckpointDb {
                 context_ids_json,
                 disabled_context_ids_json,
                 auto_include_contexts,
+                log_watch_enabled,
+                health_check_enabled,
+                health_check_urls_json,
                 id,
             ],
         )
@@ -8741,7 +10509,8 @@ impl CheckpointDb {
             SELECT id, name, description, category, tags, setup_steps, verification_steps,
                    agentic_steps, completion_steps, max_iterations, provider, model,
                    skip_ai_summary, created_at, updated_at, log_source_selection,
-                   context_ids, disabled_context_ids, auto_include_contexts, prompt_template
+                   context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
+                   log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds
             FROM unified_workflows
             WHERE 1=1
             "#,
@@ -8826,6 +10595,15 @@ impl CheckpointDb {
                         .unwrap_or_default(),
                     auto_include_contexts: row.get::<_, Option<i32>>(18)?.unwrap_or(1) != 0,
                     prompt_template: row.get(19)?,
+                    log_watch_enabled: row.get::<_, Option<i32>>(20)?.unwrap_or(1) != 0,
+                    health_check_enabled: row.get::<_, Option<i32>>(21)?.unwrap_or(1) != 0,
+                    health_check_urls: row
+                        .get::<_, Option<String>>(22)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    timeout_seconds: row.get::<_, Option<i64>>(23)?.map(|v| v as u64),
+                    // targeted_error_ids is a runtime field, not stored in DB
+                    targeted_error_ids: vec![],
                 })
             })
             .map_err(|e| format!("Failed to search unified workflows: {}", e))?
@@ -8854,6 +10632,7 @@ impl CheckpointDb {
             agentic_steps: original.agentic_steps,
             completion_steps: original.completion_steps,
             max_iterations: original.max_iterations,
+            timeout_seconds: original.timeout_seconds,
             provider: original.provider,
             model: original.model,
             skip_ai_summary: original.skip_ai_summary,
@@ -8862,6 +10641,9 @@ impl CheckpointDb {
             disabled_context_ids: original.disabled_context_ids,
             auto_include_contexts: original.auto_include_contexts,
             prompt_template: original.prompt_template,
+            log_watch_enabled: original.log_watch_enabled,
+            health_check_enabled: original.health_check_enabled,
+            health_check_urls: original.health_check_urls,
         };
 
         self.create_unified_workflow(&create_request)
@@ -9204,6 +10986,95 @@ impl CheckpointDb {
             .collect();
 
         Ok(results)
+    }
+
+    // ========================================================================
+    // Execution Spans Operations
+    // ========================================================================
+
+    /// Get execution spans with optional filtering.
+    ///
+    /// Supports filtering by:
+    /// - execution_id: Filter by task/execution ID
+    /// - name_pattern: Filter span names using SQL LIKE pattern (e.g., "workflow.%")
+    /// - min_duration_ms: Filter spans with duration >= this value
+    /// - limit: Maximum number of spans to return (default: 100)
+    pub fn get_execution_spans(
+        &self,
+        execution_id: Option<&str>,
+        name_pattern: Option<&str>,
+        min_duration_ms: Option<i64>,
+        limit: Option<u32>,
+    ) -> Result<Vec<ExecutionSpan>, String> {
+        let conn = self.get_conn()?;
+
+        let mut sql = String::from(
+            r#"
+            SELECT id, execution_id, trace_id, span_id, parent_span_id, name,
+                   start_ts, end_ts, duration_ms, attributes, success, error, created_at
+            FROM execution_spans
+            WHERE 1=1
+            "#,
+        );
+
+        let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        let mut param_idx = 1;
+
+        if let Some(exec_id) = execution_id {
+            sql.push_str(&format!(" AND execution_id = ?{}", param_idx));
+            param_values.push(Box::new(exec_id.to_string()));
+            param_idx += 1;
+        }
+
+        if let Some(pattern) = name_pattern {
+            sql.push_str(&format!(" AND name LIKE ?{}", param_idx));
+            param_values.push(Box::new(pattern.to_string()));
+            param_idx += 1;
+        }
+
+        if let Some(min_dur) = min_duration_ms {
+            sql.push_str(&format!(" AND duration_ms >= ?{}", param_idx));
+            param_values.push(Box::new(min_dur));
+            // param_idx += 1; // Not needed as it's the last
+        }
+
+        sql.push_str(" ORDER BY start_ts DESC");
+
+        let lim = limit.unwrap_or(100);
+        sql.push_str(&format!(" LIMIT {}", lim));
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("Failed to prepare statement: {}", e))?;
+
+        let params: Vec<&dyn rusqlite::ToSql> = param_values
+            .iter()
+            .map(|p| p.as_ref() as &dyn rusqlite::ToSql)
+            .collect();
+
+        let spans = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok(ExecutionSpan {
+                    id: row.get(0)?,
+                    execution_id: row.get(1)?,
+                    trace_id: row.get(2)?,
+                    span_id: row.get(3)?,
+                    parent_span_id: row.get(4)?,
+                    name: row.get(5)?,
+                    start_ts: row.get(6)?,
+                    end_ts: row.get(7)?,
+                    duration_ms: row.get(8)?,
+                    attributes: row.get(9)?,
+                    success: row.get::<_, i32>(10)? == 1,
+                    error: row.get(11)?,
+                    created_at: row.get(12)?,
+                })
+            })
+            .map_err(|e| format!("Failed to get execution spans: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(spans)
     }
 
     // ========================================================================
@@ -9938,6 +11809,239 @@ impl CheckpointDb {
             .map_err(|e| format!("Failed to delete flow: {}", e))?;
 
         Ok(affected > 0)
+    }
+
+    // ========================================================================
+    // Flow Version History
+    // ========================================================================
+
+    /// Create a new version snapshot of a flow.
+    /// Automatically increments version number.
+    pub fn create_flow_version(
+        &self,
+        flow_id: &str,
+        definition: &serde_json::Value,
+        message: Option<&str>,
+        created_by: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        // Get the next version number for this flow
+        let next_version: i32 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) + 1 FROM flow_versions WHERE flow_id = ?1",
+                params![flow_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to get next version number: {}", e))?;
+
+        let id = format!("{}_v{}", flow_id, next_version);
+        let definition_json = serde_json::to_string(definition)
+            .map_err(|e| format!("Failed to serialize flow definition: {}", e))?;
+
+        conn.execute(
+            r#"
+            INSERT INTO flow_versions (id, flow_id, version, definition, message, created_by, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+            params![id, flow_id, next_version, definition_json, message, created_by, now],
+        )
+        .map_err(|e| format!("Failed to create flow version: {}", e))?;
+
+        Ok(serde_json::json!({
+            "id": id,
+            "flow_id": flow_id,
+            "version": next_version,
+            "message": message,
+            "created_by": created_by,
+            "created_at": now
+        }))
+    }
+
+    /// List all versions of a flow.
+    pub fn list_flow_versions(&self, flow_id: &str) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self.get_conn()?;
+
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT id, flow_id, version, message, created_by, created_at
+                FROM flow_versions
+                WHERE flow_id = ?1
+                ORDER BY version DESC
+                "#,
+            )
+            .map_err(|e| format!("Failed to prepare statement: {}", e))?;
+
+        let results = stmt
+            .query_map(params![flow_id], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "flow_id": row.get::<_, String>(1)?,
+                    "version": row.get::<_, i32>(2)?,
+                    "message": row.get::<_, Option<String>>(3)?,
+                    "created_by": row.get::<_, Option<String>>(4)?,
+                    "created_at": row.get::<_, String>(5)?,
+                }))
+            })
+            .map_err(|e| format!("Failed to list flow versions: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Get a specific version of a flow (full definition).
+    pub fn get_flow_version(
+        &self,
+        flow_id: &str,
+        version: i32,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let conn = self.get_conn()?;
+
+        let result: SqliteResult<serde_json::Value> = conn.query_row(
+            r#"
+            SELECT id, flow_id, version, definition, message, created_by, created_at
+            FROM flow_versions
+            WHERE flow_id = ?1 AND version = ?2
+            "#,
+            params![flow_id, version],
+            |row| {
+                let definition_str: String = row.get(3)?;
+                let definition: serde_json::Value = serde_json::from_str(&definition_str)
+                    .unwrap_or(serde_json::Value::Null);
+
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "flow_id": row.get::<_, String>(1)?,
+                    "version": row.get::<_, i32>(2)?,
+                    "definition": definition,
+                    "message": row.get::<_, Option<String>>(4)?,
+                    "created_by": row.get::<_, Option<String>>(5)?,
+                    "created_at": row.get::<_, String>(6)?,
+                }))
+            },
+        );
+
+        match result {
+            Ok(version_data) => Ok(Some(version_data)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!("Failed to get flow version: {}", e)),
+        }
+    }
+
+    /// Restore a flow to a specific version.
+    /// Creates a new version first as backup, then updates the flow.
+    pub fn restore_flow_version(
+        &self,
+        flow_id: &str,
+        version: i32,
+        created_by: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        // Get the version to restore
+        let version_data = self
+            .get_flow_version(flow_id, version)?
+            .ok_or_else(|| format!("Version {} not found for flow {}", version, flow_id))?;
+
+        let definition = version_data["definition"].clone();
+
+        // Get current flow for backup
+        let current_flow = self.get_flow(flow_id)?;
+
+        // Create backup version of current state before restoring
+        if let Some(current) = current_flow {
+            self.create_flow_version(
+                flow_id,
+                &current,
+                Some(&format!("Backup before restoring to version {}", version)),
+                created_by,
+            )?;
+        }
+
+        // Update the flow with the restored definition
+        self.save_flow(&definition)?;
+
+        // Create a new version marking the restore
+        let new_version = self.create_flow_version(
+            flow_id,
+            &definition,
+            Some(&format!("Restored from version {}", version)),
+            created_by,
+        )?;
+
+        Ok(serde_json::json!({
+            "flow_id": flow_id,
+            "restored_from_version": version,
+            "new_version": new_version["version"],
+            "definition": definition
+        }))
+    }
+
+    /// Compare two versions of a flow.
+    /// Returns the definitions of both versions for client-side diff.
+    pub fn compare_flow_versions(
+        &self,
+        flow_id: &str,
+        version1: i32,
+        version2: i32,
+    ) -> Result<serde_json::Value, String> {
+        let v1 = self
+            .get_flow_version(flow_id, version1)?
+            .ok_or_else(|| format!("Version {} not found", version1))?;
+
+        let v2 = self
+            .get_flow_version(flow_id, version2)?
+            .ok_or_else(|| format!("Version {} not found", version2))?;
+
+        Ok(serde_json::json!({
+            "flow_id": flow_id,
+            "version1": {
+                "version": version1,
+                "definition": v1["definition"],
+                "message": v1["message"],
+                "created_at": v1["created_at"],
+                "created_by": v1["created_by"]
+            },
+            "version2": {
+                "version": version2,
+                "definition": v2["definition"],
+                "message": v2["message"],
+                "created_at": v2["created_at"],
+                "created_by": v2["created_by"]
+            }
+        }))
+    }
+
+    /// Delete a specific version of a flow.
+    pub fn delete_flow_version(&self, flow_id: &str, version: i32) -> Result<bool, String> {
+        let conn = self.get_conn()?;
+
+        let affected = conn
+            .execute(
+                "DELETE FROM flow_versions WHERE flow_id = ?1 AND version = ?2",
+                params![flow_id, version],
+            )
+            .map_err(|e| format!("Failed to delete flow version: {}", e))?;
+
+        Ok(affected > 0)
+    }
+
+    /// Get the latest version number of a flow.
+    pub fn get_latest_flow_version(&self, flow_id: &str) -> Result<Option<i32>, String> {
+        let conn = self.get_conn()?;
+
+        let result: SqliteResult<i32> = conn.query_row(
+            "SELECT MAX(version) FROM flow_versions WHERE flow_id = ?1",
+            params![flow_id],
+            |row| row.get(0),
+        );
+
+        match result {
+            Ok(version) => Ok(Some(version)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!("Failed to get latest version: {}", e)),
+        }
     }
 
     /// Save flow execution state
@@ -12488,6 +14592,678 @@ impl CheckpointDb {
             failed_count,
         })
     }
+
+    // ========================================================================
+    // Workflow State Management Operations
+    // ========================================================================
+
+    /// Save or update workflow execution state.
+    pub fn save_workflow_execution_state(
+        &self,
+        execution_id: &str,
+        workflow_type: &str,
+        state_name: &str,
+        state_data: Option<&str>,
+        phase: Option<&str>,
+        iteration: Option<u32>,
+    ) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        conn.execute(
+            r#"
+            INSERT INTO workflow_execution_state (
+                execution_id, workflow_type, state_name, state_data, phase, iteration, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(execution_id) DO UPDATE SET
+                workflow_type = ?2,
+                state_name = ?3,
+                state_data = ?4,
+                phase = ?5,
+                iteration = ?6,
+                updated_at = ?7
+            "#,
+            params![
+                execution_id,
+                workflow_type,
+                state_name,
+                state_data,
+                phase,
+                iteration.map(|i| i as i64),
+                now,
+            ],
+        )
+        .map_err(|e| format!("Failed to save workflow execution state: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Get workflow execution state by execution_id.
+    pub fn get_workflow_execution_state(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<crate::workflow_state::WorkflowExecutionStateRecord>, String> {
+        let conn = self.get_conn()?;
+
+        let result = conn
+            .query_row(
+                r#"
+                SELECT execution_id, workflow_type, state_name, state_data, phase, iteration, updated_at
+                FROM workflow_execution_state
+                WHERE execution_id = ?1
+                "#,
+                params![execution_id],
+                |row| {
+                    Ok(crate::workflow_state::WorkflowExecutionStateRecord {
+                        execution_id: row.get(0)?,
+                        workflow_type: row.get(1)?,
+                        state_name: row.get(2)?,
+                        state_data: row.get(3)?,
+                        phase: row.get(4)?,
+                        iteration: row.get::<_, Option<i64>>(5)?.map(|i| i as u32),
+                        updated_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| format!("Failed to get workflow execution state: {}", e))?;
+
+        Ok(result)
+    }
+
+    /// Delete workflow execution state.
+    pub fn delete_workflow_execution_state(&self, execution_id: &str) -> Result<(), String> {
+        let conn = self.get_conn()?;
+
+        conn.execute(
+            "DELETE FROM workflow_execution_state WHERE execution_id = ?1",
+            params![execution_id],
+        )
+        .map_err(|e| format!("Failed to delete workflow execution state: {}", e))?;
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // Workflow Step Checkpoint Operations
+    // ========================================================================
+
+    /// Save or update a workflow step checkpoint.
+    pub fn save_workflow_step_checkpoint(
+        &self,
+        checkpoint: &crate::workflow_state::StepCheckpoint,
+    ) -> Result<(), String> {
+        let conn = self.get_conn()?;
+
+        conn.execute(
+            r#"
+            INSERT INTO workflow_step_checkpoints (
+                id, execution_id, workflow_type, phase, iteration, step_index,
+                step_type, step_name, status, result_json, step_config_json, started_at,
+                completed_at, duration_ms, error
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+            ON CONFLICT(execution_id, phase, iteration, step_index) DO UPDATE SET
+                status = ?9,
+                result_json = ?10,
+                step_config_json = COALESCE(?11, step_config_json),
+                started_at = COALESCE(?12, started_at),
+                completed_at = ?13,
+                duration_ms = ?14,
+                error = ?15
+            "#,
+            params![
+                checkpoint.id,
+                checkpoint.execution_id,
+                checkpoint.workflow_type,
+                checkpoint.phase,
+                checkpoint.iteration.map(|i| i as i64),
+                checkpoint.step_index as i64,
+                checkpoint.step_type,
+                checkpoint.step_name,
+                checkpoint.status.to_string(),
+                checkpoint.result_json,
+                checkpoint.step_config_json,
+                checkpoint.started_at,
+                checkpoint.completed_at,
+                checkpoint.duration_ms,
+                checkpoint.error,
+            ],
+        )
+        .map_err(|e| format!("Failed to save workflow step checkpoint: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Atomically save both workflow execution state and a step checkpoint.
+    ///
+    /// This is critical for ensuring data consistency when a step completes and the
+    /// workflow state advances. If either operation fails, both are rolled back.
+    ///
+    /// # Arguments
+    /// * `execution_id` - The execution/task run ID
+    /// * `workflow_type` - Type of workflow (e.g., "unified")
+    /// * `state_name` - Name of the new workflow state
+    /// * `state_data` - Serialized state data (JSON)
+    /// * `phase` - Current phase name
+    /// * `iteration` - Current iteration number
+    /// * `checkpoint` - The step checkpoint to save
+    pub fn save_state_and_checkpoint_atomic(
+        &self,
+        execution_id: &str,
+        workflow_type: &str,
+        state_name: &str,
+        state_data: Option<&str>,
+        phase: Option<&str>,
+        iteration: Option<u32>,
+        checkpoint: &crate::workflow_state::StepCheckpoint,
+    ) -> Result<(), String> {
+        self.transaction(|conn| {
+            let now = chrono::Utc::now().to_rfc3339();
+
+            // Save workflow execution state
+            conn.execute(
+                r#"
+                INSERT INTO workflow_execution_state (
+                    execution_id, workflow_type, state_name, state_data, phase, iteration, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ON CONFLICT(execution_id) DO UPDATE SET
+                    workflow_type = ?2,
+                    state_name = ?3,
+                    state_data = ?4,
+                    phase = ?5,
+                    iteration = ?6,
+                    updated_at = ?7
+                "#,
+                params![
+                    execution_id,
+                    workflow_type,
+                    state_name,
+                    state_data,
+                    phase,
+                    iteration.map(|i| i as i64),
+                    now,
+                ],
+            )?;
+
+            // Save step checkpoint
+            conn.execute(
+                r#"
+                INSERT INTO workflow_step_checkpoints (
+                    id, execution_id, workflow_type, phase, iteration, step_index,
+                    step_type, step_name, status, result_json, step_config_json, started_at,
+                    completed_at, duration_ms, error
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                ON CONFLICT(execution_id, phase, iteration, step_index) DO UPDATE SET
+                    status = ?9,
+                    result_json = ?10,
+                    step_config_json = COALESCE(?11, step_config_json),
+                    started_at = COALESCE(?12, started_at),
+                    completed_at = ?13,
+                    duration_ms = ?14,
+                    error = ?15
+                "#,
+                params![
+                    checkpoint.id,
+                    checkpoint.execution_id,
+                    checkpoint.workflow_type,
+                    checkpoint.phase,
+                    checkpoint.iteration.map(|i| i as i64),
+                    checkpoint.step_index as i64,
+                    checkpoint.step_type,
+                    checkpoint.step_name,
+                    checkpoint.status.to_string(),
+                    checkpoint.result_json,
+                    checkpoint.step_config_json,
+                    checkpoint.started_at,
+                    checkpoint.completed_at,
+                    checkpoint.duration_ms,
+                    checkpoint.error,
+                ],
+            )?;
+
+            Ok(())
+        })
+    }
+
+    /// Get workflow step checkpoints for a given execution, phase, and iteration.
+    pub fn get_workflow_step_checkpoints(
+        &self,
+        execution_id: &str,
+        phase: &str,
+        iteration: Option<u32>,
+    ) -> Result<Vec<crate::workflow_state::StepCheckpoint>, String> {
+        let conn = self.get_conn()?;
+
+        let query = if iteration.is_some() {
+            r#"
+            SELECT id, execution_id, workflow_type, phase, iteration, step_index,
+                   step_type, step_name, status, result_json, step_config_json, started_at,
+                   completed_at, duration_ms, error
+            FROM workflow_step_checkpoints
+            WHERE execution_id = ?1 AND phase = ?2 AND iteration = ?3
+            ORDER BY step_index ASC
+            "#
+        } else {
+            r#"
+            SELECT id, execution_id, workflow_type, phase, iteration, step_index,
+                   step_type, step_name, status, result_json, step_config_json, started_at,
+                   completed_at, duration_ms, error
+            FROM workflow_step_checkpoints
+            WHERE execution_id = ?1 AND phase = ?2 AND iteration IS NULL
+            ORDER BY step_index ASC
+            "#
+        };
+
+        let mut stmt = conn
+            .prepare(query)
+            .map_err(|e| format!("Failed to prepare statement: {}", e))?;
+
+        let row_mapper = |row: &rusqlite::Row| -> rusqlite::Result<crate::workflow_state::StepCheckpoint> {
+            let status_str: String = row.get(8)?;
+            let status = status_str
+                .parse()
+                .unwrap_or(crate::workflow_state::StepCheckpointStatus::Pending);
+
+            Ok(crate::workflow_state::StepCheckpoint {
+                id: row.get(0)?,
+                execution_id: row.get(1)?,
+                workflow_type: row.get(2)?,
+                phase: row.get(3)?,
+                iteration: row.get::<_, Option<i64>>(4)?.map(|i| i as u32),
+                step_index: row.get::<_, i64>(5)? as usize,
+                step_type: row.get(6)?,
+                step_name: row.get(7)?,
+                status,
+                result_json: row.get(9)?,
+                step_config_json: row.get(10)?,
+                started_at: row.get(11)?,
+                completed_at: row.get(12)?,
+                duration_ms: row.get(13)?,
+                error: row.get(14)?,
+            })
+        };
+
+        let checkpoints: Vec<crate::workflow_state::StepCheckpoint> = if let Some(iter) = iteration {
+            stmt.query_map(params![execution_id, phase, iter as i64], row_mapper)
+                .map_err(|e| format!("Failed to get step checkpoints: {}", e))?
+                .filter_map(|r| r.ok())
+                .collect()
+        } else {
+            stmt.query_map(params![execution_id, phase], row_mapper)
+                .map_err(|e| format!("Failed to get step checkpoints: {}", e))?
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+
+        Ok(checkpoints)
+    }
+
+    /// Get workflow step checkpoints with cursor-based pagination.
+    ///
+    /// This is optimized for handling runs with 1000+ steps without loading all data at once.
+    /// Uses step_index as the cursor for efficient pagination.
+    ///
+    /// # Arguments
+    /// * `execution_id` - The execution/task run ID
+    /// * `cursor` - Optional step_index to start from (exclusive). None means start from beginning.
+    /// * `limit` - Maximum number of checkpoints to return
+    ///
+    /// # Returns
+    /// A tuple of (checkpoints, next_cursor). If next_cursor is Some, there are more results.
+    pub fn get_workflow_step_checkpoints_paginated(
+        &self,
+        execution_id: &str,
+        cursor: Option<i64>,
+        limit: usize,
+    ) -> Result<(Vec<crate::workflow_state::StepCheckpoint>, Option<i64>), String> {
+        let conn = self.get_conn()?;
+
+        // Use cursor-based pagination for efficiency
+        // The idx_step_checkpoints_cursor index on (execution_id, step_index) makes this fast
+        let query = if cursor.is_some() {
+            r#"
+            SELECT id, execution_id, workflow_type, phase, iteration, step_index,
+                   step_type, step_name, status, result_json, step_config_json, started_at,
+                   completed_at, duration_ms, error
+            FROM workflow_step_checkpoints
+            WHERE execution_id = ?1 AND step_index > ?2
+            ORDER BY step_index ASC
+            LIMIT ?3
+            "#
+        } else {
+            r#"
+            SELECT id, execution_id, workflow_type, phase, iteration, step_index,
+                   step_type, step_name, status, result_json, step_config_json, started_at,
+                   completed_at, duration_ms, error
+            FROM workflow_step_checkpoints
+            WHERE execution_id = ?1
+            ORDER BY step_index ASC
+            LIMIT ?2
+            "#
+        };
+
+        let mut stmt = conn
+            .prepare(query)
+            .map_err(|e| format!("Failed to prepare statement: {}", e))?;
+
+        let row_mapper = |row: &rusqlite::Row| -> rusqlite::Result<crate::workflow_state::StepCheckpoint> {
+            let status_str: String = row.get(8)?;
+            let status = status_str
+                .parse()
+                .unwrap_or(crate::workflow_state::StepCheckpointStatus::Pending);
+
+            Ok(crate::workflow_state::StepCheckpoint {
+                id: row.get(0)?,
+                execution_id: row.get(1)?,
+                workflow_type: row.get(2)?,
+                phase: row.get(3)?,
+                iteration: row.get::<_, Option<i64>>(4)?.map(|i| i as u32),
+                step_index: row.get::<_, i64>(5)? as usize,
+                step_type: row.get(6)?,
+                step_name: row.get(7)?,
+                status,
+                result_json: row.get(9)?,
+                step_config_json: row.get(10)?,
+                started_at: row.get(11)?,
+                completed_at: row.get(12)?,
+                duration_ms: row.get(13)?,
+                error: row.get(14)?,
+            })
+        };
+
+        // Request one more than limit to check if there are more results
+        let fetch_limit = (limit + 1) as i64;
+
+        let checkpoints: Vec<crate::workflow_state::StepCheckpoint> = if let Some(cursor_val) = cursor {
+            stmt.query_map(params![execution_id, cursor_val, fetch_limit], row_mapper)
+                .map_err(|e| format!("Failed to get step checkpoints: {}", e))?
+                .filter_map(|r| r.ok())
+                .collect()
+        } else {
+            stmt.query_map(params![execution_id, fetch_limit], row_mapper)
+                .map_err(|e| format!("Failed to get step checkpoints: {}", e))?
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+
+        // Determine if there are more results and what the next cursor should be
+        let (result_checkpoints, next_cursor) = if checkpoints.len() > limit {
+            // There are more results; return only `limit` items
+            let mut result = checkpoints;
+            result.truncate(limit);
+            let last_step_index = result.last().map(|cp| cp.step_index as i64);
+            (result, last_step_index)
+        } else {
+            // No more results
+            (checkpoints, None)
+        };
+
+        Ok((result_checkpoints, next_cursor))
+    }
+
+    /// Delete workflow step checkpoints.
+    pub fn delete_workflow_step_checkpoints(
+        &self,
+        execution_id: &str,
+        phase: Option<&str>,
+        iteration: Option<u32>,
+    ) -> Result<(), String> {
+        let conn = self.get_conn()?;
+
+        match (phase, iteration) {
+            (Some(p), Some(i)) => {
+                conn.execute(
+                    "DELETE FROM workflow_step_checkpoints WHERE execution_id = ?1 AND phase = ?2 AND iteration = ?3",
+                    params![execution_id, p, i as i64],
+                )
+            }
+            (Some(p), None) => {
+                conn.execute(
+                    "DELETE FROM workflow_step_checkpoints WHERE execution_id = ?1 AND phase = ?2",
+                    params![execution_id, p],
+                )
+            }
+            (None, _) => {
+                conn.execute(
+                    "DELETE FROM workflow_step_checkpoints WHERE execution_id = ?1",
+                    params![execution_id],
+                )
+            }
+        }
+        .map_err(|e| format!("Failed to delete step checkpoints: {}", e))?;
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // Step Progress Marker Operations
+    // ========================================================================
+
+    /// Save a progress marker for a step checkpoint.
+    ///
+    /// Progress markers track intra-step progress, such as "analyzed 50/100 files".
+    /// This is useful for long-running AI operations where you want to show progress
+    /// and enable resume from the last known position.
+    pub fn save_step_progress_marker(
+        &self,
+        checkpoint_id: &str,
+        marker_type: &str,
+        current_value: u64,
+        total_value: Option<u64>,
+        description: Option<&str>,
+        data_json: Option<&str>,
+    ) -> Result<i64, String> {
+        let conn = self.get_conn()?;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        conn.execute(
+            r#"
+            INSERT INTO step_progress_markers (
+                checkpoint_id, marker_type, current_value, total_value,
+                description, data_json, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+            params![
+                checkpoint_id,
+                marker_type,
+                current_value as i64,
+                total_value.map(|v| v as i64),
+                description,
+                data_json,
+                now,
+            ],
+        )
+        .map_err(|e| format!("Failed to save step progress marker: {}", e))?;
+
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Get the latest progress marker for a step checkpoint.
+    ///
+    /// Returns the most recent progress marker for the given checkpoint_id,
+    /// which can be used to resume from the last known position.
+    pub fn get_latest_step_progress_marker(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<Option<crate::workflow_state::StepProgressMarker>, String> {
+        let conn = self.get_conn()?;
+
+        let result = conn
+            .query_row(
+                r#"
+                SELECT id, checkpoint_id, marker_type, current_value, total_value,
+                       description, data_json, created_at
+                FROM step_progress_markers
+                WHERE checkpoint_id = ?1
+                ORDER BY id DESC
+                LIMIT 1
+                "#,
+                params![checkpoint_id],
+                |row| {
+                    Ok(crate::workflow_state::StepProgressMarker {
+                        id: row.get(0)?,
+                        checkpoint_id: row.get(1)?,
+                        marker_type: row.get(2)?,
+                        current_value: row.get::<_, i64>(3)? as u64,
+                        total_value: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+                        description: row.get(5)?,
+                        data_json: row.get(6)?,
+                        created_at: row.get(7)?,
+                    })
+                },
+            );
+
+        match result {
+            Ok(marker) => Ok(Some(marker)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!("Failed to get step progress marker: {}", e)),
+        }
+    }
+
+    /// Get all progress markers for a step checkpoint.
+    ///
+    /// Returns all progress markers in order of creation (oldest first).
+    pub fn get_step_progress_markers(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<Vec<crate::workflow_state::StepProgressMarker>, String> {
+        let conn = self.get_conn()?;
+
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT id, checkpoint_id, marker_type, current_value, total_value,
+                       description, data_json, created_at
+                FROM step_progress_markers
+                WHERE checkpoint_id = ?1
+                ORDER BY id ASC
+                "#,
+            )
+            .map_err(|e| format!("Failed to prepare statement: {}", e))?;
+
+        let markers = stmt
+            .query_map(params![checkpoint_id], |row| {
+                Ok(crate::workflow_state::StepProgressMarker {
+                    id: row.get(0)?,
+                    checkpoint_id: row.get(1)?,
+                    marker_type: row.get(2)?,
+                    current_value: row.get::<_, i64>(3)? as u64,
+                    total_value: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+                    description: row.get(5)?,
+                    data_json: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })
+            .map_err(|e| format!("Failed to get step progress markers: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(markers)
+    }
+
+    /// Delete all progress markers for a step checkpoint.
+    pub fn delete_step_progress_markers(&self, checkpoint_id: &str) -> Result<usize, String> {
+        let conn = self.get_conn()?;
+
+        let deleted = conn
+            .execute(
+                "DELETE FROM step_progress_markers WHERE checkpoint_id = ?1",
+                params![checkpoint_id],
+            )
+            .map_err(|e| format!("Failed to delete step progress markers: {}", e))?;
+
+        Ok(deleted)
+    }
+
+    // ========================================================================
+    // Full Workflow State (for frontend restart recovery)
+    // ========================================================================
+
+    /// Get all workflow step checkpoints for an execution (all phases).
+    ///
+    /// This is used by the full-state endpoint to return all checkpoints for restart recovery.
+    pub fn get_all_workflow_step_checkpoints(
+        &self,
+        execution_id: &str,
+    ) -> Result<Vec<crate::workflow_state::StepCheckpoint>, String> {
+        let conn = self.get_conn()?;
+
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT id, execution_id, workflow_type, phase, iteration, step_index,
+                       step_type, step_name, status, result_json, step_config_json, started_at,
+                       completed_at, duration_ms, error
+                FROM workflow_step_checkpoints
+                WHERE execution_id = ?1
+                ORDER BY phase, COALESCE(iteration, 0), step_index ASC
+                "#,
+            )
+            .map_err(|e| format!("Failed to prepare statement: {}", e))?;
+
+        let row_mapper = |row: &rusqlite::Row| -> rusqlite::Result<crate::workflow_state::StepCheckpoint> {
+            let status_str: String = row.get(8)?;
+            let status = status_str
+                .parse()
+                .unwrap_or(crate::workflow_state::StepCheckpointStatus::Pending);
+
+            Ok(crate::workflow_state::StepCheckpoint {
+                id: row.get(0)?,
+                execution_id: row.get(1)?,
+                workflow_type: row.get(2)?,
+                phase: row.get(3)?,
+                iteration: row.get::<_, Option<i64>>(4)?.map(|i| i as u32),
+                step_index: row.get::<_, i64>(5)? as usize,
+                step_type: row.get(6)?,
+                step_name: row.get(7)?,
+                status,
+                result_json: row.get(9)?,
+                step_config_json: row.get(10)?,
+                started_at: row.get(11)?,
+                completed_at: row.get(12)?,
+                duration_ms: row.get(13)?,
+                error: row.get(14)?,
+            })
+        };
+
+        let checkpoints: Vec<crate::workflow_state::StepCheckpoint> = stmt
+            .query_map(params![execution_id], row_mapper)
+            .map_err(|e| format!("Failed to get all step checkpoints: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(checkpoints)
+    }
+
+    /// Get the progress marker for the currently running step (if any).
+    ///
+    /// Finds the checkpoint that is in "running" status and returns its latest progress marker.
+    pub fn get_current_step_progress(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<crate::workflow_state::StepProgressMarker>, String> {
+        let conn = self.get_conn()?;
+
+        // First find the running checkpoint
+        let running_checkpoint_id: Option<String> = conn
+            .query_row(
+                r#"
+                SELECT id FROM workflow_step_checkpoints
+                WHERE execution_id = ?1 AND status = 'running'
+                ORDER BY step_index DESC
+                LIMIT 1
+                "#,
+                params![execution_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to find running checkpoint: {}", e))?;
+
+        match running_checkpoint_id {
+            Some(checkpoint_id) => self.get_latest_step_progress_marker(&checkpoint_id),
+            None => Ok(None),
+        }
+    }
 }
 
 /// Result of an import operation.
@@ -12564,7 +15340,7 @@ mod tests {
         // Read
         let loaded = db.get_checkpoint("test-workflow").unwrap().unwrap();
         assert_eq!(loaded.current_phase, 2);
-        assert_eq!(loaded.completed, false);
+        assert!(!loaded.completed);
 
         // Update
         let updated = CheckpointData {
@@ -12576,7 +15352,7 @@ mod tests {
 
         let reloaded = db.get_checkpoint("test-workflow").unwrap().unwrap();
         assert_eq!(reloaded.current_phase, 5);
-        assert_eq!(reloaded.completed, true);
+        assert!(reloaded.completed);
 
         // Delete
         let deleted = db.delete_checkpoint("test-workflow").unwrap();
@@ -12615,7 +15391,7 @@ mod tests {
             .check_checkpoint_status("status-test", 12)
             .unwrap()
             .unwrap();
-        assert_eq!(is_complete, false);
+        assert!(!is_complete);
         assert_eq!(phase, 5);
 
         // Complete when threshold is 5
@@ -12623,7 +15399,7 @@ mod tests {
             .check_checkpoint_status("status-test", 5)
             .unwrap()
             .unwrap();
-        assert_eq!(is_complete, true);
+        assert!(is_complete);
     }
 
     #[test]
@@ -12646,47 +15422,32 @@ mod tests {
         let (db, _temp) = create_test_db();
 
         // Create task run with default auto_continue (true)
-        let task_run = db
-            .create_task_run(
-                "test-task-1",
-                "Test Task",
-                Some("Do something"),
-                None,
-                None,
-                None,
-                None,
-            )
-            .unwrap();
-        assert_eq!(task_run.auto_continue, true);
+        let input = CreateTaskRunInput::new("test-task-1", "Test Task")
+            .with_prompt("Do something");
+        let task_run = db.create_task_run(&input).unwrap();
+        assert!(task_run.auto_continue);
 
         // Create task run with explicit auto_continue = false
-        let task_run_disabled = db
-            .create_task_run(
-                "test-task-2",
-                "Test Task 2",
-                Some("Do something else"),
-                None,
-                Some(false),
-                None,
-                None,
-            )
-            .unwrap();
-        assert_eq!(task_run_disabled.auto_continue, false);
+        let input = CreateTaskRunInput::new("test-task-2", "Test Task 2")
+            .with_prompt("Do something else")
+            .with_auto_continue(false);
+        let task_run_disabled = db.create_task_run(&input).unwrap();
+        assert!(!task_run_disabled.auto_continue);
 
         // Get auto_continue setting
         let auto_continue = db.get_task_auto_continue("test-task-1").unwrap();
-        assert_eq!(auto_continue, true);
+        assert!(auto_continue);
 
         let auto_continue_disabled = db.get_task_auto_continue("test-task-2").unwrap();
-        assert_eq!(auto_continue_disabled, false);
+        assert!(!auto_continue_disabled);
 
         // Set auto_continue setting
         db.set_task_auto_continue("test-task-1", false).unwrap();
         let updated = db.get_task_auto_continue("test-task-1").unwrap();
-        assert_eq!(updated, false);
+        assert!(!updated);
 
         // Verify via get_task_run
         let loaded = db.get_task_run("test-task-1").unwrap().unwrap();
-        assert_eq!(loaded.auto_continue, false);
+        assert!(!loaded.auto_continue);
     }
 }

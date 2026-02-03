@@ -7,6 +7,8 @@ use tauri::{AppHandle, Manager, State};
 use tracing::{debug, info, warn};
 
 use super::super::{AppState, CommandResponse};
+// Note: BridgeManager methods (is_default_bridge_running, with_default_bridge, etc.)
+// are synchronous and can be called directly after acquiring the manager lock.
 
 /// Get the executor status.
 ///
@@ -19,68 +21,55 @@ use super::super::{AppState, CommandResponse};
 /// * `Ok(CommandResponse)` - Success with status data
 /// * `Err(String)` - Error if status query fails
 #[tauri::command]
-pub fn get_executor_status(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
-    debug!("[GET_EXECUTOR_STATUS] Called - checking bridge lock...");
-    // Use unwrap_or_else to recover from poisoned mutex (after a panic in another thread)
-    let mut bridge_lock = state.python_bridge.lock().unwrap_or_else(|poisoned| {
-        warn!("[GET_EXECUTOR_STATUS] python_bridge mutex was poisoned, recovering");
-        poisoned.into_inner()
-    });
-    debug!("[GET_EXECUTOR_STATUS] Got bridge lock");
+pub async fn get_executor_status(state: State<'_, Arc<AppState>>) -> Result<CommandResponse, String> {
+    debug!("[GET_EXECUTOR_STATUS] Called - checking bridge state...");
 
-    if let Some(ref mut bridge) = *bridge_lock {
-        debug!("[GET_EXECUTOR_STATUS] Bridge exists, checking is_running()...");
-        let is_running = bridge.is_running();
-        debug!("[GET_EXECUTOR_STATUS] is_running() = {}", is_running);
+    // Use bridge manager directly - use async methods to avoid nested runtime panic
+    let (is_running, state_name) = {
+        let manager_guard = state.bridge_manager.lock().await;
+        if let Some(ref manager) = *manager_guard {
+            // Use async version to avoid nested runtime panic when called from async context
+            let running = manager.is_default_bridge_running_async().await;
+            let s_name = manager.get_default_bridge_state_async().await
+                .map(|s| s.name().to_string())
+                .unwrap_or_else(|| "not_started".to_string());
 
-        // Also get the actual state name for debugging
-        let state_name = bridge.get_state().name();
-        debug!("[GET_EXECUTOR_STATUS] Current state: {}", state_name);
+            // Note: We no longer call bridge.get_status() here as it uses block_on()
+            // internally which would panic in this async context. The running state
+            // from is_default_bridge_running_async() is sufficient.
 
-        if is_running {
-            debug!("[GET_EXECUTOR_STATUS] Calling bridge.get_status()...");
-            bridge
-                .get_status()
-                .map_err(|e| format!("Failed to get status: {}", e))?;
-            debug!("[GET_EXECUTOR_STATUS] get_status() completed");
+            (running, s_name)
+        } else {
+            (false, "not_started".to_string())
         }
+    };
 
-        let config_loaded = state
-            .current_config
-            .lock()
-            .unwrap_or_else(|poisoned| {
-                warn!("[GET_EXECUTOR_STATUS] current_config mutex was poisoned, recovering");
-                poisoned.into_inner()
-            })
-            .is_some();
-        debug!("[GET_EXECUTOR_STATUS] config_loaded = {}", config_loaded);
-        info!(
-            "[GET_EXECUTOR_STATUS] Returning: python_running={}, state={}, config_loaded={}",
-            is_running, state_name, config_loaded
-        );
+    debug!("[GET_EXECUTOR_STATUS] is_running() = {}", is_running);
+    debug!("[GET_EXECUTOR_STATUS] Current state: {}", state_name);
 
-        Ok(CommandResponse {
-            success: true,
-            message: None,
-            data: Some(serde_json::json!({
-                "python_running": is_running,
-                "executor_state": state_name,
-                "config_loaded": config_loaded
-            })),
+    let config_loaded = state
+        .current_config
+        .lock()
+        .unwrap_or_else(|poisoned| {
+            warn!("[GET_EXECUTOR_STATUS] current_config mutex was poisoned, recovering");
+            poisoned.into_inner()
         })
-    } else {
-        debug!("[GET_EXECUTOR_STATUS] Bridge is None - Python not started");
-        info!("[GET_EXECUTOR_STATUS] Returning: python_running=false (no bridge)");
-        Ok(CommandResponse {
-            success: true,
-            message: None,
-            data: Some(serde_json::json!({
-                "python_running": false,
-                "executor_state": "not_started",
-                "config_loaded": crate::safe_lock::safe_lock_or_recover(&state.current_config, "current_config").is_some()
-            })),
-        })
-    }
+        .is_some();
+    debug!("[GET_EXECUTOR_STATUS] config_loaded = {}", config_loaded);
+    info!(
+        "[GET_EXECUTOR_STATUS] Returning: python_running={}, state={}, config_loaded={}",
+        is_running, state_name, config_loaded
+    );
+
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::json!({
+            "python_running": is_running,
+            "executor_state": state_name,
+            "config_loaded": config_loaded
+        })),
+    })
 }
 
 /// Detect and return information about system monitors.
@@ -196,38 +185,44 @@ pub fn get_monitors(app_handle: AppHandle) -> Result<CommandResponse, String> {
 /// * `Ok(CommandResponse)` - Success with enabled status
 /// * `Err(String)` - Error if executor not running
 #[tauri::command]
-pub fn set_input_capture_enabled(
+pub async fn set_input_capture_enabled(
     enabled: bool,
-    state: State<Arc<AppState>>,
+    state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
     info!("Setting input capture enabled: {}", enabled);
 
-    let mut bridge_lock =
-        crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
-    if let Some(ref mut bridge) = *bridge_lock {
-        if !bridge.is_running() {
-            return Err("Python executor is not running".to_string());
-        }
+    let manager_guard = state.bridge_manager.lock().await;
+    let manager = manager_guard.as_ref().ok_or("Bridge manager not initialized")?;
 
-        let params = serde_json::json!({
-            "enabled": enabled,
-        });
-
-        bridge
-            .send_command("set_input_capture_enabled", Some(params))
-            .map_err(|e| format!("Failed to set input capture: {}", e))?;
-
-        Ok(CommandResponse {
-            success: true,
-            message: Some(format!(
-                "Input capture {}",
-                if enabled { "enabled" } else { "disabled" }
-            )),
-            data: Some(serde_json::json!({ "enabled": enabled })),
-        })
-    } else {
-        Err("Python executor not initialized".to_string())
+    // Use async check to avoid nested runtime panic
+    if !manager.is_default_bridge_running_async().await {
+        return Err("Python executor is not running".to_string());
     }
+
+    let params = serde_json::json!({
+        "enabled": enabled,
+    });
+
+    // Use spawn_blocking because PythonBridge methods use block_on internally
+    let manager_clone = manager.clone();
+    tokio::task::spawn_blocking(move || {
+        manager_clone.with_default_bridge(|bridge| {
+            bridge.send_command("set_input_capture_enabled", Some(params))
+        })
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?
+    .map_err(|e| format!("Failed to set input capture: {}", e))?
+    .map_err(|e| format!("Failed to set input capture: {}", e))?;
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some(format!(
+            "Input capture {}",
+            if enabled { "enabled" } else { "disabled" }
+        )),
+        data: Some(serde_json::json!({ "enabled": enabled })),
+    })
 }
 
 /// Get input validation capture status.
@@ -239,40 +234,45 @@ pub fn set_input_capture_enabled(
 /// * `Ok(CommandResponse)` - Success with is_monitoring, events_count, session_id
 /// * `Err(String)` - Error if executor not running
 #[tauri::command]
-pub fn get_input_validation_status(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
-    let mut bridge_lock =
-        crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
-    if let Some(ref mut bridge) = *bridge_lock {
-        if !bridge.is_running() {
-            return Ok(CommandResponse {
-                success: true,
-                message: None,
-                data: Some(serde_json::json!({
-                    "is_monitoring": false,
-                    "events_count": 0
-                })),
-            });
-        }
-
-        bridge
-            .send_command("get_input_validation_status", None)
-            .map_err(|e| format!("Failed to get input validation status: {}", e))?;
-
-        // Note: The actual response comes from Python asynchronously
-        // For now, just confirm the command was sent
-        Ok(CommandResponse {
-            success: true,
-            message: Some("Status query sent".to_string()),
-            data: None,
-        })
+pub async fn get_input_validation_status(state: State<'_, Arc<AppState>>) -> Result<CommandResponse, String> {
+    let manager_guard = state.bridge_manager.lock().await;
+    // Use async check to avoid nested runtime panic
+    let is_running = if let Some(ref manager) = *manager_guard {
+        manager.is_default_bridge_running_async().await
     } else {
-        Ok(CommandResponse {
+        false
+    };
+
+    if !is_running {
+        return Ok(CommandResponse {
             success: true,
             message: None,
             data: Some(serde_json::json!({
                 "is_monitoring": false,
                 "events_count": 0
             })),
-        })
+        });
     }
+
+    if let Some(ref manager) = *manager_guard {
+        // Use spawn_blocking because PythonBridge methods use block_on internally
+        let manager_clone = manager.clone();
+        tokio::task::spawn_blocking(move || {
+            manager_clone.with_default_bridge(|bridge| {
+                bridge.send_command("get_input_validation_status", None)
+            })
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+        .map_err(|e| format!("Failed to get input validation status: {}", e))?
+        .map_err(|e| format!("Failed to get input validation status: {}", e))?;
+    }
+
+    // Note: The actual response comes from Python asynchronously
+    // For now, just confirm the command was sent
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Status query sent".to_string()),
+        data: None,
+    })
 }

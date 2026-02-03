@@ -3,6 +3,8 @@
 //! This module provides tools for adjusting execution behavior based on
 //! historical flakiness data from the Tiered Information Model.
 
+#![allow(dead_code)]
+
 use crate::tiered_info::{get_flaky_templates, get_flaky_transitions, FlakyItem};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};

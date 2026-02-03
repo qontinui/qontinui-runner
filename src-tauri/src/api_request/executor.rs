@@ -38,8 +38,8 @@ impl Default for ApiRequestExecutor {
 impl ApiRequestExecutor {
     /// Create a new API request executor
     pub fn new() -> Self {
+        // No global timeout - each request specifies its own timeout (or no timeout)
         let client = Client::builder()
-            .timeout(Duration::from_secs(30))
             .build()
             .expect("Failed to build HTTP client");
 
@@ -51,8 +51,8 @@ impl ApiRequestExecutor {
 
     /// Create executor with a shared variable resolver
     pub fn with_resolver(resolver: VariableResolver) -> Self {
+        // No global timeout - each request specifies its own timeout (or no timeout)
         let client = Client::builder()
-            .timeout(Duration::from_secs(30))
             .build()
             .expect("Failed to build HTTP client");
 
@@ -65,6 +65,68 @@ impl ApiRequestExecutor {
     /// Get mutable access to the variable resolver
     pub fn resolver(&self) -> &VariableResolver {
         &self.variable_resolver
+    }
+
+    /// Create executor with initial variables.
+    ///
+    /// Variables can be referenced in URLs, headers, and body using {{variable_name}} syntax.
+    pub fn with_variables(variables: HashMap<String, String>) -> Self {
+        let resolver = VariableResolver::with_variables(variables);
+        Self::with_resolver(resolver)
+    }
+
+    /// Get all current variables.
+    ///
+    /// Returns a copy of all variables stored in the resolver.
+    pub fn get_all_variables(&self) -> HashMap<String, String> {
+        self.variable_resolver.get_all()
+    }
+
+    /// Clear all variables from the resolver.
+    pub fn clear_variables(&self) {
+        self.variable_resolver.clear();
+    }
+
+    /// Validate that all variables referenced in the config are defined.
+    ///
+    /// Returns Ok(()) if all variables are resolved, or Err with list of missing variable names.
+    pub fn validate_variables(&self, config: &ApiRequestConfig) -> Result<(), Vec<String>> {
+        let mut all_unresolved = Vec::new();
+
+        // Check URL
+        all_unresolved.extend(self.variable_resolver.get_unresolved(&config.url));
+
+        // Check headers
+        if let Some(ref headers) = config.headers {
+            for value in headers.values() {
+                all_unresolved.extend(self.variable_resolver.get_unresolved(value));
+            }
+        }
+
+        // Check body
+        if let Some(ref body) = config.body {
+            all_unresolved.extend(self.variable_resolver.get_unresolved(body));
+        }
+
+        // Deduplicate
+        all_unresolved.sort();
+        all_unresolved.dedup();
+
+        if all_unresolved.is_empty() {
+            Ok(())
+        } else {
+            Err(all_unresolved)
+        }
+    }
+
+    /// Set a variable in the resolver.
+    pub fn set_variable(&self, name: &str, value: &str) {
+        self.variable_resolver.set(name, value);
+    }
+
+    /// Get a mutable reference to the resolver for direct access.
+    pub fn resolver_mut(&mut self) -> &mut VariableResolver {
+        &mut self.variable_resolver
     }
 
     /// Execute an API request
@@ -90,11 +152,14 @@ impl ApiRequestExecutor {
         debug!("Executing API request: {} {}", config.method, resolved_url);
 
         // 2. Build request
-        let timeout = Duration::from_millis(config.timeout_ms.unwrap_or(30000));
         let mut request = self
             .client
-            .request(config.method.into(), &resolved_url)
-            .timeout(timeout);
+            .request(config.method.into(), &resolved_url);
+
+        // Only set timeout if explicitly configured (None = no timeout)
+        if let Some(timeout_ms) = config.timeout_ms {
+            request = request.timeout(Duration::from_millis(timeout_ms));
+        }
 
         // Apply headers (excluding Content-Type which we handle separately)
         for (key, value) in &resolved_headers {

@@ -2,6 +2,7 @@
 //!
 //! Defines the data structures used across all test executors.
 
+use crate::test_executor::diagnostics::collect_diagnostics;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -346,6 +347,59 @@ impl TestExecutionResult {
             assertions_passed: 0,
             assertions_failed: 0,
             structured_output: None,
+            individual_tests: None,
+            coverage: None,
+            exit_code: None,
+            started_at: now.clone(),
+            completed_at: now,
+        }
+    }
+
+    /// Create a new result for a timed out test with diagnostic information
+    ///
+    /// This collects diagnostic information about the extension and browser state
+    /// to help AI agents debug why the test timed out.
+    pub fn timeout_with_diagnostics(
+        test_id: String,
+        test_name: String,
+        timeout_seconds: u32,
+    ) -> Self {
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Collect diagnostic information
+        let diagnostics = collect_diagnostics();
+        let diagnostic_text = diagnostics.format_for_ai();
+
+        // Build detailed error message with diagnostics
+        let error_message = format!(
+            "Test timed out after {} seconds\n\n{}",
+            timeout_seconds, diagnostic_text
+        );
+
+        // Store diagnostics in structured output for programmatic access
+        let structured_diagnostics = serde_json::json!({
+            "timeout_seconds": timeout_seconds,
+            "diagnostics": {
+                "extension_reachable": diagnostics.extension_reachable,
+                "extension_error": diagnostics.extension_error,
+                "browser_process_running": diagnostics.browser_process_running,
+                "last_successful_operation": diagnostics.last_successful_operation,
+                "collected_at": diagnostics.collected_at,
+            }
+        });
+
+        Self {
+            test_id,
+            test_name,
+            status: TestStatus::Timeout,
+            duration_ms: (timeout_seconds * 1000) as u64,
+            output: diagnostic_text.clone(),
+            error: Some(error_message),
+            screenshots: vec![],
+            assertions: vec![],
+            assertions_passed: 0,
+            assertions_failed: 0,
+            structured_output: Some(structured_diagnostics),
             individual_tests: None,
             coverage: None,
             exit_code: None,

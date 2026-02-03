@@ -5,6 +5,8 @@
 //!
 //! Inspired by n8n's workflow hooks pattern.
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::process::Command;

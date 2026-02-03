@@ -17,6 +17,8 @@
 //!
 //! For QuickScan mode, we find the shortest path through critical states.
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 

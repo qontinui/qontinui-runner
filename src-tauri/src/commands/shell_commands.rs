@@ -11,6 +11,7 @@
 //! - Integration with task runs for audit logging
 
 use crate::commands::{AppState, CommandResponse};
+use crate::executor::with_default_bridge;
 use chrono::Utc;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
@@ -104,8 +105,10 @@ pub struct ShellCommandResult {
 // Default Values
 // ============================================================================
 
+/// Default timeout for shell commands.
+/// Returns 0 to indicate no timeout (run until completion).
 fn default_timeout_seconds() -> i32 {
-    60
+    0 // No timeout - run until completion
 }
 
 fn default_fail_on_error() -> bool {
@@ -126,7 +129,7 @@ fn ensure_shell_commands_tables(conn: &rusqlite::Connection) -> Result<(), Strin
             description TEXT,
             command TEXT NOT NULL,
             working_directory TEXT,
-            timeout_seconds INTEGER NOT NULL DEFAULT 60,
+            timeout_seconds INTEGER,  -- NULL = no timeout (default)
             fail_on_error BOOLEAN NOT NULL DEFAULT 1,
             category TEXT,
             tags TEXT DEFAULT '[]',
@@ -1122,19 +1125,9 @@ pub async fn generate_shell_command_with_ai(
     let category = input.category.unwrap_or_else(|| "general".to_string());
     let user_prompt = input.user_prompt;
 
-    // Execute via spawn_blocking since PythonBridge uses block_on internally
+    // Execute via spawn_blocking since with_default_bridge uses block_on internally
     let result = tokio::task::spawn_blocking(move || {
-        // Handle poisoned mutex gracefully instead of panicking
-        let mut guard = match app_state.python_bridge.lock() {
-            Ok(g) => g,
-            Err(poisoned) => {
-                // Recover from poisoned mutex by getting the inner guard
-                tracing::warn!("Python bridge mutex was poisoned, recovering...");
-                poisoned.into_inner()
-            }
-        };
-
-        if let Some(ref mut bridge) = *guard {
+        with_default_bridge(&app_state, |bridge| {
             let params = serde_json::json!({
                 "user_prompt": user_prompt,
                 "target_os": target_os,
@@ -1151,13 +1144,13 @@ pub async fn generate_shell_command_with_ai(
             ) {
                 Ok(response) => {
                     if response.success {
-                        Ok(CommandResponse {
+                        CommandResponse {
                             success: true,
                             message: Some("Shell command generated successfully".to_string()),
                             data: response.data,
-                        })
+                        }
                     } else {
-                        Ok(CommandResponse {
+                        CommandResponse {
                             success: false,
                             message: Some(
                                 response
@@ -1165,25 +1158,24 @@ pub async fn generate_shell_command_with_ai(
                                     .unwrap_or_else(|| "Generation failed".to_string()),
                             ),
                             data: None,
-                        })
+                        }
                     }
                 }
-                Err(e) => Ok(CommandResponse {
+                Err(e) => CommandResponse {
                     success: false,
                     message: Some(format!("Command failed: {}", e)),
                     data: None,
-                }),
+                },
             }
-        } else {
-            Ok(CommandResponse {
-                success: false,
-                message: Some("Python executor not initialized".to_string()),
-                data: None,
-            })
-        }
+        })
+        .unwrap_or_else(|e| CommandResponse {
+            success: false,
+            message: Some(e),
+            data: None,
+        })
     })
     .await
     .map_err(|e| format!("spawn_blocking error: {}", e))?;
 
-    result
+    Ok(result)
 }

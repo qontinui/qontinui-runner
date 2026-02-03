@@ -17,6 +17,8 @@
 //! ```ignore
 //! let suggester = AssertionSuggester::new();
 //! let suggestions = suggester.analyze_result(&exploration_result);
+
+#![allow(dead_code)]
 //!
 //! for suggestion in suggestions {
 //!     if user_accepts(&suggestion) {

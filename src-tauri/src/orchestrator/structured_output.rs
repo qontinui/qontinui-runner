@@ -34,6 +34,8 @@
 //! - New structured JSON format (preferred)
 //! - Legacy text markers (fallback for existing prompts)
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 

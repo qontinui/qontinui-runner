@@ -529,3 +529,153 @@ pub async fn get_flakiness_summary(
         Err(e) => Ok(TieredInfoResponse::err(e)),
     }
 }
+
+// =============================================================================
+// AI Session History Commands (for Runs page)
+// =============================================================================
+
+/// AI session run data for the Runs page.
+/// Matches the AiSessionRun TypeScript interface in the frontend.
+#[derive(Debug, Serialize)]
+pub struct AiSessionRun {
+    pub id: String,
+    pub name: String,
+    #[serde(rename = "startedAt")]
+    pub started_at: String,
+    #[serde(rename = "endedAt", skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<String>,
+    pub status: String,
+    #[serde(rename = "loopCount")]
+    pub loop_count: u32,
+    #[serde(rename = "taskType", skip_serializing_if = "Option::is_none")]
+    pub task_type: Option<String>,
+}
+
+/// Get AI session history for the Runs page.
+///
+/// # Arguments
+/// * `config_id` - Optional config ID to filter by
+/// * `limit` - Maximum number of runs to return (default: 50)
+#[tauri::command]
+pub async fn get_ai_session_history(
+    state: State<'_, Arc<AppState>>,
+    config_id: Option<String>,
+    limit: Option<u32>,
+) -> Result<TieredInfoResponse<Vec<AiSessionRun>>, String> {
+    let db = &state.checkpoint_db;
+    let conn = db.connection()?;
+    let limit = limit.unwrap_or(50);
+
+    // Build the query based on whether config_id filter is provided
+    let query = if config_id.is_some() {
+        r#"
+        SELECT id, task_name, created_at, completed_at, status, sessions_count, task_type
+        FROM task_runs
+        WHERE config_id = ?1
+        ORDER BY created_at DESC
+        LIMIT ?2
+        "#
+    } else {
+        r#"
+        SELECT id, task_name, created_at, completed_at, status, sessions_count, task_type
+        FROM task_runs
+        ORDER BY created_at DESC
+        LIMIT ?1
+        "#
+    };
+
+    let mut stmt = conn
+        .prepare(query)
+        .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+    let runs: Vec<AiSessionRun> = if let Some(ref cid) = config_id {
+        stmt.query_map(rusqlite::params![cid, limit], |row| {
+            let status: String = row.get(4)?;
+            Ok(AiSessionRun {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                started_at: row.get(2)?,
+                ended_at: row.get(3)?,
+                status: map_status_to_frontend(&status),
+                loop_count: row.get(5)?,
+                task_type: row.get(6)?,
+            })
+        })
+        .map_err(|e| format!("Failed to query task runs: {}", e))?
+        .filter_map(|r| r.ok())
+        .collect()
+    } else {
+        stmt.query_map(rusqlite::params![limit], |row| {
+            let status: String = row.get(4)?;
+            Ok(AiSessionRun {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                started_at: row.get(2)?,
+                ended_at: row.get(3)?,
+                status: map_status_to_frontend(&status),
+                loop_count: row.get(5)?,
+                task_type: row.get(6)?,
+            })
+        })
+        .map_err(|e| format!("Failed to query task runs: {}", e))?
+        .filter_map(|r| r.ok())
+        .collect()
+    };
+
+    debug!(
+        "Retrieved {} AI session runs (config_id: {:?})",
+        runs.len(),
+        config_id
+    );
+    Ok(TieredInfoResponse::ok(runs))
+}
+
+/// Map internal status to frontend-expected status values.
+/// Internal: 'running', 'complete', 'failed', 'stopped'
+/// Frontend: 'running', 'completed', 'failed', 'cancelled'
+fn map_status_to_frontend(status: &str) -> String {
+    match status {
+        "complete" => "completed".to_string(),
+        "stopped" => "cancelled".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Delete an AI session (task run) by ID.
+///
+/// This will cascade delete all related records including:
+/// - task_run_output_chunks
+/// - task_run_findings
+/// - task_run_automation
+/// - task_run_events
+/// - task_run_screenshots
+/// - task_run_playwright_results
+/// - task_knowledge
+/// - verification_plans
+/// - orchestrator_verification_results
+#[tauri::command]
+pub async fn delete_ai_session(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Result<TieredInfoResponse<bool>, String> {
+    let db = &state.checkpoint_db;
+
+    match db.delete_task_run(&session_id) {
+        Ok(deleted) => {
+            if deleted {
+                info!("Deleted AI session: {}", session_id);
+                Ok(TieredInfoResponse::ok(true))
+            } else {
+                warn!("AI session not found for deletion: {}", session_id);
+                Ok(TieredInfoResponse::err(format!(
+                    "Session not found: {}",
+                    session_id
+                )))
+            }
+        }
+        Err(e) => {
+            warn!("Failed to delete AI session {}: {}", session_id, e);
+            Ok(TieredInfoResponse::err(e))
+        }
+    }
+}

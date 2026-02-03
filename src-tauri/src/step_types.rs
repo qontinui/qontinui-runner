@@ -17,11 +17,13 @@ use tracing::warn;
 /// - **Utility**: macro
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum StepType {
     // ========================================================================
     // GUI Automation Steps
     // ========================================================================
     /// Execute a named workflow (sequence of state transitions)
+    #[default]
     Workflow,
     /// Navigate to a specific state
     State,
@@ -43,6 +45,8 @@ pub enum StepType {
     Check,
     /// Execute a group of checks
     CheckGroup,
+    /// Watch logs for errors (runtime error detection)
+    LogWatch,
 
     // ========================================================================
     // Command Steps
@@ -103,6 +107,7 @@ impl StepType {
                 | StepType::Test
                 | StepType::Check
                 | StepType::CheckGroup
+                | StepType::LogWatch
                 | StepType::Screenshot
         )
     }
@@ -140,32 +145,54 @@ impl StepType {
     }
 
     /// Returns the default timeout in seconds for this step type.
-    pub fn default_timeout_seconds(&self) -> u64 {
+    /// Returns None to indicate no timeout (run until completion).
+    /// Users can override this by explicitly setting a timeout.
+    pub fn default_timeout_seconds(&self) -> Option<u64> {
+        // All steps default to no timeout - they run until completion.
+        // Users can explicitly set a timeout if needed.
+        None
+    }
+
+    /// Returns the default expected duration in milliseconds for this step type.
+    ///
+    /// This is used for progress estimation in the Timeline widget.
+    /// Values are based on typical execution times:
+    /// - GUI actions are fast (5 seconds)
+    /// - Shell commands are medium (30 seconds)
+    /// - Playwright tests are longer (60 seconds)
+    /// - AI sessions can be very long (5 minutes)
+    pub fn default_expected_duration_ms(&self) -> Option<u64> {
         match self {
-            // Long-running steps
-            StepType::Workflow | StepType::GuiWorkflow => 300,
-            StepType::Playwright | StepType::Test => 120,
-            StepType::Prompt | StepType::AiSession => 600,
-            StepType::CheckGroup => 300,
+            // GUI Automation - generally fast
+            StepType::Action => Some(5_000),         // 5 seconds
+            StepType::Screenshot => Some(2_000),     // 2 seconds
+            StepType::State => Some(10_000),         // 10 seconds
+            StepType::Workflow | StepType::GuiWorkflow => Some(120_000), // 2 minutes
 
-            // Medium-duration steps
-            StepType::State => 60,
-            StepType::ShellCommand => 120,
-            StepType::Check => 60,
-            StepType::Macro => 120,
+            // Verification - varies by test complexity
+            StepType::Playwright => Some(60_000),    // 60 seconds
+            StepType::Test => Some(30_000),          // 30 seconds
+            StepType::Check => Some(10_000),         // 10 seconds
+            StepType::CheckGroup => Some(60_000),    // 60 seconds
+            StepType::LogWatch => Some(5_000),       // 5 seconds (quick log scan)
 
-            // Quick steps
-            StepType::Action => 30,
-            StepType::Screenshot => 10,
-            StepType::ApiRequest => 30,
-            StepType::McpCall => 60,
+            // Command - varies widely, use conservative defaults
+            StepType::ShellCommand => Some(30_000),  // 30 seconds
+            StepType::ApiRequest => Some(10_000),    // 10 seconds
+            StepType::McpCall => Some(30_000),       // 30 seconds
 
-            // AWAS steps
-            StepType::AwasDiscover => 60,
-            StepType::AwasExecute => 30,
-            StepType::AwasCheckSupport => 10,
-            StepType::AwasListActions => 30,
-            StepType::AwasExtractElements => 30,
+            // AI - typically long-running
+            StepType::Prompt | StepType::AiSession => Some(300_000), // 5 minutes
+
+            // AWAS - web automation
+            StepType::AwasDiscover => Some(30_000),  // 30 seconds
+            StepType::AwasExecute => Some(15_000),   // 15 seconds
+            StepType::AwasCheckSupport => Some(5_000), // 5 seconds
+            StepType::AwasListActions => Some(10_000), // 10 seconds
+            StepType::AwasExtractElements => Some(10_000), // 10 seconds
+
+            // Utility
+            StepType::Macro => Some(60_000),         // 60 seconds
         }
     }
 
@@ -205,6 +232,7 @@ impl StepType {
             "test" => Some(StepType::Test),
             "check" => Some(StepType::Check),
             "check_group" | "checkgroup" => Some(StepType::CheckGroup),
+            "log_watch" | "logwatch" => Some(StepType::LogWatch),
 
             // Command
             "shell_command" | "shellcommand" | "shell" | "command" => Some(StepType::ShellCommand),
@@ -247,6 +275,7 @@ impl StepType {
             StepType::Test => "test",
             StepType::Check => "check",
             StepType::CheckGroup => "check_group",
+            StepType::LogWatch => "log_watch",
             StepType::ShellCommand => "shell_command",
             StepType::ApiRequest => "api_request",
             StepType::McpCall => "mcp_call",
@@ -268,11 +297,6 @@ impl std::fmt::Display for StepType {
     }
 }
 
-impl Default for StepType {
-    fn default() -> Self {
-        StepType::Workflow
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -351,6 +375,58 @@ mod tests {
             let s = step_type.as_str();
             let parsed = StepType::from_str_compat(s);
             assert_eq!(parsed, Some(step_type));
+        }
+    }
+
+    #[test]
+    fn test_default_expected_duration_ms() {
+        // GUI actions should be fast
+        assert_eq!(StepType::Action.default_expected_duration_ms(), Some(5_000));
+        assert_eq!(StepType::Screenshot.default_expected_duration_ms(), Some(2_000));
+
+        // Shell commands medium
+        assert_eq!(StepType::ShellCommand.default_expected_duration_ms(), Some(30_000));
+
+        // Playwright tests longer
+        assert_eq!(StepType::Playwright.default_expected_duration_ms(), Some(60_000));
+
+        // AI sessions longest
+        assert_eq!(StepType::AiSession.default_expected_duration_ms(), Some(300_000));
+        assert_eq!(StepType::Prompt.default_expected_duration_ms(), Some(300_000));
+
+        // Workflows
+        assert_eq!(StepType::Workflow.default_expected_duration_ms(), Some(120_000));
+
+        // All step types should return Some value (no None cases currently)
+        let all_types = [
+            StepType::Workflow,
+            StepType::State,
+            StepType::Action,
+            StepType::Screenshot,
+            StepType::GuiWorkflow,
+            StepType::Playwright,
+            StepType::Test,
+            StepType::Check,
+            StepType::CheckGroup,
+            StepType::ShellCommand,
+            StepType::ApiRequest,
+            StepType::McpCall,
+            StepType::Prompt,
+            StepType::AiSession,
+            StepType::AwasDiscover,
+            StepType::AwasExecute,
+            StepType::AwasCheckSupport,
+            StepType::AwasListActions,
+            StepType::AwasExtractElements,
+            StepType::Macro,
+        ];
+
+        for step_type in all_types {
+            assert!(
+                step_type.default_expected_duration_ms().is_some(),
+                "{:?} should have a default expected duration",
+                step_type
+            );
         }
     }
 }

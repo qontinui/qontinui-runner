@@ -17,6 +17,8 @@
 //!         message: "Submit button should be enabled when form is valid"
 //! ```
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 
 /// Types of assertions that can be checked

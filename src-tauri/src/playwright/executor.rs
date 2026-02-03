@@ -570,7 +570,7 @@ pub fn run_script_inline(
         script_filename,
         "--reporter=json".to_string(),
         format!("--output={}", output_dir.to_string_lossy()),
-        "--timeout=300000".to_string(), // 5 minute timeout for combined scripts
+        "--timeout=0".to_string(), // No timeout - run until completion
         "--headed".to_string(),         // Use headed mode for visibility
     ];
 

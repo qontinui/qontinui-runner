@@ -407,13 +407,12 @@ class Cache {
         let root = tree.root_node();
 
         // Find the identifier
-        let mut cursor = root.walk();
+        let _cursor = root.walk();
         fn find_identifier(node: &Node, source: &str) -> Option<AccessType> {
-            if node.kind() == "identifier" {
-                if node.utf8_text(source.as_bytes()).ok() == Some("counter") {
+            if node.kind() == "identifier"
+                && node.utf8_text(source.as_bytes()).ok() == Some("counter") {
                     return Some(determine_access_type(node, source));
                 }
-            }
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 if let Some(result) = find_identifier(&child, source) {

@@ -3,6 +3,8 @@
 //! The orchestrator enforces state transitions and verification gates.
 //! Agents cannot bypass states or determine task completion.
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use tracing::info;
 

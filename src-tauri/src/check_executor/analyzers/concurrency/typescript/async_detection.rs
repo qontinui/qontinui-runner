@@ -5,6 +5,8 @@
 //! - Event handlers with shared state
 //! - Promise.all with shared state modifications
 
+#![allow(dead_code)]
+
 use crate::check_executor::analyzers::concurrency::types::{
     AccessType, AnalysisContext, RaceIssue, RacePattern, RaceSeverity, StateAccess,
 };
@@ -33,11 +35,10 @@ pub fn detect_async_patterns(
 fn traverse_for_async(node: &Node, source: &str, count: &mut u32) {
     let kind = node.kind();
 
-    if kind == "function_declaration" || kind == "arrow_function" || kind == "method_definition" {
-        if has_async_keyword(node, source) {
+    if (kind == "function_declaration" || kind == "arrow_function" || kind == "method_definition")
+        && has_async_keyword(node, source) {
             *count += 1;
         }
-    }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {

@@ -2,6 +2,8 @@
 //!
 //! Defines the data structures used across all race condition analyzers.
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 
 /// Severity of a detected race condition
@@ -290,7 +292,7 @@ impl AnalysisContext {
         ];
 
         self.locks.iter().any(|lock| {
-            lock_patterns.iter().any(|pattern| lock.name == *pattern)
+            lock_patterns.contains(&lock.name)
                 || lock.protects.contains(&state_name.to_string())
         })
     }

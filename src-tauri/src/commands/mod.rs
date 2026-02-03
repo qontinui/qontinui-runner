@@ -29,7 +29,8 @@
 use crate::config::QontinuiConfig;
 use crate::database::CheckpointDb;
 use crate::display::DisplayProcessor;
-use crate::executor::{ExtractionExecutor, PythonBridge};
+use crate::error_monitor::ErrorMonitorHandle;
+use crate::executor::{BridgeManager, ExtractionExecutor};
 use crate::mcp_client::McpClientManager;
 use crate::storage::LocalStorage;
 use crate::tiered_info::RunRecordingHandler;
@@ -69,6 +70,7 @@ pub mod learning; // Learning insights dashboard commands
 pub mod logging;
 pub mod mcp; // MCP client management and tool calling
 pub mod mobile; // Mobile development feedback (ADB, screenshots, logcat)
+pub mod performance_metrics; // Performance metrics dashboard
 pub mod mobile_settings; // Mobile settings (ADB path, device config)
 pub mod playwright_settings;
 pub mod project_logs;
@@ -96,7 +98,7 @@ pub mod websocket;
 /// Application state shared across all commands.
 ///
 /// This structure holds the core application state including:
-/// - Python bridge for executor communication
+/// - Bridge manager for multi-bridge support (handles all Python bridges)
 /// - Extraction executor for parallel extraction operations
 /// - Current loaded configuration
 /// - Display processor for UI views
@@ -105,9 +107,18 @@ pub mod websocket;
 /// - Event broadcast channel for WebSocket clients
 /// - Checkpoint database for persistent storage
 /// - Run recording handler for automatic run recording
+/// - Error monitor handle for application log monitoring
 pub struct AppState {
-    pub python_bridge: Mutex<Option<PythonBridge>>,
-    /// Separate executor for extraction operations (runs in parallel with python_bridge).
+    /// Bridge manager for handling multiple concurrent Python bridges.
+    /// Supports GUI mode (exclusive) and headless mode (parallel).
+    /// Initialized lazily in setup() when app_handle is available.
+    ///
+    /// Use the helper functions from `crate::executor::bridge_helpers` to access:
+    /// - `with_default_bridge()` - Execute closure with default bridge
+    /// - `is_default_bridge_running()` - Check if executor is running
+    /// - `get_or_create_default_bridge()` - Ensure a bridge exists
+    pub bridge_manager: TokioMutex<Option<Arc<BridgeManager>>>,
+    /// Separate executor for extraction operations (runs in parallel with bridges).
     /// This allows extraction (which uses Playwright) to run concurrently with
     /// GUI automation workflows (which use HAL).
     pub extraction_executor: Mutex<Option<ExtractionExecutor>>,
@@ -125,6 +136,9 @@ pub struct AppState {
     pub run_recording_handler: Arc<RunRecordingHandler>,
     /// MCP client manager for calling external MCP servers from workflows.
     pub mcp_client_manager: TokioMutex<McpClientManager>,
+    /// Error monitor handle for application log monitoring.
+    /// Used to monitor log files for errors and integrate with debug context.
+    pub error_monitor_handle: TokioMutex<Option<ErrorMonitorHandle>>,
 }
 
 /// Standard response structure for command handlers.

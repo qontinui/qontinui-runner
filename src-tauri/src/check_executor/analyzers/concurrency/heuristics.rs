@@ -2,6 +2,8 @@
 //!
 //! Contains rules for identifying cases that look like races but are likely safe.
 
+#![allow(dead_code)]
+
 use super::types::{RaceIssue, RaceSeverity, SharedState, SharedStateType};
 use std::collections::HashSet;
 
@@ -121,7 +123,7 @@ pub fn is_init_only(state: &SharedState) -> bool {
     let init_contexts = ["__init__", "new", "init", "setup", "configure"];
 
     state.accesses.iter().all(|access| {
-        access.context.as_ref().map_or(false, |ctx| {
+        access.context.as_ref().is_some_and(|ctx| {
             init_contexts.iter().any(|init| ctx.contains(init))
         })
     })

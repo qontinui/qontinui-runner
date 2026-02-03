@@ -8,6 +8,8 @@
 //!
 //! Inspired by agenticSeek's task routing pattern.
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 

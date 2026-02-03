@@ -28,6 +28,8 @@
 //!
 //! // Get accumulated value
 //! let findings: Vec<String> = state.get("findings").unwrap();
+
+#![allow(dead_code)]
 //! assert_eq!(findings.len(), 2);
 //! ```
 

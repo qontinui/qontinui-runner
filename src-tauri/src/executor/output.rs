@@ -5,7 +5,7 @@ use serde_json::json;
 use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 use tauri::Emitter;
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info};
 
 /// Handles output processing from Python executor
@@ -274,6 +274,117 @@ impl OutputProcessor {
                 "message": "Extraction executor process terminated unexpectedly",
             });
             let _ = app_handle.emit("extraction-error", &error_event);
+        }
+    }
+
+    /// Stdout reader task for headless bridges.
+    ///
+    /// This reader sends events to a dedicated broadcast channel instead of
+    /// emitting to the Tauri frontend. Used for parallel headless execution
+    /// where events shouldn't interfere with GUI bridge events.
+    pub async fn headless_stdout_reader_task(
+        stdout: std::process::ChildStdout,
+        lifecycle: Arc<RwLock<ExecutorLifecycle>>,
+        health_monitor: Arc<HealthMonitor>,
+        app_handle: tauri::AppHandle,
+        headless_tx: broadcast::Sender<serde_json::Value>,
+    ) {
+        info!("[HEADLESS_BRIDGE] stdout_reader_task started");
+        let reader = BufReader::new(stdout);
+        let mut line_count = 0;
+
+        for line in reader.lines() {
+            line_count += 1;
+            match line {
+                Ok(line) => {
+                    // Skip verbose logging for pong and heartbeat messages
+                    let is_pong =
+                        line.contains("\"type\": \"pong\"") || line.contains("\"type\":\"pong\"");
+                    if !is_pong {
+                        debug!("[HEADLESS_BRIDGE] Line #{}: {}", line_count, line);
+                    }
+
+                    // Parse message
+                    match parse_executor_message(&line) {
+                        Ok(message) => {
+                            // Handle pong messages for health monitoring
+                            if matches!(message, ExecutorMessage::Pong { .. }) {
+                                health_monitor.record_pong().await;
+                                continue;
+                            }
+
+                            debug!(
+                                "[HEADLESS_BRIDGE] Parsed message type: {:?}",
+                                std::mem::discriminant(&message)
+                            );
+
+                            // Process message through lifecycle
+                            let mut lifecycle_guard = lifecycle.write().await;
+                            match lifecycle_guard.handle_message(message.clone()).await {
+                                Ok(Some(msg)) => {
+                                    // Forward message to headless channel (not Tauri frontend)
+                                    EventForwarder::emit_message_to_headless_channel(
+                                        &app_handle,
+                                        msg,
+                                        &headless_tx,
+                                    )
+                                    .await;
+                                }
+                                Ok(None) => {
+                                    debug!("Headless message handled internally");
+                                }
+                                Err(e) => {
+                                    error!("Error handling headless message: {}", e);
+
+                                    let error_event = json!({
+                                        "type": "error",
+                                        "error": "message_handling_error",
+                                        "message": e.to_string(),
+                                    });
+                                    let _ = headless_tx.send(error_event);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed to parse headless executor message: {} - Line: {}",
+                                e, line
+                            );
+
+                            let error_event = json!({
+                                "type": "error",
+                                "error": "parse_error",
+                                "message": format!("Failed to parse executor output: {}", e),
+                                "raw_line": line,
+                                "timestamp": chrono::Utc::now().timestamp_millis(),
+                            });
+                            let _ = headless_tx.send(error_event);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Error reading headless stdout: {}", e);
+                    break;
+                }
+            }
+        }
+
+        info!("Headless stdout reader task ending");
+
+        // Mark as failed if not already in terminal state
+        let lifecycle_guard = lifecycle.write().await;
+        let state = lifecycle_guard.get_state().await;
+        if !state.is_terminal() {
+            let _ = lifecycle_guard
+                .mark_failed("Headless Python process stdout closed unexpectedly".to_string())
+                .await;
+
+            let error_event = json!({
+                "type": "error",
+                "error": "headless_executor_crashed",
+                "message": "Headless executor process terminated unexpectedly",
+            });
+            let _ = headless_tx.send(error_event);
         }
     }
 }

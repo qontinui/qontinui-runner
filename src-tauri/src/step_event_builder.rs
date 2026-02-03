@@ -15,7 +15,7 @@ use serde_json::Value;
 /// # Example
 ///
 /// ```ignore
-/// let metadata = StepMetadata::setup(StepType::ShellCommand, "Install deps", 0);
+/// let metadata = StepMetadata::setup(task_run_id, StepType::ShellCommand, "Install deps", 0);
 /// let details = StepDetails::shell_command("npm install".to_string(), None, None);
 ///
 /// let event = StepEventBuilder::new(task_run_id, metadata)
@@ -107,11 +107,11 @@ impl StepEventBuilder {
             return id.clone();
         }
 
-        let phase = self.metadata.phase.as_str();
+        let phase = self.metadata.phase().as_str();
         let step_type = self.metadata.step_type.as_str();
         let step_index = self.metadata.step_index;
 
-        if let Some(iteration) = self.metadata.iteration {
+        if let Some(iteration) = self.metadata.iteration() {
             format!(
                 "{}-{}-{}-{}-{}",
                 phase, step_type, self.task_run_id, iteration, step_index
@@ -132,11 +132,11 @@ impl StepEventBuilder {
             _ => serde_json::Map::new(),
         };
 
-        // Add the "type" field for backwards compatibility with existing consumers
-        // Some consumers expect "type": "ai_prompt" for AI steps
-        if self.metadata.step_type.requires_ai() {
-            data.insert("type".to_string(), serde_json::json!("ai_prompt"));
-        }
+        // Note: We no longer add a separate "type" field for AI steps.
+        // The "step_type" field from metadata is sufficient and consistent
+        // with the format used by log_step_event in step_executor.rs.
+        // This consistency allows the Timeline widget to properly aggregate
+        // start/complete events for the same step.
 
         // Merge in step-specific details
         self.details.merge_into(&mut data);
@@ -288,16 +288,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution_context::ExecutionContext;
     use crate::step_types::StepType;
-    use crate::unified_workflow_executor::WorkflowPhase;
+    
 
     #[test]
     fn test_build_start_event() {
         let metadata = StepMetadata::new(
+            ExecutionContext::setup("task-123"),
             StepType::ShellCommand,
             "Install dependencies",
             0,
-            WorkflowPhase::Setup,
         );
 
         let event = StepEventBuilder::new("task-123", metadata)
@@ -317,11 +318,12 @@ mod tests {
         assert_eq!(data["step_type"], "shell_command");
         assert_eq!(data["step_index"], 0);
         assert_eq!(data["phase"], "setup");
+        assert_eq!(data["task_run_id"], "task-123");
     }
 
     #[test]
     fn test_build_complete_event() {
-        let metadata = StepMetadata::verification(StepType::Playwright, "Login Test", 2, 1);
+        let metadata = StepMetadata::verification("task-123", StepType::Playwright, "Login Test", 2, 1);
         let details = StepDetails::playwright("script-456".to_string());
 
         let event = StepEventBuilder::new("task-123", metadata)
@@ -341,7 +343,7 @@ mod tests {
 
     #[test]
     fn test_build_error_event() {
-        let metadata = StepMetadata::setup(StepType::ShellCommand, "Build", 0);
+        let metadata = StepMetadata::setup("task-123", StepType::ShellCommand, "Build", 0);
 
         let event = StepEventBuilder::new("task-123", metadata)
             .build_error(500, Some("Command failed with exit code 1"));
@@ -357,13 +359,16 @@ mod tests {
 
     #[test]
     fn test_ai_step_type_field() {
-        let metadata = StepMetadata::agentic(StepType::AiSession, "Fix issues", 0, 1);
+        let metadata = StepMetadata::agentic("task-123", StepType::AiSession, "Fix issues", 0, 1);
 
         let event = StepEventBuilder::new("task-123", metadata).build_start();
 
-        // Verify "type": "ai_prompt" for backwards compatibility
+        // Verify step_type is set correctly (no separate "type" field anymore)
         let data: serde_json::Value = serde_json::from_str(event.data.as_ref().unwrap()).unwrap();
-        assert_eq!(data["type"], "ai_prompt");
+        assert_eq!(data["step_type"], "ai_session");
+        assert_eq!(data["step_name"], "Fix issues");
+        // The "type" field is no longer added for consistency with log_step_event
+        assert!(data.get("type").is_none());
     }
 
     #[test]

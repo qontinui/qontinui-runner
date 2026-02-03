@@ -15,6 +15,35 @@ use std::sync::Arc;
 use tauri::State;
 use tracing::{error, info};
 
+/// Configuration for vision extraction
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisionExtractionConfig {
+    /// Base64-encoded screenshot or file path
+    pub screenshot: String,
+    /// Techniques to run: "edge", "sam3", "ocr"
+    pub techniques: Option<Vec<String>>,
+    /// Edge detection: Canny low threshold
+    pub canny_low: Option<i32>,
+    /// Edge detection: Canny high threshold
+    pub canny_high: Option<i32>,
+    /// Edge detection: minimum contour area
+    pub min_contour_area: Option<i32>,
+    /// SAM3: points per side for mask generation
+    pub points_per_side: Option<i32>,
+    /// SAM3: predicted IoU threshold
+    pub pred_iou_thresh: Option<f64>,
+    /// SAM3: stability score threshold
+    pub stability_score_thresh: Option<f64>,
+    /// OCR: engine to use ("easyocr" or "tesseract")
+    pub ocr_engine: Option<String>,
+    /// OCR: languages to detect
+    pub ocr_languages: Option<Vec<String>>,
+    /// OCR: minimum confidence threshold
+    pub ocr_confidence_threshold: Option<f64>,
+    /// Fusion: IoU threshold for deduplication
+    pub iou_threshold: Option<f64>,
+}
+
 /// Configuration for web extraction
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebExtractionConfig {
@@ -75,6 +104,60 @@ pub fn start_web_extraction(
         Ok(CommandResponse {
             success: true,
             message: Some("Web extraction started".to_string()),
+            data: None,
+        })
+    } else {
+        Err("Extraction executor not initialized".to_string())
+    }
+}
+
+/// Start a vision extraction process
+///
+/// This command runs vision-based element detection on a screenshot using
+/// edge detection, SAM3 segmentation, and OCR.
+#[tauri::command]
+pub fn start_vision_extraction(
+    state: State<Arc<AppState>>,
+    config: VisionExtractionConfig,
+) -> Result<CommandResponse, String> {
+    info!("Starting vision extraction");
+
+    let mut executor_lock = state
+        .extraction_executor
+        .lock()
+        .map_err(|e| format!("Failed to acquire lock: {}", e))?;
+
+    if let Some(ref mut executor) = *executor_lock {
+        // Start executor on-demand if not running
+        executor.ensure_started().map_err(|e| {
+            error!("Failed to start extraction executor: {}", e);
+            e
+        })?;
+
+        let params = json!({
+            "config": {
+                "screenshot": config.screenshot,
+                "techniques": config.techniques.unwrap_or_else(|| vec!["edge".to_string(), "ocr".to_string()]),
+                "canny_low": config.canny_low.unwrap_or(50),
+                "canny_high": config.canny_high.unwrap_or(150),
+                "min_contour_area": config.min_contour_area.unwrap_or(100),
+                "points_per_side": config.points_per_side.unwrap_or(32),
+                "pred_iou_thresh": config.pred_iou_thresh.unwrap_or(0.88),
+                "stability_score_thresh": config.stability_score_thresh.unwrap_or(0.95),
+                "ocr_engine": config.ocr_engine.unwrap_or_else(|| "easyocr".to_string()),
+                "ocr_languages": config.ocr_languages.unwrap_or_else(|| vec!["en".to_string()]),
+                "ocr_confidence_threshold": config.ocr_confidence_threshold.unwrap_or(0.6),
+                "iou_threshold": config.iou_threshold.unwrap_or(0.5),
+            }
+        });
+
+        executor
+            .send_command("run_vision_extraction", Some(params))
+            .map_err(|e| e.to_string())?;
+
+        Ok(CommandResponse {
+            success: true,
+            message: Some("Vision extraction started".to_string()),
             data: None,
         })
     } else {

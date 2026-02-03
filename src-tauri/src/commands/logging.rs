@@ -24,12 +24,21 @@ pub struct AiOutputEntry {
     pub source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action_id: Option<String>,
-    /// Session/workflow ID for grouping loops by workflow
+    /// Parent task run ID (matches task_runs.id in database)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_run_id: Option<String>,
+    /// Session ID for grouping output (may include phase suffix like "-agentic-1")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     /// Human-readable session/workflow name (the task title)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_name: Option<String>,
+    /// Workflow phase: setup, verification, agentic, or completion
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// Iteration number within the phase (1, 2, 3...)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase_iteration: Option<u32>,
     /// Path to screenshot file (relative to .dev-logs/)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub screenshot_path: Option<String>,

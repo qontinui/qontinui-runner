@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info};
 
+use crate::executor::with_default_bridge;
 use crate::mcp_api::{api_error, ApiResponse, ApiState};
 
 // ============================================================================
@@ -167,21 +168,14 @@ pub async fn awas_discover(
     let timeout_secs = request.timeout_seconds;
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
             let timeout_duration = std::time::Duration::from_secs(timeout_secs);
             bridge.send_command_and_wait("awas_discover", Some(params), timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -241,21 +235,14 @@ pub async fn awas_execute(
     let timeout_secs = request.timeout_seconds;
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
             let timeout_duration = std::time::Duration::from_secs(timeout_secs);
             bridge.send_command_and_wait("awas_execute", Some(params), timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -310,21 +297,14 @@ pub async fn awas_check_support(
     let timeout_secs = request.timeout_seconds;
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
             let timeout_duration = std::time::Duration::from_secs(timeout_secs);
             bridge.send_command_and_wait("awas_check_support", Some(params), timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -391,21 +371,14 @@ pub async fn awas_list_actions(
     let app_state = state.app_state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
             let timeout_duration = std::time::Duration::from_secs(30);
             bridge.send_command_and_wait("awas_list_actions", None, timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {
@@ -493,21 +466,14 @@ pub async fn awas_extract_elements(
     });
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
 
             let timeout_duration = std::time::Duration::from_secs(30);
             bridge.send_command_and_wait("awas_extract_elements", Some(params), timeout_duration)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {

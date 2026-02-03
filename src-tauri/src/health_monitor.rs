@@ -4,6 +4,8 @@
 //! that could lead to application crashes. Logs memory usage, thread count,
 //! and other system metrics.
 
+#![allow(dead_code)]
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::{debug, info, warn};

@@ -50,10 +50,10 @@ pub fn get_debug_settings() -> Result<CommandResponse, String> {
 /// * `Ok(CommandResponse)` - Success
 /// * `Err(String)` - Error message if settings cannot be saved
 #[tauri::command]
-pub fn set_debug_settings(
+pub async fn set_debug_settings(
     enable_image_debug: bool,
     top_matches_count: u32,
-    state: State<Arc<AppState>>,
+    state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Setting debug settings: enable_image_debug={}, top_matches_count={}",
@@ -70,16 +70,24 @@ pub fn set_debug_settings(
         .map_err(|e| format!("Failed to save debug settings: {}", e))?;
 
     // If Python bridge is running, send the settings
-    let mut bridge_lock =
-        crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
-    if let Some(ref mut bridge) = *bridge_lock {
-        if bridge.is_running() {
-            bridge
-                .set_debug_settings(enable_image_debug, top_matches_count)
-                .map_err(|e| {
-                    error!("Failed to send debug settings to Python: {}", e);
-                    format!("Failed to send debug settings to Python: {}", e)
-                })?;
+    // NOTE: We use spawn_blocking because PythonBridge methods use block_on internally
+    let manager_guard = state.bridge_manager.lock().await;
+    if let Some(ref manager) = *manager_guard {
+        // Use async check to avoid nested runtime panic
+        if manager.is_default_bridge_running_async().await {
+            let manager_clone = manager.clone();
+            tokio::task::spawn_blocking(move || {
+                manager_clone.with_default_bridge(|bridge| {
+                    bridge
+                        .set_debug_settings(enable_image_debug, top_matches_count)
+                        .map_err(|e| {
+                            error!("Failed to send debug settings to Python: {}", e);
+                            format!("Failed to send debug settings to Python: {}", e)
+                        })
+                })
+            })
+            .await
+            .map_err(|e| format!("Task join error: {}", e))???;
             info!("Debug settings sent to Python executor");
         }
     }

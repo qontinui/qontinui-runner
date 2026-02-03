@@ -18,6 +18,8 @@
 //! ## Usage
 //!
 //! ```rust
+
+#![allow(dead_code)]
 //! use crate::safe_lock::{safe_lock, safe_read, safe_write};
 //!
 //! // For Mutex

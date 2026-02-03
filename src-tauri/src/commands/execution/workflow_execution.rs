@@ -9,6 +9,7 @@ use tauri::State;
 use tracing::{debug, info};
 
 use super::super::{AppState, CommandResponse};
+use crate::executor::{require_running_bridge, with_default_bridge};
 
 /// Start workflow execution.
 ///
@@ -40,68 +41,62 @@ pub fn start_execution(
     initial_state_ids: Option<Vec<String>>, // Override for initial active states
     state: State<Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
-    let mut bridge_lock =
-        crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
+    // Check if executor is running first
+    require_running_bridge(&state)?;
 
-    if let Some(ref mut bridge) = *bridge_lock {
-        if !bridge.is_running() {
-            return Err("Python executor not running".to_string());
-        }
+    // Build params
+    let mut params = serde_json::Map::new();
 
-        // Build params
-        let mut params = serde_json::Map::new();
+    // Resolve monitor indices (prefer array, fall back to legacy single index)
+    let resolved_monitors = monitor_indices.unwrap_or_else(|| vec![monitor_index.unwrap_or(0)]);
 
-        // Resolve monitor indices (prefer array, fall back to legacy single index)
-        let resolved_monitors = monitor_indices.unwrap_or_else(|| vec![monitor_index.unwrap_or(0)]);
+    // Pass both formats for compatibility
+    params.insert(
+        "monitor_indices".to_string(),
+        serde_json::json!(resolved_monitors),
+    );
+    // Also pass single monitor_index for backward compatibility with Python
+    params.insert(
+        "monitor_index".to_string(),
+        serde_json::json!(resolved_monitors.first().copied().unwrap_or(0)),
+    );
+    debug!("Using monitor indices: {:?}", resolved_monitors);
 
-        // Pass both formats for compatibility
+    // Add workflow_id (required)
+    let workflow_id = if let Some(pid) = process_id {
+        params.insert("workflow_id".to_string(), serde_json::json!(&pid));
+        pid
+    } else {
+        return Err("Workflow ID is required".to_string());
+    };
+
+    // Resolve and add initial_state_ids
+    // Priority: override param > workflow.initialStateIds > states with is_initial=true
+    let config_lock =
+        crate::safe_lock::safe_lock_or_recover(&state.current_config, "current_config");
+    let resolved_initial_states =
+        resolve_initial_states(config_lock.as_ref(), &workflow_id, initial_state_ids);
+    drop(config_lock);
+
+    if !resolved_initial_states.is_empty() {
         params.insert(
-            "monitor_indices".to_string(),
-            serde_json::json!(resolved_monitors),
+            "initial_state_ids".to_string(),
+            serde_json::json!(resolved_initial_states),
         );
-        // Also pass single monitor_index for backward compatibility with Python
-        params.insert(
-            "monitor_index".to_string(),
-            serde_json::json!(resolved_monitors.first().copied().unwrap_or(0)),
-        );
-        debug!("Using monitor indices: {:?}", resolved_monitors);
+        debug!("Using initial state IDs: {:?}", resolved_initial_states);
+    }
 
-        // Add workflow_id (required)
-        let workflow_id = if let Some(pid) = process_id {
-            params.insert("workflow_id".to_string(), serde_json::json!(&pid));
-            pid
-        } else {
-            return Err("Workflow ID is required".to_string());
-        };
-
-        // Resolve and add initial_state_ids
-        // Priority: override param > workflow.initialStateIds > states with is_initial=true
-        let config_lock =
-            crate::safe_lock::safe_lock_or_recover(&state.current_config, "current_config");
-        let resolved_initial_states =
-            resolve_initial_states(config_lock.as_ref(), &workflow_id, initial_state_ids);
-        drop(config_lock);
-
-        if !resolved_initial_states.is_empty() {
-            params.insert(
-                "initial_state_ids".to_string(),
-                serde_json::json!(resolved_initial_states),
-            );
-            debug!("Using initial state IDs: {:?}", resolved_initial_states);
-        }
-
+    with_default_bridge(&state, |bridge| {
         bridge
             .start_execution_with_params(Some(serde_json::Value::Object(params)))
-            .map_err(|e| format!("Failed to start execution: {}", e))?;
+            .map_err(|e| format!("Failed to start execution: {}", e))
+    })??;
 
-        Ok(CommandResponse {
-            success: true,
-            message: Some("Execution started".to_string()),
-            data: None,
-        })
-    } else {
-        Err("Python executor not initialized".to_string())
-    }
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Execution started".to_string()),
+        data: None,
+    })
 }
 
 /// Stop the current workflow execution.
@@ -116,22 +111,17 @@ pub fn start_execution(
 /// * `Err(String)` - Error if executor not initialized or stop fails
 #[tauri::command]
 pub fn stop_execution(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
-    let mut bridge_lock =
-        crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
-
-    if let Some(ref mut bridge) = *bridge_lock {
+    with_default_bridge(&state, |bridge| {
         bridge
             .stop_execution()
-            .map_err(|e| format!("Failed to stop execution: {}", e))?;
+            .map_err(|e| format!("Failed to stop execution: {}", e))
+    })??;
 
-        Ok(CommandResponse {
-            success: true,
-            message: Some("Execution stopped".to_string()),
-            data: None,
-        })
-    } else {
-        Err("Python executor not initialized".to_string())
-    }
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Execution stopped".to_string()),
+        data: None,
+    })
 }
 
 /// Pause the current workflow execution.
@@ -146,22 +136,17 @@ pub fn stop_execution(state: State<Arc<AppState>>) -> Result<CommandResponse, St
 /// * `Err(String)` - Error if executor not initialized or pause fails
 #[tauri::command]
 pub fn pause_execution(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
-    let mut bridge_lock =
-        crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
-
-    if let Some(ref mut bridge) = *bridge_lock {
+    with_default_bridge(&state, |bridge| {
         bridge
             .pause_execution()
-            .map_err(|e| format!("Failed to pause execution: {}", e))?;
+            .map_err(|e| format!("Failed to pause execution: {}", e))
+    })??;
 
-        Ok(CommandResponse {
-            success: true,
-            message: Some("Execution paused".to_string()),
-            data: None,
-        })
-    } else {
-        Err("Python executor not initialized".to_string())
-    }
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Execution paused".to_string()),
+        data: None,
+    })
 }
 
 /// Resume a paused workflow execution.
@@ -176,22 +161,17 @@ pub fn pause_execution(state: State<Arc<AppState>>) -> Result<CommandResponse, S
 /// * `Err(String)` - Error if executor not initialized or resume fails
 #[tauri::command]
 pub fn resume_execution(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
-    let mut bridge_lock =
-        crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
-
-    if let Some(ref mut bridge) = *bridge_lock {
+    with_default_bridge(&state, |bridge| {
         bridge
             .resume_execution()
-            .map_err(|e| format!("Failed to resume execution: {}", e))?;
+            .map_err(|e| format!("Failed to resume execution: {}", e))
+    })??;
 
-        Ok(CommandResponse {
-            success: true,
-            message: Some("Execution resumed".to_string()),
-            data: None,
-        })
-    } else {
-        Err("Python executor not initialized".to_string())
-    }
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Execution resumed".to_string()),
+        data: None,
+    })
 }
 
 /// Resolve initial state IDs with priority system.

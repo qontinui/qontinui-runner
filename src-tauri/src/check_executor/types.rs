@@ -196,16 +196,12 @@ pub struct CheckDefinition {
     /// Whether to fail on warnings
     #[serde(default)]
     pub fail_on_warning: bool,
-    /// Timeout in seconds
-    #[serde(default = "default_timeout")]
-    pub timeout_seconds: u32,
+    /// Timeout in seconds (None = disabled by default, no timeout)
+    #[serde(default)]
+    pub timeout_seconds: Option<u32>,
     /// Whether check failure should fail the entire workflow
     #[serde(default)]
     pub is_critical: bool,
-}
-
-fn default_timeout() -> u32 {
-    60
 }
 
 /// Full check record from database (includes metadata)
@@ -231,8 +227,8 @@ pub struct Check {
     pub auto_fix: bool,
     /// Whether to fail on warnings
     pub fail_on_warning: bool,
-    /// Timeout in seconds
-    pub timeout_seconds: u32,
+    /// Timeout in seconds (None = disabled by default, no timeout)
+    pub timeout_seconds: Option<u32>,
     /// Whether check failure should fail the entire workflow
     pub is_critical: bool,
     /// Whether check is enabled
@@ -460,8 +456,9 @@ pub struct CreateCheckInput {
     pub auto_fix: bool,
     #[serde(default)]
     pub fail_on_warning: bool,
-    #[serde(default = "default_timeout")]
-    pub timeout_seconds: u32,
+    /// Timeout in seconds (None = disabled by default, no timeout)
+    #[serde(default)]
+    pub timeout_seconds: Option<u32>,
     #[serde(default)]
     pub is_critical: bool,
     #[serde(default = "default_enabled")]

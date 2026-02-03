@@ -26,6 +26,38 @@ impl Default for LogSourceSelection {
     }
 }
 
+/// Configuration for a health check URL
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HealthCheckUrl {
+    /// Display name for the health check (e.g., "Backend Server")
+    pub name: String,
+    /// URL to check (e.g., "http://localhost:8000/health")
+    pub url: String,
+    /// Expected HTTP status code (default: 200)
+    #[serde(default = "default_expected_status")]
+    pub expected_status: u16,
+    /// Timeout in seconds (default: 5)
+    #[serde(default = "default_health_timeout")]
+    pub timeout_seconds: u64,
+    /// Whether failure should stop the workflow (default: true)
+    #[serde(default = "default_is_critical")]
+    pub is_critical: bool,
+}
+
+fn default_expected_status() -> u16 {
+    200
+}
+
+/// Default timeout for health checks.
+/// Health checks need a reasonable timeout to avoid hanging on unresponsive services.
+fn default_health_timeout() -> u64 {
+    30 // 30 seconds - reasonable for health checks
+}
+
+fn default_is_critical() -> bool {
+    true
+}
+
 /// A unified workflow with steps organized by phase
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnifiedWorkflow {
@@ -59,6 +91,14 @@ pub struct UnifiedWorkflow {
     /// Maximum iterations for agentic phase
     #[serde(default = "default_max_iterations")]
     pub max_iterations: u32,
+
+    /// Optional inactivity timeout in seconds for AI sessions.
+    /// - None (default): No timeout, runs until completion or manual stop
+    /// - Some(N): Kill AI session after N seconds of no output
+    /// Takes precedence over the global AI settings timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
+
     /// AI provider override
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
@@ -69,6 +109,12 @@ pub struct UnifiedWorkflow {
     /// Skip AI summary generation at the end (default: false, meaning AI summary is generated)
     #[serde(default)]
     pub skip_ai_summary: bool,
+
+    /// Error IDs targeted by this workflow (for auto-resolution on success).
+    /// When the workflow completes successfully, these errors will be marked as resolved.
+    /// Used by error fix workflows generated from the Error Monitor.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targeted_error_ids: Vec<i64>,
 
     /// Log source selection for this workflow
     /// - "default": Use the global default profile (from Settings → Log Sources)
@@ -97,6 +143,24 @@ pub struct UnifiedWorkflow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_template: Option<String>,
 
+    /// Whether to automatically include a log_watch step before verification
+    /// When enabled (default), a log_watch step is prepended to verification steps
+    /// to detect runtime errors in backend/frontend logs
+    #[serde(default = "default_log_watch_enabled")]
+    pub log_watch_enabled: bool,
+
+    /// Whether to automatically include health check steps before verification
+    /// When enabled and health_check_urls is non-empty, health check steps are prepended
+    /// to verification steps to verify configured servers are running
+    #[serde(default = "default_health_check_enabled")]
+    pub health_check_enabled: bool,
+
+    /// URLs to health check before verification (user-configurable)
+    /// Each entry specifies a URL to check, expected status, and timeout
+    /// If empty, no health checks are performed even if health_check_enabled is true
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub health_check_urls: Vec<HealthCheckUrl>,
+
     /// ISO 8601 timestamp of creation
     pub created_at: String,
     /// ISO 8601 timestamp of last modification (serialized as "modified_at" to match frontend)
@@ -105,6 +169,14 @@ pub struct UnifiedWorkflow {
 }
 
 fn default_auto_include_contexts() -> bool {
+    true
+}
+
+fn default_log_watch_enabled() -> bool {
+    true
+}
+
+fn default_health_check_enabled() -> bool {
     true
 }
 
@@ -140,6 +212,9 @@ pub struct CreateUnifiedWorkflowRequest {
     pub completion_steps: Vec<Value>,
     #[serde(default = "default_max_iterations")]
     pub max_iterations: u32,
+    /// Optional inactivity timeout in seconds for AI sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
     pub provider: Option<String>,
     pub model: Option<String>,
     #[serde(default)]
@@ -154,6 +229,15 @@ pub struct CreateUnifiedWorkflowRequest {
     pub auto_include_contexts: bool,
     /// Custom developer prompt template for this workflow
     pub prompt_template: Option<String>,
+    /// Whether to automatically include a log_watch step before verification
+    #[serde(default = "default_log_watch_enabled")]
+    pub log_watch_enabled: bool,
+    /// Whether to automatically include health check steps before verification
+    #[serde(default = "default_health_check_enabled")]
+    pub health_check_enabled: bool,
+    /// URLs to health check before verification (user-configurable)
+    #[serde(default)]
+    pub health_check_urls: Vec<HealthCheckUrl>,
 }
 
 /// Request body for updating a unified workflow
@@ -168,6 +252,11 @@ pub struct UpdateUnifiedWorkflowRequest {
     pub agentic_steps: Option<Vec<Value>>,
     pub completion_steps: Option<Vec<Value>>,
     pub max_iterations: Option<u32>,
+    /// Optional inactivity timeout in seconds for AI sessions.
+    /// - None: Not updating this field
+    /// - Some(None): Explicitly disable timeout
+    /// - Some(Some(N)): Set timeout to N seconds
+    pub timeout_seconds: Option<Option<u64>>,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub skip_ai_summary: Option<bool>,
@@ -177,6 +266,12 @@ pub struct UpdateUnifiedWorkflowRequest {
     pub auto_include_contexts: Option<bool>,
     /// Custom developer prompt template for this workflow
     pub prompt_template: Option<String>,
+    /// Whether to automatically include a log_watch step before verification
+    pub log_watch_enabled: Option<bool>,
+    /// Whether to automatically include health check steps before verification
+    pub health_check_enabled: Option<bool>,
+    /// URLs to health check before verification (user-configurable)
+    pub health_check_urls: Option<Vec<HealthCheckUrl>>,
 }
 
 /// Query parameters for searching unified workflows
@@ -235,4 +330,61 @@ pub struct ImportWorkflowResult {
     pub overwritten: bool,
     /// Original ID if it was changed
     pub original_id: Option<String>,
+}
+
+/// Prepend a log_watch step to verification steps if log_watch_enabled is true.
+///
+/// This function creates a default log_watch step that:
+/// - Monitors log sources from global settings (Settings > Log Sources)
+/// - Scans the last 60 seconds for errors
+/// - Is non-critical (won't fail the workflow, just reports errors)
+///
+/// The step is prepended to the beginning of the verification steps so that
+/// log errors are detected before any other verification logic runs.
+pub fn prepend_log_watch_step(
+    verification_steps: Vec<crate::step_executor::ExecutionStepConfig>,
+    log_watch_enabled: bool,
+) -> Vec<crate::step_executor::ExecutionStepConfig> {
+    if !log_watch_enabled {
+        return verification_steps;
+    }
+
+    let mut steps = vec![crate::step_executor::ExecutionStepConfig::default_log_watch()];
+    steps.extend(verification_steps);
+    steps
+}
+
+/// Prepend health check steps to verification steps if health_check_enabled is true.
+///
+/// This function creates health check steps that:
+/// - Verify the backend server (port 8000) is running and healthy
+/// - Verify user-configured URLs are reachable
+/// - Are marked as critical by default (will stop the workflow if servers are down)
+///
+/// Health checks are prepended BEFORE log_watch steps so that server availability
+/// is verified before scanning for log errors. Order: health_checks -> log_watch -> user steps
+pub fn prepend_health_check_steps(
+    verification_steps: Vec<crate::step_executor::ExecutionStepConfig>,
+    health_check_enabled: bool,
+    health_check_urls: &[HealthCheckUrl],
+) -> Vec<crate::step_executor::ExecutionStepConfig> {
+    if !health_check_enabled || health_check_urls.is_empty() {
+        return verification_steps;
+    }
+
+    let mut steps: Vec<crate::step_executor::ExecutionStepConfig> = health_check_urls
+        .iter()
+        .map(|hc| {
+            crate::step_executor::ExecutionStepConfig::health_check(
+                &hc.name,
+                &hc.url,
+                hc.expected_status,
+                hc.timeout_seconds,
+                hc.is_critical,
+            )
+        })
+        .collect();
+
+    steps.extend(verification_steps);
+    steps
 }

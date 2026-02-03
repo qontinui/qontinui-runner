@@ -9,17 +9,78 @@
 //! This module should be the ONLY place that spawns AI processes/calls.
 //! Other modules should use this module to interact with AI providers.
 
+#![allow(dead_code)]
+
 use crate::ai_router::{TaskContext, TaskRouter};
+use crate::config_facade::ai_keychain;
 use crate::settings::{self, AiProvider, CliExecutionMode};
 use std::process::Command;
 use tracing::{debug, error, info, warn};
 
 /// Result of running an AI prompt
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AiResponse {
     pub success: bool,
     pub output: String,
     pub error: Option<String>,
+    /// Input tokens consumed (available for API providers only)
+    pub input_tokens: Option<u64>,
+    /// Output tokens generated (available for API providers only)
+    pub output_tokens: Option<u64>,
+}
+
+impl AiResponse {
+    /// Create a successful response with token information
+    pub fn success_with_tokens(output: String, input_tokens: u64, output_tokens: u64) -> Self {
+        Self {
+            success: true,
+            output,
+            error: None,
+            input_tokens: Some(input_tokens),
+            output_tokens: Some(output_tokens),
+        }
+    }
+
+    /// Create a successful response without token information (for CLI providers)
+    pub fn success(output: String) -> Self {
+        Self {
+            success: true,
+            output,
+            error: None,
+            input_tokens: None,
+            output_tokens: None,
+        }
+    }
+
+    /// Create an error response
+    pub fn error(message: String) -> Self {
+        Self {
+            success: false,
+            output: String::new(),
+            error: Some(message),
+            input_tokens: None,
+            output_tokens: None,
+        }
+    }
+
+    /// Create an error response with partial output
+    pub fn error_with_output(output: String, message: String) -> Self {
+        Self {
+            success: false,
+            output,
+            error: Some(message),
+            input_tokens: None,
+            output_tokens: None,
+        }
+    }
+
+    /// Get total tokens (input + output)
+    pub fn total_tokens(&self) -> Option<u64> {
+        match (self.input_tokens, self.output_tokens) {
+            (Some(input), Some(output)) => Some(input + output),
+            _ => None,
+        }
+    }
 }
 
 /// Run an AI prompt synchronously and return the response.
@@ -231,11 +292,7 @@ fn run_claude_cli_with_file(
     let prompt_file = temp_dir.join(format!("ai-prompt-{}.txt", uuid::Uuid::new_v4()));
 
     if let Err(e) = std::fs::write(&prompt_file, prompt) {
-        return AiResponse {
-            success: false,
-            output: String::new(),
-            error: Some(format!("Failed to write prompt to temp file: {}", e)),
-        };
+        return AiResponse::error(format!("Failed to write prompt to temp file: {}", e));
     }
 
     // Build a PowerShell command that reads the file and pipes to Claude
@@ -324,11 +381,7 @@ fn run_claude_cli_with_file(
                 e
             );
             error!("{}", error_msg);
-            AiResponse {
-                success: false,
-                output: String::new(),
-                error: Some(error_msg),
-            }
+            AiResponse::error(error_msg)
         }
     }
 }
@@ -391,46 +444,45 @@ fn run_claude_cli_with_arg(
                 e
             );
             error!("{}", error_msg);
-            AiResponse {
-                success: false,
-                output: String::new(),
-                error: Some(error_msg),
-            }
+            AiResponse::error(error_msg)
         }
     }
 }
 
 /// Process CLI output into AiResponse
+///
+/// Note: CLI providers don't expose token counts in their output,
+/// so input_tokens and output_tokens will be None.
 fn process_cli_output(output: std::process::Output) -> AiResponse {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
     if output.status.success() {
         debug!("Claude CLI response length: {} chars", stdout.len());
-        AiResponse {
-            success: true,
-            output: stdout,
-            error: None,
-        }
+        AiResponse::success(stdout)
     } else {
         error!("Claude CLI failed: {}", stderr);
-        AiResponse {
-            success: false,
-            output: stdout,
-            error: Some(format!("Claude CLI failed: {}", stderr)),
-        }
+        AiResponse::error_with_output(stdout, format!("Claude CLI failed: {}", stderr))
     }
 }
 
 /// Run a prompt via Claude API (direct HTTP calls)
+///
+/// Claude API responses include usage information:
+/// ```json
+/// {
+///   "usage": {
+///     "input_tokens": 123,
+///     "output_tokens": 456
+///   }
+/// }
+/// ```
 fn run_claude_api(
     prompt: &str,
     settings: &settings::ClaudeApiSettings,
     _timeout_seconds: u64,
     model_override: Option<&str>,
 ) -> AiResponse {
-    use keyring::Entry;
-
     let model = model_override.unwrap_or(&settings.model);
     info!(
         "Running Claude API (model: {}, override: {})",
@@ -438,47 +490,21 @@ fn run_claude_api(
         model_override.is_some()
     );
 
-    // Get API key from keychain
-    let api_key = match Entry::new("com.qontinui.runner.ai", "claude_api") {
-        Ok(entry) => match entry.get_password() {
-            Ok(key) => key,
-            Err(keyring::Error::NoEntry) => {
-                return AiResponse {
-                    success: false,
-                    output: String::new(),
-                    error: Some(
-                        "No Claude API key configured. Please set your API key in Settings."
-                            .to_string(),
-                    ),
-                }
-            }
-            Err(e) => {
-                return AiResponse {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to retrieve API key: {}", e)),
-                }
-            }
-        },
-        Err(e) => {
-            return AiResponse {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Failed to access keychain: {}", e)),
-            }
+    // Get API key from keychain using KeychainHelper
+    let api_key = match ai_keychain().get("claude_api") {
+        Ok(Some(key)) => key,
+        Ok(None) => {
+            return AiResponse::error(
+                "No Claude API key configured. Please set your API key in Settings.".to_string(),
+            )
         }
+        Err(e) => return AiResponse::error(format!("Failed to retrieve API key: {}", e)),
     };
 
     // Use blocking reqwest client for synchronous HTTP request
     let client = match reqwest::blocking::Client::builder().build() {
         Ok(c) => c,
-        Err(e) => {
-            return AiResponse {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Failed to create HTTP client: {}", e)),
-            }
-        }
+        Err(e) => return AiResponse::error(format!("Failed to create HTTP client: {}", e)),
     };
 
     let response = client
@@ -498,11 +524,7 @@ fn run_claude_api(
             if !resp.status().is_success() {
                 let status = resp.status();
                 let body = resp.text().unwrap_or_default();
-                return AiResponse {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Claude API error ({}): {}", status, body)),
-                };
+                return AiResponse::error(format!("Claude API error ({}): {}", status, body));
             }
 
             match resp.json::<serde_json::Value>() {
@@ -515,24 +537,31 @@ fn run_claude_api(
                         .unwrap_or("")
                         .to_string();
 
-                    AiResponse {
-                        success: true,
-                        output: content,
-                        error: None,
+                    // Extract token usage from response
+                    // Claude API format: {"usage": {"input_tokens": N, "output_tokens": N}}
+                    let input_tokens = json["usage"]["input_tokens"].as_u64();
+                    let output_tokens = json["usage"]["output_tokens"].as_u64();
+
+                    if let (Some(input), Some(output)) = (input_tokens, output_tokens) {
+                        debug!(
+                            "Claude API tokens - input: {}, output: {}, total: {}",
+                            input,
+                            output,
+                            input + output
+                        );
+                        AiResponse::success_with_tokens(content, input, output)
+                    } else {
+                        debug!(
+                            "Claude API response missing token counts: usage={:?}",
+                            json["usage"]
+                        );
+                        AiResponse::success(content)
                     }
                 }
-                Err(e) => AiResponse {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to parse API response: {}", e)),
-                },
+                Err(e) => AiResponse::error(format!("Failed to parse API response: {}", e)),
             }
         }
-        Err(e) => AiResponse {
-            success: false,
-            output: String::new(),
-            error: Some(format!("Claude API request failed: {}", e)),
-        },
+        Err(e) => AiResponse::error(format!("Claude API request failed: {}", e)),
     }
 }
 
@@ -590,18 +619,11 @@ fn run_gemini_cli(
 
             if output.status.success() {
                 debug!("Gemini CLI response length: {} chars", stdout.len());
-                AiResponse {
-                    success: true,
-                    output: stdout,
-                    error: None,
-                }
+                // Gemini CLI doesn't expose token counts in stdout
+                AiResponse::success(stdout)
             } else {
                 error!("Gemini CLI failed: {}", stderr);
-                AiResponse {
-                    success: false,
-                    output: stdout,
-                    error: Some(format!("Gemini CLI failed: {}", stderr)),
-                }
+                AiResponse::error_with_output(stdout, format!("Gemini CLI failed: {}", stderr))
             }
         }
         Err(e) => {
@@ -610,24 +632,29 @@ fn run_gemini_cli(
                 e
             );
             error!("{}", error_msg);
-            AiResponse {
-                success: false,
-                output: String::new(),
-                error: Some(error_msg),
-            }
+            AiResponse::error(error_msg)
         }
     }
 }
 
 /// Run a prompt via Gemini API (direct HTTP calls)
+///
+/// Gemini API responses include usage metadata:
+/// ```json
+/// {
+///   "usageMetadata": {
+///     "promptTokenCount": 123,
+///     "candidatesTokenCount": 456,
+///     "totalTokenCount": 579
+///   }
+/// }
+/// ```
 fn run_gemini_api(
     prompt: &str,
     settings: &settings::GeminiApiSettings,
     _timeout_seconds: u64,
     model_override: Option<&str>,
 ) -> AiResponse {
-    use keyring::Entry;
-
     let model = model_override.unwrap_or(&settings.model);
     info!(
         "Running Gemini API (model: {}, temp: {}, override: {})",
@@ -636,47 +663,21 @@ fn run_gemini_api(
         model_override.is_some()
     );
 
-    // Get API key from keychain
-    let api_key = match Entry::new("com.qontinui.runner.ai", "gemini_api") {
-        Ok(entry) => match entry.get_password() {
-            Ok(key) => key,
-            Err(keyring::Error::NoEntry) => {
-                return AiResponse {
-                    success: false,
-                    output: String::new(),
-                    error: Some(
-                        "No Gemini API key configured. Please set your API key in Settings."
-                            .to_string(),
-                    ),
-                }
-            }
-            Err(e) => {
-                return AiResponse {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to retrieve API key: {}", e)),
-                }
-            }
-        },
-        Err(e) => {
-            return AiResponse {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Failed to access keychain: {}", e)),
-            }
+    // Get API key from keychain using KeychainHelper
+    let api_key = match ai_keychain().get("gemini_api") {
+        Ok(Some(key)) => key,
+        Ok(None) => {
+            return AiResponse::error(
+                "No Gemini API key configured. Please set your API key in Settings.".to_string(),
+            )
         }
+        Err(e) => return AiResponse::error(format!("Failed to retrieve API key: {}", e)),
     };
 
     // Use blocking reqwest client for synchronous HTTP request
     let client = match reqwest::blocking::Client::builder().build() {
         Ok(c) => c,
-        Err(e) => {
-            return AiResponse {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Failed to create HTTP client: {}", e)),
-            }
-        }
+        Err(e) => return AiResponse::error(format!("Failed to create HTTP client: {}", e)),
     };
 
     // Gemini API endpoint
@@ -702,11 +703,7 @@ fn run_gemini_api(
             if !resp.status().is_success() {
                 let status = resp.status();
                 let body = resp.text().unwrap_or_default();
-                return AiResponse {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Gemini API error ({}): {}", status, body)),
-                };
+                return AiResponse::error(format!("Gemini API error ({}): {}", status, body));
             }
 
             match resp.json::<serde_json::Value>() {
@@ -721,24 +718,31 @@ fn run_gemini_api(
                         .unwrap_or("")
                         .to_string();
 
-                    AiResponse {
-                        success: true,
-                        output: content,
-                        error: None,
+                    // Extract token usage from response
+                    // Gemini API format: {"usageMetadata": {"promptTokenCount": N, "candidatesTokenCount": N}}
+                    let input_tokens = json["usageMetadata"]["promptTokenCount"].as_u64();
+                    let output_tokens = json["usageMetadata"]["candidatesTokenCount"].as_u64();
+
+                    if let (Some(input), Some(output)) = (input_tokens, output_tokens) {
+                        debug!(
+                            "Gemini API tokens - input: {}, output: {}, total: {}",
+                            input,
+                            output,
+                            input + output
+                        );
+                        AiResponse::success_with_tokens(content, input, output)
+                    } else {
+                        debug!(
+                            "Gemini API response missing token counts: usageMetadata={:?}",
+                            json["usageMetadata"]
+                        );
+                        AiResponse::success(content)
                     }
                 }
-                Err(e) => AiResponse {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to parse API response: {}", e)),
-                },
+                Err(e) => AiResponse::error(format!("Failed to parse API response: {}", e)),
             }
         }
-        Err(e) => AiResponse {
-            success: false,
-            output: String::new(),
-            error: Some(format!("Gemini API request failed: {}", e)),
-        },
+        Err(e) => AiResponse::error(format!("Gemini API request failed: {}", e)),
     }
 }
 
@@ -748,24 +752,42 @@ mod tests {
 
     #[test]
     fn test_ai_response_success() {
-        let response = AiResponse {
-            success: true,
-            output: "Hello!".to_string(),
-            error: None,
-        };
+        let response = AiResponse::success("Hello!".to_string());
         assert!(response.success);
         assert_eq!(response.output, "Hello!");
         assert!(response.error.is_none());
+        assert!(response.input_tokens.is_none());
+        assert!(response.output_tokens.is_none());
+        assert!(response.total_tokens().is_none());
+    }
+
+    #[test]
+    fn test_ai_response_success_with_tokens() {
+        let response = AiResponse::success_with_tokens("Hello!".to_string(), 100, 50);
+        assert!(response.success);
+        assert_eq!(response.output, "Hello!");
+        assert!(response.error.is_none());
+        assert_eq!(response.input_tokens, Some(100));
+        assert_eq!(response.output_tokens, Some(50));
+        assert_eq!(response.total_tokens(), Some(150));
     }
 
     #[test]
     fn test_ai_response_failure() {
-        let response = AiResponse {
-            success: false,
-            output: String::new(),
-            error: Some("Connection failed".to_string()),
-        };
+        let response = AiResponse::error("Connection failed".to_string());
         assert!(!response.success);
         assert!(response.error.is_some());
+        assert_eq!(response.error, Some("Connection failed".to_string()));
+        assert!(response.input_tokens.is_none());
+        assert!(response.output_tokens.is_none());
+    }
+
+    #[test]
+    fn test_ai_response_failure_with_output() {
+        let response =
+            AiResponse::error_with_output("partial output".to_string(), "Error occurred".to_string());
+        assert!(!response.success);
+        assert_eq!(response.output, "partial output");
+        assert_eq!(response.error, Some("Error occurred".to_string()));
     }
 }

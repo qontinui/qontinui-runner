@@ -374,7 +374,7 @@ fn db_test_to_definition(test: &crate::database::VerificationTest) -> TestDefini
         vision_config,
         python_code: test.python_code.clone(),
         repo_test_config,
-        timeout_seconds: test.timeout_seconds,
+        timeout_seconds: test.timeout_seconds.unwrap_or(60),
         is_critical: test.is_critical,
         config: test.config.clone(),
     }

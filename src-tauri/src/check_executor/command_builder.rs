@@ -19,7 +19,7 @@
 //! - **Pyright**: Uses `npx` because pyright is distributed as an npm package
 //!   (even when installed via pip, it downloads the Node.js version).
 
-use super::types::{CheckDefinition, CheckTool, CheckType};
+use super::types::{CheckDefinition, CheckTool};
 use std::error::Error;
 
 /// Build the command and arguments for a check definition
@@ -477,6 +477,7 @@ pub fn get_auto_fix_command(tool: &CheckTool, base_args: &[String]) -> Vec<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::check_executor::CheckType;
 
     fn make_check_def(tool: CheckTool, auto_fix: bool) -> CheckDefinition {
         CheckDefinition {
@@ -489,7 +490,7 @@ mod tests {
             config_path: None,
             auto_fix,
             fail_on_warning: false,
-            timeout_seconds: 60,
+            timeout_seconds: Some(60),
             is_critical: false,
         }
     }

@@ -32,9 +32,12 @@ pub enum DisplayMode {
     ConnectExisting,
 }
 
-/// Default timeout in seconds for script execution
+/// Default timeout in seconds for script execution.
+/// Returns a reasonable default for Playwright tests (2 minutes).
+/// Note: This is kept non-zero because Playwright tests typically need
+/// a timeout to prevent hanging on failures.
 pub fn default_timeout_seconds() -> u32 {
-    60
+    120 // 2 minutes - reasonable for most Playwright tests
 }
 
 /// Default browser for Playwright tests
@@ -65,7 +68,7 @@ mod tests {
 
     #[test]
     fn test_default_timeout() {
-        assert_eq!(default_timeout_seconds(), 60);
+        assert_eq!(default_timeout_seconds(), 120);
     }
 
     #[test]

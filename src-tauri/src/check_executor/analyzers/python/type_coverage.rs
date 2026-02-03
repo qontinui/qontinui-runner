@@ -215,15 +215,10 @@ fn extract_function_type_info(
     let mut functions = Vec::new();
 
     // Query for function definitions (both regular and async)
-    // Note: This captures the function name, parameters, and return type annotation
+    // Note: In tree-sitter-python, async functions use "function_definition" with an
+    // optional "async" keyword, not a separate "async_function_definition" node type.
     let query_str = r#"
         (function_definition
-            name: (identifier) @func_name
-            parameters: (parameters) @params
-            return_type: (type)? @return_type
-        ) @function
-
-        (async_function_definition
             name: (identifier) @func_name
             parameters: (parameters) @params
             return_type: (type)? @return_type

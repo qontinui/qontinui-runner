@@ -84,7 +84,7 @@ fn extract_last_json(input: &str) -> Option<String> {
         let mut in_string = false;
         let mut escape_next = false;
 
-        for (i, c) in potential_json.chars().enumerate() {
+        for (byte_idx, c) in potential_json.char_indices() {
             if escape_next {
                 escape_next = false;
                 continue;
@@ -103,7 +103,9 @@ fn extract_last_json(input: &str) -> Option<String> {
                 } else if c == '}' {
                     depth -= 1;
                     if depth == 0 {
-                        let json_str = &potential_json[..=i];
+                        // byte_idx is the start of '}', add char length to include it
+                        let end_byte = byte_idx + c.len_utf8();
+                        let json_str = &potential_json[..end_byte];
                         if serde_json::from_str::<serde_json::Value>(json_str).is_ok() {
                             return Some(json_str.to_string());
                         }

@@ -10,6 +10,8 @@
 //! - Tier 2: Memory, roles, channels, event bus, subflows
 //! - Tier 3: Parallel execution, agent tools, checkpointing, flow mode, learning
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

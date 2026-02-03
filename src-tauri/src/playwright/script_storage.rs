@@ -503,7 +503,7 @@ mod tests {
         );
         assert!(!script.id.is_empty());
         assert_eq!(script.name, "Test Script");
-        assert_eq!(script.timeout_seconds, 60);
+        assert_eq!(script.timeout_seconds, 120);
         assert_eq!(script.display_mode, DisplayMode::Headless);
         assert_eq!(script.browser, "chromium");
         assert_eq!(script.sync_status, SyncStatus::LocalOnly);

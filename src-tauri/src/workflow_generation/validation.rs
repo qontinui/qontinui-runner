@@ -252,6 +252,7 @@ mod tests {
             agentic_steps: vec![],
             completion_steps: vec![],
             max_iterations: 10,
+            timeout_seconds: None,
             provider: None,
             model: None,
             log_source_selection: LogSourceSelection::default(),
@@ -262,6 +263,10 @@ mod tests {
             disabled_context_ids: vec![],
             auto_include_contexts: true,
             prompt_template: None,
+            log_watch_enabled: true,
+            health_check_enabled: true,
+            health_check_urls: vec![],
+            targeted_error_ids: vec![],
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };

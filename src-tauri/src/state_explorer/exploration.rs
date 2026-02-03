@@ -4,6 +4,8 @@
 //! during state exploration. Each strategy has different trade-offs between coverage,
 //! speed, and focus areas.
 
+#![allow(dead_code)]
+
 use crate::config::{StateDescription, TransitionDescription};
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};

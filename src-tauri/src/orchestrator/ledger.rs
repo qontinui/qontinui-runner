@@ -22,6 +22,8 @@
 //! - Build context for workers
 //! - Track success across iterations
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 

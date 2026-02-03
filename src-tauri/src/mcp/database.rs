@@ -15,7 +15,7 @@ use super::types::{
     CreateTaskRunRequest, ListTaskRunsQuery, SaveCheckpointRequest, SetTaskAutoContinueRequest,
     TaskOutputQuery,
 };
-use crate::database::{CheckpointData, SessionEvent, TaskRun};
+use crate::database::{CheckpointData, CreateTaskRunInput, SessionEvent, TaskRun};
 
 /// List all active checkpoints
 pub async fn list_checkpoints(
@@ -180,18 +180,18 @@ pub async fn create_task_run(
     Json(req): Json<CreateTaskRunRequest>,
 ) -> Result<Json<TaskRun>, (StatusCode, String)> {
     let id = uuid::Uuid::new_v4().to_string();
+    let mut input = CreateTaskRunInput::new(&id, &req.task_name)
+        .with_prompt(&req.prompt);
+    if let Some(ms) = req.max_sessions {
+        input = input.with_max_sessions(ms);
+    }
+    if let Some(ac) = req.auto_continue {
+        input = input.with_auto_continue(ac);
+    }
     state
         .app_state
         .checkpoint_db
-        .create_task_run(
-            &id,
-            &req.task_name,
-            &req.prompt,
-            req.max_sessions,
-            req.auto_continue,
-            None, // execution_steps_json
-            None, // log_sources_json
-        )
+        .create_task_run(&input)
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
 }

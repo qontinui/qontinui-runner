@@ -1,5 +1,5 @@
 -- SQLite Schema for qontinui-runner
--- Version: 35
+-- Version: 48
 --
 -- This schema provides persistent storage for task runs, settings,
 -- prompts, and scheduler state.
@@ -28,6 +28,12 @@
 -- Version 30 adds mobile development feedback tables (task_run_mobile_state, task_run_mobile_logs).
 -- Version 31 adds MCP integration tables (mcp_servers, task_run_mcp_calls).
 -- Version 35 adds UI Bridge Inspector tables (ui_bridge_elements, ui_bridge_states, ui_bridge_transitions, ui_bridge_events, etc.).
+-- Version 36 adds task hierarchy fields (parent_task_run_id, root_task_run_id, depth) for nested subtasks.
+-- Version 41 adds log_watch_enabled to unified_workflows for automatic log error detection.
+-- Version 42 adds health_check_enabled to unified_workflows for automatic server health checks.
+-- Version 43 adds health_check_urls to unified_workflows for user-configurable health check URLs.
+-- Version 44 adds error monitoring system (log_sources, error_events tables with FTS).
+-- Version 45 adds bridge_id to task_runs for multi-bridge support.
 
 -- Schema version tracking
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -220,18 +226,39 @@ CREATE TABLE IF NOT EXISTS task_runs (
     -- Orchestrator state transition history (for stage-based recap)
     transition_history_json TEXT,  -- JSON array of StateTransition objects
 
+    -- Hierarchy (for nested task runs / subtasks)
+    parent_task_run_id TEXT,  -- Parent task run ID (NULL for root-level tasks)
+    root_task_run_id TEXT,    -- Root task run ID (top of hierarchy, same as id for root tasks)
+    depth INTEGER DEFAULT 0,  -- Nesting depth (0 = root/top-level)
+
+    -- Multi-bridge support (for concurrent execution)
+    bridge_id TEXT,  -- Bridge ID handling this task (NULL for legacy single-bridge tasks)
+
+    -- Workflow type ('unified', 'legacy_session', 'automation_only', or NULL for legacy)
+    workflow_type TEXT,  -- Unified workflows should only have status modified by LoopController
+
+    -- Web integration
+    workspace_id TEXT,  -- Links task to a workspace/organization from qontinui-web
+    triggered_by TEXT,  -- Identifies who/what triggered the task run
+
     -- Timestamps
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     completed_at TEXT,
 
-    FOREIGN KEY (config_id) REFERENCES configs(id) ON DELETE SET NULL
+    FOREIGN KEY (config_id) REFERENCES configs(id) ON DELETE SET NULL,
+    FOREIGN KEY (parent_task_run_id) REFERENCES task_runs(id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_task_runs_status ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_task_runs_created_at ON task_runs(created_at);
 CREATE INDEX IF NOT EXISTS idx_task_runs_task_type ON task_runs(task_type);
 CREATE INDEX IF NOT EXISTS idx_task_runs_config_id ON task_runs(config_id);
+-- Hierarchy indexes for querying child/subtasks
+CREATE INDEX IF NOT EXISTS idx_task_runs_parent_task_run_id ON task_runs(parent_task_run_id);
+CREATE INDEX IF NOT EXISTS idx_task_runs_root_task_run_id ON task_runs(root_task_run_id);
+-- Bridge ID index for multi-bridge queries
+CREATE INDEX IF NOT EXISTS idx_task_runs_bridge_id ON task_runs(bridge_id);
 
 -- Task Run Output Chunks (for efficient O(1) appending)
 -- Instead of concatenating to output_log column (O(n)), we insert chunks (O(1))
@@ -428,7 +455,7 @@ CREATE TABLE IF NOT EXISTS verification_tests (
     -- Test configuration (JSON)
     config TEXT DEFAULT '{}',  -- timeout_seconds, cdp_port, env_vars, etc.
 
-    timeout_seconds INTEGER NOT NULL DEFAULT 60,
+    timeout_seconds INTEGER,  -- NULL = no timeout (default)
     is_critical BOOLEAN NOT NULL DEFAULT 0,  -- If true, failure fails the task (default: false for iterative AI workflows)
     enabled BOOLEAN NOT NULL DEFAULT 1,
 
@@ -776,6 +803,13 @@ CREATE TABLE IF NOT EXISTS unified_workflows (
     provider TEXT,  -- 'claude_cli', 'gemini_api', etc.
     model TEXT,     -- Model identifier
 
+    -- Log watch configuration
+    log_watch_enabled INTEGER DEFAULT 1,  -- 1 = enabled (default), 0 = disabled
+
+    -- Health check configuration
+    health_check_enabled INTEGER DEFAULT 1,  -- 1 = enabled (default), 0 = disabled
+    health_check_urls TEXT DEFAULT '[]',  -- JSON array of { name, url, expected_status, timeout_seconds, is_critical }
+
     -- Timestamps
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -1091,6 +1125,21 @@ CREATE TABLE IF NOT EXISTS flow_executions (
 CREATE INDEX IF NOT EXISTS idx_flow_executions_flow_id ON flow_executions(flow_id);
 CREATE INDEX IF NOT EXISTS idx_flow_executions_status ON flow_executions(status);
 
+-- Flow Versions: Version history for flow definitions (Version 46)
+CREATE TABLE IF NOT EXISTS flow_versions (
+    id TEXT PRIMARY KEY,
+    flow_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    definition TEXT NOT NULL,       -- Full flow JSON snapshot
+    message TEXT,                   -- Version description/commit message
+    created_by TEXT,                -- User or system that created this version
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (flow_id) REFERENCES orchestrator_flows(id) ON DELETE CASCADE,
+    UNIQUE(flow_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_flow_versions_flow_id ON flow_versions(flow_id);
+CREATE INDEX IF NOT EXISTS idx_flow_versions_flow_version ON flow_versions(flow_id, version);
+
 -- =============================================================================
 -- Code Quality Checks (Version 27)
 -- =============================================================================
@@ -1107,7 +1156,7 @@ CREATE TABLE IF NOT EXISTS checks (
     config_path TEXT,                 -- Path to config file (e.g., pyproject.toml)
     auto_fix BOOLEAN NOT NULL DEFAULT 0,
     fail_on_warning BOOLEAN NOT NULL DEFAULT 0,
-    timeout_seconds INTEGER NOT NULL DEFAULT 60,
+    timeout_seconds INTEGER,  -- NULL = no timeout (default)
     is_critical BOOLEAN NOT NULL DEFAULT 0,
     enabled BOOLEAN NOT NULL DEFAULT 1,
     ai_generated BOOLEAN NOT NULL DEFAULT 0,
@@ -1188,7 +1237,7 @@ CREATE TABLE IF NOT EXISTS shell_commands (
     description TEXT,
     command TEXT NOT NULL,
     working_directory TEXT,
-    timeout_seconds INTEGER NOT NULL DEFAULT 60,
+    timeout_seconds INTEGER,  -- NULL = no timeout (default)
     fail_on_error BOOLEAN NOT NULL DEFAULT 1,
     category TEXT DEFAULT 'general',  -- 'git', 'npm', 'poetry', 'docker', 'general'
     tags TEXT DEFAULT '[]',           -- JSON array
@@ -1592,7 +1641,343 @@ CREATE TABLE IF NOT EXISTS ui_bridge_navigation_history (
 CREATE INDEX IF NOT EXISTS idx_ui_bridge_nav_history_task_run ON ui_bridge_navigation_history(task_run_id);
 CREATE INDEX IF NOT EXISTS idx_ui_bridge_nav_history_timestamp ON ui_bridge_navigation_history(timestamp);
 
+-- =============================================================================
+-- Error Monitoring System (Version 44)
+-- =============================================================================
+-- Application log monitoring for error collection and debug agent integration
+-- Captures errors from user-configured log sources (applications being automated)
+
+-- Log Sources: User-configured application log files to monitor
+CREATE TABLE IF NOT EXISTS log_sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    -- Identity
+    name TEXT NOT NULL UNIQUE,              -- Display name (e.g., "api-server", "web-frontend")
+    description TEXT,
+
+    -- Location
+    path TEXT NOT NULL,                     -- File path, glob pattern, or directory
+    path_type TEXT DEFAULT 'file',          -- 'file', 'glob', 'directory'
+
+    -- Parsing configuration
+    format TEXT DEFAULT 'plaintext',        -- 'plaintext', 'json', 'jsonl'
+    parser TEXT DEFAULT 'generic',          -- 'python', 'javascript', 'rust', 'generic'
+    timestamp_pattern TEXT,                 -- Regex to extract timestamp from log lines
+    timezone TEXT DEFAULT 'local',          -- Timezone for parsing timestamps
+
+    -- Custom patterns (JSON arrays of regex patterns)
+    error_patterns TEXT,                    -- Patterns to identify errors
+    warning_patterns TEXT,                  -- Patterns to identify warnings
+    ignore_patterns TEXT,                   -- Patterns to ignore
+
+    -- Monitoring settings
+    enabled INTEGER DEFAULT 1,              -- 0 = disabled, 1 = enabled
+    poll_interval_ms INTEGER DEFAULT 5000,  -- How often to check for new content
+
+    -- Timestamps
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_log_sources_name ON log_sources(name);
+CREATE INDEX IF NOT EXISTS idx_log_sources_enabled ON log_sources(enabled);
+
+-- Error Events: Captured errors from application logs
+-- Persistent store that survives across workflow runs for pattern detection
+CREATE TABLE IF NOT EXISTS error_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    -- Source identification
+    log_source_id INTEGER REFERENCES log_sources(id) ON DELETE SET NULL,
+    log_source_name TEXT NOT NULL,          -- Denormalized for quick access
+
+    -- Workflow context (optional - only set during workflow runs)
+    task_run_id TEXT REFERENCES task_runs(id) ON DELETE SET NULL,
+    workflow_step_id TEXT,                  -- Which workflow step was executing
+
+    -- Timing
+    log_timestamp TEXT,                     -- Timestamp from the log entry itself
+    captured_at TEXT NOT NULL DEFAULT (datetime('now')),
+
+    -- Error classification
+    severity TEXT NOT NULL DEFAULT 'error', -- 'critical', 'error', 'warning'
+    error_type TEXT,                        -- 'TypeError', 'ConnectionError', etc.
+    error_code TEXT,                        -- HTTP status, exit code, etc.
+
+    -- Error content
+    message TEXT NOT NULL,                  -- The error message
+    stack_trace TEXT,                       -- Full stack trace if available
+    context_lines TEXT,                     -- Surrounding log lines for context
+    raw_entry TEXT,                         -- Original unparsed log content
+
+    -- Location (if parseable from stack trace)
+    file_path TEXT,                         -- Source file where error occurred
+    line_number INTEGER,
+    column_number INTEGER,
+    function_name TEXT,
+
+    -- Deduplication and tracking
+    signature_hash TEXT NOT NULL,           -- Hash for deduplication (error_type + message + location)
+    occurrence_count INTEGER DEFAULT 1,     -- Incremented on duplicates
+    first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+
+    -- Status lifecycle
+    status TEXT DEFAULT 'new',              -- 'new', 'acknowledged', 'in_progress', 'promoted', 'ignored', 'resolved', 'wont_fix'
+
+    -- Debug agent integration
+    finding_id INTEGER REFERENCES task_run_findings(id) ON DELETE SET NULL,  -- Linked finding (if promoted)
+    resolved_by_task_run_id TEXT,           -- Which workflow fixed this error
+    resolution_notes TEXT,
+
+    -- Status timestamps
+    acknowledged_at TEXT,
+    resolved_at TEXT
+);
+
+-- Indexes for efficient queries
+CREATE INDEX IF NOT EXISTS idx_error_events_log_source ON error_events(log_source_id);
+CREATE INDEX IF NOT EXISTS idx_error_events_task_run ON error_events(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_error_events_signature ON error_events(signature_hash);
+CREATE INDEX IF NOT EXISTS idx_error_events_status ON error_events(status);
+CREATE INDEX IF NOT EXISTS idx_error_events_severity ON error_events(severity);
+CREATE INDEX IF NOT EXISTS idx_error_events_captured ON error_events(captured_at DESC);
+CREATE INDEX IF NOT EXISTS idx_error_events_last_seen ON error_events(last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_error_events_source_name ON error_events(log_source_name);
+
+-- Full-text search for error messages and stack traces
+CREATE VIRTUAL TABLE IF NOT EXISTS error_events_fts USING fts5(
+    message,
+    stack_trace,
+    error_type,
+    content='error_events',
+    content_rowid='id'
+);
+
+-- Triggers to keep FTS index in sync
+CREATE TRIGGER IF NOT EXISTS error_events_ai AFTER INSERT ON error_events BEGIN
+    INSERT INTO error_events_fts(rowid, message, stack_trace, error_type)
+    VALUES (new.id, new.message, new.stack_trace, new.error_type);
+END;
+
+CREATE TRIGGER IF NOT EXISTS error_events_ad AFTER DELETE ON error_events BEGIN
+    INSERT INTO error_events_fts(error_events_fts, rowid, message, stack_trace, error_type)
+    VALUES ('delete', old.id, old.message, old.stack_trace, old.error_type);
+END;
+
+CREATE TRIGGER IF NOT EXISTS error_events_au AFTER UPDATE ON error_events BEGIN
+    INSERT INTO error_events_fts(error_events_fts, rowid, message, stack_trace, error_type)
+    VALUES ('delete', old.id, old.message, old.stack_trace, old.error_type);
+    INSERT INTO error_events_fts(rowid, message, stack_trace, error_type)
+    VALUES (new.id, new.message, new.stack_trace, new.error_type);
+END;
+
+-- =============================================================================
+-- Recording & Playback System (Version 46)
+-- =============================================================================
+-- Stores browser interaction recordings and enables script generation
+-- Records user actions during manual navigation for automation replay
+
+-- Recordings: Session containers for recorded actions
+CREATE TABLE IF NOT EXISTS recordings (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    base_url TEXT NOT NULL,              -- Starting URL for the recording
+    action_count INTEGER DEFAULT 0,
+
+    -- Status: 'recording', 'completed', 'failed', 'cancelled'
+    status TEXT DEFAULT 'recording',
+
+    -- Timing
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    duration_ms INTEGER,
+
+    -- Metadata
+    browser_info TEXT,                   -- JSON: {browser, version, userAgent}
+    tab_id INTEGER,                      -- Chrome tab ID during recording
+
+    -- Tags for organization
+    tags TEXT DEFAULT '[]',              -- JSON array of strings
+
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_recordings_status ON recordings(status);
+CREATE INDEX IF NOT EXISTS idx_recordings_created_at ON recordings(created_at);
+CREATE INDEX IF NOT EXISTS idx_recordings_base_url ON recordings(base_url);
+
+-- Recording Actions: Individual captured user interactions
+CREATE TABLE IF NOT EXISTS recording_actions (
+    id TEXT PRIMARY KEY,
+    recording_id TEXT NOT NULL,
+    sequence_number INTEGER NOT NULL,    -- Order of action in recording
+
+    -- Action type: 'click', 'type', 'navigate', 'select', 'scroll', 'hover', 'keypress'
+    action_type TEXT NOT NULL,
+
+    -- Page context
+    url TEXT NOT NULL,                   -- URL at time of action
+    page_title TEXT,
+
+    -- Target element information (JSON)
+    target_json TEXT NOT NULL,           -- {uiId, tagName, selector, xpath, textContent, bbox, attributes}
+
+    -- Action-specific data (JSON)
+    action_data_json TEXT,               -- Click: {x, y, button, clickCount}
+                                         -- Type: {value, inputType}
+                                         -- Navigate: {fromUrl, toUrl, navigationType}
+                                         -- Select: {value, selectedText, selectedIndex}
+                                         -- Scroll: {deltaX, deltaY, scrollLeft, scrollTop}
+
+    -- Screenshot reference (optional)
+    screenshot_path TEXT,                -- Path to screenshot taken at this action
+
+    -- Timing
+    timestamp TEXT NOT NULL,
+    duration_ms INTEGER,                 -- Time until next action (for playback timing)
+
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+
+    FOREIGN KEY (recording_id) REFERENCES recordings(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_recording_actions_recording_id ON recording_actions(recording_id);
+CREATE INDEX IF NOT EXISTS idx_recording_actions_sequence ON recording_actions(recording_id, sequence_number);
+CREATE INDEX IF NOT EXISTS idx_recording_actions_action_type ON recording_actions(action_type);
+
+-- Recording Exports: Track generated scripts from recordings
+CREATE TABLE IF NOT EXISTS recording_exports (
+    id TEXT PRIMARY KEY,
+    recording_id TEXT NOT NULL,
+
+    -- Export format: 'python', 'playwright', 'pytest', 'cypress'
+    export_format TEXT NOT NULL,
+
+    -- Generated content
+    script_content TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+
+    -- Export options used
+    options_json TEXT,                   -- JSON: {wait_strategy, selector_priority, etc.}
+
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+
+    FOREIGN KEY (recording_id) REFERENCES recordings(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_recording_exports_recording_id ON recording_exports(recording_id);
+CREATE INDEX IF NOT EXISTS idx_recording_exports_format ON recording_exports(export_format);
+
+-- =============================================================================
+-- Workflow State Management (Version 48)
+-- =============================================================================
+-- Explicit workflow state tracking for resume capability
+-- Used by Unified Workflow, Orchestrator, and GUI Automation workflows
+
+-- Workflow Execution State: Explicit state tracking for workflows
+-- This replaces implicit state inference from task_runs status fields
+CREATE TABLE IF NOT EXISTS workflow_execution_state (
+    execution_id TEXT PRIMARY KEY,          -- Same as task_run_id
+    workflow_type TEXT NOT NULL,            -- 'unified', 'orchestrator', 'gui_automation'
+    state_name TEXT NOT NULL,               -- Current state name (e.g., 'SetupRunning', 'VerificationRunning')
+    state_data TEXT,                        -- JSON serialized state variant data
+    phase TEXT,                             -- Current phase if applicable
+    iteration INTEGER,                      -- Current iteration if applicable
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (execution_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_exec_state_type ON workflow_execution_state(workflow_type);
+CREATE INDEX IF NOT EXISTS idx_workflow_exec_state_name ON workflow_execution_state(state_name);
+
+-- Workflow Step Checkpoints: Step-level checkpointing for resume
+-- When a workflow is interrupted mid-execution, this allows resuming from exact step
+CREATE TABLE IF NOT EXISTS workflow_step_checkpoints (
+    id TEXT PRIMARY KEY,
+    execution_id TEXT NOT NULL,             -- Same as task_run_id
+    workflow_type TEXT NOT NULL,            -- 'unified', 'orchestrator', 'gui_automation'
+    phase TEXT NOT NULL,                    -- 'setup', 'verification', 'agentic', 'completion'
+    iteration INTEGER,                      -- Iteration number (for phases that repeat)
+    step_index INTEGER NOT NULL,            -- Step index within the phase
+    step_type TEXT NOT NULL,                -- 'playwright', 'automation', 'ai', 'python_script'
+    step_name TEXT,                         -- Display name
+    status TEXT NOT NULL,                   -- 'pending', 'running', 'success', 'failed', 'skipped'
+    result_json TEXT,                       -- JSON serialized result (if completed)
+    step_config_json TEXT,                  -- JSON serialized step configuration (single source of truth)
+    started_at TEXT,
+    completed_at TEXT,
+    duration_ms INTEGER,
+    error TEXT,                             -- Error message if failed
+    FOREIGN KEY (execution_id) REFERENCES task_runs(id) ON DELETE CASCADE,
+    UNIQUE(execution_id, phase, iteration, step_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_step_checkpoints_execution ON workflow_step_checkpoints(execution_id);
+CREATE INDEX IF NOT EXISTS idx_step_checkpoints_lookup ON workflow_step_checkpoints(execution_id, phase, iteration);
+CREATE INDEX IF NOT EXISTS idx_step_checkpoints_status ON workflow_step_checkpoints(status);
+CREATE INDEX IF NOT EXISTS idx_step_checkpoints_cursor ON workflow_step_checkpoints(execution_id, step_index);
+
+-- Step Progress Markers: Intra-step progress tracking for long AI operations
+-- Allows tracking progress within a step (e.g., "analyzed 50/100 files")
+CREATE TABLE IF NOT EXISTS step_progress_markers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    checkpoint_id TEXT NOT NULL,              -- Reference to workflow_step_checkpoints.id
+    marker_type TEXT NOT NULL,                -- 'file_progress', 'analysis_progress', 'test_progress', etc.
+    current_value INTEGER NOT NULL,           -- Current progress value
+    total_value INTEGER,                      -- Total value (if known)
+    description TEXT,                         -- Human-readable description
+    data_json TEXT,                           -- Additional structured data (JSON)
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (checkpoint_id) REFERENCES workflow_step_checkpoints(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_progress_markers_checkpoint ON step_progress_markers(checkpoint_id);
+
+-- =============================================================================
+-- Execution Spans (Version 52)
+-- =============================================================================
+-- Stores summary-level tracing spans for AI analysis and performance debugging.
+-- Only "summary" spans are persisted (workflow phases, AI sessions, etc.)
+-- Full span data is in runner-spans.jsonl for real-time debugging.
+
+CREATE TABLE IF NOT EXISTS execution_spans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    -- Task context (links to task_runs)
+    execution_id TEXT,                      -- Same as task_run_id (may be empty for global spans)
+
+    -- Span identity
+    trace_id TEXT NOT NULL,                 -- Shared across related spans in a trace
+    span_id TEXT NOT NULL,                  -- Unique span identifier
+    parent_span_id TEXT,                    -- Parent span (NULL for root spans)
+    name TEXT NOT NULL,                     -- Span name (e.g., 'workflow.execute', 'ai.session')
+
+    -- Timing
+    start_ts TEXT NOT NULL,                 -- ISO 8601 start timestamp
+    end_ts TEXT,                            -- ISO 8601 end timestamp
+    duration_ms INTEGER,                    -- Duration in milliseconds
+
+    -- Data
+    attributes TEXT,                        -- JSON object of span attributes
+    success INTEGER DEFAULT 1,              -- 1 = success, 0 = had error
+    error TEXT,                             -- Error message if failed
+
+    created_at TEXT NOT NULL,
+
+    FOREIGN KEY (execution_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+
+-- Indexes for efficient queries
+CREATE INDEX IF NOT EXISTS idx_spans_execution ON execution_spans(execution_id);
+CREATE INDEX IF NOT EXISTS idx_spans_trace ON execution_spans(trace_id);
+CREATE INDEX IF NOT EXISTS idx_spans_name ON execution_spans(name);
+CREATE INDEX IF NOT EXISTS idx_spans_start ON execution_spans(start_ts);
+CREATE INDEX IF NOT EXISTS idx_spans_duration ON execution_spans(duration_ms);
+
 -- Initialize singleton tables
 INSERT OR IGNORE INTO gui_lock (id, holder_session_id, acquired_at) VALUES (1, NULL, NULL);
 INSERT OR IGNORE INTO scheduler_settings (id) VALUES (1);
-INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (35, datetime('now'));
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (52, datetime('now'));

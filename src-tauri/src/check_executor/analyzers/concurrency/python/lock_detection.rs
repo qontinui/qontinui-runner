@@ -241,7 +241,7 @@ class SafeClass:
         detect_locks(&tree, code, &mut ctx);
 
         // Should find the lock in __init__
-        assert!(ctx.locks.len() >= 1);
+        assert!(!ctx.locks.is_empty());
         assert!(ctx.locks.iter().any(|l| l.name == "self._lock"));
     }
 

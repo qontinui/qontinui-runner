@@ -11,6 +11,8 @@
 //! - Relevance-filtered - Only include logs relevant to the workflow's step types
 //! - Screenshots linked to steps - Clear which screenshot shows state after which step
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;

@@ -21,6 +21,8 @@
 //! let prompt = debugger.build_system_prompt();
 //! ```
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

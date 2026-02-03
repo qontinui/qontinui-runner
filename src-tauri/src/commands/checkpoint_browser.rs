@@ -7,6 +7,7 @@
 //! real-time operations like replay.
 
 use crate::commands::AppState;
+use crate::database::CreateTaskRunInput;
 use crate::orchestrator::checkpoint::{
     Checkpoint, CheckpointDiff, CheckpointManager, CheckpointSummary, CheckpointTrigger,
     LineageInfo, LineageTree, ReplayManager, ReplaySession, RestorationInstructions,
@@ -450,15 +451,10 @@ pub fn replay_from_checkpoint(
     );
 
     // Create the new task run
-    app_state.checkpoint_db.create_task_run(
-        &new_task_run_id,
-        &replay_task_name,
-        Some(&replay_prompt),
-        None,       // max_sessions
-        Some(true), // auto_continue
-        None,       // execution_steps_json
-        None,       // log_sources_json
-    )?;
+    let input = CreateTaskRunInput::new(&new_task_run_id, &replay_task_name)
+        .with_prompt(&replay_prompt)
+        .with_auto_continue(true);
+    app_state.checkpoint_db.create_task_run(&input)?;
 
     // Save replay lineage to database
     let _lineage_json = serde_json::to_string(&replay_result.lineage)

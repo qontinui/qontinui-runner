@@ -205,9 +205,24 @@ pub fn execute_check(check_def: &CheckDefinition) -> CheckExecutionResult {
         .unwrap_or_else(|| ".".to_string());
 
     // Execute the command
-    let mut cmd = Command::new(&program);
-    cmd.args(&args)
-        .current_dir(&working_dir)
+    // On Windows, we need to run commands through cmd.exe because tools like
+    // npx, eslint, prettier are batch files (.cmd) that won't execute directly
+    let mut cmd = if cfg!(target_os = "windows") {
+        let full_command = if args.is_empty() {
+            program.clone()
+        } else {
+            format!("{} {}", program, args.join(" "))
+        };
+        let mut c = Command::new("cmd");
+        c.args(["/C", &full_command]);
+        c
+    } else {
+        let mut c = Command::new(&program);
+        c.args(&args);
+        c
+    };
+
+    cmd.current_dir(&working_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -248,17 +263,19 @@ pub fn execute_check(check_def: &CheckDefinition) -> CheckExecutionResult {
     };
     let exit_code = output.status.code();
 
-    // Check for timeout (if we had timeout support - for now just check exit code)
-    if duration_ms >= (check_def.timeout_seconds as u64 * 1000) {
-        warn!(
-            "Check {} timed out after {} seconds",
-            check_def.id, check_def.timeout_seconds
-        );
-        return CheckExecutionResult::timeout(
-            check_def.id.clone(),
-            check_def.name.clone(),
-            check_def.timeout_seconds,
-        );
+    // Check for timeout only if timeout is specified
+    if let Some(timeout_secs) = check_def.timeout_seconds {
+        if duration_ms >= (timeout_secs as u64 * 1000) {
+            warn!(
+                "Check {} timed out after {} seconds",
+                check_def.id, timeout_secs
+            );
+            return CheckExecutionResult::timeout(
+                check_def.id.clone(),
+                check_def.name.clone(),
+                timeout_secs,
+            );
+        }
     }
 
     // Parse the output to extract issues

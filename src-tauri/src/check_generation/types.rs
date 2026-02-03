@@ -116,8 +116,9 @@ pub struct CreateCheckInput {
     pub auto_fix: bool,
     #[serde(default)]
     pub fail_on_warning: bool,
-    #[serde(default = "default_timeout")]
-    pub timeout_seconds: u32,
+    /// Timeout in seconds. None = no timeout (default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
     #[serde(default)]
     pub is_critical: bool,
     #[serde(default = "default_true")]
@@ -128,10 +129,6 @@ pub struct CreateCheckInput {
     pub ai_generation_prompt: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
-}
-
-fn default_timeout() -> u32 {
-    60
 }
 
 impl Default for CreateCheckInput {
@@ -146,7 +143,7 @@ impl Default for CreateCheckInput {
             config_path: None,
             auto_fix: false,
             fail_on_warning: false,
-            timeout_seconds: 60,
+            timeout_seconds: None, // No timeout by default
             is_critical: false,
             enabled: true,
             ai_generated: true,

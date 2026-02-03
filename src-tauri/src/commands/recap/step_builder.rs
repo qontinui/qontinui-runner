@@ -8,8 +8,43 @@ use super::utils::{
     get_icon_type, is_ai_step_type, parse_actions_summary,
 };
 use crate::database::{StoredVerificationResult, TaskRun, TaskRunAutomation, TaskRunEvent};
+use chrono::{DateTime, Duration};
 use std::collections::HashSet;
 use tracing::info;
+
+/// Calculate started_at timestamp from ended_at and duration_ms.
+/// Returns (started_at, ended_at) tuple.
+fn calculate_timestamps(
+    ended_at: Option<&str>,
+    duration_ms: Option<i64>,
+) -> (Option<String>, Option<String>) {
+    let ended = ended_at.map(|s| s.to_string());
+
+    let started = match (ended_at, duration_ms) {
+        (Some(end_str), Some(dur)) if dur > 0 => {
+            // Try to parse the ended_at timestamp and subtract duration
+            if let Ok(end_dt) = DateTime::parse_from_rfc3339(end_str) {
+                let start_dt = end_dt - Duration::milliseconds(dur);
+                Some(start_dt.to_rfc3339())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+
+    (started, ended)
+}
+
+/// Strip "(iteration N)" suffix from a step name.
+/// The iteration info is shown in the phase container header, so it's redundant in step names.
+fn strip_iteration_suffix(name: &str) -> String {
+    if let Some(idx) = name.rfind(" (iteration ") {
+        name[..idx].to_string()
+    } else {
+        name.to_string()
+    }
+}
 
 /// Generate a human-readable summary for an automation workflow step.
 pub fn generate_automation_summary(
@@ -200,14 +235,20 @@ pub fn build_ai_session_steps(
                 status,
             ));
 
+            let (started_at, ended_at) =
+                calculate_timestamps(Some(&event.timestamp), event.duration_ms);
+
             steps.push(RecapStep {
                 name: session_name,
                 step_type: "ai_session".to_string(),
                 status: status.to_string(),
                 phase: Some("agentic".to_string()),
+                iteration: Some(session_num),
                 icon_type: Some("prompt".to_string()),
                 work_summary,
                 summary,
+                started_at,
+                ended_at,
                 duration_ms: event.duration_ms,
                 error: None,
                 children: Vec::new(),
@@ -262,9 +303,12 @@ pub fn build_ai_session_steps(
                 step_type: "ai_session".to_string(),
                 status: status.to_string(),
                 phase: Some("agentic".to_string()),
+                iteration: Some(session_num),
                 icon_type: Some("prompt".to_string()),
                 work_summary,
                 summary,
+                started_at: None, // No timestamp available from output_log parsing
+                ended_at: None,
                 duration_ms: None,
                 error: if status == "failed" && is_last {
                     task_run.error_message.clone()
@@ -318,14 +362,12 @@ pub fn build_steps(
                         .and_then(|v| v.as_str())
                         .unwrap_or("Verification Step");
 
-                    // Include iteration in name if multiple iterations
-                    let display_name = if workflow_verification_results.len() > 1 {
-                        format!("{} (iteration {})", step_name, iteration)
-                    } else {
-                        step_name.to_string()
-                    };
+                    // Display name doesn't need iteration - the phase container shows it
+                    let display_name = step_name.to_string();
 
-                    if seen_step_names.contains(&display_name) {
+                    // Use iteration-qualified key for deduplication across iterations
+                    let dedup_key = format!("{}:iter{}", step_name, iteration);
+                    if seen_step_names.contains(&dedup_key) {
                         continue;
                     }
 
@@ -376,15 +418,36 @@ pub fn build_steps(
 
                     let icon_type = get_icon_type(&step_type, step_name);
 
-                    seen_step_names.insert(display_name.clone());
+                    // Extract timestamps from step_result if available
+                    let step_started_at = step_result
+                        .get("started_at")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let step_ended_at = step_result
+                        .get("ended_at")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+
+                    // If no explicit timestamps, try to calculate from duration
+                    let (started_at, ended_at) = if step_started_at.is_some() || step_ended_at.is_some()
+                    {
+                        (step_started_at, step_ended_at)
+                    } else {
+                        (None, None) // No timestamps available in verification results
+                    };
+
+                    seen_step_names.insert(dedup_key);
                     steps.push(RecapStep {
                         name: display_name,
                         step_type,
                         status: status.to_string(),
                         phase: Some("verification".to_string()),
+                        iteration: Some(iteration),
                         icon_type,
                         work_summary: None,
                         summary,
+                        started_at,
+                        ended_at,
                         duration_ms,
                         error,
                         children: Vec::new(),
@@ -433,9 +496,12 @@ pub fn build_steps(
                 step_type,
                 status: status.to_string(),
                 phase: Some("verification".to_string()),
+                iteration: None, // Orchestrator results don't have iteration info
                 icon_type,
                 work_summary: None,
                 summary,
+                started_at: None, // Orchestrator results don't have timestamps
+                ended_at: None,
                 duration_ms: None,
                 error,
                 children: Vec::new(),
@@ -533,15 +599,22 @@ pub fn build_steps(
             )
         };
 
+        // Get timestamps directly from automation record (it has started_at and ended_at)
+        let started_at = Some(automation.started_at.clone());
+        let ended_at = automation.ended_at.clone();
+
         seen_step_names.insert(workflow_name.clone());
         steps.push(RecapStep {
             name: workflow_name.clone(),
             step_type,
             status: status.to_string(),
             phase: Some(phase),
+            iteration: None, // Automation records don't have iteration info
             icon_type,
             work_summary: None,
             summary,
+            started_at,
+            ended_at,
             duration_ms: automation.duration_ms,
             error: automation.error_message.clone(),
             children: Vec::new(),
@@ -556,8 +629,17 @@ pub fn build_steps(
         }
     }
 
-    // 4. Build steps from step_execution events for setup and completion phases
-    // (verification steps are already captured from workflow_verification_results)
+    // 4. Build steps from step_execution events for setup, agentic, and completion phases
+    // Note: verification steps are captured from workflow_verification_phase_results when available,
+    // but if verification was interrupted (no results stored), we fall back to events.
+    let has_verification_results = !workflow_verification_results.is_empty();
+
+    info!(
+        "Processing {} events for steps (has_verification_results={})",
+        events.len(),
+        has_verification_results
+    );
+
     for event in events {
         if event.event_type != "step_execution" {
             continue;
@@ -579,29 +661,81 @@ pub fn build_steps(
                 .get("step_type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("step");
+            let iteration = data.get("iteration").and_then(|v| v.as_u64()).map(|i| i as u32);
 
-            // Process setup, verification, agentic, and completion phase events
+            // Process events based on phase
+            // Skip verification phase events only if we already have verification results
+            // (workflow_verification_phase_results is more detailed)
             match phase {
-                Some("setup") | Some("verification") | Some("agentic") | Some("completion") => {}
+                Some("setup") | Some("agentic") | Some("completion") => {}
+                Some("verification") => {
+                    if has_verification_results {
+                        // Skip - already handled by more detailed verification results above
+                        continue;
+                    }
+                    // No verification results stored (e.g., interrupted) - use events as fallback
+                }
                 _ => continue,
             }
 
+            // Build display name - strip iteration suffix since the phase container already shows it
+            let display_name = strip_iteration_suffix(step_name);
+
+            // Create a unique key that includes iteration to handle multiple iterations
+            let dedup_key = if let Some(iter) = iteration {
+                format!("{}:iter{}:{}", display_name, iter, phase.unwrap_or("unknown"))
+            } else {
+                format!("{}:{}", display_name, phase.unwrap_or("unknown"))
+            };
+
             // Skip if we already have this step
-            if seen_step_names.contains(step_name) {
+            if seen_step_names.contains(&dedup_key) {
                 continue;
             }
 
-            // Only process "complete" or "error" events (not "start")
+            // Process "complete", "error", or "start" events
+            // For interrupted workflows, "start" events without completion show as "running"
             let event_subtype = event.event_subtype.as_deref();
-            if event_subtype != Some("complete") && event_subtype != Some("error") {
-                continue;
-            }
 
             let status = match event_subtype {
                 Some("complete") => "success",
                 Some("error") => "failed",
-                _ => "running",
+                Some("start") => "running",
+                _ => continue, // Skip unknown event subtypes
             };
+
+            // For "start" events, only include them if we don't have a corresponding complete/error event
+            // We track this by checking if the step was already added with a terminal status
+            if event_subtype == Some("start") {
+                // Check if we already have a completed version of this step
+                // If so, skip the start event (we prefer showing final state)
+                let has_completion = events.iter().any(|e| {
+                    if e.event_type != "step_execution" {
+                        return false;
+                    }
+                    let e_subtype = e.event_subtype.as_deref();
+                    if e_subtype != Some("complete") && e_subtype != Some("error") {
+                        return false;
+                    }
+                    // Check if this is the same step by comparing action_id or step details
+                    if let (Some(ref e_action_id), Some(ref this_action_id)) = (&e.action_id, &event.action_id) {
+                        return e_action_id == this_action_id;
+                    }
+                    // Fallback: compare by parsing data
+                    if let Some(e_data) = e.data.as_ref().and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok()) {
+                        let e_step_name = e_data.get("step_name").and_then(|v| v.as_str()).unwrap_or("");
+                        let e_phase = e_data.get("phase").and_then(|v| v.as_str()).unwrap_or("");
+                        let e_iteration = e_data.get("iteration").and_then(|v| v.as_u64());
+                        return e_step_name == step_name
+                            && e_phase == phase.unwrap_or("")
+                            && e_iteration == iteration.map(|i| i as u64);
+                    }
+                    false
+                });
+                if has_completion {
+                    continue;
+                }
+            }
 
             let error = data
                 .get("error")
@@ -611,21 +745,35 @@ pub fn build_steps(
 
             let icon_type = get_icon_type(step_type, step_name);
 
-            seen_step_names.insert(step_name.to_string());
+            // For step_execution events, timestamp is when the event was recorded (completion time)
+            // Calculate started_at from ended_at - duration
+            let (started_at, ended_at) =
+                calculate_timestamps(Some(&event.timestamp), duration_ms);
+
+            info!(
+                "Adding step from event: name='{}', phase={:?}, status='{}', step_type='{}'",
+                display_name, phase, status, step_type
+            );
+            seen_step_names.insert(dedup_key);
             steps.push(RecapStep {
-                name: step_name.to_string(),
+                name: display_name,
                 step_type: step_type.to_string(),
                 status: status.to_string(),
                 phase: phase.map(|p| p.to_string()),
+                iteration,
                 icon_type,
                 work_summary: None,
                 summary: Some(event.message.clone()),
+                started_at,
+                ended_at,
                 duration_ms,
                 error,
                 children: Vec::new(),
             });
         }
     }
+
+    info!("Total steps after events processing: {}", steps.len());
 
     // 5. Fallback: if no steps yet, try to build from events with named workflows
     if steps.is_empty() && !events.is_empty() {
@@ -671,15 +819,22 @@ pub fn build_steps(
                     )
                 };
 
+                // Try to get timestamps from first and last events
+                let started_at = wf_events.first().map(|e| e.timestamp.clone());
+                let ended_at = wf_events.last().map(|e| e.timestamp.clone());
+
                 seen_step_names.insert(workflow_name.clone());
                 steps.push(RecapStep {
                     name: workflow_name.clone(),
                     step_type,
                     status: status.to_string(),
                     phase: Some(phase),
+                    iteration: None, // Fallback doesn't have iteration info
                     icon_type,
                     work_summary: None,
                     summary: Some(format!("{} events", event_count)),
+                    started_at,
+                    ended_at,
                     duration_ms: None,
                     error: None,
                     children: Vec::new(),

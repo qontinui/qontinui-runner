@@ -8,6 +8,7 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 
 use super::types::{api_error, ApiResponse, ApiState, ExecuteActionRequest, ExecuteActionResult};
+use crate::executor::with_default_bridge;
 
 /// Execute a single action (e.g., click on an image)
 ///
@@ -37,12 +38,7 @@ pub async fn execute_action(
 
     // Send command and wait for response using spawn_blocking
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
+        with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
             }
@@ -72,9 +68,7 @@ pub async fn execute_action(
                 }
                 Err(e) => Err(format!("Failed to execute action: {}", e)),
             }
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
+        })?
     })
     .await
     .map_err(|e| {

@@ -33,9 +33,9 @@ use super::{AppState, CommandResponse};
 /// * `Ok(CommandResponse)` - Success with configuration summary
 /// * `Err(String)` - Error message if loading fails
 #[tauri::command]
-pub fn load_configuration(
+pub async fn load_configuration(
     path: String,
-    state: State<Arc<AppState>>,
+    state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
     info!("Loading configuration from: {}", path);
 
@@ -94,25 +94,39 @@ pub fn load_configuration(
     file_logger::copy_config_file(&path);
 
     // If Python bridge is running, send the configuration and debug settings
-    if let Some(ref mut bridge) =
-        *crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge")
-    {
-        if bridge.is_running() {
-            // First send debug settings to ensure they're applied before config execution
+    // NOTE: We use spawn_blocking because PythonBridge methods use block_on internally
+    let manager_guard = state.bridge_manager.lock().await;
+    if let Some(ref manager) = *manager_guard {
+        // Use async check to avoid nested runtime panic
+        if manager.is_default_bridge_running_async().await {
+            let manager_clone = manager.clone();
+            let path_clone = path.clone();
             let debug_settings = settings::get_debug_settings();
-            if let Err(e) = bridge.set_debug_settings(
-                debug_settings.enable_image_debug,
-                debug_settings.top_matches_count,
-            ) {
-                warn!("Failed to send debug settings before config load: {}", e);
-            } else {
-                info!(
-                    "Debug settings sent before config load: enable={}, top_matches={}",
-                    debug_settings.enable_image_debug, debug_settings.top_matches_count
-                );
-            }
 
-            bridge.load_configuration(&path).map_err(|e| {
+            tokio::task::spawn_blocking(move || {
+                // First send debug settings to ensure they're applied before config execution
+                let _ = manager_clone.with_default_bridge(|bridge| {
+                    if let Err(e) = bridge.set_debug_settings(
+                        debug_settings.enable_image_debug,
+                        debug_settings.top_matches_count,
+                    ) {
+                        warn!("Failed to send debug settings before config load: {}", e);
+                    } else {
+                        info!(
+                            "Debug settings sent before config load: enable={}, top_matches={}",
+                            debug_settings.enable_image_debug, debug_settings.top_matches_count
+                        );
+                    }
+                }); // Ignore errors for debug settings
+
+                manager_clone.with_default_bridge(|bridge| {
+                    bridge.load_configuration(&path_clone)
+                })
+            })
+            .await
+            .map_err(|e| format!("Task join error: {}", e))?
+            .map_err(|e| format!("Failed to access bridge: {}", e))?
+            .map_err(|e| {
                 error!("Failed to send configuration to Python: {}", e);
                 format!("Failed to send configuration to Python: {}", e)
             })?;

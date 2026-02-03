@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use super::types::{
-    api_error, AiOutputSessionContext, ApiResponse, ApiState, AutoContinueSettingResponse,
+    api_error, AiSessionContext, ApiResponse, ApiState, AutoContinueSettingResponse,
     ForceContinueRequest, ForceContinueResponse, ResumableWorkflowInfo, ResumeWorkflowResponse,
     SetAutoContinueRequest, StartSessionRequest, StartSessionResponse, WorkflowAutoContinueResponse,
     ActiveSessionInfo,
@@ -22,7 +22,7 @@ pub fn emit_ai_output(
     line: &str,
     source: &str,
     action_id: Option<&str>,
-    session_ctx: Option<&AiOutputSessionContext>,
+    session_ctx: Option<&AiSessionContext>,
 ) {
     crate::mcp_api::emit_ai_output(app_handle, line, source, action_id, session_ctx)
 }

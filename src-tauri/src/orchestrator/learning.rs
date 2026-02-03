@@ -17,6 +17,8 @@
 //! use crate::orchestrator::learning::{LearningSystem, TaskOutcome, AnalysisConfig};
 //!
 //! let mut learning = LearningSystem::new();
+
+#![allow(dead_code)]
 //!
 //! // Record task outcome
 //! let outcome = TaskOutcome::success("task-1")
@@ -873,7 +875,7 @@ impl LearningSystem {
                             (pattern.success_rate * 100.0) as u32,
                             pattern.occurrences
                         ))
-                        .with_recommendation(format!("Prioritize using this strategy"));
+                        .with_recommendation("Prioritize using this strategy".to_string());
                         self.insights.push(insight);
                     }
                     PatternType::FailureMode => {
@@ -1125,7 +1127,7 @@ mod tests {
         let result = learning.analyze_patterns();
 
         assert!(result.success_rate > 0.5);
-        assert!(result.patterns.len() > 0);
+        assert!(!result.patterns.is_empty());
         assert!(result.top_strategies.iter().any(|(s, _)| s == "effective"));
     }
 

@@ -17,6 +17,7 @@ use tauri::State;
 use tracing::{error, info};
 
 use super::{AppState, CommandResponse};
+use crate::executor::{is_default_bridge_running, with_default_bridge};
 
 /// Configuration for interaction recording
 #[derive(Debug, Serialize, Deserialize)]
@@ -61,36 +62,32 @@ pub fn start_interaction_recording(
         config.session_id, config.fps
     );
 
-    let mut bridge_lock =
-        crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
-    if let Some(ref mut bridge) = *bridge_lock {
-        if !bridge.is_running() {
-            return Err(
-                "Python executor is not running. Please start the executor first.".to_string(),
-            );
-        }
+    if !is_default_bridge_running(&state) {
+        return Err(
+            "Python executor is not running. Please start the executor first.".to_string(),
+        );
+    }
 
-        let params = json!({
-            "session_id": config.session_id,
-            "fps": config.fps.unwrap_or(30),
-            "output_dir": config.output_dir,
-        });
+    let params = json!({
+        "session_id": config.session_id,
+        "fps": config.fps.unwrap_or(30),
+        "output_dir": config.output_dir,
+    });
 
+    with_default_bridge(&state, |bridge| {
         bridge
-            .send_command("start_interaction_recording", Some(params))
+            .send_command("start_interaction_recording", Some(params.clone()))
             .map_err(|e| {
                 error!("Failed to start interaction recording: {}", e);
                 format!("Failed to start interaction recording: {}", e)
-            })?;
+            })
+    })??;
 
-        Ok(CommandResponse {
-            success: true,
-            message: Some("Interaction recording started".to_string()),
-            data: None,
-        })
-    } else {
-        Err("Python executor not initialized. Please start the executor first.".to_string())
-    }
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Interaction recording started".to_string()),
+        data: None,
+    })
 }
 
 /// Stop interaction recording and save the captured data.
@@ -107,30 +104,26 @@ pub fn start_interaction_recording(
 pub fn stop_interaction_recording(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Stopping interaction recording");
 
-    let mut bridge_lock =
-        crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
-    if let Some(ref mut bridge) = *bridge_lock {
-        if !bridge.is_running() {
-            return Err(
-                "Python executor is not running. Please start the executor first.".to_string(),
-            );
-        }
+    if !is_default_bridge_running(&state) {
+        return Err(
+            "Python executor is not running. Please start the executor first.".to_string(),
+        );
+    }
 
+    with_default_bridge(&state, |bridge| {
         bridge
             .send_command("stop_interaction_recording", None)
             .map_err(|e| {
                 error!("Failed to stop interaction recording: {}", e);
                 format!("Failed to stop interaction recording: {}", e)
-            })?;
+            })
+    })??;
 
-        Ok(CommandResponse {
-            success: true,
-            message: Some("Interaction recording stopped".to_string()),
-            data: None,
-        })
-    } else {
-        Err("Python executor not initialized. Please start the executor first.".to_string())
-    }
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Interaction recording stopped".to_string()),
+        data: None,
+    })
 }
 
 /// Get the current interaction recording status.
@@ -147,42 +140,31 @@ pub fn stop_interaction_recording(state: State<Arc<AppState>>) -> Result<Command
 pub fn get_interaction_recording_status(
     state: State<Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
-    let mut bridge_lock =
-        crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
-    if let Some(ref mut bridge) = *bridge_lock {
-        if !bridge.is_running() {
-            // Return not recording if executor is not running
-            return Ok(CommandResponse {
-                success: true,
-                message: None,
-                data: Some(json!({
-                    "is_recording": false,
-                })),
-            });
-        }
+    // Return not recording if executor is not running
+    if !is_default_bridge_running(&state) {
+        return Ok(CommandResponse {
+            success: true,
+            message: None,
+            data: Some(json!({
+                "is_recording": false,
+            })),
+        });
+    }
 
+    with_default_bridge(&state, |bridge| {
         bridge
             .send_command("get_interaction_recording_status", None)
             .map_err(|e| {
                 error!("Failed to get interaction recording status: {}", e);
                 format!("Failed to get interaction recording status: {}", e)
-            })?;
+            })
+    })??;
 
-        Ok(CommandResponse {
-            success: true,
-            message: None,
-            data: Some(json!({
-                "is_recording": false,
-            })),
-        })
-    } else {
-        // Return not recording if bridge is not initialized
-        Ok(CommandResponse {
-            success: true,
-            message: None,
-            data: Some(json!({
-                "is_recording": false,
-            })),
-        })
-    }
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(json!({
+            "is_recording": false,
+        })),
+    })
 }

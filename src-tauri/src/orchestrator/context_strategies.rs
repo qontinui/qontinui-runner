@@ -28,6 +28,8 @@
 //! let result = strategy.apply(&context_items);
 //! ```
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use tracing::info;
 

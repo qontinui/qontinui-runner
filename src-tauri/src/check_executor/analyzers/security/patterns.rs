@@ -2,6 +2,8 @@
 //!
 //! Defines regex patterns for detecting common security vulnerabilities across multiple languages.
 
+#![allow(dead_code)]
+
 /// A security vulnerability pattern
 #[derive(Debug, Clone)]
 pub struct SecurityPattern {
@@ -235,7 +237,9 @@ pub const INSECURE_YAML: SecurityPattern = SecurityPattern {
     name: "Insecure YAML Load",
     description: "Unsafe YAML loading can execute arbitrary code",
     severity: "critical",
-    pattern: r#"(?i)yaml\.(load|unsafe_load)\s*\([^)]*(?!Loader|safe)"#,
+    // Match yaml.load or yaml.unsafe_load calls - look-ahead not supported in Rust regex
+    // Simplified pattern that matches the dangerous calls
+    pattern: r#"(?i)yaml\.(load|unsafe_load)\s*\("#,
     languages: &["python"],
 };
 

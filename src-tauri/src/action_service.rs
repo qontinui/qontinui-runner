@@ -10,6 +10,8 @@
 use crate::commands::AppState;
 use crate::config::QontinuiConfig;
 use crate::config_storage::{ConfigStorage, ConfigStorageError};
+use crate::executor::with_default_bridge;
+use crate::timeout_config::Timeouts;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -187,20 +189,7 @@ impl UnifiedActionService {
     /// Check if the Python executor is running
     #[allow(dead_code)] // Part of public API, reserved for future use
     pub fn is_executor_running(&self) -> bool {
-        let bridge_lock = self
-            .app_state
-            .python_bridge
-            .lock()
-            .unwrap_or_else(|poisoned| {
-                warn!("python_bridge mutex was poisoned, recovering");
-                poisoned.into_inner()
-            });
-
-        if let Some(ref bridge) = *bridge_lock {
-            bridge.is_running()
-        } else {
-            false
-        }
+        with_default_bridge(&self.app_state, |bridge| bridge.is_running()).unwrap_or(false)
     }
 
     /// Get the current loaded configuration
@@ -258,17 +247,15 @@ impl UnifiedActionService {
             }
         }
 
-        let timeout_duration = Duration::from_secs(30);
+        // Use configurable timeout (default: disabled - run until completion)
+        // Falls back to 1 hour if timeout is disabled to prevent infinite hangs on IPC
+        let timeout_duration = Timeouts::action_execution()
+            .unwrap_or_else(|| Duration::from_secs(3600));
 
         // Execute via spawn_blocking since PythonBridge uses block_on internally
         let app_state = self.app_state.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-                warn!("python_bridge mutex was poisoned, recovering");
-                poisoned.into_inner()
-            });
-
-            if let Some(ref mut bridge) = *bridge_lock {
+            with_default_bridge(&app_state, |bridge| {
                 if !bridge.is_running() {
                     return Err(ActionError::ExecutorNotRunning);
                 }
@@ -293,9 +280,8 @@ impl UnifiedActionService {
                     }
                     Err(e) => Err(ActionError::ActionFailed(e)),
                 }
-            } else {
-                Err(ActionError::ExecutorNotInitialized)
-            }
+            })
+            .map_err(|_| ActionError::ExecutorNotInitialized)?
         })
         .await
         .map_err(|e| ActionError::Internal(format!("spawn_blocking error: {}", e)))??;
@@ -310,7 +296,7 @@ impl UnifiedActionService {
     /// * `workflow_name` - Name of the workflow to run
     /// * `config` - Optional additional configuration parameters
     /// * `monitor_index` - Optional monitor index (defaults to 0)
-    /// * `timeout_seconds` - Maximum time to wait for completion
+    /// * `timeout_seconds` - Optional maximum time to wait for completion (None = no timeout)
     /// * `initial_state_ids` - Optional override for initial active states
     ///
     /// # Returns
@@ -320,37 +306,34 @@ impl UnifiedActionService {
         workflow_name: &str,
         config: Option<&serde_json::Value>,
         monitor_index: Option<i32>,
-        timeout_seconds: u64,
+        timeout_seconds: Option<u64>,
         initial_state_ids: Option<&[String]>,
     ) -> Result<WorkflowResult, ActionError> {
         let start = std::time::Instant::now();
+        let timeout_str = timeout_seconds
+            .map(|t| format!("{}s", t))
+            .unwrap_or_else(|| "disabled".to_string());
         info!(
-            "Running workflow: {} (monitor: {:?}, timeout: {}s, initial_states: {:?})",
-            workflow_name, monitor_index, timeout_seconds, initial_state_ids
+            "Running workflow: {} (monitor: {:?}, timeout: {}, initial_states: {:?})",
+            workflow_name, monitor_index, timeout_str, initial_state_ids
         );
 
-        let timeout_duration = Duration::from_secs(timeout_seconds);
+        // Use a very large duration when timeout is disabled (effectively infinite)
+        let timeout_duration = timeout_seconds
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(u64::MAX / 2));
         let workflow_name_clone = workflow_name.to_string();
 
         // First, get the lifecycle Arc from the bridge
         let app_state_clone = self.app_state.clone();
         let lifecycle = tokio::task::spawn_blocking(move || {
-            let bridge_lock = app_state_clone
-                .python_bridge
-                .lock()
-                .unwrap_or_else(|poisoned| {
-                    warn!("python_bridge mutex was poisoned, recovering");
-                    poisoned.into_inner()
-                });
-
-            if let Some(ref bridge) = *bridge_lock {
+            with_default_bridge(&app_state_clone, |bridge| {
                 if !bridge.is_running() {
                     return Err(ActionError::ExecutorNotRunning);
                 }
                 Ok(bridge.get_lifecycle())
-            } else {
-                Err(ActionError::ExecutorNotInitialized)
-            }
+            })
+            .map_err(|_| ActionError::ExecutorNotInitialized)?
         })
         .await
         .map_err(|e| ActionError::Internal(format!("spawn_blocking error: {}", e)))??;
@@ -394,12 +377,7 @@ impl UnifiedActionService {
         // Start the workflow execution
         let app_state = self.app_state.clone();
         tokio::task::spawn_blocking(move || {
-            let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-                warn!("python_bridge mutex was poisoned, recovering");
-                poisoned.into_inner()
-            });
-
-            if let Some(ref mut bridge) = *bridge_lock {
+            with_default_bridge(&app_state, |bridge| {
                 match bridge.start_execution_with_params(Some(serde_json::Value::Object(params))) {
                     Ok(_) => Ok(()),
                     Err(e) => Err(ActionError::ActionFailed(format!(
@@ -407,9 +385,8 @@ impl UnifiedActionService {
                         e
                     ))),
                 }
-            } else {
-                Err(ActionError::ExecutorNotInitialized)
-            }
+            })
+            .map_err(|_| ActionError::ExecutorNotInitialized)?
         })
         .await
         .map_err(|e| ActionError::Internal(format!("spawn_blocking error: {}", e)))??;
@@ -440,8 +417,9 @@ impl UnifiedActionService {
                 }
             }
             Err(_) => {
-                error!("Workflow execution timed out after {}s", timeout_seconds);
-                return Err(ActionError::Timeout(timeout_seconds));
+                let timeout_val = timeout_seconds.unwrap_or(0);
+                error!("Workflow execution timed out after {}s", timeout_val);
+                return Err(ActionError::Timeout(timeout_val));
             }
         };
 
@@ -454,7 +432,7 @@ impl UnifiedActionService {
     /// * `state_id` - The target state ID to navigate to
     /// * `config` - Optional additional configuration parameters
     /// * `monitor_index` - Optional monitor index (defaults to 0)
-    /// * `timeout_seconds` - Maximum time to wait for completion
+    /// * `timeout_seconds` - Optional maximum time to wait for completion (None = no timeout)
     ///
     /// # Returns
     /// `StateResult` with success/failure information
@@ -464,15 +442,21 @@ impl UnifiedActionService {
         state_id: &str,
         config: Option<&serde_json::Value>,
         monitor_index: Option<i32>,
-        timeout_seconds: u64,
+        timeout_seconds: Option<u64>,
     ) -> Result<StateResult, ActionError> {
         let start = std::time::Instant::now();
+        let timeout_str = timeout_seconds
+            .map(|t| format!("{}s", t))
+            .unwrap_or_else(|| "disabled".to_string());
         info!(
-            "Navigating to state: {} (monitor: {:?}, timeout: {}s)",
-            state_id, monitor_index, timeout_seconds
+            "Navigating to state: {} (monitor: {:?}, timeout: {})",
+            state_id, monitor_index, timeout_str
         );
 
-        let timeout_duration = Duration::from_secs(timeout_seconds);
+        // Use a very large duration when timeout is disabled (effectively infinite)
+        let timeout_duration = timeout_seconds
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(u64::MAX / 2));
 
         // Build navigation parameters
         let mut params = serde_json::json!({
@@ -495,12 +479,7 @@ impl UnifiedActionService {
         let app_state = self.app_state.clone();
 
         let result = tokio::task::spawn_blocking(move || {
-            let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-                warn!("python_bridge mutex was poisoned, recovering");
-                poisoned.into_inner()
-            });
-
-            if let Some(ref mut bridge) = *bridge_lock {
+            with_default_bridge(&app_state, |bridge| {
                 if !bridge.is_running() {
                     return Err(ActionError::ExecutorNotRunning);
                 }
@@ -529,9 +508,8 @@ impl UnifiedActionService {
                     }
                     Err(e) => Err(ActionError::ActionFailed(e)),
                 }
-            } else {
-                Err(ActionError::ExecutorNotInitialized)
-            }
+            })
+            .map_err(|_| ActionError::ExecutorNotInitialized)?
         })
         .await
         .map_err(|e| ActionError::Internal(format!("spawn_blocking error: {}", e)))??;
@@ -579,17 +557,15 @@ impl UnifiedActionService {
         });
 
         let result = tokio::task::spawn_blocking(move || {
-            let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-                warn!("python_bridge mutex was poisoned, recovering");
-                poisoned.into_inner()
-            });
-
-            if let Some(ref mut bridge) = *bridge_lock {
+            with_default_bridge(&app_state, |bridge| {
                 if !bridge.is_running() {
                     return Err(ActionError::ExecutorNotRunning);
                 }
 
-                let timeout_duration = Duration::from_secs(30);
+                // Use configurable timeout (default: disabled - run until completion)
+                // Falls back to 5 minutes if timeout is disabled to prevent infinite hangs on IPC
+                let timeout_duration = Timeouts::screenshot_capture()
+                    .unwrap_or_else(|| Duration::from_secs(300));
                 match bridge.send_command_and_wait(
                     "capture_screenshot",
                     Some(params),
@@ -608,9 +584,8 @@ impl UnifiedActionService {
                     }
                     Err(e) => Err(ActionError::ActionFailed(e)),
                 }
-            } else {
-                Err(ActionError::ExecutorNotInitialized)
-            }
+            })
+            .map_err(|_| ActionError::ExecutorNotInitialized)?
         })
         .await
         .map_err(|e| ActionError::Internal(format!("spawn_blocking error: {}", e)))??;

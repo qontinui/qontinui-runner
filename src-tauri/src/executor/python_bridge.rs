@@ -9,9 +9,9 @@ use std::process::Child;
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::Emitter;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::time::timeout;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, instrument};
 
 // Re-export protocol types for backward compatibility
 pub use super::protocol::ExecutorEvent;
@@ -39,6 +39,10 @@ pub struct PythonBridge {
 
     /// Runtime for async tasks
     runtime: Arc<tokio::runtime::Runtime>,
+
+    /// Headless event channel (only used when in headless mode).
+    /// Events go here instead of Tauri frontend emit.
+    headless_events: Option<broadcast::Sender<serde_json::Value>>,
 }
 
 impl PythonBridge {
@@ -54,11 +58,61 @@ impl PythonBridge {
             health_monitor: Arc::new(HealthMonitor::new()),
             app_handle,
             runtime,
+            headless_events: None,
         }
     }
 
+    /// Create a new PythonBridge in headless mode.
+    ///
+    /// Headless mode disables GUI interactions (screen capture, mouse/keyboard).
+    /// Multiple headless bridges can run in parallel.
+    pub fn new_headless(app_handle: tauri::AppHandle) -> Self {
+        let runtime =
+            Arc::new(tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime"));
+
+        Self {
+            process: None,
+            process_manager: ProcessManager::new_headless(app_handle.clone()),
+            protocol_handler: ProtocolHandler::new(),
+            lifecycle: Arc::new(RwLock::new(ExecutorLifecycle::new())),
+            health_monitor: Arc::new(HealthMonitor::new()),
+            app_handle,
+            runtime,
+            headless_events: None,
+        }
+    }
+
+    /// Set headless mode before starting the bridge.
+    ///
+    /// Must be called before `start()`.
+    pub fn set_headless(&mut self, headless: bool) {
+        self.process_manager.set_headless(headless);
+    }
+
+    /// Check if this bridge is in headless mode.
+    pub fn is_headless(&self) -> bool {
+        self.process_manager.is_headless()
+    }
+
+    /// Set the headless event channel for this bridge.
+    ///
+    /// When set, events will be sent to this channel instead of being emitted
+    /// to the Tauri frontend. Must be called before `start()`.
+    pub fn set_headless_events(&mut self, tx: broadcast::Sender<serde_json::Value>) {
+        self.headless_events = Some(tx);
+    }
+
+    /// Get a clone of the headless event sender, if any.
+    pub fn get_headless_events(&self) -> Option<broadcast::Sender<serde_json::Value>> {
+        self.headless_events.clone()
+    }
+
     /// Starts the Python executor process.
-    pub fn start(&mut self) -> Result<(), String> {
+    ///
+    /// This is an async function that must be called from an async context.
+    /// For synchronous contexts, use the bridge manager which handles the async call.
+    #[instrument(name = "python.startup", skip(self))]
+    pub async fn start(&mut self) -> Result<(), String> {
         // Check if process is already running
         if self.process.is_some() {
             return Err("Python process already running".to_string());
@@ -92,21 +146,41 @@ impl PythonBridge {
         let runtime = Arc::clone(&self.runtime);
 
         // Spawn stdout reader task using output processor
+        // Use headless reader if we have a headless event channel
         let lifecycle_stdout = Arc::clone(&lifecycle);
         let app_handle_stdout = app_handle.clone();
         let health_monitor_stdout = Arc::clone(&health_monitor);
+        let headless_tx = self.headless_events.clone();
 
-        std::thread::spawn(move || {
-            runtime.block_on(async {
-                OutputProcessor::stdout_reader_task(
-                    stdout,
-                    lifecycle_stdout,
-                    health_monitor_stdout,
-                    app_handle_stdout,
-                )
-                .await;
+        if let Some(tx) = headless_tx {
+            // Headless mode: send events to dedicated channel instead of Tauri frontend
+            info!("Starting headless stdout reader task");
+            std::thread::spawn(move || {
+                runtime.block_on(async {
+                    OutputProcessor::headless_stdout_reader_task(
+                        stdout,
+                        lifecycle_stdout,
+                        health_monitor_stdout,
+                        app_handle_stdout,
+                        tx,
+                    )
+                    .await;
+                });
             });
-        });
+        } else {
+            // GUI mode: emit events to Tauri frontend
+            std::thread::spawn(move || {
+                runtime.block_on(async {
+                    OutputProcessor::stdout_reader_task(
+                        stdout,
+                        lifecycle_stdout,
+                        health_monitor_stdout,
+                        app_handle_stdout,
+                    )
+                    .await;
+                });
+            });
+        }
 
         // Spawn stderr reader task using output processor
         std::thread::spawn(move || {
@@ -130,9 +204,7 @@ impl PythonBridge {
 
         // Start health monitoring
         info!("Starting health monitoring");
-        self.runtime.block_on(async {
-            self.health_monitor.start().await;
-        });
+        self.health_monitor.start().await;
 
         // Start health check task
         let health_monitor_task = Arc::clone(&self.health_monitor);
@@ -185,17 +257,12 @@ impl PythonBridge {
             params: Some(debug_params),
         };
 
-        if let Err(e) = self
-            .runtime
-            .block_on(async { cmd_tx.send(debug_cmd).await })
-        {
+        if let Err(e) = cmd_tx.send(debug_cmd).await {
             error!("Failed to send debug settings to Python: {}", e);
         }
 
         // Drain any queued events
-        let queued_events = self
-            .runtime
-            .block_on(async { self.lifecycle.read().await.drain_queued_events().await });
+        let queued_events = self.lifecycle.read().await.drain_queued_events().await;
 
         for queued in queued_events {
             info!(
@@ -217,26 +284,27 @@ impl PythonBridge {
         Ok(())
     }
 
-    pub fn stop(&mut self) -> Result<(), String> {
+    /// Stops the Python executor process (async version).
+    ///
+    /// This is the preferred method when called from an async context.
+    pub async fn stop(&mut self) -> Result<(), String> {
         info!("Stopping Python executor");
 
         // Stop health monitoring
-        self.runtime.block_on(async {
-            self.health_monitor.stop().await;
-        });
+        self.health_monitor.stop().await;
 
         // Initiate shutdown
-        self.runtime.block_on(async {
+        {
             let lifecycle = self.lifecycle.read().await;
             let _ = lifecycle.shutdown().await;
-        });
+        }
 
         if let Some(mut process) = self.process.take() {
             // Send stop command
-            let _ = self.send_command("stop", None);
+            let _ = self.send_command_async("stop", None).await;
 
             // Wait a bit for graceful shutdown
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
             // Kill the process if still running
             process.kill().map_err(|e| e.to_string())?;
@@ -247,6 +315,83 @@ impl PythonBridge {
         Ok(())
     }
 
+    /// Stops the Python executor process (sync version for Drop).
+    ///
+    /// This version runs the async operations in a separate thread to avoid
+    /// "cannot start a runtime from within a runtime" panics when Drop is
+    /// called from an async context.
+    pub fn stop_sync(&mut self) -> Result<(), String> {
+        info!("Stopping Python executor (sync)");
+
+        // Run async cleanup in a dedicated thread to avoid nested runtime issues
+        let runtime = Arc::clone(&self.runtime);
+        let health_monitor = Arc::clone(&self.health_monitor);
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let protocol_handler_sender = self.protocol_handler.get_sender();
+
+        let cleanup_handle = std::thread::spawn(move || {
+            runtime.block_on(async {
+                // Stop health monitoring
+                health_monitor.stop().await;
+
+                // Initiate shutdown
+                {
+                    let lc = lifecycle.read().await;
+                    let _ = lc.shutdown().await;
+                }
+
+                // Send stop command if channel is available
+                if let Some(tx) = protocol_handler_sender {
+                    let stop_cmd = ExecutorCommand {
+                        cmd_type: "command".to_string(),
+                        id: uuid::Uuid::new_v4().to_string(),
+                        command: "stop".to_string(),
+                        params: None,
+                    };
+                    let _ = tx.send(stop_cmd).await;
+                }
+            });
+        });
+
+        // Wait for cleanup thread with timeout
+        let _ = cleanup_handle.join();
+
+        if let Some(mut process) = self.process.take() {
+            // Wait a bit for graceful shutdown
+            std::thread::sleep(std::time::Duration::from_millis(500));
+
+            // Kill the process if still running
+            process.kill().map_err(|e| e.to_string())?;
+            process.wait().map_err(|e| e.to_string())?;
+        }
+
+        info!("Python executor stopped (sync)");
+        Ok(())
+    }
+
+    /// Send a command to the Python executor (async version).
+    pub async fn send_command_async(&self, command: &str, params: Option<Value>) -> Result<(), String> {
+        let cmd = ExecutorCommand {
+            cmd_type: "command".to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            command: command.to_string(),
+            params,
+        };
+
+        if let Some(tx) = self.protocol_handler.get_sender() {
+            tx.send(cmd)
+                .await
+                .map_err(|e| format!("Failed to send command: {}", e))?;
+            Ok(())
+        } else {
+            Err("Command channel not initialized".to_string())
+        }
+    }
+
+    /// Send a command to the Python executor (sync version).
+    ///
+    /// Note: This uses block_on internally and should NOT be called from async contexts.
+    /// Use send_command_async instead when in an async context.
     pub fn send_command(&mut self, command: &str, params: Option<Value>) -> Result<(), String> {
         let cmd = ExecutorCommand {
             cmd_type: "command".to_string(),
@@ -399,6 +544,11 @@ impl PythonBridge {
         self.send_command("ws_disconnect", None)
     }
 
+    /// Check if the executor is running (sync version).
+    ///
+    /// WARNING: This method uses block_on internally and MUST NOT be called from
+    /// within a tokio async context. If you're in an async function, use
+    /// `is_running_async()` instead.
     pub fn is_running(&self) -> bool {
         debug!("[PYTHON_BRIDGE] is_running() called");
         let result = self.runtime.block_on(async {
@@ -416,6 +566,23 @@ impl PythonBridge {
         result
     }
 
+    /// Check if the executor is running (async version).
+    ///
+    /// Use this version when calling from within an async context (e.g., Tauri async commands,
+    /// axum handlers, async functions). This avoids the nested runtime panic that would occur
+    /// with `is_running()`.
+    pub async fn is_running_async(&self) -> bool {
+        debug!("[PYTHON_BRIDGE] is_running_async() called");
+        let state = self.lifecycle.read().await.get_state().await;
+        debug!("[PYTHON_BRIDGE] is_running_async() - got state: {}", state.name());
+        let can_accept = state.can_accept_commands();
+        debug!(
+            "[PYTHON_BRIDGE] is_running_async() - can_accept_commands: {}",
+            can_accept
+        );
+        can_accept
+    }
+
     /// Sends a command and waits for its response.
     /// This is useful for request-response style commands where
     /// we need the result before continuing.
@@ -428,6 +595,11 @@ impl PythonBridge {
     /// # Returns
     /// The command response result or an error if timeout or send fails
     #[allow(clippy::async_yields_async)]
+    #[instrument(
+        name = "python.command",
+        skip(self, params, timeout_duration),
+        fields(command = %command, timeout_ms = timeout_duration.as_millis() as u64)
+    )]
     pub fn send_command_and_wait(
         &mut self,
         command: &str,
@@ -479,12 +651,29 @@ impl PythonBridge {
         result
     }
 
+    /// Get the current executor state.
+    ///
+    /// WARNING: This method uses block_on internally and MUST NOT be called from
+    /// within a tokio async context. If you're in an async function, use
+    /// `get_state_async()` instead.
     pub fn get_state(&self) -> ExecutorState {
         debug!("[PYTHON_BRIDGE] get_state() called");
         let state = self
             .runtime
             .block_on(async { self.lifecycle.read().await.get_state().await });
         debug!("[PYTHON_BRIDGE] get_state() returning: {}", state.name());
+        state
+    }
+
+    /// Get the current executor state asynchronously.
+    ///
+    /// Use this version when calling from within an async context (e.g., axum handlers,
+    /// async functions). This avoids the nested runtime panic that would occur with
+    /// `get_state()`.
+    pub async fn get_state_async(&self) -> ExecutorState {
+        debug!("[PYTHON_BRIDGE] get_state_async() called");
+        let state = self.lifecycle.read().await.get_state().await;
+        debug!("[PYTHON_BRIDGE] get_state_async() returning: {}", state.name());
         state
     }
 
@@ -498,7 +687,8 @@ impl Drop for PythonBridge {
     fn drop(&mut self) {
         // Always attempt to stop, regardless of reported state
         // This ensures cleanup even if state tracking is inconsistent
-        if let Err(e) = self.stop() {
+        // Use stop_sync to avoid nested runtime issues when Drop is called from async context
+        if let Err(e) = self.stop_sync() {
             error!("Error during PythonBridge drop: {}", e);
         }
     }

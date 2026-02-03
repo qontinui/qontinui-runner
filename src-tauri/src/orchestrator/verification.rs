@@ -5,6 +5,8 @@
 //! AI verification is isolated - the verification agent only sees the screenshot
 //! and evaluation prompt, NOT the worker's reasoning.
 
+#![allow(dead_code)]
+
 use serde::Deserialize;
 use std::process::Command;
 use std::sync::Arc;

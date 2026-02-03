@@ -23,6 +23,8 @@
 //!     .with_output(OutputPort::new("results", PortType::Json));
 //! ```
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -757,7 +759,7 @@ impl SubflowLibrary {
         for tag in &subflow.tags {
             self.category_index
                 .entry(tag.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(id.clone());
         }
         self.subflows.insert(id, subflow);

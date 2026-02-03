@@ -10,6 +10,8 @@
 //! - Summarization of old knowledge entries
 //! - Preservation of recent context
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -413,7 +415,7 @@ impl CompressionService {
         category: &str,
         entries: &[StoredTaskKnowledge],
     ) -> Result<KnowledgeSummary, String> {
-        let covered_iterations: Vec<u32> = entries.iter().map(|e| e.iteration as u32).collect();
+        let covered_iterations: Vec<u32> = entries.iter().map(|e| e.iteration).collect();
 
         // Build a simple extractive summary
         // In a production system, this could use AI summarization

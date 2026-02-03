@@ -2,6 +2,8 @@
 //!
 //! Contains all data structures used for building and returning recap data.
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 
 /// A step in the recap timeline.
@@ -16,6 +18,9 @@ pub struct RecapStep {
     /// Workflow phase: "setup", "verification", "agentic", "completion"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
+    /// Iteration number (for verification/agentic phases in loop)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iteration: Option<u32>,
     /// Icon type for frontend rendering (maps to STEP_ICON_CONFIG).
     /// More specific than step_type (e.g., "check_lint" vs "check").
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -27,6 +32,12 @@ pub struct RecapStep {
     /// Brief summary of what happened (deterministic summary for non-AI steps)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// When this step started (ISO 8601 timestamp)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    /// When this step ended (ISO 8601 timestamp)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<String>,
     /// Duration in milliseconds
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<i64>,

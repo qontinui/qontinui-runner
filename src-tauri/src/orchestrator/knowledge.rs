@@ -10,6 +10,8 @@
 //! - Cross-iteration context preservation
 //! - Agents to query accumulated knowledge
 
+#![allow(dead_code)]
+
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -18,6 +20,19 @@ use crate::orchestrator::compression::{CompressionConfig, CompressionResult, Com
 use crate::orchestrator::types::{
     Confidence, CriterionOverride, Finding, OverrideCollection, WorkerSignal,
 };
+
+// ============================================================================
+// Execution Span Types
+// ============================================================================
+
+/// A stored execution span from the database.
+#[derive(Debug, Clone)]
+pub struct ExecutionSpan {
+    pub name: String,
+    pub duration_ms: Option<u64>,
+    pub success: bool,
+    pub error: Option<String>,
+}
 
 // ============================================================================
 // Knowledge Categories
@@ -528,7 +543,7 @@ impl KnowledgeBase {
                     &criterion_id,
                     &item,
                     &justification,
-                    k.iteration as u32,
+                    k.iteration,
                 ));
             }
         }
@@ -684,6 +699,147 @@ pub fn process_worker_output_full(
 }
 
 // ============================================================================
+// Execution Span Helpers
+// ============================================================================
+
+/// Query execution spans for a task run from the database.
+fn query_execution_spans(
+    db: &CheckpointDb,
+    task_run_id: &str,
+) -> Result<Vec<ExecutionSpan>, String> {
+    let conn = db.get_conn_string()?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT name, duration_ms, success, error
+             FROM execution_spans
+             WHERE execution_id = ?1
+             ORDER BY start_ts ASC",
+        )
+        .map_err(|e| format!("Failed to prepare spans query: {}", e))?;
+
+    let spans = stmt
+        .query_map(rusqlite::params![task_run_id], |row| {
+            Ok(ExecutionSpan {
+                name: row.get(0)?,
+                duration_ms: row.get(1)?,
+                success: row.get(2)?,
+                error: row.get(3)?,
+            })
+        })
+        .map_err(|e| format!("Failed to query spans: {}", e))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(spans)
+}
+
+/// Build a timing summary section from execution spans.
+///
+/// Returns None if there are no spans for the execution.
+fn build_timing_section(spans: &[ExecutionSpan]) -> Option<String> {
+    if spans.is_empty() {
+        return None;
+    }
+
+    let mut section = String::new();
+    section.push_str("### Execution Timing\n\n");
+
+    // Collect phase timings
+    let phase_names = [
+        "workflow.phase.setup",
+        "workflow.phase.verification",
+        "workflow.phase.agentic",
+        "workflow.phase.completion",
+    ];
+    let mut phase_timings = Vec::new();
+    for span in spans {
+        if phase_names.contains(&span.name.as_str()) {
+            if let Some(duration) = span.duration_ms {
+                let phase_name = span
+                    .name
+                    .strip_prefix("workflow.phase.")
+                    .unwrap_or(&span.name);
+                phase_timings.push((phase_name.to_string(), duration, span.success));
+            }
+        }
+    }
+
+    if !phase_timings.is_empty() {
+        section.push_str("**Phase Timings:**\n");
+        for (name, duration, success) in &phase_timings {
+            let status = if *success { "" } else { " (failed)" };
+            section.push_str(&format!(
+                "- {}: {}ms{}\n",
+                name,
+                duration,
+                status
+            ));
+        }
+        section.push('\n');
+    }
+
+    // Collect AI session durations
+    let ai_sessions: Vec<_> = spans
+        .iter()
+        .filter(|s| s.name == "ai.session")
+        .filter_map(|s| s.duration_ms.map(|d| (d, s.success)))
+        .collect();
+
+    if !ai_sessions.is_empty() {
+        section.push_str("**AI Sessions:**\n");
+        let total_ai_time: u64 = ai_sessions.iter().map(|(d, _)| d).sum();
+        let count = ai_sessions.len();
+        let avg = total_ai_time / count as u64;
+        let failed = ai_sessions.iter().filter(|(_, s)| !s).count();
+
+        section.push_str(&format!("- Total: {} sessions, {}ms total\n", count, total_ai_time));
+        section.push_str(&format!("- Average: {}ms per session\n", avg));
+        if failed > 0 {
+            section.push_str(&format!("- Failed: {} sessions\n", failed));
+        }
+        section.push('\n');
+    }
+
+    // Identify slow operations (>5 seconds)
+    let slow_threshold_ms = 5000u64;
+    let slow_ops: Vec<_> = spans
+        .iter()
+        .filter_map(|s| {
+            s.duration_ms.and_then(|d| {
+                if d > slow_threshold_ms {
+                    Some((s.name.clone(), d, s.success, s.error.clone()))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+
+    if !slow_ops.is_empty() {
+        section.push_str("**Slow Operations (>5s):**\n");
+        for (name, duration, success, error) in slow_ops.iter().take(10) {
+            let status = if *success {
+                String::new()
+            } else if let Some(err) = error {
+                format!(" - FAILED: {}", err)
+            } else {
+                " - FAILED".to_string()
+            };
+            section.push_str(&format!("- {}: {}ms{}\n", name, duration, status));
+        }
+        section.push('\n');
+    }
+
+    // Only return if we added meaningful content
+    if section.len() > 25 {
+        Some(section)
+    } else {
+        None
+    }
+}
+
+// ============================================================================
 // Cross-Iteration Context Builder
 // ============================================================================
 
@@ -791,6 +947,13 @@ pub fn build_iteration_context_with_compression(
             context.push_str(&format!("- {} {}\n", status, sol.content));
         }
         context.push('\n');
+    }
+
+    // Add execution timing information if spans exist
+    if let Ok(spans) = query_execution_spans(&kb.db, task_run_id) {
+        if let Some(timing_section) = build_timing_section(&spans) {
+            context.push_str(&timing_section);
+        }
     }
 
     if context.len() > 30 {

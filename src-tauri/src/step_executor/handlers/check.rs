@@ -1,0 +1,699 @@
+//! Check Step Handler
+//!
+//! Handles check steps that run code quality checks (lint, format, typecheck, etc.)
+//! with automatic language detection and tool selection.
+
+use async_trait::async_trait;
+use serde_json::json;
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::process::Command;
+use tokio::time::timeout;
+use tracing::{info, warn};
+
+use super::{HandlerContext, StepHandler, StepHandlerResult};
+use crate::step_executor::executor::ExecutionStepConfig;
+
+/// Handler for check steps.
+pub struct CheckHandler;
+
+#[async_trait]
+impl StepHandler for CheckHandler {
+    fn step_type(&self) -> &'static str {
+        "check"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Check"
+    }
+
+    async fn execute(
+        &self,
+        step: &ExecutionStepConfig,
+        context: &HandlerContext,
+    ) -> StepHandlerResult {
+        let check_type = step.check_type.as_deref().unwrap_or("custom_command");
+        let step_name = step.name.as_deref().unwrap_or("Check");
+        let timeout_secs = step.timeout_seconds;
+
+        // Note: Due to serde alias conflict, "working_directory" goes to shell_command_working_directory
+        // So we check both fields for backwards compatibility
+        let working_directory = step
+            .check_working_directory
+            .clone()
+            .or_else(|| step.shell_command_working_directory.clone());
+
+        info!(
+            "execute_check_step: step_name={:?}, check_type={:?}, check_command={:?}, working_dir={:?}",
+            step.name, step.check_type, step.check_command, step.check_working_directory
+        );
+
+        // Handle http_status check type separately
+        if check_type == "http_status" {
+            return Self::execute_http_status_check(step, step_name, timeout_secs, context).await;
+        }
+
+        // Detect project type from working directory
+        let detected_language = Self::detect_language(working_directory.as_deref().unwrap_or("."));
+
+        info!(
+            "Check step '{}': detected language = {}",
+            step_name, detected_language
+        );
+
+        // Get the command to run
+        let explicit_command = step
+            .check_command
+            .as_ref()
+            .filter(|s| !s.is_empty())
+            .or_else(|| step.shell_command.as_ref().filter(|s| !s.is_empty()));
+
+        let command = match explicit_command {
+            Some(cmd) => Some(cmd.clone()),
+            None => Self::get_auto_command(check_type, &detected_language, step_name),
+        };
+
+        // Handle the case where no command could be determined
+        let command = match command {
+            Some(cmd) => cmd,
+            None => {
+                info!(
+                    "Check step '{}' skipped: no applicable check for type '{}' and language '{}'",
+                    step_name, check_type, detected_language
+                );
+                return StepHandlerResult::success_with_data(json!({
+                    "skipped": true,
+                    "reason": format!(
+                        "No {} check available for {} projects. Specify a command explicitly if needed.",
+                        check_type, detected_language
+                    )
+                }));
+            }
+        };
+
+        let auto_fix = step.check_auto_fix.unwrap_or(false);
+        let final_command = if auto_fix {
+            Self::apply_auto_fix(&command, check_type, &detected_language)
+        } else {
+            command.clone()
+        };
+
+        let timeout_str = timeout_secs
+            .map(|t| format!("{}s", t))
+            .unwrap_or_else(|| "disabled".to_string());
+        info!(
+            "Executing check '{}' ({}): {} (timeout: {}, working_dir: {:?})",
+            step_name, check_type, final_command, timeout_str, working_directory
+        );
+
+        // Generate sequence number and timestamp for tree events
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CHECK_SEQUENCE: AtomicU32 = AtomicU32::new(1);
+        let sequence = CHECK_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+        let timestamp = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let action_id = format!("check-{}", sequence);
+
+        // Truncate command for display
+        let command_display = if final_command.len() > 50 {
+            format!("{}...", &final_command[..50])
+        } else {
+            final_command.clone()
+        };
+
+        // Emit action_started tree event
+        let action_name = format!("CHECK: {}", step_name);
+        let metadata = json!({
+            "check_type": check_type,
+            "command": &command_display,
+            "working_directory": working_directory.as_deref().unwrap_or(""),
+            "auto_fix": auto_fix,
+            "timeout_seconds": timeout_secs,
+        });
+        let (timestamp, sequence) =
+            Self::emit_started(context, &action_id, &action_name, metadata).await;
+
+        // Build the command
+        let mut cmd = if cfg!(target_os = "windows") {
+            let mut c = Command::new("cmd");
+            c.args(["/C", &final_command]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", &final_command]);
+            c
+        };
+
+        // Set working directory if specified
+        if let Some(ref wd) = working_directory {
+            cmd.current_dir(wd);
+        }
+
+        // Capture stdout and stderr
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let start = std::time::Instant::now();
+
+        // Execute with or without timeout
+        let (final_success, error_msg, output_data) = if let Some(timeout_secs_val) = timeout_secs {
+            let timeout_duration = Duration::from_secs(timeout_secs_val);
+            let output_result = timeout(timeout_duration, cmd.output()).await;
+            let duration_ms = start.elapsed().as_millis() as u64;
+
+            match output_result {
+                Ok(Ok(output)) => Self::process_output(output, step_name, duration_ms),
+                Ok(Err(e)) => {
+                    warn!("Failed to execute check '{}': {}", step_name, e);
+                    (false, Some(format!("Failed to execute check: {}", e)), None)
+                }
+                Err(_) => {
+                    warn!("Check '{}' timed out after {}s", step_name, timeout_secs_val);
+                    (
+                        false,
+                        Some(format!("Check timed out after {} seconds", timeout_secs_val)),
+                        None,
+                    )
+                }
+            }
+        } else {
+            let duration_ms = start.elapsed().as_millis() as u64;
+            match cmd.output().await {
+                Ok(output) => Self::process_output(output, step_name, duration_ms),
+                Err(e) => {
+                    warn!("Failed to execute check '{}': {}", step_name, e);
+                    (false, Some(format!("Failed to execute check: {}", e)), None)
+                }
+            }
+        };
+
+        // Emit completion event
+        let total_duration_ms = start.elapsed().as_millis() as u64;
+
+        let result_metadata = json!({
+            "check_type": check_type,
+            "command": &command_display,
+            "working_directory": working_directory.as_deref().unwrap_or(""),
+            "duration_ms": total_duration_ms,
+        });
+
+        if final_success {
+            Self::emit_completed(context, &action_id, &action_name, timestamp, sequence, result_metadata).await;
+        } else {
+            Self::emit_failed(
+                context,
+                &action_id,
+                &action_name,
+                timestamp,
+                sequence,
+                error_msg.as_deref().unwrap_or("Check failed"),
+                Some(result_metadata),
+            )
+            .await;
+        }
+
+        if final_success {
+            match output_data {
+                Some(data) => StepHandlerResult::success_with_data(json!({ "output": data })),
+                None => StepHandlerResult::success(),
+            }
+        } else {
+            match output_data {
+                Some(data) => StepHandlerResult::failure_with_data(
+                    error_msg.unwrap_or_else(|| "Check failed".to_string()),
+                    json!({ "output": data }),
+                ),
+                None => StepHandlerResult::failure(
+                    error_msg.unwrap_or_else(|| "Check failed".to_string()),
+                ),
+            }
+        }
+    }
+}
+
+impl CheckHandler {
+    /// Detect project language from marker files
+    fn detect_language(work_dir: &str) -> String {
+        let path = std::path::Path::new(work_dir);
+
+        if path.join("Cargo.toml").exists() {
+            return "rust".to_string();
+        }
+        if path.join("pyproject.toml").exists()
+            || path.join("setup.py").exists()
+            || path.join("requirements.txt").exists()
+        {
+            return "python".to_string();
+        }
+        if path.join("go.mod").exists() {
+            return "go".to_string();
+        }
+        if path.join("tsconfig.json").exists() {
+            return "typescript".to_string();
+        }
+        if path.join("package.json").exists() {
+            return "javascript".to_string();
+        }
+        if path.join("CMakeLists.txt").exists()
+            || path.join("Makefile").exists()
+            || path.join("configure.ac").exists()
+        {
+            return "c_cpp".to_string();
+        }
+        if path.join("build.gradle").exists()
+            || path.join("build.gradle.kts").exists()
+            || path.join("pom.xml").exists()
+        {
+            return "java".to_string();
+        }
+        if path.join("mix.exs").exists() {
+            return "elixir".to_string();
+        }
+        if path.join("Gemfile").exists() {
+            return "ruby".to_string();
+        }
+        if path.join("composer.json").exists() {
+            return "php".to_string();
+        }
+        if path.join("Package.swift").exists() {
+            return "swift".to_string();
+        }
+
+        // Check for .NET projects
+        if let Ok(entries) = std::fs::read_dir(path) {
+            let has_dotnet = entries.filter_map(|e| e.ok()).any(|entry| {
+                let name = entry.file_name().to_string_lossy().to_string();
+                name.ends_with(".csproj") || name.ends_with(".sln") || name.ends_with(".fsproj")
+            });
+            if has_dotnet {
+                return "dotnet".to_string();
+            }
+        }
+
+        "unknown".to_string()
+    }
+
+    /// Get auto-detected command for check type and language
+    fn get_auto_command(check_type: &str, language: &str, step_name: &str) -> Option<String> {
+        match (check_type, language) {
+            // Python
+            ("lint", "python") => Some("ruff check .".to_string()),
+            ("format", "python") => Some("black --check .".to_string()),
+            ("typecheck", "python") => Some("mypy .".to_string()),
+            ("analyze", "python") => Some("ruff check . --statistics".to_string()),
+            ("security", "python") => Some("pip-audit".to_string()),
+
+            // Rust
+            ("lint", "rust") => Some("cargo clippy -- -D warnings".to_string()),
+            ("format", "rust") => Some("cargo fmt --check".to_string()),
+            ("typecheck", "rust") => Some("cargo check".to_string()),
+            ("analyze", "rust") => Some("cargo clippy --all-targets --all-features".to_string()),
+            ("security", "rust") => Some("cargo audit".to_string()),
+
+            // Go
+            ("lint", "go") => Some("golangci-lint run".to_string()),
+            ("format", "go") => Some("gofmt -l .".to_string()),
+            ("typecheck", "go") => Some("go vet ./...".to_string()),
+            ("analyze", "go") => Some("go vet ./... && staticcheck ./...".to_string()),
+            ("security", "go") => Some("gosec ./...".to_string()),
+
+            // TypeScript
+            ("lint", "typescript") => Some("npx eslint . --ext .ts,.tsx".to_string()),
+            ("format", "typescript") => Some("npx prettier --check .".to_string()),
+            ("typecheck", "typescript") => Some("npx tsc --noEmit".to_string()),
+            ("analyze", "typescript") => Some("npx eslint . --ext .ts,.tsx --format json".to_string()),
+            ("security", "typescript") => Some("npm audit".to_string()),
+
+            // JavaScript
+            ("lint", "javascript") => Some("npx eslint .".to_string()),
+            ("format", "javascript") => Some("npx prettier --check .".to_string()),
+            ("typecheck", "javascript") => None,
+            ("analyze", "javascript") => Some("npx eslint . --format json".to_string()),
+            ("security", "javascript") => Some("npm audit".to_string()),
+
+            // C/C++
+            ("lint", "c_cpp") => Some("cppcheck --enable=all .".to_string()),
+            ("format", "c_cpp") => Some("clang-format --dry-run -Werror **/*.cpp **/*.c **/*.h".to_string()),
+            ("typecheck", "c_cpp") => Some("make -n".to_string()),
+            ("analyze", "c_cpp") => Some("cppcheck --enable=all --xml .".to_string()),
+            ("security", "c_cpp") => Some("flawfinder .".to_string()),
+
+            // Java
+            ("lint", "java") => Some("./gradlew checkstyleMain || mvn checkstyle:check".to_string()),
+            ("format", "java") => Some("./gradlew spotlessCheck || mvn spotless:check".to_string()),
+            ("typecheck", "java") => Some("./gradlew compileJava || mvn compile".to_string()),
+            ("analyze", "java") => Some("./gradlew pmd || mvn pmd:check".to_string()),
+            ("security", "java") => Some("./gradlew dependencyCheckAnalyze || mvn org.owasp:dependency-check-maven:check".to_string()),
+
+            // Ruby
+            ("lint", "ruby") => Some("bundle exec rubocop".to_string()),
+            ("format", "ruby") => Some("bundle exec rubocop --format offenses".to_string()),
+            ("typecheck", "ruby") => Some("bundle exec srb tc".to_string()),
+            ("analyze", "ruby") => Some("bundle exec rubocop --format json".to_string()),
+            ("security", "ruby") => Some("bundle exec bundler-audit check".to_string()),
+
+            // PHP
+            ("lint", "php") => Some("./vendor/bin/phpcs".to_string()),
+            ("format", "php") => Some("./vendor/bin/php-cs-fixer fix --dry-run --diff".to_string()),
+            ("typecheck", "php") => Some("./vendor/bin/phpstan analyse".to_string()),
+            ("analyze", "php") => Some("./vendor/bin/phpmd . text cleancode,codesize,controversial".to_string()),
+            ("security", "php") => Some("composer audit".to_string()),
+
+            // Elixir
+            ("lint", "elixir") => Some("mix credo".to_string()),
+            ("format", "elixir") => Some("mix format --check-formatted".to_string()),
+            ("typecheck", "elixir") => Some("mix dialyzer".to_string()),
+            ("analyze", "elixir") => Some("mix credo --format json".to_string()),
+            ("security", "elixir") => Some("mix deps.audit".to_string()),
+
+            // Swift
+            ("lint", "swift") => Some("swiftlint".to_string()),
+            ("format", "swift") => Some("swiftformat --lint .".to_string()),
+            ("typecheck", "swift") => Some("swift build".to_string()),
+            ("analyze", "swift") => Some("swiftlint --reporter json".to_string()),
+            ("security", "swift") => None,
+
+            // .NET
+            ("lint", "dotnet") | ("format", "dotnet") => Some("dotnet format --verify-no-changes".to_string()),
+            ("typecheck", "dotnet") => Some("dotnet build --no-restore".to_string()),
+            ("analyze", "dotnet") => Some("dotnet build /p:TreatWarningsAsErrors=true".to_string()),
+            ("security", "dotnet") => Some("dotnet list package --vulnerable".to_string()),
+
+            // Unknown language
+            (check_type_val, "unknown") => {
+                warn!(
+                    "Check step '{}': No language detected, skipping {} check.",
+                    step_name, check_type_val
+                );
+                None
+            }
+
+            // Unrecognized combination
+            _ => {
+                warn!(
+                    "Check step '{}': Unsupported check type '{}' for language '{}'",
+                    step_name, check_type, language
+                );
+                None
+            }
+        }
+    }
+
+    /// Apply auto-fix modifications to command
+    fn apply_auto_fix(command: &str, check_type: &str, language: &str) -> String {
+        match (check_type, language) {
+            ("lint", "python") => command.replace("ruff check", "ruff check --fix"),
+            ("format", "python") => command.replace("--check", ""),
+            ("lint", "rust") => command.replace("cargo clippy", "cargo clippy --fix"),
+            ("format", "rust") => command.replace("--check", ""),
+            ("lint", "go") => command.replace("golangci-lint run", "golangci-lint run --fix"),
+            ("format", "go") => command.replace("gofmt -l", "gofmt -w"),
+            ("lint", "typescript") | ("lint", "javascript") => {
+                if command.contains("eslint") {
+                    format!("{} --fix", command)
+                } else {
+                    command.replace("lint", "lint:fix")
+                }
+            }
+            ("format", "typescript") | ("format", "javascript") => {
+                if command.contains("prettier") {
+                    command.replace("--check", "--write")
+                } else {
+                    command.replace("format:check", "format").replace("--check", "")
+                }
+            }
+            ("format", "c_cpp") => command.replace("--dry-run -Werror", "-i"),
+            ("lint", "ruby") | ("format", "ruby") => format!("{} --autocorrect", command),
+            ("lint", "php") => command.replace("phpcs", "phpcbf"),
+            ("format", "php") => command.replace("--dry-run --diff", ""),
+            ("format", "elixir") => command.replace("--check-formatted", ""),
+            ("lint", "swift") => format!("{} --fix", command),
+            ("format", "swift") => command.replace("--lint", ""),
+            ("lint", "dotnet") | ("format", "dotnet") => command.replace("--verify-no-changes", ""),
+            _ => command.to_string(),
+        }
+    }
+
+    /// Process command output
+    fn process_output(
+        output: std::process::Output,
+        step_name: &str,
+        duration_ms: u64,
+    ) -> (bool, Option<String>, Option<String>) {
+        let exit_code = output.status.code();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let success = output.status.success();
+
+        info!(
+            "Check '{}' completed: success={}, exit_code={:?}, duration={}ms",
+            step_name, success, exit_code, duration_ms
+        );
+
+        if success {
+            let output_data = if stdout.is_empty() { None } else { Some(stdout) };
+            (true, None, output_data)
+        } else {
+            let mut combined_output = String::new();
+            if !stdout.is_empty() {
+                combined_output.push_str("=== STDOUT ===\n");
+                combined_output.push_str(&stdout);
+            }
+            if !stderr.is_empty() {
+                if !combined_output.is_empty() {
+                    combined_output.push_str("\n\n");
+                }
+                combined_output.push_str("=== STDERR ===\n");
+                combined_output.push_str(&stderr);
+            }
+            let error_summary = if !stderr.is_empty() {
+                stderr.lines().take(5).collect::<Vec<_>>().join("\n")
+            } else {
+                stdout.lines().take(5).collect::<Vec<_>>().join("\n")
+            };
+            (
+                false,
+                Some(format!(
+                    "Check failed (exit code {:?}): {}",
+                    exit_code,
+                    error_summary.trim()
+                )),
+                Some(combined_output),
+            )
+        }
+    }
+
+    /// Emit started tree event for UI updates
+    async fn emit_started(
+        context: &HandlerContext,
+        action_id: &str,
+        action_name: &str,
+        metadata: serde_json::Value,
+    ) -> (f64, u32) {
+        context
+            .event_emitter
+            .emit_action_started(action_id, action_name, metadata)
+            .await
+    }
+
+    /// Emit completed tree event for UI updates
+    async fn emit_completed(
+        context: &HandlerContext,
+        action_id: &str,
+        action_name: &str,
+        start_timestamp: f64,
+        sequence: u32,
+        metadata: serde_json::Value,
+    ) {
+        context
+            .event_emitter
+            .emit_action_completed(action_id, action_name, start_timestamp, sequence, metadata)
+            .await;
+    }
+
+    /// Emit failed tree event for UI updates
+    async fn emit_failed(
+        context: &HandlerContext,
+        action_id: &str,
+        action_name: &str,
+        start_timestamp: f64,
+        sequence: u32,
+        error: &str,
+        metadata: Option<serde_json::Value>,
+    ) {
+        context
+            .event_emitter
+            .emit_action_failed(action_id, action_name, start_timestamp, sequence, error, metadata)
+            .await;
+    }
+
+    /// Execute HTTP status check
+    async fn execute_http_status_check(
+        step: &ExecutionStepConfig,
+        step_name: &str,
+        timeout_secs: Option<u64>,
+        context: &HandlerContext,
+    ) -> StepHandlerResult {
+        let url = match &step.check_url {
+            Some(u) => u.clone(),
+            None => {
+                return StepHandlerResult::failure("check_url is required for http_status check");
+            }
+        };
+
+        let expected_status = step.expected_status.unwrap_or(200);
+        let timeout = timeout_secs
+            .map(|t| Duration::from_secs(t.min(300)))
+            .unwrap_or(Duration::from_secs(300));
+
+        info!(
+            "Executing HTTP status check '{}': url={}, expected_status={}, timeout={}s",
+            step_name,
+            url,
+            expected_status,
+            timeout.as_secs()
+        );
+
+        // Generate action ID
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static HTTP_CHECK_SEQUENCE: AtomicU32 = AtomicU32::new(1);
+        let seq_num = HTTP_CHECK_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+        let action_id = format!("http-check-{}", seq_num);
+        let action_name = format!("HTTP CHECK: {}", step_name);
+
+        let metadata = json!({
+            "check_type": "http_status",
+            "url": &url,
+            "expected_status": expected_status,
+            "timeout_seconds": timeout.as_secs(),
+        });
+
+        let (timestamp, sequence) =
+            Self::emit_started(context, &action_id, &action_name, metadata).await;
+
+        let start = std::time::Instant::now();
+        let client = match reqwest::Client::builder().timeout(timeout).build() {
+            Ok(c) => c,
+            Err(e) => {
+                return StepHandlerResult::failure(format!("Failed to create HTTP client: {}", e));
+            }
+        };
+
+        let result = client.get(&url).send().await;
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        let (final_success, error_msg, output_data) = match result {
+            Ok(response) => {
+                let actual_status = response.status().as_u16();
+                info!(
+                    "HTTP check '{}' completed: actual_status={}, expected={}, duration={}ms",
+                    step_name, actual_status, expected_status, duration_ms
+                );
+
+                if actual_status == expected_status {
+                    (
+                        true,
+                        None,
+                        Some(json!({
+                            "status": actual_status,
+                            "url": url,
+                            "duration_ms": duration_ms
+                        })),
+                    )
+                } else {
+                    (
+                        false,
+                        Some(format!(
+                            "Expected status {} but got {}",
+                            expected_status, actual_status
+                        )),
+                        Some(json!({
+                            "expected_status": expected_status,
+                            "actual_status": actual_status,
+                            "url": url,
+                            "duration_ms": duration_ms
+                        })),
+                    )
+                }
+            }
+            Err(e) => {
+                warn!("HTTP check '{}' failed: {}", step_name, e);
+                (
+                    false,
+                    Some(format!("HTTP request failed: {}", e)),
+                    None,
+                )
+            }
+        };
+
+        // Emit completion event
+        let result_metadata = json!({
+            "check_type": "http_status",
+            "url": &url,
+            "duration_ms": duration_ms,
+        });
+
+        if final_success {
+            Self::emit_completed(context, &action_id, &action_name, timestamp, sequence, result_metadata).await;
+        } else {
+            Self::emit_failed(
+                context,
+                &action_id,
+                &action_name,
+                timestamp,
+                sequence,
+                error_msg.as_deref().unwrap_or("HTTP check failed"),
+                Some(result_metadata),
+            )
+            .await;
+        }
+
+        if final_success {
+            match output_data {
+                Some(data) => StepHandlerResult::success_with_data(data),
+                None => StepHandlerResult::success(),
+            }
+        } else {
+            match output_data {
+                Some(data) => StepHandlerResult::failure_with_data(
+                    error_msg.unwrap_or_else(|| "HTTP check failed".to_string()),
+                    data,
+                ),
+                None => StepHandlerResult::failure(
+                    error_msg.unwrap_or_else(|| "HTTP check failed".to_string()),
+                ),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_check_handler_step_type() {
+        let handler = CheckHandler;
+        assert_eq!(handler.step_type(), "check");
+        assert_eq!(handler.display_name(), "Check");
+    }
+
+    #[test]
+    fn test_detect_language_rust() {
+        // This test would need a temp directory with Cargo.toml
+        // For now, just verify the function exists and compiles
+        let lang = CheckHandler::detect_language(".");
+        assert!(!lang.is_empty());
+    }
+
+    #[test]
+    fn test_get_auto_command_rust_lint() {
+        let cmd = CheckHandler::get_auto_command("lint", "rust", "test");
+        assert_eq!(cmd, Some("cargo clippy -- -D warnings".to_string()));
+    }
+
+    #[test]
+    fn test_apply_auto_fix_python_lint() {
+        let cmd = CheckHandler::apply_auto_fix("ruff check .", "lint", "python");
+        assert_eq!(cmd, "ruff check --fix .");
+    }
+}

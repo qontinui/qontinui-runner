@@ -1,5 +1,7 @@
 //! Type definitions for the Tiered Information Model.
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

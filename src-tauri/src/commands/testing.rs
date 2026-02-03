@@ -14,6 +14,7 @@ use crate::database::{
     CreateTestResultInput, CreateVerificationTestInput, TestResultStatus, TriggerPoint,
     VerificationTest,
 };
+use crate::executor::{is_default_bridge_running, with_default_bridge};
 use crate::test_executor::{
     execute_test, execute_test_suite, RepoTestConfig, TestCategory, TestDefinition,
     TestExecutionResult, TestStatus, TestSuiteSummary, TestType, VisionConfig,
@@ -323,7 +324,7 @@ fn db_test_to_definition(test: &VerificationTest) -> TestDefinition {
         vision_config,
         python_code: test.python_code.clone(),
         repo_test_config,
-        timeout_seconds: test.timeout_seconds,
+        timeout_seconds: test.timeout_seconds.unwrap_or(60),
         is_critical: test.is_critical,
         config: test.config.clone(),
     }
@@ -914,7 +915,7 @@ pub fn export_tests_to_file(
                     repo_test_config: test.repo_test_config,
                     success_criteria: test.success_criteria,
                     config: test.config,
-                    timeout_seconds: test.timeout_seconds,
+                    timeout_seconds: test.timeout_seconds.unwrap_or(60),
                     is_critical: test.is_critical,
                     enabled: test.enabled,
                     tags: test.tags,
@@ -1117,7 +1118,7 @@ fn import_single_test(
                 repo_test_config: exported.repo_test_config.clone(),
                 success_criteria: exported.success_criteria.clone(),
                 config: exported.config.clone(),
-                timeout_seconds: exported.timeout_seconds,
+                timeout_seconds: Some(exported.timeout_seconds),
                 is_critical: exported.is_critical,
                 enabled: exported.enabled,
                 ai_generated: false,
@@ -1162,7 +1163,7 @@ fn import_single_test(
             repo_test_config: exported.repo_test_config.clone(),
             success_criteria: exported.success_criteria.clone(),
             config: exported.config.clone(),
-            timeout_seconds: exported.timeout_seconds,
+            timeout_seconds: Some(exported.timeout_seconds),
             is_critical: exported.is_critical,
             enabled: exported.enabled,
             ai_generated: false,
@@ -1218,69 +1219,59 @@ pub fn analyze_page_playwright(
     let port = cdp_port.unwrap_or(9222);
     info!("Analyzing page via Playwright CDP on port {}", port);
 
-    let mut bridge_lock = match state.python_bridge.lock() {
-        Ok(lock) => lock,
-        Err(e) => {
-            return CommandResponse {
-                success: false,
-                message: Some(format!("Failed to acquire lock: {}", e)),
-                data: None,
-            };
-        }
-    };
+    if !is_default_bridge_running(&state) {
+        return CommandResponse {
+            success: false,
+            message: Some(
+                "Python executor not running. Please start the executor first.".to_string(),
+            ),
+            data: None,
+        };
+    }
 
-    if let Some(ref mut bridge) = *bridge_lock {
-        if !bridge.is_running() {
-            return CommandResponse {
-                success: false,
-                message: Some(
-                    "Python executor not running. Please start the executor first.".to_string(),
-                ),
-                data: None,
-            };
-        }
+    let params = serde_json::json!({
+        "cdp_port": port,
+    });
 
-        let params = serde_json::json!({
-            "cdp_port": port,
-        });
-
-        // Use send_command_and_wait for synchronous response
-        match bridge.send_command_and_wait(
+    // Use send_command_and_wait for synchronous response
+    let result = with_default_bridge(&state, |bridge| {
+        bridge.send_command_and_wait(
             "analyze_page_playwright",
             Some(params),
             std::time::Duration::from_secs(60),
-        ) {
-            Ok(response) => {
-                if response.success {
-                    CommandResponse {
-                        success: true,
-                        message: Some("Page analysis completed".to_string()),
-                        data: response.data,
-                    }
-                } else {
-                    CommandResponse {
-                        success: false,
-                        message: Some(
-                            response
-                                .error
-                                .unwrap_or_else(|| "Analysis failed".to_string()),
-                        ),
-                        data: None,
-                    }
+        )
+    });
+
+    match result {
+        Ok(Ok(response)) => {
+            if response.success {
+                CommandResponse {
+                    success: true,
+                    message: Some("Page analysis completed".to_string()),
+                    data: response.data,
+                }
+            } else {
+                CommandResponse {
+                    success: false,
+                    message: Some(
+                        response
+                            .error
+                            .unwrap_or_else(|| "Analysis failed".to_string()),
+                    ),
+                    data: None,
                 }
             }
-            Err(e) => CommandResponse {
-                success: false,
-                message: Some(format!("Command failed: {}", e)),
-                data: None,
-            },
         }
-    } else {
-        CommandResponse {
+        Ok(Err(e)) => CommandResponse {
             success: false,
-            message: Some("Python executor not initialized".to_string()),
+            message: Some(format!("Command failed: {}", e)),
             data: None,
-        }
+        },
+        Err(e) => CommandResponse {
+            success: false,
+            message: Some(format!("Bridge error: {}", e)),
+            data: None,
+        },
     }
 }
 
@@ -1303,69 +1294,59 @@ pub fn analyze_page_playwright_script(
         script.len()
     );
 
-    let mut bridge_lock = match state.python_bridge.lock() {
-        Ok(lock) => lock,
-        Err(e) => {
-            return CommandResponse {
-                success: false,
-                message: Some(format!("Failed to acquire lock: {}", e)),
-                data: None,
-            };
-        }
-    };
+    if !is_default_bridge_running(&state) {
+        return CommandResponse {
+            success: false,
+            message: Some(
+                "Python executor not running. Please start the executor first.".to_string(),
+            ),
+            data: None,
+        };
+    }
 
-    if let Some(ref mut bridge) = *bridge_lock {
-        if !bridge.is_running() {
-            return CommandResponse {
-                success: false,
-                message: Some(
-                    "Python executor not running. Please start the executor first.".to_string(),
-                ),
-                data: None,
-            };
-        }
+    let params = serde_json::json!({
+        "script": script,
+    });
 
-        let params = serde_json::json!({
-            "script": script,
-        });
-
-        // Use longer timeout for script execution (may include navigation, waiting, etc.)
-        match bridge.send_command_and_wait(
+    // Use longer timeout for script execution (may include navigation, waiting, etc.)
+    let result = with_default_bridge(&state, |bridge| {
+        bridge.send_command_and_wait(
             "analyze_page_playwright_script",
             Some(params),
             std::time::Duration::from_secs(120),
-        ) {
-            Ok(response) => {
-                if response.success {
-                    CommandResponse {
-                        success: true,
-                        message: Some("Page analysis completed".to_string()),
-                        data: response.data,
-                    }
-                } else {
-                    CommandResponse {
-                        success: false,
-                        message: Some(
-                            response
-                                .error
-                                .unwrap_or_else(|| "Analysis failed".to_string()),
-                        ),
-                        data: None,
-                    }
+        )
+    });
+
+    match result {
+        Ok(Ok(response)) => {
+            if response.success {
+                CommandResponse {
+                    success: true,
+                    message: Some("Page analysis completed".to_string()),
+                    data: response.data,
+                }
+            } else {
+                CommandResponse {
+                    success: false,
+                    message: Some(
+                        response
+                            .error
+                            .unwrap_or_else(|| "Analysis failed".to_string()),
+                    ),
+                    data: None,
                 }
             }
-            Err(e) => CommandResponse {
-                success: false,
-                message: Some(format!("Command failed: {}", e)),
-                data: None,
-            },
         }
-    } else {
-        CommandResponse {
+        Ok(Err(e)) => CommandResponse {
             success: false,
-            message: Some("Python executor not initialized".to_string()),
+            message: Some(format!("Command failed: {}", e)),
             data: None,
-        }
+        },
+        Err(e) => CommandResponse {
+            success: false,
+            message: Some(format!("Bridge error: {}", e)),
+            data: None,
+        },
     }
 }
 
@@ -1385,69 +1366,59 @@ pub fn analyze_page_vision(
     let monitor = monitor_index.unwrap_or(0);
     info!("Analyzing page via Vision on monitor {}", monitor);
 
-    let mut bridge_lock = match state.python_bridge.lock() {
-        Ok(lock) => lock,
-        Err(e) => {
-            return CommandResponse {
-                success: false,
-                message: Some(format!("Failed to acquire lock: {}", e)),
-                data: None,
-            };
-        }
-    };
+    if !is_default_bridge_running(&state) {
+        return CommandResponse {
+            success: false,
+            message: Some(
+                "Python executor not running. Please start the executor first.".to_string(),
+            ),
+            data: None,
+        };
+    }
 
-    if let Some(ref mut bridge) = *bridge_lock {
-        if !bridge.is_running() {
-            return CommandResponse {
-                success: false,
-                message: Some(
-                    "Python executor not running. Please start the executor first.".to_string(),
-                ),
-                data: None,
-            };
-        }
+    let params = serde_json::json!({
+        "monitor_index": monitor,
+    });
 
-        let params = serde_json::json!({
-            "monitor_index": monitor,
-        });
-
-        // Use send_command_and_wait for synchronous response
-        match bridge.send_command_and_wait(
+    // Use send_command_and_wait for synchronous response
+    let result = with_default_bridge(&state, |bridge| {
+        bridge.send_command_and_wait(
             "analyze_page_vision",
             Some(params),
             std::time::Duration::from_secs(120), // Vision analysis can take longer
-        ) {
-            Ok(response) => {
-                if response.success {
-                    CommandResponse {
-                        success: true,
-                        message: Some("Page analysis completed".to_string()),
-                        data: response.data,
-                    }
-                } else {
-                    CommandResponse {
-                        success: false,
-                        message: Some(
-                            response
-                                .error
-                                .unwrap_or_else(|| "Analysis failed".to_string()),
-                        ),
-                        data: None,
-                    }
+        )
+    });
+
+    match result {
+        Ok(Ok(response)) => {
+            if response.success {
+                CommandResponse {
+                    success: true,
+                    message: Some("Page analysis completed".to_string()),
+                    data: response.data,
+                }
+            } else {
+                CommandResponse {
+                    success: false,
+                    message: Some(
+                        response
+                            .error
+                            .unwrap_or_else(|| "Analysis failed".to_string()),
+                    ),
+                    data: None,
                 }
             }
-            Err(e) => CommandResponse {
-                success: false,
-                message: Some(format!("Command failed: {}", e)),
-                data: None,
-            },
         }
-    } else {
-        CommandResponse {
+        Ok(Err(e)) => CommandResponse {
             success: false,
-            message: Some("Python executor not initialized".to_string()),
+            message: Some(format!("Command failed: {}", e)),
             data: None,
-        }
+        },
+        Err(e) => CommandResponse {
+            success: false,
+            message: Some(format!("Bridge error: {}", e)),
+            data: None,
+        },
     }
 }
 
@@ -1574,65 +1545,55 @@ pub async fn generate_test_with_ai(
     // Execute in spawn_blocking to avoid blocking the main thread
     // This prevents "Not Responding" on Windows during AI generation
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = match app_state.python_bridge.lock() {
-            Ok(lock) => lock,
-            Err(e) => {
-                return CommandResponse {
-                    success: false,
-                    message: Some(format!("Failed to acquire lock: {}", e)),
-                    data: None,
-                };
-            }
-        };
+        if !is_default_bridge_running(&app_state) {
+            return CommandResponse {
+                success: false,
+                message: Some(
+                    "Python executor not running. Please start the executor first.".to_string(),
+                ),
+                data: None,
+            };
+        }
 
-        if let Some(ref mut bridge) = *bridge_lock {
-            if !bridge.is_running() {
-                return CommandResponse {
-                    success: false,
-                    message: Some(
-                        "Python executor not running. Please start the executor first.".to_string(),
-                    ),
-                    data: None,
-                };
-            }
-
-            // Use longer timeout for AI generation (can take time)
-            match bridge.send_command_and_wait(
+        // Use longer timeout for AI generation (can take time)
+        let bridge_result = with_default_bridge(&app_state, |bridge| {
+            bridge.send_command_and_wait(
                 "generate_test_with_ai",
                 Some(params),
                 std::time::Duration::from_secs(180),
-            ) {
-                Ok(response) => {
-                    if response.success {
-                        CommandResponse {
-                            success: true,
-                            message: Some("Test generated successfully".to_string()),
-                            data: response.data,
-                        }
-                    } else {
-                        CommandResponse {
-                            success: false,
-                            message: Some(
-                                response
-                                    .error
-                                    .unwrap_or_else(|| "Generation failed".to_string()),
-                            ),
-                            data: None,
-                        }
+            )
+        });
+
+        match bridge_result {
+            Ok(Ok(response)) => {
+                if response.success {
+                    CommandResponse {
+                        success: true,
+                        message: Some("Test generated successfully".to_string()),
+                        data: response.data,
+                    }
+                } else {
+                    CommandResponse {
+                        success: false,
+                        message: Some(
+                            response
+                                .error
+                                .unwrap_or_else(|| "Generation failed".to_string()),
+                        ),
+                        data: None,
                     }
                 }
-                Err(e) => CommandResponse {
-                    success: false,
-                    message: Some(format!("Command failed: {}", e)),
-                    data: None,
-                },
             }
-        } else {
-            CommandResponse {
+            Ok(Err(e)) => CommandResponse {
                 success: false,
-                message: Some("Python executor not initialized".to_string()),
+                message: Some(format!("Command failed: {}", e)),
                 data: None,
-            }
+            },
+            Err(e) => CommandResponse {
+                success: false,
+                message: Some(format!("Bridge error: {}", e)),
+                data: None,
+            },
         }
     })
     .await;

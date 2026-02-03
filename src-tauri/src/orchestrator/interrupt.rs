@@ -28,6 +28,8 @@
 //! interrupt_manager.resume(interrupt_id, ResumeValue::Selected("Approve"))?;
 //! ```
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::{info, warn};

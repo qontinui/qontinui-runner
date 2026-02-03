@@ -39,12 +39,14 @@ fn get_start_pattern() -> &'static Regex {
     FINDING_START_PATTERN.get_or_init(|| {
         // Matches: [FINDING:category:severity] or [FINDING:category:severity:modifier]
         // where modifier can be needs_input or resolved
-        Regex::new(r"\[FINDING:([a-z_]+):([a-z]+)(?::(needs_input|resolved))?\]").unwrap()
+        // Case-insensitive to handle mixed-case output from Claude (e.g., CodeBug, Medium)
+        Regex::new(r"(?i)\[FINDING:([a-z_]+):([a-z]+)(?::(needs_input|resolved))?\]").unwrap()
     })
 }
 
 fn get_end_pattern() -> &'static Regex {
-    FINDING_END_PATTERN.get_or_init(|| Regex::new(r"\[/FINDING\]").unwrap())
+    // Case-insensitive to match start pattern
+    FINDING_END_PATTERN.get_or_init(|| Regex::new(r"(?i)\[/FINDING\]").unwrap())
 }
 
 /// State machine for parsing multi-line findings
@@ -97,17 +99,24 @@ impl FindingParser {
 
         // Check for start marker
         if let Some(caps) = start_pattern.captures(line) {
-            let category_str = caps.get(1).map(|m| m.as_str()).unwrap_or("code_bug");
-            let severity_str = caps.get(2).map(|m| m.as_str()).unwrap_or("medium");
+            // Lowercase captured values since from_str expects lowercase
+            let category_str = caps
+                .get(1)
+                .map(|m| m.as_str().to_lowercase())
+                .unwrap_or_else(|| "code_bug".to_string());
+            let severity_str = caps
+                .get(2)
+                .map(|m| m.as_str().to_lowercase())
+                .unwrap_or_else(|| "medium".to_string());
             // Third capture group contains the modifier (needs_input or resolved)
-            let modifier = caps.get(3).map(|m| m.as_str());
-            let needs_input = modifier == Some("needs_input");
-            let is_resolved = modifier == Some("resolved");
+            let modifier = caps.get(3).map(|m| m.as_str().to_lowercase());
+            let needs_input = modifier.as_deref() == Some("needs_input");
+            let is_resolved = modifier.as_deref() == Some("resolved");
 
             let category =
-                FindingCategory::from_str(category_str).unwrap_or(FindingCategory::CodeBug);
+                FindingCategory::from_str(&category_str).unwrap_or(FindingCategory::CodeBug);
             let severity =
-                FindingSeverity::from_str(severity_str).unwrap_or(FindingSeverity::Medium);
+                FindingSeverity::from_str(&severity_str).unwrap_or(FindingSeverity::Medium);
 
             self.current_meta = Some(FindingMeta {
                 category,
@@ -447,5 +456,40 @@ mod tests {
 
         assert!(!finding.is_resolved);
         assert!(!finding.needs_input);
+    }
+
+    #[test]
+    fn test_parse_mixed_case_finding() {
+        let mut parser = FindingParser::new();
+
+        // Test with mixed case - should still parse correctly
+        parser.process_line("[FINDING:Code_Bug:High]");
+        parser.process_line("Title: Mixed case test");
+        parser.process_line("Description: Testing case-insensitive parsing");
+
+        let finding = parser
+            .process_line("[/FINDING]")
+            .expect("Should parse mixed-case finding");
+
+        // Should normalize to lowercase enum values
+        assert_eq!(finding.category, FindingCategory::CodeBug);
+        assert_eq!(finding.severity, FindingSeverity::High);
+        assert_eq!(finding.title, "Mixed case test");
+    }
+
+    #[test]
+    fn test_parse_uppercase_finding() {
+        let mut parser = FindingParser::new();
+
+        // Test with all uppercase
+        parser.process_line("[FINDING:SECURITY:CRITICAL]");
+        parser.process_line("Title: Uppercase test");
+
+        let finding = parser
+            .process_line("[/FINDING]")
+            .expect("Should parse uppercase finding");
+
+        assert_eq!(finding.category, FindingCategory::Security);
+        assert_eq!(finding.severity, FindingSeverity::Critical);
     }
 }
