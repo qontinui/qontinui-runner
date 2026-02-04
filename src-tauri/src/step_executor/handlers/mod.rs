@@ -6,8 +6,7 @@
 //!
 //! ## Architecture
 //!
-//! The handler pattern replaces the monolithic match statement in `execute_single_step`
-//! with a polymorphic dispatch mechanism:
+//! The handler pattern provides polymorphic dispatch for step execution:
 //!
 //! ```text
 //! StepExecutor.execute_single_step()
@@ -15,23 +14,37 @@
 //!             └── handler.execute(step, context)
 //! ```
 //!
+//! ## Available Handlers (24 total)
+//!
+//! | Category | Handlers |
+//! |----------|----------|
+//! | **GUI** | workflow, workflow_ref, state, action, gui_action, screenshot, macro |
+//! | **Shell/Script** | shell_command, shell, script, playwright |
+//! | **Verification** | log_watch, check, check_group, test |
+//! | **API/MCP** | api_request, mcp_call |
+//! | **AWAS** | awas_discover, awas_execute, awas_check_support, awas_list_actions, awas_extract_elements |
+//! | **Other** | prompt |
+//!
 //! ## Adding a New Step Type
 //!
 //! 1. Create a new file in `handlers/` (e.g., `my_step.rs`)
 //! 2. Implement `StepHandler` for your handler struct
-//! 3. Register the handler in `HandlerRegistry::new()`
+//! 3. Add the module declaration and re-export in this file
+//! 4. Register the handler in `HandlerRegistry::with_standard_handlers()`
 //!
 //! ## Example Handler
 //!
 //! ```ignore
-//! pub struct MyStepHandler {
-//!     // dependencies
-//! }
+//! pub struct MyStepHandler;
 //!
 //! #[async_trait]
 //! impl StepHandler for MyStepHandler {
 //!     fn step_type(&self) -> &'static str {
 //!         "my_step"
+//!     }
+//!
+//!     fn display_name(&self) -> &'static str {
+//!         "My Step"
 //!     }
 //!
 //!     async fn execute(

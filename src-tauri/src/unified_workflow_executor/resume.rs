@@ -155,7 +155,7 @@ impl ResumeManager {
     fn resume_point_from_state(
         &self,
         state_name: &str,
-        phase: Option<&str>,
+        _phase: Option<&str>,
         iteration: Option<u32>,
         execution_id: &str,
     ) -> Result<ResumePoint, String> {

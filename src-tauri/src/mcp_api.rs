@@ -13004,6 +13004,369 @@ async fn get_task_run_checkpoints(
     })))
 }
 
+/// Query parameters for verification results.
+#[derive(Debug, Deserialize)]
+struct VerificationResultsQuery {
+    /// Filter by iteration number (optional)
+    iteration: Option<u32>,
+    /// Only show failed results (optional, default: false)
+    #[serde(default)]
+    failed_only: bool,
+}
+
+/// Get verification results for a task run.
+///
+/// Returns detailed verification test results from the orchestrator,
+/// including issues, observations, suggestions, and raw output.
+/// This is useful for AI agents to understand what specifically failed
+/// during verification and why.
+async fn get_task_run_verification_results(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<VerificationResultsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Verify task exists
+    let task = state
+        .app_state
+        .checkpoint_db
+        .get_task_run(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
+
+    // Get verification results
+    let results = if let Some(iteration) = query.iteration {
+        state
+            .app_state
+            .checkpoint_db
+            .get_iteration_verification_results(&id, iteration)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+    } else {
+        state
+            .app_state
+            .checkpoint_db
+            .get_latest_verification_results(&id)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+    };
+
+    // Filter by failed_only if requested
+    let results: Vec<_> = if query.failed_only {
+        results.into_iter().filter(|r| !r.passed).collect()
+    } else {
+        results
+    };
+
+    // Calculate summary stats
+    let total = results.len();
+    let passed = results.iter().filter(|r| r.passed).count();
+    let failed = results.iter().filter(|r| !r.passed).count();
+    let critical_failed = results.iter().filter(|r| !r.passed && r.is_critical).count();
+
+    Ok(Json(serde_json::json!({
+        "task_run_id": id,
+        "task_name": task.task_name,
+        "results": results,
+        "summary": {
+            "total": total,
+            "passed": passed,
+            "failed": failed,
+            "critical_failed": critical_failed,
+            "all_passed": failed == 0
+        },
+        "query": {
+            "iteration": query.iteration,
+            "failed_only": query.failed_only
+        }
+    })))
+}
+
+/// Query parameters for MCP calls endpoint.
+#[derive(Debug, Deserialize)]
+struct McpCallsQuery {
+    /// Filter by success status (optional)
+    success: Option<bool>,
+    /// Limit number of results (optional, default: all)
+    limit: Option<u32>,
+}
+
+/// Get MCP tool calls for a task run.
+///
+/// Returns all MCP tool calls made during the task execution,
+/// including server info, tool name, arguments, response, and timing.
+/// Useful for AI to understand what external tools were used.
+async fn get_task_run_mcp_calls(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<McpCallsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Verify task exists
+    let task = state
+        .app_state
+        .checkpoint_db
+        .get_task_run(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
+
+    // Get MCP calls
+    let result = state
+        .app_state
+        .checkpoint_db
+        .get_task_run_mcp_calls(&id, query.success)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Apply limit if specified
+    let calls = if let Some(limit) = query.limit {
+        result.calls.into_iter().take(limit as usize).collect::<Vec<_>>()
+    } else {
+        result.calls
+    };
+
+    Ok(Json(serde_json::json!({
+        "task_run_id": id,
+        "task_name": task.task_name,
+        "calls": calls,
+        "summary": {
+            "total": result.count,
+            "success": result.success_count,
+            "failed": result.failed_count
+        },
+        "query": {
+            "success_filter": query.success,
+            "limit": query.limit
+        }
+    })))
+}
+
+/// Query parameters for API requests endpoint.
+#[derive(Debug, Deserialize)]
+struct ApiRequestsQuery {
+    /// Filter by success status (optional)
+    success: Option<bool>,
+    /// Limit number of results (optional, default: all)
+    limit: Option<u32>,
+}
+
+/// Get API requests for a task run.
+///
+/// Returns all API requests made during the task execution,
+/// including method, URL, status, response, and timing.
+async fn get_task_run_api_requests(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<ApiRequestsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Verify task exists
+    let task = state
+        .app_state
+        .checkpoint_db
+        .get_task_run(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
+
+    // Get API requests
+    let requests = state
+        .app_state
+        .checkpoint_db
+        .get_task_run_api_requests(&id, query.success)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Apply limit if specified
+    let requests = if let Some(limit) = query.limit {
+        requests.into_iter().take(limit as usize).collect::<Vec<_>>()
+    } else {
+        requests
+    };
+
+    // Calculate summary
+    let total = requests.len();
+    let success = requests.iter().filter(|r| r.success).count();
+    let failed = total - success;
+
+    Ok(Json(serde_json::json!({
+        "task_run_id": id,
+        "task_name": task.task_name,
+        "requests": requests,
+        "summary": {
+            "total": total,
+            "success": success,
+            "failed": failed
+        },
+        "query": {
+            "success_filter": query.success,
+            "limit": query.limit
+        }
+    })))
+}
+
+/// Query parameters for Playwright results endpoint.
+#[derive(Debug, Deserialize)]
+struct PlaywrightResultsQuery {
+    /// Filter by status (optional: "passed", "failed", "skipped")
+    status: Option<String>,
+    /// Limit number of results (optional, default: all)
+    limit: Option<u32>,
+}
+
+/// Get Playwright test results for a task run.
+///
+/// Returns all Playwright test results including status, duration,
+/// console output, page snapshots, and failure screenshots.
+async fn get_task_run_playwright_results(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<PlaywrightResultsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Verify task exists
+    let task = state
+        .app_state
+        .checkpoint_db
+        .get_task_run(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
+
+    // Get Playwright results
+    let results = state
+        .app_state
+        .checkpoint_db
+        .get_task_run_playwright_results(&id, query.status.as_deref())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Apply limit if specified
+    let results = if let Some(limit) = query.limit {
+        results.into_iter().take(limit as usize).collect::<Vec<_>>()
+    } else {
+        results
+    };
+
+    // Calculate summary
+    let total = results.len();
+    let passed = results.iter().filter(|r| r.status == "passed").count();
+    let failed = results.iter().filter(|r| r.status == "failed").count();
+    let skipped = results.iter().filter(|r| r.status == "skipped").count();
+
+    Ok(Json(serde_json::json!({
+        "task_run_id": id,
+        "task_name": task.task_name,
+        "results": results,
+        "summary": {
+            "total": total,
+            "passed": passed,
+            "failed": failed,
+            "skipped": skipped
+        },
+        "query": {
+            "status_filter": query.status,
+            "limit": query.limit
+        }
+    })))
+}
+
+/// Get AWAS (Automated Web Agent System) steps for a task run.
+///
+/// Returns all AWAS operations including discovery, execution, and element extraction.
+async fn get_task_run_awas_steps(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Verify task exists
+    let task = state
+        .app_state
+        .checkpoint_db
+        .get_task_run(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
+
+    // Get AWAS steps
+    let steps = state
+        .app_state
+        .checkpoint_db
+        .get_task_run_awas_steps(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Calculate summary
+    let total = steps.len();
+    let success = steps.iter().filter(|s| s.success).count();
+    let failed = total - success;
+
+    Ok(Json(serde_json::json!({
+        "task_run_id": id,
+        "task_name": task.task_name,
+        "steps": steps,
+        "summary": {
+            "total": total,
+            "success": success,
+            "failed": failed
+        }
+    })))
+}
+
+/// Query parameters for knowledge endpoint.
+#[derive(Debug, Deserialize)]
+struct KnowledgeQuery {
+    /// Filter by category (optional: "finding", "observation", "solution", etc.)
+    category: Option<String>,
+    /// Only show unresolved entries (optional, default: false)
+    #[serde(default)]
+    unresolved_only: bool,
+}
+
+/// Get knowledge entries for a task run.
+///
+/// Returns accumulated knowledge from the task execution including:
+/// - Findings (bugs, root causes identified)
+/// - Observations (things noticed during execution)
+/// - Solutions (fixes applied)
+/// - Verification feedback (test failure context)
+///
+/// This helps the AI understand what was discovered and attempted.
+async fn get_task_run_knowledge(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<KnowledgeQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Verify task exists
+    let task = state
+        .app_state
+        .checkpoint_db
+        .get_task_run(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
+
+    // Get knowledge entries
+    let knowledge = state
+        .app_state
+        .checkpoint_db
+        .list_task_knowledge(&id, query.category.as_deref(), query.unresolved_only)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Calculate summary by category
+    let total = knowledge.len();
+    let findings = knowledge.iter().filter(|k| k.category == "finding").count();
+    let observations = knowledge.iter().filter(|k| k.category == "observation").count();
+    let solutions = knowledge.iter().filter(|k| k.category == "solution").count();
+    let feedback = knowledge.iter().filter(|k| k.category == "verification_feedback").count();
+    let unresolved = knowledge.iter().filter(|k| !k.is_resolved).count();
+
+    Ok(Json(serde_json::json!({
+        "task_run_id": id,
+        "task_name": task.task_name,
+        "knowledge": knowledge,
+        "summary": {
+            "total": total,
+            "by_category": {
+                "finding": findings,
+                "observation": observations,
+                "solution": solutions,
+                "verification_feedback": feedback
+            },
+            "unresolved": unresolved
+        },
+        "query": {
+            "category_filter": query.category,
+            "unresolved_only": query.unresolved_only
+        }
+    })))
+}
+
 /// Path parameters for step progress endpoint.
 #[derive(Debug, Deserialize)]
 struct StepProgressPath {
@@ -13519,32 +13882,6 @@ async fn get_task_run_screenshots(
         "task_run_id": id,
         "screenshots": screenshots,
         "count": screenshots.len()
-    })))
-}
-
-/// Get Playwright results for a task run from SQLite.
-async fn get_task_run_playwright_results(
-    State(state): State<Arc<ApiState>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // Verify task exists
-    state
-        .app_state
-        .checkpoint_db
-        .get_task_run(&id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
-
-    let results = state
-        .app_state
-        .checkpoint_db
-        .get_task_run_playwright_results(&id, None)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    Ok(Json(serde_json::json!({
-        "task_run_id": id,
-        "playwright_results": results,
-        "count": results.len()
     })))
 }
 
@@ -19048,6 +19385,16 @@ pub fn create_router(
         .route("/task-runs/:id/migrate-logs", post(migrate_task_run_logs))
         // Step checkpoint routes (for dashboard progress display)
         .route("/task-runs/:id/checkpoints", get(get_task_run_checkpoints))
+        // Verification results (for AI agents to access detailed test results)
+        .route(
+            "/task-runs/:id/verification-results",
+            get(get_task_run_verification_results),
+        )
+        // Additional data endpoints for AI agents
+        .route("/task-runs/:id/mcp-calls", get(get_task_run_mcp_calls))
+        .route("/task-runs/:id/api-requests", get(get_task_run_api_requests))
+        .route("/task-runs/:id/awas-steps", get(get_task_run_awas_steps))
+        .route("/task-runs/:id/knowledge", get(get_task_run_knowledge))
         .route(
             "/task-runs/:id/steps/:checkpoint_id/progress",
             get(get_step_progress_markers),

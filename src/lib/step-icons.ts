@@ -142,13 +142,13 @@ export const STEP_ICON_CONFIG: Record<string, StepIconConfig> = {
     bgClass: "bg-cyan-500/10",
     textClass: "text-cyan-400",
   },
-  error_check: {
-    icon: AlertTriangle,
+  log_watch: {
+    icon: FileSearch,
     bgClass: "bg-cyan-500/10",
     textClass: "text-cyan-400",
   },
-  log_check: {
-    icon: FileSearch,
+  check_group: {
+    icon: CheckCircle,
     bgClass: "bg-cyan-500/10",
     textClass: "text-cyan-400",
   },

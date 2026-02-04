@@ -904,6 +904,173 @@ pub fn build_iteration_context_with_compression(
         }
     }
 
+    // Add detailed verification results from the database
+    // This ensures AI has access to structured test results even after runner restart
+    let verification_results = kb.get_latest_verification_results(task_run_id)?;
+    if !verification_results.is_empty() {
+        context.push_str("### Detailed Verification Test Results\n\n");
+
+        // Group results by passed/failed for better readability
+        let failed_results: Vec<_> = verification_results.iter().filter(|r| !r.passed).collect();
+        let passed_results: Vec<_> = verification_results.iter().filter(|r| r.passed).collect();
+
+        // Show failed results first (most important for AI to know what to fix)
+        if !failed_results.is_empty() {
+            context.push_str("#### ❌ Failed Checks\n\n");
+            for result in failed_results {
+                let critical_marker = if result.is_critical { " [CRITICAL]" } else { "" };
+                context.push_str(&format!(
+                    "**{}**{} ({})\n",
+                    result.criterion_id, critical_marker, result.criterion_type
+                ));
+
+                // Add issues (most important - what specifically failed)
+                if !result.issues.is_empty() {
+                    context.push_str("- **Issues:**\n");
+                    for issue in &result.issues {
+                        context.push_str(&format!("  - {}\n", issue));
+                    }
+                }
+
+                // Add observations (context about the failure)
+                if !result.observations.is_empty() {
+                    context.push_str("- **Observations:**\n");
+                    for obs in &result.observations {
+                        context.push_str(&format!("  - {}\n", obs));
+                    }
+                }
+
+                // Add suggestions (how to fix)
+                if !result.suggestions.is_empty() {
+                    context.push_str("- **Suggestions:**\n");
+                    for suggestion in &result.suggestions {
+                        context.push_str(&format!("  - {}\n", suggestion));
+                    }
+                }
+
+                // Add raw output (truncated to avoid context bloat)
+                if let Some(raw_output) = &result.raw_output {
+                    let truncated = if raw_output.len() > 2000 {
+                        format!("{}...\n[truncated, {} chars total]", &raw_output[..2000], raw_output.len())
+                    } else {
+                        raw_output.clone()
+                    };
+                    context.push_str("- **Raw Output:**\n```\n");
+                    context.push_str(&truncated);
+                    context.push_str("\n```\n");
+                }
+
+                context.push('\n');
+            }
+        }
+
+        // Show passed results summary (less detail needed)
+        if !passed_results.is_empty() {
+            context.push_str(&format!(
+                "#### ✓ Passed Checks ({} total)\n\n",
+                passed_results.len()
+            ));
+            for result in passed_results.iter().take(5) {
+                context.push_str(&format!("- {} ({})\n", result.criterion_id, result.criterion_type));
+            }
+            if passed_results.len() > 5 {
+                context.push_str(&format!("- ... and {} more\n", passed_results.len() - 5));
+            }
+            context.push('\n');
+        }
+
+        // Add instructions for accessing complete data via API
+        context.push_str("### Available Data APIs\n\n");
+        context.push_str("The runner database contains detailed execution data. Access via HTTP:\n\n");
+        context.push_str("**Verification & Testing:**\n");
+        context.push_str(&format!(
+            "- `curl http://localhost:9876/task-runs/{}/verification-results` - Full test results (issues, observations, raw output)\n",
+            task_run_id
+        ));
+        context.push_str(&format!(
+            "- `curl http://localhost:9876/task-runs/{}/verification-results?failed_only=true` - Only failed checks\n",
+            task_run_id
+        ));
+        context.push_str(&format!(
+            "- `curl http://localhost:9876/task-runs/{}/playwright-results` - Playwright test results (status, console, snapshots)\n",
+            task_run_id
+        ));
+        context.push_str(&format!(
+            "- `curl http://localhost:9876/task-runs/{}/playwright-results?status=failed` - Only failed Playwright tests\n\n",
+            task_run_id
+        ));
+        context.push_str("**Execution History:**\n");
+        context.push_str(&format!(
+            "- `curl http://localhost:9876/task-runs/{}/events` - All execution events (general, action, state changes)\n",
+            task_run_id
+        ));
+        context.push_str(&format!(
+            "- `curl http://localhost:9876/task-runs/{}/checkpoints` - Step completion checkpoints\n",
+            task_run_id
+        ));
+        context.push_str(&format!(
+            "- `curl http://localhost:9876/task-runs/{}/screenshots` - Screenshot paths from execution\n\n",
+            task_run_id
+        ));
+        context.push_str("**Tool Calls & Integrations:**\n");
+        context.push_str(&format!(
+            "- `curl http://localhost:9876/task-runs/{}/mcp-calls` - MCP tool calls (server, tool, args, response)\n",
+            task_run_id
+        ));
+        context.push_str(&format!(
+            "- `curl http://localhost:9876/task-runs/{}/mcp-calls?success=false` - Only failed MCP calls\n",
+            task_run_id
+        ));
+        context.push_str(&format!(
+            "- `curl http://localhost:9876/task-runs/{}/api-requests` - HTTP API requests made\n",
+            task_run_id
+        ));
+        context.push_str(&format!(
+            "- `curl http://localhost:9876/task-runs/{}/awas-steps` - AWAS web automation steps\n\n",
+            task_run_id
+        ));
+        context.push_str("**Knowledge & Findings:**\n");
+        context.push_str(&format!(
+            "- `curl http://localhost:9876/task-runs/{}/knowledge` - All findings, observations, solutions\n",
+            task_run_id
+        ));
+        context.push_str(&format!(
+            "- `curl http://localhost:9876/task-runs/{}/knowledge?category=finding` - Only findings/bugs\n",
+            task_run_id
+        ));
+        context.push_str(&format!(
+            "- `curl http://localhost:9876/task-runs/{}/knowledge?unresolved_only=true` - Unresolved issues\n\n",
+            task_run_id
+        ));
+        context.push_str("**Task Run Info:**\n");
+        context.push_str(&format!(
+            "- `curl http://localhost:9876/task-runs/{}` - Task run metadata and status\n",
+            task_run_id
+        ));
+        context.push_str(&format!(
+            "- `curl http://localhost:9876/task-runs/{}/output` - Full AI output log\n",
+            task_run_id
+        ));
+        context.push_str(&format!(
+            "- `curl http://localhost:9876/task-runs/{}/full-state` - Complete workflow state\n\n",
+            task_run_id
+        ));
+        context.push_str("**Tracing & Performance:**\n");
+        context.push_str(&format!(
+            "- `curl http://localhost:9876/execution-spans?execution_id={}` - Execution traces (timing, hierarchy)\n",
+            task_run_id
+        ));
+        context.push_str(&format!(
+            "- `curl \"http://localhost:9876/execution-spans?execution_id={}&name_pattern=workflow.%\"` - Workflow phase spans\n",
+            task_run_id
+        ));
+        context.push_str(&format!(
+            "- `curl \"http://localhost:9876/execution-spans?execution_id={}&min_duration_ms=5000\"` - Slow operations (>5s)\n\n",
+            task_run_id
+        ));
+        context.push_str("Use these APIs when you need more detail than provided in this context.\n\n");
+    }
+
     // Add unresolved findings
     let findings = kb.get_unresolved_findings(task_run_id)?;
     if !findings.is_empty() {

@@ -10,7 +10,7 @@
  */
 
 import { useState, useEffect, useCallback } from "react";
-import { Sparkles, Code, ScanSearch, Zap } from "lucide-react";
+import { Sparkles, Code, ScanSearch, Zap, FileJson } from "lucide-react";
 import { TestBuilderProvider, useTestBuilder } from "./TestBuilderContext";
 import { TestLibraryPanel } from "./TestLibraryPanel";
 import { TestEditorPanel, getCodeFromTest } from "./TestEditorPanel";
@@ -20,6 +20,8 @@ import { PageAnalyzer } from "./PageAnalyzer";
 import { ElementPicker } from "./ElementPicker";
 import { AiTestGenerator } from "./AiTestGenerator";
 import { TestOrchestratorPanel } from "./TestOrchestratorPanel";
+import { SpecWorkflowBuilder } from "../spec-workflow-builder/SpecWorkflowBuilder";
+import type { UnifiedWorkflow } from "../../types/unified-workflow";
 import type {
   PageAnalysis,
   TestType,
@@ -46,8 +48,8 @@ function TestBuilderContent({ onLog }: TestBuilderTabProps) {
   // Track the code in local state for the editor
   const [code, setCode] = useState("");
 
-  // Tab state: "ai", "code", "analysis", or "orchestrator" - AI selected by default
-  const [activeTab, setActiveTab] = useState<"ai" | "code" | "analysis" | "orchestrator">("ai");
+  // Tab state: "ai", "code", "analysis", "orchestrator", or "spec-workflow" - AI selected by default
+  const [activeTab, setActiveTab] = useState<"ai" | "code" | "analysis" | "orchestrator" | "spec-workflow">("ai");
   const [analysisData, setAnalysisData] = useState<AnalysisData | null>(null);
   const [showGenerator, setShowGenerator] = useState(false);
 
@@ -242,6 +244,18 @@ function TestBuilderContent({ onLog }: TestBuilderTabProps) {
             >
               <Zap className="w-4 h-4" />
               Orchestrator
+            </button>
+            <button
+              onClick={() => setActiveTab("spec-workflow")}
+              className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium transition-colors border-b-2 ${
+                activeTab === "spec-workflow"
+                  ? "text-emerald-400 border-emerald-400 bg-neutral-900/50"
+                  : "text-neutral-400 border-transparent hover:text-neutral-200 hover:bg-neutral-700/30"
+              }`}
+              data-ui-id="test-builder-spec-workflow-tab-btn"
+            >
+              <FileJson className="w-4 h-4" />
+              Spec Workflow
             </button>
             {/* Test type selector - only show when no test is selected */}
             {!selectedTest && activeTab === "ai" && (
@@ -519,6 +533,28 @@ function TestBuilderContent({ onLog }: TestBuilderTabProps) {
                     onLog?.("info", "Orchestrator-generated test code applied to editor");
                   }}
                   onLog={onLog}
+                />
+              </div>
+            )}
+
+            {activeTab === "spec-workflow" && (
+              /* Spec Workflow Builder - build workflows from test spec JSON files */
+              <div className="h-full">
+                <SpecWorkflowBuilder
+                  onApplyWorkflow={async (workflow: UnifiedWorkflow) => {
+                    try {
+                      const res = await fetch("http://localhost:9876/unified-workflows", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(workflow),
+                      });
+                      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                      const saved = await res.json();
+                      onLog?.("info", `Workflow "${workflow.name}" saved (ID: ${saved.id || workflow.id}). Open it in the Workflow Builder tab.`);
+                    } catch (err) {
+                      onLog?.("error", `Failed to save workflow: ${err}`);
+                    }
+                  }}
                 />
               </div>
             )}

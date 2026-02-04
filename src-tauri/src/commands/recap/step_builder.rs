@@ -8,6 +8,7 @@ use super::utils::{
     get_icon_type, is_ai_step_type, parse_actions_summary,
 };
 use crate::database::{StoredVerificationResult, TaskRun, TaskRunAutomation, TaskRunEvent};
+use crate::workflow_state::StepCheckpoint;
 use chrono::{DateTime, Duration};
 use std::collections::HashSet;
 use tracing::info;
@@ -327,18 +328,96 @@ pub fn build_ai_session_steps(
     steps
 }
 
+/// Convert a StepCheckpoint to a RecapStep.
+fn checkpoint_to_recap_step(checkpoint: &StepCheckpoint) -> RecapStep {
+    let status = match checkpoint.status {
+        crate::workflow_state::StepCheckpointStatus::Pending => "pending",
+        crate::workflow_state::StepCheckpointStatus::Running => "running",
+        crate::workflow_state::StepCheckpointStatus::Success => "success",
+        crate::workflow_state::StepCheckpointStatus::Failed => "failed",
+        crate::workflow_state::StepCheckpointStatus::Skipped => "skipped",
+    };
+
+    let name = checkpoint
+        .step_name
+        .clone()
+        .unwrap_or_else(|| format!("Step {}", checkpoint.step_index + 1));
+
+    let icon_type = get_icon_type(&checkpoint.step_type, &name);
+
+    RecapStep {
+        name,
+        step_type: checkpoint.step_type.clone(),
+        status: status.to_string(),
+        phase: Some(checkpoint.phase.clone()),
+        iteration: checkpoint.iteration,
+        icon_type,
+        work_summary: None,
+        summary: None,
+        started_at: checkpoint.started_at.clone(),
+        ended_at: checkpoint.completed_at.clone(),
+        duration_ms: checkpoint.duration_ms,
+        error: checkpoint.error.clone(),
+        children: Vec::new(),
+    }
+}
+
 /// Build steps from EXECUTED records only.
+///
+/// Data sources in priority order:
+/// 0. workflow_step_checkpoints - Unified workflow executor checkpoints (highest priority, most authoritative)
+/// 1. workflow_verification_phase_results - Verification step results from execute_verification_steps
+/// 2. task_run_automation - Automation workflow records
+/// 3. AI sessions from task_run.sessions_count and output_log parsing
+/// 4. step_execution events from task_run_events
+/// 5. Named workflow events (fallback)
 pub fn build_steps(
     task_run: &TaskRun,
     automations: &[TaskRunAutomation],
     events: &[TaskRunEvent],
     verification_results: &[StoredVerificationResult],
     workflow_verification_results: &[serde_json::Value],
+    step_checkpoints: &[StepCheckpoint],
 ) -> Vec<RecapStep> {
     let mut steps = Vec::new();
     let mut seen_step_names: HashSet<String> = HashSet::new();
 
     let ai_step_names = get_ai_step_names(task_run);
+
+    // 0. Add steps from workflow_step_checkpoints (unified workflow executor)
+    // These are the most authoritative source for unified workflow execution
+    if !step_checkpoints.is_empty() {
+        info!(
+            "Adding {} workflow step checkpoints to steps",
+            step_checkpoints.len()
+        );
+
+        for checkpoint in step_checkpoints {
+            let name = checkpoint
+                .step_name
+                .clone()
+                .unwrap_or_else(|| format!("Step {}", checkpoint.step_index + 1));
+
+            // Create dedup key with phase and iteration to handle multiple iterations
+            let dedup_key = if let Some(iter) = checkpoint.iteration {
+                format!("checkpoint:{}:{}:iter{}", checkpoint.phase, name, iter)
+            } else {
+                format!("checkpoint:{}:{}", checkpoint.phase, name)
+            };
+
+            if seen_step_names.contains(&dedup_key) {
+                continue;
+            }
+
+            seen_step_names.insert(dedup_key);
+            steps.push(checkpoint_to_recap_step(checkpoint));
+        }
+
+        info!(
+            "Total steps after checkpoint processing: {}",
+            steps.len()
+        );
+    }
 
     // 1. Add workflow verification phase results (step-based, from execute_verification_steps)
     // These are more detailed than orchestrator criterion-based results

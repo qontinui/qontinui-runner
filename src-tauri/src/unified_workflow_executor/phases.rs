@@ -52,6 +52,118 @@ use super::phase_configs::{
 use super::types::{AgenticOutcome, LoopConfig};
 
 // =============================================================================
+// Execution Timing Context
+// =============================================================================
+
+/// Build a timing context string from execution spans for the current execution.
+///
+/// Returns None if no spans exist or the query fails.
+fn build_execution_timing_context(
+    checkpoint_db: &CheckpointDb,
+    execution_id: &str,
+) -> Option<String> {
+    let spans = checkpoint_db
+        .get_execution_spans(Some(execution_id), None, None, Some(100))
+        .ok()?;
+
+    if spans.is_empty() {
+        return None;
+    }
+
+    let mut sections = Vec::new();
+
+    // Phase timings
+    let phase_spans: Vec<_> = spans
+        .iter()
+        .filter(|s| s.name.starts_with("workflow.phase."))
+        .collect();
+    if !phase_spans.is_empty() {
+        let mut phase_lines = vec!["**Phase Timings:**".to_string()];
+        for span in &phase_spans {
+            let phase_name = span.name.strip_prefix("workflow.phase.").unwrap_or(&span.name);
+            let duration = span
+                .duration_ms
+                .map(|d| format_duration_ms(d))
+                .unwrap_or_else(|| "in progress".to_string());
+            let status = if !span.success {
+                " (failed)"
+            } else {
+                ""
+            };
+            phase_lines.push(format!("- {}: {}{}", phase_name, duration, status));
+        }
+        sections.push(phase_lines.join("\n"));
+    }
+
+    // AI session stats
+    let ai_spans: Vec<_> = spans.iter().filter(|s| s.name == "ai.session").collect();
+    if !ai_spans.is_empty() {
+        let total_ms: i64 = ai_spans.iter().filter_map(|s| s.duration_ms).sum();
+        let count = ai_spans.len();
+        let avg_ms = if count > 0 { total_ms / count as i64 } else { 0 };
+        let failed = ai_spans.iter().filter(|s| !s.success).count();
+
+        let mut ai_lines = vec!["**AI Sessions:**".to_string()];
+        ai_lines.push(format!(
+            "- Total: {} sessions, {} total",
+            count,
+            format_duration_ms(total_ms)
+        ));
+        ai_lines.push(format!("- Average: {} per session", format_duration_ms(avg_ms)));
+        if failed > 0 {
+            ai_lines.push(format!("- Failed: {} sessions", failed));
+        }
+        sections.push(ai_lines.join("\n"));
+    }
+
+    // Slow operations (>5s)
+    let slow_spans: Vec<_> = spans
+        .iter()
+        .filter(|s| s.duration_ms.unwrap_or(0) > 5000)
+        .collect();
+    if !slow_spans.is_empty() {
+        let mut slow_lines = vec!["**Slow Operations (>5s):**".to_string()];
+        for span in &slow_spans {
+            let duration = span
+                .duration_ms
+                .map(|d| format_duration_ms(d))
+                .unwrap_or_default();
+            let error_suffix = if let Some(ref err) = span.error {
+                format!(" - FAILED: {}", err)
+            } else if !span.success {
+                " - FAILED".to_string()
+            } else {
+                String::new()
+            };
+            slow_lines.push(format!("- {}: {}{}", span.name, duration, error_suffix));
+        }
+        sections.push(slow_lines.join("\n"));
+    }
+
+    if sections.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "---\n\n### Execution Timing\n\n{}",
+        sections.join("\n\n")
+    ))
+}
+
+/// Format milliseconds into a human-readable duration string.
+fn format_duration_ms(ms: i64) -> String {
+    if ms < 1000 {
+        format!("{}ms", ms)
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        let minutes = ms / 60_000;
+        let seconds = (ms % 60_000) / 1000;
+        format!("{}m {}s", minutes, seconds)
+    }
+}
+
+// =============================================================================
 // Setup Phase Executor
 // =============================================================================
 
@@ -644,6 +756,19 @@ impl AgenticExecutor {
             } else {
                 base
             }
+        };
+
+        // Append execution timing context if available (from iteration 2+)
+        let enhanced_prompt = if iteration > 1 {
+            match build_execution_timing_context(&self.checkpoint_db, &config.execution_id) {
+                Some(timing) => {
+                    info!("AGENTIC-PHASE: Appending execution timing context ({} chars)", timing.len());
+                    format!("{}\n\n{}", enhanced_prompt, timing)
+                }
+                None => enhanced_prompt,
+            }
+        } else {
+            enhanced_prompt
         };
 
         // Use the unified AI session executor with timing

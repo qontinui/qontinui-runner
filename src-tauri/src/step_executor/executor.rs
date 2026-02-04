@@ -9,11 +9,27 @@
 //! The design principle: multi-step execution is the foundation, and running
 //! a single workflow is just a special case (one step of type "workflow").
 //!
-//! ## Step Categories
+//! ## Architecture
 //!
-//! - **GUI Automation**: workflow, state, action
-//! - **Web Automation**: playwright
-//! - **AWAS Automation**: awas_discover, awas_execute, awas_check_support, awas_list_actions, awas_extract_elements
+//! Step execution uses a polymorphic handler dispatch system:
+//!
+//! ```text
+//! StepExecutor.execute_single_step()
+//!     └── HandlerRegistry.get_handler(step_type)
+//!             └── handler.execute(step, context)
+//! ```
+//!
+//! All step types are implemented as separate handlers in the `handlers/` module.
+//! The `HandlerRegistry` maps step type strings to handler implementations.
+//!
+//! ## Step Categories (24 handlers)
+//!
+//! - **GUI** (7): workflow, workflow_ref, state, action, gui_action, screenshot, macro
+//! - **Shell/Script** (4): shell_command, shell, script, playwright
+//! - **Verification** (4): log_watch, check, check_group, test
+//! - **API/MCP** (2): api_request, mcp_call
+//! - **AWAS** (5): awas_discover, awas_execute, awas_check_support, awas_list_actions, awas_extract_elements
+//! - **Other** (1): prompt
 
 #![allow(dead_code)]
 
@@ -24,10 +40,9 @@ use crate::action_service::UnifiedActionService;
 use crate::api_request::{ApiRequestConfig, ApiRequestSession, HttpMethod, VariableExtraction};
 use crate::commands::AppState;
 use crate::config_storage::ConfigStorage;
-use crate::database::{CreateTaskRunAwasStepInput, CreateTaskRunEventInput};
+use crate::database::CreateTaskRunEventInput;
 use crate::display::RawEvent;
 use crate::executor::file_logger::FileLogger;
-use crate::executor::with_default_bridge;
 use crate::iteration_bundle::{
     parse_action_events, parse_image_recognition_events, ActionEvent, ImageRecognitionEvent,
     RelevantLogSources,
@@ -1881,62 +1896,6 @@ impl StepExecutor {
             .await;
     }
 
-    /// Save an AWAS step result to the database (if task_run_id is set)
-    ///
-    /// This method is called after each AWAS step execution to persist
-    /// the results for later analysis and debugging.
-    fn save_awas_step_result(
-        &self,
-        step_type: &str,
-        url: Option<&str>,
-        action_id: Option<&str>,
-        parameters: Option<&serde_json::Value>,
-        response: &AwasCommandResponse,
-        duration_ms: i64,
-        step_name: Option<&str>,
-    ) {
-        // Only save if we have a task_run_id
-        let Some(ref task_run_id) = self.task_run_id else {
-            return;
-        };
-
-        let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-
-        let input = CreateTaskRunAwasStepInput {
-            task_run_id: task_run_id.clone(),
-            step_id: None, // Step ID from workflow if available
-            step_name: step_name.map(|s| s.to_string()),
-            step_type: step_type.to_string(),
-            url: url.map(|s| s.to_string()),
-            action_id: action_id.map(|s| s.to_string()),
-            parameters: parameters.map(|p| serde_json::to_string(p).unwrap_or_default()),
-            response_data: response
-                .data
-                .as_ref()
-                .map(|d| serde_json::to_string(d).unwrap_or_default()),
-            success: response.success,
-            error_message: response.error.clone(),
-            duration_ms: Some(duration_ms),
-            timestamp,
-        };
-
-        match self
-            .app_state
-            .checkpoint_db
-            .create_task_run_awas_step(&input)
-        {
-            Ok(id) => {
-                info!(
-                    "Saved AWAS step result to database: {} (type: {})",
-                    id, step_type
-                );
-            }
-            Err(e) => {
-                warn!("Failed to save AWAS step result to database: {}", e);
-            }
-        }
-    }
-
     /// Execute a list of steps and return results
     ///
     /// This is the core execution function used by all consumers.
@@ -3325,57 +3284,6 @@ impl StepExecutor {
                 (true, None, None)
             }
             // ================================================================
-            // AWAS Step Types
-            // ================================================================
-            "awas_discover" => {
-                if let Some(ref url) = step.awas_url {
-                    self.execute_awas_discover(url, timeout).await
-                } else {
-                    (
-                        false,
-                        Some("No URL specified for AWAS discover".to_string()),
-                        None,
-                    )
-                }
-            }
-            "awas_execute" => {
-                if let (Some(ref url), Some(ref action_id)) = (&step.awas_url, &step.awas_action_id)
-                {
-                    self.execute_awas_action(url, action_id, step.awas_params.clone(), timeout)
-                        .await
-                } else {
-                    (
-                        false,
-                        Some("URL and action_id required for AWAS execute".to_string()),
-                        None,
-                    )
-                }
-            }
-            "awas_check_support" => {
-                if let Some(ref url) = step.awas_url {
-                    self.execute_awas_check_support(url, timeout).await
-                } else {
-                    (
-                        false,
-                        Some("No URL specified for AWAS check support".to_string()),
-                        None,
-                    )
-                }
-            }
-            "awas_list_actions" => self.execute_awas_list_actions(timeout).await,
-            "awas_extract_elements" => {
-                if let Some(ref html) = step.awas_html {
-                    self.execute_awas_extract_elements(html, step.awas_base_url.as_deref(), timeout)
-                        .await
-                } else {
-                    (
-                        false,
-                        Some("No HTML specified for AWAS extract elements".to_string()),
-                        None,
-                    )
-                }
-            }
-            // ================================================================
             // MCP Call Step Type
             // ================================================================
             "mcp_call" => {
@@ -4213,421 +4121,6 @@ impl StepExecutor {
 
         info!("{}", result.summary());
         result
-    }
-
-    // ========================================================================
-    // AWAS Step Execution Methods
-    // ========================================================================
-
-    /// Execute AWAS discover step - discovers AWAS manifest from a URL
-    async fn execute_awas_discover(
-        &self,
-        url: &str,
-        timeout_secs: Option<u64>,
-    ) -> (bool, Option<String>, Option<String>) {
-        info!("AWAS Discover: {}", url);
-        let timeout = timeout_secs.unwrap_or(60);
-
-        let start_time = std::time::Instant::now();
-        let params = json!({
-            "url": url,
-        });
-
-        match self
-            .execute_awas_command("awas_discover", Some(params.clone()), timeout)
-            .await
-        {
-            Ok(response) => {
-                let duration_ms = start_time.elapsed().as_millis() as i64;
-
-                // Save result to database
-                self.save_awas_step_result(
-                    "awas_discover",
-                    Some(url),
-                    None,
-                    Some(&params),
-                    &response,
-                    duration_ms,
-                    Some(&format!("AWAS Discover: {}", url)),
-                );
-
-                if response.success {
-                    info!(
-                        "AWAS Discover completed successfully for {} in {}ms",
-                        url, duration_ms
-                    );
-                    (true, None, None)
-                } else {
-                    let error = response
-                        .error
-                        .unwrap_or_else(|| "AWAS discover failed".to_string());
-                    (false, Some(error), None)
-                }
-            }
-            Err(e) => {
-                let duration_ms = start_time.elapsed().as_millis() as i64;
-                let error_msg = format!("AWAS discover error: {}", e);
-
-                // Save error result to database
-                let error_response = AwasCommandResponse {
-                    success: false,
-                    data: None,
-                    error: Some(error_msg.clone()),
-                };
-                self.save_awas_step_result(
-                    "awas_discover",
-                    Some(url),
-                    None,
-                    Some(&params),
-                    &error_response,
-                    duration_ms,
-                    Some(&format!("AWAS Discover: {}", url)),
-                );
-
-                (false, Some(error_msg), None)
-            }
-        }
-    }
-
-    /// Execute AWAS action step - executes an AWAS action on the target application
-    async fn execute_awas_action(
-        &self,
-        url: &str,
-        action_id: &str,
-        params: Option<serde_json::Value>,
-        timeout_secs: Option<u64>,
-    ) -> (bool, Option<String>, Option<String>) {
-        info!("AWAS Execute: {} on {}", action_id, url);
-        let timeout = timeout_secs.unwrap_or(60);
-
-        let start_time = std::time::Instant::now();
-        let command_params = json!({
-            "url": url,
-            "action_id": action_id,
-            "params": params,
-        });
-
-        match self
-            .execute_awas_command("awas_execute", Some(command_params.clone()), timeout)
-            .await
-        {
-            Ok(response) => {
-                let duration_ms = start_time.elapsed().as_millis() as i64;
-
-                // Save result to database
-                self.save_awas_step_result(
-                    "awas_execute",
-                    Some(url),
-                    Some(action_id),
-                    Some(&command_params),
-                    &response,
-                    duration_ms,
-                    Some(&format!("AWAS Execute: {}", action_id)),
-                );
-
-                if response.success {
-                    info!(
-                        "AWAS Execute '{}' completed successfully in {}ms",
-                        action_id, duration_ms
-                    );
-                    (true, None, None)
-                } else {
-                    let error = response
-                        .error
-                        .unwrap_or_else(|| "AWAS execute failed".to_string());
-                    (false, Some(error), None)
-                }
-            }
-            Err(e) => {
-                let duration_ms = start_time.elapsed().as_millis() as i64;
-                let error_msg = format!("AWAS execute error: {}", e);
-
-                // Save error result to database
-                let error_response = AwasCommandResponse {
-                    success: false,
-                    data: None,
-                    error: Some(error_msg.clone()),
-                };
-                self.save_awas_step_result(
-                    "awas_execute",
-                    Some(url),
-                    Some(action_id),
-                    Some(&command_params),
-                    &error_response,
-                    duration_ms,
-                    Some(&format!("AWAS Execute: {}", action_id)),
-                );
-
-                (false, Some(error_msg), None)
-            }
-        }
-    }
-
-    /// Execute AWAS check support step - checks if a URL supports AWAS
-    async fn execute_awas_check_support(
-        &self,
-        url: &str,
-        timeout_secs: Option<u64>,
-    ) -> (bool, Option<String>, Option<String>) {
-        info!("AWAS Check Support: {}", url);
-        let timeout = timeout_secs.unwrap_or(60);
-
-        let start_time = std::time::Instant::now();
-        let params = json!({
-            "url": url,
-        });
-
-        match self
-            .execute_awas_command("awas_check_support", Some(params.clone()), timeout)
-            .await
-        {
-            Ok(response) => {
-                let duration_ms = start_time.elapsed().as_millis() as i64;
-
-                // Save result to database
-                self.save_awas_step_result(
-                    "awas_check_support",
-                    Some(url),
-                    None,
-                    Some(&params),
-                    &response,
-                    duration_ms,
-                    Some(&format!("AWAS Check Support: {}", url)),
-                );
-
-                if response.success {
-                    // Extract support status from response data
-                    let supported = response
-                        .data
-                        .as_ref()
-                        .and_then(|d| d.get("supported"))
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-
-                    if supported {
-                        info!(
-                            "AWAS is supported at {} (checked in {}ms)",
-                            url, duration_ms
-                        );
-                    } else {
-                        info!(
-                            "AWAS is not supported at {} (checked in {}ms)",
-                            url, duration_ms
-                        );
-                    }
-                    (true, None, None)
-                } else {
-                    let error = response
-                        .error
-                        .unwrap_or_else(|| "AWAS check support failed".to_string());
-                    (false, Some(error), None)
-                }
-            }
-            Err(e) => {
-                let duration_ms = start_time.elapsed().as_millis() as i64;
-                let error_msg = format!("AWAS check support error: {}", e);
-
-                // Save error result to database
-                let error_response = AwasCommandResponse {
-                    success: false,
-                    data: None,
-                    error: Some(error_msg.clone()),
-                };
-                self.save_awas_step_result(
-                    "awas_check_support",
-                    Some(url),
-                    None,
-                    Some(&params),
-                    &error_response,
-                    duration_ms,
-                    Some(&format!("AWAS Check Support: {}", url)),
-                );
-
-                (false, Some(error_msg), None)
-            }
-        }
-    }
-
-    /// Execute AWAS list actions step - lists available AWAS actions
-    async fn execute_awas_list_actions(
-        &self,
-        timeout_secs: Option<u64>,
-    ) -> (bool, Option<String>, Option<String>) {
-        info!("AWAS List Actions");
-        let timeout = timeout_secs.unwrap_or(60);
-
-        let start_time = std::time::Instant::now();
-
-        match self
-            .execute_awas_command("awas_list_actions", None, timeout)
-            .await
-        {
-            Ok(response) => {
-                let duration_ms = start_time.elapsed().as_millis() as i64;
-
-                // Save result to database
-                self.save_awas_step_result(
-                    "awas_list_actions",
-                    None,
-                    None,
-                    None,
-                    &response,
-                    duration_ms,
-                    Some("AWAS List Actions"),
-                );
-
-                if response.success {
-                    let action_count = response
-                        .data
-                        .as_ref()
-                        .and_then(|d| d.get("actions"))
-                        .and_then(|v| v.as_array())
-                        .map(|a| a.len())
-                        .unwrap_or(0);
-                    info!(
-                        "AWAS List Actions: found {} actions in {}ms",
-                        action_count, duration_ms
-                    );
-                    (true, None, None)
-                } else {
-                    let error = response
-                        .error
-                        .unwrap_or_else(|| "AWAS list actions failed".to_string());
-                    (false, Some(error), None)
-                }
-            }
-            Err(e) => {
-                let duration_ms = start_time.elapsed().as_millis() as i64;
-                let error_msg = format!("AWAS list actions error: {}", e);
-
-                // Save error result to database
-                let error_response = AwasCommandResponse {
-                    success: false,
-                    data: None,
-                    error: Some(error_msg.clone()),
-                };
-                self.save_awas_step_result(
-                    "awas_list_actions",
-                    None,
-                    None,
-                    None,
-                    &error_response,
-                    duration_ms,
-                    Some("AWAS List Actions"),
-                );
-
-                (false, Some(error_msg), None)
-            }
-        }
-    }
-
-    /// Execute AWAS extract elements step - extracts AWAS elements from HTML
-    async fn execute_awas_extract_elements(
-        &self,
-        html: &str,
-        base_url: Option<&str>,
-        timeout_secs: Option<u64>,
-    ) -> (bool, Option<String>, Option<String>) {
-        info!("AWAS Extract Elements (HTML length: {} bytes)", html.len());
-        let timeout = timeout_secs.unwrap_or(60);
-
-        let start_time = std::time::Instant::now();
-        let params = json!({
-            "html": html,
-            "base_url": base_url,
-        });
-
-        // For the database, we don't want to store the full HTML in parameters
-        // (could be very large), so we just store metadata
-        let params_for_db = json!({
-            "html_length": html.len(),
-            "base_url": base_url,
-        });
-
-        match self
-            .execute_awas_command("awas_extract_elements", Some(params), timeout)
-            .await
-        {
-            Ok(response) => {
-                let duration_ms = start_time.elapsed().as_millis() as i64;
-
-                // Save result to database
-                self.save_awas_step_result(
-                    "awas_extract_elements",
-                    base_url,
-                    None,
-                    Some(&params_for_db),
-                    &response,
-                    duration_ms,
-                    Some("AWAS Extract Elements"),
-                );
-
-                if response.success {
-                    info!(
-                        "AWAS Extract Elements completed successfully in {}ms",
-                        duration_ms
-                    );
-                    (true, None, None)
-                } else {
-                    let error = response
-                        .error
-                        .unwrap_or_else(|| "AWAS extract elements failed".to_string());
-                    (false, Some(error), None)
-                }
-            }
-            Err(e) => {
-                let duration_ms = start_time.elapsed().as_millis() as i64;
-                let error_msg = format!("AWAS extract elements error: {}", e);
-
-                // Save error result to database
-                let error_response = AwasCommandResponse {
-                    success: false,
-                    data: None,
-                    error: Some(error_msg.clone()),
-                };
-                self.save_awas_step_result(
-                    "awas_extract_elements",
-                    base_url,
-                    None,
-                    Some(&params_for_db),
-                    &error_response,
-                    duration_ms,
-                    Some("AWAS Extract Elements"),
-                );
-
-                (false, Some(error_msg), None)
-            }
-        }
-    }
-
-    /// Execute an AWAS command via the Python bridge
-    async fn execute_awas_command(
-        &self,
-        command: &str,
-        params: Option<serde_json::Value>,
-        timeout_secs: u64,
-    ) -> Result<AwasCommandResponse, String> {
-        let app_state = self.app_state.clone();
-        let command = command.to_string();
-        let timeout_duration = std::time::Duration::from_secs(timeout_secs);
-
-        tokio::task::spawn_blocking(move || {
-            with_default_bridge(&app_state, |bridge| {
-                if !bridge.is_running() {
-                    return Err("Python executor not running".to_string());
-                }
-
-                let result = bridge.send_command_and_wait(&command, params, timeout_duration)?;
-
-                Ok(AwasCommandResponse {
-                    success: result.success,
-                    data: result.data,
-                    error: result.error,
-                })
-            })?
-        })
-        .await
-        .map_err(|e| format!("Task join error: {}", e))?
     }
 
     // =========================================================================
@@ -6849,14 +6342,6 @@ pub(crate) fn format_log_errors_for_ai(errors: &[LogError]) -> String {
     }
 
     report
-}
-
-/// Response from AWAS command execution
-#[derive(Debug)]
-struct AwasCommandResponse {
-    success: bool,
-    data: Option<serde_json::Value>,
-    error: Option<String>,
 }
 
 #[cfg(test)]

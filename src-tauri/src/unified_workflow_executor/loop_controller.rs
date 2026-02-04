@@ -1008,7 +1008,7 @@ impl LoopController {
             return;
         }
 
-        let mut state_machine = StateMachine::new(
+        let state_machine = StateMachine::new(
             self.checkpoint_db.clone(),
             execution_id,
             "unified",

@@ -96,13 +96,31 @@ pub async fn get_task_run_recap(
             Vec::new()
         });
 
-    // Build steps - include workflow verification results for richer step data
+    // Get workflow step checkpoints (from unified workflow executor)
+    let step_checkpoints = state
+        .checkpoint_db
+        .get_all_workflow_step_checkpoints(&task_run_id)
+        .unwrap_or_else(|e| {
+            warn!(
+                "Failed to get workflow step checkpoints for {}: {}",
+                task_run_id, e
+            );
+            Vec::new()
+        });
+
+    info!(
+        "get_task_run_recap: step_checkpoints_count={}",
+        step_checkpoints.len()
+    );
+
+    // Build steps - include workflow verification results and step checkpoints for richer step data
     let steps = step_builder::build_steps(
         &task_run,
         &automations,
         &events,
         &verification_results,
         &workflow_verification_results,
+        &step_checkpoints,
     );
 
     // Build stages from transition history or heuristically

@@ -12,35 +12,24 @@
 //! ## Module Structure
 //!
 //! - `executor` - Main executor implementation (StepExecutor, types, execute methods)
-//! - `events` - Tree event emission helpers for action logging (NEW)
-//! - `handlers` - Step handler trait and registry (NEW)
+//! - `events` - Tree event emission helpers for action logging
+//! - `handlers` - Step handler trait, registry, and all handler implementations
 //!
-//! ## Refactoring Status
+//! ## Architecture
 //!
-//! This module has been fully refactored:
-//! - Phase 1-3 (DONE): Added events.rs and handlers/ for new patterns
-//! - Phase 4-5 (DONE): Migrated initial step handlers to handlers/
-//! - Phase 6 (DONE): Wired handlers into execute_single_step via HandlerRegistry
-//! - Phase 7-9 (DONE): Migrated most handlers (19 total)
-//! - Phase 10 (DONE): Migrated AWAS handlers (5 total)
+//! Step execution uses a polymorphic handler dispatch system. All 24 step types
+//! are implemented as individual handlers in the `handlers/` module:
 //!
-//! All 24 handlers are now active:
-//!   - GUI: workflow, workflow_ref, state, action, gui_action, screenshot, macro (7)
-//!   - Shell/Script: shell_command, shell, script, playwright (4)
-//!   - Verification: log_watch, check, check_group, test (4)
-//!   - API/MCP: api_request, mcp_call (2)
-//!   - AWAS: awas_discover, awas_execute, awas_check_support, awas_list_actions, awas_extract_elements (5)
-//!   - Other: prompt (1)
+//! | Category | Handlers |
+//! |----------|----------|
+//! | **GUI** (7) | workflow, workflow_ref, state, action, gui_action, screenshot, macro |
+//! | **Shell/Script** (4) | shell_command, shell, script, playwright |
+//! | **Verification** (4) | log_watch, check, check_group, test |
+//! | **API/MCP** (2) | api_request, mcp_call |
+//! | **AWAS** (5) | awas_discover, awas_execute, awas_check_support, awas_list_actions, awas_extract_elements |
+//! | **Other** (1) | prompt |
 //!
-//! ## Step Categories
-//!
-//! - **GUI Automation**: workflow, state, action
-//! - **Web Automation**: playwright
-//! - **AWAS Automation**: awas_discover, awas_execute, awas_check_support, etc.
-//! - **Shell**: shell_command
-//! - **API**: api_request
-//! - **Checks**: check, check_group
-//! - **Other**: mcp_call, macro, log_watch, prompt
+//! See `handlers/mod.rs` for details on adding new step types.
 
 // The original step_executor.rs implementation (moved here)
 #[allow(clippy::module_inception)]

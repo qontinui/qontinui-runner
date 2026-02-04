@@ -1,5 +1,11 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Allow dead code: many modules are in active development with planned integrations
+#![allow(dead_code)]
+// Allow complex types: API response types are intentionally detailed
+#![allow(clippy::type_complexity)]
+// Allow many arguments: refactoring to structs is tracked separately
+#![allow(clippy::too_many_arguments)]
 
 mod action_service;
 mod ai_pricing;

@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useCallback } from "react";
+import React, { useState, useEffect, useMemo, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeRaw from "rehype-raw";
@@ -246,7 +246,9 @@ function SimpleCodeBlock({ children }: { children: React.ReactNode }) {
 
 /**
  * Collapsible thinking section.
- * Uses module-level store to persist expanded state across re-renders.
+ * Uses local state for reliable toggle, backed by a module-level store
+ * to persist expanded state across React re-mounts (e.g. when ReactMarkdown
+ * rebuilds its component tree on parent re-renders).
  */
 function ThinkingSection({
   children,
@@ -255,21 +257,32 @@ function ThinkingSection({
   children: React.ReactNode;
   contentId?: string;
 }) {
-  // Use external store to persist expanded state, falling back to local state for initial render
-  const [, forceUpdate] = useState(0);
-
   // Generate a stable ID from content if not provided
   const sectionId = contentId || hashContent(extractTextContent(children));
-  const isExpanded = expandedSectionsStore.has(sectionId);
 
-  const toggleExpanded = useCallback(() => {
-    if (isExpanded) {
-      expandedSectionsStore.delete(sectionId);
-    } else {
-      expandedSectionsStore.add(sectionId);
-    }
-    forceUpdate((n) => n + 1);
-  }, [sectionId, isExpanded]);
+  // Local state, initialized from the module-level store
+  const [isExpanded, setIsExpanded] = useState(() => expandedSectionsStore.has(sectionId));
+
+  // Sync from store when sectionId changes (handles re-mount with same content)
+  useEffect(() => {
+    setIsExpanded(expandedSectionsStore.has(sectionId));
+  }, [sectionId]);
+
+  const toggleExpanded = useCallback(
+    (e: React.MouseEvent) => {
+      e.stopPropagation();
+      setIsExpanded((prev) => {
+        const next = !prev;
+        if (next) {
+          expandedSectionsStore.add(sectionId);
+        } else {
+          expandedSectionsStore.delete(sectionId);
+        }
+        return next;
+      });
+    },
+    [sectionId],
+  );
 
   return (
     <div className="my-2 border border-border/50 rounded-md overflow-hidden">
@@ -483,12 +496,14 @@ export function MarkdownViewer({ content, className, isAnimated = false }: Markd
               );
             }
 
-            const { children: _, ...restProps } = props;
+            const { children: divChildren, node: _node, ...restProps } = props;
             return (
               <div
                 className={className as string}
                 {...(restProps as React.HTMLAttributes<HTMLDivElement>)}
-              />
+              >
+                {divChildren as React.ReactNode}
+              </div>
             );
           },
           // Enhanced headers with visual hierarchy

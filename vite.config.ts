@@ -16,6 +16,10 @@ export default defineConfig({
     host: '0.0.0.0', // Listen on all network interfaces (needed for WSL2 access)
     port: 1420,
     strictPort: true,
+    fs: {
+      // Allow serving files from sibling directories (ui-bridge, qontinui-schemas)
+      allow: ['.', '..'],
+    },
   },
   envPrefix: ["VITE_", "TAURI_"],
   build: {

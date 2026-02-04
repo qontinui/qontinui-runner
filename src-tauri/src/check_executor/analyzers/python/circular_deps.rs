@@ -651,14 +651,10 @@ fn tarjan_strongconnect(
 
     if module_lowlink == module_index {
         let mut scc = Vec::new();
-        loop {
-            if let Some(w) = stack.pop() {
-                on_stack.remove(&w);
-                scc.push(w.clone());
-                if w == module {
-                    break;
-                }
-            } else {
+        while let Some(w) = stack.pop() {
+            on_stack.remove(&w);
+            scc.push(w.clone());
+            if w == module {
                 break;
             }
         }

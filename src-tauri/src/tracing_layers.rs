@@ -155,15 +155,24 @@ impl JsonlSpanLayer {
         }
     }
 
-    /// Get or create the output file
+    /// Get or create the output file.
+    ///
+    /// Resolves the dev_logs_dir at open time (not at construction time) by checking
+    /// the settings override directly. This avoids the OnceLock in `get_dev_logs_dir()`
+    /// which may have cached the default path before settings were loaded.
     fn get_file(&self) -> Option<std::sync::MutexGuard<'_, Option<File>>> {
         let mut file_guard = self.file.lock().ok()?;
         if file_guard.is_none() {
-            let path = self.config.dev_logs_dir.join("runner-spans.jsonl");
+            // Check settings override directly to bypass the OnceLock cache
+            let dev_logs_dir = match crate::settings::get_dev_logs_dir_override() {
+                Some(override_path) => PathBuf::from(override_path),
+                None => self.config.dev_logs_dir.clone(),
+            };
+            let path = dev_logs_dir.join("runner-spans.jsonl");
             match OpenOptions::new().create(true).append(true).open(&path) {
                 Ok(f) => *file_guard = Some(f),
                 Err(e) => {
-                    eprintln!("Failed to open spans JSONL file: {}", e);
+                    eprintln!("Failed to open spans JSONL file at {}: {}", path.display(), e);
                     return None;
                 }
             }
@@ -634,19 +643,36 @@ impl<'a> tracing::field::Visit for MessageVisitor<'a> {
 // Utility Functions
 // ============================================================================
 
-/// Clear the spans JSONL file (called on startup)
+/// Clear the spans JSONL file (called on startup).
+///
+/// Clears from both the default and override paths to handle the case where
+/// the file was previously written to a different location.
 pub fn clear_spans_jsonl() {
-    let path = crate::paths::get_dev_logs_dir().join("runner-spans.jsonl");
-    if path.exists() {
-        if let Err(e) = std::fs::remove_file(&path) {
-            eprintln!("Failed to clear spans JSONL: {}", e);
+    // Clear from default path
+    let default_path = crate::paths::get_dev_logs_dir().join("runner-spans.jsonl");
+    if default_path.exists() {
+        if let Err(e) = std::fs::remove_file(&default_path) {
+            eprintln!("Failed to clear spans JSONL (default): {}", e);
+        }
+    }
+
+    // Also clear from override path if different
+    if let Some(override_dir) = crate::settings::get_dev_logs_dir_override() {
+        let override_path = PathBuf::from(override_dir).join("runner-spans.jsonl");
+        if override_path != default_path && override_path.exists() {
+            if let Err(e) = std::fs::remove_file(&override_path) {
+                eprintln!("Failed to clear spans JSONL (override): {}", e);
+            }
         }
     }
 }
 
 /// Get the path to the spans JSONL file
 pub fn get_spans_jsonl_path() -> PathBuf {
-    crate::paths::get_dev_logs_dir().join("runner-spans.jsonl")
+    match crate::settings::get_dev_logs_dir_override() {
+        Some(override_dir) => PathBuf::from(override_dir).join("runner-spans.jsonl"),
+        None => crate::paths::get_dev_logs_dir().join("runner-spans.jsonl"),
+    }
 }
 
 // ============================================================================

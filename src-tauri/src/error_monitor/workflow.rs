@@ -118,21 +118,12 @@ impl ErrorFixWorkflowGenerator {
             "verification_steps": verification_criteria,
 
             // Agentic steps: the debug agent fixes errors
+            // "content" field is used for the prompt text (maps to prompt_content)
             "agentic_steps": [
                 {
                     "name": "Debug Agent - Fix Errors",
-                    "type": "ai_analysis",
-                    "config": {
-                        "prompt": ai_prompt,
-                        "model": "claude-sonnet-4-20250514",
-                        "max_iterations": self.config.max_iterations,
-                        "tools": ["read_file", "write_file", "run_command", "search_files"],
-                        "context": {
-                            "error_count": context.total_count,
-                            "has_critical": !context.critical_errors.is_empty(),
-                            "focus_areas": context.focus_areas
-                        }
-                    }
+                    "type": "prompt",
+                    "content": ai_prompt
                 }
             ],
 
@@ -210,50 +201,21 @@ impl ErrorFixWorkflowGenerator {
     }
 
     /// Build verification criteria for the workflow.
-    fn build_verification_criteria(&self, context: &DebugContext) -> Vec<Value> {
+    ///
+    /// Uses log_watch step type to check for errors in application logs.
+    /// The orchestrator will automatically prepend additional log_watch verification
+    /// when executing the workflow.
+    fn build_verification_criteria(&self, _context: &DebugContext) -> Vec<Value> {
         let mut criteria = Vec::new();
 
-        // Primary criterion: no more critical or error-severity issues
-        criteria.push(json!({
-            "name": "No Critical Errors",
-            "type": "error_check",
-            "config": {
-                "severity": ["critical", "error"],
-                "max_count": 0,
-                "description": "Application should have no critical or error-level issues"
-            }
-        }));
-
-        // If we had specific files with errors, add file-specific checks
-        let mut files_checked: Vec<String> = Vec::new();
-        for error in context.critical_errors.iter().chain(context.errors.iter()) {
-            if let Some(ref loc) = error.location {
-                if !files_checked.contains(&loc) && files_checked.len() < 5 {
-                    files_checked.push(loc.clone());
-                    criteria.push(json!({
-                        "name": format!("No errors in {}", loc),
-                        "type": "log_check",
-                        "config": {
-                            "file_pattern": loc,
-                            "error_pattern": "(?i)(error|exception|traceback)",
-                            "should_not_match": true,
-                            "description": format!("File {} should not produce errors", loc)
-                        }
-                    }));
-                }
-            }
-        }
-
-        // Add a general log check
+        // Primary verification: check application logs for new errors
+        // Using "log_watch" step type which is registered in the handler registry
+        // and specifically designed for log-based error detection
         criteria.push(json!({
             "name": "Application Logs Clean",
-            "type": "log_check",
-            "config": {
-                "check_recent_logs": true,
-                "max_error_count": 0,
-                "time_window_seconds": 60,
-                "description": "No new errors should appear in application logs"
-            }
+            "type": "log_watch",
+            "time_window_seconds": 60,
+            "error_patterns": ["(?i)(error|exception|traceback|failed|panic)"]
         }));
 
         criteria
@@ -340,32 +302,23 @@ Focus on a minimal, targeted fix for this specific issue.
 
             "setup_steps": [],
 
+            // Verification uses log_watch to check for new errors in logs
+            // The targeted_error_ids field tracks which errors should be resolved
             "verification_steps": [
                 {
-                    "name": "Error Resolved",
-                    "type": "error_check",
-                    "config": {
-                        "error_id": error_id,
-                        "should_be_resolved": true,
-                        "description": "The targeted error should be resolved"
-                    }
+                    "name": "No New Errors",
+                    "type": "log_watch",
+                    "time_window_seconds": 30,
+                    "error_patterns": ["(?i)(error|exception|traceback|failed|panic)"]
                 }
             ],
 
+            // "content" field is used for the prompt text (maps to prompt_content)
             "agentic_steps": [
                 {
                     "name": "Fix Single Error",
-                    "type": "ai_analysis",
-                    "config": {
-                        "prompt": ai_prompt,
-                        "model": "claude-sonnet-4-20250514",
-                        "max_iterations": 5,
-                        "tools": ["read_file", "write_file", "run_command", "search_files"],
-                        "context": {
-                            "error_id": error_id,
-                            "error_type": error.error_type
-                        }
-                    }
+                    "type": "prompt",
+                    "content": ai_prompt
                 }
             ],
 
