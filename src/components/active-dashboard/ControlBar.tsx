@@ -225,7 +225,7 @@ function WorkflowStageIndicator({
 export function ControlBar({
   taskName,
   phase = "idle",
-  showPhaseBadge = false,
+  showPhaseBadge: _showPhaseBadge = false,
   status,
   workflowStage,
   isOrchestrated = false,
@@ -276,10 +276,16 @@ export function ControlBar({
             maxIterations={maxIterations}
           />
         )}
-        {/* Show phase badge for non-orchestrated workflows (fallback) */}
-        {!isOrchestrated && showPhaseBadge && phase !== "idle" && phaseInfo.label && (
+        {/* Show phase badge for non-orchestrated workflows - removed showPhaseBadge requirement */}
+        {!isOrchestrated && phase !== "idle" && phaseInfo.label && (
           <Badge className={`px-3 py-1 text-xs font-medium ${phaseStyle.className}`}>
             {phaseInfo.label}
+          </Badge>
+        )}
+        {/* Fallback: Show "Running" badge when task is running but no specific phase detected */}
+        {!isOrchestrated && isRunning && phase === "idle" && (
+          <Badge className="px-3 py-1 text-xs font-medium bg-blue-500/10 text-blue-600 border border-blue-500/30">
+            RUNNING
           </Badge>
         )}
         {/* Inline execution stats (compact mode) */}

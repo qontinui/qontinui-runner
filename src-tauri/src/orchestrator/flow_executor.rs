@@ -1091,7 +1091,7 @@ impl FlowExecutor {
         // Spawn tasks for each branch
         // Note: In a full implementation, each branch would execute its own step chain.
         // For now, we simulate branch execution with configurable delays.
-        for branch_id in branches.iter().cloned() {
+        for branch_id in branches.iter() {
             let tx = tx.clone();
             let branch_id_clone = branch_id.clone();
             let step_id_clone = step_id.to_string();

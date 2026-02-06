@@ -38,12 +38,16 @@ interface DashboardLayoutProps {
   onWidgetClick: (type: ActivityType) => void;
   /** Callback to navigate to detail page */
   onNavigateToDetail: (type: ActivityType) => void;
-  /** Callback to go to execute page */
-  onGoToExecute: () => void;
   /** Callback to go to recap page */
   onGoToRecap?: () => void;
+  /** Callback to run the last workflow again */
+  onRunLastWorkflow?: () => void;
+  /** Whether the last workflow is currently being started */
+  isRunningLastWorkflow?: boolean;
   /** Name of the last run workflow */
   lastRunWorkflowName?: string | null;
+  /** ID of the last run workflow */
+  lastRunWorkflowId?: string | null;
 }
 
 /**
@@ -1103,9 +1107,11 @@ export function DashboardLayout({
   layout,
   onWidgetClick,
   onNavigateToDetail,
-  onGoToExecute,
   onGoToRecap,
+  onRunLastWorkflow,
+  isRunningLastWorkflow,
   lastRunWorkflowName,
+  lastRunWorkflowId,
 }: DashboardLayoutProps) {
   const { activeWidget, summaryWidgets, activities, isIdle, detectedWidgets } = layout;
 
@@ -1212,9 +1218,11 @@ export function DashboardLayout({
   if (detectedWidgets.length === 0 || isIdle) {
     return (
       <IdleState
-        onGoToExecute={onGoToExecute}
         onGoToRecap={onGoToRecap}
+        onRunLastWorkflow={onRunLastWorkflow}
+        isRunningLastWorkflow={isRunningLastWorkflow}
         lastRunWorkflowName={lastRunWorkflowName}
+        lastRunWorkflowId={lastRunWorkflowId}
       />
     );
   }

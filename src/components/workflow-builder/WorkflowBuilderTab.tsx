@@ -23,6 +23,7 @@ import {
   ChevronDown,
   ChevronUp,
   AlertCircle,
+  Zap,
 } from "lucide-react";
 import type {
   WorkflowPhase,
@@ -1192,7 +1193,6 @@ function WorkflowBuilderContent({
         prompt_id: prompt.id,
         provider: prompt.provider ?? undefined,
         model: prompt.model ?? undefined,
-        is_blocking: phase === "verification" ? true : undefined,
       };
 
       addStep(step, phase);
@@ -1274,7 +1274,6 @@ function WorkflowBuilderContent({
         auto_fix: check.auto_fix,
         fail_on_warning: check.fail_on_warning,
         timeout_seconds: check.timeout_seconds,
-        is_blocking: check.is_critical,
       };
 
       addStep(step, phase);
@@ -1324,7 +1323,6 @@ function WorkflowBuilderContent({
         test_type: testTypeMap[test.test_type] || "custom_command",
         test_id: test.id,
         timeout_seconds: test.timeout_seconds,
-        is_critical: test.is_critical,
       };
 
       addStep(step, phase);
@@ -1360,7 +1358,6 @@ function WorkflowBuilderContent({
         phase: "verification",
         name: group.name,
         check_group_id: group.id,
-        is_blocking: true, // Check groups are blocking by default
       };
 
       addStep(step, phase);
@@ -1436,7 +1433,6 @@ function WorkflowBuilderContent({
         script_content: script.script_content,
         target_url: script.target_url,
         timeout_seconds: script.timeout_seconds,
-        is_critical: true,
       };
 
       addStep(step, phase);
@@ -1635,7 +1631,6 @@ function WorkflowBuilderContent({
             className="mb-3"
             actions={[
               toolbarActions.ai(() => setAiGenerateModalOpen(true)),
-              toolbarActions.liveBrowser(() => setLiveBrowserPanelOpen(true)),
               toolbarActions.stateMachine(() => setGenerateFromStatesModalOpen(true)),
               toolbarActions.addFromState(() => setAddStateStepsModalOpen(true)),
               toolbarActions.new(handleNewWorkflow, "New"),
@@ -1916,6 +1911,18 @@ function WorkflowBuilderContent({
                   phase="verification"
                   steps={state.workflow.verification_steps}
                   onAddStep={handleAddStep}
+                  headerActions={
+                    <button
+                      onClick={() => setLiveBrowserPanelOpen(true)}
+                      className="flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium
+                                 text-cyan-400 hover:text-cyan-300 hover:bg-green-500/10 transition-colors"
+                      title="Add verification steps from a live browser page"
+                      data-ui-id="workflow-builder-verification-live-btn"
+                    >
+                      <Zap className="w-3.5 h-3.5" />
+                      Live
+                    </button>
+                  }
                   renderStep={(step, index, isSelectionMode, isSelectedForDelete, onToggleSelect) =>
                     renderStep(
                       step,

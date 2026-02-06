@@ -102,9 +102,7 @@ fn find_auto_include_reason(
     action_types: &[String],
     recent_errors: &[String],
 ) -> Option<(String, String)> {
-    let Some(ref rules) = context.auto_include else {
-        return None;
-    };
+    let rules = context.auto_include.as_ref()?;
 
     let task_lower = task_prompt.to_lowercase();
 

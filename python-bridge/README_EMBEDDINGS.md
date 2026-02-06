@@ -15,6 +15,7 @@ poetry install
 ```
 
 This installs:
+
 - `sentence-transformers` - For text embeddings
 - `transformers` - For CLIP embeddings
 - `torch` - For deep learning models
@@ -108,6 +109,7 @@ For each GUI element, the script generates:
 Embeddings are stored in a local Qdrant database at `~/.qontinui/rag/{project_id}/embeddings/vector.qvdb/`.
 
 The database uses multi-vector configuration:
+
 - `text_embedding` - 384-dim, Cosine distance
 - `clip_embedding` - 512-dim, Cosine distance
 - `dinov2_embedding` - 768-dim, Cosine distance
@@ -115,6 +117,7 @@ The database uses multi-vector configuration:
 ## Error Handling
 
 The script handles errors gracefully:
+
 - Missing config file → Fatal error
 - Missing screenshots → Fatal error
 - Missing bounding box → Skip element, continue

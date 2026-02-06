@@ -16,6 +16,8 @@ interface PhaseSectionProps {
   phase: WorkflowPhase;
   steps: UnifiedStep[];
   onAddStep: (phase: WorkflowPhase) => void;
+  /** Optional actions rendered in the phase header (e.g. a "Live" button) */
+  headerActions?: React.ReactNode;
   renderStep: (
     step: UnifiedStep,
     index: number,
@@ -25,7 +27,7 @@ interface PhaseSectionProps {
   ) => React.ReactNode;
 }
 
-export function PhaseSection({ phase, steps, onAddStep, renderStep }: PhaseSectionProps) {
+export function PhaseSection({ phase, steps, onAddStep, headerActions, renderStep }: PhaseSectionProps) {
   const { state, togglePhase, selectStep, removeStep } = useWorkflowBuilder();
   const phaseInfo = PHASE_INFO[phase];
   const isExpanded = state.expandedPhases[phase];
@@ -158,6 +160,7 @@ export function PhaseSection({ phase, steps, onAddStep, renderStep }: PhaseSecti
           <span className={`text-xs ${colors.textMuted} hidden sm:block`}>
             {phaseInfo.description}
           </span>
+          {headerActions}
           {/* Trashcan icon for step selection mode - only show if there are steps */}
           {!isEmpty && (
             <button

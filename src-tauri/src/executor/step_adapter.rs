@@ -226,7 +226,7 @@ impl StepExecutorAdapter {
         // Execute the step using the underlying executor
         let result = self
             .executor
-            .execute_steps(&[step.clone()], &config.execution_id)
+            .execute_steps(std::slice::from_ref(step), &config.execution_id)
             .await;
 
         let duration_ms = start_time.elapsed().as_millis() as u64;

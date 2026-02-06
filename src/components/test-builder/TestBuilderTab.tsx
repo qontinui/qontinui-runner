@@ -49,7 +49,9 @@ function TestBuilderContent({ onLog }: TestBuilderTabProps) {
   const [code, setCode] = useState("");
 
   // Tab state: "ai", "code", "analysis", "orchestrator", or "spec-workflow" - AI selected by default
-  const [activeTab, setActiveTab] = useState<"ai" | "code" | "analysis" | "orchestrator" | "spec-workflow">("ai");
+  const [activeTab, setActiveTab] = useState<
+    "ai" | "code" | "analysis" | "orchestrator" | "spec-workflow"
+  >("ai");
   const [analysisData, setAnalysisData] = useState<AnalysisData | null>(null);
   const [showGenerator, setShowGenerator] = useState(false);
 
@@ -550,7 +552,10 @@ function TestBuilderContent({ onLog }: TestBuilderTabProps) {
                       });
                       if (!res.ok) throw new Error(`HTTP ${res.status}`);
                       const saved = await res.json();
-                      onLog?.("info", `Workflow "${workflow.name}" saved (ID: ${saved.id || workflow.id}). Open it in the Workflow Builder tab.`);
+                      onLog?.(
+                        "info",
+                        `Workflow "${workflow.name}" saved (ID: ${saved.id || workflow.id}). Open it in the Workflow Builder tab.`,
+                      );
                     } catch (err) {
                       onLog?.("error", `Failed to save workflow: ${err}`);
                     }

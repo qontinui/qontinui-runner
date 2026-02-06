@@ -14,5 +14,4 @@ export { StagedTimeline } from "./StagedTimeline";
 export { VerificationTab } from "./VerificationTab";
 export { KnowledgeTab } from "./KnowledgeTab";
 export { AutomationTab } from "./AutomationTab";
-export { TestsTab } from "./TestsTab";
 export { ContextTab } from "./ContextTab";

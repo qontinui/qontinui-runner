@@ -172,7 +172,11 @@ impl JsonlSpanLayer {
             match OpenOptions::new().create(true).append(true).open(&path) {
                 Ok(f) => *file_guard = Some(f),
                 Err(e) => {
-                    eprintln!("Failed to open spans JSONL file at {}: {}", path.display(), e);
+                    eprintln!(
+                        "Failed to open spans JSONL file at {}: {}",
+                        path.display(),
+                        e
+                    );
                     return None;
                 }
             }

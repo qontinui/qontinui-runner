@@ -68,6 +68,7 @@ python3 analysis/example_usage.py
 ```
 
 This will demonstrate:
+
 - Basic extraction
 - Contour detection
 - Position analysis
@@ -81,6 +82,7 @@ python3 analysis/example_usage.py /path/to/screenshots /path/to/events.json
 ```
 
 This will:
+
 1. Load your captured screenshots
 2. Load input events
 3. Detect states
@@ -121,6 +123,7 @@ fixed_images = [img for img in images if img.position_type == "fixed"]
 ## Configuration Presets
 
 ### Desktop App
+
 ```python
 ImageExtractionConfig(
     min_size=(30, 30),
@@ -131,6 +134,7 @@ ImageExtractionConfig(
 ```
 
 ### Web App
+
 ```python
 ImageExtractionConfig(
     min_size=(20, 20),
@@ -141,6 +145,7 @@ ImageExtractionConfig(
 ```
 
 ### Mobile App
+
 ```python
 ImageExtractionConfig(
     min_size=(40, 40),
@@ -199,6 +204,7 @@ pytest analysis/test_image_extractor.py::TestStateImageExtractor::test_extract_a
 **Problem**: `extract_from_state()` returns empty list
 
 **Solutions**:
+
 1. Check that frames have valid image data
 2. Verify click locations are within bounds
 3. Lower `min_contour_area` to detect smaller elements
@@ -209,6 +215,7 @@ pytest analysis/test_image_extractor.py::TestStateImageExtractor::test_extract_a
 **Problem**: Too many false positive extractions
 
 **Solutions**:
+
 1. Increase `min_contour_area`
 2. Reduce `max_contours`
 3. Use stricter `min_size` constraints
@@ -219,6 +226,7 @@ pytest analysis/test_image_extractor.py::TestStateImageExtractor::test_extract_a
 **Problem**: `ModuleNotFoundError: No module named 'models'`
 
 **Solutions**:
+
 1. Run from `python-bridge` directory
 2. Add to Python path: `export PYTHONPATH=/path/to/python-bridge:$PYTHONPATH`
 3. Use absolute imports in your code
@@ -228,6 +236,7 @@ pytest analysis/test_image_extractor.py::TestStateImageExtractor::test_extract_a
 **Problem**: `cv2.error: OpenCV(4.x.x) ... error`
 
 **Solutions**:
+
 1. Verify image format: Should be BGR numpy array
 2. Check image dimensions: `image.shape` should be (height, width, 3)
 3. Ensure image data type: `image.dtype` should be `uint8`

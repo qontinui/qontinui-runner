@@ -58,7 +58,7 @@ class StateNavigationFormatter(AnalysisFormatter):
             for i, step in enumerate(path_taken):
                 action = f" ({step.get('action_taken', '')})" if step.get("action_taken") else ""
                 lines.append(
-                    f"{i + 1}. {step.get('from_state', '')} → {step.get('to_state', '')} via \"{step.get('transition_name', '')}\"{action}"
+                    f'{i + 1}. {step.get("from_state", "")} → {step.get("to_state", "")} via "{step.get("transition_name", "")}"{action}'
                 )
         elif reached:
             lines.append("")
@@ -145,7 +145,7 @@ class StateNavigationFormatter(AnalysisFormatter):
                         field_type="string",
                         example_value=step.get("transition_name", ""),
                         suggested_assertions=[
-                            f"Assert transition \"{step.get('transition_name', '')}\" was used"
+                            f'Assert transition "{step.get("transition_name", "")}" was used'
                         ],
                     )
                 )

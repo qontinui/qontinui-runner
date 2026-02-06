@@ -2361,7 +2361,7 @@ pub fn add_project_context_to_config(
 ///
 /// Returns the updated contexts array.
 pub fn update_project_context_in_config(
-    contexts_json: &mut Vec<serde_json::Value>,
+    contexts_json: &mut [serde_json::Value],
     context: Context,
 ) -> Result<(), String> {
     let index = contexts_json

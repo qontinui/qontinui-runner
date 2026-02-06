@@ -17,15 +17,8 @@
           "type": "RECURSIVE_VERIFY",
           "name": "Verify Extraction States",
           "config": {
-            "states": [
-              "ExtractionPage",
-              "ExtractionResults",
-              "ExtractionComplete"
-            ],
-            "screenshotStates": [
-              "ExtractionPage",
-              "ExtractionResults"
-            ],
+            "states": ["ExtractionPage", "ExtractionResults", "ExtractionComplete"],
+            "screenshotStates": ["ExtractionPage", "ExtractionResults"],
             "goal": "Verify that web extraction navigates through all states correctly and displays extraction results",
             "maxIterations": 10,
             "timeout": 600000
@@ -44,14 +37,8 @@
           "type": "RECURSIVE_VERIFY",
           "name": "Verify Login States",
           "config": {
-            "states": [
-              "LoginPage",
-              "DashboardHome"
-            ],
-            "screenshotStates": [
-              "LoginPage",
-              "DashboardHome"
-            ],
+            "states": ["LoginPage", "DashboardHome"],
+            "screenshotStates": ["LoginPage", "DashboardHome"],
             "goal": "Verify that login navigates from login page to dashboard successfully",
             "maxIterations": 5,
             "timeout": 300000
@@ -70,11 +57,7 @@
           "type": "RECURSIVE_VERIFY",
           "name": "Verify Capture Feature",
           "config": {
-            "states": [
-              "CaptureTab",
-              "CaptureInProgress",
-              "CaptureComplete"
-            ],
+            "states": ["CaptureTab", "CaptureInProgress", "CaptureComplete"],
             "goal": "Verify screen capture functionality",
             "maxIterations": 5
           }
@@ -84,10 +67,7 @@
           "type": "RECURSIVE_VERIFY",
           "name": "Verify Dataset Feature",
           "config": {
-            "states": [
-              "DatasetTab",
-              "DatasetPackaging"
-            ],
+            "states": ["DatasetTab", "DatasetPackaging"],
             "goal": "Verify dataset packaging functionality",
             "maxIterations": 5
           }

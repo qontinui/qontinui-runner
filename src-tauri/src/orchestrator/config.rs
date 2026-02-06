@@ -189,7 +189,6 @@ impl EnhancedOrchestratorConfig {
                 enable_observability: true,
                 enable_limits: true,
                 enable_debug: false, // Disabled in production
-                ..Default::default()
             },
             interrupt: InterruptConfig {
                 enabled: true,

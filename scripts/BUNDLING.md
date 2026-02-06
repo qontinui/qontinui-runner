@@ -47,24 +47,25 @@ When the bundled executable is present, the runner uses it automatically. This e
 
 ## Build Variants
 
-| Variant | Size | Description |
-|---------|------|-------------|
-| Minimal | ~80-100MB | Core Python + basic deps, no ML |
-| Standard | ~400-500MB | + CPU PyTorch, OpenCV, EasyOCR |
-| CUDA | ~2-3GB | + GPU support |
+| Variant  | Size       | Description                     |
+| -------- | ---------- | ------------------------------- |
+| Minimal  | ~80-100MB  | Core Python + basic deps, no ML |
+| Standard | ~400-500MB | + CPU PyTorch, OpenCV, EasyOCR  |
+| CUDA     | ~2-3GB     | + GPU support                   |
 
 ## ML Models (Lazy Loading)
 
 Large ML models are NOT included in the bundle. They are downloaded on first use:
 
-| Model | Size | Purpose |
-|-------|------|---------|
-| SAM3 Base | ~375MB | Segment Anything |
-| SAM3 Large | ~1.25GB | Higher quality segmentation |
-| CLIP ViT-B/32 | ~354MB | Vision-language understanding |
-| EasyOCR | ~100MB/lang | Text recognition |
+| Model         | Size        | Purpose                       |
+| ------------- | ----------- | ----------------------------- |
+| SAM3 Base     | ~375MB      | Segment Anything              |
+| SAM3 Large    | ~1.25GB     | Higher quality segmentation   |
+| CLIP ViT-B/32 | ~354MB      | Vision-language understanding |
+| EasyOCR       | ~100MB/lang | Text recognition              |
 
 Models are stored in:
+
 - Windows: `%APPDATA%/com.qontinui.runner/models/`
 - macOS: `~/Library/Application Support/com.qontinui.runner/models/`
 - Linux: `~/.local/share/com.qontinui.runner/models/`
@@ -89,6 +90,7 @@ src-tauri/binaries/qontinui-executor-{target}      (macOS/Linux)
 ```
 
 Where `{target}` is the platform triple:
+
 - `x86_64-pc-windows-msvc` (Windows x64)
 - `aarch64-pc-windows-msvc` (Windows ARM64)
 - `x86_64-apple-darwin` (macOS Intel)
@@ -106,7 +108,7 @@ The release workflow can optionally include bundled Python:
 workflow_dispatch:
   inputs:
     include_bundled_python:
-      description: 'Bundle Python executor'
+      description: "Bundle Python executor"
       type: boolean
       default: true
 ```

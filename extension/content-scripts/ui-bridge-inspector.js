@@ -6,7 +6,7 @@
  */
 
 (function () {
-  'use strict';
+  "use strict";
 
   // Handle extension reinstall: remove old listeners and re-register
   // The old extension context is invalidated on reinstall, so we need fresh listeners
@@ -94,9 +94,10 @@
    * Find all iframes on the page and return information about cross-origin ones.
    * @returns {Array<{element: HTMLIFrameElement, bounds: DOMRect, isCrossOrigin: boolean}>}
    */
-  function getIframeInfo() {  // eslint-disable-line no-unused-vars
-    const iframes = document.querySelectorAll('iframe');
-    return Array.from(iframes).map(iframe => {
+  function getIframeInfo() {
+    // eslint-disable-line no-unused-vars
+    const iframes = document.querySelectorAll("iframe");
+    return Array.from(iframes).map((iframe) => {
       const rect = iframe.getBoundingClientRect();
       return {
         element: iframe,
@@ -111,18 +112,18 @@
           left: rect.left,
         },
         isCrossOrigin: isCrossOriginIframe(iframe),
-        src: iframe.src || '',
-        name: iframe.name || '',
-        id: iframe.id || '',
+        src: iframe.src || "",
+        name: iframe.name || "",
+        id: iframe.id || "",
       };
     });
   }
 
   // Style constants
-  const OVERLAY_COLOR = 'rgba(59, 130, 246, 0.3)';
-  const OVERLAY_BORDER = 'rgba(59, 130, 246, 0.8)';
-  const HOVER_COLOR = 'rgba(59, 130, 246, 0.2)';
-  const LABEL_BG = 'rgba(59, 130, 246, 0.9)';
+  const OVERLAY_COLOR = "rgba(59, 130, 246, 0.3)";
+  const OVERLAY_BORDER = "rgba(59, 130, 246, 0.8)";
+  const HOVER_COLOR = "rgba(59, 130, 246, 0.2)";
+  const LABEL_BG = "rgba(59, 130, 246, 0.9)";
 
   /**
    * Check if an element is interactive
@@ -132,39 +133,53 @@
     const tag = el.tagName.toLowerCase();
 
     // Check native interactive elements
-    if (['button', 'input', 'select', 'textarea', 'a'].includes(tag)) {
+    if (["button", "input", "select", "textarea", "a"].includes(tag)) {
       // Links need href to be interactive
-      if (tag === 'a' && !el.hasAttribute('href')) {
+      if (tag === "a" && !el.hasAttribute("href")) {
         return false;
       }
       return true;
     }
 
     // Check ARIA roles that indicate interactivity
-    const role = el.getAttribute('role');
+    const role = el.getAttribute("role");
     const interactiveRoles = [
-      'button', 'link', 'checkbox', 'radio', 'switch',
-      'tab', 'menuitem', 'menuitemcheckbox', 'menuitemradio',
-      'option', 'combobox', 'listbox', 'slider', 'spinbutton',
-      'textbox', 'searchbox', 'treeitem', 'gridcell'
+      "button",
+      "link",
+      "checkbox",
+      "radio",
+      "switch",
+      "tab",
+      "menuitem",
+      "menuitemcheckbox",
+      "menuitemradio",
+      "option",
+      "combobox",
+      "listbox",
+      "slider",
+      "spinbutton",
+      "textbox",
+      "searchbox",
+      "treeitem",
+      "gridcell",
     ];
     if (role && interactiveRoles.includes(role)) {
       return true;
     }
 
     // Check tabindex >= 0
-    const tabindex = el.getAttribute('tabindex');
+    const tabindex = el.getAttribute("tabindex");
     if (tabindex !== null && parseInt(tabindex, 10) >= 0) {
       return true;
     }
 
     // Check onclick handler
-    if (el.hasAttribute('onclick') || el.onclick) {
+    if (el.hasAttribute("onclick") || el.onclick) {
       return true;
     }
 
     // Check contenteditable
-    if (el.isContentEditable || el.getAttribute('contenteditable') === 'true') {
+    if (el.isContentEditable || el.getAttribute("contenteditable") === "true") {
       return true;
     }
 
@@ -175,7 +190,7 @@
    * Get all registered UI Bridge elements (with data-ui-id)
    */
   function getRegisteredElements() {
-    const elements = document.querySelectorAll('[data-ui-id]');
+    const elements = document.querySelectorAll("[data-ui-id]");
     return Array.from(elements).map((el) => {
       const rect = el.getBoundingClientRect();
       const accessibility = getElementAccessibility(el);
@@ -183,12 +198,12 @@
       const extraction = getExtractionAttributes(el);
 
       // Check required: HTML attribute or aria-required
-      const htmlRequired = el.hasAttribute('required') || el.required === true;
-      const ariaRequired = el.getAttribute('aria-required') === 'true';
+      const htmlRequired = el.hasAttribute("required") || el.required === true;
+      const ariaRequired = el.getAttribute("aria-required") === "true";
 
       // Check readonly: HTML attribute or aria-readonly
-      const htmlReadonly = el.hasAttribute('readonly') || el.readOnly === true;
-      const ariaReadonly = el.getAttribute('aria-readonly') === 'true';
+      const htmlReadonly = el.hasAttribute("readonly") || el.readOnly === true;
+      const ariaReadonly = el.getAttribute("aria-readonly") === "true";
 
       // Check if element is inside a cross-origin iframe
       const isCrossOrigin = isInsideCrossOriginIframe(el);
@@ -210,8 +225,8 @@
         visible: isElementVisible(el),
         enabled: !isElementDisabled(el),
         focused: document.activeElement === el,
-        value: 'value' in el ? el.value : undefined,
-        checked: 'checked' in el ? el.checked : undefined,
+        value: "value" in el ? el.value : undefined,
+        checked: "checked" in el ? el.checked : undefined,
         text: el.textContent?.trim().slice(0, 100) || undefined,
         label: getElementLabel(el),
         parent: findParentUiId(el),
@@ -244,7 +259,7 @@
    */
   function generateElementId(el, index) {
     // FIRST: Check for data-ui-id (highest priority - user-defined semantic ID)
-    const dataUiId = el.dataset?.uiId || el.getAttribute('data-ui-id');
+    const dataUiId = el.dataset?.uiId || el.getAttribute("data-ui-id");
     if (dataUiId) {
       return dataUiId;
     }
@@ -260,16 +275,22 @@
     }
 
     // Use aria-label if available
-    const ariaLabel = el.getAttribute('aria-label');
+    const ariaLabel = el.getAttribute("aria-label");
     if (ariaLabel) {
-      const sanitized = ariaLabel.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 30);
+      const sanitized = ariaLabel
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .slice(0, 30);
       return `aria-${sanitized}`;
     }
 
     // Use text content for buttons/links (sanitized)
     const text = el.textContent?.trim();
-    if (text && ['button', 'a'].includes(el.tagName.toLowerCase())) {
-      const sanitized = text.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 30);
+    if (text && ["button", "a"].includes(el.tagName.toLowerCase())) {
+      const sanitized = text
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .slice(0, 30);
       return `${el.tagName.toLowerCase()}-${sanitized}`;
     }
 
@@ -305,11 +326,11 @@
     // Otherwise, discover interactive elements on the page
     // Selectors for common interactive elements
     const interactiveSelectors = [
-      'button',
-      'a[href]',
+      "button",
+      "a[href]",
       'input:not([type="hidden"])',
-      'select',
-      'textarea',
+      "select",
+      "textarea",
       '[role="button"]',
       '[role="link"]',
       '[role="tab"]',
@@ -319,12 +340,12 @@
       '[role="switch"]',
       '[role="option"]',
       '[tabindex]:not([tabindex="-1"])',
-      '[onclick]',
-      '[data-action]',
-      '[data-click]',
+      "[onclick]",
+      "[data-action]",
+      "[data-click]",
     ];
 
-    const selector = interactiveSelectors.join(', ');
+    const selector = interactiveSelectors.join(", ");
     const allElements = document.querySelectorAll(selector);
 
     // Track which elements we've already processed (to avoid duplicates)
@@ -346,12 +367,12 @@
       const extraction = getExtractionAttributes(el);
 
       // Check required: HTML attribute or aria-required
-      const htmlRequired = el.hasAttribute('required') || el.required === true;
-      const ariaRequired = el.getAttribute('aria-required') === 'true';
+      const htmlRequired = el.hasAttribute("required") || el.required === true;
+      const ariaRequired = el.getAttribute("aria-required") === "true";
 
       // Check readonly: HTML attribute or aria-readonly
-      const htmlReadonly = el.hasAttribute('readonly') || el.readOnly === true;
-      const ariaReadonly = el.getAttribute('aria-readonly') === 'true';
+      const htmlReadonly = el.hasAttribute("readonly") || el.readOnly === true;
+      const ariaReadonly = el.getAttribute("aria-readonly") === "true";
 
       // Check if element is inside a cross-origin iframe
       const isCrossOrigin = isInsideCrossOriginIframe(el);
@@ -373,8 +394,8 @@
         visible: true, // Already filtered above
         enabled: !isElementDisabled(el),
         focused: document.activeElement === el,
-        value: 'value' in el ? el.value : undefined,
-        checked: 'checked' in el ? el.checked : undefined,
+        value: "value" in el ? el.value : undefined,
+        checked: "checked" in el ? el.checked : undefined,
         text: el.textContent?.trim().slice(0, 100) || undefined,
         label: getElementLabel(el),
         parent: null,
@@ -422,6 +443,116 @@
   }
 
   /**
+   * Discover visible non-interactive elements (headings, badges, labels, etc.).
+   * Used when specs need to verify structural/non-interactive page elements.
+   */
+  function discoverNonInteractiveElements() {
+    const selectors = [
+      "h1", "h2", "h3", "h4", "h5", "h6",
+      "p",
+      '[role="heading"]',
+      '[role="banner"]',
+      '[role="status"]',
+      '[role="alert"]',
+      '[role="note"]',
+      '[role="img"]',
+      '[role="separator"]',
+      "label",
+      "figcaption",
+      "caption",
+      "legend",
+    ];
+
+    const selector = selectors.join(", ");
+    const candidateElements = document.querySelectorAll(selector);
+    const seen = new Set();
+    const results = [];
+
+    Array.from(candidateElements).forEach((el, index) => {
+      if (!isElementVisible(el)) return;
+      if (seen.has(el)) return;
+      // Skip if already has data-ui-id (already covered by registered elements)
+      if (el.dataset && el.dataset.uiId) return;
+      seen.add(el);
+
+      const rect = el.getBoundingClientRect();
+      const accessibility = getElementAccessibility(el);
+      const generatedId = generateElementId(el, 10000 + index);
+
+      results.push({
+        id: generatedId,
+        tagName: el.tagName.toLowerCase(),
+        type: "text",
+        bounds: {
+          x: rect.x, y: rect.y,
+          width: rect.width, height: rect.height,
+          top: rect.top, right: rect.right,
+          bottom: rect.bottom, left: rect.left,
+        },
+        visible: true,
+        enabled: true,
+        focused: false,
+        text: el.textContent?.trim().slice(0, 200) || undefined,
+        label: el.getAttribute("aria-label") || undefined,
+        parent: null,
+        children: [],
+        actions: [],
+        hasUiId: false,
+        is_interactive: false,
+        role: accessibility.role,
+        accessibleName: accessibility.accessibleName,
+        _discovered: true,
+      });
+    });
+
+    // Also find visible spans/divs with short text that may be badges
+    document.querySelectorAll("span, div").forEach((el) => {
+      if (!isElementVisible(el)) return;
+      if (seen.has(el)) return;
+      if (el.dataset && el.dataset.uiId) return;
+      const text = el.textContent?.trim();
+      // Only include text elements up to 100 chars (badges, status messages, empty states)
+      if (!text || text.length > 100 || text.length === 0) return;
+      // Skip if it has interactive children
+      if (el.querySelector("button, a, input, select, textarea")) return;
+      // Skip if parent is already captured
+      if (el.closest("h1, h2, h3, h4, h5, h6, button, a, input, label")) return;
+
+      seen.add(el);
+      const rect = el.getBoundingClientRect();
+      const accessibility = getElementAccessibility(el);
+      const generatedId = generateElementId(el, 20000 + results.length);
+
+      results.push({
+        id: generatedId,
+        tagName: el.tagName.toLowerCase(),
+        type: "text",
+        bounds: {
+          x: rect.x, y: rect.y,
+          width: rect.width, height: rect.height,
+          top: rect.top, right: rect.right,
+          bottom: rect.bottom, left: rect.left,
+        },
+        visible: true,
+        enabled: true,
+        focused: false,
+        text: text.slice(0, 200),
+        label: el.getAttribute("aria-label") || undefined,
+        parent: null,
+        children: [],
+        actions: [],
+        hasUiId: false,
+        is_interactive: false,
+        role: accessibility.role,
+        accessibleName: accessibility.accessibleName,
+        _discovered: true,
+      });
+    });
+
+    return results;
+  }
+
+  /**
    * Build a unique CSS selector for an element.
    * Used to re-find discovered elements during executeAction.
    */
@@ -440,15 +571,13 @@
       // Add classes if available (use first 2 classes to avoid overly specific selectors)
       const classes = Array.from(current.classList).slice(0, 2);
       if (classes.length > 0) {
-        selector += '.' + classes.map(c => CSS.escape(c)).join('.');
+        selector += "." + classes.map((c) => CSS.escape(c)).join(".");
       }
 
       // Add nth-child if needed for uniqueness
       const parent = current.parentElement;
       if (parent) {
-        const siblings = Array.from(parent.children).filter(
-          s => s.tagName === current.tagName
-        );
+        const siblings = Array.from(parent.children).filter((s) => s.tagName === current.tagName);
         if (siblings.length > 1) {
           const index = siblings.indexOf(current) + 1;
           selector += `:nth-of-type(${index})`;
@@ -462,7 +591,7 @@
       if (parts.length >= 5) break;
     }
 
-    return parts.join(' > ');
+    return parts.join(" > ");
   }
 
   /**
@@ -481,38 +610,46 @@
     // Try as selector (for discovered elements)
     try {
       // Handle special generated IDs
-      if (elementId.startsWith('name-')) {
+      if (elementId.startsWith("name-")) {
         const name = elementId.slice(5);
         el = document.querySelector(`[name="${CSS.escape(name)}"]`);
         if (el) return el;
       }
 
-      if (elementId.startsWith('aria-')) {
+      if (elementId.startsWith("aria-")) {
         // Search by aria-label prefix match
-        const searchText = elementId.slice(5).replace(/-/g, ' ').trim();
-        const elements = document.querySelectorAll('[aria-label]');
+        const searchText = elementId.slice(5).replace(/-/g, " ").trim();
+        const elements = document.querySelectorAll("[aria-label]");
         for (const candidate of elements) {
-          const label = candidate.getAttribute('aria-label')?.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+          const label = candidate
+            .getAttribute("aria-label")
+            ?.toLowerCase()
+            .replace(/[^a-z0-9]+/g, " ")
+            .trim();
           if (label && label.startsWith(searchText.toLowerCase())) {
             return candidate;
           }
         }
       }
 
-      if (elementId.startsWith('button-') || elementId.startsWith('a-')) {
+      if (elementId.startsWith("button-") || elementId.startsWith("a-")) {
         // Search by text content for buttons/links
-        const [tag, ...textParts] = elementId.split('-');
-        const searchText = textParts.join('-').replace(/-/g, ' ').trim();
+        const [tag, ...textParts] = elementId.split("-");
+        const searchText = textParts.join("-").replace(/-/g, " ").trim();
         const elements = document.querySelectorAll(tag);
         for (const candidate of elements) {
-          const text = candidate.textContent?.trim().toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+          const text = candidate.textContent
+            ?.trim()
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, " ")
+            .trim();
           if (text && text.startsWith(searchText.toLowerCase())) {
             return candidate;
           }
         }
       }
     } catch (e) {
-      console.warn('[Qontinui] Error finding element by ID:', e);
+      console.warn("[Qontinui] Error finding element by ID:", e);
     }
 
     return null;
@@ -536,8 +673,8 @@
    * Get direct child UI IDs
    */
   function getChildUiIds(el) {
-    return Array.from(el.querySelectorAll('[data-ui-id]'))
-      .filter((child) => child.parentElement.closest('[data-ui-id]') === el)
+    return Array.from(el.querySelectorAll("[data-ui-id]"))
+      .filter((child) => child.parentElement.closest("[data-ui-id]") === el)
       .map((child) => child.dataset.uiId);
   }
 
@@ -546,8 +683,8 @@
    */
   function getElementLabel(el) {
     // Check aria-label
-    if (el.getAttribute('aria-label')) {
-      return el.getAttribute('aria-label');
+    if (el.getAttribute("aria-label")) {
+      return el.getAttribute("aria-label");
     }
     // Check associated label
     if (el.id) {
@@ -565,7 +702,7 @@
       return el.title;
     }
     // Use text content for buttons/links
-    if (['button', 'a'].includes(el.tagName.toLowerCase())) {
+    if (["button", "a"].includes(el.tagName.toLowerCase())) {
       return el.textContent?.trim().slice(0, 50);
     }
     return undefined;
@@ -575,54 +712,54 @@
    * Infer element type from tag and attributes
    */
   function inferElementType(el) {
-    const role = el.getAttribute('role');
+    const role = el.getAttribute("role");
     if (role) {
       switch (role) {
-        case 'button':
-          return 'button';
-        case 'textbox':
-          return 'input';
-        case 'checkbox':
-          return 'checkbox';
-        case 'radio':
-          return 'radio';
-        case 'link':
-          return 'link';
-        case 'listbox':
-        case 'combobox':
-          return 'select';
-        case 'menu':
-          return 'menu';
-        case 'menuitem':
-          return 'menuitem';
-        case 'tab':
-          return 'tab';
-        case 'dialog':
-          return 'dialog';
+        case "button":
+          return "button";
+        case "textbox":
+          return "input";
+        case "checkbox":
+          return "checkbox";
+        case "radio":
+          return "radio";
+        case "link":
+          return "link";
+        case "listbox":
+        case "combobox":
+          return "select";
+        case "menu":
+          return "menu";
+        case "menuitem":
+          return "menuitem";
+        case "tab":
+          return "tab";
+        case "dialog":
+          return "dialog";
       }
     }
 
     const tag = el.tagName.toLowerCase();
     switch (tag) {
-      case 'button':
-        return 'button';
-      case 'input': {
+      case "button":
+        return "button";
+      case "input": {
         const type = el.type;
-        if (type === 'checkbox') return 'checkbox';
-        if (type === 'radio') return 'radio';
-        if (type === 'submit' || type === 'button') return 'button';
-        return 'input';
+        if (type === "checkbox") return "checkbox";
+        if (type === "radio") return "radio";
+        if (type === "submit" || type === "button") return "button";
+        return "input";
       }
-      case 'textarea':
-        return 'textarea';
-      case 'select':
-        return 'select';
-      case 'a':
-        return 'link';
-      case 'form':
-        return 'form';
+      case "textarea":
+        return "textarea";
+      case "select":
+        return "select";
+      case "a":
+        return "link";
+      case "form":
+        return "form";
       default:
-        return 'custom';
+        return "custom";
     }
   }
 
@@ -630,25 +767,25 @@
    * Infer available actions based on element type
    */
   function inferActions(type) {
-    const baseActions = ['focus', 'blur', 'hover'];
+    const baseActions = ["focus", "blur", "hover"];
 
     switch (type) {
-      case 'button':
-        return [...baseActions, 'click', 'doubleClick', 'rightClick'];
-      case 'input':
-        return [...baseActions, 'click', 'type', 'clear'];
-      case 'textarea':
-        return [...baseActions, 'click', 'type', 'clear'];
-      case 'select':
-        return [...baseActions, 'click', 'select'];
-      case 'checkbox':
-        return [...baseActions, 'click', 'check', 'uncheck', 'toggle'];
-      case 'radio':
-        return [...baseActions, 'click', 'check'];
-      case 'link':
-        return [...baseActions, 'click'];
+      case "button":
+        return [...baseActions, "click", "doubleClick", "rightClick"];
+      case "input":
+        return [...baseActions, "click", "type", "clear"];
+      case "textarea":
+        return [...baseActions, "click", "type", "clear"];
+      case "select":
+        return [...baseActions, "click", "select"];
+      case "checkbox":
+        return [...baseActions, "click", "check", "uncheck", "toggle"];
+      case "radio":
+        return [...baseActions, "click", "check"];
+      case "link":
+        return [...baseActions, "click"];
       default:
-        return [...baseActions, 'click'];
+        return [...baseActions, "click"];
     }
   }
 
@@ -657,8 +794,8 @@
    */
   function isElementVisible(el) {
     const style = window.getComputedStyle(el);
-    if (style.display === 'none') return false;
-    if (style.visibility === 'hidden') return false;
+    if (style.display === "none") return false;
+    if (style.visibility === "hidden") return false;
     if (parseFloat(style.opacity) === 0) return false;
 
     const rect = el.getBoundingClientRect();
@@ -677,10 +814,10 @@
    * Check if element is disabled
    */
   function isElementDisabled(el) {
-    if ('disabled' in el && el.disabled) {
+    if ("disabled" in el && el.disabled) {
       return true;
     }
-    if (el.getAttribute('aria-disabled') === 'true') {
+    if (el.getAttribute("aria-disabled") === "true") {
       return true;
     }
     return false;
@@ -691,7 +828,7 @@
    */
   function buildXPath(el) {
     if (!el || el.nodeType !== Node.ELEMENT_NODE) {
-      return '';
+      return "";
     }
 
     // If element has an ID, use it
@@ -724,7 +861,7 @@
       }
     }
 
-    return '/' + parts.join('/');
+    return "/" + parts.join("/");
   }
 
   /**
@@ -770,12 +907,12 @@
       classes: Array.from(el.classList),
 
       // HTML attributes useful for extraction
-      href: el.href || el.getAttribute('href') || undefined,
-      src: el.src || el.getAttribute('src') || undefined,
-      alt: el.alt || el.getAttribute('alt') || undefined,
-      title: el.title || el.getAttribute('title') || undefined,
-      placeholder: el.placeholder || el.getAttribute('placeholder') || undefined,
-      name: el.name || el.getAttribute('name') || undefined,
+      href: el.href || el.getAttribute("href") || undefined,
+      src: el.src || el.getAttribute("src") || undefined,
+      alt: el.alt || el.getAttribute("alt") || undefined,
+      title: el.title || el.getAttribute("title") || undefined,
+      placeholder: el.placeholder || el.getAttribute("placeholder") || undefined,
+      name: el.name || el.getAttribute("name") || undefined,
       inputType: el.type || undefined,
 
       // Form-related
@@ -808,7 +945,7 @@
   function getDataAttributes(el) {
     const dataAttrs = {};
     for (const attr of el.attributes) {
-      if (attr.name.startsWith('data-') && attr.name !== 'data-ui-id') {
+      if (attr.name.startsWith("data-") && attr.name !== "data-ui-id") {
         dataAttrs[attr.name] = attr.value;
       }
     }
@@ -864,7 +1001,7 @@
       const parent = current.parentElement;
       if (parent) {
         const sameTagSiblings = Array.from(parent.children).filter(
-          s => s.tagName === current.tagName
+          (s) => s.tagName === current.tagName,
         );
         if (sameTagSiblings.length > 1) {
           const index = sameTagSiblings.indexOf(current) + 1;
@@ -880,7 +1017,7 @@
       maxDepth--;
     }
 
-    return parts.join(' > ');
+    return parts.join(" > ");
   }
 
   /**
@@ -895,18 +1032,18 @@
 
     // Check for fixed/sticky positioning (often headers/footers)
     const position = computed.position;
-    if (position === 'fixed' || position === 'sticky') {
+    if (position === "fixed" || position === "sticky") {
       if (rect.top < viewportHeight * 0.2) {
-        return 'fixed-top';
+        return "fixed-top";
       } else if (rect.bottom > viewportHeight * 0.8) {
-        return 'fixed-bottom';
+        return "fixed-bottom";
       }
     }
 
     // Check if element is in a modal/dialog
     const dialog = el.closest('dialog, [role="dialog"], [role="alertdialog"], [aria-modal="true"]');
     if (dialog) {
-      return 'modal';
+      return "modal";
     }
 
     // Calculate relative position
@@ -918,15 +1055,15 @@
 
     // Determine zone based on position
     if (relativeY < 0.15) {
-      return 'header';
+      return "header";
     } else if (relativeY > 0.85) {
-      return 'footer';
+      return "footer";
     } else if (relativeX < 0.2) {
-      return 'sidebar-left';
+      return "sidebar-left";
     } else if (relativeX > 0.8) {
-      return 'sidebar-right';
+      return "sidebar-right";
     } else {
-      return 'main';
+      return "main";
     }
   }
 
@@ -936,49 +1073,64 @@
    */
   function getLandmarkContext(el) {
     const landmarkRoles = [
-      'banner', 'navigation', 'main', 'complementary',
-      'contentinfo', 'search', 'form', 'region'
+      "banner",
+      "navigation",
+      "main",
+      "complementary",
+      "contentinfo",
+      "search",
+      "form",
+      "region",
     ];
 
     // Note: landmarkSelectors kept for potential future DOM-based lookup
     const _landmarkSelectors = [
-      'header', 'nav', 'main', 'aside', 'footer',
-      '[role="banner"]', '[role="navigation"]', '[role="main"]',
-      '[role="complementary"]', '[role="contentinfo"]', '[role="search"]',
-      '[role="form"]', '[role="region"]'
+      "header",
+      "nav",
+      "main",
+      "aside",
+      "footer",
+      '[role="banner"]',
+      '[role="navigation"]',
+      '[role="main"]',
+      '[role="complementary"]',
+      '[role="contentinfo"]',
+      '[role="search"]',
+      '[role="form"]',
+      '[role="region"]',
     ];
 
     // Find nearest landmark
     let current = el;
     while (current && current !== document.body) {
       // Check explicit role
-      const role = current.getAttribute('role');
+      const role = current.getAttribute("role");
       if (role && landmarkRoles.includes(role)) {
-        const label = current.getAttribute('aria-label') ||
-                      current.getAttribute('aria-labelledby') || '';
+        const label =
+          current.getAttribute("aria-label") || current.getAttribute("aria-labelledby") || "";
         return { role, label: label.slice(0, 50) };
       }
 
       // Check implicit landmark (semantic elements)
       const tagName = current.tagName.toLowerCase();
       const implicitMap = {
-        'header': 'banner',
-        'nav': 'navigation',
-        'main': 'main',
-        'aside': 'complementary',
-        'footer': 'contentinfo'
+        header: "banner",
+        nav: "navigation",
+        main: "main",
+        aside: "complementary",
+        footer: "contentinfo",
       };
 
       if (implicitMap[tagName]) {
         // header/footer are only landmarks if not inside article/aside/main/nav/section
-        if (tagName === 'header' || tagName === 'footer') {
-          const sectioning = current.closest('article, aside, main, nav, section');
+        if (tagName === "header" || tagName === "footer") {
+          const sectioning = current.closest("article, aside, main, nav, section");
           if (!sectioning || sectioning === current) {
-            const label = current.getAttribute('aria-label') || '';
+            const label = current.getAttribute("aria-label") || "";
             return { role: implicitMap[tagName], label: label.slice(0, 50) };
           }
         } else {
-          const label = current.getAttribute('aria-label') || '';
+          const label = current.getAttribute("aria-label") || "";
           return { role: implicitMap[tagName], label: label.slice(0, 50) };
         }
       }
@@ -986,7 +1138,7 @@
       current = current.parentElement;
     }
 
-    return { role: 'none', label: '' };
+    return { role: "none", label: "" };
   }
 
   /**
@@ -999,19 +1151,19 @@
     const relativeArea = area / viewportArea;
 
     if (rect.width <= 32 && rect.height <= 32) {
-      return 'icon';
+      return "icon";
     } else if (rect.width <= 150 && rect.height <= 50) {
-      return 'button';
+      return "button";
     } else if (relativeArea < 0.02) {
-      return 'small';
+      return "small";
     } else if (relativeArea < 0.1) {
-      return 'medium';
+      return "medium";
     } else if (relativeArea < 0.3) {
-      return 'large';
+      return "large";
     } else if (rect.width > window.innerWidth * 0.9) {
-      return 'fullwidth';
+      return "fullwidth";
     } else {
-      return 'panel';
+      return "panel";
     }
   }
 
@@ -1020,23 +1172,23 @@
    * Removes dynamic content patterns and normalizes text.
    */
   function normalizeAccessibleName(name) {
-    if (!name) return '';
+    if (!name) return "";
 
     let normalized = name
       .toLowerCase()
       .trim()
       // Remove common dynamic patterns
-      .replace(/\d{1,2}:\d{2}(:\d{2})?(\s*[ap]m)?/gi, '[time]')  // Times
-      .replace(/\d{1,2}\/\d{1,2}\/\d{2,4}/g, '[date]')           // Dates MM/DD/YYYY
-      .replace(/\d{4}-\d{2}-\d{2}/g, '[date]')                   // Dates YYYY-MM-DD
-      .replace(/\$[\d,.]+/g, '[price]')                          // Prices
-      .replace(/€[\d,.]+/g, '[price]')
-      .replace(/£[\d,.]+/g, '[price]')
-      .replace(/\d+(\.\d+)?%/g, '[percent]')                     // Percentages
-      .replace(/\b\d{5,}\b/g, '[number]')                        // Large numbers (IDs, etc.)
-      .replace(/[a-f0-9]{8,}/gi, '[hash]')                       // Hex hashes
-      .replace(/\s+/g, ' ')                                      // Normalize whitespace
-      .slice(0, 100);                                            // Limit length
+      .replace(/\d{1,2}:\d{2}(:\d{2})?(\s*[ap]m)?/gi, "[time]") // Times
+      .replace(/\d{1,2}\/\d{1,2}\/\d{2,4}/g, "[date]") // Dates MM/DD/YYYY
+      .replace(/\d{4}-\d{2}-\d{2}/g, "[date]") // Dates YYYY-MM-DD
+      .replace(/\$[\d,.]+/g, "[price]") // Prices
+      .replace(/€[\d,.]+/g, "[price]")
+      .replace(/£[\d,.]+/g, "[price]")
+      .replace(/\d+(\.\d+)?%/g, "[percent]") // Percentages
+      .replace(/\b\d{5,}\b/g, "[number]") // Large numbers (IDs, etc.)
+      .replace(/[a-f0-9]{8,}/gi, "[hash]") // Hex hashes
+      .replace(/\s+/g, " ") // Normalize whitespace
+      .slice(0, 100); // Limit length
 
     return normalized;
   }
@@ -1051,74 +1203,81 @@
     }
 
     // Check if parent is a list container
-    const listContainers = ['ul', 'ol', 'menu', 'datalist'];
+    const listContainers = ["ul", "ol", "menu", "datalist"];
     const parentTag = parent.tagName.toLowerCase();
 
     if (listContainers.includes(parentTag)) {
-      const siblings = Array.from(parent.children).filter(
-        s => s.tagName === el.tagName
-      );
+      const siblings = Array.from(parent.children).filter((s) => s.tagName === el.tagName);
       if (siblings.length > 1) {
         return {
-          type: 'list',
+          type: "list",
           containerTag: parentTag,
           index: siblings.indexOf(el),
           count: siblings.length,
-          itemSelector: `${parentTag} > ${el.tagName.toLowerCase()}`
+          itemSelector: `${parentTag} > ${el.tagName.toLowerCase()}`,
         };
       }
     }
 
     // Check for ARIA list roles
-    const parentRole = parent.getAttribute('role');
-    if (['list', 'listbox', 'menu', 'menubar', 'tablist', 'tree', 'grid'].includes(parentRole)) {
-      const itemRoles = ['listitem', 'option', 'menuitem', 'menuitemcheckbox',
-                         'menuitemradio', 'tab', 'treeitem', 'row', 'gridcell'];
-      const elRole = el.getAttribute('role');
+    const parentRole = parent.getAttribute("role");
+    if (["list", "listbox", "menu", "menubar", "tablist", "tree", "grid"].includes(parentRole)) {
+      const itemRoles = [
+        "listitem",
+        "option",
+        "menuitem",
+        "menuitemcheckbox",
+        "menuitemradio",
+        "tab",
+        "treeitem",
+        "row",
+        "gridcell",
+      ];
+      const elRole = el.getAttribute("role");
       if (elRole && itemRoles.includes(elRole)) {
         const siblings = Array.from(parent.children).filter(
-          s => s.getAttribute('role') === elRole
+          (s) => s.getAttribute("role") === elRole,
         );
         return {
           type: parentRole,
           containerRole: parentRole,
           index: siblings.indexOf(el),
           count: siblings.length,
-          itemRole: elRole
+          itemRole: elRole,
         };
       }
     }
 
     // Check for table structure
-    if (el.tagName.toLowerCase() === 'tr') {
+    if (el.tagName.toLowerCase() === "tr") {
       const table = el.closest('table, [role="grid"], [role="table"]');
       if (table) {
         const rows = table.querySelectorAll('tr, [role="row"]');
         return {
-          type: 'table-row',
+          type: "table-row",
           index: Array.from(rows).indexOf(el),
-          count: rows.length
+          count: rows.length,
         };
       }
     }
 
     // Check for grid-like layout (many similar siblings)
-    const similarSiblings = Array.from(parent.children).filter(s => {
+    const similarSiblings = Array.from(parent.children).filter((s) => {
       if (s === el) return true;
       // Check if sibling has same tag and similar classes
       if (s.tagName !== el.tagName) return false;
       const elClasses = Array.from(el.classList);
       const sibClasses = Array.from(s.classList);
       // At least 50% class overlap
-      const overlap = elClasses.filter(c => sibClasses.includes(c)).length;
+      const overlap = elClasses.filter((c) => sibClasses.includes(c)).length;
       return overlap >= Math.min(elClasses.length, sibClasses.length) * 0.5;
     });
 
     if (similarSiblings.length >= 3) {
       return {
-        type: 'grid-item',
+        type: "grid-item",
         index: similarSiblings.indexOf(el),
-        count: similarSiblings.length
+        count: similarSiblings.length,
       };
     }
 
@@ -1131,7 +1290,7 @@
   function simpleHash(str) {
     let hash = 5381;
     for (let i = 0; i < str.length; i++) {
-      hash = ((hash << 5) + hash) + str.charCodeAt(i);
+      hash = (hash << 5) + hash + str.charCodeAt(i);
       hash = hash & hash; // Convert to 32-bit integer
     }
     return Math.abs(hash).toString(36);
@@ -1143,8 +1302,8 @@
    */
   function getElementFingerprint(el) {
     const rect = el.getBoundingClientRect();
-    const role = el.getAttribute('role') || getImplicitRole(el) || el.tagName.toLowerCase();
-    const accessibleName = computeAccessibleName(el) || '';
+    const role = el.getAttribute("role") || getImplicitRole(el) || el.tagName.toLowerCase();
+    const accessibleName = computeAccessibleName(el) || "";
     const structuralPath = getStructuralPath(el);
     const positionZone = getPositionZone(el);
     const landmarkContext = getLandmarkContext(el);
@@ -1154,7 +1313,7 @@
     // Calculate relative position (0-1 percentage of viewport)
     const relativePosition = {
       top: Math.round((rect.top / window.innerHeight) * 100) / 100,
-      left: Math.round((rect.left / window.innerWidth) * 100) / 100
+      left: Math.round((rect.left / window.innerWidth) * 100) / 100,
     };
 
     // Normalize accessible name for matching
@@ -1182,7 +1341,7 @@
       repeatPattern: repeatPattern || undefined,
 
       // Hash for quick matching (computed from stable properties)
-      hash: null // Will be computed below
+      hash: null, // Will be computed below
     };
 
     // Compute hash from stable properties
@@ -1192,12 +1351,12 @@
       fingerprint.landmarkContext,
       fingerprint.role,
       fingerprint.tagName,
-      fingerprint.accessibleName || '',
+      fingerprint.accessibleName || "",
       fingerprint.sizeCategory,
       // Include relative position with some tolerance (round to 0.1)
       Math.round(relativePosition.top * 10),
-      Math.round(relativePosition.left * 10)
-    ].join('|');
+      Math.round(relativePosition.left * 10),
+    ].join("|");
 
     fingerprint.hash = simpleHash(hashInput);
 
@@ -1213,56 +1372,60 @@
    * Based on WAI-ARIA 1.2 specification
    */
   const IMPLICIT_ROLE_MAP = {
-    a: (el) => el.hasAttribute('href') ? 'link' : null,
-    article: () => 'article',
-    aside: () => 'complementary',
-    button: () => 'button',
-    datalist: () => 'listbox',
-    details: () => 'group',
-    dialog: () => 'dialog',
-    fieldset: () => 'group',
-    figure: () => 'figure',
-    footer: (el) => isLandmark(el) ? 'contentinfo' : null,
-    form: (el) => el.hasAttribute('aria-label') || el.hasAttribute('aria-labelledby') || el.hasAttribute('name') ? 'form' : null,
-    h1: () => 'heading',
-    h2: () => 'heading',
-    h3: () => 'heading',
-    h4: () => 'heading',
-    h5: () => 'heading',
-    h6: () => 'heading',
-    header: (el) => isLandmark(el) ? 'banner' : null,
-    hr: () => 'separator',
-    img: (el) => el.getAttribute('alt') === '' ? 'presentation' : 'img',
+    a: (el) => (el.hasAttribute("href") ? "link" : null),
+    article: () => "article",
+    aside: () => "complementary",
+    button: () => "button",
+    datalist: () => "listbox",
+    details: () => "group",
+    dialog: () => "dialog",
+    fieldset: () => "group",
+    figure: () => "figure",
+    footer: (el) => (isLandmark(el) ? "contentinfo" : null),
+    form: (el) =>
+      el.hasAttribute("aria-label") || el.hasAttribute("aria-labelledby") || el.hasAttribute("name")
+        ? "form"
+        : null,
+    h1: () => "heading",
+    h2: () => "heading",
+    h3: () => "heading",
+    h4: () => "heading",
+    h5: () => "heading",
+    h6: () => "heading",
+    header: (el) => (isLandmark(el) ? "banner" : null),
+    hr: () => "separator",
+    img: (el) => (el.getAttribute("alt") === "" ? "presentation" : "img"),
     input: (el) => getInputRole(el),
-    li: () => 'listitem',
-    main: () => 'main',
-    menu: () => 'list',
-    meter: () => 'meter',
-    nav: () => 'navigation',
-    ol: () => 'list',
-    optgroup: () => 'group',
-    option: () => 'option',
-    output: () => 'status',
-    progress: () => 'progressbar',
-    section: (el) => el.hasAttribute('aria-label') || el.hasAttribute('aria-labelledby') ? 'region' : null,
-    select: (el) => el.hasAttribute('multiple') || el.size > 1 ? 'listbox' : 'combobox',
-    summary: () => 'button',
-    table: () => 'table',
-    tbody: () => 'rowgroup',
-    td: () => 'cell',
-    textarea: () => 'textbox',
-    tfoot: () => 'rowgroup',
-    th: (el) => el.getAttribute('scope') === 'col' ? 'columnheader' : 'rowheader',
-    thead: () => 'rowgroup',
-    tr: () => 'row',
-    ul: () => 'list',
+    li: () => "listitem",
+    main: () => "main",
+    menu: () => "list",
+    meter: () => "meter",
+    nav: () => "navigation",
+    ol: () => "list",
+    optgroup: () => "group",
+    option: () => "option",
+    output: () => "status",
+    progress: () => "progressbar",
+    section: (el) =>
+      el.hasAttribute("aria-label") || el.hasAttribute("aria-labelledby") ? "region" : null,
+    select: (el) => (el.hasAttribute("multiple") || el.size > 1 ? "listbox" : "combobox"),
+    summary: () => "button",
+    table: () => "table",
+    tbody: () => "rowgroup",
+    td: () => "cell",
+    textarea: () => "textbox",
+    tfoot: () => "rowgroup",
+    th: (el) => (el.getAttribute("scope") === "col" ? "columnheader" : "rowheader"),
+    thead: () => "rowgroup",
+    tr: () => "row",
+    ul: () => "list",
   };
 
   /**
    * Check if element is a landmark (not inside article/aside/main/nav/section)
    */
   function isLandmark(el) {
-    const sectioning = el.closest('article, aside, main, nav, section');
+    const sectioning = el.closest("article, aside, main, nav, section");
     return !sectioning || sectioning === el;
   }
 
@@ -1270,30 +1433,30 @@
    * Get implicit role for input elements based on type
    */
   function getInputRole(el) {
-    const type = (el.type || 'text').toLowerCase();
+    const type = (el.type || "text").toLowerCase();
     switch (type) {
-      case 'button':
-      case 'image':
-      case 'reset':
-      case 'submit':
-        return 'button';
-      case 'checkbox':
-        return 'checkbox';
-      case 'email':
-      case 'tel':
-      case 'text':
-      case 'url':
-        return el.hasAttribute('list') ? 'combobox' : 'textbox';
-      case 'number':
-        return 'spinbutton';
-      case 'radio':
-        return 'radio';
-      case 'range':
-        return 'slider';
-      case 'search':
-        return el.hasAttribute('list') ? 'combobox' : 'searchbox';
+      case "button":
+      case "image":
+      case "reset":
+      case "submit":
+        return "button";
+      case "checkbox":
+        return "checkbox";
+      case "email":
+      case "tel":
+      case "text":
+      case "url":
+        return el.hasAttribute("list") ? "combobox" : "textbox";
+      case "number":
+        return "spinbutton";
+      case "radio":
+        return "radio";
+      case "range":
+        return "slider";
+      case "search":
+        return el.hasAttribute("list") ? "combobox" : "searchbox";
       default:
-        return 'textbox';
+        return "textbox";
     }
   }
 
@@ -1315,27 +1478,32 @@
    */
   function computeAccessibleName(el) {
     // Step 1: aria-labelledby (highest priority)
-    const labelledBy = el.getAttribute('aria-labelledby');
+    const labelledBy = el.getAttribute("aria-labelledby");
     if (labelledBy) {
-      const names = labelledBy.split(/\s+/)
-        .map(id => {
+      const names = labelledBy
+        .split(/\s+/)
+        .map((id) => {
           const labelEl = document.getElementById(id);
           return labelEl ? labelEl.textContent?.trim() : null;
         })
         .filter(Boolean);
       if (names.length > 0) {
-        return names.join(' ');
+        return names.join(" ");
       }
     }
 
     // Step 2: aria-label
-    const ariaLabel = el.getAttribute('aria-label');
+    const ariaLabel = el.getAttribute("aria-label");
     if (ariaLabel) {
       return ariaLabel;
     }
 
     // Step 3: Native label association (for form elements)
-    if (el instanceof HTMLInputElement || el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement) {
+    if (
+      el instanceof HTMLInputElement ||
+      el instanceof HTMLSelectElement ||
+      el instanceof HTMLTextAreaElement
+    ) {
       // Check for <label for="id">
       if (el.id) {
         const label = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
@@ -1344,12 +1512,12 @@
         }
       }
       // Check for wrapping <label>
-      const parentLabel = el.closest('label');
+      const parentLabel = el.closest("label");
       if (parentLabel) {
         // Get text excluding the input itself
         const clone = parentLabel.cloneNode(true);
-        const inputs = clone.querySelectorAll('input, select, textarea');
-        inputs.forEach(input => input.remove());
+        const inputs = clone.querySelectorAll("input, select, textarea");
+        inputs.forEach((input) => input.remove());
         const text = clone.textContent?.trim();
         if (text) return text;
       }
@@ -1361,7 +1529,7 @@
     }
 
     // Step 5: title attribute
-    const title = el.getAttribute('title');
+    const title = el.getAttribute("title");
     if (title) {
       return title;
     }
@@ -1372,8 +1540,8 @@
     }
 
     // Step 7: Text content (for buttons, links, etc.)
-    const role = el.getAttribute('role') || getImplicitRole(el);
-    if (['button', 'link', 'menuitem', 'tab', 'option'].includes(role)) {
+    const role = el.getAttribute("role") || getImplicitRole(el);
+    if (["button", "link", "menuitem", "tab", "option"].includes(role)) {
       return el.textContent?.trim() || null;
     }
 
@@ -1385,21 +1553,22 @@
    */
   function computeAccessibleDescription(el) {
     // aria-describedby
-    const describedBy = el.getAttribute('aria-describedby');
+    const describedBy = el.getAttribute("aria-describedby");
     if (describedBy) {
-      const descriptions = describedBy.split(/\s+/)
-        .map(id => {
+      const descriptions = describedBy
+        .split(/\s+/)
+        .map((id) => {
           const descEl = document.getElementById(id);
           return descEl ? descEl.textContent?.trim() : null;
         })
         .filter(Boolean);
       if (descriptions.length > 0) {
-        return descriptions.join(' ');
+        return descriptions.join(" ");
       }
     }
 
     // title attribute (if not used for accessible name)
-    const title = el.getAttribute('title');
+    const title = el.getAttribute("title");
     const accessibleName = computeAccessibleName(el);
     if (title && title !== accessibleName) {
       return title;
@@ -1415,16 +1584,16 @@
     const tag = el.tagName.toLowerCase();
 
     // Links with href
-    if (tag === 'a' && el.hasAttribute('href')) return true;
+    if (tag === "a" && el.hasAttribute("href")) return true;
 
     // Buttons
-    if (tag === 'button') return true;
+    if (tag === "button") return true;
 
     // Form elements (unless disabled)
-    if (['input', 'select', 'textarea'].includes(tag) && !el.disabled) return true;
+    if (["input", "select", "textarea"].includes(tag) && !el.disabled) return true;
 
     // Summary elements
-    if (tag === 'summary') return true;
+    if (tag === "summary") return true;
 
     // Elements with contenteditable
     if (el.isContentEditable) return true;
@@ -1436,7 +1605,7 @@
    * Get the element's tabindex value
    */
   function getTabIndex(el) {
-    const tabindexAttr = el.getAttribute('tabindex');
+    const tabindexAttr = el.getAttribute("tabindex");
     if (tabindexAttr !== null) {
       const parsed = parseInt(tabindexAttr, 10);
       return isNaN(parsed) ? -1 : parsed;
@@ -1468,7 +1637,7 @@
     if (isElementDisabled(el)) return false;
 
     // Check if hidden from accessibility tree
-    if (el.getAttribute('aria-hidden') === 'true') return false;
+    if (el.getAttribute("aria-hidden") === "true") return false;
 
     // Check visibility
     if (!isElementVisible(el)) return false;
@@ -1480,9 +1649,9 @@
    * Parse aria-checked attribute value
    */
   function parseAriaChecked(value) {
-    if (value === 'true') return true;
-    if (value === 'false') return false;
-    if (value === 'mixed') return 'mixed';
+    if (value === "true") return true;
+    if (value === "false") return false;
+    if (value === "mixed") return "mixed";
     return undefined;
   }
 
@@ -1490,9 +1659,9 @@
    * Parse aria-pressed attribute value
    */
   function parseAriaPressed(value) {
-    if (value === 'true') return true;
-    if (value === 'false') return false;
-    if (value === 'mixed') return 'mixed';
+    if (value === "true") return true;
+    if (value === "false") return false;
+    if (value === "mixed") return "mixed";
     return undefined;
   }
 
@@ -1500,30 +1669,43 @@
    * Get comprehensive accessibility information for an element
    */
   function getElementAccessibility(el) {
-    const explicitRole = el.getAttribute('role');
+    const explicitRole = el.getAttribute("role");
     const implicitRole = getImplicitRole(el);
     const tabIndex = getTabIndex(el);
 
     return {
-      role: explicitRole || implicitRole || 'generic',
+      role: explicitRole || implicitRole || "generic",
       accessibleName: computeAccessibleName(el) || undefined,
       accessibleDescription: computeAccessibleDescription(el) || undefined,
-      ariaLabel: el.getAttribute('aria-label') || undefined,
-      ariaLabelledBy: el.getAttribute('aria-labelledby') || undefined,
-      ariaDescribedBy: el.getAttribute('aria-describedby') || undefined,
-      ariaExpanded: el.getAttribute('aria-expanded') === 'true' ? true :
-                    el.getAttribute('aria-expanded') === 'false' ? false : undefined,
-      ariaSelected: el.getAttribute('aria-selected') === 'true' ? true :
-                    el.getAttribute('aria-selected') === 'false' ? false : undefined,
-      ariaChecked: parseAriaChecked(el.getAttribute('aria-checked')),
-      ariaPressed: parseAriaPressed(el.getAttribute('aria-pressed')),
-      ariaReadOnly: el.getAttribute('aria-readonly') === 'true' ? true :
-                    el.getAttribute('aria-readonly') === 'false' ? false : undefined,
-      ariaHidden: el.getAttribute('aria-hidden') === 'true' ? true : undefined,
-      ariaDisabled: el.getAttribute('aria-disabled') === 'true' ? true : undefined,
-      ariaRequired: el.getAttribute('aria-required') === 'true' ? true : undefined,
-      ariaLive: ['off', 'polite', 'assertive'].includes(el.getAttribute('aria-live'))
-                ? el.getAttribute('aria-live') : undefined,
+      ariaLabel: el.getAttribute("aria-label") || undefined,
+      ariaLabelledBy: el.getAttribute("aria-labelledby") || undefined,
+      ariaDescribedBy: el.getAttribute("aria-describedby") || undefined,
+      ariaExpanded:
+        el.getAttribute("aria-expanded") === "true"
+          ? true
+          : el.getAttribute("aria-expanded") === "false"
+            ? false
+            : undefined,
+      ariaSelected:
+        el.getAttribute("aria-selected") === "true"
+          ? true
+          : el.getAttribute("aria-selected") === "false"
+            ? false
+            : undefined,
+      ariaChecked: parseAriaChecked(el.getAttribute("aria-checked")),
+      ariaPressed: parseAriaPressed(el.getAttribute("aria-pressed")),
+      ariaReadOnly:
+        el.getAttribute("aria-readonly") === "true"
+          ? true
+          : el.getAttribute("aria-readonly") === "false"
+            ? false
+            : undefined,
+      ariaHidden: el.getAttribute("aria-hidden") === "true" ? true : undefined,
+      ariaDisabled: el.getAttribute("aria-disabled") === "true" ? true : undefined,
+      ariaRequired: el.getAttribute("aria-required") === "true" ? true : undefined,
+      ariaLive: ["off", "polite", "assertive"].includes(el.getAttribute("aria-live"))
+        ? el.getAttribute("aria-live")
+        : undefined,
       tabIndex: tabIndex,
       isInTabOrder: isInTabOrder(el),
       isKeyboardAccessible: isKeyboardAccessible(el),
@@ -1536,42 +1718,42 @@
    * Create highlight overlay for an element
    */
   function createOverlay(el, color = OVERLAY_COLOR, showLabel = true) {
-    const overlay = document.createElement('div');
-    overlay.className = '__qontinui-overlay__';
+    const overlay = document.createElement("div");
+    overlay.className = "__qontinui-overlay__";
     const rect = el.getBoundingClientRect();
 
     Object.assign(overlay.style, {
-      position: 'fixed',
-      top: rect.top + 'px',
-      left: rect.left + 'px',
-      width: rect.width + 'px',
-      height: rect.height + 'px',
+      position: "fixed",
+      top: rect.top + "px",
+      left: rect.left + "px",
+      width: rect.width + "px",
+      height: rect.height + "px",
       backgroundColor: color,
       border: `2px solid ${OVERLAY_BORDER}`,
-      borderRadius: '2px',
-      pointerEvents: 'none',
-      zIndex: '999999',
-      transition: 'all 0.1s ease-out',
+      borderRadius: "2px",
+      pointerEvents: "none",
+      zIndex: "999999",
+      transition: "all 0.1s ease-out",
     });
 
     // Add label if element has data-ui-id
     if (showLabel && el.dataset?.uiId) {
-      const label = document.createElement('div');
+      const label = document.createElement("div");
       label.textContent = el.dataset.uiId;
       Object.assign(label.style, {
-        position: 'absolute',
-        top: '-20px',
-        left: '0',
+        position: "absolute",
+        top: "-20px",
+        left: "0",
         backgroundColor: LABEL_BG,
-        color: 'white',
-        fontSize: '11px',
-        fontFamily: '-apple-system, BlinkMacSystemFont, sans-serif',
-        padding: '2px 6px',
-        borderRadius: '2px',
-        whiteSpace: 'nowrap',
-        maxWidth: '200px',
-        overflow: 'hidden',
-        textOverflow: 'ellipsis',
+        color: "white",
+        fontSize: "11px",
+        fontFamily: "-apple-system, BlinkMacSystemFont, sans-serif",
+        padding: "2px 6px",
+        borderRadius: "2px",
+        whiteSpace: "nowrap",
+        maxWidth: "200px",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
       });
       overlay.appendChild(label);
     }
@@ -1595,12 +1777,12 @@
    */
   function enablePicker() {
     pickerEnabled = true;
-    document.body.style.cursor = 'crosshair';
+    document.body.style.cursor = "crosshair";
 
-    document.addEventListener('mouseover', onPickerMouseOver, true);
-    document.addEventListener('mouseout', onPickerMouseOut, true);
-    document.addEventListener('click', onPickerClick, true);
-    document.addEventListener('keydown', onPickerKeyDown, true);
+    document.addEventListener("mouseover", onPickerMouseOver, true);
+    document.addEventListener("mouseout", onPickerMouseOut, true);
+    document.addEventListener("click", onPickerClick, true);
+    document.addEventListener("keydown", onPickerKeyDown, true);
   }
 
   /**
@@ -1608,12 +1790,12 @@
    */
   function disablePicker() {
     pickerEnabled = false;
-    document.body.style.cursor = '';
+    document.body.style.cursor = "";
 
-    document.removeEventListener('mouseover', onPickerMouseOver, true);
-    document.removeEventListener('mouseout', onPickerMouseOut, true);
-    document.removeEventListener('click', onPickerClick, true);
-    document.removeEventListener('keydown', onPickerKeyDown, true);
+    document.removeEventListener("mouseover", onPickerMouseOver, true);
+    document.removeEventListener("mouseout", onPickerMouseOut, true);
+    document.removeEventListener("click", onPickerClick, true);
+    document.removeEventListener("keydown", onPickerKeyDown, true);
 
     clearHoverOverlay();
   }
@@ -1622,7 +1804,7 @@
     if (!pickerEnabled) return;
 
     // Find closest UI Bridge element or use target
-    const target = e.target.closest('[data-ui-id]') || e.target;
+    const target = e.target.closest("[data-ui-id]") || e.target;
     if (target === hoveredElement) return;
 
     hoveredElement = target;
@@ -1640,7 +1822,7 @@
     e.preventDefault();
     e.stopPropagation();
 
-    const target = e.target.closest('[data-ui-id]') || e.target;
+    const target = e.target.closest("[data-ui-id]") || e.target;
     _selectedElement = target;
 
     // Build element data
@@ -1658,7 +1840,7 @@
       hasUiId: !!target.dataset?.uiId,
       visible: isElementVisible(target),
       enabled: !isElementDisabled(target),
-      value: 'value' in target ? target.value : undefined,
+      value: "value" in target ? target.value : undefined,
       text: target.textContent?.trim().slice(0, 100),
       label: getElementLabel(target),
       actions: inferActions(inferElementType(target)),
@@ -1667,23 +1849,23 @@
     // Send selection to bridge
     window.postMessage(
       {
-        type: '__QONTINUI_ELEMENT_SELECTED__',
+        type: "__QONTINUI_ELEMENT_SELECTED__",
         data: elementData,
       },
-      '*'
+      "*",
     );
 
     disablePicker();
   }
 
   function onPickerKeyDown(e) {
-    if (e.key === 'Escape') {
+    if (e.key === "Escape") {
       disablePicker();
       window.postMessage(
         {
-          type: '__QONTINUI_PICKER_CANCELLED__',
+          type: "__QONTINUI_PICKER_CANCELLED__",
         },
-        '*'
+        "*",
       );
     }
   }
@@ -1695,7 +1877,7 @@
     hideOverlays();
     _overlayEnabled = true;
 
-    const elements = document.querySelectorAll('[data-ui-id]');
+    const elements = document.querySelectorAll("[data-ui-id]");
     elements.forEach((el) => {
       const overlay = createOverlay(el, OVERLAY_COLOR, true);
       overlayElements.set(el.dataset.uiId, overlay);
@@ -1721,15 +1903,15 @@
     }
 
     // Remove existing highlight
-    const existingHighlight = document.querySelector('.__qontinui-highlight__');
+    const existingHighlight = document.querySelector(".__qontinui-highlight__");
     if (existingHighlight) {
       existingHighlight.remove();
     }
 
     // Create highlight
-    const highlight = createOverlay(el, 'rgba(34, 197, 94, 0.3)', true);
-    highlight.className = '__qontinui-highlight__';
-    highlight.style.border = '2px solid rgba(34, 197, 94, 0.8)';
+    const highlight = createOverlay(el, "rgba(34, 197, 94, 0.3)", true);
+    highlight.className = "__qontinui-highlight__";
+    highlight.style.border = "2px solid rgba(34, 197, 94, 0.8)";
 
     // Auto-remove after 2 seconds
     setTimeout(() => {
@@ -1737,7 +1919,7 @@
     }, 2000);
 
     // Scroll into view
-    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
 
     return { success: true };
   }
@@ -1754,7 +1936,7 @@
 
     try {
       switch (action) {
-        case 'click':
+        case "click":
           // Use proper mouse events for better compatibility with React/Radix UI components
           // Simple el.click() doesn't always trigger React's synthetic event handlers
           {
@@ -1778,67 +1960,71 @@
               buttons: 1,
             };
 
-            el.dispatchEvent(new MouseEvent('mousedown', mouseEventInit));
-            el.dispatchEvent(new MouseEvent('mouseup', mouseEventInit));
-            el.dispatchEvent(new MouseEvent('click', mouseEventInit));
+            el.dispatchEvent(new MouseEvent("mousedown", mouseEventInit));
+            el.dispatchEvent(new MouseEvent("mouseup", mouseEventInit));
+            el.dispatchEvent(new MouseEvent("click", mouseEventInit));
 
             // Also try el.click() as a fallback for elements that expect it
-            try { el.click(); } catch { /* ignore */ }
+            try {
+              el.click();
+            } catch {
+              /* ignore */
+            }
           }
           break;
-        case 'doubleClick':
-          el.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+        case "doubleClick":
+          el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
           break;
-        case 'rightClick':
-          el.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true }));
+        case "rightClick":
+          el.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true }));
           break;
-        case 'focus':
+        case "focus":
           el.focus();
           break;
-        case 'blur':
+        case "blur":
           el.blur();
           break;
-        case 'hover':
-          el.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
-          el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+        case "hover":
+          el.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true }));
+          el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
           break;
-        case 'clear':
-          if ('value' in el) {
-            el.value = '';
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-            el.dispatchEvent(new Event('change', { bubbles: true }));
+        case "clear":
+          if ("value" in el) {
+            el.value = "";
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
           }
           break;
-        case 'type':
-        case 'fill': // Alias for 'type'
-          if ('value' in el) {
+        case "type":
+        case "fill": // Alias for 'type'
+          if ("value" in el) {
             el.focus();
             if (params.clear) {
-              el.value = '';
+              el.value = "";
             }
-            el.value = params.text || '';
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.value = params.text || "";
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
           }
           break;
-        case 'select':
-          if (el.tagName === 'SELECT') {
+        case "select":
+          if (el.tagName === "SELECT") {
             el.value = params.value;
-            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
           }
           break;
-        case 'check':
-          if ('checked' in el && !el.checked) {
+        case "check":
+          if ("checked" in el && !el.checked) {
             el.click();
           }
           break;
-        case 'uncheck':
-          if ('checked' in el && el.checked) {
+        case "uncheck":
+          if ("checked" in el && el.checked) {
             el.click();
           }
           break;
-        case 'toggle':
-          if ('checked' in el) {
+        case "toggle":
+          if ("checked" in el) {
             el.click();
           }
           break;
@@ -1854,8 +2040,8 @@
           visible: isElementVisible(el),
           enabled: !isElementDisabled(el),
           focused: document.activeElement === el,
-          value: 'value' in el ? el.value : undefined,
-          checked: 'checked' in el ? el.checked : undefined,
+          value: "value" in el ? el.value : undefined,
+          checked: "checked" in el ? el.checked : undefined,
           bounds: {
             x: rect.x,
             y: rect.y,
@@ -1886,8 +2072,8 @@
         visible: isElementVisible(el),
         enabled: !isElementDisabled(el),
         focused: document.activeElement === el,
-        value: 'value' in el ? el.value : undefined,
-        checked: 'checked' in el ? el.checked : undefined,
+        value: "value" in el ? el.value : undefined,
+        checked: "checked" in el ? el.checked : undefined,
         text: el.textContent?.trim().slice(0, 100),
         bounds: {
           x: rect.x,
@@ -1907,7 +2093,7 @@
    * Clear highlight
    */
   function clearHighlight() {
-    const existingHighlight = document.querySelector('.__qontinui-highlight__');
+    const existingHighlight = document.querySelector(".__qontinui-highlight__");
     if (existingHighlight) {
       existingHighlight.remove();
     }
@@ -1921,7 +2107,7 @@
   function getStateSnapshot() {
     // Try to access UI Bridge state if it's exposed
     const uiBridge = window.__UI_BRIDGE__;
-    if (uiBridge && typeof uiBridge.getStateSnapshot === 'function') {
+    if (uiBridge && typeof uiBridge.getStateSnapshot === "function") {
       return { success: true, ...uiBridge.getStateSnapshot() };
     }
 
@@ -1942,24 +2128,40 @@
     if (event.source !== window) return;
 
     const { type, action, params, requestId } = event.data || {};
-    if (type !== '__QONTINUI_UI_BRIDGE_REQUEST__') return;
+    if (type !== "__QONTINUI_UI_BRIDGE_REQUEST__") return;
 
     let response;
 
     switch (action) {
-      case 'ping': {
+      case "ping": {
         // Check if UI Bridge is available
-        const hasUIBridge = !!window.__UI_BRIDGE__ || document.querySelector('[data-ui-id]') !== null;
+        const hasUIBridge =
+          !!window.__UI_BRIDGE__ || document.querySelector("[data-ui-id]") !== null;
         response = {
           success: true,
           available: hasUIBridge,
-          version: window.__UI_BRIDGE__?.version || '2.0.0',
+          version: window.__UI_BRIDGE__?.version || "2.0.0",
         };
         break;
       }
-      case 'getElements': {
+      case "getElements": {
         // Use getAllInteractiveElements which works with both UI Bridge and regular websites
-        const elements = getAllInteractiveElements();
+        let elements = getAllInteractiveElements();
+
+        // When includeNonInteractive is true, also discover visible non-interactive
+        // elements (headings, labels, badges, etc.) for spec verification.
+        if (params?.includeNonInteractive) {
+          const existingIds = new Set(elements.map((el) => el.id));
+          const nonInteractive = discoverNonInteractiveElements();
+          let nextRef = elements.length + 1;
+          for (const el of nonInteractive) {
+            if (!existingIds.has(el.id)) {
+              existingIds.add(el.id);
+              elements.push({ ...el, ref: `@e${nextRef++}` });
+            }
+          }
+        }
+
         const snapshot = getStateSnapshot();
         response = {
           success: true,
@@ -1967,68 +2169,116 @@
           activeStatesCount: snapshot.activeStates?.length || 0,
           transitionsCount: snapshot.transitions?.length || 0,
           // Indicate whether this is a UI Bridge instrumented page or discovered elements
-          isUIBridgeInstrumented: document.querySelector('[data-ui-id]') !== null,
+          isUIBridgeInstrumented: document.querySelector("[data-ui-id]") !== null,
         };
         break;
       }
-      case 'getElementState':
+      case "getElementState":
         response = getElementState(params?.elementId);
         break;
-      case 'enablePicker':
+      case "enablePicker":
         enablePicker();
         response = { success: true };
         break;
-      case 'disablePicker':
+      case "disablePicker":
         disablePicker();
         response = { success: true };
         break;
-      case 'showOverlays':
+      case "showOverlays":
         showOverlays();
         response = { success: true };
         break;
-      case 'hideOverlays':
+      case "hideOverlays":
         hideOverlays();
         response = { success: true };
         break;
-      case 'highlightElement':
+      case "highlightElement":
         response = highlightElement(params?.elementId);
         break;
-      case 'clearHighlight':
+      case "clearHighlight":
         response = clearHighlight();
         break;
-      case 'executeAction':
+      case "executeAction":
         response = executeAction(params?.elementId, params?.action, params?.params || {});
         break;
-      case 'getStateSnapshot':
+      case "getStateSnapshot":
         response = getStateSnapshot();
         break;
+      case "navigate": {
+        // Navigate the current page to a new URL
+        if (params?.url) {
+          window.location.href = params.url;
+          response = { success: true, url: params.url };
+        } else {
+          response = { success: false, error: "No url specified" };
+        }
+        break;
+      }
+      case "getSpecs": {
+        // Read specs from the page's SpecStore singleton (if available).
+        // Checks two locations:
+        // 1. window.__UI_BRIDGE__.specs.getGlobalSpecStore() - set by UIBridgeProvider
+        // 2. window.__QONTINUI_SPEC_STORE__ - set directly by usePageSpecs hook
+        // Prefers the store with actual specs loaded (handles module singleton duplication
+        // in bundled apps like Next.js where different chunks get different store instances).
+        try {
+          const storeFromUIBridge = window.__UI_BRIDGE__?.specs?.getGlobalSpecStore?.();
+          const storeFromWindow = window.__QONTINUI_SPEC_STORE__;
+          const specStore =
+            (storeFromUIBridge && storeFromUIBridge.count > 0)
+              ? storeFromUIBridge
+              : storeFromWindow || storeFromUIBridge;
+          if (specStore && typeof specStore.getAll === "function") {
+            const allConfigs = specStore.getAll(); // Map<string, SpecConfig>
+            const specs = [];
+            if (allConfigs instanceof Map) {
+              for (const [id, config] of allConfigs) {
+                specs.push({ specId: id, config });
+              }
+            } else if (typeof allConfigs === "object" && allConfigs !== null) {
+              for (const [id, config] of Object.entries(allConfigs)) {
+                specs.push({ specId: id, config });
+              }
+            }
+            response = { success: true, specs };
+          } else {
+            response = { success: true, specs: [] };
+          }
+        } catch (e) {
+          response = {
+            success: false,
+            error: "Failed to read specs: " + (e.message || String(e)),
+          };
+        }
+        break;
+      }
       default:
         response = { success: false, error: `Unknown action: ${action}` };
     }
 
     window.postMessage(
       {
-        type: '__QONTINUI_UI_BRIDGE_RESPONSE__',
+        type: "__QONTINUI_UI_BRIDGE_RESPONSE__",
         requestId,
         success: response.success !== false,
         data: response,
         error: response.error,
       },
-      '*'
+      "*",
     );
   }
 
   // Listen for messages from bridge
-  window.addEventListener('message', handleBridgeMessage);
+  window.addEventListener("message", handleBridgeMessage);
 
   // Store cleanup function for extension reinstall handling
-  window.__qontinuiUIBridgeInspectorCleanup = function() {
-    window.removeEventListener('message', handleBridgeMessage);
-    console.log('[Qontinui UI Bridge] Old inspector listener cleaned up for reinstall');
+  window.__qontinuiUIBridgeInspectorCleanup = function () {
+    window.removeEventListener("message", handleBridgeMessage);
+    console.log("[Qontinui UI Bridge] Old inspector listener cleaned up for reinstall");
   };
 
   // Inject styles
-  const style = document.createElement('style');
+  const style = document.createElement("style");
   style.textContent = `
     .__qontinui-overlay__,
     .__qontinui-highlight__ {
@@ -2038,5 +2288,5 @@
   `;
   document.head.appendChild(style);
 
-  console.log('[Qontinui UI Bridge] Inspector loaded');
+  console.log("[Qontinui UI Bridge] Inspector loaded");
 })();

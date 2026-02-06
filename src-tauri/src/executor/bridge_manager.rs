@@ -163,19 +163,15 @@ impl BridgeManager {
         );
 
         // For GUI mode, acquire the lock
-        if effective_mode == BridgeMode::Gui {
-            if !self.gui_lock.try_acquire(&bridge_id).await {
-                if force_gui_lock {
-                    warn!("Force-releasing GUI lock for new bridge");
-                    self.gui_lock.force_release().await;
-                    if !self.gui_lock.try_acquire(&bridge_id).await {
-                        return Err(
-                            "Failed to acquire GUI lock even after force release".to_string()
-                        );
-                    }
-                } else {
-                    return Err("GUI lock is held by another bridge. Use force_gui_lock=true to override or use headless mode.".to_string());
+        if effective_mode == BridgeMode::Gui && !self.gui_lock.try_acquire(&bridge_id).await {
+            if force_gui_lock {
+                warn!("Force-releasing GUI lock for new bridge");
+                self.gui_lock.force_release().await;
+                if !self.gui_lock.try_acquire(&bridge_id).await {
+                    return Err("Failed to acquire GUI lock even after force release".to_string());
                 }
+            } else {
+                return Err("GUI lock is held by another bridge. Use force_gui_lock=true to override or use headless mode.".to_string());
             }
         }
 
@@ -741,20 +737,25 @@ impl BridgeManager {
             return Ok(false);
         }
 
-        // Now start the bridge - acquire write lock, start, release
-        // We need to use spawn_blocking to avoid holding the guard across await
-        let bridges_ref = &self.bridges;
-        let mut bridges = bridges_ref.write().unwrap();
-        if let Some(managed) = bridges.get_mut(&bid) {
-            managed
-                .bridge
-                .start()
-                .await
-                .map_err(|e| format!("Failed to start bridge: {}", e))?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        // Now start the bridge - remove from map, drop guard, start, re-insert
+        let mut managed = {
+            let mut bridges = self.bridges.write().unwrap();
+            match bridges.remove(&bid) {
+                Some(m) => m,
+                None => return Ok(false),
+            }
+        };
+
+        let result = managed
+            .bridge
+            .start()
+            .await
+            .map_err(|e| format!("Failed to start bridge: {}", e));
+
+        // Re-insert the bridge regardless of start result
+        self.bridges.write().unwrap().insert(bid, managed);
+
+        result.map(|()| true)
     }
 
     /// Stop the default bridge.
@@ -765,13 +766,20 @@ impl BridgeManager {
         };
 
         let bid = BridgeId::from_string(bridge_id);
-        let mut bridges = self.bridges.write().unwrap();
+        let mut managed = {
+            let mut bridges = self.bridges.write().unwrap();
+            match bridges.remove(&bid) {
+                Some(m) => m,
+                None => return Err("Default bridge not found".to_string()),
+            }
+        };
 
-        if let Some(managed) = bridges.get_mut(&bid) {
-            managed.bridge.stop().await
-        } else {
-            Err("Default bridge not found".to_string())
-        }
+        let result = managed.bridge.stop().await;
+
+        // Re-insert the bridge regardless of stop result
+        self.bridges.write().unwrap().insert(bid, managed);
+
+        result
     }
 
     /// Get the state of the default bridge (sync version).
@@ -808,8 +816,6 @@ impl BridgeManager {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     // Note: These tests would require a mock Tauri app handle,
     // which is complex to set up. In practice, integration tests
     // would be more appropriate for the BridgeManager.

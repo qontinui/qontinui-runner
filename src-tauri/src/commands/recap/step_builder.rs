@@ -282,9 +282,7 @@ pub fn build_ai_session_steps(
                 || content.to_lowercase().contains("failed")
                 || content.to_lowercase().contains("timed out");
 
-            let status = if is_last && task_run.status == "failed" {
-                "failed"
-            } else if has_error {
+            let status = if (is_last && task_run.status == "failed") || has_error {
                 "failed"
             } else {
                 "success"
@@ -398,11 +396,12 @@ pub fn build_steps(
                 .clone()
                 .unwrap_or_else(|| format!("Step {}", checkpoint.step_index + 1));
 
-            // Create dedup key with phase and iteration to handle multiple iterations
+            // Normalize dedup key to match other sources: "name:iterN" or "name:phase:iterN"
+            // This ensures checkpoints don't create duplicates with verification_results
             let dedup_key = if let Some(iter) = checkpoint.iteration {
-                format!("checkpoint:{}:{}:iter{}", checkpoint.phase, name, iter)
+                format!("{}:iter{}", name, iter)
             } else {
-                format!("checkpoint:{}:{}", checkpoint.phase, name)
+                name.clone()
             };
 
             if seen_step_names.contains(&dedup_key) {
@@ -413,10 +412,7 @@ pub fn build_steps(
             steps.push(checkpoint_to_recap_step(checkpoint));
         }
 
-        info!(
-            "Total steps after checkpoint processing: {}",
-            steps.len()
-        );
+        info!("Total steps after checkpoint processing: {}", steps.len());
     }
 
     // 1. Add workflow verification phase results (step-based, from execute_verification_steps)
@@ -701,10 +697,25 @@ pub fn build_steps(
     }
 
     // 3. Add AI sessions from task run
-    if task_run.sessions_count > 0 {
+    // Skip if we already have AI session steps from checkpoints (avoids duplicates)
+    let has_ai_session_checkpoints = step_checkpoints
+        .iter()
+        .any(|cp| cp.step_type == "ai_session");
+
+    if task_run.sessions_count > 0 && !has_ai_session_checkpoints {
         let ai_steps = build_ai_session_steps(task_run, events, verification_results);
         for step in ai_steps {
-            steps.push(step);
+            // Add dedup key for AI session steps
+            let dedup_key = if let Some(iter) = step.iteration {
+                format!("{}:iter{}", step.name, iter)
+            } else {
+                step.name.clone()
+            };
+
+            if !seen_step_names.contains(&dedup_key) {
+                seen_step_names.insert(dedup_key);
+                steps.push(step);
+            }
         }
     }
 

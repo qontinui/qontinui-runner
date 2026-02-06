@@ -154,7 +154,7 @@ def test_batch_extraction(service: FrameExtractorService, video_path: str):
     elapsed = time.time() - start
 
     print(f"  Success: Extracted {len(frames)} frames in {elapsed:.2f}s")
-    print(f"  Average: {elapsed/len(frames):.3f}s per frame")
+    print(f"  Average: {elapsed / len(frames):.3f}s per frame")
 
     # Save all frames
     output_dir = service.frames_dir / "batch_test"

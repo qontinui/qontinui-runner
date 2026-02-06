@@ -29,7 +29,7 @@ impl StepHandler for AwasListActionsHandler {
         context: &HandlerContext,
     ) -> StepHandlerResult {
         let step_name = step.name.as_deref().unwrap_or("AWAS List Actions");
-        let timeout = step.timeout_seconds.unwrap_or(60) as u64;
+        let timeout = step.timeout_seconds.unwrap_or(60);
 
         info!("AWAS List Actions");
 

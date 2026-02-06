@@ -8,7 +8,7 @@
  * It forwards commands to the recorder and snapshots back to the background.
  */
 
-(function() {
+(function () {
   // Avoid double-injection
   if (window.__QONTINUI_RECORDER_BRIDGE_INJECTED__) {
     return;
@@ -34,12 +34,15 @@
 
       pendingRequests.set(requestId, { resolve, reject, timeout });
 
-      window.postMessage({
-        type: "QONTINUI_RECORDER_COMMAND",
-        action: action,
-        params: params,
-        requestId: requestId,
-      }, "*");
+      window.postMessage(
+        {
+          type: "QONTINUI_RECORDER_COMMAND",
+          action: action,
+          params: params,
+          requestId: requestId,
+        },
+        "*",
+      );
     });
   }
 
@@ -79,10 +82,10 @@
     const { action, params } = message;
 
     sendToRecorder(action, params)
-      .then(result => {
+      .then((result) => {
         sendResponse({ success: true, data: result });
       })
-      .catch(error => {
+      .catch((error) => {
         sendResponse({ success: false, error: error.message });
       });
 

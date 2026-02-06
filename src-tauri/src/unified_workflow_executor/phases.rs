@@ -27,7 +27,7 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
-use tracing::{info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 use crate::config_storage::ConfigStorage;
 use crate::database::CheckpointDb;
@@ -36,7 +36,8 @@ use crate::executor::{
     FromContext, IntoOutcome,
 };
 use crate::step_executor::{
-    ExecutionStepConfig, StepExecutionResult, StepExecutor, VerificationPhaseResult,
+    handlers::spec::fetch_external_elements, ExecutionStepConfig, StepExecutionResult,
+    StepExecutor, VerificationPhaseResult,
 };
 use crate::step_metadata::{StepDetails, StepMetadata};
 use crate::step_registry::{StepEventKind, StepEventLogger};
@@ -80,16 +81,15 @@ fn build_execution_timing_context(
     if !phase_spans.is_empty() {
         let mut phase_lines = vec!["**Phase Timings:**".to_string()];
         for span in &phase_spans {
-            let phase_name = span.name.strip_prefix("workflow.phase.").unwrap_or(&span.name);
+            let phase_name = span
+                .name
+                .strip_prefix("workflow.phase.")
+                .unwrap_or(&span.name);
             let duration = span
                 .duration_ms
-                .map(|d| format_duration_ms(d))
+                .map(format_duration_ms)
                 .unwrap_or_else(|| "in progress".to_string());
-            let status = if !span.success {
-                " (failed)"
-            } else {
-                ""
-            };
+            let status = if !span.success { " (failed)" } else { "" };
             phase_lines.push(format!("- {}: {}{}", phase_name, duration, status));
         }
         sections.push(phase_lines.join("\n"));
@@ -100,7 +100,11 @@ fn build_execution_timing_context(
     if !ai_spans.is_empty() {
         let total_ms: i64 = ai_spans.iter().filter_map(|s| s.duration_ms).sum();
         let count = ai_spans.len();
-        let avg_ms = if count > 0 { total_ms / count as i64 } else { 0 };
+        let avg_ms = if count > 0 {
+            total_ms / count as i64
+        } else {
+            0
+        };
         let failed = ai_spans.iter().filter(|s| !s.success).count();
 
         let mut ai_lines = vec!["**AI Sessions:**".to_string()];
@@ -109,7 +113,10 @@ fn build_execution_timing_context(
             count,
             format_duration_ms(total_ms)
         ));
-        ai_lines.push(format!("- Average: {} per session", format_duration_ms(avg_ms)));
+        ai_lines.push(format!(
+            "- Average: {} per session",
+            format_duration_ms(avg_ms)
+        ));
         if failed > 0 {
             ai_lines.push(format!("- Failed: {} sessions", failed));
         }
@@ -124,10 +131,7 @@ fn build_execution_timing_context(
     if !slow_spans.is_empty() {
         let mut slow_lines = vec!["**Slow Operations (>5s):**".to_string()];
         for span in &slow_spans {
-            let duration = span
-                .duration_ms
-                .map(|d| format_duration_ms(d))
-                .unwrap_or_default();
+            let duration = span.duration_ms.map(format_duration_ms).unwrap_or_default();
             let error_suffix = if let Some(ref err) = span.error {
                 format!(" - FAILED: {}", err)
             } else if !span.success {
@@ -494,6 +498,8 @@ impl VerificationExecutor {
                     skipped_steps: 0,
                     total_duration_ms: 0,
                     step_results: Vec::new(),
+                    gate_results: Vec::new(),
+                    gate_based_evaluation: false,
                 },
                 Vec::new(),
             );
@@ -508,18 +514,108 @@ impl VerificationExecutor {
         // Create checkpoint manager for step-level checkpointing
         let checkpoint_mgr = CheckpointManager::new(self.checkpoint_db.clone(), "unified");
 
+        // Pre-fetch external elements if any spec step needs them
+        // This avoids per-step timeouts and provides early failure detection
+        let needs_external_elements = steps.iter().any(|step| {
+            step.step_type == "spec" && step.spec_element_source.as_deref() == Some("external")
+        });
+
+        let prefetched_elements = if needs_external_elements {
+            info!("VERIFICATION-PHASE: Pre-fetching external elements for spec verification");
+            match fetch_external_elements().await {
+                Ok(elements) => {
+                    let count = elements.as_array().map(|a| a.len()).unwrap_or(0);
+                    info!(
+                        "VERIFICATION-PHASE: Pre-fetched {} external elements from Chrome extension",
+                        count
+                    );
+                    Some(elements)
+                }
+                Err(e) => {
+                    // External elements are required but couldn't be fetched - fail early
+                    // This provides clear feedback about Chrome extension connectivity
+                    warn!(
+                        "VERIFICATION-PHASE: UI Bridge spec verification failed - Chrome extension not connected (not a Playwright issue): {}",
+                        e
+                    );
+
+                    // Return a failed verification result with connectivity error
+                    let error_msg = format!(
+                        "UI Bridge spec verification failed: Chrome extension not connected. \
+                         This is NOT a Playwright test - it's a UI Bridge spec verification \
+                         that requires the Qontinui browser extension to be installed and \
+                         connected to an active browser tab. Error: {}",
+                        e
+                    );
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let connectivity_result = StepExecutionResult {
+                        step_index: 0,
+                        step_type: "ui_bridge_connectivity".to_string(),
+                        step_name: "UI Bridge Extension Connectivity Check".to_string(),
+                        success: false,
+                        error: Some(error_msg.clone()),
+                        screenshot_path: None,
+                        started_at: Some(now.clone()),
+                        ended_at: Some(now),
+                        duration_ms: 0,
+                        config: crate::step_executor::StepExecutionConfig::default(),
+                        verification_details: None,
+                    };
+
+                    return (
+                        VerificationPhaseResult {
+                            iteration,
+                            all_passed: false,
+                            critical_failure: true, // Mark as critical since external elements are required
+                            total_steps: steps.len(),
+                            passed_steps: 0,
+                            failed_steps: 1,
+                            skipped_steps: steps.len().saturating_sub(1),
+                            total_duration_ms: 0,
+                            step_results: vec![connectivity_result.clone()],
+                            gate_results: Vec::new(),
+                            gate_based_evaluation: false,
+                        },
+                        vec![connectivity_result],
+                    );
+                }
+            }
+        } else {
+            None
+        };
+
+        // Clone steps and inject pre-fetched elements if available
+        let steps_to_execute: Vec<ExecutionStepConfig> = if let Some(ref elements) =
+            prefetched_elements
+        {
+            steps
+                .iter()
+                .map(|step| {
+                    let mut step = step.clone();
+                    if step.step_type == "spec"
+                        && step.spec_element_source.as_deref() == Some("external")
+                    {
+                        debug!(
+                            "VERIFICATION-PHASE: Injecting pre-fetched elements into spec step '{}'",
+                            step.name.as_deref().unwrap_or("unnamed")
+                        );
+                        step.spec_prefetched_elements = Some(elements.clone());
+                    }
+                    step
+                })
+                .collect()
+        } else {
+            steps.to_vec()
+        };
+        let steps = &steps_to_execute;
+
         // Log START events and save checkpoints for each step before execution
         for (idx, step) in steps.iter().enumerate() {
             let step_type =
                 StepType::from_str_compat(&step.step_type).unwrap_or(StepType::Playwright);
             let step_name = step.name.as_deref().unwrap_or(&step.step_type);
-            let metadata = StepMetadata::verification(
-                execution_id,
-                step_type.clone(),
-                step_name,
-                idx,
-                iteration,
-            );
+            let metadata =
+                StepMetadata::verification(execution_id, step_type, step_name, idx, iteration);
             let details = StepDetails::default();
 
             if let Err(e) =
@@ -762,7 +858,10 @@ impl AgenticExecutor {
         let enhanced_prompt = if iteration > 1 {
             match build_execution_timing_context(&self.checkpoint_db, &config.execution_id) {
                 Some(timing) => {
-                    info!("AGENTIC-PHASE: Appending execution timing context ({} chars)", timing.len());
+                    info!(
+                        "AGENTIC-PHASE: Appending execution timing context ({} chars)",
+                        timing.len()
+                    );
                     format!("{}\n\n{}", enhanced_prompt, timing)
                 }
                 None => enhanced_prompt,
@@ -1055,8 +1154,17 @@ impl CompletionExecutor {
             }
 
             // Use structured prompts for granular sub-step tracking
-            let (completion_prompt, sub_step_metadata) =
+            let (mut completion_prompt, sub_step_metadata) =
                 prompt_builder::consolidate_prompts_structured(prompt_steps, "completion");
+
+            // Inject prior phase output context so the completion AI knows what happened
+            if !completion_prompt.is_empty() {
+                let prior_context = self.build_prior_phase_context(execution_id, iterations_run);
+                if !prior_context.is_empty() {
+                    completion_prompt =
+                        format!("{}\n\n---\n\n{}", prior_context, completion_prompt);
+                }
+            }
 
             if !completion_prompt.is_empty() {
                 // Use the unified AI session executor with sub-step metadata
@@ -1163,6 +1271,133 @@ impl CompletionExecutor {
             step_results,
         };
         result.into_outcome(duration_ms)
+    }
+
+    /// Build context from prior phases (setup, verification, agentic) to give the
+    /// completion AI knowledge of what happened during the workflow execution.
+    ///
+    /// This reads the accumulated output_log, verification results, and findings
+    /// from the database and formats them as context that gets prepended to the
+    /// completion prompt.
+    fn build_prior_phase_context(&self, execution_id: &str, iterations_run: u32) -> String {
+        let mut sections = Vec::new();
+
+        sections.push("## Prior Workflow Execution Context\n".to_string());
+        sections.push(format!(
+            "This workflow ran {} verification-agentic iteration(s) before reaching the completion phase.\n\
+             Below is the accumulated output from all prior phases.\n",
+            iterations_run
+        ));
+
+        // Fetch and include verification test results from step checkpoints
+        // This is especially important when verification passes on the first try
+        // (no agentic phase runs, so output_log would be empty)
+        match self
+            .checkpoint_db
+            .get_workflow_step_checkpoints(execution_id, "verification", None)
+        {
+            Ok(checkpoints) if !checkpoints.is_empty() => {
+                let mut verification_lines = vec!["### Verification Test Results\n".to_string()];
+                let mut passed_count = 0;
+                let mut failed_count = 0;
+
+                for checkpoint in &checkpoints {
+                    use crate::workflow_state::StepCheckpointStatus;
+                    let status_emoji = match checkpoint.status {
+                        StepCheckpointStatus::Success => {
+                            passed_count += 1;
+                            "✓"
+                        }
+                        StepCheckpointStatus::Failed => {
+                            failed_count += 1;
+                            "✗"
+                        }
+                        _ => "○",
+                    };
+                    let duration = checkpoint
+                        .duration_ms
+                        .map(|ms| format!(" ({}ms)", ms))
+                        .unwrap_or_default();
+
+                    verification_lines.push(format!(
+                        "- {} **{}**{}",
+                        status_emoji,
+                        checkpoint
+                            .step_name
+                            .as_deref()
+                            .unwrap_or(&checkpoint.step_type),
+                        duration
+                    ));
+
+                    // Include error details for failed checks
+                    if checkpoint.status == StepCheckpointStatus::Failed {
+                        if let Some(ref error) = checkpoint.error {
+                            verification_lines.push(format!("  - Error: {}", error));
+                        }
+                    }
+                }
+
+                verification_lines.push(format!(
+                    "\n**Summary:** {} passed, {} failed\n",
+                    passed_count, failed_count
+                ));
+                sections.push(verification_lines.join("\n"));
+            }
+            Ok(_) => {
+                sections.push(
+                    "### Verification Test Results\n\nNo verification checkpoints recorded.\n"
+                        .to_string(),
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to read verification checkpoints for completion context: {}",
+                    e
+                );
+            }
+        }
+
+        // Fetch and include accumulated output_log (from agentic phases)
+        match self.checkpoint_db.get_full_task_output(execution_id) {
+            Ok(output) if !output.is_empty() => {
+                let cleaned = crate::summary_generator::strip_output_markers(&output);
+                // Truncate to last 50k chars to avoid overwhelming the AI
+                let max_chars = 50_000;
+                let truncated = if cleaned.len() > max_chars {
+                    let start = cleaned.len() - max_chars;
+                    format!("...[earlier output truncated]...\n{}", &cleaned[start..])
+                } else {
+                    cleaned
+                };
+                sections.push(format!(
+                    "### AI Session Output ({} chars)\n\n{}\n",
+                    truncated.len(),
+                    truncated
+                ));
+            }
+            Ok(_) => {
+                // Don't add "no output" message if we already have verification results
+                // This is expected when verification passes on the first try
+            }
+            Err(e) => {
+                warn!("Failed to read prior output for completion context: {}", e);
+            }
+        }
+
+        // Fetch and include findings
+        match self.checkpoint_db.get_findings_for_task(execution_id) {
+            Ok(findings) if !findings.is_empty() => {
+                let findings_section =
+                    crate::summary_generator::format_findings_for_summary(&findings);
+                sections.push(findings_section);
+            }
+            Ok(_) => {} // No findings, skip section
+            Err(e) => {
+                warn!("Failed to read findings for completion context: {}", e);
+            }
+        }
+
+        sections.join("\n")
     }
 }
 
@@ -1327,6 +1562,7 @@ impl Executor for AgenticExecutor {
             execution_id: config.execution_id.clone(),
             targeted_error_ids: Vec::new(),
             starting_iteration: 0,
+            run_agentic_first: false,
         };
 
         let outcome = self

@@ -3121,7 +3121,7 @@ function ExecutionSpansSection() {
     setError(null);
 
     fetch(
-      `http://localhost:9876/execution-spans?execution_id=${encodeURIComponent(selectedRunId)}&limit=200`
+      `http://localhost:9876/execution-spans?execution_id=${encodeURIComponent(selectedRunId)}&limit=200`,
     )
       .then((res) => res.json())
       .then((data) => {
@@ -3228,7 +3228,9 @@ function ExecutionSpansSection() {
             </div>
             <div className="rounded-lg border border-border bg-card p-3">
               <div className="text-xs text-muted-foreground mb-1">Failed</div>
-              <div className={`text-lg font-semibold ${failedSpans.length > 0 ? "text-destructive" : ""}`}>
+              <div
+                className={`text-lg font-semibold ${failedSpans.length > 0 ? "text-destructive" : ""}`}
+              >
                 {failedSpans.length}
               </div>
             </div>
@@ -3242,17 +3244,12 @@ function ExecutionSpansSection() {
                 {phaseSpans.map((span) => {
                   const phaseName = span.name.replace("workflow.phase.", "");
                   const duration = span.duration_ms ?? 0;
-                  const maxDuration = Math.max(
-                    ...phaseSpans.map((s) => s.duration_ms ?? 0),
-                    1
-                  );
+                  const maxDuration = Math.max(...phaseSpans.map((s) => s.duration_ms ?? 0), 1);
                   const widthPct = Math.max((duration / maxDuration) * 100, 2);
 
                   return (
                     <div key={span.id} className="flex items-center gap-2 text-sm">
-                      <span className="w-24 text-muted-foreground truncate">
-                        {phaseName}
-                      </span>
+                      <span className="w-24 text-muted-foreground truncate">{phaseName}</span>
                       <div className="flex-1 h-5 bg-muted/50 rounded overflow-hidden">
                         <div
                           className={`h-full rounded ${
@@ -3276,16 +3273,16 @@ function ExecutionSpansSection() {
 
           {/* All Spans List */}
           <div className="rounded-lg border border-border bg-card">
-            <h4 className="text-sm font-medium p-3 border-b border-border">
-              All Spans
-            </h4>
+            <h4 className="text-sm font-medium p-3 border-b border-border">All Spans</h4>
             <div className="divide-y divide-border max-h-[500px] overflow-y-auto">
               {displaySpans.map((span) => {
                 const isExpanded = expandedIds.has(span.id);
                 let attrs: Record<string, unknown> = {};
                 try {
                   if (span.attributes) attrs = JSON.parse(span.attributes);
-                } catch { /* JSON parse may fail for invalid attributes */ }
+                } catch {
+                  /* JSON parse may fail for invalid attributes */
+                }
 
                 return (
                   <div key={span.id}>
@@ -3352,9 +3349,7 @@ function ExecutionSpansSection() {
                         )}
                         {Object.keys(attrs).length > 0 && (
                           <div className="mt-1">
-                            <div className="text-xs text-muted-foreground mb-1">
-                              Attributes
-                            </div>
+                            <div className="text-xs text-muted-foreground mb-1">Attributes</div>
                             <pre className="text-xs bg-muted/50 rounded p-2 overflow-x-auto max-h-48">
                               {JSON.stringify(attrs, null, 2)}
                             </pre>

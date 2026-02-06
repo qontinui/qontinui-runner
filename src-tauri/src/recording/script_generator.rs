@@ -183,9 +183,7 @@ def run_automation(base_url: Optional[str] = None) -> None:
                             "    print(\"Scrolling: deltaY={}\")\n",
                             data.delta_y
                         ));
-                        script.push_str(&format!(
-                            "    # Scroll action - implement based on your client\n"
-                        ));
+                        script.push_str("    # Scroll action - implement based on your client\n");
                     }
                 }
                 ActionType::Keypress => {
@@ -199,9 +197,7 @@ def run_automation(base_url: Optional[str] = None) -> None:
                 }
                 ActionType::Hover => {
                     script.push_str(&format!("    print(\"Hovering: {}\")\n", selector));
-                    script.push_str(&format!(
-                        "    # Hover action - implement based on your client\n"
-                    ));
+                    script.push_str("    # Hover action - implement based on your client\n");
                 }
             }
 

@@ -287,8 +287,10 @@ function ThinkingSection({
   return (
     <div className="my-2 border border-border/50 rounded-md overflow-hidden">
       <button
+        type="button"
         onClick={toggleExpanded}
-        className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-muted-foreground bg-muted/30 hover:bg-muted/50 transition-colors"
+        onMouseDown={(e) => e.stopPropagation()}
+        className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-muted-foreground bg-muted/30 hover:bg-muted/50 transition-colors cursor-pointer select-none"
       >
         {isExpanded ? (
           <ChevronDown className="w-3.5 h-3.5" />
@@ -402,8 +404,9 @@ function preprocessThinkingSections(content: string): string {
       ) {
         // End thinking block
         if (thinkingLines.length > 0) {
+          const contentHash = hashContent(thinkingLines.join("\n"));
           result.push(
-            `<div data-thinking-section="true">\n\n${thinkingLines.join("\n")}\n\n</div>`,
+            `<div data-thinking-section="true" data-content-id="${contentHash}">\n\n${thinkingLines.join("\n")}\n\n</div>`,
           );
           thinkingLines = [];
         }
@@ -419,7 +422,8 @@ function preprocessThinkingSections(content: string): string {
 
   // Don't forget remaining thinking lines
   if (thinkingLines.length > 0) {
-    result.push(`<div data-thinking-section="true">\n\n${thinkingLines.join("\n")}\n\n</div>`);
+    const contentHash = hashContent(thinkingLines.join("\n"));
+    result.push(`<div data-thinking-section="true" data-content-id="${contentHash}">\n\n${thinkingLines.join("\n")}\n\n</div>`);
   }
 
   return result.join("\n");
@@ -460,7 +464,11 @@ export function MarkdownViewer({ content, className, isAnimated = false }: Markd
           div: ({ className, ...props }: Record<string, unknown>) => {
             // Check for thinking section
             if (props["data-thinking-section"]) {
-              return <ThinkingSection>{props.children as React.ReactNode}</ThinkingSection>;
+              return (
+                <ThinkingSection contentId={props["data-content-id"] as string}>
+                  {props.children as React.ReactNode}
+                </ThinkingSection>
+              );
             }
 
             // Check for finding data attributes

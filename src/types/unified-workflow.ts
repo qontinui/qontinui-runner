@@ -342,19 +342,6 @@ export interface TestStep extends BaseStep {
   test_id?: string;
   /** Timeout in seconds */
   timeout_seconds?: number;
-  /**
-   * Whether failure blocks the agentic loop.
-   * - true (default): Failure causes agentic phase to fix the problem
-   * - false: Informative only, doesn't block completion
-   * @deprecated Use is_blocking instead
-   */
-  is_critical: boolean;
-  /**
-   * Whether failure blocks the agentic loop.
-   * - true (default): Failure causes agentic phase to fix the problem
-   * - false: Informative only, doesn't block completion
-   */
-  is_blocking?: boolean;
   /** Description of what this test verifies */
   description?: string;
 
@@ -419,12 +406,6 @@ export interface CheckStep extends BaseStep {
   fail_on_warning?: boolean;
   /** Timeout in seconds */
   timeout_seconds?: number;
-  /**
-   * Whether failure blocks the agentic loop.
-   * - true (default): Failure causes agentic phase to fix the problem
-   * - false: Informative only, doesn't block completion
-   */
-  is_blocking?: boolean;
 }
 
 /**
@@ -439,12 +420,6 @@ export interface CheckGroupStep extends BaseStep {
   phase: "setup" | "verification" | "completion";
   /** Reference to saved check group ID */
   check_group_id: string;
-  /**
-   * Whether failure blocks the agentic loop.
-   * - true (default): Failure causes agentic phase to fix the problem
-   * - false: Informative only, doesn't block completion
-   */
-  is_blocking?: boolean;
 }
 
 // -----------------------------------------------------------------------------
@@ -471,12 +446,6 @@ export interface PromptStep extends BaseStep {
   provider?: string;
   /** Model override */
   model?: string;
-  /**
-   * For verification prompts: whether failure blocks the agentic loop.
-   * - true (default): Failure causes agentic phase to fix the problem
-   * - false: Informative only, doesn't block completion
-   */
-  is_blocking?: boolean;
   /**
    * True for the auto-generated summary step (locked to last position in completion phase).
    * Summary steps cannot be moved and are always executed last.
@@ -634,6 +603,59 @@ export interface AwasExtractElementsStep extends BaseStep {
   base_url?: string;
 }
 
+// -----------------------------------------------------------------------------
+// UI Bridge Spec Steps
+// -----------------------------------------------------------------------------
+
+/**
+ * Spec Step (Verification)
+ *
+ * Verifies UI state by running a SpecGroup against live UI Bridge elements.
+ * Elements are sourced from the runner's own registry ("control") or from
+ * an external browser tab via Chrome extension ("external").
+ *
+ * Returns a boolean based on whether all assertions in the group passed.
+ * The full SpecGroupResult (per-assertion pass/fail, durations) is available
+ * in the step's output_data for detailed reporting.
+ */
+export interface SpecStep extends BaseStep {
+  type: "spec";
+  phase: "verification";
+  /** The spec group to verify (contains assertions) */
+  spec_group: unknown;
+  /** Where to get elements: "control" (runner UI) or "external" (browser tab) */
+  element_source: "control" | "external";
+  /** Whether failure should stop remaining verification steps */
+  stop_on_failure?: boolean;
+  /** Description of what this spec group verifies */
+  description?: string;
+}
+
+// -----------------------------------------------------------------------------
+// Gate Steps (Verification Phase Only)
+// -----------------------------------------------------------------------------
+
+/**
+ * Gate Step (Verification only)
+ *
+ * A gate aggregates the results of other verification steps by ID.
+ * If gate steps exist, only gated steps determine whether the agentic loop triggers.
+ * If no gate steps exist, all verification step failures trigger the agentic loop (backward compat).
+ *
+ * Gates are evaluated after all their required steps have run. A gate passes
+ * only if ALL its required_steps passed.
+ */
+export interface GateStep extends BaseStep {
+  type: "gate";
+  phase: "verification";
+  /** Step IDs (from other verification steps) that must ALL pass for this gate to pass */
+  required_steps: string[];
+  /** If true, skip remaining verification steps when this gate fails */
+  stop_on_failure?: boolean;
+  /** Description of what this gate controls */
+  description?: string;
+}
+
 // =============================================================================
 // Unified Step Type
 // =============================================================================
@@ -655,6 +677,8 @@ export type UnifiedStep =
   | ScreenshotStep
   | PromptStep
   | ShellCommandStep
+  | SpecStep
+  | GateStep
   // AWAS step types
   | AwasDiscoverStep
   | AwasExecuteStep
@@ -714,6 +738,8 @@ export type VerificationStep =
   | CheckStep
   | CheckGroupStep
   | ScreenshotStep
+  | SpecStep
+  | GateStep
   | AwasDiscoverStep
   | AwasExecuteStep
   | AwasCheckSupportStep
@@ -1365,6 +1391,24 @@ export const STEP_TYPES: Record<WorkflowPhase, StepTypeInfo[]> = {
       color: "teal",
       phase: "verification",
     },
+    // UI Bridge Spec Verification
+    {
+      type: "spec",
+      label: "UI Bridge Spec",
+      description: "Verify UI elements against spec assertions",
+      icon: "ShieldCheck",
+      color: "emerald",
+      phase: "verification",
+    },
+    // Gate (aggregates other step results)
+    {
+      type: "gate",
+      label: "Gate",
+      description: "Aggregate step results to control agentic loop",
+      icon: "ShieldCheck",
+      color: "red",
+      phase: "verification",
+    },
   ],
   agentic: [
     {
@@ -1688,8 +1732,6 @@ export function createDefaultStep(type: UnifiedStep["type"], phase: WorkflowPhas
         phase: "verification",
         name: "New Test",
         test_type: "custom_command",
-        is_critical: true,
-        is_blocking: true,
       };
     case "check":
       return {
@@ -1698,7 +1740,6 @@ export function createDefaultStep(type: UnifiedStep["type"], phase: WorkflowPhas
         phase: "verification",
         name: "New Check",
         check_type: "custom_command",
-        is_blocking: true,
       };
     case "screenshot":
       return {
@@ -1739,7 +1780,6 @@ export function createDefaultStep(type: UnifiedStep["type"], phase: WorkflowPhas
         phase: phase as "setup" | "verification" | "agentic" | "completion",
         name: promptNames[phase] ?? "Prompt",
         content: "",
-        is_blocking: phase === "verification" ? true : undefined,
       };
     }
     // AWAS step types
@@ -1782,6 +1822,23 @@ export function createDefaultStep(type: UnifiedStep["type"], phase: WorkflowPhas
         phase: "verification",
         name: "AWAS Extract Elements",
         html: "",
+      };
+    case "spec":
+      return {
+        id,
+        type: "spec",
+        phase: "verification",
+        name: "Spec Verification",
+        spec_group: {},
+        element_source: "control",
+      };
+    case "gate":
+      return {
+        id,
+        type: "gate",
+        phase: "verification",
+        name: "Gate",
+        required_steps: [],
       };
     default:
       throw new Error(`Unknown step type: ${type}`);
@@ -1882,6 +1939,9 @@ export function canStepExistInPhase(stepType: UnifiedStep["type"], phase: Workfl
     case "awas_list_actions":
     case "awas_extract_elements":
       return true;
+    case "spec":
+    case "gate":
+      return phase === "verification";
     default:
       return false;
   }

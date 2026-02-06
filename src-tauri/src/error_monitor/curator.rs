@@ -279,7 +279,7 @@ impl DebugContextCurator {
         }
 
         // Occurrence count matters
-        score += (error.occurrence_count.min(20) * 3) as u32;
+        score += error.occurrence_count.min(20) * 3;
 
         // Newer errors are more relevant
         if error.status == ErrorStatus::New {

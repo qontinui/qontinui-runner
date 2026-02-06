@@ -30,19 +30,19 @@ import { ProgressBar } from "@/components/ui/ProgressBar";
 
 #### Props
 
-| Prop | Type | Default | Description |
-|------|------|---------|-------------|
-| `current` | `number` | Required | Current progress value |
-| `total` | `number \| null` | `undefined` | Total value (null for indeterminate) |
-| `progressType` | `ProgressType` | `"default"` | Color scheme |
-| `status` | `ProgressStatus` | Auto-detected | Override status |
-| `indeterminate` | `boolean` | `false` | Force indeterminate mode |
-| `showLabel` | `boolean` | `false` | Show label text |
-| `labelFormat` | `LabelFormat` | `"count"` | Label format |
-| `label` | `string` | Auto-generated | Custom label text |
-| `description` | `string` | `undefined` | Description below bar |
-| `size` | `"xs" \| "sm" \| "md" \| "lg"` | `"md"` | Size variant |
-| `ariaLabel` | `string` | Auto-generated | Custom ARIA label |
+| Prop            | Type                           | Default        | Description                          |
+| --------------- | ------------------------------ | -------------- | ------------------------------------ |
+| `current`       | `number`                       | Required       | Current progress value               |
+| `total`         | `number \| null`               | `undefined`    | Total value (null for indeterminate) |
+| `progressType`  | `ProgressType`                 | `"default"`    | Color scheme                         |
+| `status`        | `ProgressStatus`               | Auto-detected  | Override status                      |
+| `indeterminate` | `boolean`                      | `false`        | Force indeterminate mode             |
+| `showLabel`     | `boolean`                      | `false`        | Show label text                      |
+| `labelFormat`   | `LabelFormat`                  | `"count"`      | Label format                         |
+| `label`         | `string`                       | Auto-generated | Custom label text                    |
+| `description`   | `string`                       | `undefined`    | Description below bar                |
+| `size`          | `"xs" \| "sm" \| "md" \| "lg"` | `"md"`         | Size variant                         |
+| `ariaLabel`     | `string`                       | Auto-generated | Custom ARIA label                    |
 
 ### InlineProgressBar
 
@@ -51,21 +51,17 @@ Compact variant for tables and lists.
 ```tsx
 import { InlineProgressBar } from "@/components/ui/ProgressBar";
 
-<InlineProgressBar
-  current={5}
-  total={10}
-  progressType="file_progress"
-/>
+<InlineProgressBar current={5} total={10} progressType="file_progress" />;
 ```
 
 #### Props
 
-| Prop | Type | Default | Description |
-|------|------|---------|-------------|
-| `current` | `number` | Required | Current progress value |
-| `total` | `number \| null` | Required | Total value (null for indeterminate) |
-| `progressType` | `ProgressType` | `"default"` | Color scheme |
-| `className` | `string` | `undefined` | Additional CSS classes |
+| Prop           | Type             | Default     | Description                          |
+| -------------- | ---------------- | ----------- | ------------------------------------ |
+| `current`      | `number`         | Required    | Current progress value               |
+| `total`        | `number \| null` | Required    | Total value (null for indeterminate) |
+| `progressType` | `ProgressType`   | `"default"` | Color scheme                         |
+| `className`    | `string`         | `undefined` | Additional CSS classes               |
 
 ### StepProgressIndicator
 
@@ -74,52 +70,48 @@ Simplified indicator for step/workflow progress.
 ```tsx
 import { StepProgressIndicator } from "@/components/active-dashboard/widgets/shared/StepProgressMarker";
 
-<StepProgressIndicator
-  current={5}
-  total={10}
-  type="test_progress"
-/>
+<StepProgressIndicator current={5} total={10} type="test_progress" />;
 ```
 
 ## Progress Types
 
 Progress types determine the semantic color of the progress bar:
 
-| Type | Color | Use Case |
-|------|-------|----------|
-| `default` | Blue | General progress |
-| `file_progress` | Blue | File operations |
-| `test_progress` | Purple | Test execution |
-| `analysis_progress` | Cyan | Code analysis |
-| `review_progress` | Amber | Review items |
+| Type                 | Color   | Use Case         |
+| -------------------- | ------- | ---------------- |
+| `default`            | Blue    | General progress |
+| `file_progress`      | Blue    | File operations  |
+| `test_progress`      | Purple  | Test execution   |
+| `analysis_progress`  | Cyan    | Code analysis    |
+| `review_progress`    | Amber   | Review items     |
 | `iteration_progress` | Emerald | Iteration cycles |
 
 ## Status States
 
-| Status | Color | Behavior |
-|--------|-------|----------|
-| `idle` | Type color | No animation |
-| `active` | Type color | Subtle pulse |
-| `success` | Green | Auto-detected when complete |
-| `error` | Red | Manual set for failures |
+| Status    | Color      | Behavior                    |
+| --------- | ---------- | --------------------------- |
+| `idle`    | Type color | No animation                |
+| `active`  | Type color | Subtle pulse                |
+| `success` | Green      | Auto-detected when complete |
+| `error`   | Red        | Manual set for failures     |
 
 ## Label Formats
 
-| Format | Example |
-|--------|---------|
-| `percentage` | "50%" |
-| `count` | "50/100" |
-| `both` | "50/100 (50%)" |
-| `none` | (no label) |
+| Format       | Example        |
+| ------------ | -------------- |
+| `percentage` | "50%"          |
+| `count`      | "50/100"       |
+| `both`       | "50/100 (50%)" |
+| `none`       | (no label)     |
 
 ## Size Variants
 
-| Size | Height | Text Size | Use Case |
-|------|--------|-----------|----------|
-| `xs` | 4px | 10px | Very compact, minimal UI |
-| `sm` | 6px | 12px | Inline, secondary progress |
-| `md` | 8px | 12px | Default, standard use |
-| `lg` | 12px | 14px | Prominent, hero displays |
+| Size | Height | Text Size | Use Case                   |
+| ---- | ------ | --------- | -------------------------- |
+| `xs` | 4px    | 10px      | Very compact, minimal UI   |
+| `sm` | 6px    | 12px      | Inline, secondary progress |
+| `md` | 8px    | 12px      | Default, standard use      |
+| `lg` | 12px   | 14px      | Prominent, hero displays   |
 
 ## Accessibility
 
@@ -140,13 +132,13 @@ For indeterminate progress, `aria-valuenow` is undefined.
 
 ## When to Use Each Component
 
-| Scenario | Component | Why |
-|----------|-----------|-----|
-| Primary progress display | `ProgressBar` | Full features, labels |
-| Table cell | `InlineProgressBar` | Fixed width, compact |
-| Workflow step | `StepProgressIndicator` | Semantic type mapping |
-| File upload list | `ProgressBar` (xs/sm) | Individual file progress |
-| Dashboard widget | Both | Overall + details |
+| Scenario                 | Component               | Why                      |
+| ------------------------ | ----------------------- | ------------------------ |
+| Primary progress display | `ProgressBar`           | Full features, labels    |
+| Table cell               | `InlineProgressBar`     | Fixed width, compact     |
+| Workflow step            | `StepProgressIndicator` | Semantic type mapping    |
+| File upload list         | `ProgressBar` (xs/sm)   | Individual file progress |
+| Dashboard widget         | Both                    | Overall + details        |
 
 ## Best Practices
 

@@ -189,6 +189,7 @@ pub struct AwasExtractElementsResult {
 /// AWAS step types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(clippy::enum_variant_names)]
 pub enum AwasStepType {
     /// Discover AWAS manifest for a URL
     AwasDiscover,

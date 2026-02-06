@@ -8,10 +8,16 @@
  * Safe wrapper for chrome.runtime.sendMessage that handles errors gracefully.
  * Returns null if there's an error instead of throwing.
  */
-function safeSendMessage(message) {
+function safeSendMessage(message, timeoutMs = 5000) {
   return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      console.debug("[Qontinui] sendMessage timeout after", timeoutMs, "ms");
+      resolve(null);
+    }, timeoutMs);
+
     try {
       chrome.runtime.sendMessage(message, (response) => {
+        clearTimeout(timer);
         if (chrome.runtime.lastError) {
           // Service worker may be inactive or reloading
           console.debug("[Qontinui] sendMessage error:", chrome.runtime.lastError.message);
@@ -21,6 +27,7 @@ function safeSendMessage(message) {
         resolve(response);
       });
     } catch (error) {
+      clearTimeout(timer);
       console.debug("[Qontinui] sendMessage exception:", error);
       resolve(null);
     }
@@ -51,6 +58,7 @@ const mainTabs = document.querySelectorAll(".main-tab");
 const domTabContent = document.getElementById("domTabContent");
 const apiTabContent = document.getElementById("apiTabContent");
 const uibridgeTabContent = document.getElementById("uibridgeTabContent");
+const specsTabContent = document.getElementById("specsTabContent");
 
 // UI Bridge DOM elements
 const uibridgeStatusBox = document.getElementById("uibridgeStatusBox");
@@ -64,6 +72,13 @@ const activeStatesCount = document.getElementById("activeStatesCount");
 const transitionsCount = document.getElementById("transitionsCount");
 const viewSnapshotBtn = document.getElementById("viewSnapshotBtn");
 
+// Specs DOM elements
+const refreshSpecsBtn = document.getElementById("refreshSpecsBtn");
+const specsCount = document.getElementById("specsCount");
+const specsList = document.getElementById("specsList");
+const specDetail = document.getElementById("specDetail");
+const specDetailContent = document.getElementById("specDetailContent");
+const closeSpecDetailBtn = document.getElementById("closeSpecDetailBtn");
 
 // Sub-tab elements (for API section)
 const subTabs = document.querySelectorAll(".sub-tab");
@@ -185,7 +200,7 @@ async function capture(selector = null) {
       showResult(
         true,
         "DOM captured successfully!",
-        `Size: ${formatSize(response.size)}${selector ? ` | Selector: ${selector}` : " | Full page"}`
+        `Size: ${formatSize(response.size)}${selector ? ` | Selector: ${selector}` : " | Full page"}`,
       );
     } else {
       showResult(false, response?.error || "Unknown error");
@@ -245,11 +260,7 @@ async function importCurl() {
     });
 
     if (response?.success) {
-      showResult(
-        true,
-        "API request imported!",
-        `${response.method} ${response.url}`
-      );
+      showResult(true, "API request imported!", `${response.method} ${response.url}`);
       curlInput.value = ""; // Clear input on success
     } else {
       showResult(false, response?.error || "Failed to import cURL");
@@ -296,6 +307,7 @@ function switchToMainTab(tabId) {
   domTabContent.classList.remove("active");
   apiTabContent.classList.remove("active");
   uibridgeTabContent.classList.remove("active");
+  specsTabContent.classList.remove("active");
 
   if (tabId === "dom") {
     domTabContent.classList.add("active");
@@ -305,6 +317,9 @@ function switchToMainTab(tabId) {
     uibridgeTabContent.classList.add("active");
     // Check UI Bridge status when tab is opened
     checkUIBridgeStatus();
+  } else if (tabId === "specs") {
+    specsTabContent.classList.add("active");
+    refreshSpecs();
   }
 
   // Persist the selected tab
@@ -319,7 +334,7 @@ mainTabs.forEach((tab) => {
 });
 
 // Restore the previously selected popup tab
-chrome.storage.local.get(['selectedPopupTab'], (result) => {
+chrome.storage.local.get(["selectedPopupTab"], (result) => {
   if (result.selectedPopupTab) {
     switchToMainTab(result.selectedPopupTab);
   }
@@ -392,7 +407,8 @@ async function toggleRecording() {
     // Start recording
     await safeSendMessage({ action: "startRecording" });
     updateRecordingUI(true);
-    requestList.innerHTML = '<div class="request-list-empty">Recording... perform actions in your app</div>';
+    requestList.innerHTML =
+      '<div class="request-list-empty">Recording... perform actions in your app</div>';
   }
 }
 
@@ -409,7 +425,8 @@ async function refreshRequestList() {
 
   if (!response?.success || !response?.requests || response.requests.length === 0) {
     if (!isRecording) {
-      requestList.innerHTML = '<div class="request-list-empty">No requests captured. Click "Start Recording" to begin.</div>';
+      requestList.innerHTML =
+        '<div class="request-list-empty">No requests captured. Click "Start Recording" to begin.</div>';
     }
     saveAllBtn.style.display = "none";
     return;
@@ -458,9 +475,10 @@ async function refreshRequestList() {
       }
 
       // Repeat count badge
-      const repeatBadge = req.repeatCount > 1
-        ? `<span class="repeat-badge" title="Called ${req.repeatCount} times">×${req.repeatCount}</span>`
-        : "";
+      const repeatBadge =
+        req.repeatCount > 1
+          ? `<span class="repeat-badge" title="Called ${req.repeatCount} times">×${req.repeatCount}</span>`
+          : "";
 
       return `
         <div class="request-item" data-request-id="${req.id}">
@@ -553,7 +571,10 @@ async function saveAllRequestsToRunner() {
   saveAllBtn.disabled = !isRunnerAvailable;
 
   if (response?.success) {
-    showResult(true, `Saved ${response.count} request${response.count !== 1 ? "s" : ""} to Library!`);
+    showResult(
+      true,
+      `Saved ${response.count} request${response.count !== 1 ? "s" : ""} to Library!`,
+    );
   } else {
     showResult(false, response?.error || "Failed to save requests");
   }
@@ -564,7 +585,8 @@ async function saveAllRequestsToRunner() {
  */
 async function clearCapturedRequests() {
   await safeSendMessage({ action: "clearCapturedRequests" });
-  requestList.innerHTML = '<div class="request-list-empty">No requests captured. Click "Start Recording" to begin.</div>';
+  requestList.innerHTML =
+    '<div class="request-list-empty">No requests captured. Click "Start Recording" to begin.</div>';
   requestCountEl.textContent = "0";
   saveAllBtn.style.display = "none";
 }
@@ -589,12 +611,12 @@ safeSendMessage({ action: "getRecordingStatus" }).then((response) => {
 /**
  * Send command to UI Bridge content script via background
  */
-async function sendUIBridgeCommand(action, params = {}) {
+async function sendUIBridgeCommand(action, params = {}, timeoutMs) {
   return safeSendMessage({
     type: "UI_BRIDGE_POPUP_COMMAND",
     action,
     params,
-  });
+  }, timeoutMs);
 }
 
 /**
@@ -626,16 +648,41 @@ function updateUIBridgeStatus(available, message = null) {
 async function checkUIBridgeStatus() {
   updateUIBridgeStatus(false, "Checking...");
 
-  const response = await sendUIBridgeCommand("ping");
+  // The background handler has its own 3-attempt retry cycle that takes up to ~9s.
+  // Use a generous timeout so we don't cut it short, with one extra retry as safety.
+  const maxRetries = 2;
+  let lastResponse = null;
 
-  if (response?.success && response?.data?.available) {
-    const version = response.data.version || "unknown";
-    updateUIBridgeStatus(true, `UI Bridge v${version}`);
-    // Auto-refresh elements when UI Bridge is detected
-    refreshUIBridgeElements();
-  } else {
-    updateUIBridgeStatus(false, "UI Bridge not found on this page");
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    if (attempt > 0) {
+      updateUIBridgeStatus(false, "Checking... (retrying)");
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+
+    const response = await sendUIBridgeCommand("ping", {}, 12000);
+
+    lastResponse = response;
+    console.log(`[Qontinui Popup] Ping attempt ${attempt + 1}/${maxRetries}:`, JSON.stringify(response));
+
+    if (response?.success && response?.data?.available) {
+      const version = response.data.version || "unknown";
+      updateUIBridgeStatus(true, `UI Bridge v${version}`);
+      refreshUIBridgeElements();
+      return;
+    }
+
+    // If we got an actual response (not timeout), no point retrying
+    if (response !== null) {
+      break;
+    }
   }
+
+  // Show diagnostic info: what did the last response look like?
+  const diag = lastResponse
+    ? (lastResponse.error || `success=${lastResponse.success}, available=${lastResponse.data?.available}`)
+    : "no response (timeout)";
+  console.warn("[Qontinui Popup] UI Bridge not found. Last response:", lastResponse);
+  updateUIBridgeStatus(false, `UI Bridge not found (${diag})`);
 }
 
 /**
@@ -663,7 +710,8 @@ async function refreshUIBridgeElements() {
  */
 function renderElementList() {
   if (uibridgeElements.length === 0) {
-    elementList.innerHTML = '<div class="request-list-empty">No UI Bridge elements registered</div>';
+    elementList.innerHTML =
+      '<div class="request-list-empty">No UI Bridge elements registered</div>';
     return;
   }
 
@@ -837,4 +885,131 @@ chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
       // Could show hover info in status
     }
   }
+});
+
+// =============================================================================
+// Specs Functions
+// =============================================================================
+
+/**
+ * Fetch and display specs from the page's SpecStore
+ */
+async function refreshSpecs() {
+  refreshSpecsBtn.disabled = true;
+
+  const response = await sendUIBridgeCommand("getSpecs");
+
+  refreshSpecsBtn.disabled = false;
+
+  if (response?.success && response?.data) {
+    const specs = response.data.specs || [];
+    specsCount.textContent = `${specs.length} spec${specs.length !== 1 ? "s" : ""} loaded`;
+    renderSpecsList(specs);
+  } else {
+    specsCount.textContent = "0 specs loaded";
+    specsList.innerHTML =
+      '<div class="request-list-empty">Failed to fetch specs. Make sure UI Bridge is active on the page.</div>';
+  }
+}
+
+/**
+ * Render the specs list
+ */
+function renderSpecsList(specs) {
+  if (specs.length === 0) {
+    specsList.innerHTML =
+      '<div class="request-list-empty">No specs loaded. Make sure the page has specs in its SpecStore.</div>';
+    return;
+  }
+
+  const html = specs
+    .map((spec) => {
+      const config = spec.config || {};
+      const groupCount = config.groups?.length || 0;
+      const assertionCount = countAssertions(config);
+      const version = config.version || "?";
+
+      return `
+        <div class="request-item spec-item" data-spec-id="${escapeHtml(spec.specId)}">
+          <div class="request-main-row">
+            <span class="request-method get">SPEC</span>
+            <span class="request-url" title="${escapeHtml(spec.specId)}">${escapeHtml(spec.specId)}</span>
+            <span class="request-host">v${escapeHtml(version)}</span>
+          </div>
+          <div class="request-body-preview">
+            ${groupCount} group${groupCount !== 1 ? "s" : ""}, ${assertionCount} assertion${assertionCount !== 1 ? "s" : ""}${config.description ? " - " + escapeHtml(config.description) : ""}
+          </div>
+          <div class="request-actions">
+            <button class="btn-send spec-view-btn" data-spec-id="${escapeHtml(spec.specId)}" title="View spec details">View</button>
+            <button class="btn-copy spec-copy-btn" data-spec-id="${escapeHtml(spec.specId)}" title="Copy spec JSON">Copy</button>
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+
+  specsList.innerHTML = html;
+
+  // Add event listeners
+  specsList.querySelectorAll(".spec-view-btn").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      viewSpecDetail(btn.dataset.specId, specs);
+    });
+  });
+
+  specsList.querySelectorAll(".spec-copy-btn").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      copySpecJson(btn.dataset.specId, specs);
+    });
+  });
+}
+
+/**
+ * Count total assertions in a spec config
+ */
+function countAssertions(config) {
+  let count = 0;
+  if (config.groups) {
+    for (const group of config.groups) {
+      count += group.assertions?.length || 0;
+    }
+  }
+  if (config.assertions) {
+    count += config.assertions.length;
+  }
+  return count;
+}
+
+/**
+ * Show detail view for a spec
+ */
+function viewSpecDetail(specId, specs) {
+  const spec = specs.find((s) => s.specId === specId);
+  if (!spec) return;
+
+  specDetail.style.display = "block";
+  specDetailContent.textContent = JSON.stringify(spec.config, null, 2);
+}
+
+/**
+ * Copy spec JSON to clipboard
+ */
+async function copySpecJson(specId, specs) {
+  const spec = specs.find((s) => s.specId === specId);
+  if (!spec) return;
+
+  try {
+    await navigator.clipboard.writeText(JSON.stringify(spec.config, null, 2));
+    showResult(true, `Copied spec "${specId}" to clipboard`);
+  } catch {
+    showResult(false, "Failed to copy to clipboard");
+  }
+}
+
+// Specs event listeners
+refreshSpecsBtn.addEventListener("click", refreshSpecs);
+closeSpecDetailBtn.addEventListener("click", () => {
+  specDetail.style.display = "none";
 });

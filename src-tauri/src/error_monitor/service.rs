@@ -9,7 +9,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,7 +43,7 @@ struct FileState {
 #[derive(Debug, Clone)]
 pub enum ErrorMonitorEvent {
     /// New error detected
-    NewError(StoredErrorEvent),
+    NewError(Box<StoredErrorEvent>),
     /// Multiple errors detected at once
     NewErrors(Vec<StoredErrorEvent>),
     /// Error parsing log content
@@ -86,7 +86,7 @@ impl Default for ErrorMonitorConfig {
 #[derive(Debug)]
 pub enum ServiceCommand {
     /// Add a source to monitor
-    AddSource(LogSourceConfig),
+    AddSource(Box<LogSourceConfig>),
     /// Remove a source by name
     RemoveSource(String),
     /// Set the current workflow context
@@ -113,7 +113,7 @@ impl ErrorMonitorHandle {
     /// Add a log source to monitor.
     pub async fn add_source(&self, source: LogSourceConfig) -> Result<(), String> {
         self.command_tx
-            .send(ServiceCommand::AddSource(source))
+            .send(ServiceCommand::AddSource(Box::new(source)))
             .await
             .map_err(|e| format!("Failed to send add source command: {}", e))
     }
@@ -243,7 +243,7 @@ impl ErrorMonitorService {
                             break;
                         }
                         ServiceCommand::AddSource(source) => {
-                            self.add_source(source).await;
+                            self.add_source(*source).await;
                         }
                         ServiceCommand::RemoveSource(name) => {
                             self.remove_source(&name).await;
@@ -503,7 +503,7 @@ impl ErrorMonitorService {
     }
 
     /// Handle a file change event.
-    async fn handle_file_change(&mut self, path: &PathBuf) {
+    async fn handle_file_change(&mut self, path: &Path) {
         let path_str = path.to_string_lossy().to_string();
 
         // Clone the data we need to avoid borrow issues
@@ -659,9 +659,9 @@ impl ErrorMonitorService {
         if stored_errors.len() == 1 {
             let _ = self
                 .event_tx
-                .send(ErrorMonitorEvent::NewError(
+                .send(ErrorMonitorEvent::NewError(Box::new(
                     stored_errors.into_iter().next().unwrap(),
-                ))
+                )))
                 .await;
         } else if !stored_errors.is_empty() {
             let _ = self
@@ -920,7 +920,7 @@ mod tests {
     #[tokio::test]
     async fn test_service_creation() {
         let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
+        let _db_path = dir.path().join("test.db");
         let db = Arc::new(CheckpointDb::new_in_memory().unwrap());
 
         let config = ErrorMonitorConfig::default();
@@ -934,7 +934,7 @@ mod tests {
     #[test]
     fn test_resolve_paths_file() {
         let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
+        let _db_path = dir.path().join("test.db");
         let db = Arc::new(CheckpointDb::new_in_memory().unwrap());
 
         let config = ErrorMonitorConfig::default();
@@ -978,7 +978,7 @@ mod tests {
     async fn test_read_new_content() {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("test.log");
-        let db_path = dir.path().join("test.db");
+        let _db_path = dir.path().join("test.db");
 
         // Create initial log file
         let mut file = std::fs::File::create(&log_path).unwrap();

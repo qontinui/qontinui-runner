@@ -16,6 +16,7 @@ A Chrome/Edge extension for capturing page DOM and sending it to qontinui-runner
 ### Icons
 
 The extension requires PNG icons at these sizes:
+
 - `icons/icon16.png` (16x16) - Toolbar
 - `icons/icon48.png` (48x48) - Extensions page
 - `icons/icon128.png` (128x128) - Web Store

@@ -474,9 +474,10 @@ class WebExtractionService:
                 logger.info(
                     f"[PERF_DEBUG] [{self._current_extraction_id}] Starting _build_and_upload_state_machine()"
                 )
-                clustered_states, clustered_transitions = (
-                    await self._build_and_upload_state_machine(serialized_elements)
-                )
+                (
+                    clustered_states,
+                    clustered_transitions,
+                ) = await self._build_and_upload_state_machine(serialized_elements)
                 duration_build = time.time() - start_build
                 logger.info(
                     f"[PERF_DEBUG] [{self._current_extraction_id}] _build_and_upload_state_machine() finished in {duration_build:.2f}s"

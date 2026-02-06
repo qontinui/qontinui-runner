@@ -39,6 +39,8 @@ pub fn parse_output(
         // qontinui-devtools tools - use devtools JSON parser
         CheckTool::CircularDeps
         | CheckTool::GodClass
+        | CheckTool::GodClassTs
+        | CheckTool::GodClassRust
         | CheckTool::Coupling
         | CheckTool::TypeCoveragePy
         | CheckTool::TypeCoverageTs
@@ -304,12 +306,12 @@ fn parse_mypy_line(line: &str) -> Option<CheckIssue> {
     let rest = parts[3..].join(":");
     let rest = rest.trim();
 
-    let (severity, message) = if rest.starts_with(" error:") {
-        (IssueSeverity::Error, rest[7..].trim().to_string())
-    } else if rest.starts_with(" warning:") {
-        (IssueSeverity::Warning, rest[9..].trim().to_string())
-    } else if rest.starts_with(" note:") {
-        (IssueSeverity::Info, rest[6..].trim().to_string())
+    let (severity, message) = if let Some(stripped) = rest.strip_prefix(" error:") {
+        (IssueSeverity::Error, stripped.trim().to_string())
+    } else if let Some(stripped) = rest.strip_prefix(" warning:") {
+        (IssueSeverity::Warning, stripped.trim().to_string())
+    } else if let Some(stripped) = rest.strip_prefix(" note:") {
+        (IssueSeverity::Info, stripped.trim().to_string())
     } else {
         (IssueSeverity::Error, rest.to_string())
     };

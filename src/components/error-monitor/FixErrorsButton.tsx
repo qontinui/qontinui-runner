@@ -120,11 +120,18 @@ export function FixErrorsButton({
         } catch {
           errorMessage = errorText || errorMessage;
         }
+        // Handle conflict (duplicate workflow) error specially
+        if (runResponse.status === 409) {
+          throw new Error(errorMessage);
+        }
         throw new Error(errorMessage);
       }
 
       setSuccess(true);
       setTimeout(() => setSuccess(false), 3000);
+
+      // Navigate to the Active page to show the running workflow
+      window.dispatchEvent(new CustomEvent("navigate-to-active"));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to start fix workflow");
       setTimeout(() => setError(null), 5000);

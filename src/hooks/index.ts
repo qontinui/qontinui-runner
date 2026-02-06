@@ -169,6 +169,8 @@ export { useTaskRunRecap, recapKeys } from "./useTaskRunRecap";
 
 export { useUIBridgeEventHandler, UIBridgeEventHandler } from "./useUIBridgeEventHandler";
 
+export { useSpecExecutionHandler, SpecExecutionHandler } from "./useSpecExecutionHandler";
+
 export { useWorkflowGenerator } from "./useWorkflowGenerator";
 export type { UseWorkflowGeneratorReturn, GeneratorResult } from "./useWorkflowGenerator";
 

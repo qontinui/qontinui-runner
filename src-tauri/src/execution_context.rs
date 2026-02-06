@@ -549,7 +549,7 @@ impl AiSessionContext {
     }
 
     /// Mark as continuation of another session.
-    pub fn as_continuation_of(mut self, previous_session_id: impl Into<String>) -> Self {
+    pub fn with_continuation_of(mut self, previous_session_id: impl Into<String>) -> Self {
         self.is_continuation = true;
         self.continued_from = Some(previous_session_id.into());
         self

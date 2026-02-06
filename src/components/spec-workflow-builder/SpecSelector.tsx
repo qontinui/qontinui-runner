@@ -1,23 +1,23 @@
 /**
  * SpecSelector
  *
- * Checklist for selecting which test specifications to include
+ * Checklist for selecting which spec groups to include
  * as verification steps in the workflow.
  */
 
 import { useMemo } from "react";
 import { Check, TestTube2, AlertTriangle, Info } from "lucide-react";
-import type { TestSpecification } from "./types";
+import type { SpecGroup, SpecSeverity } from "./types";
 
 interface SpecSelectorProps {
-  specs: TestSpecification[];
+  specs: SpecGroup[];
   selectedIds: Set<string>;
   onToggle: (specId: string) => void;
   onSelectAll: () => void;
   onDeselectAll: () => void;
 }
 
-const SEVERITY_ICON = {
+const SEVERITY_ICON: Record<SpecSeverity, React.ReactNode> = {
   critical: <AlertTriangle className="w-3 h-3 text-red-400" />,
   warning: <AlertTriangle className="w-3 h-3 text-yellow-400" />,
   info: <Info className="w-3 h-3 text-blue-400" />,
@@ -35,7 +35,7 @@ export function SpecSelector({
     [specs],
   );
 
-  const maxSeverity = (spec: TestSpecification): "critical" | "warning" | "info" => {
+  const maxSeverity = (spec: SpecGroup): SpecSeverity => {
     if (spec.assertions.some((a) => a.enabled && a.severity === "critical")) return "critical";
     if (spec.assertions.some((a) => a.enabled && a.severity === "warning")) return "warning";
     return "info";
@@ -99,7 +99,8 @@ export function SpecSelector({
               <div className="flex-1 min-w-0">
                 <div className="text-sm text-neutral-200 truncate">{spec.name}</div>
                 <div className="text-xs text-neutral-500">
-                  {enabledAssertions} assertion{enabledAssertions !== 1 ? "s" : ""} &middot; {spec.category}
+                  {enabledAssertions} assertion{enabledAssertions !== 1 ? "s" : ""} &middot;{" "}
+                  {spec.category}
                 </div>
               </div>
             </button>

@@ -4,30 +4,30 @@ on:
   workflow_dispatch:
     inputs:
       include_cuda:
-        description: 'Include CUDA support'
+        description: "Include CUDA support"
         type: boolean
         default: false
       include_sam3:
-        description: 'Include SAM3 support'
+        description: "Include SAM3 support"
         type: boolean
         default: true
   workflow_call:
     inputs:
       include_cuda:
-        description: 'Include CUDA support'
+        description: "Include CUDA support"
         type: boolean
         default: false
       include_sam3:
-        description: 'Include SAM3 support'
+        description: "Include SAM3 support"
         type: boolean
         default: true
     outputs:
       artifact-name:
-        description: 'Name of the uploaded artifact'
+        description: "Name of the uploaded artifact"
         value: ${{ jobs.build.outputs.artifact-name }}
 
 env:
-  PYTHON_VERSION: '3.12'
+  PYTHON_VERSION: "3.12"
 
 jobs:
   build:

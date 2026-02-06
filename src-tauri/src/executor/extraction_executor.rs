@@ -362,13 +362,11 @@ impl Executor for ExtractionExecutor {
 #[async_trait]
 impl LifecycleExecutor for ExtractionExecutor {
     async fn start(&mut self) -> Result<(), ExecutorError> {
-        self.start_internal()
-            .map_err(|e| ExecutorError::lifecycle(e))
+        self.start_internal().map_err(ExecutorError::lifecycle)
     }
 
     async fn stop(&mut self) -> Result<(), ExecutorError> {
-        self.stop_internal()
-            .map_err(|e| ExecutorError::lifecycle(e))
+        self.stop_internal().map_err(ExecutorError::lifecycle)
     }
 
     fn is_running(&self) -> bool {

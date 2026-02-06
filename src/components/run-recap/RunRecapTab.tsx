@@ -31,7 +31,6 @@ import { StepsTimeline } from "./StepsTimeline";
 import { VerificationTab } from "./VerificationTab";
 import { KnowledgeTab } from "./KnowledgeTab";
 import { AutomationTab } from "./AutomationTab";
-import { TestsTab } from "./TestsTab";
 import { ContextTab } from "./ContextTab";
 import { getAccentColors, getStatusColors } from "@/design-system";
 
@@ -243,9 +242,6 @@ export function RunRecapTab() {
           <TabsTrigger data-ui-id="recap-tab-automation" value="automation">
             Automation
           </TabsTrigger>
-          <TabsTrigger data-ui-id="recap-tab-tests" value="tests">
-            Tests
-          </TabsTrigger>
           <TabsTrigger data-ui-id="recap-tab-context" value="context">
             Context
           </TabsTrigger>
@@ -273,11 +269,6 @@ export function RunRecapTab() {
         {/* Automation Tab */}
         <TabsContent value="automation">
           <AutomationTab taskRunId={taskRunId} stats={data.stats} />
-        </TabsContent>
-
-        {/* Tests Tab */}
-        <TabsContent value="tests">
-          <TestsTab taskRunId={taskRunId} loopResult={selectedRun?.loop_result} />
         </TabsContent>
 
         {/* Context Tab */}

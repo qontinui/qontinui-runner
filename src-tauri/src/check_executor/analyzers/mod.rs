@@ -8,7 +8,7 @@ pub mod concurrency;
 pub mod python;
 pub mod rust_analyzer;
 pub mod security;
-// pub mod typescript; // Has pre-existing bugs in dead_code.rs - disabled until fixed
+pub mod typescript;
 
 use crate::check_executor::output_parser::ParsedOutput;
 use crate::check_executor::types::{CheckDefinition, CheckTool};
@@ -26,7 +26,8 @@ pub fn run_native_analyzer(check_def: &CheckDefinition) -> Result<ParsedOutput, 
         CheckTool::DeadCodePy => python::dead_code::analyze(working_dir),
         CheckTool::SrpAnalyzer => python::srp::analyze_with_defaults(working_dir),
 
-        // TypeScript analyzers (pre-existing bugs in dead_code.rs - kept commented)
+        // TypeScript analyzers
+        CheckTool::GodClassTs => typescript::god_class::analyze_with_defaults(working_dir),
         // CheckTool::TypeCoverageTs => typescript::type_coverage::analyze_with_defaults(working_dir),
         // CheckTool::DeadCodeTs => typescript::dead_code::analyze(working_dir),
 
@@ -40,6 +41,7 @@ pub fn run_native_analyzer(check_def: &CheckDefinition) -> Result<ParsedOutput, 
         CheckTool::RustComplexity => rust_analyzer::complexity::analyze_with_defaults(working_dir),
         CheckTool::UnsafeRust => rust_analyzer::unsafe_code::analyze(working_dir),
         CheckTool::DeadCodeRust => rust_analyzer::dead_code::analyze(working_dir),
+        CheckTool::GodClassRust => rust_analyzer::god_class::analyze_with_defaults(working_dir),
 
         // Security scanner
         CheckTool::SecurityScan => security::scan::analyze_with_defaults(working_dir),
@@ -64,6 +66,8 @@ pub fn has_native_analyzer(tool: &CheckTool) -> bool {
         tool,
         CheckTool::CircularDeps
             | CheckTool::GodClass
+            | CheckTool::GodClassTs
+            | CheckTool::GodClassRust
             | CheckTool::Coupling
             | CheckTool::TypeCoveragePy
             // TypeScript analyzers have pre-existing bugs

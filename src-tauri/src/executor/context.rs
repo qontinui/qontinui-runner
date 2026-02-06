@@ -151,8 +151,6 @@ impl std::fmt::Debug for ExecutorContext {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     // Note: These tests would require mocking AppState which is complex.
     // For now, we document the expected behavior.
 

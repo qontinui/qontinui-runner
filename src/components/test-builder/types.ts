@@ -397,8 +397,8 @@ export interface ReferenceDocument {
 // Import step output types for the modular piping system
 import type { StepOutput, StepOutputType } from "../../types/step-output";
 
-// Analysis source type (extended to include step_output)
-export type AnalysisSourceType = "playwright" | "vision" | "api_request" | "step_output";
+// Analysis source type (extended to include step_output and live_browser)
+export type AnalysisSourceType = "playwright" | "vision" | "api_request" | "step_output" | "live_browser";
 
 // API Request analysis result (from executing a saved API request)
 export interface ApiRequestAnalysis {
@@ -431,13 +431,36 @@ export interface ApiRequestAnalysis {
   };
 }
 
+/** Element captured from live browser via UI Bridge */
+export interface LiveBrowserElement {
+  id: string;
+  tagName: string;
+  type: string;
+  text?: string;
+  label?: string;
+  value?: string;
+  checked?: boolean;
+  visible: boolean;
+  enabled: boolean;
+  bounds: { x: number; y: number; width: number; height: number };
+}
+
+/** Analysis data from live browser element capture */
+export interface LiveBrowserAnalysis {
+  elements: LiveBrowserElement[];
+  url: string;
+  title: string;
+  captured_at: string;
+}
+
 // A single collected analysis (can be any type)
 // Extended with step_output to support the modular piping system
 export type CollectedAnalysis =
   | { type: "playwright"; id: string; name: string; data: PageAnalysis }
   | { type: "vision"; id: string; name: string; data: PageAnalysis }
   | { type: "api_request"; id: string; name: string; data: ApiRequestAnalysis }
-  | { type: "step_output"; id: string; name: string; data: StepOutput };
+  | { type: "step_output"; id: string; name: string; data: StepOutput }
+  | { type: "live_browser"; id: string; name: string; data: LiveBrowserAnalysis };
 
 // Re-export step output types for convenience
 export type { StepOutput, StepOutputType };

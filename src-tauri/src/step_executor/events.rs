@@ -40,6 +40,11 @@ impl TreeEventEmitter {
         }
     }
 
+    /// Get a reference to the app handle (if available).
+    pub fn app_handle(&self) -> Option<&tauri::AppHandle> {
+        self.app_handle.as_ref()
+    }
+
     /// Get the next sequence number for events.
     pub fn next_sequence() -> u32 {
         EVENT_SEQUENCE.fetch_add(1, Ordering::SeqCst)

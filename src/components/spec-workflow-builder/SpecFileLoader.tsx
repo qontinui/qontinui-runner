@@ -2,35 +2,29 @@
  * SpecFileLoader
  *
  * File picker for loading spec files. Supports both:
- * - Legacy TestGeneratorOutput JSON (auto-migrated via migrateFromTestGeneratorOutput)
  * - New SpecConfig (.spec.uibridge.json) format
+ * - Legacy TestGeneratorOutput JSON (auto-migrated via migrateFromTestGeneratorOutput)
  */
 
 import { useState, useCallback, useRef } from "react";
 import { Upload, FileJson, AlertCircle, Check } from "lucide-react";
-import { validateSpecConfig } from "@qontinui/ui-bridge/specs";
-import { migrateFromTestGeneratorOutput } from "@qontinui/ui-bridge/specs";
-import type { SpecConfig } from "@qontinui/ui-bridge/specs";
-import type { TestGeneratorOutput } from "./types";
+import type { SpecConfig } from "./types";
+import { validateSpecConfig, migrateFromTestGeneratorOutput } from "./types";
 
 interface SpecFileLoaderProps {
-  onLoad: (output: TestGeneratorOutput) => void;
-  onLoadSpecConfig?: (config: SpecConfig) => void;
+  onLoad: (config: SpecConfig) => void;
   currentFile?: string;
 }
 
 function isLegacyFormat(parsed: Record<string, unknown>): boolean {
-  return (
-    typeof parsed.generatorType === "string" &&
-    Array.isArray(parsed.testSpecifications)
-  );
+  return typeof parsed.generatorType === "string" && Array.isArray(parsed.testSpecifications);
 }
 
 function isSpecConfigFormat(parsed: Record<string, unknown>): boolean {
   return Array.isArray(parsed.groups) && typeof parsed.version === "string";
 }
 
-export function SpecFileLoader({ onLoad, onLoadSpecConfig, currentFile }: SpecFileLoaderProps) {
+export function SpecFileLoader({ onLoad, currentFile }: SpecFileLoaderProps) {
   const [error, setError] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [migratedFromLegacy, setMigratedFromLegacy] = useState(false);
@@ -50,55 +44,33 @@ export function SpecFileLoader({ onLoad, onLoadSpecConfig, currentFile }: SpecFi
             return;
           }
           setError(null);
-          if (onLoadSpecConfig) {
-            onLoadSpecConfig(parsed as SpecConfig);
-          } else {
-            // Fallback: convert SpecConfig to legacy format for backward compatibility
-            // (This path is for when the parent only handles legacy format)
-            setError("This component requires onLoadSpecConfig to handle .spec.uibridge.json files");
-          }
+          onLoad(parsed as SpecConfig);
           return;
         }
 
-        // Try legacy TestGeneratorOutput format
+        // Try legacy TestGeneratorOutput format — auto-migrate
         if (isLegacyFormat(parsed)) {
           if (!parsed.version || parsed.version !== "1.0.0") {
             setError("Invalid file: missing or unsupported version");
             return;
           }
-          if (!["snapshot", "navigation"].includes(parsed.generatorType as string)) {
-            setError("Invalid file: missing or invalid generatorType");
-            return;
-          }
-          if (!Array.isArray(parsed.testSpecifications)) {
-            setError("Invalid file: missing testSpecifications array");
-            return;
-          }
-          if (!Array.isArray(parsed.states)) {
-            setError("Invalid file: missing states array");
-            return;
-          }
 
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const specConfig = migrateFromTestGeneratorOutput(parsed as any);
+          setMigratedFromLegacy(true);
           setError(null);
-
-          // If onLoadSpecConfig is provided, migrate and use it
-          if (onLoadSpecConfig) {
-            const specConfig = migrateFromTestGeneratorOutput(parsed as TestGeneratorOutput);
-            setMigratedFromLegacy(true);
-            onLoadSpecConfig(specConfig);
-          }
-
-          // Always call onLoad for backward compatibility
-          onLoad(parsed as TestGeneratorOutput);
+          onLoad(specConfig);
           return;
         }
 
-        setError("Unrecognized file format. Expected a .spec.uibridge.json or legacy test spec JSON.");
+        setError(
+          "Unrecognized file format. Expected a .spec.uibridge.json or legacy test spec JSON.",
+        );
       } catch {
         setError(`Failed to parse ${fileName}: invalid JSON`);
       }
     },
-    [onLoad, onLoadSpecConfig],
+    [onLoad],
   );
 
   const handleFileSelect = useCallback(
@@ -133,7 +105,10 @@ export function SpecFileLoader({ onLoad, onLoadSpecConfig, currentFile }: SpecFi
     <div className="p-4 space-y-3">
       {/* Drop zone */}
       <div
-        onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+        onDragOver={(e) => {
+          e.preventDefault();
+          setIsDragging(true);
+        }}
         onDragLeave={() => setIsDragging(false)}
         onDrop={handleDrop}
         onClick={() => fileInputRef.current?.click()}
@@ -144,9 +119,7 @@ export function SpecFileLoader({ onLoad, onLoadSpecConfig, currentFile }: SpecFi
         }`}
       >
         <Upload className="w-8 h-8 text-neutral-500 mx-auto mb-2" />
-        <p className="text-sm text-neutral-300">
-          Drop a spec file here, or click to browse
-        </p>
+        <p className="text-sm text-neutral-300">Drop a spec file here, or click to browse</p>
         <p className="text-xs text-neutral-500 mt-1">
           Supports .spec.uibridge.json and legacy test spec JSON formats
         </p>

@@ -721,9 +721,17 @@ pub struct Settings {
     pub log_sources: GlobalLogSourceSettings,
     #[serde(default)]
     pub execution_variables: ExecutionVariablesSettings,
+    /// Global default: Run pre-flight environment check at start of Setup phase (default: true)
+    /// Can be overridden per-workflow. Checks disk space, Node.js, Python, Rust, Git availability.
+    #[serde(default = "default_preflight_check_enabled")]
+    pub preflight_check_enabled: bool,
 }
 
 fn default_auto_load_last_config() -> bool {
+    true
+}
+
+fn default_preflight_check_enabled() -> bool {
     true
 }
 

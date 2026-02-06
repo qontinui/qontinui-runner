@@ -591,7 +591,10 @@ pub struct Finding {
     pub id: String,
 
     /// Type of finding
-    pub finding_type: String, // "bug", "root_cause", "observation", "hypothesis", "solution"
+    /// Valid types: "bug", "root_cause", "observation", "hypothesis", "solution", "environment"
+    /// Note: "environment" findings (PATH issues, disk space, tools not installed) require
+    /// user intervention and should NOT trigger automatic retries.
+    pub finding_type: String,
 
     /// Description of the finding
     pub description: String,

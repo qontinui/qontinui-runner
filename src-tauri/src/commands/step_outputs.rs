@@ -868,13 +868,11 @@ fn create_step_output(
             // For unknown types, return base output with all data
             let mut output = base.clone();
             if let serde_json::Value::Object(ref mut map) = output {
-                if let Some(d) = data {
+                if let Some(serde_json::Value::Object(data_map)) = data {
                     // Merge all data fields
-                    if let serde_json::Value::Object(data_map) = d {
-                        for (key, value) in data_map {
-                            if !map.contains_key(key) {
-                                map.insert(key.clone(), value.clone());
-                            }
+                    for (key, value) in data_map {
+                        if !map.contains_key(key) {
+                            map.insert(key.clone(), value.clone());
                         }
                     }
                 }

@@ -4290,6 +4290,23 @@ impl CheckpointDb {
             info!("Successfully migrated to version 52 (execution spans table)");
         }
 
+        // Migration to version 53: Add preflight_check_enabled to unified_workflows
+        if current_version < 53 {
+            info!("Migrating database to version 53 (adding preflight_check_enabled to unified_workflows)");
+            conn.execute_batch(
+                r#"
+                -- Add preflight_check_enabled column: enables automatic pre-flight environment check
+                -- When enabled (default), runs a check for disk space, Node.js, Python, Rust, Git at start of setup
+                ALTER TABLE unified_workflows ADD COLUMN preflight_check_enabled INTEGER DEFAULT 1;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (53, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 53: {}", e))?;
+
+            info!("Successfully migrated to version 53 (preflight_check_enabled added)");
+        }
+
         Ok(())
     }
 
@@ -5765,6 +5782,36 @@ impl CheckpointDb {
         .map_err(|e| format!("Failed to mark interrupted workflow as failed: {}", e))?;
 
         Ok(())
+    }
+
+    /// Check if there's a running error-fix workflow.
+    /// Returns the task_run ID if one exists, None otherwise.
+    /// Used to prevent duplicate error-fix workflows from being created.
+    pub fn has_running_error_fix_workflow(&self) -> Result<Option<String>, String> {
+        let conn = self.get_conn()?;
+
+        let result: Result<String, rusqlite::Error> = conn.query_row(
+            r#"
+            SELECT id
+            FROM task_runs
+            WHERE status = 'running'
+              AND (task_name LIKE 'Fix%Error%' OR task_name LIKE '%error-fix%')
+              AND workflow_type = 'unified'
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+            [],
+            |row| row.get(0),
+        );
+
+        match result {
+            Ok(id) => Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!(
+                "Failed to check for running error-fix workflow: {}",
+                e
+            )),
+        }
     }
 
     /// Get recent task runs (for display in UI).
@@ -9940,7 +9987,8 @@ impl CheckpointDb {
                        agentic_steps, completion_steps, max_iterations, provider, model,
                        skip_ai_summary, created_at, updated_at, log_source_selection,
                        context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
-                       log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds
+                       log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
+                       preflight_check_enabled
                 FROM unified_workflows
                 ORDER BY updated_at DESC
                 "#,
@@ -10003,6 +10051,7 @@ impl CheckpointDb {
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
                     timeout_seconds: row.get::<_, Option<i64>>(23)?.map(|v| v as u64),
+                    preflight_check_enabled: row.get::<_, Option<i32>>(24)?.unwrap_or(1) != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -10027,7 +10076,8 @@ impl CheckpointDb {
                    agentic_steps, completion_steps, max_iterations, provider, model,
                    skip_ai_summary, created_at, updated_at, log_source_selection,
                    context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
-                   log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds
+                   log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
+                   preflight_check_enabled
             FROM unified_workflows
             WHERE id = ?1
             "#,
@@ -10087,6 +10137,7 @@ impl CheckpointDb {
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
                     timeout_seconds: row.get::<_, Option<i64>>(23)?.map(|v| v as u64),
+                    preflight_check_enabled: row.get::<_, Option<i32>>(24)?.unwrap_or(1) != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -10113,7 +10164,8 @@ impl CheckpointDb {
                    agentic_steps, completion_steps, max_iterations, provider, model,
                    skip_ai_summary, created_at, updated_at, log_source_selection,
                    context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
-                   log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds
+                   log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
+                   preflight_check_enabled
             FROM unified_workflows
             WHERE name = ?1
             ORDER BY updated_at DESC
@@ -10175,6 +10227,7 @@ impl CheckpointDb {
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
                     timeout_seconds: row.get::<_, Option<i64>>(23)?.map(|v| v as u64),
+                    preflight_check_enabled: row.get::<_, Option<i32>>(24)?.unwrap_or(1) != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -10222,8 +10275,8 @@ impl CheckpointDb {
                 agentic_steps, completion_steps, max_iterations, timeout_seconds, provider, model,
                 skip_ai_summary, created_at, updated_at, log_source_selection,
                 context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
-                log_watch_enabled, health_check_enabled, health_check_urls
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
+                log_watch_enabled, health_check_enabled, health_check_urls, preflight_check_enabled
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
             "#,
             params![
                 id,
@@ -10250,6 +10303,7 @@ impl CheckpointDb {
                 request.log_watch_enabled,
                 request.health_check_enabled,
                 health_check_urls_json,
+                request.preflight_check_enabled,
             ],
         )
         .map_err(|e| format!("Failed to create unified workflow: {}", e))?;
@@ -10292,8 +10346,8 @@ impl CheckpointDb {
                 agentic_steps, completion_steps, max_iterations, timeout_seconds, provider, model,
                 skip_ai_summary, created_at, updated_at, log_source_selection,
                 context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
-                log_watch_enabled, health_check_enabled, health_check_urls
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
+                log_watch_enabled, health_check_enabled, health_check_urls, preflight_check_enabled
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
             "#,
             params![
                 id,
@@ -10320,6 +10374,7 @@ impl CheckpointDb {
                 request.log_watch_enabled,
                 request.health_check_enabled,
                 health_check_urls_json,
+                request.preflight_check_enabled,
             ],
         )
         .map_err(|e| format!("Failed to create unified workflow: {}", e))?;
@@ -10372,7 +10427,7 @@ impl CheckpointDb {
         // - Some(None): Explicitly disable timeout
         // - Some(Some(N)): Set timeout to N seconds
         let timeout_seconds: Option<u64> = match &request.timeout_seconds {
-            Some(val) => val.clone(), // Use provided value (including None to disable)
+            Some(val) => *val,                // Use provided value (including None to disable)
             None => existing.timeout_seconds, // Not provided, keep existing
         };
         let provider = request.provider.as_ref().or(existing.provider.as_ref());
@@ -10410,6 +10465,9 @@ impl CheckpointDb {
             .health_check_urls
             .as_ref()
             .unwrap_or(&existing.health_check_urls);
+        let preflight_check_enabled = request
+            .preflight_check_enabled
+            .unwrap_or(existing.preflight_check_enabled);
 
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
         let setup_steps_json =
@@ -10453,8 +10511,9 @@ impl CheckpointDb {
                 auto_include_contexts = ?19,
                 log_watch_enabled = ?20,
                 health_check_enabled = ?21,
-                health_check_urls = ?22
-            WHERE id = ?23
+                health_check_urls = ?22,
+                preflight_check_enabled = ?23
+            WHERE id = ?24
             "#,
             params![
                 name,
@@ -10479,6 +10538,7 @@ impl CheckpointDb {
                 log_watch_enabled,
                 health_check_enabled,
                 health_check_urls_json,
+                preflight_check_enabled,
                 id,
             ],
         )
@@ -10512,7 +10572,8 @@ impl CheckpointDb {
                    agentic_steps, completion_steps, max_iterations, provider, model,
                    skip_ai_summary, created_at, updated_at, log_source_selection,
                    context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
-                   log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds
+                   log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
+                   preflight_check_enabled
             FROM unified_workflows
             WHERE 1=1
             "#,
@@ -10604,6 +10665,7 @@ impl CheckpointDb {
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
                     timeout_seconds: row.get::<_, Option<i64>>(23)?.map(|v| v as u64),
+                    preflight_check_enabled: row.get::<_, Option<i32>>(24)?.unwrap_or(1) != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -10646,6 +10708,7 @@ impl CheckpointDb {
             log_watch_enabled: original.log_watch_enabled,
             health_check_enabled: original.health_check_enabled,
             health_check_urls: original.health_check_urls,
+            preflight_check_enabled: original.preflight_check_enabled,
         };
 
         self.create_unified_workflow(&create_request)

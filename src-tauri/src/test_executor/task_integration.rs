@@ -290,8 +290,8 @@ fn insert_test_failure_finding(
         )
         .ok();
 
-    if existing.is_some() {
-        return Ok(existing.unwrap());
+    if let Some(id) = existing {
+        return Ok(id);
     }
 
     // Insert new finding

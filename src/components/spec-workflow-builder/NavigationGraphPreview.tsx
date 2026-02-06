@@ -27,7 +27,10 @@ export function NavigationGraphPreview({ states, transitions }: NavigationGraphP
         {states.map((state) => {
           const outgoing = transitions.filter((t) => t.fromStateId === state.id);
           return (
-            <div key={state.id} className="p-3 bg-neutral-800/50 rounded-lg border border-neutral-700">
+            <div
+              key={state.id}
+              className="p-3 bg-neutral-800/50 rounded-lg border border-neutral-700"
+            >
               <div className="flex items-center gap-2">
                 <Circle className="w-3 h-3 text-emerald-400 fill-emerald-400" />
                 <span className="text-sm font-medium text-neutral-200">{state.name}</span>

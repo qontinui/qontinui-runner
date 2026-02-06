@@ -28,6 +28,7 @@ use std::sync::Arc;
 use tauri::Emitter;
 use tracing::{error, info, instrument, warn};
 
+use crate::database::CreateTaskRunEventInput;
 use crate::execution_context::AiSessionContext;
 use crate::mcp_api::{FindingContext, ProgressContext, FINDING_INSTRUCTIONS};
 use crate::runtime_env::{
@@ -138,7 +139,7 @@ impl AiSessionConfig {
             timeout_seconds: None,
             step_name: step_name.into(),
             add_autonomous_context: false,
-            append_finding_instructions: false,
+            append_finding_instructions: true,
             strip_completion_markers: true,
             checkpoint_id: None,
             sub_step_metadata: None,
@@ -434,6 +435,12 @@ impl UnifiedAiSessionExecutor {
                     warn!("Failed to log AI complete event: {}", e);
                 }
 
+                // Save AI output as a task_run_event for the AI Data viewer
+                // This ensures completed runs show AI output from all phases
+                if !output.is_empty() {
+                    self.save_ai_output_event(config, &session_id, &output, duration_ms);
+                }
+
                 AiSessionResult {
                     success,
                     output,
@@ -489,6 +496,52 @@ impl UnifiedAiSessionExecutor {
     // =========================================================================
     // Helper Methods
     // =========================================================================
+
+    /// Save AI output as a task_run_event so the AI Data viewer shows it for completed runs.
+    fn save_ai_output_event(
+        &self,
+        config: &AiSessionConfig,
+        session_id: &str,
+        output: &str,
+        duration_ms: i64,
+    ) {
+        let phase_label = config.phase.as_str();
+        let iteration_label = config
+            .iteration
+            .map(|i| format!(" (iteration {})", i))
+            .unwrap_or_default();
+        let message = format!(
+            "AI {} session{}: {}",
+            phase_label, iteration_label, &config.step_name
+        );
+
+        let data = serde_json::json!({
+            "session_id": session_id,
+            "phase": phase_label,
+            "iteration": config.iteration,
+            "step_name": config.step_name,
+            "output": output,
+            "output_length": output.len(),
+            "source": "claude",
+        });
+
+        let event = CreateTaskRunEventInput {
+            task_run_id: config.task_run_id.clone(),
+            event_type: "ai_output".to_string(),
+            event_subtype: Some(phase_label.to_string()),
+            message,
+            data: Some(data.to_string()),
+            workflow_name: Some(config.workflow_name.clone()),
+            state_name: None,
+            action_id: None,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            duration_ms: Some(duration_ms),
+        };
+
+        if let Err(e) = self.app_state.checkpoint_db.create_task_run_event(&event) {
+            warn!("Failed to save AI output event to database: {}", e);
+        }
+    }
 
     /// Build a session ID based on the configuration.
     fn build_session_id(&self, config: &AiSessionConfig) -> String {
@@ -741,7 +794,7 @@ mod tests {
         assert_eq!(config.phase, WorkflowPhase::Completion);
         assert_eq!(config.iteration, Some(5)); // iterations_run for turn count
         assert!(!config.add_autonomous_context);
-        assert!(!config.append_finding_instructions);
+        assert!(config.append_finding_instructions);
         assert!(config.strip_completion_markers);
         assert_eq!(config.timeout_seconds, Some(300));
     }

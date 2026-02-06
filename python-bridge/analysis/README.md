@@ -31,17 +31,20 @@ StateImages are persistent visual elements (like buttons, icons, labels) that he
 ### Position Classification
 
 Images are classified as:
+
 - **Fixed**: Appears at the same location across frames (e.g., menu bar buttons)
 - **Dynamic**: Appears at varying locations (e.g., popup dialogs)
 
 ## Installation
 
 The service requires:
+
 ```bash
 pip install numpy opencv-python
 ```
 
 It also depends on the qontinui-runner models:
+
 ```python
 from models import DetectedState, Frame, InputEvent, StateImage
 ```
@@ -135,20 +138,20 @@ loaded_image = load_state_image(file_path)
 
 ### ImageExtractionConfig
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `min_size` | Tuple[int, int] | (20, 20) | Minimum image size (width, height) |
-| `max_size` | Tuple[int, int] | (500, 500) | Maximum image size (width, height) |
-| `edge_detection` | str | "canny" | Edge detection method: "canny", "sobel", "laplacian" |
-| `contour_approximation` | float | 0.02 | Contour approximation epsilon |
-| `extract_at_click_locations` | bool | True | Whether to extract at click locations |
-| `click_region_padding` | int | 20 | Padding around click locations (pixels) |
-| `position_tolerance_px` | int | 5 | Tolerance for fixed position classification |
-| `canny_threshold1` | int | 50 | Canny edge detection lower threshold |
-| `canny_threshold2` | int | 150 | Canny edge detection upper threshold |
-| `similarity_threshold` | float | 0.85 | Template matching threshold |
-| `min_contour_area` | int | 100 | Minimum contour area to consider |
-| `max_contours` | int | 50 | Maximum number of contours to extract |
+| Parameter                    | Type            | Default    | Description                                          |
+| ---------------------------- | --------------- | ---------- | ---------------------------------------------------- |
+| `min_size`                   | Tuple[int, int] | (20, 20)   | Minimum image size (width, height)                   |
+| `max_size`                   | Tuple[int, int] | (500, 500) | Maximum image size (width, height)                   |
+| `edge_detection`             | str             | "canny"    | Edge detection method: "canny", "sobel", "laplacian" |
+| `contour_approximation`      | float           | 0.02       | Contour approximation epsilon                        |
+| `extract_at_click_locations` | bool            | True       | Whether to extract at click locations                |
+| `click_region_padding`       | int             | 20         | Padding around click locations (pixels)              |
+| `position_tolerance_px`      | int             | 5          | Tolerance for fixed position classification          |
+| `canny_threshold1`           | int             | 50         | Canny edge detection lower threshold                 |
+| `canny_threshold2`           | int             | 150        | Canny edge detection upper threshold                 |
+| `similarity_threshold`       | float           | 0.85       | Template matching threshold                          |
+| `min_contour_area`           | int             | 100        | Minimum contour area to consider                     |
+| `max_contours`               | int             | 50         | Maximum number of contours to extract                |
 
 ## Data Models
 
@@ -218,6 +221,7 @@ The extraction process follows these steps:
 ### Click Location Extraction
 
 When `extract_at_click_locations=True`:
+
 - For each click location (x, y)
 - Extract region: [x-padding, y-padding] to [x+padding, y+padding]
 - Validate size constraints
@@ -237,6 +241,7 @@ When `extract_at_click_locations=True`:
 ### Position Classification
 
 For each extracted image:
+
 1. Search for occurrences across all state frames
 2. Use template matching with similarity threshold
 3. Collect all matching positions (x, y)
@@ -288,6 +293,7 @@ logging.getLogger('analysis.image_extractor').setLevel(logging.DEBUG)
 ```
 
 Log levels:
+
 - **DEBUG**: Detailed extraction progress
 - **INFO**: High-level operations
 - **WARNING**: Non-critical issues
@@ -313,8 +319,8 @@ The service integrates with the broader qontinui-runner architecture:
 ### Processing Time
 
 - Contour detection: O(n) per frame where n = pixel count
-- Template matching: O(m*n) where m = template size, n = frame size
-- Position analysis: O(k*f) where k = images, f = frames
+- Template matching: O(m\*n) where m = template size, n = frame size
+- Position analysis: O(k\*f) where k = images, f = frames
 
 ### Optimization Tips
 

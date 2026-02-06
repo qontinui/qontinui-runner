@@ -116,9 +116,56 @@ impl LoopController {
         let start = std::time::Instant::now();
         let mut all_step_results = Vec::new();
 
+        // =====================================================================
+        // DETERMINE RESUME POINT (must happen before transition loading)
+        // =====================================================================
+        let resume_manager = ResumeManager::new(self.checkpoint_db.clone());
+        let resume_point = resume_manager
+            .determine_resume_point(&config.execution_id)
+            .unwrap_or_else(|e| {
+                warn!(
+                    "Failed to determine resume point: {} - starting from beginning",
+                    e
+                );
+                ResumePoint::FromStart
+            });
+
+        info!("Resume point: {}", resume_point.description());
+
         // Stage transition tracking for recap timeline
-        let mut transitions: Vec<StageTransition> = Vec::new();
-        let mut current_stage = "init".to_string();
+        // Load existing transitions when resuming to preserve prior phase history
+        let (mut transitions, mut current_stage) =
+            if !matches!(resume_point, ResumePoint::FromStart) {
+                // Try to load existing transition history from database
+                if let Ok(Some(task_run)) = self.checkpoint_db.get_task_run(&config.execution_id) {
+                    if let Some(ref history_json) = task_run.transition_history_json {
+                        if let Ok(loaded_transitions) =
+                            serde_json::from_str::<Vec<StageTransition>>(history_json)
+                        {
+                            // Get the last stage from transitions, or default to "init"
+                            let last_stage = loaded_transitions
+                                .last()
+                                .map(|t| t.to.clone())
+                                .unwrap_or_else(|| "init".to_string());
+                            info!(
+                                "Loaded {} existing transitions, current stage: {}",
+                                loaded_transitions.len(),
+                                last_stage
+                            );
+                            (loaded_transitions, last_stage)
+                        } else {
+                            (Vec::new(), "init".to_string())
+                        }
+                    } else {
+                        (Vec::new(), "init".to_string())
+                    }
+                } else {
+                    (Vec::new(), "init".to_string())
+                }
+            } else {
+                // Fresh run - start with empty transitions
+                (Vec::new(), "init".to_string())
+            };
 
         info!(
             "=== UNIFIED WORKFLOW START: {} (id: {}) ===",
@@ -150,46 +197,42 @@ impl LoopController {
             &config.workflow_name,
         );
 
-        // =====================================================================
-        // DETERMINE RESUME POINT
-        // =====================================================================
-        let resume_manager = ResumeManager::new(self.checkpoint_db.clone());
-        let resume_point = resume_manager
-            .determine_resume_point(&config.execution_id)
-            .unwrap_or_else(|e| {
-                warn!(
-                    "Failed to determine resume point: {} - starting from beginning",
-                    e
-                );
-                ResumePoint::FromStart
-            });
-
-        info!("Resume point: {}", resume_point.description());
-
         // Calculate effective starting iteration based on resume point
-        let (skip_setup, effective_starting_iteration, run_agentic_first, skip_to_completion) =
-            match &resume_point {
-                ResumePoint::FromStart => (false, 0, false, false),
-                ResumePoint::SetupPhase { .. } => {
-                    // Resume in setup - re-run setup (could be smarter about partial resume)
-                    (false, 0, false, false)
-                }
-                ResumePoint::VerificationPhase { iteration, .. } => {
-                    // Skip setup, start verification at the given iteration
-                    // iteration is 1-indexed, starting_iteration is 0-indexed (number of completed iterations)
-                    (true, iteration.saturating_sub(1), false, false)
-                }
-                ResumePoint::AgenticPhase { iteration } => {
-                    // Skip setup, run agentic phase first, then continue verification loop
-                    // The agentic phase is at the given iteration, so we'll run it and then
-                    // continue with verification at iteration + 1
-                    (true, iteration.saturating_sub(1), true, false)
-                }
-                ResumePoint::CompletionPhase { .. } => {
-                    // Skip directly to completion - verification already passed
-                    (true, 0, false, true)
-                }
-            };
+        let (
+            skip_setup,
+            effective_starting_iteration,
+            run_agentic_first_from_resume,
+            skip_to_completion,
+        ) = match &resume_point {
+            ResumePoint::FromStart => (false, 0, false, false),
+            ResumePoint::SetupPhase { .. } => {
+                // Resume in setup - re-run setup (could be smarter about partial resume)
+                (false, 0, false, false)
+            }
+            ResumePoint::VerificationPhase { iteration, .. } => {
+                // Skip setup, start verification at the given iteration
+                // iteration is 1-indexed, starting_iteration is 0-indexed (number of completed iterations)
+                (true, iteration.saturating_sub(1), false, false)
+            }
+            ResumePoint::AgenticPhase { iteration } => {
+                // Skip setup, run agentic phase first, then continue verification loop
+                // The agentic phase is at the given iteration, so we'll run it and then
+                // continue with verification at iteration + 1
+                (true, iteration.saturating_sub(1), true, false)
+            }
+            ResumePoint::CompletionPhase { .. } => {
+                // Skip directly to completion - verification already passed
+                (true, 0, false, true)
+            }
+        };
+
+        // Determine if we should run agentic first:
+        // - From resume: if we were interrupted during agentic phase
+        // - From config: if this is an error-fix workflow (run_agentic_first=true in config)
+        //   This ensures AI attempts to fix errors before verification runs, since log_watch
+        //   verification may pass immediately if logs are currently clean.
+        let run_agentic_first = run_agentic_first_from_resume
+            || (matches!(resume_point, ResumePoint::FromStart) && config.run_agentic_first);
 
         // =====================================================================
         // CLEAR OLD DATA FOR FRESH RUNS
@@ -394,6 +437,7 @@ impl LoopController {
                 max_iterations_reached: false,
                 critical_failure: false,
                 was_stopped: false,
+                unfixable_errors: false,
                 iteration_results: Vec::new(),
             }
         } else {
@@ -488,24 +532,32 @@ impl LoopController {
                 &UnifiedWorkflowState::completion_complete(),
             );
 
-            // Mark task as completed (verification passed)
+            // Mark task as completed
+            // Note: We mark as completed even for unfixable errors because the AI
+            // did its job and determined the errors cannot be fixed automatically.
             self.mark_task_completed(&config.execution_id).await;
 
-            // Resolve targeted errors on successful completion
-            if !config.targeted_error_ids.is_empty() {
+            // Resolve targeted errors on successful completion (verification passed)
+            // Do NOT resolve errors if the AI signaled unfixable - they're still unresolved
+            if loop_result.verification_passed && !config.targeted_error_ids.is_empty() {
                 self.resolve_targeted_errors(&config.execution_id, &config.targeted_error_ids)
                     .await;
             }
 
-            info!("=== WORKFLOW COMPLETED SUCCESSFULLY ===");
+            if loop_result.unfixable_errors {
+                info!("=== WORKFLOW COMPLETED WITH UNFIXABLE ERRORS ===");
+            } else {
+                info!("=== WORKFLOW COMPLETED SUCCESSFULLY ===");
+            }
         } else {
             info!("=== PHASE 3: COMPLETION SKIPPED (verification did not pass) ===");
             info!(
-                "Reason: verification_passed={}, critical_failure={}, max_iterations_reached={}, was_stopped={}",
+                "Reason: verification_passed={}, critical_failure={}, max_iterations_reached={}, was_stopped={}, unfixable_errors={}",
                 loop_result.verification_passed,
                 loop_result.critical_failure,
                 loop_result.max_iterations_reached,
-                loop_result.was_stopped
+                loop_result.was_stopped,
+                loop_result.unfixable_errors
             );
 
             // Mark task as failed (unless it was stopped - stop_ai_analysis already handled that)
@@ -600,6 +652,7 @@ impl LoopController {
                     max_iterations_reached: false,
                     critical_failure: false,
                     was_stopped: true,
+                    unfixable_errors: false,
                     iteration_results,
                 };
             }
@@ -630,6 +683,7 @@ impl LoopController {
                     max_iterations_reached: true,
                     critical_failure: false,
                     was_stopped: false,
+                    unfixable_errors: false,
                     iteration_results,
                 };
             }
@@ -721,6 +775,7 @@ impl LoopController {
                     max_iterations_reached: false,
                     critical_failure: false,
                     was_stopped: false,
+                    unfixable_errors: false,
                     iteration_results,
                 };
             }
@@ -750,6 +805,7 @@ impl LoopController {
                     max_iterations_reached: false,
                     critical_failure: true,
                     was_stopped: false,
+                    unfixable_errors: false,
                     iteration_results,
                 };
             }
@@ -806,13 +862,21 @@ impl LoopController {
             // CRITICAL: Use append_task_output_ex with check_completion_marker=false
             // The AI may output [TASK_COMPLETE] but that does NOT mean verification passed!
             // In unified workflows, only verification passing can mark the task complete.
-            if let Some(output) = agentic_outcome.output() {
+            // ALWAYS log and increment session count, even for Error outcomes, to prevent
+            // the task from getting stuck with sessions_count=0 and status="running".
+            {
+                let output_text = match agentic_outcome.output() {
+                    Some(text) => {
+                        format!("\n--- AI Output (Iteration {}) ---\n{}\n", iteration, text)
+                    }
+                    None => format!(
+                        "\n--- AI Output (Iteration {}) ---\n(no output - skipped)\n",
+                        iteration
+                    ),
+                };
                 let _ = self.checkpoint_db.append_task_output_ex(
                     &config.execution_id,
-                    &format!(
-                        "\n--- AI Output (Iteration {}) ---\n{}\n",
-                        iteration, output
-                    ),
+                    &output_text,
                     true,  // increment session count
                     false, // Don't check for completion marker - verification is the authority
                 );
@@ -845,6 +909,37 @@ impl LoopController {
                 }
             );
 
+            // Check if the AI signaled unfixable errors
+            // This allows the AI to gracefully exit the loop when it determines
+            // that the errors cannot be fixed (e.g., infrastructure issues,
+            // missing dependencies, external service problems).
+            if let Some(output) = agentic_outcome.output() {
+                if output.contains("[UNFIXABLE_ERRORS]") || output.contains("[UNFIXABLE_ERROR]") {
+                    warn!(
+                        "AI signaled unfixable errors on iteration {} - exiting loop gracefully",
+                        iteration
+                    );
+
+                    // Log the unfixable signal to the task output
+                    let _ = self.checkpoint_db.append_task_output_ex(
+                        &config.execution_id,
+                        "\n=== AI SIGNALED UNFIXABLE ERRORS ===\nThe AI has determined that some errors cannot be fixed automatically. Proceeding to completion phase.\n",
+                        false,
+                        false,
+                    );
+
+                    return LoopResult {
+                        iterations_run: iteration,
+                        verification_passed: false,
+                        max_iterations_reached: false,
+                        critical_failure: false,
+                        was_stopped: false,
+                        unfixable_errors: true,
+                        iteration_results,
+                    };
+                }
+            }
+
             // Check if the task was stopped during the agentic phase
             if self.is_task_stopped(&config.execution_id) {
                 warn!("Task was stopped during agentic phase - exiting loop");
@@ -854,6 +949,7 @@ impl LoopController {
                     max_iterations_reached: false,
                     critical_failure: false,
                     was_stopped: true,
+                    unfixable_errors: false,
                     iteration_results,
                 };
             }
@@ -1093,6 +1189,7 @@ pub struct WorkflowResult {
 
 impl WorkflowResult {
     /// Convert to ExecutionResult for API response
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_execution_result(self) -> crate::step_executor::ExecutionResult {
         let successful = self.step_results.iter().filter(|r| r.success).count();
         let failed = self.step_results.iter().filter(|r| !r.success).count();
@@ -1209,7 +1306,7 @@ pub async fn resume_interrupted_workflows(
                     // Spawn the workflow resume in a background task with panic protection
                     let task_id = task_run.id.clone();
                     let task_name = task_run.task_name.clone();
-                    let starting_iteration = task_run.sessions_count as u32; // Resume from after completed iterations
+                    let starting_iteration = task_run.sessions_count; // Resume from after completed iterations
                     let checkpoint_db_for_guard = db.clone();
 
                     // Capture values needed inside the async block
@@ -1243,6 +1340,13 @@ pub async fn resume_interrupted_workflows(
                                 0,
                                 Some("setup"),
                             );
+                            // Prepend pre-flight check if enabled (default: true)
+                            // Pre-flight checks run FIRST to catch environment issues early
+                            let setup_automation_steps =
+                                crate::unified_workflows::prepend_preflight_check_step(
+                                    setup_automation_steps,
+                                    workflow.preflight_check_enabled,
+                                );
                             let setup_prompt_steps = extract_prompt_steps_with_phase(
                                 &workflow.setup_steps,
                                 Some("setup"),
@@ -1282,6 +1386,10 @@ pub async fn resume_interrupted_workflows(
                                 Some("completion"),
                             );
 
+                            // For error-fix workflows, run agentic first (only if starting fresh)
+                            let run_agentic_first =
+                                !workflow.targeted_error_ids.is_empty() && starting_iteration == 0;
+
                             let loop_config = super::types::LoopConfig {
                                 max_iterations: workflow.max_iterations,
                                 timeout_seconds: workflow.timeout_seconds, // Use workflow setting
@@ -1291,6 +1399,7 @@ pub async fn resume_interrupted_workflows(
                                 execution_id: task_id.clone(),
                                 targeted_error_ids: workflow.targeted_error_ids.clone(),
                                 starting_iteration,
+                                run_agentic_first,
                             };
 
                             controller
@@ -1335,7 +1444,7 @@ pub async fn resume_interrupted_workflows(
                     let task_id = task_run.id.clone();
                     let task_name = task_run.task_name.clone();
                     let wf_id = workflow.id.clone();
-                    let starting_iteration = task_run.sessions_count as u32;
+                    let starting_iteration = task_run.sessions_count;
                     let checkpoint_db_for_guard = db.clone();
 
                     // Capture values needed inside the async block
@@ -1370,6 +1479,12 @@ pub async fn resume_interrupted_workflows(
                                 0,
                                 Some("setup"),
                             );
+                            // Prepend pre-flight check if enabled (default: true)
+                            let setup_automation_steps =
+                                crate::unified_workflows::prepend_preflight_check_step(
+                                    setup_automation_steps,
+                                    workflow.preflight_check_enabled,
+                                );
                             let setup_prompt_steps = extract_prompt_steps_with_phase(
                                 &workflow.setup_steps,
                                 Some("setup"),
@@ -1404,6 +1519,10 @@ pub async fn resume_interrupted_workflows(
                                 Some("completion"),
                             );
 
+                            // For error-fix workflows, run agentic first (only if starting fresh)
+                            let run_agentic_first =
+                                !workflow.targeted_error_ids.is_empty() && starting_iteration == 0;
+
                             let loop_config = super::types::LoopConfig {
                                 max_iterations: workflow.max_iterations,
                                 timeout_seconds: workflow.timeout_seconds,
@@ -1413,6 +1532,7 @@ pub async fn resume_interrupted_workflows(
                                 execution_id: task_id.clone(),
                                 targeted_error_ids: workflow.targeted_error_ids.clone(),
                                 starting_iteration,
+                                run_agentic_first,
                             };
 
                             controller

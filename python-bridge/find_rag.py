@@ -148,7 +148,7 @@ async def find_elements(
         # Validate database exists
         if not db_path.exists():
             raise FileNotFoundError(
-                f"Embeddings database not found: {db_path}. " f"Please generate embeddings first."
+                f"Embeddings database not found: {db_path}. Please generate embeddings first."
             )
 
         log_progress("Initializing segment vectorizer...")

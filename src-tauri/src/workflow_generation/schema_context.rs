@@ -81,8 +81,7 @@ The Verification/Agentic loop continues until all blocking checks pass or max_it
 2. `phase` field MUST match the array the step is in (setup_steps -> "setup", etc.)
 3. `agentic_steps` can ONLY contain `prompt` type steps
 4. Use ISO 8601 format for timestamps (e.g., "2024-01-15T10:30:00Z")
-5. `is_critical` and `is_blocking` default to true for test/check steps
-6. Return ONLY the JSON object, no markdown formatting"#,
+5. Return ONLY the JSON object, no markdown formatting"#,
         step_types = get_step_types_documentation(),
         examples = get_example_workflows()
     )
@@ -111,8 +110,6 @@ Runs verification checks.
   "test_type": "playwright" | "qontinui_vision" | "python" | "repository" | "custom_command",
   "command": "string (for repository/custom_command)",
   "code": "string (for playwright/python)",
-  "is_critical": boolean (default: true),
-  "is_blocking": boolean (default: true),
   "description": "string"
 }
 ```
@@ -126,8 +123,7 @@ Code quality checks (lint, format, typecheck).
   "check_type": "lint" | "format" | "typecheck" | "analyze" | "security" | "custom_command",
   "command": "string (command to run)",
   "working_directory": "string (optional)",
-  "auto_fix": boolean (default: false),
-  "is_blocking": boolean (default: true)
+  "auto_fix": boolean (default: false)
 }
 ```
 
@@ -137,8 +133,7 @@ AI task instructions.
 {
   "type": "prompt",
   "phase": "setup" | "verification" | "agentic" | "completion",
-  "content": "string (the prompt instructions)",
-  "is_blocking": boolean (for verification phase, default: true)
+  "content": "string (the prompt instructions)"
 }
 ```
 
@@ -249,8 +244,7 @@ User request: "Run TypeScript type checking and fix any errors"
       "phase": "verification",
       "name": "TypeScript Type Check",
       "check_type": "typecheck",
-      "command": "npx tsc --noEmit",
-      "is_blocking": true
+      "command": "npx tsc --noEmit"
     }
   ],
   "agentic_steps": [
@@ -295,9 +289,7 @@ User request: "Install dependencies, run pytest, and fix failing tests"
       "phase": "verification",
       "name": "Run Pytest",
       "test_type": "repository",
-      "command": "pytest -v",
-      "is_critical": true,
-      "is_blocking": true
+      "command": "pytest -v"
     }
   ],
   "agentic_steps": [
@@ -342,8 +334,7 @@ User request: "Run ESLint and Prettier on my React project"
       "name": "ESLint Check",
       "check_type": "lint",
       "command": "npx eslint src --ext .ts,.tsx",
-      "auto_fix": true,
-      "is_blocking": true
+      "auto_fix": true
     },
     {
       "id": "e1f2a3b4-c5d6-4e7f-8a9b-0c1d2e3f4a5b",
@@ -352,8 +343,7 @@ User request: "Run ESLint and Prettier on my React project"
       "name": "Prettier Check",
       "check_type": "format",
       "command": "npx prettier --check src",
-      "auto_fix": true,
-      "is_blocking": true
+      "auto_fix": true
     }
   ],
   "agentic_steps": [

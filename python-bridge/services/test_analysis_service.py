@@ -177,7 +177,7 @@ class TestAnalysisService:
                 }
 
             # Create a wrapper script that runs the user's script and then captures elements
-            wrapper_script = f'''
+            wrapper_script = f"""
 const {{ chromium }} = require('playwright');
 
 (async () => {{
@@ -186,7 +186,7 @@ const {{ chromium }} = require('playwright');
 
     try {{
         // User's script logic - extract URL if present
-        const userScript = `{script.replace('`', '\\`').replace('$', '\\$')}`;
+        const userScript = `{script.replace("`", "\\`").replace("$", "\\$")}`;
 
         // Parse user script to find goto URL
         const gotoMatch = userScript.match(/goto\\s*\\(\\s*['"]([^'"]+)['"]/);
@@ -292,7 +292,7 @@ const {{ chromium }} = require('playwright');
         if (browser) await browser.close();
     }}
 }})();
-'''
+"""
 
             # Write wrapper script to temp file
             with tempfile.NamedTemporaryFile(mode="w", suffix=".js", delete=False) as f:

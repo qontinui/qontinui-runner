@@ -27,7 +27,7 @@
 
 import { useEffect, useCallback, useRef } from "react";
 import { listen, emit, type UnlistenFn } from "@tauri-apps/api/event";
-import { useUIBridge } from "ui-bridge";
+import { useUIBridge, getGlobalSpecStore } from "ui-bridge";
 import type {
   RegisteredElement,
   RegisteredComponent,
@@ -47,7 +47,9 @@ type UIBridgeRequestType =
   | "get_component"
   | "execute_component_action"
   | "discover"
-  | "get_snapshot";
+  | "get_snapshot"
+  | "get_specs"
+  | "get_spec";
 
 /**
  * Payload structure for UI Bridge requests from Rust
@@ -69,6 +71,7 @@ interface UIBridgeRequestPayload {
       interval?: number;
     };
   };
+  specId?: string;
   params?: Record<string, unknown>;
   options?: {
     root?: string;
@@ -386,6 +389,59 @@ export function useUIBridgeEventHandler(): void {
               type,
               success: true,
               data: snapshot,
+              timestamp: Date.now(),
+            });
+            break;
+          }
+
+          case "get_specs": {
+            const store = getGlobalSpecStore();
+            const allConfigs = store.getAll();
+            const specs: Array<{ specId: string; config: unknown }> = [];
+            for (const [id, config] of allConfigs) {
+              specs.push({ specId: id, config });
+            }
+
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: { specs, count: specs.length },
+              timestamp: Date.now(),
+            });
+            break;
+          }
+
+          case "get_spec": {
+            const { specId } = payload;
+            if (!specId) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: "specId is required",
+                timestamp: Date.now(),
+              });
+              return;
+            }
+
+            const specConfig = getGlobalSpecStore().get(specId);
+            if (!specConfig) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: `Spec not found: ${specId}`,
+                timestamp: Date.now(),
+              });
+              return;
+            }
+
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: { specId, config: specConfig },
               timestamp: Date.now(),
             });
             break;

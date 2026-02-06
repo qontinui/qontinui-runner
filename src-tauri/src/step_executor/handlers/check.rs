@@ -133,10 +133,20 @@ impl StepHandler for CheckHandler {
             Self::emit_started(context, &action_id, &action_name, metadata).await;
 
         // Build the command
+        // On Windows, detect PowerShell syntax and run directly via PowerShell
+        // This avoids cmd.exe quote escaping issues that cause "string is missing terminator" errors
+        let is_powershell = Self::is_powershell_syntax(&final_command);
         let mut cmd = if cfg!(target_os = "windows") {
-            let mut c = Command::new("cmd");
-            c.args(["/C", &final_command]);
-            c
+            if is_powershell {
+                // PowerShell syntax detected - run directly via PowerShell
+                let mut c = Command::new("powershell");
+                c.args(["-NoProfile", "-NonInteractive", "-Command", &final_command]);
+                c
+            } else {
+                let mut c = Command::new("cmd");
+                c.args(["/C", &final_command]);
+                c
+            }
         } else {
             let mut c = Command::new("sh");
             c.args(["-c", &final_command]);
@@ -245,6 +255,23 @@ impl StepHandler for CheckHandler {
 }
 
 impl CheckHandler {
+    /// Check if a command uses PowerShell syntax.
+    /// This mirrors the detection logic from shell_command.rs
+    fn is_powershell_syntax(command: &str) -> bool {
+        command.contains("Get-")
+            || command.contains("Set-")
+            || command.contains("New-")
+            || command.contains("Remove-")
+            || command.contains("Invoke-")
+            || command.contains("Write-Host")
+            || command.contains("Write-Output")
+            || command.contains("$env:")
+            || command.contains("$null")
+            || command.contains("| %")
+            || command.contains("| ?")
+            || command.starts_with("$")
+    }
+
     /// Detect project language from marker files
     fn detect_language(work_dir: &str) -> String {
         let path = std::path::Path::new(work_dir);

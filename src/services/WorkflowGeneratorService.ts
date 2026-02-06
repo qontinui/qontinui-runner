@@ -225,7 +225,6 @@ class WorkflowGeneratorServiceClass {
       state_id: state.id,
       state_name: state.name,
       timeout_seconds: timeoutSeconds,
-      is_blocking: phase === "verification",
     } as StateStep;
   }
 
@@ -410,7 +409,6 @@ Fix any navigation issues to successfully reach all expected states.`;
       includeVisionTest = true,
       includePlaywrightTest = false,
       timeoutSeconds = 30,
-      isBlocking = true,
     } = options;
 
     const steps: VerificationStep[] = [];
@@ -425,7 +423,6 @@ Fix any navigation issues to successfully reach all expected states.`;
         state_id: state.id,
         state_name: state.name,
         timeout_seconds: timeoutSeconds,
-        is_blocking: isBlocking,
       } as StateStep);
     }
 
@@ -437,7 +434,6 @@ Fix any navigation issues to successfully reach all expected states.`;
         phase: "verification",
         name: `Vision Test: ${state.name}`,
         test_type: "qontinui_vision",
-        is_blocking: isBlocking,
         // The vision test will use state images from the loaded config
       } as VerificationStep);
     }
@@ -452,7 +448,6 @@ Fix any navigation issues to successfully reach all expected states.`;
         name: `Playwright Test: ${state.name}`,
         test_type: "playwright",
         code: playwrightCode,
-        is_blocking: isBlocking,
       } as VerificationStep);
     }
 
@@ -766,8 +761,6 @@ export interface SingleStateGeneratorOptions {
   includePlaywrightTest?: boolean;
   /** Timeout for verification in seconds (default: 30) */
   timeoutSeconds?: number;
-  /** Whether steps are blocking (default: true) */
-  isBlocking?: boolean;
 }
 
 /**

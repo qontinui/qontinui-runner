@@ -93,8 +93,9 @@ pub struct UnifiedWorkflow {
     pub max_iterations: u32,
 
     /// Optional inactivity timeout in seconds for AI sessions.
-    /// - None (default): No timeout, runs until completion or manual stop
-    /// - Some(N): Kill AI session after N seconds of no output
+    ///   - None (default): No timeout, runs until completion or manual stop
+    ///   - Some(N): Kill AI session after N seconds of no output
+    ///
     /// Takes precedence over the global AI settings timeout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u64>,
@@ -161,6 +162,14 @@ pub struct UnifiedWorkflow {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub health_check_urls: Vec<HealthCheckUrl>,
 
+    /// Whether to automatically include a pre-flight environment check at the start of setup.
+    /// When enabled (default), a shell command step runs to verify:
+    ///   - Disk space, Node.js/npm, Python/Poetry, Rust/Cargo, Git availability
+    ///
+    /// Uses global setting from Settings if not explicitly set per-workflow
+    #[serde(default = "default_preflight_check_enabled")]
+    pub preflight_check_enabled: bool,
+
     /// ISO 8601 timestamp of creation
     pub created_at: String,
     /// ISO 8601 timestamp of last modification (serialized as "modified_at" to match frontend)
@@ -177,6 +186,10 @@ fn default_log_watch_enabled() -> bool {
 }
 
 fn default_health_check_enabled() -> bool {
+    true
+}
+
+fn default_preflight_check_enabled() -> bool {
     true
 }
 
@@ -238,6 +251,9 @@ pub struct CreateUnifiedWorkflowRequest {
     /// URLs to health check before verification (user-configurable)
     #[serde(default)]
     pub health_check_urls: Vec<HealthCheckUrl>,
+    /// Whether to automatically include a pre-flight environment check at the start of setup
+    #[serde(default = "default_preflight_check_enabled")]
+    pub preflight_check_enabled: bool,
 }
 
 /// Request body for updating a unified workflow
@@ -272,6 +288,8 @@ pub struct UpdateUnifiedWorkflowRequest {
     pub health_check_enabled: Option<bool>,
     /// URLs to health check before verification (user-configurable)
     pub health_check_urls: Option<Vec<HealthCheckUrl>>,
+    /// Whether to automatically include a pre-flight environment check at the start of setup
+    pub preflight_check_enabled: Option<bool>,
 }
 
 /// Query parameters for searching unified workflows
@@ -386,5 +404,35 @@ pub fn prepend_health_check_steps(
         .collect();
 
     steps.extend(verification_steps);
+    steps
+}
+
+/// Prepend a pre-flight environment check step to setup steps if preflight_check_enabled is true.
+///
+/// This function creates a shell command step that:
+/// - Checks disk space on C: and D: drives
+/// - Verifies Node.js, npm, npx are installed and accessible
+/// - Verifies Python and Poetry are installed
+/// - Verifies Rust (rustc) and Cargo are installed
+/// - Verifies Git is installed
+/// - Tests temp directory writability
+///
+/// The step is prepended to the beginning of setup steps so that environment
+/// issues are detected before any other setup logic runs.
+///
+/// Exit codes:
+/// - 0: All checks passed
+/// - 1: Critical issue found (should abort workflow)
+/// - 2: Warning (non-critical issue, workflow can continue)
+pub fn prepend_preflight_check_step(
+    setup_steps: Vec<crate::step_executor::ExecutionStepConfig>,
+    preflight_check_enabled: bool,
+) -> Vec<crate::step_executor::ExecutionStepConfig> {
+    if !preflight_check_enabled {
+        return setup_steps;
+    }
+
+    let mut steps = vec![crate::step_executor::ExecutionStepConfig::default_preflight_check()];
+    steps.extend(setup_steps);
     steps
 }

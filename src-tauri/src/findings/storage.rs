@@ -551,11 +551,11 @@ fn row_to_finding(row: &rusqlite::Row) -> rusqlite::Result<Finding> {
     let question: Option<String> = row.get(16)?;
     let input_options_json: Option<String> = row.get(17)?;
 
-    let user_input = if needs_input && question.is_some() {
+    let user_input = if let (true, Some(q)) = (needs_input, question) {
         let options =
             input_options_json.and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok());
         Some(FindingUserInput {
-            question: question.unwrap(),
+            question: q,
             input_type: if options.is_some() {
                 "choice".to_string()
             } else {

@@ -128,8 +128,6 @@ pub fn analyze(working_dir: &str, max_lcom: f64) -> Result<ParsedOutput, String>
 
             let severity = if lcom_result.value > 0.95 {
                 IssueSeverity::Error
-            } else if lcom_result.value > 0.9 {
-                IssueSeverity::Warning
             } else {
                 IssueSeverity::Warning
             };

@@ -437,7 +437,7 @@ export function LiveBrowserPanel({
             <div>
               <h2 className="text-lg font-semibold text-zinc-100">Live Browser Mode</h2>
               <p className="text-sm text-zinc-400">
-                Connect to open pages and generate tests without a config file
+                Add verification steps from a live browser page
               </p>
             </div>
           </div>

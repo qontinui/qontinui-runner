@@ -403,7 +403,7 @@ impl ExplorationAnalysisContext {
         let mut prompt = String::new();
 
         // Header
-        prompt.push_str(&"# State Exploration Analysis Report\n\n".to_string());
+        prompt.push_str("# State Exploration Analysis Report\n\n");
         prompt.push_str(&format!("**Run ID:** {}\n", self.run_id));
         prompt.push_str(&format!("**Strategy:** {}\n", self.strategy));
         prompt.push_str(&format!(

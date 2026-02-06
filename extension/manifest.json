@@ -3,7 +3,7 @@
   "name": "Qontinui DevTools",
   "version": "2.0.0",
   "description": "AI-powered debugging: DOM capture, API recording, and UI Bridge inspection",
-  "permissions": ["activeTab", "scripting", "webRequest", "storage", "tabs"],
+  "permissions": ["activeTab", "scripting", "webRequest", "storage", "tabs", "offscreen"],
   "host_permissions": ["http://localhost:9876/*", "<all_urls>"],
   "action": {
     "default_popup": "popup.html",
@@ -61,7 +61,11 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["request-interceptor.js", "content-scripts/ui-bridge-inspector.js", "content-scripts/ui-bridge-recorder.js"],
+      "resources": [
+        "request-interceptor.js",
+        "content-scripts/ui-bridge-inspector.js",
+        "content-scripts/ui-bridge-recorder.js"
+      ],
       "matches": ["<all_urls>"]
     }
   ]

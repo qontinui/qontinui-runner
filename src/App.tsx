@@ -105,6 +105,7 @@ import {
   useWebSocketAutoConnect,
   useBackgroundActivities,
   UIBridgeEventHandler,
+  SpecExecutionHandler,
 } from "./hooks";
 import { useGlobalLogSources } from "./hooks/useGlobalLogSources";
 
@@ -161,8 +162,9 @@ import { ExternalUIBridgeInspector } from "./components/ui-bridge";
 import { LearningDashboard } from "./components/learning-dashboard";
 import { CheckpointBrowser } from "./components/checkpoint-browser";
 import { FlowDesigner } from "./components/flow-designer";
-// Live Page Generator
-import { LivePageGeneratorTab } from "./components/live-page-generator";
+// Spec Discovery (formerly Live Page Generator)
+import { SpecDiscoveryTab } from "./components/spec-discovery";
+import type { UnifiedWorkflow } from "./types/unified-workflow";
 // Configure components
 import { ExternalLogsTab as _ExternalLogsTab } from "./components/ExternalLogsTab";
 import { CategoryManager } from "./components/findings/CategoryManager";
@@ -223,7 +225,7 @@ type MainTabId =
   | "test-builder"
   | "check-builder"
   | "shell-command-builder"
-  | "live-page-generator"
+  | "spec-discovery"
   | "capture"
   | "config-log-sources"
   | "config-findings"
@@ -291,7 +293,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "test-builder",
   "check-builder",
   "shell-command-builder",
-  "live-page-generator",
+  "spec-discovery",
   "capture",
   "config-log-sources",
   "config-findings",
@@ -336,6 +338,7 @@ function migrateTabId(stored: string | null): MainTabId {
     scheduler: "tasks",
     dataset: "capture", // Dataset is now part of capture
     extract: "capture",
+    "live-page-generator": "spec-discovery", // Renamed to Spec Discovery
     // Old observe tab migrations to new structure
     logs: "run-recap",
     "run-dashboard": "run-recap", // Dashboard merged into Summary (formerly Recap)
@@ -500,6 +503,20 @@ function AppContent() {
     };
   }, []);
 
+  // Listen for Quick Fix to navigate to active dashboard
+  useEffect(() => {
+    const handleNavigateToActive = () => {
+      console.log("[APP] Navigating to active tab from Quick Fix");
+      setActiveTab("active");
+    };
+
+    window.addEventListener("navigate-to-active", handleNavigateToActive);
+
+    return () => {
+      window.removeEventListener("navigate-to-active", handleNavigateToActive);
+    };
+  }, []);
+
   // Script ID to edit (when navigating from Library to Script Builder)
   const [editScriptId, setEditScriptId] = useState<string | null>(null);
 
@@ -576,6 +593,136 @@ function AppContent() {
     },
     [],
   );
+
+  // Store the last inline workflow definition for re-execution via "Run Last Workflow" button.
+  // Inline workflows aren't saved to the DB, so we keep the definition here.
+  const lastInlineWorkflowRef = useRef<{
+    name: string;
+    description?: string;
+    setup_steps: unknown[];
+    verification_steps: unknown[];
+    agentic_steps: unknown[];
+    completion_steps: unknown[];
+    max_iterations?: number;
+  } | null>(null);
+
+  // Handle applying a generated workflow from Live Page Generator
+  const handleApplyWorkflow = useCallback(async (workflow: UnifiedWorkflow) => {
+    const inlinePayload = {
+      name: workflow.name,
+      description: workflow.description || "",
+      setup_steps: workflow.setup_steps || [],
+      verification_steps: workflow.verification_steps || [],
+      agentic_steps: workflow.agentic_steps || [],
+      completion_steps: workflow.completion_steps || [],
+      max_iterations: workflow.max_iterations || 3,
+    };
+
+    // Store for re-execution via "Run Last Workflow" button
+    lastInlineWorkflowRef.current = inlinePayload;
+
+    // Fire the execute-inline request (don't await — the backend runs it synchronously,
+    // so we navigate to the Active page immediately while the workflow executes in the
+    // background HTTP request. The backend creates the task_run entry before execution
+    // starts, so the Active page's polling will detect it.)
+    fetch("http://127.0.0.1:9876/unified-workflows/execute-inline", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(inlinePayload),
+    }).catch((error) => {
+      console.error("[APP] Failed to execute workflow:", error);
+    });
+
+    // Navigate to active dashboard immediately to monitor execution
+    setActiveTab("active");
+  }, []);
+
+  // State for "Run Last Workflow" button
+  const [isRunningLastWorkflow, setIsRunningLastWorkflow] = useState(false);
+
+  // The last workflow can be re-run if we have a workflow_name
+  const lastRunWorkflowId = lastRun?.workflow_name ?? null;
+
+  // Handle running the last workflow again
+  const handleRunLastWorkflow = useCallback(async () => {
+    if (!lastRun?.workflow_name) return;
+
+    setIsRunningLastWorkflow(true);
+
+    try {
+      // Search for the unified workflow by name in the database
+      const searchResponse = await fetch(
+        `http://127.0.0.1:9876/unified-workflows/search?q=${encodeURIComponent(lastRun.workflow_name)}`,
+      );
+
+      if (!searchResponse.ok) {
+        throw new Error(`Failed to search workflows: ${searchResponse.statusText}`);
+      }
+
+      const searchResult = await searchResponse.json();
+      // API returns data as an array directly, not wrapped in .workflows
+      const workflows = searchResult.data ?? [];
+
+      // Find exact match by name
+      const workflow = workflows.find((w: { name: string }) => w.name === lastRun.workflow_name);
+
+      if (workflow?.id) {
+        // Found in DB — run via the /run endpoint
+        fetch(`http://127.0.0.1:9876/unified-workflows/${workflow.id}/run`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        }).catch((error) => {
+          console.error("[APP] Failed to run workflow:", error);
+        });
+
+        console.log("[APP] Started saved workflow:", workflow.name);
+        setActiveTab("active");
+      } else {
+        // Not found in DB — try re-executing as an inline workflow.
+        // The task_run stores workflow_name with "[Inline] " prefix, so strip it for matching.
+        const rawName = lastRun.workflow_name.replace(/^\[Inline\]\s*/, "");
+        let inlinePayload = lastInlineWorkflowRef.current;
+
+        // If not in the React ref, try fetching from the backend's last-inline store
+        if (!inlinePayload || inlinePayload.name !== rawName) {
+          try {
+            const inlineResponse = await fetch(
+              "http://127.0.0.1:9876/unified-workflows/last-inline",
+            );
+            if (inlineResponse.ok) {
+              const inlineResult = await inlineResponse.json();
+              if (inlineResult.data?.name === rawName) {
+                inlinePayload = inlineResult.data;
+              }
+            }
+          } catch {
+            // Ignore fetch errors for fallback
+          }
+        }
+
+        if (inlinePayload && inlinePayload.name === rawName) {
+          // Re-execute the inline workflow
+          fetch("http://127.0.0.1:9876/unified-workflows/execute-inline", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(inlinePayload),
+          }).catch((error) => {
+            console.error("[APP] Failed to re-execute inline workflow:", error);
+          });
+
+          console.log("[APP] Re-executing inline workflow:", lastRun.workflow_name);
+          setActiveTab("active");
+        } else {
+          console.warn("[APP] Workflow not found in DB or inline cache:", lastRun.workflow_name);
+        }
+      }
+    } catch (error) {
+      console.error("[APP] Failed to run last workflow:", error);
+    } finally {
+      setIsRunningLastWorkflow(false);
+    }
+  }, [lastRun]);
 
   // Clear script ID when navigating away from script builder
   useEffect(() => {
@@ -854,7 +1001,10 @@ function AppContent() {
           <ActiveDashboardPage
             onGoToExecute={() => setActiveTab("gui-automation")}
             onGoToRecap={lastRun ? handleGoToRecap : undefined}
+            onRunLastWorkflow={lastRunWorkflowId ? handleRunLastWorkflow : undefined}
+            isRunningLastWorkflow={isRunningLastWorkflow}
             lastRunWorkflowName={lastRunWorkflowName}
+            lastRunWorkflowId={lastRunWorkflowId}
           />
         );
 
@@ -1246,12 +1396,13 @@ function AppContent() {
           </div>
         );
 
-      case "live-page-generator":
+      case "spec-discovery":
         return (
           <div className="h-full overflow-hidden">
-            <LivePageGeneratorTab
+            <SpecDiscoveryTab
               onLog={addLog}
               onNavigateToLibrary={() => setActiveTab("library")}
+              onApplyWorkflow={handleApplyWorkflow}
             />
           </div>
         );
@@ -1571,6 +1722,7 @@ export default function App() {
   return (
     <UIBridgeProvider features={{ renderLog: true, control: true, debug: true }}>
       <UIBridgeEventHandler />
+      <SpecExecutionHandler />
       {/* AutoRegisterProvider enables automatic UI Bridge element registration */}
       {/* All interactive elements (buttons, inputs, links, etc.) are auto-registered */}
       <AutoRegisterProvider

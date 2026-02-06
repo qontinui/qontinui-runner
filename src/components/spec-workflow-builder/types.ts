@@ -1,13 +1,10 @@
 /**
- * Test Generator Types (Runner-local)
+ * Spec Workflow Builder Types
  *
- * Types matching the legacy TestGeneratorOutput format for use in the runner.
- * Also re-exports canonical spec types from @qontinui/ui-bridge/specs.
- *
- * For migration, use migrateFromTestGeneratorOutput() from @qontinui/ui-bridge/specs.
+ * Re-exports spec types from @qontinui/ui-bridge/specs.
+ * Defines local types for state machine data used in navigation workflows.
  */
 
-// Re-export canonical types for consumers ready to migrate
 export type {
   SpecCategory,
   SpecSeverity,
@@ -16,56 +13,16 @@ export type {
   SpecAssertion,
   SpecGroup,
   SpecConfig,
+  SpecMetadata,
+  AssertionType,
+  SearchCriteria,
 } from "@qontinui/ui-bridge/specs";
 
-export { migrateFromTestGeneratorOutput } from "@qontinui/ui-bridge/specs";
+export { migrateFromTestGeneratorOutput, validateSpecConfig } from "@qontinui/ui-bridge/specs";
 
-// Legacy types (backward-compatible with TestGeneratorOutput JSON)
+export type { LegacyTestGeneratorOutput } from "@qontinui/ui-bridge/specs";
 
-export type TestCategory =
-  | "element-presence"
-  | "accessibility"
-  | "form-validation"
-  | "state-consistency"
-  | "modal-dialog"
-  | "navigation"
-  | "cross-page-consistency"
-  | "custom";
-
-export type TestSeverity = "critical" | "warning" | "info";
-
-export type TestTarget =
-  | { type: "elementId"; elementId: string; label?: string }
-  | { type: "formId"; formId: string; label?: string }
-  | { type: "modalId"; modalId: string; label?: string };
-
-export interface TestAssertion {
-  id: string;
-  description: string;
-  category: TestCategory;
-  severity: TestSeverity;
-  target: TestTarget;
-  assertionType: string;
-  expected?: unknown;
-  attributeName?: string;
-  source: "auto" | "manual";
-  reviewed: boolean;
-  enabled: boolean;
-  notes?: string;
-}
-
-export interface TestSpecification {
-  id: string;
-  name: string;
-  description: string;
-  category: TestCategory;
-  assertions: TestAssertion[];
-  stateId: string;
-  transitionId?: string;
-  source: "auto" | "manual";
-  createdAt: string;
-  updatedAt: string;
-}
+// Local types for state machine data (carried in SpecConfig.metadata)
 
 export interface NonVisualState {
   id: string;
@@ -87,29 +44,11 @@ export interface NonVisualTransition {
   confidence: number;
 }
 
-export interface TestGeneratorOutput {
-  version: "1.0.0";
-  projectId: string;
-  generatorType: "snapshot" | "navigation";
-  states: NonVisualState[];
-  transitions: NonVisualTransition[];
-  testSpecifications: TestSpecification[];
-  snapshotMetadata?: {
-    snapshotId: string;
-    pageUrl: string;
-    pageTitle: string;
-    capturedAt: string;
-    elementCount: number;
-    formCount: number;
-    modalCount: number;
-  };
-  explorationMetadata?: {
-    explorationId: string;
-    targetUrl: string;
-    statesDiscovered: number;
-    transitionsDiscovered: number;
-    exploredAt: string;
-  };
-  createdAt: string;
-  updatedAt: string;
+// Generator metadata stored in SpecConfig.metadata
+export interface GeneratorSpecMetadata {
+  generatorType?: "snapshot" | "navigation";
+  projectId?: string;
+  states?: NonVisualState[];
+  transitions?: NonVisualTransition[];
+  [key: string]: unknown;
 }

@@ -14,13 +14,13 @@
 //!             └── handler.execute(step, context)
 //! ```
 //!
-//! ## Available Handlers (24 total)
+//! ## Available Handlers (25 total)
 //!
 //! | Category | Handlers |
 //! |----------|----------|
 //! | **GUI** | workflow, workflow_ref, state, action, gui_action, screenshot, macro |
 //! | **Shell/Script** | shell_command, shell, script, playwright |
-//! | **Verification** | log_watch, check, check_group, test |
+//! | **Verification** | log_watch, check, check_group, test, spec |
 //! | **API/MCP** | api_request, mcp_call |
 //! | **AWAS** | awas_discover, awas_execute, awas_check_support, awas_list_actions, awas_extract_elements |
 //! | **Other** | prompt |
@@ -74,6 +74,7 @@ mod action;
 mod api_request;
 mod check;
 mod check_group;
+mod error_resolved;
 mod gui_action;
 mod log_watch;
 mod macro_step;
@@ -88,6 +89,9 @@ mod test;
 mod workflow;
 mod workflow_ref;
 
+// UI Bridge Spec handler
+pub mod spec;
+
 // AWAS handlers
 mod awas_check_support;
 mod awas_common;
@@ -101,6 +105,7 @@ pub use action::ActionHandler;
 pub use api_request::ApiRequestHandler;
 pub use check::CheckHandler;
 pub use check_group::CheckGroupHandler;
+pub use error_resolved::ErrorResolvedHandler;
 pub use gui_action::GuiActionHandler;
 pub use log_watch::LogWatchHandler;
 pub use macro_step::MacroHandler;
@@ -114,6 +119,9 @@ pub use state::StateHandler;
 pub use test::TestHandler;
 pub use workflow::WorkflowHandler;
 pub use workflow_ref::WorkflowRefHandler;
+
+// Spec handler re-exports
+pub use spec::SpecHandler;
 
 // AWAS handler re-exports
 pub use awas_check_support::AwasCheckSupportHandler;
@@ -224,6 +232,7 @@ pub struct HandlerContext {
 
 impl HandlerContext {
     /// Create a new handler context.
+    #[allow(clippy::unwrap_or_default)]
     pub fn new(
         app_state: Arc<AppState>,
         config_storage: Arc<TokioMutex<ConfigStorage>>,
@@ -406,6 +415,7 @@ impl HandlerRegistry {
 
         // Verification handlers
         registry.register(LogWatchHandler);
+        registry.register(ErrorResolvedHandler);
         registry.register(CheckHandler);
         registry.register(CheckGroupHandler);
 
@@ -420,6 +430,9 @@ impl HandlerRegistry {
 
         // Simple pass-through handlers
         registry.register(PromptStepHandler);
+
+        // UI Bridge Spec handler
+        registry.register(SpecHandler);
 
         // AWAS handlers
         registry.register(AwasDiscoverHandler);

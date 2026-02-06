@@ -128,7 +128,8 @@ class TestUnifiedDataCollectorPathReturn:
     ):
         """Test that None values returned when no screenshot service."""
         collector = UnifiedDataCollector(
-            state_memory=mock_state_memory, screenshot_service=None  # No screenshot service
+            state_memory=mock_state_memory,
+            screenshot_service=None,  # No screenshot service
         )
         collector.start_action("action-001", None, "workflow-001", 0)
 

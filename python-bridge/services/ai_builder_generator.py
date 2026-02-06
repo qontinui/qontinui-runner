@@ -778,19 +778,32 @@ def _parse_json_output(output: str) -> dict[str, Any]:
 
     output = output.strip()
 
-    # Remove markdown code blocks if present
-    if output.startswith("```"):
+    # Extract JSON from markdown code blocks (handles preamble text before the block)
+    import re
+
+    code_block_match = re.search(r"```(?:json)?\s*\n(.*?)```", output, re.DOTALL)
+    if code_block_match:
+        output = code_block_match.group(1).strip()
+        logger.debug(f"[_parse_json_output] Extracted from code block, length: {len(output)}")
+        logger.debug(f"[_parse_json_output] Extracted content, first 300 chars: {output[:300]!r}")
+    elif output.startswith("```"):
+        # Fallback: opening ``` without closing (shouldn't happen but handle gracefully)
         lines = output.split("\n")
-        # First line is ```json or similar
         lines = lines[1:]
-        # Last line might be ```
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
         output = "\n".join(lines).strip()
         logger.debug(f"[_parse_json_output] After removing code blocks, length: {len(output)}")
-        logger.debug(
-            f"[_parse_json_output] After removing code blocks, first 300 chars: {output[:300]!r}"
-        )
+    elif not output.startswith("{") and not output.startswith("["):
+        # Try to find JSON object or array in the output (skip preamble text)
+        json_start = -1
+        for i, ch in enumerate(output):
+            if ch in "{[":
+                json_start = i
+                break
+        if json_start > 0:
+            output = output[json_start:]
+            logger.debug(f"[_parse_json_output] Skipped preamble, extracted from char {json_start}")
 
     try:
         data = json.loads(output)
@@ -1214,7 +1227,7 @@ def build_flow_exploration_prompt(
     captured_summary = ""
     if captured_pages:
         captured_lines = [
-            f"  - Page {i+1}: {p.get('title', 'Unknown')} - {p.get('url', 'Unknown')} ({p.get('element_count', 0)} elements)"
+            f"  - Page {i + 1}: {p.get('title', 'Unknown')} - {p.get('url', 'Unknown')} ({p.get('element_count', 0)} elements)"
             for i, p in enumerate(captured_pages)
         ]
         captured_summary = f"""

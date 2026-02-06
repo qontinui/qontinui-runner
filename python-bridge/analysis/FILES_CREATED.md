@@ -28,18 +28,22 @@ qontinui-runner/python-bridge/
 ### Core Implementation
 
 #### `/models/state_models.py` (NEW)
+
 **Lines**: ~100
 **Purpose**: Data models for state detection and image extraction
 **Contents**:
+
 - `InputEvent`: User input event data model
 - `Frame`: Screenshot/frame data model with metadata
 - `StateImage`: Extracted identifying image with position info
 - `DetectedState`: Application state with images and metadata
 
 #### `/analysis/image_extractor.py` (NEW)
+
 **Lines**: ~700
 **Purpose**: Main StateImage extraction service
 **Contents**:
+
 - `ImageExtractionConfig`: Configuration dataclass (12+ parameters)
 - `StateImageExtractor`: Main extraction class with:
   - `extract_from_state()`: Main extraction method
@@ -56,9 +60,11 @@ qontinui-runner/python-bridge/
 ### Documentation
 
 #### `/analysis/README.md` (NEW)
+
 **Lines**: ~400
 **Purpose**: Complete reference documentation
 **Sections**:
+
 - Overview and architecture
 - Installation instructions
 - Usage examples
@@ -71,9 +77,11 @@ qontinui-runner/python-bridge/
 - Future enhancements
 
 #### `/analysis/INTEGRATION_GUIDE.md` (NEW)
+
 **Lines**: ~600
 **Purpose**: Step-by-step integration guide
 **Sections**:
+
 - Integration points with existing services
 - Complete pipeline example
 - Configuration best practices (desktop/web/mobile)
@@ -84,9 +92,11 @@ qontinui-runner/python-bridge/
 - Troubleshooting guide
 
 #### `/analysis/IMPLEMENTATION_SUMMARY.md` (NEW)
+
 **Lines**: ~500
 **Purpose**: Overview of implementation
 **Sections**:
+
 - What was created
 - Technical implementation details
 - Architecture overview
@@ -99,9 +109,11 @@ qontinui-runner/python-bridge/
 - Testing coverage
 
 #### `/analysis/QUICK_START.md` (NEW)
+
 **Lines**: ~200
 **Purpose**: 5-minute quick start guide
 **Sections**:
+
 - Installation steps
 - Basic usage example
 - Common use cases
@@ -112,15 +124,18 @@ qontinui-runner/python-bridge/
 - Next steps
 
 #### `/analysis/FILES_CREATED.md` (NEW)
+
 **Lines**: ~200
 **Purpose**: This file - complete file listing
 
 ### Examples and Tests
 
 #### `/analysis/example_usage.py` (NEW)
+
 **Lines**: ~450
 **Purpose**: Comprehensive usage examples
 **Contents**:
+
 - `example_basic_extraction()`: Basic extraction demo
 - `example_contour_detection()`: Contour detection demo
 - `example_position_analysis()`: Position classification demo
@@ -131,9 +146,11 @@ qontinui-runner/python-bridge/
 - Command-line interface
 
 #### `/analysis/test_image_extractor.py` (NEW)
+
 **Lines**: ~450
 **Purpose**: Comprehensive test suite
 **Contents**:
+
 - `TestImageExtractionConfig`: Config tests (2 tests)
 - `TestStateImageExtractor`: Core functionality tests (15+ tests)
 - `TestStateImage`: Data model tests (2 tests)
@@ -143,9 +160,11 @@ qontinui-runner/python-bridge/
 - Integration tests
 
 #### `/analysis/verify_installation.py` (NEW)
+
 **Lines**: ~200
 **Purpose**: Installation verification tool
 **Contents**:
+
 - Python version check
 - Dependency verification (numpy, opencv-python)
 - Module import checks (models, analysis)
@@ -157,18 +176,22 @@ qontinui-runner/python-bridge/
 ### Module Configuration
 
 #### `/analysis/__init__.py` (NEW)
+
 **Lines**: ~20
 **Purpose**: Analysis module exports
 **Exports**:
+
 - `ImageExtractionConfig`
 - `StateImageExtractor`
 - `save_state_image`
 - `load_state_image`
 
 #### `/models/__init__.py` (UPDATED)
+
 **Lines**: ~15
 **Purpose**: Models module exports
 **Added Exports**:
+
 - `InputEvent`
 - `Frame`
 - `StateImage`
@@ -177,6 +200,7 @@ qontinui-runner/python-bridge/
 ## Statistics
 
 ### Code Statistics
+
 - **Total Python Code**: ~1,700 lines
 - **Total Documentation**: ~2,000 lines
 - **Total Test Code**: ~450 lines
@@ -187,6 +211,7 @@ qontinui-runner/python-bridge/
 - **Test Cases**: 25+ unit tests
 
 ### Documentation Statistics
+
 - **README.md**: 400+ lines
 - **INTEGRATION_GUIDE.md**: 600+ lines
 - **IMPLEMENTATION_SUMMARY.md**: 500+ lines
@@ -195,6 +220,7 @@ qontinui-runner/python-bridge/
 - **Total Documentation**: ~2,000 lines
 
 ### Feature Statistics
+
 - **Extraction Methods**: 3 (click locations, contours, best crop)
 - **Edge Detection Methods**: 3 (Canny, Sobel, Laplacian)
 - **Configuration Parameters**: 12
@@ -204,11 +230,13 @@ qontinui-runner/python-bridge/
 ## Dependencies
 
 ### Required Dependencies
+
 - **numpy**: Array operations and numerical computing
 - **opencv-python**: Image processing and computer vision
 - **Python 3.7+**: For dataclasses and type hints
 
 ### Optional Dependencies
+
 - **pytest**: For running test suite
 - **poetry**: For dependency management (alternative to pip)
 
@@ -269,6 +297,7 @@ qontinui-runner/python-bridge/
 ## Usage Overview
 
 ### Basic Usage
+
 ```python
 from analysis import ImageExtractionConfig, StateImageExtractor
 from models import DetectedState, Frame, InputEvent
@@ -279,17 +308,20 @@ images = extractor.extract_from_state(state, frames, events)
 ```
 
 ### Running Examples
+
 ```bash
 python3 analysis/example_usage.py
 python3 analysis/example_usage.py /path/to/screenshots /path/to/events.json
 ```
 
 ### Running Tests
+
 ```bash
 pytest analysis/test_image_extractor.py -v
 ```
 
 ### Verifying Installation
+
 ```bash
 python3 analysis/verify_installation.py
 ```
@@ -319,16 +351,19 @@ The service integrates with:
 After reviewing these files:
 
 1. **Install Dependencies**
+
    ```bash
    pip install numpy opencv-python
    ```
 
 2. **Verify Installation**
+
    ```bash
    python3 analysis/verify_installation.py
    ```
 
 3. **Run Examples**
+
    ```bash
    python3 analysis/example_usage.py
    ```

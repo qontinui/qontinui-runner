@@ -47,6 +47,12 @@ pub enum StepType {
     CheckGroup,
     /// Watch logs for errors (runtime error detection)
     LogWatch,
+    /// Execute a UI Bridge spec group verification
+    Spec,
+    /// Gate step - aggregates results of other verification steps
+    Gate,
+    /// Check if a specific error has been resolved (no longer appears in logs)
+    ErrorResolved,
 
     // ========================================================================
     // Command Steps
@@ -109,6 +115,9 @@ impl StepType {
                 | StepType::CheckGroup
                 | StepType::LogWatch
                 | StepType::Screenshot
+                | StepType::Spec
+                | StepType::Gate
+                | StepType::ErrorResolved
         )
     }
 
@@ -175,6 +184,9 @@ impl StepType {
             StepType::Check => Some(10_000),      // 10 seconds
             StepType::CheckGroup => Some(60_000), // 60 seconds
             StepType::LogWatch => Some(5_000),    // 5 seconds (quick log scan)
+            StepType::Spec => Some(30_000),       // 30 seconds (spec group verification)
+            StepType::Gate => Some(100),          // Near-instant (evaluates cached results)
+            StepType::ErrorResolved => Some(5_000), // 5 seconds (quick log scan)
 
             // Command - varies widely, use conservative defaults
             StepType::ShellCommand => Some(30_000), // 30 seconds
@@ -233,6 +245,9 @@ impl StepType {
             "check" => Some(StepType::Check),
             "check_group" | "checkgroup" => Some(StepType::CheckGroup),
             "log_watch" | "logwatch" => Some(StepType::LogWatch),
+            "spec" | "spec_group" | "specgroup" => Some(StepType::Spec),
+            "gate" => Some(StepType::Gate),
+            "error_resolved" | "errorresolved" => Some(StepType::ErrorResolved),
 
             // Command
             "shell_command" | "shellcommand" | "shell" | "command" => Some(StepType::ShellCommand),
@@ -276,6 +291,9 @@ impl StepType {
             StepType::Check => "check",
             StepType::CheckGroup => "check_group",
             StepType::LogWatch => "log_watch",
+            StepType::Spec => "spec",
+            StepType::Gate => "gate",
+            StepType::ErrorResolved => "error_resolved",
             StepType::ShellCommand => "shell_command",
             StepType::ApiRequest => "api_request",
             StepType::McpCall => "mcp_call",
@@ -425,6 +443,8 @@ mod tests {
             StepType::Test,
             StepType::Check,
             StepType::CheckGroup,
+            StepType::Gate,
+            StepType::ErrorResolved,
             StepType::ShellCommand,
             StepType::ApiRequest,
             StepType::McpCall,

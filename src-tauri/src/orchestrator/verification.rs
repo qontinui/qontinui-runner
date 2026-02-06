@@ -8,9 +8,86 @@
 #![allow(dead_code)]
 
 use serde::Deserialize;
+use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
+
+/// Build an enhanced PATH that includes Node.js tools and local node_modules.
+///
+/// On Windows, npm tools like npx, eslint, prettier are .cmd batch files that may not be
+/// found if the PATH doesn't include the npm directory. This function:
+/// 1. Adds local node_modules/.bin to PATH (for project-local tools)
+/// 2. Adds common Node.js installation paths on Windows
+/// 3. Preserves the existing PATH
+fn build_enhanced_path(working_dir: &str) -> String {
+    let mut paths: Vec<String> = Vec::new();
+    let path_separator = if cfg!(target_os = "windows") {
+        ";"
+    } else {
+        ":"
+    };
+
+    // Add local node_modules/.bin (highest priority for project-local tools)
+    let local_node_bin = Path::new(working_dir).join("node_modules").join(".bin");
+    if local_node_bin.exists() {
+        paths.push(local_node_bin.to_string_lossy().to_string());
+    }
+
+    // On Windows, add common Node.js installation paths
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            // npm global packages directory
+            let npm_path = Path::new(&appdata).join("npm");
+            if npm_path.exists() {
+                paths.push(npm_path.to_string_lossy().to_string());
+            }
+        }
+
+        if let Ok(localappdata) = std::env::var("LOCALAPPDATA") {
+            // Node.js installation via installer
+            let nodejs_path = Path::new(&localappdata).join("Programs").join("nodejs");
+            if nodejs_path.exists() {
+                paths.push(nodejs_path.to_string_lossy().to_string());
+            }
+        }
+
+        // Common Program Files paths
+        if let Ok(program_files) = std::env::var("ProgramFiles") {
+            let nodejs_path = Path::new(&program_files).join("nodejs");
+            if nodejs_path.exists() {
+                paths.push(nodejs_path.to_string_lossy().to_string());
+            }
+        }
+
+        // fnm (Fast Node Manager) paths
+        if let Ok(fnm_dir) = std::env::var("FNM_DIR") {
+            let fnm_current = Path::new(&fnm_dir)
+                .join("node-versions")
+                .join("current")
+                .join("bin");
+            if fnm_current.exists() {
+                paths.push(fnm_current.to_string_lossy().to_string());
+            }
+        }
+
+        // nvm-windows paths
+        if let Ok(nvm_home) = std::env::var("NVM_HOME") {
+            if let Ok(nvm_symlink) = std::env::var("NVM_SYMLINK") {
+                paths.push(nvm_symlink);
+            }
+            paths.push(nvm_home);
+        }
+    }
+
+    // Append existing PATH
+    if let Ok(existing_path) = std::env::var("PATH") {
+        paths.push(existing_path);
+    }
+
+    paths.join(path_separator)
+}
 
 use super::types::*;
 use crate::ai_router::TaskContext;
@@ -423,16 +500,21 @@ impl DeterministicVerifier {
     ) -> VerificationResult {
         info!("Running {}: {}", check_name, command);
 
-        // Run command using shell
+        // Build enhanced PATH to ensure npm/npx tools are found
+        let enhanced_path = build_enhanced_path(&self.working_directory);
+
+        // Run command using shell with enhanced PATH
         let output = if cfg!(target_os = "windows") {
             Command::new("cmd")
                 .args(["/C", command])
                 .current_dir(&self.working_directory)
+                .env("PATH", &enhanced_path)
                 .output()
         } else {
             Command::new("sh")
                 .args(["-c", command])
                 .current_dir(&self.working_directory)
+                .env("PATH", &enhanced_path)
                 .output()
         };
 

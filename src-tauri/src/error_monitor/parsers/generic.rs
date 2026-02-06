@@ -80,7 +80,7 @@ mod default_patterns {
 }
 
 /// Configuration for custom patterns
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PatternConfig {
     /// Custom error patterns (regex strings)
     pub error_patterns: Vec<String>,
@@ -88,16 +88,6 @@ pub struct PatternConfig {
     pub warning_patterns: Vec<String>,
     /// Patterns to ignore (even if they match error patterns)
     pub ignore_patterns: Vec<String>,
-}
-
-impl Default for PatternConfig {
-    fn default() -> Self {
-        Self {
-            error_patterns: Vec::new(),
-            warning_patterns: Vec::new(),
-            ignore_patterns: Vec::new(),
-        }
-    }
 }
 
 /// Generic log parser using regex patterns.

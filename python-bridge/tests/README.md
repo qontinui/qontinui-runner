@@ -7,6 +7,7 @@ This directory contains comprehensive unit tests for the unified data architectu
 The test suite includes **162 tests** across 4 main test modules:
 
 ### 1. test_action_execution_record.py (37 tests)
+
 Tests for the immutable `ActionExecutionRecord` dataclass:
 
 - **Record Creation** (2 tests)
@@ -42,6 +43,7 @@ Tests for the immutable `ActionExecutionRecord` dataclass:
   - Partial state changes
 
 ### 2. test_unified_data_collector.py (41 tests)
+
 Tests for the `UnifiedDataCollector` service:
 
 - **Initialization** (3 tests)
@@ -80,6 +82,7 @@ Tests for the `UnifiedDataCollector` service:
   - Sequential action creation
 
 ### 3. test_screenshot_service.py (47 tests)
+
 Tests for the `ScreenshotService`:
 
 - **Initialization** (3 tests)
@@ -131,6 +134,7 @@ Tests for the `ScreenshotService`:
   - No filesystem operations
 
 ### 4. test_tree_view_layer.py (37 tests)
+
 Tests for the `TreeViewLayer` service:
 
 - **TreeNode Serialization** (3 tests)
@@ -190,6 +194,7 @@ Tests for the `TreeViewLayer` service:
 ## Test Infrastructure
 
 ### conftest.py
+
 Provides shared fixtures and utilities:
 
 - **MockStateMemory**: Simulates state tracking for testing
@@ -207,37 +212,44 @@ Provides shared fixtures and utilities:
 ## Running Tests
 
 ### Run all tests
+
 ```bash
 cd /mnt/c/Users/jspin/Documents/qontinui_parent/qontinui-runner/python-bridge
 pytest tests/
 ```
 
 ### Run specific test file
+
 ```bash
 pytest tests/test_action_execution_record.py
 ```
 
 ### Run specific test class
+
 ```bash
 pytest tests/test_unified_data_collector.py::TestCreateRecord
 ```
 
 ### Run specific test
+
 ```bash
 pytest tests/test_screenshot_service.py::TestStoreScreenshot::test_store_screenshot_basic
 ```
 
 ### Run with coverage
+
 ```bash
 pytest tests/ --cov=models --cov=services --cov-report=html
 ```
 
 ### Run with verbose output
+
 ```bash
 pytest tests/ -v
 ```
 
 ### Run tests matching pattern
+
 ```bash
 pytest tests/ -k "state_change"
 ```
@@ -256,14 +268,18 @@ Tests follow pytest best practices:
 ## Test Categories
 
 ### Unit Tests
+
 All tests in this suite are unit tests that:
+
 - Test single components in isolation
 - Use mocks for dependencies
 - Run quickly (< 1 second each)
 - Don't require external services
 
 ### Integration Tests
+
 A separate `test_integration.py` file contains integration tests that verify:
+
 - Component interaction
 - End-to-end workflows
 - Multiple components working together
@@ -271,6 +287,7 @@ A separate `test_integration.py` file contains integration tests that verify:
 ## Coverage Goals
 
 Target coverage: **95%+** for all modules:
+
 - `models/action_execution_record.py`
 - `services/unified_data_collector.py`
 - `services/screenshot_service.py`
@@ -291,6 +308,7 @@ When adding new tests:
 ## Dependencies
 
 Required packages (from pyproject.toml):
+
 - pytest >= 7.4.3
 - pytest-cov (for coverage reporting)
 - pytest-asyncio (if async tests are added)
@@ -298,6 +316,7 @@ Required packages (from pyproject.toml):
 ## Continuous Integration
 
 These tests are designed to run in CI/CD pipelines:
+
 - Fast execution (all tests complete in < 5 seconds)
 - No external dependencies
 - Deterministic (no random behavior)
@@ -306,17 +325,22 @@ These tests are designed to run in CI/CD pipelines:
 ## Troubleshooting
 
 ### Import errors
+
 Ensure you're running pytest from the python-bridge directory:
+
 ```bash
 cd /mnt/c/Users/jspin/Documents/qontinui_parent/qontinui-runner/python-bridge
 pytest tests/
 ```
 
 ### Fixture not found
+
 Check that conftest.py is in the tests directory and is being loaded.
 
 ### Test collection errors
+
 Run with verbose collection to see what's being discovered:
+
 ```bash
 pytest tests/ --collect-only -v
 ```

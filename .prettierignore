@@ -1,0 +1,31 @@
+# Cache directories
+.mypy_cache/
+python-bridge/.mypy_cache/
+.pytest_cache/
+src-tauri/.pytest_cache/
+__pycache__/
+
+# Generated files
+src-tauri/gen/
+src-tauri/target/
+
+# Build output
+dist/
+dist-ssr/
+node_modules/
+
+# Python virtual environments
+venv/
+.venv/
+python-bridge/venv/
+python-bridge/build/
+python-bridge/dist/
+
+# Binary files
+src-tauri/binaries/
+
+# Assets that prettier can't parse
+src/assets/*.svg
+
+# Temporary files
+tmpclaude-*

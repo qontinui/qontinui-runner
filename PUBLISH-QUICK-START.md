@@ -57,9 +57,11 @@ Edit `README.md`, find the Installation section, add:
 **Latest Release: [v0.1.0](https://github.com/qontinui/qontinui-runner/releases/tag/v0.1.0)**
 
 **Windows:**
+
 - [Download MSI Installer](https://github.com/qontinui/qontinui-runner/releases/download/v0.1.0/Qontinui.Runner_0.1.0_x64_en-US.msi)
 
 **macOS / Linux:**
+
 - Build from source (instructions below)
 ```
 

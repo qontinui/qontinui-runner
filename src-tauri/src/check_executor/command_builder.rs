@@ -51,9 +51,11 @@ pub fn build_command(check_def: &CheckDefinition) -> Result<(String, Vec<String>
         CheckTool::Rustfmt => build_rustfmt_command(check_def),
         CheckTool::CargoCheck => build_cargo_check_command(check_def),
 
-        // qontinui-devtools Analysis tools
+        // qontinui-devtools Analysis tools (native analyzers - no external command)
         CheckTool::CircularDeps => build_devtools_command("circular-deps", check_def),
         CheckTool::GodClass => build_devtools_command("god-class", check_def),
+        CheckTool::GodClassTs => build_devtools_command("god-class-ts", check_def),
+        CheckTool::GodClassRust => build_devtools_command("god-class-rust", check_def),
         CheckTool::Coupling => build_devtools_command("coupling", check_def),
         CheckTool::TypeCoveragePy => build_devtools_command("type-coverage-py", check_def),
         CheckTool::TypeCoverageTs => build_devtools_command("type-coverage-ts", check_def),
@@ -451,6 +453,8 @@ pub fn get_auto_fix_command(tool: &CheckTool, base_args: &[String]) -> Vec<Strin
         // qontinui-devtools tools (analysis only, no auto-fix)
         | CheckTool::CircularDeps
         | CheckTool::GodClass
+        | CheckTool::GodClassTs
+        | CheckTool::GodClassRust
         | CheckTool::Coupling
         | CheckTool::TypeCoveragePy
         | CheckTool::TypeCoverageTs

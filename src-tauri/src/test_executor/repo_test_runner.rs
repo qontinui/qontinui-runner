@@ -315,24 +315,24 @@ fn parse_pytest_text(stdout: &str, _stderr: &str) -> ParsedTestResults {
     let mut tests = Vec::new();
 
     // Look for summary line like "5 passed, 2 failed in 1.23s"
+    let re_passed = regex::Regex::new(r"(\d+) passed").ok();
+    let re_failed = regex::Regex::new(r"(\d+) failed").ok();
+    let re_skipped = regex::Regex::new(r"(\d+) skipped").ok();
+
     for line in stdout.lines() {
         if line.contains("passed") || line.contains("failed") {
             // Extract numbers
-            let re_passed = regex::Regex::new(r"(\d+) passed").ok();
-            let re_failed = regex::Regex::new(r"(\d+) failed").ok();
-            let re_skipped = regex::Regex::new(r"(\d+) skipped").ok();
-
-            if let Some(re) = re_passed {
+            if let Some(ref re) = re_passed {
                 if let Some(cap) = re.captures(line) {
                     summary.passed = cap[1].parse().unwrap_or(0);
                 }
             }
-            if let Some(re) = re_failed {
+            if let Some(ref re) = re_failed {
                 if let Some(cap) = re.captures(line) {
                     summary.failed = cap[1].parse().unwrap_or(0);
                 }
             }
-            if let Some(re) = re_skipped {
+            if let Some(ref re) = re_skipped {
                 if let Some(cap) = re.captures(line) {
                     summary.skipped = cap[1].parse().unwrap_or(0);
                 }

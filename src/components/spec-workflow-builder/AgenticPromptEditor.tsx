@@ -5,13 +5,15 @@
  * verification steps fail.
  */
 
-import { Bot } from "lucide-react";
+import { Bot, Monitor, Globe } from "lucide-react";
 
 interface AgenticPromptEditorProps {
   prompt: string;
   onPromptChange: (prompt: string) => void;
   maxIterations: number;
   onMaxIterationsChange: (max: number) => void;
+  elementSource?: "control" | "external";
+  onElementSourceChange?: (source: "control" | "external") => void;
 }
 
 const DEFAULT_PROMPT = `You are a QA assistant. The verification step above has failed.
@@ -29,6 +31,8 @@ export function AgenticPromptEditor({
   onPromptChange,
   maxIterations,
   onMaxIterationsChange,
+  elementSource,
+  onElementSourceChange,
 }: AgenticPromptEditorProps) {
   return (
     <div className="p-4 space-y-4">
@@ -41,6 +45,42 @@ export function AgenticPromptEditor({
         This prompt runs when a verification step fails. The AI agent will attempt to fix the
         application state so verification passes.
       </p>
+
+      {/* Element source selector */}
+      {elementSource && onElementSourceChange && (
+        <div>
+          <label className="block text-xs text-neutral-400 mb-2">Element Source</label>
+          <div className="flex gap-2">
+            <button
+              onClick={() => onElementSourceChange("control")}
+              className={`flex items-center gap-2 px-3 py-2 text-xs rounded-md border transition-colors ${
+                elementSource === "control"
+                  ? "bg-blue-500/20 border-blue-500/40 text-blue-300"
+                  : "bg-neutral-800 border-neutral-600 text-neutral-400 hover:text-neutral-200"
+              }`}
+            >
+              <Monitor className="w-3.5 h-3.5" />
+              Runner UI
+            </button>
+            <button
+              onClick={() => onElementSourceChange("external")}
+              className={`flex items-center gap-2 px-3 py-2 text-xs rounded-md border transition-colors ${
+                elementSource === "external"
+                  ? "bg-emerald-500/20 border-emerald-500/40 text-emerald-300"
+                  : "bg-neutral-800 border-neutral-600 text-neutral-400 hover:text-neutral-200"
+              }`}
+            >
+              <Globe className="w-3.5 h-3.5" />
+              Browser Tab
+            </button>
+          </div>
+          <p className="text-[10px] text-neutral-500 mt-1">
+            {elementSource === "control"
+              ? "Specs run against the runner's own UI elements"
+              : "Specs run against an external browser tab via the Chrome extension"}
+          </p>
+        </div>
+      )}
 
       <div>
         <label className="block text-xs text-neutral-400 mb-1">Agentic Prompt</label>
@@ -62,9 +102,7 @@ export function AgenticPromptEditor({
           max={20}
           className="w-20 px-2 py-1 text-sm bg-neutral-900 border border-neutral-600 rounded text-neutral-200 focus:outline-none focus:border-purple-500"
         />
-        <span className="text-xs text-neutral-500">
-          verification-agentic loops before stopping
-        </span>
+        <span className="text-xs text-neutral-500">verification-agentic loops before stopping</span>
       </div>
     </div>
   );

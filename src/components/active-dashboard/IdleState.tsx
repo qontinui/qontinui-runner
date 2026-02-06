@@ -5,11 +5,17 @@
  * Shows a prompt to navigate to the execute page or view the last run.
  */
 
-import { ArrowRight, Workflow, History } from "lucide-react";
+import { Workflow, History, Play, Loader2 } from "lucide-react";
 import { Button } from "../ui";
 import type { IdleStateProps } from "./types";
 
-export function IdleState({ onGoToExecute, onGoToRecap, lastRunWorkflowName }: IdleStateProps) {
+export function IdleState({
+  onGoToRecap,
+  onRunLastWorkflow,
+  isRunningLastWorkflow,
+  lastRunWorkflowName,
+  lastRunWorkflowId,
+}: IdleStateProps) {
   return (
     <div className="flex flex-1 items-center justify-center pt-16">
       <div className="flex flex-col items-center gap-6 text-center">
@@ -19,14 +25,30 @@ export function IdleState({ onGoToExecute, onGoToRecap, lastRunWorkflowName }: I
 
         <div>
           <h2 className="text-2xl font-semibold text-foreground">No Active Workflow</h2>
-          <p className="mt-2 text-muted-foreground">Start a workflow from the Execute page</p>
+          <p className="mt-2 text-muted-foreground">Run a workflow to get started</p>
         </div>
 
         <div className="flex flex-col gap-3">
-          <Button size="lg" onClick={onGoToExecute} className="bg-primary hover:bg-primary/90">
-            Go to Execute
-            <ArrowRight className="ml-2 h-5 w-5" />
-          </Button>
+          {/* Run Last Workflow button - shown when there's a last workflow */}
+          {lastRunWorkflowId && onRunLastWorkflow && (
+            <Button
+              size="lg"
+              onClick={onRunLastWorkflow}
+              disabled={isRunningLastWorkflow}
+              className="bg-green-600 hover:bg-green-700 text-white"
+              data-ui-id="button-run-last-workflow"
+            >
+              {isRunningLastWorkflow ? (
+                <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+              ) : (
+                <Play className="mr-2 h-5 w-5" />
+              )}
+              {isRunningLastWorkflow ? "Starting..." : "Run Last Workflow"}
+              {lastRunWorkflowName && (
+                <span className="ml-2 text-sm opacity-90">({lastRunWorkflowName})</span>
+              )}
+            </Button>
+          )}
 
           {onGoToRecap && (
             <Button

@@ -1,5 +1,5 @@
 -- SQLite Schema for qontinui-runner
--- Version: 48
+-- Version: 53
 --
 -- This schema provides persistent storage for task runs, settings,
 -- prompts, and scheduler state.
@@ -34,6 +34,7 @@
 -- Version 43 adds health_check_urls to unified_workflows for user-configurable health check URLs.
 -- Version 44 adds error monitoring system (log_sources, error_events tables with FTS).
 -- Version 45 adds bridge_id to task_runs for multi-bridge support.
+-- Version 53 adds preflight_check_enabled to unified_workflows for automatic pre-flight environment checks.
 
 -- Schema version tracking
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -809,6 +810,9 @@ CREATE TABLE IF NOT EXISTS unified_workflows (
     -- Health check configuration
     health_check_enabled INTEGER DEFAULT 1,  -- 1 = enabled (default), 0 = disabled
     health_check_urls TEXT DEFAULT '[]',  -- JSON array of { name, url, expected_status, timeout_seconds, is_critical }
+
+    -- Pre-flight check configuration
+    preflight_check_enabled INTEGER DEFAULT 1,  -- 1 = enabled (default), 0 = disabled
 
     -- Timestamps
     created_at TEXT NOT NULL,

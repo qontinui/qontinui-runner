@@ -266,6 +266,7 @@ mod tests {
             log_watch_enabled: true,
             health_check_enabled: true,
             health_check_urls: vec![],
+            preflight_check_enabled: true,
             targeted_error_ids: vec![],
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),

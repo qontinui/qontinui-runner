@@ -136,11 +136,13 @@ config = StateBoundaryConfig(
 ```
 
 **Pros:**
+
 - Automatically determines number of states
 - Handles noise and outliers
 - No need to specify cluster count
 
 **Cons:**
+
 - Sensitive to parameter tuning
 - May create too many small clusters
 
@@ -156,11 +158,13 @@ config = StateBoundaryConfig(
 ```
 
 **Pros:**
+
 - Creates natural hierarchy of states
 - Deterministic results
 - Good for nested UI states
 
 **Cons:**
+
 - Slower than other methods
 - Requires distance threshold tuning
 
@@ -176,11 +180,13 @@ config = StateBoundaryConfig(
 ```
 
 **Pros:**
+
 - Fast and scalable
 - Consistent cluster sizes
 - Works well with auto-detection
 
 **Cons:**
+
 - Requires knowing/estimating state count
 - Sensitive to initialization
 
@@ -295,21 +301,26 @@ python analysis/example_state_boundary.py
 #### Methods
 
 **`__init__(config: Optional[StateBoundaryConfig] = None)`**
+
 - Initialize detector with optional configuration
 
 **`detect_states(frames: List[Frame]) -> List[DetectedState]`**
+
 - Main state detection method
 - Returns list of unique states
 
 **`identify_transitions(frames: List[Frame], events: List[InputEvent]) -> List[TransitionPoint]`**
+
 - Detect state transitions
 - Correlate with input events
 
 **`compute_similarity(frame1: Frame, frame2: Frame) -> float`**
+
 - Compute SSIM between two frames
 - Returns similarity score (0.0-1.0)
 
 **`compute_perceptual_hash(frame: Frame) -> str`**
+
 - Compute perceptual hash
 - Returns hash string
 

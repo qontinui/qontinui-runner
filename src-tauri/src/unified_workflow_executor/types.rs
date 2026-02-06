@@ -38,15 +38,26 @@ pub struct LoopResult {
     pub critical_failure: bool,
     /// Whether the loop was stopped externally (via stop_ai_analysis endpoint)
     pub was_stopped: bool,
+    /// Whether the AI signaled that errors are unfixable (via [UNFIXABLE_ERRORS] marker)
+    #[serde(default)]
+    pub unfixable_errors: bool,
     /// All iteration results
     pub iteration_results: Vec<IterationResult>,
 }
 
 impl LoopResult {
     /// Check if the workflow should proceed to completion phase.
-    /// Only proceeds if verification passed (not max_iterations, critical failure, or stopped).
+    /// Proceeds if:
+    /// - Verification passed (normal success path)
+    /// - AI signaled unfixable errors (graceful exit path)
+    ///   Does NOT proceed if:
+    /// - Critical failure occurred
+    /// - User stopped the workflow
+    /// - Max iterations reached without unfixable signal
     pub fn should_run_completion(&self) -> bool {
-        self.verification_passed && !self.critical_failure && !self.was_stopped
+        !self.critical_failure
+            && !self.was_stopped
+            && (self.verification_passed || self.unfixable_errors)
     }
 
     /// Get a human-readable summary of the loop result.
@@ -56,6 +67,11 @@ impl LoopResult {
         } else if self.verification_passed {
             format!(
                 "Verification PASSED after {} iteration(s)",
+                self.iterations_run
+            )
+        } else if self.unfixable_errors {
+            format!(
+                "AI determined errors UNFIXABLE after {} iteration(s) - proceeding to completion",
                 self.iterations_run
             )
         } else if self.critical_failure {
@@ -95,6 +111,11 @@ pub struct LoopConfig {
     pub targeted_error_ids: Vec<i64>,
     /// Starting iteration for resumed workflows (0 = start fresh, N = resume from iteration N)
     pub starting_iteration: u32,
+    /// Run agentic phase before verification on first iteration.
+    /// This is useful for error-fix workflows where we want the AI to attempt
+    /// a fix before verification runs (since verification may pass immediately
+    /// if it only checks current state, not whether fixes were applied).
+    pub run_agentic_first: bool,
 }
 
 /// Phase of workflow execution.
@@ -140,7 +161,8 @@ impl AgenticOutcome {
         match self {
             AgenticOutcome::Success { output } => Some(output),
             AgenticOutcome::Failed { output, .. } => Some(output),
-            _ => None,
+            AgenticOutcome::Error { error } => Some(error),
+            AgenticOutcome::Skipped => None,
         }
     }
 }

@@ -539,8 +539,8 @@ fn repair_truncated_json(json: &str) -> String {
 
     // Remove trailing comma if present
     let trimmed = result.trim_end();
-    if trimmed.ends_with(',') {
-        result = trimmed[..trimmed.len() - 1].to_string();
+    if let Some(stripped) = trimmed.strip_suffix(',') {
+        result = stripped.to_string();
     }
 
     // Close open brackets and braces (in reverse order of likely nesting)

@@ -147,6 +147,11 @@ export const STEP_ICON_CONFIG: Record<string, StepIconConfig> = {
     bgClass: "bg-cyan-500/10",
     textClass: "text-cyan-400",
   },
+  error_resolved: {
+    icon: CheckCircle,
+    bgClass: "bg-green-500/10",
+    textClass: "text-green-400",
+  },
   check_group: {
     icon: CheckCircle,
     bgClass: "bg-cyan-500/10",

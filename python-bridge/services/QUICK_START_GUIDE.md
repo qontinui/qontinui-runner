@@ -23,6 +23,7 @@ captures/session1/
 ```
 
 **Events JSON format:**
+
 ```json
 {
   "events": [
@@ -40,6 +41,7 @@ captures/session1/
 ### 2. Run the Service
 
 **Command line:**
+
 ```bash
 python3 state_detection_service.py \
     ./captures/session1 \
@@ -50,6 +52,7 @@ python3 state_detection_service.py \
 > **Note:** Use `python3` (not `python`) to ensure Python 3.x is used.
 
 **Python API:**
+
 ```python
 from state_detection_service import LocalStateDetectionService
 from pathlib import Path
@@ -65,14 +68,15 @@ print(f"Detected {result['num_states']} states")
 ```
 
 **TypeScript (qontinui-runner):**
+
 ```typescript
-import { StateDetectionServiceClient } from './typescript_integration_example';
+import { StateDetectionServiceClient } from "./typescript_integration_example";
 
 const client = new StateDetectionServiceClient();
 const result = await client.detectStates(
-  './captures/session1',
-  './captures/session1/events.json',
-  './output/states.json'
+  "./captures/session1",
+  "./captures/session1/events.json",
+  "./output/states.json",
 );
 
 console.log(`Detected ${result.num_states} states`);
@@ -109,19 +113,25 @@ This creates sample data and tests the full pipeline.
 ## Common Issues
 
 ### Import Error
+
 ```
 ImportError: No module named 'qontinui'
 ```
+
 **Fix:** Install qontinui: `pip install -e /path/to/qontinui`
 
 ### No Screenshots Found
+
 ```
 ValueError: No PNG files found
 ```
+
 **Fix:** Ensure screenshots are PNG format and in the correct directory
 
 ### Timestamp Parsing
+
 If screenshots aren't matched correctly, verify:
+
 - Filenames: `screenshot_1234567890000.png` (timestamp in milliseconds)
 - Events: `"timestamp": 1234567890.0` (timestamp in seconds)
 

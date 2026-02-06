@@ -339,7 +339,7 @@ pub fn execute_python_script(test_def: &TestDefinition) -> TestExecutionResult {
         .config
         .get("api_request_config")
         .and_then(|v| serde_json::from_value::<ApiRequestConfig>(v.clone()).ok())
-        .map(|api_config| {
+        .and_then(|api_config| {
             info!(
                 "Executing API request before Python script: {} {}",
                 api_config.method, api_config.url
@@ -356,8 +356,7 @@ pub fn execute_python_script(test_def: &TestDefinition) -> TestExecutionResult {
                     None
                 }
             }
-        })
-        .flatten();
+        });
 
     // Create temp directory for scripts
     let temp_dir = std::env::temp_dir().join("qontinui-verification");

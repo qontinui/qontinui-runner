@@ -88,7 +88,7 @@ def test_basic_recording():
         frame_count = (
             len(service._current_session.frame_timestamps) if service._current_session else 0
         )
-        print(f"  {i+1}s elapsed, {frame_count} frames captured")
+        print(f"  {i + 1}s elapsed, {frame_count} frames captured")
 
     # Stop recording
     print("\nStopping recording...")

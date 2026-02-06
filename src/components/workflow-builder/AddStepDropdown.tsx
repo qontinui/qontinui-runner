@@ -378,7 +378,6 @@ export function AddStepDropdown({
           phase: phase as "setup" | "verification" | "completion",
           name: STEP_TYPES[phase].find((s) => s.type === stepType)?.label || "New Test",
           test_type: testTypeMap[stepType] || "custom_command",
-          is_critical: true,
         };
         break;
       }
@@ -404,7 +403,6 @@ export function AddStepDropdown({
           name: STEP_TYPES[phase].find((s) => s.type === stepType)?.label || "New Check",
           check_type: checkTypeMap[stepType] || "custom_command",
           auto_fix: checkTypeMap[stepType] === "format", // Default formatters to auto-fix
-          is_blocking: true,
         };
         break;
       }
@@ -431,7 +429,6 @@ export function AddStepDropdown({
           phase: phase as "setup" | "verification" | "agentic" | "completion",
           name: promptNames[phase] || "Prompt",
           content: "",
-          is_blocking: phase === "verification" ? true : undefined,
         };
         break;
       }

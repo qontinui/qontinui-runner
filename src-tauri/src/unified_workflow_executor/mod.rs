@@ -34,6 +34,9 @@
 //!     workflow_name: "My Workflow".to_string(),
 //!     workflow_id: "wf-123".to_string(),
 //!     execution_id: "exec-456".to_string(),
+//!     targeted_error_ids: vec![],
+//!     starting_iteration: 0,
+//!     run_agentic_first: false, // Set to true for error-fix workflows
 //! };
 //!
 //! let result = controller.run(

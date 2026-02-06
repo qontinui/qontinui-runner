@@ -510,6 +510,13 @@ export interface UseExternalUIBridgeReturn {
   enablePicker: () => Promise<void>;
   disablePicker: () => void;
 
+  // Spec discovery
+  getSpecs: () => Promise<
+    CommandResult<{
+      specs: Array<{ specId: string; config: unknown }>;
+    }>
+  >;
+
   // Raw API access (for Postman-like panel)
   sendCommand: <T = unknown>(
     action: string,
@@ -1672,6 +1679,20 @@ export function useExternalUIBridge(
     }
   }, [exportCaptureSession]);
 
+  /**
+   * Get specs from the connected page's SpecStore
+   */
+  const getSpecs = useCallback(async () => {
+    if (connectionStatus !== "connected") {
+      return {
+        success: false,
+        error: "Not connected to a browser tab",
+      } as CommandResult<{ specs: Array<{ specId: string; config: unknown }> }>;
+    }
+
+    return sendCommand<{ specs: Array<{ specId: string; config: unknown }> }>("getSpecs");
+  }, [connectionStatus, sendCommand]);
+
   return {
     // Connection state
     connectionStatus,
@@ -1718,6 +1739,9 @@ export function useExternalUIBridge(
     highlightElement,
     enablePicker,
     disablePicker,
+
+    // Spec discovery
+    getSpecs,
 
     // Raw API access
     sendCommand,

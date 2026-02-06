@@ -15,7 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::info;
 
 use crate::step_executor::{ExecutionResult, ExecutionStepConfig, LogSourceConfig};
@@ -1392,7 +1392,7 @@ impl IterationBundle {
 
 impl IterationBundle {
     /// Save the bundle to a JSON file
-    pub fn save_to_file(&self, base_dir: &PathBuf) -> Result<PathBuf, String> {
+    pub fn save_to_file(&self, base_dir: &Path) -> Result<PathBuf, String> {
         let dir = base_dir.join("iterations").join(&self.task_run_id);
         std::fs::create_dir_all(&dir)
             .map_err(|e| format!("Failed to create iteration directory: {}", e))?;

@@ -251,11 +251,6 @@ export function StepItem({
               Locked
             </span>
           )}
-          {step.type === "test" && step.is_critical && (
-            <span className="text-xs px-1.5 py-0.5 rounded bg-red-500/20 text-red-400">
-              Critical
-            </span>
-          )}
           {showWarning && (
             <span title="Needs configuration">
               <AlertCircle className="w-4 h-4 text-yellow-500" />

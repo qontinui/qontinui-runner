@@ -19,14 +19,14 @@ Built with Tauri (Rust) + React (TypeScript) for a native, performant desktop ex
 
 Qontinui Runner includes advanced agentic capabilities for robust AI-assisted automation:
 
-| Feature | Description |
-|---------|-------------|
-| [Memory Compression](docs/features/memory-compression.md) | Prevents context overflow by compressing historical data |
-| [Retry with Feedback](docs/features/retry-feedback.md) | Recovers from transient failures with error context injection |
-| [Task Routing](docs/features/task-routing.md) | Routes tasks to appropriate AI models by complexity |
-| [Context Propagation](docs/features/context-propagation.md) | Passes data between execution steps with expression syntax |
-| [Lifecycle Hooks](docs/features/lifecycle-hooks.md) | Triggers custom actions at execution milestones |
-| [Accessibility Explorer](docs/features/accessibility-explorer.md) | Captures and interacts with accessibility trees |
+| Feature                                                           | Description                                                   |
+| ----------------------------------------------------------------- | ------------------------------------------------------------- |
+| [Memory Compression](docs/features/memory-compression.md)         | Prevents context overflow by compressing historical data      |
+| [Retry with Feedback](docs/features/retry-feedback.md)            | Recovers from transient failures with error context injection |
+| [Task Routing](docs/features/task-routing.md)                     | Routes tasks to appropriate AI models by complexity           |
+| [Context Propagation](docs/features/context-propagation.md)       | Passes data between execution steps with expression syntax    |
+| [Lifecycle Hooks](docs/features/lifecycle-hooks.md)               | Triggers custom actions at execution milestones               |
+| [Accessibility Explorer](docs/features/accessibility-explorer.md) | Captures and interacts with accessibility trees               |
 
 See [Agentic Features Overview](docs/features/agentic-features.md) for details.
 
@@ -34,11 +34,11 @@ See [Agentic Features Overview](docs/features/agentic-features.md) for details.
 
 Advanced features for workflow design, debugging, and optimization:
 
-| Feature | Description |
-|---------|-------------|
+| Feature                                          | Description                                                    |
+| ------------------------------------------------ | -------------------------------------------------------------- |
 | [Learning Dashboard](docs/LEARNING_DASHBOARD.md) | Track AI learning patterns, strategy performance, and insights |
-| [Flow Designer](docs/FLOW_DESIGNER.md) | Visual editor for deterministic, step-by-step workflows |
-| [Checkpoint Browser](docs/CHECKPOINT_BROWSER.md) | Time-travel debugging with replay functionality |
+| [Flow Designer](docs/FLOW_DESIGNER.md)           | Visual editor for deterministic, step-by-step workflows        |
+| [Checkpoint Browser](docs/CHECKPOINT_BROWSER.md) | Time-travel debugging with replay functionality                |
 
 See [Features Overview](docs/FEATURES.md) for details and [API Reference](docs/API_REFERENCE.md) for complete API documentation.
 
@@ -46,14 +46,15 @@ See [Features Overview](docs/FEATURES.md) for details and [API Reference](docs/A
 
 AWAS (AI Web Action Standard) enables AI-driven web automation through standardized action manifests:
 
-| Feature | Description |
-|---------|-------------|
-| [AWAS Builder](docs/features/awas-builder.md) | Discover, configure, and test AWAS actions |
-| AWAS Steps | Five step types for workflows (discover, execute, check support, list, extract) |
-| Manifest Discovery | Automatic detection of `/.well-known/ai-actions.json` |
-| Action Execution | Execute AWAS actions with typed parameters |
+| Feature                                       | Description                                                                     |
+| --------------------------------------------- | ------------------------------------------------------------------------------- |
+| [AWAS Builder](docs/features/awas-builder.md) | Discover, configure, and test AWAS actions                                      |
+| AWAS Steps                                    | Five step types for workflows (discover, execute, check support, list, extract) |
+| Manifest Discovery                            | Automatic detection of `/.well-known/ai-actions.json`                           |
+| Action Execution                              | Execute AWAS actions with typed parameters                                      |
 
 **Benefits over vision-based automation:**
+
 - 10-100x faster execution
 - No visual template maintenance
 - Structured input/output validation
@@ -70,10 +71,12 @@ See the [AWAS Builder Guide](docs/features/awas-builder.md) for usage details.
 #### Windows
 
 Download and run the MSI installer:
-- **[Qontinui Runner v0.1.0 (MSI)](https://github.com/qontinui/qontinui-runner/releases/download/v0.1.0/Qontinui.Runner_0.1.0_x64_en-US.msi)** *(Recommended)*
-- **[Qontinui Runner v0.1.0 (EXE)](https://github.com/qontinui/qontinui-runner/releases/download/v0.1.0/Qontinui.Runner_0.1.0_x64-setup.exe)** *(Alternative)*
+
+- **[Qontinui Runner v0.1.0 (MSI)](https://github.com/qontinui/qontinui-runner/releases/download/v0.1.0/Qontinui.Runner_0.1.0_x64_en-US.msi)** _(Recommended)_
+- **[Qontinui Runner v0.1.0 (EXE)](https://github.com/qontinui/qontinui-runner/releases/download/v0.1.0/Qontinui.Runner_0.1.0_x64-setup.exe)** _(Alternative)_
 
 **⚠️ Windows SmartScreen Warning:** You'll see a "Windows protected your PC" warning because the installer isn't code-signed. This is normal for open-source projects. To install:
+
 1. Click "More info"
 2. Click "Run anyway"
 
@@ -170,7 +173,6 @@ npm run tauri dev
 
 2. **Start Python Executor**
    - Click "Start Executor" button
-
 
 3. **Load Configuration**
    - Click "Load Config"

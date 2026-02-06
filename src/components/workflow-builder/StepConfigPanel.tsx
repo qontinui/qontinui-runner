@@ -28,6 +28,7 @@ import type {
   ApiRequestStep,
   McpCallStep,
   CheckType,
+  GateStep,
 } from "../../types/unified-workflow";
 import { GUI_ACTION_TYPES, STEP_TYPES } from "../../types";
 import { CHECK_TOOLS, CHECK_TYPE_INFO } from "../check-builder/types";
@@ -583,19 +584,6 @@ function TestConfig({
         </>
       )}
 
-      <div className="flex items-center gap-2">
-        <input
-          type="checkbox"
-          id="is_critical"
-          checked={step.is_critical ?? true}
-          onChange={(e) => onUpdate({ is_critical: e.target.checked })}
-          className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
-          data-ui-id="workflow-builder-step-config-test-is-critical-checkbox"
-        />
-        <label htmlFor="is_critical" className="text-sm text-zinc-300">
-          Critical test (fails workflow on failure)
-        </label>
-      </div>
     </div>
   );
 }
@@ -734,21 +722,6 @@ function CheckConfig({
           </label>
         </div>
       )}
-
-      {/* Blocking toggle */}
-      <div className="flex items-center gap-2">
-        <input
-          type="checkbox"
-          id="is_blocking"
-          checked={step.is_blocking ?? true}
-          onChange={(e) => onUpdate({ is_blocking: e.target.checked })}
-          className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
-          data-ui-id="workflow-builder-step-config-check-is-blocking-checkbox"
-        />
-        <label htmlFor="is_blocking" className="text-sm text-zinc-300">
-          Blocking (fails workflow on check failure)
-        </label>
-      </div>
 
       {/* Timeout */}
       <div>
@@ -1405,6 +1378,99 @@ function AwasExtractElementsConfig({
 }
 
 // =============================================================================
+// Gate Step Config
+// =============================================================================
+
+function GateConfig({
+  step,
+  onUpdate,
+  verificationSteps,
+}: {
+  step: UnifiedStep & { type: "gate" };
+  onUpdate: (updates: Partial<GateStep>) => void;
+  verificationSteps: UnifiedStep[];
+}) {
+  const requiredSteps = step.required_steps ?? [];
+  // Available steps = all non-gate verification steps
+  const availableSteps = verificationSteps.filter(
+    (s) => s.type !== "gate" && s.id !== step.id,
+  );
+
+  const toggleStep = (stepName: string) => {
+    const updated = requiredSteps.includes(stepName)
+      ? requiredSteps.filter((id) => id !== stepName)
+      : [...requiredSteps, stepName];
+    onUpdate({ required_steps: updated });
+  };
+
+  return (
+    <div className="space-y-4">
+      {/* Description */}
+      <div>
+        <label className="block text-sm font-medium text-zinc-400 mb-1">Description</label>
+        <input
+          type="text"
+          value={step.description ?? ""}
+          onChange={(e) => onUpdate({ description: e.target.value || undefined })}
+          placeholder="What this gate controls..."
+          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+          data-ui-id="workflow-builder-step-config-gate-description-input"
+        />
+      </div>
+
+      {/* Required Steps */}
+      <div>
+        <label className="block text-sm font-medium text-zinc-400 mb-2">
+          Required Steps ({requiredSteps.length} selected)
+        </label>
+        <p className="text-xs text-zinc-500 mb-2">
+          All selected steps must pass for this gate to pass. Gate results control whether
+          the agentic loop triggers.
+        </p>
+        {availableSteps.length === 0 ? (
+          <p className="text-xs text-zinc-500 italic">
+            No verification steps available. Add test, check, or other verification steps first.
+          </p>
+        ) : (
+          <div className="space-y-1 max-h-48 overflow-y-auto border border-zinc-700 rounded-md p-2 bg-zinc-800/50">
+            {availableSteps.map((vs) => (
+              <label
+                key={vs.id}
+                className="flex items-center gap-2 p-1.5 rounded hover:bg-zinc-700/50 cursor-pointer"
+              >
+                <input
+                  type="checkbox"
+                  checked={requiredSteps.includes(vs.name)}
+                  onChange={() => toggleStep(vs.name)}
+                  className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
+                />
+                <span className="text-sm text-zinc-300">{vs.name}</span>
+                <span className="text-xs text-zinc-500 ml-auto">{vs.type}</span>
+              </label>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Stop on Failure */}
+      <div className="flex items-center gap-2">
+        <input
+          type="checkbox"
+          id="gate_stop_on_failure"
+          checked={step.stop_on_failure ?? false}
+          onChange={(e) => onUpdate({ stop_on_failure: e.target.checked })}
+          className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
+          data-ui-id="workflow-builder-step-config-gate-stop-on-failure-checkbox"
+        />
+        <label htmlFor="gate_stop_on_failure" className="text-sm text-zinc-300">
+          Stop on failure (skip remaining verification steps)
+        </label>
+      </div>
+    </div>
+  );
+}
+
+// =============================================================================
 // Main StepConfigPanel Component
 // =============================================================================
 
@@ -1481,6 +1547,8 @@ export function StepConfigPanel({ onClose }: StepConfigPanelProps) {
         return "AWAS List Actions";
       case "awas_extract_elements":
         return "AWAS Extract Elements";
+      case "gate":
+        return "Gate";
       default:
         return "Step";
     }
@@ -1577,6 +1645,13 @@ export function StepConfigPanel({ onClose }: StepConfigPanelProps) {
         )}
         {selectedStep.type === "awas_extract_elements" && (
           <AwasExtractElementsConfig step={selectedStep} onUpdate={handleUpdate} />
+        )}
+        {selectedStep.type === "gate" && (
+          <GateConfig
+            step={selectedStep}
+            onUpdate={handleUpdate}
+            verificationSteps={state.workflow.verification_steps}
+          />
         )}
       </div>
 

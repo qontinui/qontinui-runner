@@ -180,13 +180,13 @@ class EventTranslator:
 
         try:
             # PROMINENT DEBUG LOGGING - Verify callback is being called
-            print(f"\n{'='*80}", file=sys.stderr, flush=True)
+            print(f"\n{'=' * 80}", file=sys.stderr, flush=True)
             print(
                 "[EventTranslator] !!!!! MATCH_ATTEMPTED EVENT RECEIVED !!!!!",
                 file=sys.stderr,
                 flush=True,
             )
-            print(f"{'='*80}\n", file=sys.stderr, flush=True)
+            print(f"{'=' * 80}\n", file=sys.stderr, flush=True)
 
             # File-based debug logging (works even when stderr is disabled)
             import os

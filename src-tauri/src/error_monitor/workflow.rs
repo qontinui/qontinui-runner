@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::error_monitor::curator::{DebugContext, DebugContextCurator};
+use crate::error_monitor::curator::{CuratedError, DebugContext, DebugContextCurator};
 use crate::error_monitor::storage::ErrorEventStorage;
 use crate::error_monitor::types::{ErrorQuery, ErrorStatus};
 use rusqlite::Connection;
@@ -195,30 +195,109 @@ impl ErrorFixWorkflowGenerator {
         prompt.push_str("- Focus on fixing the root cause, not just the symptoms\n");
         prompt.push_str("- Make minimal changes necessary to fix each issue\n");
         prompt.push_str("- Preserve existing functionality\n");
-        prompt.push_str("- If an error cannot be fixed, document why\n");
+        prompt.push_str("- If an error cannot be fixed (e.g., infrastructure issue, missing external dependency, requires manual intervention), document why\n\n");
+
+        prompt.push_str("## Signaling Unfixable Errors\n\n");
+        prompt.push_str("If you determine that one or more errors CANNOT be fixed automatically, output the marker:\n\n");
+        prompt.push_str("```\n[UNFIXABLE_ERRORS]\n```\n\n");
+        prompt.push_str("This signals the system to exit the verification loop gracefully and proceed to the summary phase.\n");
+        prompt.push_str("Use this when:\n");
+        prompt.push_str("- The error requires external infrastructure changes (database migrations, server configuration)\n");
+        prompt.push_str("- The error is caused by a missing external service or dependency\n");
+        prompt.push_str("- The fix requires credentials or permissions you don't have\n");
+        prompt.push_str("- The error is a known limitation that needs architectural changes\n");
+        prompt.push_str("- Multiple attempts to fix have failed and you've identified the root cause as unfixable\n\n");
+        prompt.push_str("Before outputting [UNFIXABLE_ERRORS], provide a clear explanation of:\n");
+        prompt.push_str("1. Which errors are unfixable and why\n");
+        prompt.push_str("2. What would be needed to fix them (for human follow-up)\n");
+        prompt.push_str("3. Any partial fixes you were able to apply\n");
 
         prompt
     }
 
     /// Build verification criteria for the workflow.
     ///
-    /// Uses log_watch step type to check for errors in application logs.
-    /// The orchestrator will automatically prepend additional log_watch verification
-    /// when executing the workflow.
-    fn build_verification_criteria(&self, _context: &DebugContext) -> Vec<Value> {
+    /// Creates error-specific verification steps that check if each targeted error
+    /// is resolved. This provides precise verification that the AI actually fixed
+    /// the specific errors, rather than just checking if logs are clean.
+    fn build_verification_criteria(&self, context: &DebugContext) -> Vec<Value> {
         let mut criteria = Vec::new();
 
-        // Primary verification: check application logs for new errors
-        // Using "log_watch" step type which is registered in the handler registry
-        // and specifically designed for log-based error detection
-        criteria.push(json!({
-            "name": "Application Logs Clean",
-            "type": "log_watch",
-            "time_window_seconds": 60,
-            "error_patterns": ["(?i)(error|exception|traceback|failed|panic)"]
-        }));
+        // Create a verification step for each error to check if it's resolved
+        // Critical errors first (highest priority)
+        for error in &context.critical_errors {
+            criteria.push(self.build_error_check(error, "critical"));
+        }
+
+        // Regular errors
+        for error in &context.errors {
+            criteria.push(self.build_error_check(error, "error"));
+        }
+
+        // Warnings (if included)
+        if self.config.include_warnings {
+            for error in &context.warnings {
+                criteria.push(self.build_error_check(error, "warning"));
+            }
+        }
+
+        // If no specific errors, fall back to generic log_watch
+        if criteria.is_empty() {
+            criteria.push(json!({
+                "name": "Application Logs Clean",
+                "type": "log_watch",
+                "time_window_seconds": 60,
+                "error_patterns": ["(?i)(error|exception|traceback|failed|panic)"]
+            }));
+        }
 
         criteria
+    }
+
+    /// Build an error_resolved verification step for a specific error.
+    fn build_error_check(&self, error: &CuratedError, severity: &str) -> Value {
+        // Create a pattern from the error message
+        // Escape special characters but keep the core message
+        let pattern = self.create_error_pattern(&error.message);
+
+        // Create a descriptive name
+        let name = if let Some(ref error_type) = error.error_type {
+            format!("[{}] {} resolved", severity.to_uppercase(), error_type)
+        } else {
+            let short_msg = if error.message.len() > 40 {
+                format!("{}...", &error.message[..40])
+            } else {
+                error.message.clone()
+            };
+            format!("[{}] '{}' resolved", severity.to_uppercase(), short_msg)
+        };
+
+        json!({
+            "name": name,
+            "type": "error_resolved",
+            "error_id": error.id,
+            "error_pattern": pattern,
+            "error_source": error.source,
+            "time_window_seconds": 120  // Longer window to catch lingering errors
+        })
+    }
+
+    /// Create a pattern from an error message for matching.
+    ///
+    /// This extracts the key parts of the error message while being lenient
+    /// about variable parts (line numbers, timestamps, etc.).
+    fn create_error_pattern(&self, message: &str) -> String {
+        // Take the first line if multi-line
+        let first_line = message.lines().next().unwrap_or(message);
+
+        // Truncate very long messages
+        let pattern = if first_line.len() > 200 {
+            &first_line[..200]
+        } else {
+            first_line
+        };
+
+        pattern.to_string()
     }
 
     /// Generate a human-readable description of the workflow.
@@ -274,6 +353,19 @@ impl ErrorFixWorkflowGenerator {
 4. Document what you changed
 
 Focus on a minimal, targeted fix for this specific issue.
+
+## If the Error Cannot Be Fixed
+
+If you determine this error CANNOT be fixed automatically (e.g., requires infrastructure changes,
+missing dependencies, or manual intervention), output:
+
+```
+[UNFIXABLE_ERRORS]
+```
+
+Before doing so, explain:
+1. Why the error cannot be fixed automatically
+2. What would be needed to fix it (for human follow-up)
 "#,
             error.error_type.as_deref().unwrap_or("Unknown"),
             error.message,
@@ -295,6 +387,16 @@ Focus on a minimal, targeted fix for this specific issue.
                 .unwrap_or_default()
         );
 
+        // Create an error pattern from the message (first line, truncated if needed)
+        let error_pattern = {
+            let first_line = error.message.lines().next().unwrap_or(&error.message);
+            if first_line.len() > 200 {
+                first_line[..200].to_string()
+            } else {
+                first_line.to_string()
+            }
+        };
+
         let workflow = json!({
             "name": format!("Fix: {}", error.error_type.as_deref().unwrap_or(&error.message[..30.min(error.message.len())])),
             "description": format!("Fix error: {}", error.message),
@@ -302,14 +404,15 @@ Focus on a minimal, targeted fix for this specific issue.
 
             "setup_steps": [],
 
-            // Verification uses log_watch to check for new errors in logs
-            // The targeted_error_ids field tracks which errors should be resolved
+            // Verification uses error_resolved to check if this specific error is fixed
             "verification_steps": [
                 {
-                    "name": "No New Errors",
-                    "type": "log_watch",
-                    "time_window_seconds": 30,
-                    "error_patterns": ["(?i)(error|exception|traceback|failed|panic)"]
+                    "name": format!("Error '{}' resolved", error.error_type.as_deref().unwrap_or("Unknown")),
+                    "type": "error_resolved",
+                    "error_id": error_id,
+                    "error_pattern": error_pattern,
+                    "error_source": error.log_source_name,
+                    "time_window_seconds": 120
                 }
             ],
 

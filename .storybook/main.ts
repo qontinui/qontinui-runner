@@ -4,10 +4,7 @@ import path from "path";
 
 const config: StorybookConfig = {
   stories: ["../src/**/*.mdx", "../src/**/*.stories.@(js|jsx|mjs|ts|tsx)"],
-  addons: [
-    "@storybook/addon-links",
-    "@storybook/addon-essentials",
-  ],
+  addons: ["@storybook/addon-links", "@storybook/addon-essentials"],
   framework: {
     name: "@storybook/react-vite",
     options: {},
@@ -20,7 +17,10 @@ const config: StorybookConfig = {
       resolve: {
         alias: {
           "@": path.resolve(__dirname, "../src"),
-          "@qontinui/schemas": path.resolve(__dirname, "../../qontinui-schemas/generated/typescript"),
+          "@qontinui/schemas": path.resolve(
+            __dirname,
+            "../../qontinui-schemas/generated/typescript",
+          ),
         },
       },
     });

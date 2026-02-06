@@ -144,9 +144,7 @@ class ScreenshotFormatter(AnalysisFormatter):
                         description=f"Label of detected element: {el.get('label', '')}",
                         field_type="string",
                         example_value=el.get("label"),
-                        suggested_assertions=[
-                            f"Assert element \"{el.get('label', '')}\" is present"
-                        ],
+                        suggested_assertions=[f'Assert element "{el.get("label", "")}" is present'],
                     )
                 )
 

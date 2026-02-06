@@ -10,6 +10,7 @@ use thiserror::Error;
 
 /// Errors that can occur during RAG find operation
 #[derive(Debug, Error)]
+#[allow(clippy::enum_variant_names)]
 pub enum FindError {
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),

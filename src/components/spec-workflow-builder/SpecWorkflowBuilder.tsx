@@ -5,8 +5,8 @@
  * Handles both snapshot (Tier 1) and navigation (Tier 2) specs.
  *
  * Flow:
- * 1. Load TestGeneratorOutput JSON
- * 2. Select which specs to include as verification steps
+ * 1. Load SpecConfig JSON (.spec.uibridge.json or legacy migrated)
+ * 2. Select which spec groups to include as verification steps
  * 3. Configure agentic prompt for failure recovery
  * 4. Preview and apply the generated workflow
  */
@@ -18,11 +18,11 @@ import { SpecSelector } from "./SpecSelector";
 import { NavigationGraphPreview } from "./NavigationGraphPreview";
 import { AgenticPromptEditor } from "./AgenticPromptEditor";
 import { WorkflowPreview } from "./WorkflowPreview";
-import type { TestGeneratorOutput } from "./types";
+import type { SpecConfig, GeneratorSpecMetadata } from "./types";
 import type {
   UnifiedWorkflow,
   ScriptStep,
-  TestStep,
+  SpecStep,
   PromptStep,
 } from "../../types/unified-workflow";
 import { createSummaryStep } from "../../types/unified-workflow";
@@ -35,23 +35,40 @@ interface SpecWorkflowBuilderProps {
 
 export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProps) {
   const [currentStep, setCurrentStep] = useState<Step>("load");
-  const [loadedData, setLoadedData] = useState<TestGeneratorOutput | null>(null);
+  const [loadedData, setLoadedData] = useState<SpecConfig | null>(null);
   const [fileName, setFileName] = useState<string>("");
   const [selectedSpecIds, setSelectedSpecIds] = useState<Set<string>>(new Set());
   const [agenticPrompt, setAgenticPrompt] = useState("");
   const [maxIterations, setMaxIterations] = useState(3);
+  const [elementSource, setElementSource] = useState<"control" | "external">("control");
+
+  // Extract generator metadata from SpecConfig
+  const genMeta = useMemo<GeneratorSpecMetadata | undefined>(
+    () => loadedData?.metadata as GeneratorSpecMetadata | undefined,
+    [loadedData],
+  );
+
+  const generatorType = genMeta?.generatorType;
+  const states = useMemo(() => genMeta?.states || [], [genMeta]);
+  const transitions = useMemo(() => genMeta?.transitions || [], [genMeta]);
 
   // Handle file load
-  const handleLoad = useCallback((output: TestGeneratorOutput) => {
-    setLoadedData(output);
-    setFileName(`${output.generatorType}-specs.json`);
-    // Auto-select all specs with critical assertions
+  const handleLoad = useCallback((config: SpecConfig) => {
+    setLoadedData(config);
+    const meta = config.metadata as GeneratorSpecMetadata | undefined;
+    const genType = meta?.generatorType || "spec";
+    setFileName(`${genType}.spec.uibridge.json`);
+    // Auto-select all groups with critical assertions
     const criticalIds = new Set(
-      output.testSpecifications
-        .filter((s) => s.assertions.some((a) => a.enabled && a.severity === "critical"))
-        .map((s) => s.id),
+      config.groups
+        .filter((g) => g.assertions.some((a) => a.enabled && a.severity === "critical"))
+        .map((g) => g.id),
     );
     setSelectedSpecIds(criticalIds);
+    // Determine element source: prefer explicit metadata, otherwise default to "control"
+    const rawMeta = config.metadata as Record<string, unknown> | undefined;
+    const explicitSource = rawMeta?.elementSource as "control" | "external" | undefined;
+    setElementSource(explicitSource || "control");
     setCurrentStep("select");
   }, []);
 
@@ -68,7 +85,7 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
   // Select all / deselect all
   const selectAll = useCallback(() => {
     if (!loadedData) return;
-    setSelectedSpecIds(new Set(loadedData.testSpecifications.map((s) => s.id)));
+    setSelectedSpecIds(new Set(loadedData.groups.map((g) => g.id)));
   }, [loadedData]);
 
   const deselectAll = useCallback(() => {
@@ -80,16 +97,15 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
     if (!loadedData) return null;
 
     const now = new Date().toISOString();
-    const isNavigation = loadedData.generatorType === "navigation";
+    const isNavigation = generatorType === "navigation";
     const workflowName = isNavigation ? "Navigation Verification" : "Snapshot Verification";
 
     // Setup steps
     const setupSteps: ScriptStep[] = [];
-    if (isNavigation && loadedData.transitions.length > 0) {
-      const pageUrl =
-        loadedData.explorationMetadata?.targetUrl ||
-        loadedData.states[0]?.pageUrl ||
-        "";
+    if (isNavigation && transitions.length > 0) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const explorationMeta = (genMeta as any)?.explorationMetadata;
+      const pageUrl = explorationMeta?.targetUrl || states[0]?.pageUrl || "";
       if (pageUrl) {
         setupSteps.push({
           id: crypto.randomUUID(),
@@ -103,32 +119,28 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
       }
     }
 
-    // Verification steps: each selected spec becomes a TestStep
-    const selectedSpecs = loadedData.testSpecifications.filter((s) =>
-      selectedSpecIds.has(s.id),
-    );
-    const verificationSteps: TestStep[] = selectedSpecs.map((spec) => {
-      const enabledAssertions = spec.assertions.filter((a) => a.enabled);
+    // Verification steps: each selected group becomes a SpecStep
+    const selectedGroups = loadedData.groups.filter((g) => selectedSpecIds.has(g.id));
+    const verificationSteps: SpecStep[] = selectedGroups.map((group) => {
+      const enabledAssertions = group.assertions.filter((a) => a.enabled);
       const assertionDescriptions = enabledAssertions
         .map((a) => `- ${a.description} [${a.severity}]`)
         .join("\n");
 
       return {
         id: crypto.randomUUID(),
-        type: "test",
+        type: "spec",
         phase: "verification",
-        name: spec.name,
-        test_type: "playwright",
-        is_critical: enabledAssertions.some((a) => a.severity === "critical"),
-        is_blocking: true,
-        description: `${spec.description}\n\nAssertions:\n${assertionDescriptions}`,
-        timeout_seconds: 30,
+        name: group.name,
+        spec_group: group,
+        element_source: elementSource,
+        description: `${group.description}\n\nAssertions:\n${assertionDescriptions}`,
       };
     });
 
     // Agentic steps
     const agenticSteps: PromptStep[] = [];
-    if (agenticPrompt || selectedSpecs.length > 0) {
+    if (agenticPrompt || selectedGroups.length > 0) {
       const defaultPrompt =
         agenticPrompt ||
         `Some verification steps failed. Analyze the failures and fix the issues. The test specifications describe what the application should look like and how it should behave.`;
@@ -147,18 +159,28 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
     return {
       id: crypto.randomUUID(),
       name: workflowName,
-      description: `Auto-generated from ${loadedData.generatorType} test specifications. ${selectedSpecs.length} specs selected with ${selectedSpecs.reduce((sum, s) => sum + s.assertions.filter((a) => a.enabled).length, 0)} total assertions.`,
+      description: `Auto-generated from ${generatorType || "spec"} specifications. ${selectedGroups.length} groups selected with ${selectedGroups.reduce((sum, g) => sum + g.assertions.filter((a) => a.enabled).length, 0)} total assertions.`,
       setup_steps: setupSteps,
       verification_steps: verificationSteps,
       agentic_steps: agenticSteps,
       completion_steps: completionSteps,
       max_iterations: maxIterations,
       category: "spec-generated",
-      tags: [loadedData.generatorType, "auto-generated"],
+      tags: [generatorType || "spec", "auto-generated"].filter(Boolean) as string[],
       created_at: now,
       modified_at: now,
     };
-  }, [loadedData, selectedSpecIds, agenticPrompt, maxIterations]);
+  }, [
+    loadedData,
+    selectedSpecIds,
+    agenticPrompt,
+    maxIterations,
+    elementSource,
+    generatorType,
+    genMeta,
+    states,
+    transitions,
+  ]);
 
   const steps: { id: Step; label: string; icon: React.ReactNode }[] = [
     { id: "load", label: "Load Specs", icon: <FileJson className="w-4 h-4" /> },
@@ -187,16 +209,18 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
               {step.icon}
               {step.label}
             </button>
-            {i < steps.length - 1 && (
-              <span className="text-neutral-600 mx-1">&rsaquo;</span>
-            )}
+            {i < steps.length - 1 && <span className="text-neutral-600 mx-1">&rsaquo;</span>}
           </div>
         ))}
 
         {loadedData && (
           <span className="text-xs text-neutral-500 ml-auto">
-            {loadedData.generatorType === "snapshot" ? "Snapshot" : "Navigation"} &middot;{" "}
-            {loadedData.testSpecifications.length} specs
+            {generatorType === "snapshot"
+              ? "Snapshot"
+              : generatorType === "navigation"
+                ? "Navigation"
+                : "Spec"}{" "}
+            &middot; {loadedData.groups.length} groups
           </span>
         )}
       </div>
@@ -210,17 +234,14 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
         {currentStep === "select" && loadedData && (
           <div className="flex flex-col h-full">
             {/* Navigation graph preview for Tier 2 */}
-            {loadedData.generatorType === "navigation" && (
+            {generatorType === "navigation" && states.length > 0 && (
               <div className="border-b border-neutral-700 max-h-[200px] overflow-auto">
-                <NavigationGraphPreview
-                  states={loadedData.states}
-                  transitions={loadedData.transitions}
-                />
+                <NavigationGraphPreview states={states} transitions={transitions} />
               </div>
             )}
             <div className="flex-1 min-h-0">
               <SpecSelector
-                specs={loadedData.testSpecifications}
+                specs={loadedData.groups}
                 selectedIds={selectedSpecIds}
                 onToggle={toggleSpec}
                 onSelectAll={selectAll}
@@ -233,7 +254,7 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
                 disabled={selectedSpecIds.size === 0}
                 className="px-4 py-2 text-sm font-medium bg-emerald-600 text-white rounded-md hover:bg-emerald-700 disabled:opacity-50 transition-colors"
               >
-                Continue with {selectedSpecIds.size} specs
+                Continue with {selectedSpecIds.size} groups
               </button>
             </div>
           </div>
@@ -247,6 +268,8 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
                 onPromptChange={setAgenticPrompt}
                 maxIterations={maxIterations}
                 onMaxIterationsChange={setMaxIterations}
+                elementSource={elementSource}
+                onElementSourceChange={setElementSource}
               />
             </div>
             <div className="px-4 py-3 border-t border-neutral-700 bg-neutral-800/50">
@@ -263,11 +286,7 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
         {currentStep === "preview" && workflow && (
           <WorkflowPreview
             workflow={workflow}
-            onApply={
-              onApplyWorkflow
-                ? () => onApplyWorkflow(workflow)
-                : undefined
-            }
+            onApply={onApplyWorkflow ? () => onApplyWorkflow(workflow) : undefined}
           />
         )}
       </div>

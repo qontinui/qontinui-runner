@@ -34,17 +34,14 @@ impl StepHandler for TestHandler {
         context: &HandlerContext,
     ) -> StepHandlerResult {
         let step_name = step.name.as_deref().unwrap_or("Test");
-        let is_critical = step.test_is_critical.unwrap_or(false);
 
         // Determine execution path
         if let Some(ref test_id) = step.test_id {
             // Path A: Execute test by ID (database lookup)
-            self.execute_test_by_id(test_id, step_name, is_critical, context)
-                .await
+            self.execute_test_by_id(test_id, step_name, context).await
         } else if step.test_type.as_deref() == Some("repository") {
             // Path B: Execute repository test (shell command)
-            self.execute_repository_test(step, step_name, is_critical, context)
-                .await
+            self.execute_repository_test(step, step_name, context).await
         } else {
             StepHandlerResult::failure("No test_id specified and not a repository test")
         }
@@ -57,20 +54,15 @@ impl TestHandler {
         &self,
         test_id: &str,
         step_name: &str,
-        is_critical: bool,
         context: &HandlerContext,
     ) -> StepHandlerResult {
-        info!(
-            "Executing test by ID: {} (critical: {})",
-            test_id, is_critical
-        );
+        info!("Executing test by ID: {}", test_id);
 
         // Emit action started event
         let action_id = format!("test-{}", uuid::Uuid::new_v4());
         let action_name = format!("TEST: {}", step_name);
         let metadata = json!({
             "test_id": test_id,
-            "is_critical": is_critical,
         });
 
         let (start_timestamp, sequence) = context
@@ -130,6 +122,7 @@ impl TestHandler {
             .and_then(|v| serde_json::from_value(v.clone()).ok());
 
         // Build TestDefinition
+        // Note: is_critical is false here; blocking behavior is controlled by gate steps
         let test_def = TestDefinition {
             id: verification_test.id.clone(),
             name: verification_test.name.clone(),
@@ -140,7 +133,7 @@ impl TestHandler {
             python_code: verification_test.python_code.clone(),
             repo_test_config,
             timeout_seconds: verification_test.timeout_seconds.unwrap_or(30),
-            is_critical,
+            is_critical: false,
             config: verification_test.config.clone(),
         };
 
@@ -204,10 +197,7 @@ impl TestHandler {
                 )
                 .await;
 
-            warn!(
-                "Test '{}' failed: {} (critical: {})",
-                step_name, error_msg, is_critical
-            );
+            warn!("Test '{}' failed: {}", step_name, error_msg);
 
             StepHandlerResult::failure_with_data(
                 error_msg,
@@ -229,7 +219,6 @@ impl TestHandler {
         &self,
         step: &ExecutionStepConfig,
         step_name: &str,
-        is_critical: bool,
         context: &HandlerContext,
     ) -> StepHandlerResult {
         // Get command - check both fields for backwards compatibility
@@ -258,7 +247,6 @@ impl TestHandler {
         let metadata = json!({
             "command": &command,
             "working_directory": &working_dir,
-            "is_critical": is_critical,
         });
 
         let (start_timestamp, sequence) = context
@@ -282,6 +270,7 @@ impl TestHandler {
         });
 
         // Build TestDefinition for repository test
+        // Note: is_critical is false here; blocking behavior is controlled by gate steps
         let test_def = TestDefinition {
             id: format!("repo-{}", uuid::Uuid::new_v4()),
             name: step_name.to_string(),
@@ -292,7 +281,7 @@ impl TestHandler {
             python_code: None,
             repo_test_config: Some(repo_config),
             timeout_seconds: step.timeout_seconds.unwrap_or(300) as u32,
-            is_critical,
+            is_critical: false,
             config: json!({}),
         };
 
@@ -350,10 +339,7 @@ impl TestHandler {
                 )
                 .await;
 
-            warn!(
-                "Repository test '{}' failed: {} (critical: {})",
-                step_name, error_msg, is_critical
-            );
+            warn!("Repository test '{}' failed: {}", step_name, error_msg);
 
             StepHandlerResult::failure_with_data(
                 error_msg,

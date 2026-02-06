@@ -74,12 +74,8 @@ export function WorkflowPreview({ workflow, onApply }: WorkflowPreviewProps) {
 
       {/* Settings summary */}
       <div className="flex gap-4 text-xs text-neutral-400">
-        {workflow.max_iterations && (
-          <span>Max iterations: {workflow.max_iterations}</span>
-        )}
-        {workflow.tags.length > 0 && (
-          <span>Tags: {workflow.tags.join(", ")}</span>
-        )}
+        {workflow.max_iterations && <span>Max iterations: {workflow.max_iterations}</span>}
+        {workflow.tags.length > 0 && <span>Tags: {workflow.tags.join(", ")}</span>}
       </div>
 
       <div className="space-y-2">

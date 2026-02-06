@@ -10,7 +10,9 @@
 use crate::check_executor::analyzers::common::file_walker::{walk_files, WalkConfig};
 use crate::check_executor::analyzers::common::issue_builder::IssueBuilder;
 use crate::check_executor::output_parser::ParsedOutput;
-use crate::check_executor::types::{CheckIssue, CheckStructuredOutput, CheckSummary, IssueSeverity};
+use crate::check_executor::types::{
+    CheckIssue, CheckStructuredOutput, CheckSummary, IssueSeverity,
+};
 use std::collections::HashMap;
 use std::path::Path;
 use tracing::{debug, warn};
@@ -191,10 +193,7 @@ pub fn analyze(working_dir: &str, min_coverage: f64) -> Result<ParsedOutput, Str
                     "typed_annotations".to_string(),
                     serde_json::json!(typed_annotations),
                 ),
-                (
-                    "min_coverage".to_string(),
-                    serde_json::json!(min_coverage),
-                ),
+                ("min_coverage".to_string(), serde_json::json!(min_coverage)),
             ]),
         },
     })
@@ -206,11 +205,7 @@ pub fn analyze_with_defaults(working_dir: &str) -> Result<ParsedOutput, String> 
 }
 
 /// Analyze a single file's AST for type coverage
-fn analyze_file_ast(
-    tree: &tree_sitter::Tree,
-    source: &str,
-    file_path: &str,
-) -> FileCoverageResult {
+fn analyze_file_ast(tree: &tree_sitter::Tree, source: &str, file_path: &str) -> FileCoverageResult {
     let mut result = FileCoverageResult::default();
     let root_node = tree.root_node();
 

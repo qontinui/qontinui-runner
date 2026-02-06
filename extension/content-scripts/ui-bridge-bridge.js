@@ -10,14 +10,20 @@
  */
 
 (function () {
-  'use strict';
+  "use strict";
 
   // Handle extension reinstall: remove old listeners and re-register
   // The old extension context is invalidated on reinstall, so we need fresh listeners
   if (window.__QONTINUI_UI_BRIDGE_BRIDGE_INITIALIZED__) {
     // Clean up old listeners if they exist
-    if (window.__qontinuiUIBridgeBridgeCleanup) {
-      window.__qontinuiUIBridgeBridgeCleanup();
+    // Wrapped in try-catch because after service worker inactivity, the old
+    // extension context is invalidated and chrome.runtime.* calls throw
+    try {
+      if (window.__qontinuiUIBridgeBridgeCleanup) {
+        window.__qontinuiUIBridgeBridgeCleanup();
+      }
+    } catch (e) {
+      console.debug("[Qontinui UI Bridge] Old context invalidated, skipping cleanup:", e.message);
     }
   }
   window.__QONTINUI_UI_BRIDGE_BRIDGE_INITIALIZED__ = true;
@@ -48,12 +54,12 @@
 
       window.postMessage(
         {
-          type: '__QONTINUI_UI_BRIDGE_REQUEST__',
+          type: "__QONTINUI_UI_BRIDGE_REQUEST__",
           requestId,
           action,
           params,
         },
-        '*'
+        "*",
       );
     });
   }
@@ -63,7 +69,7 @@
    */
   function handleInspectorResponse(event) {
     if (event.source !== window) return;
-    if (!event.data || event.data.type !== '__QONTINUI_UI_BRIDGE_RESPONSE__') return;
+    if (!event.data || event.data.type !== "__QONTINUI_UI_BRIDGE_RESPONSE__") return;
 
     const { requestId, success, data, error } = event.data;
     const pending = pendingRequests.get(requestId);
@@ -75,7 +81,7 @@
       if (success) {
         pending.resolve(data);
       } else {
-        pending.reject(new Error(error || 'Unknown error'));
+        pending.reject(new Error(error || "Unknown error"));
       }
     }
   }
@@ -90,30 +96,36 @@
     const { type, data } = event.data;
 
     // Handle different event types
-    if (type === '__QONTINUI_UI_BRIDGE_EVENT__') {
-      // Forward generic events to background script
-      chrome.runtime.sendMessage({
-        type: 'UI_BRIDGE_EVENT',
-        eventType: data.eventType,
-        data: data.data,
-        tabId: null,
-      });
-    } else if (type === '__QONTINUI_ELEMENT_SELECTED__') {
-      // Element was picked via the picker
-      chrome.runtime.sendMessage({
-        type: 'UI_BRIDGE_EVENT',
-        eventType: 'elementPicked',
-        data: data,
-        tabId: null,
-      });
-    } else if (type === '__QONTINUI_PICKER_CANCELLED__') {
-      // Picker was cancelled
-      chrome.runtime.sendMessage({
-        type: 'UI_BRIDGE_EVENT',
-        eventType: 'pickerCancelled',
-        data: {},
-        tabId: null,
-      });
+    // All chrome.runtime.sendMessage calls wrapped in try-catch because the
+    // extension context can be invalidated after service worker inactivity
+    try {
+      if (type === "__QONTINUI_UI_BRIDGE_EVENT__") {
+        // Forward generic events to background script
+        chrome.runtime.sendMessage({
+          type: "UI_BRIDGE_EVENT",
+          eventType: data.eventType,
+          data: data.data,
+          tabId: null,
+        });
+      } else if (type === "__QONTINUI_ELEMENT_SELECTED__") {
+        // Element was picked via the picker
+        chrome.runtime.sendMessage({
+          type: "UI_BRIDGE_EVENT",
+          eventType: "elementPicked",
+          data: data,
+          tabId: null,
+        });
+      } else if (type === "__QONTINUI_PICKER_CANCELLED__") {
+        // Picker was cancelled
+        chrome.runtime.sendMessage({
+          type: "UI_BRIDGE_EVENT",
+          eventType: "pickerCancelled",
+          data: {},
+          tabId: null,
+        });
+      }
+    } catch (_e) {
+      // Extension context invalidated — will be restored on next script injection
     }
   }
 
@@ -123,39 +135,52 @@
    */
   function handleRunnerCommand(event) {
     if (event.source !== window) return;
-    if (!event.data || event.data.type !== '__QONTINUI_RUNNER_COMMAND__') return;
+    if (!event.data || event.data.type !== "__QONTINUI_RUNNER_COMMAND__") return;
 
     const { requestId, action, params } = event.data;
 
     // Forward to background script which will call the runner API
-    chrome.runtime.sendMessage(
-      {
-        type: 'RUNNER_COMMAND_FROM_PAGE',
-        requestId,
-        action,
-        params,
-      },
-      (response) => {
-        // Send response back to the page
-        window.postMessage(
-          {
-            type: '__QONTINUI_RUNNER_RESPONSE__',
-            requestId,
-            success: response?.success ?? false,
-            data: response?.data,
-            error: response?.error,
-          },
-          '*'
-        );
-      }
-    );
+    try {
+      chrome.runtime.sendMessage(
+        {
+          type: "RUNNER_COMMAND_FROM_PAGE",
+          requestId,
+          action,
+          params,
+        },
+        (response) => {
+          // Send response back to the page
+          window.postMessage(
+            {
+              type: "__QONTINUI_RUNNER_RESPONSE__",
+              requestId,
+              success: response?.success ?? false,
+              data: response?.data,
+              error: response?.error,
+            },
+            "*",
+          );
+        },
+      );
+    } catch (_e) {
+      // Extension context invalidated — send error response back to page
+      window.postMessage(
+        {
+          type: "__QONTINUI_RUNNER_RESPONSE__",
+          requestId,
+          success: false,
+          error: "Extension context invalidated, please reload",
+        },
+        "*",
+      );
+    }
   }
 
   /**
    * Handle messages from popup/background scripts
    */
   function handleExtensionMessage(message, sender, sendResponse) {
-    if (!message || message.type !== 'UI_BRIDGE_COMMAND') {
+    if (!message || message.type !== "UI_BRIDGE_COMMAND") {
       return false;
     }
 
@@ -180,7 +205,7 @@
    */
   async function checkUIBridgeAvailable() {
     try {
-      const result = await sendToInspector('ping');
+      const result = await sendToInspector("ping");
       return result && result.available;
     } catch {
       return false;
@@ -191,78 +216,82 @@
    * Get registered elements from the page
    */
   async function getElements(options = {}) {
-    return sendToInspector('getElements', options);
+    return sendToInspector("getElements", options);
   }
 
   /**
    * Get state management snapshot
    */
   async function getStateSnapshot() {
-    return sendToInspector('getStateSnapshot');
+    return sendToInspector("getStateSnapshot");
   }
 
   /**
    * Execute an action on an element
    */
   async function executeAction(elementId, action, params = {}) {
-    return sendToInspector('executeAction', { elementId, action, params });
+    return sendToInspector("executeAction", { elementId, action, params });
   }
 
   /**
    * Enable element picker mode
    */
   async function enablePicker() {
-    return sendToInspector('enablePicker');
+    return sendToInspector("enablePicker");
   }
 
   /**
    * Disable element picker mode
    */
   async function disablePicker() {
-    return sendToInspector('disablePicker');
+    return sendToInspector("disablePicker");
   }
 
   /**
    * Show element overlays
    */
   async function showOverlays(elementIds) {
-    return sendToInspector('showOverlays', { elementIds });
+    return sendToInspector("showOverlays", { elementIds });
   }
 
   /**
    * Hide element overlays
    */
   async function hideOverlays() {
-    return sendToInspector('hideOverlays');
+    return sendToInspector("hideOverlays");
   }
 
   /**
    * Highlight a specific element
    */
   async function highlightElement(elementId) {
-    return sendToInspector('highlightElement', { elementId });
+    return sendToInspector("highlightElement", { elementId });
   }
 
   /**
    * Clear element highlight
    */
   async function clearHighlight() {
-    return sendToInspector('clearHighlight');
+    return sendToInspector("clearHighlight");
   }
 
   // Set up event listeners
-  window.addEventListener('message', handleInspectorResponse);
-  window.addEventListener('message', handleInspectorEvent);
-  window.addEventListener('message', handleRunnerCommand);
+  window.addEventListener("message", handleInspectorResponse);
+  window.addEventListener("message", handleInspectorEvent);
+  window.addEventListener("message", handleRunnerCommand);
   chrome.runtime.onMessage.addListener(handleExtensionMessage);
 
   // Store cleanup function for extension reinstall handling
-  window.__qontinuiUIBridgeBridgeCleanup = function() {
-    window.removeEventListener('message', handleInspectorResponse);
-    window.removeEventListener('message', handleInspectorEvent);
-    window.removeEventListener('message', handleRunnerCommand);
-    chrome.runtime.onMessage.removeListener(handleExtensionMessage);
-    console.log('[Qontinui UI Bridge] Old bridge listeners cleaned up for reinstall');
+  window.__qontinuiUIBridgeBridgeCleanup = function () {
+    window.removeEventListener("message", handleInspectorResponse);
+    window.removeEventListener("message", handleInspectorEvent);
+    window.removeEventListener("message", handleRunnerCommand);
+    try {
+      chrome.runtime.onMessage.removeListener(handleExtensionMessage);
+    } catch (_e) {
+      // Extension context may be invalidated after service worker inactivity
+    }
+    console.log("[Qontinui UI Bridge] Old bridge listeners cleaned up for reinstall");
   };
 
   // Expose bridge API for debugging (only in isolated world, not accessible from page)
@@ -281,9 +310,9 @@
 
   // Notify background script that bridge is ready
   chrome.runtime.sendMessage({
-    type: 'UI_BRIDGE_BRIDGE_READY',
+    type: "UI_BRIDGE_BRIDGE_READY",
     url: window.location.href,
   });
 
-  console.log('[Qontinui UI Bridge] Bridge script initialized (ISOLATED world)');
+  console.log("[Qontinui UI Bridge] Bridge script initialized (ISOLATED world)");
 })();

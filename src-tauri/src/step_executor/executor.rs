@@ -22,11 +22,11 @@
 //! All step types are implemented as separate handlers in the `handlers/` module.
 //! The `HandlerRegistry` maps step type strings to handler implementations.
 //!
-//! ## Step Categories (24 handlers)
+//! ## Step Categories (25 handlers)
 //!
 //! - **GUI** (7): workflow, workflow_ref, state, action, gui_action, screenshot, macro
 //! - **Shell/Script** (4): shell_command, shell, script, playwright
-//! - **Verification** (4): log_watch, check, check_group, test
+//! - **Verification** (5): log_watch, check, check_group, test, spec
 //! - **API/MCP** (2): api_request, mcp_call
 //! - **AWAS** (5): awas_discover, awas_execute, awas_check_support, awas_list_actions, awas_extract_elements
 //! - **Other** (1): prompt
@@ -362,6 +362,37 @@ pub struct ExecutionStepConfig {
     pub check_group_id: Option<String>,
 
     // ========================================================================
+    // UI Bridge Spec Step Fields
+    // ========================================================================
+    /// Spec: JSON spec group for UI Bridge spec verification (for "spec" step type)
+    #[serde(alias = "specGroup", alias = "spec_group")]
+    pub spec_group_json: Option<serde_json::Value>,
+
+    /// Spec: Element source - "control" (runner UI) or "external" (browser tab)
+    #[serde(alias = "specElementSource", alias = "element_source")]
+    pub spec_element_source: Option<String>,
+
+    /// Spec: Whether failure should stop remaining verification steps
+    #[serde(alias = "specStopOnFailure", alias = "stop_on_failure")]
+    pub spec_stop_on_failure: Option<bool>,
+
+    /// Spec: Pre-fetched external elements (injected at runtime to avoid HTTP self-call)
+    /// This field is populated by the workflow executor before passing to the step handler.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spec_prefetched_elements: Option<serde_json::Value>,
+
+    // ========================================================================
+    // Gate Step Fields
+    // ========================================================================
+    /// Gate: Step IDs that must all pass for this gate to pass
+    #[serde(alias = "gateRequiredSteps", alias = "required_steps")]
+    pub gate_required_steps: Option<Vec<String>>,
+
+    /// Gate: Whether to skip remaining verification steps when this gate fails
+    #[serde(alias = "gateStopOnFailure", alias = "gate_stop_on_failure", default)]
+    pub gate_stop_on_failure: Option<bool>,
+
+    // ========================================================================
     // Log Watch Step Fields
     // ========================================================================
     /// Log Watch: Log sources to watch (e.g., ["backend.log", "frontend.log"])
@@ -376,6 +407,21 @@ pub struct ExecutionStepConfig {
     /// Log Watch: Custom error patterns to match (in addition to defaults)
     #[serde(rename = "errorPatterns", alias = "error_patterns")]
     pub error_patterns: Option<Vec<String>>,
+
+    // ========================================================================
+    // Error Resolved Step Fields (for error-specific verification)
+    // ========================================================================
+    /// Error Resolved: ID of the specific error to check (from error_events table)
+    #[serde(rename = "errorId", alias = "error_id")]
+    pub error_id: Option<i64>,
+
+    /// Error Resolved: Error message pattern to check for (regex or literal)
+    #[serde(rename = "errorPattern", alias = "error_pattern")]
+    pub error_pattern: Option<String>,
+
+    /// Error Resolved: Specific log source where the error originated
+    #[serde(rename = "errorSource", alias = "error_source")]
+    pub error_source: Option<String>,
 }
 
 impl ExecutionStepConfig {
@@ -457,10 +503,22 @@ impl ExecutionStepConfig {
             macro_id: None,
             // Check group fields
             check_group_id: None,
+            // Spec fields
+            spec_group_json: None,
+            spec_element_source: None,
+            spec_stop_on_failure: None,
+            spec_prefetched_elements: None,
             // Log watch fields
             log_sources: None,
             time_window_seconds: None,
             error_patterns: None,
+            // Error resolved fields
+            error_id: None,
+            error_pattern: None,
+            error_source: None,
+            // Gate fields
+            gate_required_steps: None,
+            gate_stop_on_failure: None,
         }
     }
 
@@ -526,10 +584,22 @@ impl ExecutionStepConfig {
             macro_id: None,
             // Check group fields
             check_group_id: None,
+            // Spec fields
+            spec_group_json: None,
+            spec_element_source: None,
+            spec_stop_on_failure: None,
+            spec_prefetched_elements: None,
             // Log watch fields
             log_sources: None,
             time_window_seconds: None,
             error_patterns: None,
+            // Error resolved fields
+            error_id: None,
+            error_pattern: None,
+            error_source: None,
+            // Gate fields
+            gate_required_steps: None,
+            gate_stop_on_failure: None,
         }
     }
 
@@ -595,10 +665,22 @@ impl ExecutionStepConfig {
             macro_id: None,
             // Check group fields
             check_group_id: None,
+            // Spec fields
+            spec_group_json: None,
+            spec_element_source: None,
+            spec_stop_on_failure: None,
+            spec_prefetched_elements: None,
             // Log watch fields
             log_sources: None,
             time_window_seconds: None,
             error_patterns: None,
+            // Error resolved fields
+            error_id: None,
+            error_pattern: None,
+            error_source: None,
+            // Gate fields
+            gate_required_steps: None,
+            gate_stop_on_failure: None,
         }
     }
 
@@ -668,10 +750,22 @@ impl ExecutionStepConfig {
             macro_id: None,
             // Check group fields
             check_group_id: None,
+            // Spec fields
+            spec_group_json: None,
+            spec_element_source: None,
+            spec_stop_on_failure: None,
+            spec_prefetched_elements: None,
             // Log watch fields
             log_sources: None,
             time_window_seconds: None,
             error_patterns: None,
+            // Error resolved fields
+            error_id: None,
+            error_pattern: None,
+            error_source: None,
+            // Gate fields
+            gate_required_steps: None,
+            gate_stop_on_failure: None,
         }
     }
 
@@ -737,10 +831,22 @@ impl ExecutionStepConfig {
             macro_id: None,
             // Check group fields
             check_group_id: None,
+            // Spec fields
+            spec_group_json: None,
+            spec_element_source: None,
+            spec_stop_on_failure: None,
+            spec_prefetched_elements: None,
             // Log watch fields
             log_sources: None,
             time_window_seconds: None,
             error_patterns: None,
+            // Error resolved fields
+            error_id: None,
+            error_pattern: None,
+            error_source: None,
+            // Gate fields
+            gate_required_steps: None,
+            gate_stop_on_failure: None,
         }
     }
 
@@ -806,10 +912,22 @@ impl ExecutionStepConfig {
             macro_id: None,
             // Check group fields
             check_group_id: None,
+            // Spec fields
+            spec_group_json: None,
+            spec_element_source: None,
+            spec_stop_on_failure: None,
+            spec_prefetched_elements: None,
             // Log watch fields
             log_sources: None,
             time_window_seconds: None,
             error_patterns: None,
+            // Error resolved fields
+            error_id: None,
+            error_pattern: None,
+            error_source: None,
+            // Gate fields
+            gate_required_steps: None,
+            gate_stop_on_failure: None,
         }
     }
 
@@ -875,10 +993,22 @@ impl ExecutionStepConfig {
             macro_id: None,
             // Check group fields
             check_group_id: None,
+            // Spec fields
+            spec_group_json: None,
+            spec_element_source: None,
+            spec_stop_on_failure: None,
+            spec_prefetched_elements: None,
             // Log watch fields
             log_sources: None,
             time_window_seconds: None,
             error_patterns: None,
+            // Error resolved fields
+            error_id: None,
+            error_pattern: None,
+            error_source: None,
+            // Gate fields
+            gate_required_steps: None,
+            gate_stop_on_failure: None,
         }
     }
 
@@ -944,10 +1074,22 @@ impl ExecutionStepConfig {
             macro_id: None,
             // Check group fields
             check_group_id: None,
+            // Spec fields
+            spec_group_json: None,
+            spec_element_source: None,
+            spec_stop_on_failure: None,
+            spec_prefetched_elements: None,
             // Log watch fields
             log_sources: None,
             time_window_seconds: None,
             error_patterns: None,
+            // Error resolved fields
+            error_id: None,
+            error_pattern: None,
+            error_source: None,
+            // Gate fields
+            gate_required_steps: None,
+            gate_stop_on_failure: None,
         }
     }
 
@@ -1021,10 +1163,22 @@ impl ExecutionStepConfig {
             macro_id: None,
             // Check group fields
             check_group_id: None,
+            // Spec fields
+            spec_group_json: None,
+            spec_element_source: None,
+            spec_stop_on_failure: None,
+            spec_prefetched_elements: None,
             // Log watch fields
             log_sources: None,
             time_window_seconds: None,
             error_patterns: None,
+            // Error resolved fields
+            error_id: None,
+            error_pattern: None,
+            error_source: None,
+            // Gate fields
+            gate_required_steps: None,
+            gate_stop_on_failure: None,
         }
     }
 
@@ -1090,10 +1244,22 @@ impl ExecutionStepConfig {
             macro_id: Some(macro_id.to_string()),
             // Check group fields
             check_group_id: None,
+            // Spec fields
+            spec_group_json: None,
+            spec_element_source: None,
+            spec_stop_on_failure: None,
+            spec_prefetched_elements: None,
             // Log watch fields
             log_sources: None,
             time_window_seconds: None,
             error_patterns: None,
+            // Error resolved fields
+            error_id: None,
+            error_pattern: None,
+            error_source: None,
+            // Gate fields
+            gate_required_steps: None,
+            gate_stop_on_failure: None,
         }
     }
 
@@ -1127,6 +1293,43 @@ impl ExecutionStepConfig {
             get_default_log_source_names(),
             60,
         )
+    }
+
+    /// Create the default pre-flight environment check step.
+    ///
+    /// This creates a step that runs inline commands to verify:
+    /// - Disk space (minimum 5GB free)
+    /// - Node.js availability
+    /// - Git availability
+    ///
+    /// The check is platform-aware and uses inline commands (no external script required).
+    /// Exit codes: 0=all passed, non-zero=check failed
+    pub fn default_preflight_check() -> Self {
+        // Use inline commands instead of external script for portability
+        // Windows: Raw PowerShell script (check handler detects PowerShell syntax and runs directly)
+        // Unix: Use bash with && chained commands
+        let command = if cfg!(target_os = "windows") {
+            // Windows: Raw PowerShell script - DO NOT wrap with "powershell -Command"
+            // The check handler will detect PowerShell syntax (Get-, $var) and run via PowerShell
+            r#"$d = Get-PSDrive -Name ((Get-Location).Drive.Name) -ErrorAction SilentlyContinue; $freeGB = [math]::Round($d.Free / 1GB, 1); Write-Host "Disk: $freeGB GB free"; if ($freeGB -lt 5) { Write-Host '[FAIL] Low disk space'; exit 1 }; $nodeVer = node --version 2>$null; if ($nodeVer) { Write-Host "[OK] Node.js: $nodeVer" } else { Write-Host '[WARN] Node.js not found' }; $gitVer = git --version 2>$null; if ($gitVer) { Write-Host "[OK] $gitVer" } else { Write-Host '[WARN] Git not found' }; exit 0"#
+        } else {
+            // Unix: bash commands
+            r#"FREE_GB=$(($(df -k . | tail -1 | awk '{print $4}') / 1024 / 1024)); echo "Disk: ${FREE_GB}GB free"; if [ "$FREE_GB" -lt 5 ]; then echo "[FAIL] Low disk space"; exit 1; fi; node --version 2>/dev/null && echo "[OK] Node.js found" || echo "[WARN] Node.js not found"; git --version 2>/dev/null && echo "[OK] Git found" || echo "[WARN] Git not found"; exit 0"#
+        };
+
+        Self {
+            step_type: "check".to_string(),
+            name: Some("Pre-flight Environment Check".to_string()),
+            phase: Some("setup".to_string()),
+            check_type: Some("custom_command".to_string()),
+            check_command: Some(command.to_string()),
+            // Non-critical: environment warnings should not block workflow
+            // Only critical failures (exit 1) like low disk space will cause the step to fail
+            test_is_critical: Some(false),
+            // Only run on first iteration - environment doesn't change during workflow
+            run_on_subsequent_iterations: Some(false),
+            ..Default::default()
+        }
     }
 
     /// Create a health check step for verifying server availability.
@@ -1206,10 +1409,6 @@ pub struct VerificationStepDetails {
     pub step_id: String,
     /// Phase this step belongs to
     pub phase: String,
-    /// Whether this is a critical step (failure stops execution)
-    pub is_critical: bool,
-    /// Whether this is a blocking step (failure prevents agentic phase from continuing)
-    pub is_blocking: bool,
     /// Standard output from the step
     pub stdout: Option<String>,
     /// Standard error from the step
@@ -1341,6 +1540,23 @@ pub struct ExecutionResult {
     pub task_summary: Option<String>,
 }
 
+/// Result of evaluating a single gate step
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GateEvaluationResult {
+    /// Gate step name
+    pub gate_name: String,
+    /// Step IDs that the gate requires
+    pub required_step_ids: Vec<String>,
+    /// Step IDs that passed
+    pub passed_step_ids: Vec<String>,
+    /// Step IDs that failed
+    pub failed_step_ids: Vec<String>,
+    /// Step IDs that were not found in results
+    pub missing_step_ids: Vec<String>,
+    /// Whether the gate passed (all required steps passed)
+    pub passed: bool,
+}
+
 /// Result of running all verification_steps in a unified workflow
 ///
 /// This is returned by execute_verification_steps and used to:
@@ -1359,14 +1575,20 @@ pub struct VerificationPhaseResult {
     pub passed_steps: usize,
     /// Number of steps that failed
     pub failed_steps: usize,
-    /// Number of steps that were skipped (due to critical step failure)
+    /// Number of steps that were skipped (due to gate stop_on_failure)
     pub skipped_steps: usize,
     /// Total execution time in milliseconds
     pub total_duration_ms: u64,
     /// Individual step results
     pub step_results: Vec<StepExecutionResult>,
-    /// Whether a critical step failed (should stop execution)
+    /// Whether a critical gate failure occurred (stop_on_failure gate failed)
     pub critical_failure: bool,
+    /// Gate evaluation results (empty if no gate steps)
+    #[serde(default)]
+    pub gate_results: Vec<GateEvaluationResult>,
+    /// Whether evaluation was gate-based (true) or all-steps-based (false)
+    #[serde(default)]
+    pub gate_based_evaluation: bool,
 }
 
 impl VerificationPhaseResult {
@@ -1434,6 +1656,31 @@ impl VerificationPhaseResult {
                     }
                 }
                 context.push('\n');
+            }
+        }
+
+        // Gate results section
+        if !self.gate_results.is_empty() {
+            context.push_str("### Gate Results\n\n");
+            for gate in &self.gate_results {
+                let status = if gate.passed { "PASSED" } else { "FAILED" };
+                context.push_str(&format!("**{}: {}**\n", gate.gate_name, status));
+                if !gate.failed_step_ids.is_empty() {
+                    context.push_str(&format!(
+                        "  Failed steps: {}\n",
+                        gate.failed_step_ids.join(", ")
+                    ));
+                }
+                if !gate.missing_step_ids.is_empty() {
+                    context.push_str(&format!(
+                        "  Missing steps (not found): {}\n",
+                        gate.missing_step_ids.join(", ")
+                    ));
+                }
+            }
+            context.push('\n');
+            if self.gate_based_evaluation {
+                context.push_str("*Note: Only gated steps affect the agentic loop decision.*\n\n");
             }
         }
 
@@ -2157,10 +2404,22 @@ impl StepExecutor {
             macro_id: None,
             // Check group fields
             check_group_id: None,
+            // Spec fields
+            spec_group_json: None,
+            spec_element_source: None,
+            spec_stop_on_failure: None,
+            spec_prefetched_elements: None,
             // Log watch fields
             log_sources: None,
             time_window_seconds: None,
             error_patterns: None,
+            // Error resolved fields
+            error_id: None,
+            error_pattern: None,
+            error_source: None,
+            // Gate fields
+            gate_required_steps: None,
+            gate_stop_on_failure: None,
         })
     }
 
@@ -3193,7 +3452,7 @@ impl StepExecutor {
                 let timestamp = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
                 let action_id = format!("prompt-{}", sequence);
                 let step_name = step.name.clone().unwrap_or_else(|| "AI Prompt".to_string());
-                let prompt_text = step.prompt_content.clone().unwrap_or_else(String::new);
+                let prompt_text = step.prompt_content.clone().unwrap_or_default();
                 let prompt_preview = if prompt_text.len() > 100 {
                     format!("{}...", &prompt_text[..100])
                 } else {
@@ -3795,6 +4054,7 @@ impl StepExecutor {
         let mut failed_steps = 0;
         let mut skipped_steps = 0;
         let mut critical_failure = false;
+        let mut gate_results: Vec<GateEvaluationResult> = Vec::new();
 
         // Filter to only verification phase steps
         let verification_steps: Vec<_> = steps
@@ -3853,7 +4113,6 @@ impl StepExecutor {
                 .name
                 .clone()
                 .unwrap_or_else(|| format!("Step {}", index + 1));
-            let is_critical = step.test_is_critical.unwrap_or(false);
 
             // Execute based on step type
             let (success, error, verification_details) = match step.step_type.as_str() {
@@ -3868,8 +4127,6 @@ impl StepExecutor {
                                         .clone()
                                         .unwrap_or_else(|| format!("step-{}", index)),
                                     phase: "verification".to_string(),
-                                    is_critical,
-                                    is_blocking: is_critical,
                                     stdout: Some(test_result.output.clone()),
                                     stderr: None,
                                     assertions_passed: Some(test_result.assertions_passed),
@@ -3911,8 +4168,6 @@ impl StepExecutor {
                                         .clone()
                                         .unwrap_or_else(|| format!("step-{}", index)),
                                     phase: "verification".to_string(),
-                                    is_critical,
-                                    is_blocking: is_critical,
                                     stderr: Some(e),
                                     ..Default::default()
                                 }),
@@ -3931,8 +4186,6 @@ impl StepExecutor {
                             .clone()
                             .unwrap_or_else(|| format!("step-{}", index)),
                         phase: "verification".to_string(),
-                        is_critical,
-                        is_blocking: is_critical,
                         stdout: output, // Capture output for AI context
                         ..Default::default()
                     };
@@ -3950,8 +4203,6 @@ impl StepExecutor {
                             .clone()
                             .unwrap_or_else(|| format!("step-{}", index)),
                         phase: "verification".to_string(),
-                        is_critical,
-                        is_blocking: is_critical,
                         stdout: output, // Capture output for AI context
                         ..Default::default()
                     };
@@ -3969,8 +4220,6 @@ impl StepExecutor {
                             .clone()
                             .unwrap_or_else(|| format!("step-{}", index)),
                         phase: "verification".to_string(),
-                        is_critical,
-                        is_blocking: is_critical,
                         // Capture the detailed summary with all check results for AI context
                         stdout: summary,
                         // Include structured check results for UI display
@@ -3978,6 +4227,61 @@ impl StepExecutor {
                         ..Default::default()
                     };
                     (success, error, Some(details))
+                }
+                "gate" => {
+                    // Gate step: evaluate results of required steps
+                    let required_ids = step.gate_required_steps.clone().unwrap_or_default();
+                    let mut passed_ids = Vec::new();
+                    let mut failed_ids = Vec::new();
+                    let mut missing_ids = Vec::new();
+
+                    for req_id in &required_ids {
+                        // Look up the required step in accumulated results by matching step name
+                        // (step_id in VerificationStepDetails is set to step.name)
+                        let found = step_results.iter().find(|r| {
+                            r.step_name == *req_id
+                                || r.verification_details
+                                    .as_ref()
+                                    .is_some_and(|d| d.step_id == *req_id)
+                        });
+                        match found {
+                            Some(r) if r.success => passed_ids.push(req_id.clone()),
+                            Some(_) => failed_ids.push(req_id.clone()),
+                            None => missing_ids.push(req_id.clone()),
+                        }
+                    }
+
+                    let gate_passed = failed_ids.is_empty() && missing_ids.is_empty();
+                    let gate_result = GateEvaluationResult {
+                        gate_name: step_name.clone(),
+                        required_step_ids: required_ids.clone(),
+                        passed_step_ids: passed_ids,
+                        failed_step_ids: failed_ids.clone(),
+                        missing_step_ids: missing_ids.clone(),
+                        passed: gate_passed,
+                    };
+                    gate_results.push(gate_result);
+
+                    let error_msg = if gate_passed {
+                        None
+                    } else {
+                        let mut parts = Vec::new();
+                        if !failed_ids.is_empty() {
+                            parts.push(format!("failed: {}", failed_ids.join(", ")));
+                        }
+                        if !missing_ids.is_empty() {
+                            parts.push(format!("missing: {}", missing_ids.join(", ")));
+                        }
+                        Some(format!("Gate failed - {}", parts.join("; ")))
+                    };
+
+                    // If gate has stop_on_failure and it failed, set critical_failure
+                    if !gate_passed && step.gate_stop_on_failure.unwrap_or(false) {
+                        critical_failure = true;
+                        warn!("Gate '{}' failed with stop_on_failure - skipping remaining verification steps", step_name);
+                    }
+
+                    (gate_passed, error_msg, None)
                 }
                 _ => {
                     // For other step types, use the generic executor
@@ -3990,8 +4294,6 @@ impl StepExecutor {
                                 .clone()
                                 .unwrap_or_else(|| format!("step-{}", index)),
                             phase: "verification".to_string(),
-                            is_critical,
-                            is_blocking: is_critical,
                             stdout: output,
                             ..Default::default()
                         })
@@ -4018,11 +4320,7 @@ impl StepExecutor {
                     error.as_deref().unwrap_or("unknown error")
                 );
 
-                // Check for critical failure
-                if is_critical {
-                    critical_failure = true;
-                    warn!("Critical verification step failed - stopping verification phase");
-                }
+                // Note: critical_failure is now set by gate steps with stop_on_failure
             }
 
             let step_ended_at = chrono::Utc::now().to_rfc3339();
@@ -4105,7 +4403,16 @@ impl StepExecutor {
         }
 
         let total_duration_ms = start.elapsed().as_millis() as u64;
-        let all_passed = failed_steps == 0 && skipped_steps == 0;
+
+        // Determine all_passed:
+        // - If gate steps exist: only gate results matter (gate-based evaluation)
+        // - If no gate steps: all step failures matter (backward compat)
+        let has_gates = !gate_results.is_empty();
+        let all_passed = if has_gates {
+            gate_results.iter().all(|g| g.passed)
+        } else {
+            failed_steps == 0 && skipped_steps == 0
+        };
 
         let result = VerificationPhaseResult {
             iteration,
@@ -4117,6 +4424,8 @@ impl StepExecutor {
             total_duration_ms,
             step_results,
             critical_failure,
+            gate_results,
+            gate_based_evaluation: has_gates,
         };
 
         info!("{}", result.summary());
@@ -6139,7 +6448,7 @@ pub(crate) async fn collect_recent_log_errors(
         };
 
         let reader = BufReader::new(file);
-        let lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+        let lines: Vec<String> = reader.lines().map_while(|l| l.ok()).collect();
         let total_lines = lines.len();
 
         // Process lines, looking for errors
@@ -6155,27 +6464,33 @@ pub(crate) async fn collect_recent_log_errors(
             let timestamp = extract_timestamp(line);
 
             // If we have a timestamp, check if it's within the time window
-            if let Some(ref ts) = timestamp {
-                if let Some(parsed) = parse_log_timestamp(ts) {
-                    if parsed < cutoff_time {
-                        // This error is older than our time window, skip it
+            // If no timestamp can be parsed, skip the error to avoid including stale entries
+            match &timestamp {
+                Some(ts) => {
+                    if let Some(parsed) = parse_log_timestamp(ts) {
+                        if parsed < cutoff_time {
+                            // This error is older than our time window, skip it
+                            continue;
+                        }
+                    } else {
+                        // Timestamp found but couldn't be parsed - skip to avoid stale errors
                         continue;
                     }
+                }
+                None => {
+                    // No timestamp in the line - skip to avoid including errors of unknown age
+                    // This prevents old errors from files that weren't cleared from being included
+                    continue;
                 }
             }
 
             // Collect context lines
-            let context_before: Vec<String> = lines
-                [line_idx.saturating_sub(CONTEXT_LINES)..line_idx]
-                .iter()
-                .cloned()
-                .collect();
+            let context_before: Vec<String> =
+                lines[line_idx.saturating_sub(CONTEXT_LINES)..line_idx].to_vec();
 
             let context_after: Vec<String> = lines
                 [(line_idx + 1).min(total_lines)..(line_idx + 1 + CONTEXT_LINES).min(total_lines)]
-                .iter()
-                .cloned()
-                .collect();
+                .to_vec();
 
             all_errors.push(LogError {
                 source: source_name.clone(),

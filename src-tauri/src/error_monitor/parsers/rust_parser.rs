@@ -232,14 +232,15 @@ impl RustParser {
 
             // Collect context lines (code snippets, notes)
             let mut context = Vec::new();
-            for i in lines_consumed..lines.len().min(lines_consumed + 10) {
-                let line = lines[i];
+            let context_start = lines_consumed;
+            let scan_end = lines.len().min(context_start + 10);
+            for (i, line) in lines[context_start..scan_end].iter().enumerate() {
                 if line.starts_with("error") || line.starts_with("warning") {
                     break;
                 }
                 if !line.trim().is_empty() {
                     context.push(line.to_string());
-                    lines_consumed = i + 1;
+                    lines_consumed = context_start + i + 1;
                 }
             }
 

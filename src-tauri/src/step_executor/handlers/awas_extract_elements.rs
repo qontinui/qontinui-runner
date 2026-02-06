@@ -29,7 +29,7 @@ impl StepHandler for AwasExtractElementsHandler {
         context: &HandlerContext,
     ) -> StepHandlerResult {
         let step_name = step.name.as_deref().unwrap_or("AWAS Extract Elements");
-        let timeout = step.timeout_seconds.unwrap_or(60) as u64;
+        let timeout = step.timeout_seconds.unwrap_or(60);
 
         // Get HTML content from step config
         let html = match &step.awas_html {

@@ -261,7 +261,6 @@ export interface ControlBarProps {
   status: ExecutionStatus;
   onPlayPause: () => void;
   onStop: () => void;
-  onGoToExecute: () => void;
 }
 
 /** Props for LiveExecutionView component */
@@ -296,9 +295,14 @@ export interface BottomBarProps {
 
 /** Props for IdleState component */
 export interface IdleStateProps {
-  onGoToExecute: () => void;
   /** Callback to navigate to Recap page and set session workflow */
   onGoToRecap?: () => void;
+  /** Callback to run the last workflow again */
+  onRunLastWorkflow?: () => void;
+  /** Whether the last workflow is currently being started */
+  isRunningLastWorkflow?: boolean;
   /** Name of the last run workflow (if any) */
   lastRunWorkflowName?: string | null;
+  /** ID of the last run workflow (if any) */
+  lastRunWorkflowId?: string | null;
 }

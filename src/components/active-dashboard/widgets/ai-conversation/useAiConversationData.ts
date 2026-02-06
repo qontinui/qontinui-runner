@@ -3,6 +3,9 @@
  *
  * React hook for accessing AI conversation data for the dashboard widget.
  * Subscribes to LogStore updates and transforms data for display.
+ *
+ * IMPORTANT: Filters logs by taskRunId to ensure proper isolation when
+ * multiple workflows are running simultaneously.
  */
 
 import { useState, useEffect, useMemo } from "react";
@@ -14,17 +17,26 @@ import type { AiConversationData, AiOutputEntry } from "./types";
 const THINKING_THRESHOLD_MS = 5000;
 
 /**
- * Global session tracking to persist across component remounts.
- * This ensures that when widgets move between containers, they don't lose their content.
+ * Filter entries to only show entries for a specific task run.
+ * This ensures proper isolation when multiple workflows run simultaneously.
  */
-const sessionTracker = {
-  currentTaskId: null as string | null,
-  sessionStartTime: null as number | null,
-};
+function filterByTaskRunId(
+  allEntries: AiOutputEntry[] | undefined,
+  taskRunId: string | null,
+): AiOutputEntry[] {
+  // Defensive: handle undefined or null input
+  if (!allEntries || allEntries.length === 0) return [];
+
+  // If no taskRunId specified, return empty (don't show other tasks' data)
+  if (!taskRunId) return [];
+
+  // Filter to only entries for this specific task run
+  return allEntries.filter((entry) => entry.taskRunId === taskRunId);
+}
 
 /**
- * Filter entries to only show the most recent session.
- * This ensures we don't show data from previous tasks.
+ * Filter entries to only show the most recent session within a task.
+ * This ensures we don't show data from previous AI sessions.
  */
 function filterToCurrentSession(allEntries: AiOutputEntry[] | undefined): AiOutputEntry[] {
   // Defensive: handle undefined or null input
@@ -80,40 +92,15 @@ const EMPTY_DATA: AiConversationData = {
 /**
  * Hook for accessing AI conversation data.
  * Returns transformed data suitable for widget display.
- * Only shows entries from the current active session (not historical data).
- * Uses TaskContext to determine if a task is running and filter appropriately.
+ * Only shows entries from the current task run (not other tasks' data).
+ *
+ * IMPORTANT: Filters by taskRunId to ensure proper isolation when
+ * multiple workflows are running simultaneously.
  */
 export function useAiConversationData(): AiConversationData {
   const currentTaskRunId = useCurrentTaskRunId();
-  const taskStartTime = useTaskStartTime();
+  const _taskStartTime = useTaskStartTime();
   const [allEntries, setAllEntries] = useState<AiOutputEntry[]>([]);
-  // Initialize from global tracker to preserve state across remounts
-  const [sessionStartTime, setSessionStartTime] = useState<number | null>(
-    () => sessionTracker.sessionStartTime,
-  );
-
-  // Track when a new task starts (to filter out stale data)
-  // Only reset sessionStartTime when the task ID actually changes, not on remount
-  // Use the task's actual start time from the database instead of Date.now()
-  // to avoid race conditions where AI events arrive before we detect the task
-  useEffect(() => {
-    if (currentTaskRunId) {
-      // Only set a new session start time if this is a different task
-      if (currentTaskRunId !== sessionTracker.currentTaskId) {
-        // Use task's actual start time from DB, fallback to Date.now() if not available
-        const newStartTime = taskStartTime ?? Date.now();
-        sessionTracker.currentTaskId = currentTaskRunId;
-        sessionTracker.sessionStartTime = newStartTime;
-        setSessionStartTime(newStartTime);
-      }
-      // If same task and we have a stored time, the useState initializer already handled it
-    } else {
-      // No task running - clear session start time
-      sessionTracker.currentTaskId = null;
-      sessionTracker.sessionStartTime = null;
-      setSessionStartTime(null);
-    }
-  }, [currentTaskRunId, taskStartTime]);
 
   // Subscribe to log changes
   useEffect(() => {
@@ -145,25 +132,20 @@ export function useAiConversationData(): AiConversationData {
     return () => unsubscribe?.();
   }, []);
 
-  // Filter to current session and deduplicate
+  // Filter by taskRunId, then to current session, and deduplicate
   const entries = useMemo(() => {
     try {
-      // If no task is running (no sessionStartTime), return empty array to avoid showing stale data
-      if (sessionStartTime === null) {
-        return [];
-      }
+      // Filter to entries for this specific task run (critical for multi-workflow isolation)
+      const taskEntries = filterByTaskRunId(allEntries, currentTaskRunId);
 
-      // Filter to entries that arrived after session started
-      const recentEntries = allEntries.filter((entry) => entry.timestamp >= sessionStartTime);
-
-      // Then filter to current session and deduplicate
-      const sessionFiltered = filterToCurrentSession(recentEntries);
+      // Then filter to current session within this task and deduplicate
+      const sessionFiltered = filterToCurrentSession(taskEntries);
       return deduplicateEntries(sessionFiltered);
     } catch (e) {
       console.error("useAiConversationData: Error filtering entries:", e);
       return [];
     }
-  }, [allEntries, sessionStartTime]);
+  }, [allEntries, currentTaskRunId]);
 
   // Compute derived state
   const data = useMemo((): AiConversationData => {

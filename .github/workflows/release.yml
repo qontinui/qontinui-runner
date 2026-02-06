@@ -7,11 +7,11 @@ on:
   workflow_dispatch:
     inputs:
       include_bundled_python:
-        description: 'Bundle Python executor (zero-setup installation)'
+        description: "Bundle Python executor (zero-setup installation)"
         type: boolean
         default: true
       include_cuda:
-        description: 'Include CUDA support in bundled Python'
+        description: "Include CUDA support in bundled Python"
         type: boolean
         default: false
 

@@ -32,8 +32,14 @@ export interface DashboardPageProps {
   onGoToExecute: () => void;
   /** Callback to navigate to the Recap page and set session workflow */
   onGoToRecap?: () => void;
+  /** Callback to run the last workflow again */
+  onRunLastWorkflow?: () => void;
+  /** Whether the last workflow is currently being started */
+  isRunningLastWorkflow?: boolean;
   /** Name of the last run workflow */
   lastRunWorkflowName?: string | null;
+  /** ID of the last run workflow */
+  lastRunWorkflowId?: string | null;
 }
 
 /**
@@ -49,7 +55,10 @@ export interface DashboardPageProps {
 export function DashboardPage({
   onGoToExecute,
   onGoToRecap,
+  onRunLastWorkflow,
+  isRunningLastWorkflow,
   lastRunWorkflowName,
+  lastRunWorkflowId,
 }: DashboardPageProps) {
   // Get dashboard state
   const { state, setActiveWidget, navigateToDetail } = useDashboardState();
@@ -265,9 +274,11 @@ export function DashboardPage({
             layout={state.layout}
             onWidgetClick={handleWidgetClick}
             onNavigateToDetail={handleNavigateToDetail}
-            onGoToExecute={onGoToExecute}
             onGoToRecap={onGoToRecap}
+            onRunLastWorkflow={onRunLastWorkflow}
+            isRunningLastWorkflow={isRunningLastWorkflow}
             lastRunWorkflowName={lastRunWorkflowName}
+            lastRunWorkflowId={lastRunWorkflowId}
           />
         </div>
 

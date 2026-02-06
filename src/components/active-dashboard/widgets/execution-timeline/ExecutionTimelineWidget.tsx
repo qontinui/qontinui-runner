@@ -238,6 +238,9 @@ function IterationSection({
   const successColors = getStatusColors("success");
   const errorColors = getStatusColors("error");
 
+  // Check if any step in this iteration is actually running
+  const hasRunningStep = iterationGroup.steps.some((step) => step.status === "running");
+
   return (
     <div className="border-l border-border/30 ml-4">
       {/* Iteration header */}
@@ -270,10 +273,8 @@ function IterationSection({
           Iteration {iterationGroup.iteration}
         </Badge>
 
-        {/* Running indicator */}
-        {iterationGroup.isActive && !iterationGroup.isComplete && (
-          <Loader2 className={cn("h-3 w-3 animate-spin", colors.text)} />
-        )}
+        {/* Running indicator - only show if a step is actually running */}
+        {hasRunningStep && <Loader2 className={cn("h-3 w-3 animate-spin", colors.text)} />}
 
         {/* Step count */}
         <span className="text-[10px] text-muted-foreground ml-auto">
@@ -330,6 +331,9 @@ function PhaseSection({
   // For phases without iterations, show flat list
   const showFlatList = !group.hasIterations || group.iterationGroups.length === 0;
 
+  // Check if any step in this phase is actually running
+  const hasRunningStep = group.steps.some((step) => step.status === "running");
+
   return (
     <div className="border-b border-border/50 last:border-b-0">
       {/* Phase header */}
@@ -362,8 +366,8 @@ function PhaseSection({
           {config.label}
         </Badge>
 
-        {/* Running indicator */}
-        {group.isActive && <Loader2 className={cn("h-3.5 w-3.5 animate-spin", colors.text)} />}
+        {/* Running indicator - only show if a step is actually running */}
+        {hasRunningStep && <Loader2 className={cn("h-3.5 w-3.5 animate-spin", colors.text)} />}
 
         {/* Iteration count for phases with iterations */}
         {group.hasIterations && group.iterationGroups.length > 0 && (

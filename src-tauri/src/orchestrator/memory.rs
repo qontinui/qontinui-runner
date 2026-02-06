@@ -269,7 +269,7 @@ impl ShortTermMemory {
         self.get_recent(limit)
             .into_iter()
             .rev()
-            .map(|item| format!("[{}] {}", format!("{:?}", item.item_type), item.content))
+            .map(|item| format!("[{:?}] {}", item.item_type, item.content))
             .collect::<Vec<_>>()
             .join("\n")
     }

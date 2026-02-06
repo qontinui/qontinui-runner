@@ -21,7 +21,7 @@
  * - Type action text tracking with debounce
  */
 
-(function() {
+(function () {
   // Avoid double-injection
   if (window.__QONTINUI_RECORDER_INJECTED__) {
     console.log("[Qontinui Recorder] Already injected, skipping");
@@ -55,7 +55,7 @@
     }
 
     // Priority 1: ID attribute
-    if (el.id && !el.id.match(/^\d/) && !el.id.includes(':')) {
+    if (el.id && !el.id.match(/^\d/) && !el.id.includes(":")) {
       return `#${CSS.escape(el.id)}`;
     }
 
@@ -102,11 +102,15 @@
 
     // Priority 5: Class-based selector
     if (el.className && typeof el.className === "string") {
-      const classes = el.className.trim().split(/\s+/).filter(c =>
-        c && !c.match(/^(hover|active|focus|visited|disabled|selected)/i)
-      );
+      const classes = el.className
+        .trim()
+        .split(/\s+/)
+        .filter((c) => c && !c.match(/^(hover|active|focus|visited|disabled|selected)/i));
       if (classes.length > 0) {
-        const classSelector = classes.slice(0, 2).map(c => `.${CSS.escape(c)}`).join("");
+        const classSelector = classes
+          .slice(0, 2)
+          .map((c) => `.${CSS.escape(c)}`)
+          .join("");
         const selector = `${tag}${classSelector}`;
         if (isUniqueSelector(selector)) return selector;
       }
@@ -137,7 +141,7 @@
       // Add nth-child for disambiguation
       const parent = current.parentElement;
       if (parent) {
-        const siblings = Array.from(parent.children).filter(s => s.tagName === current.tagName);
+        const siblings = Array.from(parent.children).filter((s) => s.tagName === current.tagName);
         if (siblings.length > 1) {
           const index = siblings.indexOf(current) + 1;
           selector = `${tag}:nth-child(${index})`;
@@ -193,7 +197,7 @@
       // Add position predicate
       const parent = current.parentElement;
       if (parent) {
-        const siblings = Array.from(parent.children).filter(s => s.tagName === current.tagName);
+        const siblings = Array.from(parent.children).filter((s) => s.tagName === current.tagName);
         if (siblings.length > 1) {
           const index = siblings.indexOf(current) + 1;
           part = `${part}[${index}]`;
@@ -258,7 +262,7 @@
    */
   function getUIBridgeElements() {
     const elements = document.querySelectorAll("[data-ui-id]");
-    return Array.from(elements).map(el => {
+    return Array.from(elements).map((el) => {
       const rect = el.getBoundingClientRect();
       const computedStyle = window.getComputedStyle(el);
 
@@ -281,7 +285,11 @@
           width: rect.width,
           height: rect.height,
         },
-        isVisible: rect.width > 0 && rect.height > 0 && computedStyle.visibility !== "hidden" && computedStyle.display !== "none",
+        isVisible:
+          rect.width > 0 &&
+          rect.height > 0 &&
+          computedStyle.visibility !== "hidden" &&
+          computedStyle.display !== "none",
         isEnabled: !el.disabled && !el.hasAttribute("disabled"),
         value: el.value !== undefined ? el.value : null,
       };
@@ -327,24 +335,31 @@
       url: window.location.href,
       title: document.title,
       trigger: trigger,
-      triggerElement: targetElement ? {
-        id: targetElement.getAttribute?.("data-ui-id") || null,
-        tagName: targetElement.tagName?.toLowerCase() || null,
-        textContent: targetElement.textContent?.trim()?.substring(0, 100) || null,
-      } : null,
+      triggerElement: targetElement
+        ? {
+            id: targetElement.getAttribute?.("data-ui-id") || null,
+            tagName: targetElement.tagName?.toLowerCase() || null,
+            textContent: targetElement.textContent?.trim()?.substring(0, 100) || null,
+          }
+        : null,
       elements: elements,
       elementCount: elements.length,
       // Include enhanced action data if present
       action: action,
     };
 
-    console.log(`[Qontinui Recorder] Captured snapshot #${captureCount}: ${trigger} (${elements.length} elements)${action ? `, action: ${action.type}` : ''}`);
+    console.log(
+      `[Qontinui Recorder] Captured snapshot #${captureCount}: ${trigger} (${elements.length} elements)${action ? `, action: ${action.type}` : ""}`,
+    );
 
     // Send to bridge script which forwards to background
-    window.postMessage({
-      type: "QONTINUI_RECORDER_SNAPSHOT",
-      snapshot: snapshot,
-    }, "*");
+    window.postMessage(
+      {
+        type: "QONTINUI_RECORDER_SNAPSHOT",
+        snapshot: snapshot,
+      },
+      "*",
+    );
 
     return snapshot;
   }
@@ -585,12 +600,11 @@
       if (!isRecording) return;
 
       // Check if any mutation added elements with data-ui-id
-      const hasRelevantChanges = mutations.some(mutation => {
+      const hasRelevantChanges = mutations.some((mutation) => {
         if (mutation.type === "childList") {
-          return Array.from(mutation.addedNodes).some(node => {
+          return Array.from(mutation.addedNodes).some((node) => {
             if (node.nodeType !== Node.ELEMENT_NODE) return false;
-            return node.hasAttribute?.("data-ui-id") ||
-                   node.querySelector?.("[data-ui-id]");
+            return node.hasAttribute?.("data-ui-id") || node.querySelector?.("[data-ui-id]");
           });
         }
         if (mutation.type === "attributes" && mutation.attributeName === "data-ui-id") {
@@ -670,7 +684,7 @@
     return {
       success: true,
       initialSnapshot: initialSnapshot,
-      message: "Recording started"
+      message: "Recording started",
     };
   }
 
@@ -706,7 +720,7 @@
       success: true,
       captureCount: captureCount,
       actionCount: actionCount,
-      message: "Recording stopped"
+      message: "Recording stopped",
     };
   }
 
@@ -752,12 +766,17 @@
     }
 
     // Send response back
-    window.postMessage({
-      type: "QONTINUI_RECORDER_RESPONSE",
-      requestId: requestId,
-      result: result,
-    }, "*");
+    window.postMessage(
+      {
+        type: "QONTINUI_RECORDER_RESPONSE",
+        requestId: requestId,
+        result: result,
+      },
+      "*",
+    );
   });
 
-  console.log("[Qontinui Recorder] Content script loaded and ready (v2 with enhanced action capture)");
+  console.log(
+    "[Qontinui Recorder] Content script loaded and ready (v2 with enhanced action capture)",
+  );
 })();

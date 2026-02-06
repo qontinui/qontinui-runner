@@ -104,6 +104,8 @@ pub struct TokenCount {
     pub feedback: usize,
     /// Tokens from solutions
     pub solutions: usize,
+    /// Tokens from environment/infrastructure issues
+    pub environment: usize,
     /// Tokens from other categories
     pub other: usize,
     /// Number of knowledge entries counted
@@ -119,6 +121,7 @@ impl TokenCount {
             observations: 0,
             feedback: 0,
             solutions: 0,
+            environment: 0,
             other: 0,
             entry_count: 0,
         }
@@ -237,6 +240,7 @@ impl CompressionService {
                 "observation" => count.observations += tokens,
                 "verification_feedback" | "feedback" => count.feedback += tokens,
                 "solution" | "fix" => count.solutions += tokens,
+                "environment" | "infrastructure" => count.environment += tokens,
                 _ => count.other += tokens,
             }
         }
@@ -296,6 +300,7 @@ impl CompressionService {
             ("observation", original_count.observations),
             ("verification_feedback", original_count.feedback),
             ("solution", original_count.solutions),
+            ("environment", original_count.environment),
         ] {
             // Only compress if this category has significant tokens
             if tokens > 1000 {
@@ -482,6 +487,7 @@ mod tests {
             observations: 10000,
             feedback: 10000,
             solutions: 5000,
+            environment: 0,
             other: 5000,
             entry_count: 100,
         };

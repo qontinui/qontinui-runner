@@ -1313,7 +1313,7 @@ mod tests {
         // Create a checkpoint
         let state = StateSnapshot::new("executing", 5);
         let cp = Checkpoint::new("task-1", state);
-        let cp_id = cp_manager.save(cp.clone());
+        let _cp_id = cp_manager.save(cp.clone());
 
         // Start a replay
         let result = replay_manager.start_replay(&cp, &cp_manager);

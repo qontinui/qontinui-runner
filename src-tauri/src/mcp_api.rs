@@ -113,6 +113,8 @@ use tauri::{Emitter, Manager};
 
 // Windows-specific imports for process creation flags
 #[cfg(target_os = "windows")]
+use std::os::windows::io::AsRawHandle;
+#[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
 // Windows constants for process creation
@@ -687,6 +689,18 @@ fn run_claude_session_inline(
     let finding_ctx_for_stdout = finding_ctx.clone();
     let progress_ctx_for_stdout = progress_ctx.clone();
 
+    // On Windows, save the raw pipe handle before moving stdout into the reader thread.
+    // After the Claude process exits, child processes may still hold inherited copies of
+    // the pipe's write end, preventing EOF. Closing the read end from the main thread
+    // unblocks the reader thread's BufReader::lines() immediately.
+    #[cfg(target_os = "windows")]
+    let stdout_raw_handle = stdout.as_ref().map(|s| s.as_raw_handle());
+
+    // Shared buffer for accumulated text, so we can read it even if the stdout
+    // thread hangs (e.g., on Windows when child processes hold pipe handles open).
+    let shared_output_buf = Arc::new(std::sync::Mutex::new(String::new()));
+    let shared_output_for_thread = shared_output_buf.clone();
+
     let stdout_handle = thread::spawn(move || {
         let mut all_text = String::new();
         // Create finding parser if we have a finding context
@@ -759,6 +773,12 @@ fn run_claude_session_inline(
                         }
 
                         all_text.push_str(&text);
+
+                        // Sync accumulated text to shared buffer periodically
+                        // so it's available even if this thread hangs on pipe read
+                        if let Ok(mut buf) = shared_output_for_thread.lock() {
+                            *buf = all_text.clone();
+                        }
                     }
                 }
             }
@@ -776,6 +796,11 @@ fn run_claude_session_inline(
                     let _ = progress_tx.send(parsed_progress);
                 }
             }
+        }
+
+        // Final sync
+        if let Ok(mut buf) = shared_output_for_thread.lock() {
+            *buf = all_text.clone();
         }
 
         all_text
@@ -1051,9 +1076,11 @@ fn run_claude_session_inline(
     });
 
     // Wait for process with optional inactivity timeout
+    // Use a safety fallback of 600s (10 min) when no timeout is configured,
+    // to prevent hanging indefinitely if the process doesn't exit cleanly.
+    let effective_timeout = timeout_seconds.unwrap_or(600);
     let status = loop {
-        // Only check timeout if one is configured
-        if let Some(timeout) = timeout_seconds {
+        {
             let now_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1061,21 +1088,40 @@ fn run_claude_session_inline(
             let last_activity_secs = last_activity.load(Ordering::Relaxed);
             let inactive_secs = now_secs.saturating_sub(last_activity_secs);
 
-            if inactive_secs > timeout {
+            if inactive_secs > effective_timeout {
                 warn!(
-                    "Session {} timed out after {}s of inactivity",
-                    session_id, inactive_secs
+                    "Session {} timed out after {}s of inactivity (configured: {:?}, effective: {}s)",
+                    session_id, inactive_secs, timeout_seconds, effective_timeout
                 );
                 let _ = child.kill();
                 thread::sleep(Duration::from_millis(500));
-                let _ = child.try_wait();
-                let _ = stop_tx.send(());
-                let _ = heartbeat_handle.join();
-                let _ = std::fs::remove_file(&prompt_file);
-                return Err(format!(
-                    "Session timed out after {}s of inactivity",
-                    inactive_secs
-                ));
+                // Break with the exit status so the normal cleanup path runs
+                // and collects whatever output was accumulated before the timeout.
+                match child.try_wait() {
+                    Ok(Some(status)) => break status,
+                    _ => {
+                        // Process didn't exit cleanly after kill — use normal cleanup
+                        // to recover accumulated output from the shared buffer
+                        let _ = stop_tx.send(());
+                        let _ = heartbeat_handle.join();
+                        let _ = std::fs::remove_file(&prompt_file);
+                        // Recover output from shared buffer
+                        let buffered = shared_output_buf
+                            .lock()
+                            .map(|s| s.clone())
+                            .unwrap_or_default();
+                        remove_pid(&pid_tracker);
+                        if buffered.is_empty() {
+                            return Err(format!(
+                                "Session timed out after {}s of inactivity (no output captured)",
+                                inactive_secs
+                            ));
+                        }
+                        // Return the buffered output as a failed session (not an Err)
+                        // so the caller gets the output text
+                        return Ok((false, buffered));
+                    }
+                }
             }
         }
 
@@ -1094,7 +1140,49 @@ fn run_claude_session_inline(
     // Cleanup
     let _ = stop_tx.send(());
     let _ = heartbeat_handle.join();
-    let all_output = stdout_handle.join().unwrap_or_default();
+
+    // On Windows, close the stdout pipe's read end now that the process has exited.
+    // This unblocks the reader thread immediately if child processes are still
+    // holding inherited copies of the pipe's write end.
+    #[cfg(target_os = "windows")]
+    if let Some(raw_handle) = stdout_raw_handle {
+        unsafe {
+            // SAFETY: The handle was obtained from ChildStdout before it was moved
+            // into the reader thread. Closing it here causes the reader's read() to
+            // return an error, terminating the BufReader::lines() loop. The reader
+            // thread will then exit and join() will return promptly.
+            windows_sys::Win32::Foundation::CloseHandle(
+                raw_handle as windows_sys::Win32::Foundation::HANDLE,
+            );
+        }
+    }
+
+    // Join stdout thread with a bounded wait (fallback for non-Windows or edge cases).
+    // On Windows the handle close above should make this return immediately, but
+    // the timeout acts as a safety net.
+    let all_output = {
+        let (join_tx, join_rx) = mpsc::channel::<String>();
+        let _ = thread::spawn(move || {
+            let result = stdout_handle.join().unwrap_or_default();
+            let _ = join_tx.send(result);
+        });
+        match join_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(text) => text,
+            Err(_) => {
+                warn!(
+                    "Session {}: stdout thread didn't finish within 10s after process exit. \
+                     Child process likely holding pipe handle. Using buffered output.",
+                    session_id
+                );
+                // Fall back to the shared buffer which was synced periodically
+                shared_output_buf
+                    .lock()
+                    .map(|s| s.clone())
+                    .unwrap_or_default()
+            }
+        }
+    };
+
     let stderr_output = stderr_handle.join().unwrap_or_default();
     // Wait for the finding processor thread to complete
     // (it will exit when the stdout thread closes the channel sender)
@@ -1325,6 +1413,12 @@ pub struct ApiState {
     >,
     /// Extension connection status
     pub extension_connected: Arc<std::sync::atomic::AtomicBool>,
+    /// Timestamp of last pong received from extension (epoch millis)
+    pub extension_last_pong: Arc<std::sync::atomic::AtomicI64>,
+    /// Timestamp when extension connected (epoch millis, 0 if not connected)
+    pub extension_connected_since: Arc<std::sync::atomic::AtomicI64>,
+    /// Number of extension reconnections since runner start
+    pub extension_reconnect_count: Arc<std::sync::atomic::AtomicU64>,
     /// Orchestrator states by task_run_id (for agentic task orchestration)
     pub orchestrator_states:
         Arc<tokio::sync::Mutex<std::collections::HashMap<String, OrchestratorState>>>,
@@ -1670,7 +1764,10 @@ async fn ws_extension_handler(
     ws.on_upgrade(move |socket| handle_extension_ws(socket, state))
 }
 
-/// Handle WebSocket connection from Chrome extension
+/// Handle WebSocket connection from Chrome extension (or offscreen document).
+///
+/// Includes a server-side ping loop that sends PING frames every 20 seconds
+/// to detect dead connections early and keep the connection alive at the TCP level.
 async fn handle_extension_ws(socket: WebSocket, state: Arc<ApiState>) {
     use std::sync::atomic::Ordering;
 
@@ -1681,32 +1778,82 @@ async fn handle_extension_ws(socket: WebSocket, state: Arc<ApiState>) {
         let mut ws_sender = state.extension_ws_sender.lock().await;
         *ws_sender = Some(sender);
     }
+
+    // Update connection tracking
+    let now_ms = chrono::Utc::now().timestamp_millis();
     state.extension_connected.store(true, Ordering::SeqCst);
+    state.extension_last_pong.store(now_ms, Ordering::SeqCst);
+    state
+        .extension_connected_since
+        .store(now_ms, Ordering::SeqCst);
+    let reconnect_num = state
+        .extension_reconnect_count
+        .fetch_add(1, Ordering::SeqCst);
 
-    info!("Chrome extension WebSocket connected");
+    info!(
+        "Chrome extension WebSocket connected (connection #{})",
+        reconnect_num + 1
+    );
 
-    // Handle incoming messages from extension
-    while let Some(result) = receiver.next().await {
-        match result {
-            Ok(Message::Text(text)) => match serde_json::from_str::<serde_json::Value>(&text) {
-                Ok(msg) => {
-                    handle_extension_message(msg, state.clone()).await;
+    // Server-side ping interval: sends PING every 20 seconds
+    let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(20));
+    ping_interval.tick().await; // First tick completes immediately
+
+    // Main event loop: process messages and send pings concurrently
+    loop {
+        tokio::select! {
+            // Handle incoming messages from extension
+            result = receiver.next() => {
+                match result {
+                    Some(Ok(Message::Text(text))) => {
+                        match serde_json::from_str::<serde_json::Value>(&text) {
+                            Ok(msg) => {
+                                handle_extension_message(msg, state.clone()).await;
+                            }
+                            Err(e) => {
+                                warn!("Failed to parse extension message: {}", e);
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Ping(_))) => {
+                        debug!("Received WebSocket ping from extension");
+                    }
+                    Some(Ok(Message::Pong(_))) => {
+                        // Update last pong timestamp for health tracking
+                        state.extension_last_pong.store(
+                            chrono::Utc::now().timestamp_millis(),
+                            Ordering::SeqCst,
+                        );
+                        debug!("Received pong from extension");
+                    }
+                    Some(Ok(Message::Close(_))) => {
+                        info!("Extension WebSocket closed");
+                        break;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => {
+                        warn!("Extension WebSocket error: {}", e);
+                        break;
+                    }
+                    None => {
+                        // Stream ended
+                        info!("Extension WebSocket stream ended");
+                        break;
+                    }
                 }
-                Err(e) => {
-                    warn!("Failed to parse extension message: {}", e);
+            }
+            // Send periodic PING frames to detect dead connections
+            _ = ping_interval.tick() => {
+                let mut ws_sender = state.extension_ws_sender.lock().await;
+                if let Some(ref mut sender) = *ws_sender {
+                    if let Err(e) = sender.send(Message::Ping(vec![])).await {
+                        warn!("Failed to send ping to extension: {}", e);
+                        break;
+                    }
+                    debug!("Sent ping to extension");
+                } else {
+                    break;
                 }
-            },
-            Ok(Message::Ping(_)) => {
-                debug!("Received ping from extension");
-            }
-            Ok(Message::Close(_)) => {
-                info!("Extension WebSocket closed");
-                break;
-            }
-            Ok(_) => {}
-            Err(e) => {
-                warn!("Extension WebSocket error: {}", e);
-                break;
             }
         }
     }
@@ -1717,6 +1864,7 @@ async fn handle_extension_ws(socket: WebSocket, state: Arc<ApiState>) {
         *ws_sender = None;
     }
     state.extension_connected.store(false, Ordering::SeqCst);
+    state.extension_connected_since.store(0, Ordering::SeqCst);
 
     // Reject all pending requests
     {
@@ -1756,8 +1904,30 @@ async fn handle_extension_message(msg: serde_json::Value, state: Arc<ApiState>) 
             // Snapshot from the recorder during a recording session
             handle_recording_snapshot(msg, state).await;
         }
+        "PING" => {
+            // Extension sent an application-level ping — respond with PONG
+            // so the extension knows the connection is alive.
+            let mut ws_sender = state.extension_ws_sender.lock().await;
+            if let Some(ref mut sender) = *ws_sender {
+                let pong = serde_json::json!({ "type": "PONG" });
+                if let Ok(json_str) = serde_json::to_string(&pong) {
+                    let _ = sender.send(Message::Text(json_str)).await;
+                }
+            }
+            // Also update last pong tracking (bidirectional health)
+            state.extension_last_pong.store(
+                chrono::Utc::now().timestamp_millis(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            debug!("Responded to application-level ping from extension");
+        }
         "PONG" => {
-            debug!("Received pong from extension");
+            // Update last pong timestamp (application-level pong)
+            state.extension_last_pong.store(
+                chrono::Utc::now().timestamp_millis(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            debug!("Received application-level pong from extension");
         }
         "EXTENSION_REQUEST" => {
             // Extension is sending a request to the runner (future use)
@@ -1989,8 +2159,9 @@ async fn send_extension_command(
         }
     }
 
-    // Wait for response with timeout
-    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
+    // Wait for response with timeout (0 = default 30s, not infinite)
+    let effective_timeout = if timeout_secs == 0 { 30 } else { timeout_secs };
+    match tokio::time::timeout(std::time::Duration::from_secs(effective_timeout), rx).await {
         Ok(Ok(response)) => {
             let success = response
                 .get("success")
@@ -2016,7 +2187,7 @@ async fn send_extension_command(
             pending.remove(&request_id);
             Err(format!(
                 "Extension command timed out after {}s",
-                timeout_secs
+                effective_timeout
             ))
         }
     }
@@ -2042,17 +2213,35 @@ fn default_extension_timeout() -> u64 {
     0 // No timeout - run until completion
 }
 
-/// Get extension connection status
+/// Get extension connection status with health details
 async fn get_extension_status(
     State(state): State<Arc<ApiState>>,
 ) -> Json<ApiResponse<serde_json::Value>> {
     use std::sync::atomic::Ordering;
 
     let connected = state.extension_connected.load(Ordering::SeqCst);
+    let last_pong_ms = state.extension_last_pong.load(Ordering::SeqCst);
+    let connected_since_ms = state.extension_connected_since.load(Ordering::SeqCst);
+    let reconnect_count = state.extension_reconnect_count.load(Ordering::SeqCst);
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let last_pong_ago_sec = if last_pong_ms > 0 {
+        Some((now_ms - last_pong_ms) / 1000)
+    } else {
+        None
+    };
+    let connection_age_sec = if connected_since_ms > 0 {
+        Some((now_ms - connected_since_ms) / 1000)
+    } else {
+        None
+    };
 
     Json(ApiResponse::success(serde_json::json!({
         "connected": connected,
-        "websocket_url": "ws://localhost:9876/ws/extension"
+        "websocket_url": "ws://localhost:9876/ws/extension",
+        "last_pong_ago_sec": last_pong_ago_sec,
+        "connection_age_sec": connection_age_sec,
+        "reconnect_count": reconnect_count
     })))
 }
 
@@ -2289,14 +2478,14 @@ async fn run_bridge_workflow(
                 .with_bridge(&bridge_id, |bridge| bridge.load_configuration(&config_path));
 
             if let Err(e) = load_result {
-                return Json(ApiResponse::<serde_json::Value>::error(&format!(
+                return Json(ApiResponse::<serde_json::Value>::error(format!(
                     "Failed to access bridge: {}",
                     e
                 )));
             }
 
             if let Ok(Err(e)) = load_result {
-                return Json(ApiResponse::<serde_json::Value>::error(&format!(
+                return Json(ApiResponse::<serde_json::Value>::error(format!(
                     "Failed to load config: {}",
                     e
                 )));
@@ -2323,11 +2512,11 @@ async fn run_bridge_workflow(
                 "message": "Workflow started",
                 "bridge_id": bridge_id,
             }))),
-            Ok(Err(e)) => Json(ApiResponse::<serde_json::Value>::error(&format!(
+            Ok(Err(e)) => Json(ApiResponse::<serde_json::Value>::error(format!(
                 "Failed to start workflow: {}",
                 e
             ))),
-            Err(e) => Json(ApiResponse::<serde_json::Value>::error(&e)),
+            Err(e) => Json(ApiResponse::<serde_json::Value>::error(e)),
         }
     } else {
         Json(ApiResponse::<serde_json::Value>::error(
@@ -2525,26 +2714,36 @@ async fn get_debug_errors(
             .iter()
             .filter(|s| s.enabled)
             .map(|s| {
-                let path = std::path::Path::new(&s.path);
-                let filename = if path.is_absolute() {
-                    s.path.clone()
-                } else {
-                    s.path.clone()
-                };
+                let filename = s.path.clone();
                 let service = s.name.to_lowercase().replace(' ', "-");
                 (filename, service)
             })
             .collect()
     };
 
-    // Regex patterns for error detection
-    let error_patterns = [
+    // Regex patterns for error detection (compiled once)
+    static RE_ERROR_1: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static RE_ERROR_2: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static RE_WARNING: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static RE_TIMESTAMP: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static RE_DATE_PREFIX: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+
+    let re_error_1 =
+        RE_ERROR_1.get_or_init(|| Regex::new(r"(?i)(error|exception|traceback|failed)").unwrap());
+    let re_error_2 =
+        RE_ERROR_2.get_or_init(|| Regex::new(r"(?i)(ERROR|error:|\[error\])").unwrap());
+    let re_warning = RE_WARNING.get_or_init(|| Regex::new(r"(?i)(warning|warn|\[warn\])").unwrap());
+    let re_timestamp = RE_TIMESTAMP
+        .get_or_init(|| Regex::new(r"(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})").unwrap());
+    let re_date_prefix = RE_DATE_PREFIX.get_or_init(|| Regex::new(r"^\d{4}-\d{2}-\d{2}").unwrap());
+
+    let error_patterns: &[(&Regex, &str)] = &[
         // Python/FastAPI errors
-        (r"(?i)(error|exception|traceback|failed)", "error"),
+        (re_error_1, "error"),
         // TypeScript/Next.js errors
-        (r"(?i)(ERROR|error:|\[error\])", "error"),
+        (re_error_2, "error"),
         // Warnings
-        (r"(?i)(warning|warn|\[warn\])", "warning"),
+        (re_warning, "warning"),
     ];
 
     for (filename, service) in &log_files {
@@ -2568,7 +2767,7 @@ async fn get_debug_errors(
 
         if let Ok(file) = std::fs::File::open(&file_path) {
             let reader = BufReader::new(file);
-            let lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+            let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
 
             // Process from end (most recent) to beginning
             let mut i = lines.len();
@@ -2578,12 +2777,10 @@ async fn get_debug_errors(
 
                 // Determine log level
                 let mut level = None;
-                for (pattern, lvl) in &error_patterns {
-                    if let Ok(re) = Regex::new(pattern) {
-                        if re.is_match(line) {
-                            level = Some(*lvl);
-                            break;
-                        }
+                for (re, lvl) in error_patterns {
+                    if re.is_match(line) {
+                        level = Some(*lvl);
+                        break;
                     }
                 }
 
@@ -2596,17 +2793,11 @@ async fn get_debug_errors(
                     }
 
                     // Extract timestamp if present (various formats)
-                    let timestamp = if let Ok(ts_re) =
-                        Regex::new(r"(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})")
-                    {
-                        ts_re
-                            .captures(line)
-                            .and_then(|c| c.get(1))
-                            .map(|m| m.as_str().to_string())
-                            .unwrap_or_default()
-                    } else {
-                        String::new()
-                    };
+                    let timestamp = re_timestamp
+                        .captures(line)
+                        .and_then(|c| c.get(1))
+                        .map(|m| m.as_str().to_string())
+                        .unwrap_or_default();
 
                     // Collect context (surrounding lines for stack traces)
                     let mut context_lines = Vec::new();
@@ -2614,11 +2805,7 @@ async fn get_debug_errors(
                     while j < lines.len() && j < i + 10 {
                         let ctx_line = &lines[j];
                         // Stop at next log entry (has timestamp or is empty)
-                        if ctx_line.is_empty()
-                            || Regex::new(r"^\d{4}-\d{2}-\d{2}")
-                                .map(|re| re.is_match(ctx_line))
-                                .unwrap_or(false)
-                        {
+                        if ctx_line.is_empty() || re_date_prefix.is_match(ctx_line) {
                             break;
                         }
                         context_lines.push(ctx_line.clone());
@@ -4678,6 +4865,37 @@ async fn ui_bridge_get_snapshot_handler(
     info!("UI Bridge API: Getting snapshot");
 
     match ui_bridge_request_sync(&state, "get_snapshot", serde_json::json!({})).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Get all loaded specs from the SpecStore.
+async fn ui_bridge_get_specs_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Getting all specs");
+
+    match ui_bridge_request_sync(&state, "get_specs", serde_json::json!({})).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Get a specific spec by ID from the SpecStore.
+async fn ui_bridge_get_spec_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Getting spec {}", id);
+
+    match ui_bridge_request_sync(&state, "get_spec", serde_json::json!({ "specId": id })).await {
         Ok(data) => Ok(Json(ApiResponse::success(data))),
         Err(e) => {
             error!("UI Bridge API: {}", e);
@@ -12850,6 +13068,11 @@ async fn resume_task_run(
     // Convert steps for LoopController with explicit phase assignment
     let setup_automation_steps =
         convert_json_steps_with_phase(&workflow.setup_steps, 0, Some("setup"));
+    // Prepend pre-flight check if enabled (default: true)
+    let setup_automation_steps = crate::unified_workflows::prepend_preflight_check_step(
+        setup_automation_steps,
+        workflow.preflight_check_enabled,
+    );
     let setup_prompt_steps = extract_prompt_steps_with_phase(&workflow.setup_steps, Some("setup"));
     let verification_steps =
         convert_json_steps_with_phase(&workflow.verification_steps, 0, Some("verification"));
@@ -12872,7 +13095,10 @@ async fn resume_task_run(
         extract_prompt_steps_with_phase(&workflow.completion_steps, Some("completion"));
 
     // Calculate starting iteration for resume (sessions_count is the number of completed iterations)
-    let starting_iteration = task_run.sessions_count as u32;
+    let starting_iteration = task_run.sessions_count;
+
+    // For error-fix workflows, run agentic first (only if starting fresh)
+    let run_agentic_first = !workflow.targeted_error_ids.is_empty() && starting_iteration == 0;
 
     let loop_config = LoopConfig {
         max_iterations: workflow.max_iterations,
@@ -12883,6 +13109,7 @@ async fn resume_task_run(
         execution_id: id.clone(),
         targeted_error_ids: workflow.targeted_error_ids.clone(),
         starting_iteration,
+        run_agentic_first,
     };
 
     // Spawn the workflow execution in background with panic protection
@@ -13059,7 +13286,10 @@ async fn get_task_run_verification_results(
     let total = results.len();
     let passed = results.iter().filter(|r| r.passed).count();
     let failed = results.iter().filter(|r| !r.passed).count();
-    let critical_failed = results.iter().filter(|r| !r.passed && r.is_critical).count();
+    let critical_failed = results
+        .iter()
+        .filter(|r| !r.passed && r.is_critical)
+        .count();
 
     Ok(Json(serde_json::json!({
         "task_run_id": id,
@@ -13115,7 +13345,11 @@ async fn get_task_run_mcp_calls(
 
     // Apply limit if specified
     let calls = if let Some(limit) = query.limit {
-        result.calls.into_iter().take(limit as usize).collect::<Vec<_>>()
+        result
+            .calls
+            .into_iter()
+            .take(limit as usize)
+            .collect::<Vec<_>>()
     } else {
         result.calls
     };
@@ -13171,7 +13405,10 @@ async fn get_task_run_api_requests(
 
     // Apply limit if specified
     let requests = if let Some(limit) = query.limit {
-        requests.into_iter().take(limit as usize).collect::<Vec<_>>()
+        requests
+            .into_iter()
+            .take(limit as usize)
+            .collect::<Vec<_>>()
     } else {
         requests
     };
@@ -13341,9 +13578,18 @@ async fn get_task_run_knowledge(
     // Calculate summary by category
     let total = knowledge.len();
     let findings = knowledge.iter().filter(|k| k.category == "finding").count();
-    let observations = knowledge.iter().filter(|k| k.category == "observation").count();
-    let solutions = knowledge.iter().filter(|k| k.category == "solution").count();
-    let feedback = knowledge.iter().filter(|k| k.category == "verification_feedback").count();
+    let observations = knowledge
+        .iter()
+        .filter(|k| k.category == "observation")
+        .count();
+    let solutions = knowledge
+        .iter()
+        .filter(|k| k.category == "solution")
+        .count();
+    let feedback = knowledge
+        .iter()
+        .filter(|k| k.category == "verification_feedback")
+        .count();
     let unresolved = knowledge.iter().filter(|k| !k.is_resolved).count();
 
     Ok(Json(serde_json::json!({
@@ -13837,7 +14083,7 @@ async fn get_current_execution_steps(
         .iter()
         .filter(|e| e.status == "running")
         .filter_map(|e| e.phase.clone())
-        .last()
+        .next_back()
         .or_else(|| {
             // Fall back to the most recent step's phase (by start_time, already sorted)
             executions
@@ -15652,7 +15898,7 @@ async fn duplicate_context_handler(
                 None
             }
         }
-        "user" | _ => context::get_user_context(&id),
+        _ => context::get_user_context(&id),
     };
 
     let Some(source) = source_ctx else {
@@ -16840,7 +17086,7 @@ async fn import_unified_workflow(
                 overwritten = true;
             }
         }
-        "generate" | _ => {
+        _ => {
             // Always generate a new ID
             workflow.id = uuid::Uuid::new_v4().to_string();
         }
@@ -16876,6 +17122,7 @@ async fn import_unified_workflow(
         log_watch_enabled: workflow.log_watch_enabled,
         health_check_enabled: workflow.health_check_enabled,
         health_check_urls: workflow.health_check_urls.clone(),
+        preflight_check_enabled: workflow.preflight_check_enabled,
     };
 
     // Use the database's create function but with our custom ID
@@ -16992,7 +17239,7 @@ struct RunUnifiedWorkflowRequest {
 
 /// Request body for executing an inline workflow (without saving to database)
 /// Used by Quick Fix to run a workflow directly without cluttering the library
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ExecuteInlineWorkflowRequest {
     /// Workflow name
     name: String,
@@ -17347,6 +17594,32 @@ async fn run_unified_workflow(
                         .filter_map(|v| v.as_str().map(|s| s.to_string()))
                         .collect()
                 }),
+            // Spec fields
+            spec_group_json: step.get("spec_group").cloned(),
+            spec_element_source: step
+                .get("element_source")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            spec_stop_on_failure: step.get("stop_on_failure").and_then(|v| v.as_bool()),
+            spec_prefetched_elements: None,
+            // Error resolved fields
+            error_id: None,
+            error_pattern: None,
+            error_source: None,
+            // Gate fields
+            gate_required_steps: step
+                .get("required_steps")
+                .or_else(|| step.get("gateRequiredSteps"))
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                }),
+            gate_stop_on_failure: step
+                .get("stop_on_failure")
+                .or_else(|| step.get("gateStopOnFailure"))
+                .and_then(|v| v.as_bool()),
         })
     };
 
@@ -17399,6 +17672,55 @@ async fn run_unified_workflow(
                 task_summary: None,
             },
         )));
+    }
+
+    // Pre-fetch external elements for spec steps to avoid HTTP self-call deadlock
+    // (same pattern as execute_inline_workflow)
+    let needs_external_elements = all_steps
+        .iter()
+        .any(|s| s.step_type == "spec" && s.spec_element_source.as_deref() == Some("external"));
+
+    let prefetched_elements = if needs_external_elements {
+        info!("Pre-fetching external elements for spec steps (run endpoint)");
+        match send_extension_command(
+            state.clone(),
+            "getElements",
+            serde_json::json!({"includeNonInteractive": true}),
+            10,
+        )
+        .await
+        {
+            Ok(response) => {
+                let elements = response
+                    .get("elements")
+                    .cloned()
+                    .unwrap_or(serde_json::json!([]));
+                info!(
+                    "Pre-fetched {} external elements",
+                    elements.as_array().map(|a| a.len()).unwrap_or(0)
+                );
+                Some(elements)
+            }
+            Err(e) => {
+                warn!("Failed to pre-fetch external elements: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Inject prefetched elements into spec steps.
+    // When prefetch fails (None) but external specs exist, inject an empty array
+    // to prevent the SpecHandler from making HTTP self-calls that can deadlock.
+    // The React handler will return a clear "No external elements" error.
+    if needs_external_elements {
+        let elements_to_inject = prefetched_elements.unwrap_or_else(|| serde_json::json!([]));
+        for step in &mut all_steps {
+            if step.step_type == "spec" && step.spec_element_source.as_deref() == Some("external") {
+                step.spec_prefetched_elements = Some(elements_to_inject.clone());
+            }
+        }
     }
 
     // Separate automation steps from AI steps using the robust categorize_steps helper.
@@ -17527,6 +17849,11 @@ async fn run_unified_workflow(
             .filter(|s| s.phase.as_deref() == Some("setup"))
             .cloned()
             .collect();
+        // Prepend pre-flight check if enabled (default: true)
+        let setup_automation_steps = crate::unified_workflows::prepend_preflight_check_step(
+            setup_automation_steps,
+            workflow.preflight_check_enabled,
+        );
         // Setup prompt steps (AI tasks during setup)
         let setup_prompt_steps: Vec<_> = prompt_steps
             .iter()
@@ -17611,6 +17938,10 @@ async fn run_unified_workflow(
         // Run the verification-agentic loop using the new modular architecture
         // Timeout priority: request override > workflow setting > None (no timeout)
         let timeout_seconds = request.timeout_seconds.or(workflow.timeout_seconds);
+
+        // For error-fix workflows, run agentic first
+        let run_agentic_first = !workflow.targeted_error_ids.is_empty();
+
         let loop_config = crate::unified_workflow_executor::LoopConfig {
             max_iterations: workflow.max_iterations,
             timeout_seconds, // None = no timeout (default)
@@ -17620,6 +17951,7 @@ async fn run_unified_workflow(
             execution_id: execution_id.clone(),
             targeted_error_ids: workflow.targeted_error_ids.clone(),
             starting_iteration: 0, // Fresh start
+            run_agentic_first,
         };
 
         let mut controller = crate::unified_workflow_executor::LoopController::new(
@@ -17712,6 +18044,28 @@ async fn run_unified_workflow(
     Ok(Json(ApiResponse::success(result)))
 }
 
+/// Stores the last inline workflow request for re-execution via "Run Last Workflow".
+/// Inline workflows aren't saved to the database, so this provides a way to re-run them.
+static LAST_INLINE_WORKFLOW: std::sync::Mutex<Option<serde_json::Value>> =
+    std::sync::Mutex::new(None);
+
+/// Get the last inline workflow definition for re-execution
+async fn get_last_inline_workflow(
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let guard = LAST_INLINE_WORKFLOW
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match guard.as_ref() {
+        Some(workflow) => Ok(Json(ApiResponse::success(workflow.clone()))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(
+                "No inline workflow has been executed yet".to_string(),
+            )),
+        )),
+    }
+}
+
 /// Execute an inline workflow without saving to the database
 ///
 /// This endpoint is used by Quick Fix to run a generated workflow directly
@@ -17725,6 +18079,37 @@ async fn execute_inline_workflow(
     (StatusCode, Json<ApiResponse<()>>),
 > {
     info!("Executing inline workflow: {}", request.name);
+
+    // Check for duplicate running error-fix workflows
+    // This prevents multiple Quick Fix workflows from targeting the same errors
+    if request.name.contains("Fix") && request.name.contains("Error") {
+        if let Ok(Some(existing_id)) = state
+            .app_state
+            .checkpoint_db
+            .has_running_error_fix_workflow()
+        {
+            warn!(
+                "Duplicate error-fix workflow prevented - already running: {}",
+                existing_id
+            );
+            return Err((
+                StatusCode::CONFLICT,
+                Json(api_error(format!(
+                    "An error-fix workflow is already running (task_id: {}). \
+                     Please wait for it to complete or stop it before starting a new one.",
+                    existing_id
+                ))),
+            ));
+        }
+    }
+
+    // Store the request for re-execution via "Run Last Workflow" button
+    if let Ok(request_json) = serde_json::to_value(&request) {
+        let mut guard = LAST_INLINE_WORKFLOW
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = Some(request_json);
+    }
 
     // Create a temporary workflow object (not saved to DB)
     let execution_id = uuid::Uuid::new_v4().to_string();
@@ -17752,6 +18137,7 @@ async fn execute_inline_workflow(
         log_watch_enabled: true,
         health_check_enabled: false,
         health_check_urls: vec![],
+        preflight_check_enabled: true,
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
     };
@@ -17857,6 +18243,51 @@ async fn execute_inline_workflow(
         all_steps.len()
     );
 
+    // Pre-fetch external elements for spec steps to avoid HTTP self-call deadlock
+    // Check if any spec steps need external elements
+    let needs_external_elements = all_steps
+        .iter()
+        .any(|s| s.step_type == "spec" && s.spec_element_source.as_deref() == Some("external"));
+
+    let prefetched_elements = if needs_external_elements {
+        info!("Pre-fetching external elements for spec steps");
+        match send_extension_command(
+            state.clone(),
+            "getElements",
+            serde_json::json!({"includeNonInteractive": true}),
+            10,
+        )
+        .await
+        {
+            Ok(response) => {
+                let elements = response
+                    .get("elements")
+                    .cloned()
+                    .unwrap_or(serde_json::json!([]));
+                info!(
+                    "Pre-fetched {} external elements",
+                    elements.as_array().map(|a| a.len()).unwrap_or(0)
+                );
+                Some(elements)
+            }
+            Err(e) => {
+                warn!("Failed to pre-fetch external elements: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Inject prefetched elements into spec steps
+    if let Some(ref elements) = prefetched_elements {
+        for step in &mut all_steps {
+            if step.step_type == "spec" && step.spec_element_source.as_deref() == Some("external") {
+                step.spec_prefetched_elements = Some(elements.clone());
+            }
+        }
+    }
+
     // Separate steps by type
     let (automation_steps, prompt_steps) = categorize_steps(all_steps, |s| &s.step_type);
 
@@ -17884,6 +18315,11 @@ async fn execute_inline_workflow(
             .filter(|s| s.phase.as_deref() == Some("setup"))
             .cloned()
             .collect();
+        // Prepend pre-flight check if enabled (default: true)
+        let setup_automation_steps = crate::unified_workflows::prepend_preflight_check_step(
+            setup_automation_steps,
+            workflow.preflight_check_enabled,
+        );
         let setup_prompt_steps: Vec<_> = prompt_steps
             .iter()
             .filter(|s| s.phase.as_deref() == Some("setup"))
@@ -17923,7 +18359,7 @@ async fn execute_inline_workflow(
         let mut input = crate::database::CreateTaskRunInput::new(&execution_id, &workflow.name)
             .with_prompt(&combined_prompt)
             .with_task_type("ai")
-            .with_workflow_name(&format!("[Inline] {}", workflow.name))
+            .with_workflow_name(format!("[Inline] {}", workflow.name))
             .with_max_sessions(workflow.max_iterations)
             .with_auto_continue(true)
             .with_workflow_type("unified");
@@ -17940,6 +18376,11 @@ async fn execute_inline_workflow(
         let (completion_automation_steps, completion_prompt_steps) =
             categorize_steps(completion_steps, |s| &s.step_type);
 
+        // For error-fix workflows (with targeted_error_ids), run agentic first.
+        // This ensures the AI attempts to fix errors before verification runs,
+        // since log_watch verification may pass immediately if logs are currently clean.
+        let run_agentic_first = !workflow.targeted_error_ids.is_empty();
+
         let loop_config = crate::unified_workflow_executor::LoopConfig {
             max_iterations: workflow.max_iterations,
             timeout_seconds: request.timeout_seconds,
@@ -17949,6 +18390,7 @@ async fn execute_inline_workflow(
             execution_id: execution_id.clone(),
             targeted_error_ids: workflow.targeted_error_ids.clone(),
             starting_iteration: 0,
+            run_agentic_first,
         };
 
         let mut controller = crate::unified_workflow_executor::LoopController::new(
@@ -17977,7 +18419,7 @@ async fn execute_inline_workflow(
     let execution_steps_json = serde_json::to_string(&automation_steps).ok();
     let mut input = crate::database::CreateTaskRunInput::new(&execution_id, &workflow.name)
         .with_task_type("automation")
-        .with_workflow_name(&format!("[Inline] {}", workflow.name));
+        .with_workflow_name(format!("[Inline] {}", workflow.name));
     if let Some(esj) = execution_steps_json {
         input = input.with_execution_steps_json(esj);
     }
@@ -18440,6 +18882,11 @@ async fn run_workflow_sequence(
                         .filter(|s| s.phase.as_deref() == Some("setup"))
                         .cloned()
                         .collect();
+                    // Prepend pre-flight check if enabled (default: true)
+                    let setup_automation = crate::unified_workflows::prepend_preflight_check_step(
+                        setup_automation,
+                        workflow.preflight_check_enabled,
+                    );
                     let setup_prompts: Vec<_> = prompt_steps
                         .iter()
                         .filter(|s| s.phase.as_deref() == Some("setup"))
@@ -18480,6 +18927,9 @@ async fn run_workflow_sequence(
                     // caused duplicate entries to appear in the running tasks list.
                     let workflow_exec_id = format!("{}-workflow-{}", execution_id_clone, idx + 1);
 
+                    // For error-fix workflows, run agentic first
+                    let run_agentic_first = !workflow.targeted_error_ids.is_empty();
+
                     let loop_config = crate::unified_workflow_executor::LoopConfig {
                         max_iterations: workflow.max_iterations,
                         timeout_seconds: workflow.timeout_seconds, // Use workflow setting
@@ -18489,6 +18939,7 @@ async fn run_workflow_sequence(
                         execution_id: workflow_exec_id,
                         targeted_error_ids: workflow.targeted_error_ids.clone(),
                         starting_iteration: 0, // Fresh start
+                        run_agentic_first,
                     };
 
                     let result = controller
@@ -19063,6 +19514,9 @@ pub fn create_router(
             std::collections::HashMap::new(),
         )),
         extension_connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        extension_last_pong: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        extension_connected_since: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        extension_reconnect_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
 
     // Set up UI Bridge response listener
@@ -19100,6 +19554,39 @@ pub fn create_router(
             }
         });
         info!("UI Bridge: Response listener set up");
+    }
+
+    // Set up Spec Execution response listener
+    // This listens for "spec-execute-response" events from the React frontend
+    // and delivers responses to waiting spec step handlers
+    {
+        let handle = app_handle.clone();
+
+        use tauri::Listener;
+
+        let _listener_id = handle.listen("spec-execute-response", move |event| {
+            // Parse the response payload
+            if let Ok(response) = serde_json::from_str::<serde_json::Value>(event.payload()) {
+                // Spawn a task to handle the response since we need async
+                let runtime = tokio::runtime::Handle::try_current();
+                if let Ok(rt) = runtime {
+                    rt.spawn(async move {
+                        crate::step_executor::handlers::spec::handle_spec_execute_response(
+                            response,
+                        )
+                        .await;
+                    });
+                } else {
+                    warn!("Spec Execute: No tokio runtime available for response handling");
+                }
+            } else {
+                warn!(
+                    "Spec Execute: Failed to parse response payload: {}",
+                    event.payload()
+                );
+            }
+        });
+        info!("Spec Execute: Response listener set up");
     }
 
     // Resume interrupted unified workflows on startup
@@ -19392,7 +19879,10 @@ pub fn create_router(
         )
         // Additional data endpoints for AI agents
         .route("/task-runs/:id/mcp-calls", get(get_task_run_mcp_calls))
-        .route("/task-runs/:id/api-requests", get(get_task_run_api_requests))
+        .route(
+            "/task-runs/:id/api-requests",
+            get(get_task_run_api_requests),
+        )
         .route("/task-runs/:id/awas-steps", get(get_task_run_awas_steps))
         .route("/task-runs/:id/knowledge", get(get_task_run_knowledge))
         .route(
@@ -19526,6 +20016,10 @@ pub fn create_router(
             post(execute_inline_workflow),
         )
         .route(
+            "/unified-workflows/last-inline",
+            get(get_last_inline_workflow),
+        )
+        .route(
             "/unified-workflows/:id/stats",
             get(get_unified_workflow_stats),
         )
@@ -19587,6 +20081,11 @@ pub fn create_router(
         .route(
             "/ui-bridge/control/snapshot",
             get(ui_bridge_get_snapshot_handler),
+        )
+        .route("/ui-bridge/control/specs", get(ui_bridge_get_specs_handler))
+        .route(
+            "/ui-bridge/control/spec/:id",
+            get(ui_bridge_get_spec_handler),
         )
         // UI Bridge Exploration (uses qontinui library via Python bridge)
         .route("/ui-bridge/explore", post(start_ui_bridge_exploration))

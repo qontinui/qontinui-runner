@@ -57,6 +57,9 @@ pub enum KnowledgeCategory {
     VerificationFeedback,
     /// A criterion override with justification
     CriterionOverride,
+    /// Environment or infrastructure issue (PATH, disk space, tools not installed, etc.)
+    /// These require user intervention and should NOT trigger automatic retries.
+    Environment,
 }
 
 impl KnowledgeCategory {
@@ -70,6 +73,7 @@ impl KnowledgeCategory {
             Self::Context => "context",
             Self::VerificationFeedback => "verification_feedback",
             Self::CriterionOverride => "criterion_override",
+            Self::Environment => "environment",
         }
     }
 
@@ -83,8 +87,15 @@ impl KnowledgeCategory {
             "context" => Some(Self::Context),
             "verification_feedback" | "feedback" => Some(Self::VerificationFeedback),
             "criterion_override" | "override" => Some(Self::CriterionOverride),
+            "environment" | "infrastructure" | "env" => Some(Self::Environment),
             _ => None,
         }
+    }
+
+    /// Returns true if this category represents an issue requiring user intervention
+    /// (should not trigger automatic retries).
+    pub fn requires_user_intervention(&self) -> bool {
+        matches!(self, Self::Environment)
     }
 }
 
@@ -226,6 +237,56 @@ impl KnowledgeBase {
         )?;
 
         Ok(stored.id)
+    }
+
+    /// Record an environment/infrastructure issue.
+    ///
+    /// Environment issues are problems with the execution environment (PATH, disk space,
+    /// missing tools, etc.) rather than code issues. These require user intervention
+    /// and should NOT trigger automatic retries.
+    pub fn record_environment_issue(
+        &self,
+        task_run_id: &str,
+        iteration: u32,
+        description: &str,
+        issue_type: &str, // e.g., "path_not_found", "disk_space", "tool_missing", "timeout"
+        affected_checks: &[String],
+    ) -> Result<String, String> {
+        let evidence = format!(
+            "Issue type: {}\nAffected checks: {}",
+            issue_type,
+            affected_checks.join(", ")
+        );
+
+        let stored = self.db.create_task_knowledge(
+            task_run_id,
+            KnowledgeCategory::Environment.as_str(),
+            AgentType::System.as_str(),
+            iteration,
+            description,
+            Some(&evidence),
+            "high", // Environment issues are definitive
+            affected_checks,
+        )?;
+
+        info!(
+            "Recorded environment issue {} (type: {}) for task {} iteration {}: {}",
+            stored.id, issue_type, task_run_id, iteration, description
+        );
+
+        Ok(stored.id)
+    }
+
+    /// Get all environment issues for a task.
+    pub fn get_environment_issues(
+        &self,
+        task_run_id: &str,
+    ) -> Result<Vec<StoredTaskKnowledge>, String> {
+        self.db.list_task_knowledge(
+            task_run_id,
+            Some(KnowledgeCategory::Environment.as_str()),
+            false,
+        )
     }
 
     /// Get all unresolved findings for a task.
@@ -841,6 +902,159 @@ fn build_timing_section(spans: &[ExecutionSpan]) -> Option<String> {
 // Cross-Iteration Context Builder
 // ============================================================================
 
+/// Failure category for verification results
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FailureCategory {
+    /// Environment/infrastructure issues (PATH, disk space, tools not found, timeouts)
+    /// These require user intervention and should NOT trigger automatic retries.
+    Environment,
+    /// Code issues (actual lint/type/test failures)
+    /// These can be fixed by the AI and should trigger retries.
+    Code,
+}
+
+/// Categorize a verification result failure.
+///
+/// Uses heuristics to detect environment issues based on error messages and patterns.
+pub fn categorize_failure(issues: &[String], raw_output: Option<&str>) -> FailureCategory {
+    let combined_text = issues.join(" ").to_lowercase();
+    let raw_lower = raw_output.map(|s| s.to_lowercase()).unwrap_or_default();
+
+    // Environment issue patterns
+    let env_patterns = [
+        // Tool not found
+        "program not found",
+        "not found in path",
+        "is not recognized as an internal or external command",
+        "'npx' is not recognized",
+        "'npm' is not recognized",
+        "'node' is not recognized",
+        "'python' is not recognized",
+        "'cargo' is not recognized",
+        "command not found",
+        "no such file or directory",
+        // Disk space
+        "no space left on device",
+        "disk space",
+        "not enough space",
+        "enospc",
+        "[winerror 112]",
+        // Permission issues
+        "permission denied",
+        "access denied",
+        "operation not permitted",
+        // Network issues
+        "network is unreachable",
+        "connection refused",
+        "etimedout",
+        "econnrefused",
+        // Timeout (when it's a system-level timeout, not test timeout)
+        "timed out after",
+        "check timed out",
+        "operation timed out",
+    ];
+
+    for pattern in env_patterns {
+        if combined_text.contains(pattern) || raw_lower.contains(pattern) {
+            return FailureCategory::Environment;
+        }
+    }
+
+    FailureCategory::Code
+}
+
+/// Build a structured failure summary for AI context.
+///
+/// Separates failures into environment issues (require user intervention) and
+/// code issues (can be fixed by AI). This helps AI understand what to focus on.
+pub fn build_structured_failure_summary(
+    failed_results: &[&crate::database::StoredVerificationResult],
+) -> String {
+    let mut summary = String::new();
+
+    // Categorize failures
+    let mut env_failures: Vec<&crate::database::StoredVerificationResult> = Vec::new();
+    let mut code_failures: Vec<&crate::database::StoredVerificationResult> = Vec::new();
+
+    for result in failed_results {
+        let category = categorize_failure(&result.issues, result.raw_output.as_deref());
+        match category {
+            FailureCategory::Environment => env_failures.push(result),
+            FailureCategory::Code => code_failures.push(result),
+        }
+    }
+
+    // Build summary
+    summary.push_str("## Verification Failure Summary\n\n");
+
+    // Environment issues section
+    if !env_failures.is_empty() {
+        summary.push_str("### ⚠️ Environment Issues (Require User Intervention)\n\n");
+        summary.push_str("**These issues are NOT code problems. They indicate missing tools, configuration issues, or resource constraints. Do NOT attempt to fix these with code changes.**\n\n");
+
+        for result in &env_failures {
+            summary.push_str(&format!(
+                "- **{}** ({})\n",
+                result.criterion_id, result.criterion_type
+            ));
+            for issue in &result.issues {
+                summary.push_str(&format!("  - {}\n", issue));
+            }
+        }
+        summary.push_str("\n**Action Required:** User should verify:\n");
+        summary
+            .push_str("1. Required tools are installed and in PATH (node, npm, python, cargo)\n");
+        summary.push_str("2. Sufficient disk space is available\n");
+        summary.push_str("3. Network connectivity for package downloads\n\n");
+    }
+
+    // Code issues section
+    if !code_failures.is_empty() {
+        summary.push_str(&format!(
+            "### 🔧 Code Issues ({} checks to fix)\n\n",
+            code_failures.len()
+        ));
+        summary.push_str("**These are actual code problems that you should fix:**\n\n");
+
+        for result in &code_failures {
+            let critical = if result.is_critical {
+                " [CRITICAL]"
+            } else {
+                ""
+            };
+            summary.push_str(&format!(
+                "- **{}**{} ({}): {} issues\n",
+                result.criterion_id,
+                critical,
+                result.criterion_type,
+                result.issues.len()
+            ));
+        }
+        summary.push('\n');
+    }
+
+    // Summary stats
+    summary.push_str(&format!(
+        "**Total failures:** {} ({} environment, {} code)\n\n",
+        failed_results.len(),
+        env_failures.len(),
+        code_failures.len()
+    ));
+
+    if env_failures.is_empty() && !code_failures.is_empty() {
+        summary.push_str("All failures are code issues - proceed with fixes.\n\n");
+    } else if !env_failures.is_empty() && code_failures.is_empty() {
+        summary.push_str("All failures are environment issues - no code changes needed.\n");
+        summary.push_str("Consider using `[FINDING:environment:high]` to report these issues.\n\n");
+    } else if !env_failures.is_empty() && !code_failures.is_empty() {
+        summary.push_str(
+            "Fix the code issues. Environment issues will persist until user resolves them.\n\n",
+        );
+    }
+
+    summary
+}
+
 /// Build context for a worker based on accumulated knowledge.
 ///
 /// This creates a context string that can be prepended to the worker's prompt
@@ -914,11 +1128,21 @@ pub fn build_iteration_context_with_compression(
         let failed_results: Vec<_> = verification_results.iter().filter(|r| !r.passed).collect();
         let passed_results: Vec<_> = verification_results.iter().filter(|r| r.passed).collect();
 
-        // Show failed results first (most important for AI to know what to fix)
+        // Add structured failure summary FIRST (helps AI understand what to focus on)
         if !failed_results.is_empty() {
-            context.push_str("#### ❌ Failed Checks\n\n");
+            let structured_summary = build_structured_failure_summary(&failed_results);
+            context.push_str(&structured_summary);
+        }
+
+        // Show detailed failed results
+        if !failed_results.is_empty() {
+            context.push_str("#### Detailed Failed Check Results\n\n");
             for result in failed_results {
-                let critical_marker = if result.is_critical { " [CRITICAL]" } else { "" };
+                let critical_marker = if result.is_critical {
+                    " [CRITICAL]"
+                } else {
+                    ""
+                };
                 context.push_str(&format!(
                     "**{}**{} ({})\n",
                     result.criterion_id, critical_marker, result.criterion_type
@@ -951,7 +1175,11 @@ pub fn build_iteration_context_with_compression(
                 // Add raw output (truncated to avoid context bloat)
                 if let Some(raw_output) = &result.raw_output {
                     let truncated = if raw_output.len() > 2000 {
-                        format!("{}...\n[truncated, {} chars total]", &raw_output[..2000], raw_output.len())
+                        format!(
+                            "{}...\n[truncated, {} chars total]",
+                            &raw_output[..2000],
+                            raw_output.len()
+                        )
                     } else {
                         raw_output.clone()
                     };
@@ -971,7 +1199,10 @@ pub fn build_iteration_context_with_compression(
                 passed_results.len()
             ));
             for result in passed_results.iter().take(5) {
-                context.push_str(&format!("- {} ({})\n", result.criterion_id, result.criterion_type));
+                context.push_str(&format!(
+                    "- {} ({})\n",
+                    result.criterion_id, result.criterion_type
+                ));
             }
             if passed_results.len() > 5 {
                 context.push_str(&format!("- ... and {} more\n", passed_results.len() - 5));
@@ -981,7 +1212,8 @@ pub fn build_iteration_context_with_compression(
 
         // Add instructions for accessing complete data via API
         context.push_str("### Available Data APIs\n\n");
-        context.push_str("The runner database contains detailed execution data. Access via HTTP:\n\n");
+        context
+            .push_str("The runner database contains detailed execution data. Access via HTTP:\n\n");
         context.push_str("**Verification & Testing:**\n");
         context.push_str(&format!(
             "- `curl http://localhost:9876/task-runs/{}/verification-results` - Full test results (issues, observations, raw output)\n",
@@ -1068,7 +1300,9 @@ pub fn build_iteration_context_with_compression(
             "- `curl \"http://localhost:9876/execution-spans?execution_id={}&min_duration_ms=5000\"` - Slow operations (>5s)\n\n",
             task_run_id
         ));
-        context.push_str("Use these APIs when you need more detail than provided in this context.\n\n");
+        context.push_str(
+            "Use these APIs when you need more detail than provided in this context.\n\n",
+        );
     }
 
     // Add unresolved findings

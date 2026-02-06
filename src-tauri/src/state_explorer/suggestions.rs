@@ -278,7 +278,7 @@ impl SuggestionSet {
     }
 
     /// Save suggestion set to disk
-    pub fn save(&self, output_dir: &std::path::PathBuf) -> Result<std::path::PathBuf, String> {
+    pub fn save(&self, output_dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
         let suggestions_dir = output_dir.join("suggestions");
         std::fs::create_dir_all(&suggestions_dir)
             .map_err(|e| format!("Failed to create suggestions directory: {}", e))?;
@@ -296,7 +296,7 @@ impl SuggestionSet {
     }
 
     /// Load suggestion set from disk
-    pub fn load(path: &std::path::PathBuf) -> Result<Self, String> {
+    pub fn load(path: &std::path::Path) -> Result<Self, String> {
         let json = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read suggestions file: {}", e))?;
 

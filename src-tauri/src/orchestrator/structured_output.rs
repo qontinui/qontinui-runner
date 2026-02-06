@@ -423,7 +423,7 @@ pub enum ConfidenceLevel {
 }
 
 impl ConfidenceLevel {
-    pub fn to_confidence(&self) -> Confidence {
+    pub fn to_confidence(self) -> Confidence {
         match self {
             Self::High => Confidence::High,
             Self::Medium => Confidence::Medium,

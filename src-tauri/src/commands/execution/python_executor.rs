@@ -251,7 +251,7 @@ pub fn update_capture_settings(
     })
     .map_err(|e| {
         error!("Failed to access bridge: {}", e);
-        format!("Python executor not initialized. Please start the executor first by clicking 'Start Executor' in the Control tab.")
+        "Python executor not initialized. Please start the executor first by clicking 'Start Executor' in the Control tab.".to_string()
     })?
     .map_err(|e| {
         error!("Failed to update capture settings: {}", e);

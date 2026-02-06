@@ -24,7 +24,7 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A saved baseline from a successful exploration run
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -451,7 +451,7 @@ impl ExplorationBaseline {
     }
 
     /// Save baseline to disk
-    pub fn save(&self, output_dir: &PathBuf) -> Result<PathBuf, String> {
+    pub fn save(&self, output_dir: &Path) -> Result<PathBuf, String> {
         let baseline_dir = output_dir.join("baselines");
         std::fs::create_dir_all(&baseline_dir)
             .map_err(|e| format!("Failed to create baselines directory: {}", e))?;
@@ -589,7 +589,7 @@ impl BaselineDiff {
     }
 
     /// Save diff report to disk
-    pub fn save(&self, output_dir: &PathBuf) -> Result<PathBuf, String> {
+    pub fn save(&self, output_dir: &Path) -> Result<PathBuf, String> {
         let diff_dir = output_dir.join("diffs");
         std::fs::create_dir_all(&diff_dir)
             .map_err(|e| format!("Failed to create diffs directory: {}", e))?;

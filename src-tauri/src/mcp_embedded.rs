@@ -223,7 +223,7 @@ impl EmbeddedMcp {
                 let file = File::open(&path).map_err(|e| format!("Failed to open log: {}", e))?;
                 let reader = BufReader::new(file);
 
-                let lines: Vec<String> = reader.lines().filter_map(Result::ok).collect();
+                let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
                 let entries: Vec<Value> = lines
                     .iter()
                     .rev()

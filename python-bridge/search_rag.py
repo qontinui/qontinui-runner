@@ -78,7 +78,7 @@ async def search_elements(
         # Validate database exists
         if not db_path.exists():
             raise FileNotFoundError(
-                f"Embeddings database not found: {db_path}. " f"Please generate embeddings first."
+                f"Embeddings database not found: {db_path}. Please generate embeddings first."
             )
 
         # Initialize text embedder (same model as used in generate_embeddings.py)

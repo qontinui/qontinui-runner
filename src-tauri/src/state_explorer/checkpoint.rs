@@ -23,7 +23,7 @@
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::report::Discrepancy;
 use super::types::ExplorationConfig;
@@ -150,7 +150,7 @@ impl ExplorationCheckpoint {
     }
 
     /// Save checkpoint to disk
-    pub fn save(&mut self, output_dir: &PathBuf) -> Result<PathBuf, String> {
+    pub fn save(&mut self, output_dir: &Path) -> Result<PathBuf, String> {
         let checkpoint_dir = output_dir.join("checkpoints");
         std::fs::create_dir_all(&checkpoint_dir)
             .map_err(|e| format!("Failed to create checkpoint directory: {}", e))?;

@@ -7,7 +7,7 @@ use crate::commands::AppState;
 use crate::database::TaskRun;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::State;
 use tracing::warn;
@@ -517,7 +517,7 @@ pub struct JsonlLogFileInfo {
 pub async fn get_jsonl_logs_summary() -> Result<AiDataResponse<JsonlLogsSummary>, String> {
     let dev_logs_dir = get_dev_logs_dir();
 
-    fn get_file_info(dir: &PathBuf, filename: &str) -> JsonlLogFileInfo {
+    fn get_file_info(dir: &Path, filename: &str) -> JsonlLogFileInfo {
         let path = dir.join(filename);
         let exists = path.exists();
         let count = if exists {

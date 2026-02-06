@@ -47,6 +47,10 @@ pub enum CheckTool {
     CircularDeps,
     #[serde(rename = "god_class")]
     GodClass,
+    #[serde(rename = "god_class_ts")]
+    GodClassTs,
+    #[serde(rename = "god_class_rust")]
+    GodClassRust,
     Coupling,
     #[serde(rename = "type_coverage_py")]
     TypeCoveragePy,
@@ -748,13 +752,36 @@ pub const CHECK_TOOLS: &[CheckToolInfo] = &[
     },
     CheckToolInfo {
         tool: CheckTool::GodClass,
-        name: "God Class Detector",
-        description: "Find classes that are too large or have too many responsibilities",
+        name: "God Class Detector (Python)",
+        description: "Find Python classes that are too large or have too many responsibilities",
         check_type: CheckType::Analyze,
         language: CheckLanguage::Python,
         supports_auto_fix: false,
         default_command: "",
         config_files: &["pyproject.toml"],
+        install_command: None,
+    },
+    CheckToolInfo {
+        tool: CheckTool::GodClassTs,
+        name: "God Class Detector (TypeScript)",
+        description: "Find TypeScript classes that are too large or have too many responsibilities",
+        check_type: CheckType::Analyze,
+        language: CheckLanguage::Typescript,
+        supports_auto_fix: false,
+        default_command: "",
+        config_files: &["tsconfig.json"],
+        install_command: None,
+    },
+    CheckToolInfo {
+        tool: CheckTool::GodClassRust,
+        name: "God Class Detector (Rust)",
+        description:
+            "Find Rust structs with impl blocks that are too large or have too many methods",
+        check_type: CheckType::Analyze,
+        language: CheckLanguage::Rust,
+        supports_auto_fix: false,
+        default_command: "",
+        config_files: &["Cargo.toml"],
         install_command: None,
     },
     CheckToolInfo {

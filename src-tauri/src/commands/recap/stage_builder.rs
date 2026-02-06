@@ -231,7 +231,7 @@ fn build_stages_from_history(
                 stages.push(StageRecap {
                     stage: phase.to_string(),
                     display_name: get_stage_display_name(phase),
-                    status: compute_stage_status(&[step.clone()], task_run),
+                    status: compute_stage_status(std::slice::from_ref(&step), task_run),
                     started_at,
                     ended_at,
                     duration_ms,

@@ -24,14 +24,17 @@ A browser extension for capturing page DOM and sending it to qontinui-runner for
 ### Step 2: Open Extensions Page
 
 **Chrome:**
+
 - Navigate to `chrome://extensions/` in your address bar
 - Or: Menu (⋮) → Extensions → Manage Extensions
 
 **Edge:**
+
 - Navigate to `edge://extensions/` in your address bar
 - Or: Menu (⋯) → Extensions → Manage Extensions
 
 **Brave:**
+
 - Navigate to `brave://extensions/` in your address bar
 
 ### Step 3: Enable Developer Mode
@@ -113,6 +116,7 @@ You should see the Qontinui DOM Capture extension in your extensions list with a
 ## Privacy
 
 This extension:
+
 - Only activates when you click the extension icon
 - Only sends data to `localhost:9876` (your local qontinui-runner)
 - Does not collect or transmit any data to external servers

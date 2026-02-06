@@ -24,7 +24,7 @@
 
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tracing::debug;
 
@@ -167,7 +167,7 @@ pub fn clear_cache() {
 // ============================================================================
 
 /// Convert a path to a string, handling non-UTF8 paths gracefully.
-pub fn path_to_string(path: &PathBuf) -> String {
+pub fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
 

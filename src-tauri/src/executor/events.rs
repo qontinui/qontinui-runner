@@ -376,7 +376,7 @@ impl EventForwarder {
 
                 // Also check for exploration started/completed/failed events
                 if event.starts_with("ui_bridge_exploration_") {
-                    let channel_name = format!("{}", event.replace('_', "-"));
+                    let channel_name = event.replace('_', "-");
                     if let Err(e) = app_handle.emit(&channel_name, &data) {
                         debug!("Failed to emit {}: {}", channel_name, e);
                     }

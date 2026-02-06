@@ -611,7 +611,7 @@ class CloudStreamingService:
                 self.thumbnails_sent += 1
                 self.bytes_sent += len(thumbnail_bytes)
                 logger.debug(
-                    f"Thumbnail sent: frame={frame_number}, " f"size={len(thumbnail_bytes)} bytes"
+                    f"Thumbnail sent: frame={frame_number}, size={len(thumbnail_bytes)} bytes"
                 )
                 return True
             else:

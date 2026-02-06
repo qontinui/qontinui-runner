@@ -7,39 +7,156 @@
  */
 
 const RUNNER_API = "http://localhost:9876";
-const RUNNER_WS_URL = "ws://localhost:9876/ws/extension";
 
 // =============================================================================
-// WebSocket Connection to Runner (for exploration commands)
+// Offscreen Document Lifecycle (WebSocket connection manager)
 // =============================================================================
 
-let wsConnection = null;
-let wsReconnectTimeout = null;
-let wsConnected = false;
-let wsPendingRequests = new Map(); // requestId -> { resolve, reject, timeout }
+// Track whether the offscreen document exists
+let offscreenCreating = false;
+
+/**
+ * Ensure the offscreen document is created. The offscreen document owns
+ * the WebSocket connection to the runner. It persists independently of the
+ * service worker lifecycle, solving the Chrome MV3 30-second termination problem.
+ */
+async function ensureOffscreenDocument() {
+  // Check if already exists
+  const existingContexts = await chrome.runtime.getContexts({
+    contextTypes: ["OFFSCREEN_DOCUMENT"],
+    documentUrls: [chrome.runtime.getURL("offscreen.html")],
+  });
+
+  if (existingContexts.length > 0) {
+    return; // Already exists
+  }
+
+  // Prevent concurrent creation attempts
+  if (offscreenCreating) {
+    return;
+  }
+
+  offscreenCreating = true;
+  try {
+    await chrome.offscreen.createDocument({
+      url: "offscreen.html",
+      reasons: ["WORKERS"],
+      justification: "Maintains persistent WebSocket connection to qontinui-runner",
+    });
+    console.log("[Qontinui] Offscreen document created for WebSocket connection");
+  } catch (e) {
+    // May already exist from a race condition — that's fine
+    if (!e.message?.includes("Only a single offscreen")) {
+      console.error("[Qontinui] Failed to create offscreen document:", e);
+    }
+  } finally {
+    offscreenCreating = false;
+  }
+}
+
+/**
+ * Send a message to the offscreen document.
+ */
+function sendToOffscreen(message) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error("Offscreen response timeout"));
+    }, 5000);
+
+    try {
+      chrome.runtime.sendMessage(message, (response) => {
+        clearTimeout(timeout);
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+          return;
+        }
+        resolve(response);
+      });
+    } catch (error) {
+      clearTimeout(timeout);
+      reject(error);
+    }
+  });
+}
+
+/**
+ * Send data over WebSocket via the offscreen document.
+ */
+function sendViaOffscreenWebSocket(payload) {
+  sendToOffscreen({ type: "TO_OFFSCREEN_WS_SEND", payload }).catch(() => {
+    // Offscreen doc may not be ready yet, ignore
+  });
+}
+
+// Track connection state as reported by offscreen document
+let offscreenWsConnected = false;
+
+// Create offscreen document on startup
+ensureOffscreenDocument();
+
+// Re-inject content scripts into all existing tabs on extension startup/install.
+// After extension install, update, or reload, content scripts in already-open tabs
+// are stale (their extension context is invalidated). We must re-inject to restore
+// communication with those tabs.
+(async function reinjectContentScripts() {
+  try {
+    const tabs = await chrome.tabs.query({});
+    for (const tab of tabs) {
+      if (
+        !tab.id ||
+        !tab.url ||
+        tab.url.startsWith("chrome://") ||
+        tab.url.startsWith("chrome-extension://") ||
+        tab.url.startsWith("about:")
+      ) {
+        continue;
+      }
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          files: ["content-scripts/ui-bridge-inspector.js"],
+          world: "MAIN",
+        });
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          files: ["content-scripts/ui-bridge-bridge.js"],
+          world: "ISOLATED",
+        });
+      } catch {
+        // Tab may not allow injection (e.g., chrome web store pages)
+      }
+    }
+    console.log("[Qontinui] Re-injected content scripts into existing tabs on startup");
+  } catch (e) {
+    console.error("[Qontinui] Failed to re-inject content scripts:", e);
+  }
+})();
 
 // Selected tab for exploration (null = use active tab)
 let selectedExplorationTabId = null;
 let selectedExplorationTabInfo = null; // { id, url, title } for display
 
 // Load persisted selected tab on startup
-chrome.storage.local.get(['selectedExplorationTabId', 'selectedExplorationTabInfo'], (result) => {
+chrome.storage.local.get(["selectedExplorationTabId", "selectedExplorationTabInfo"], (result) => {
   if (result.selectedExplorationTabId) {
     selectedExplorationTabId = result.selectedExplorationTabId;
     selectedExplorationTabInfo = result.selectedExplorationTabInfo || null;
     console.log("[Qontinui] Restored selected tab from storage:", selectedExplorationTabId);
     // Verify tab still exists
-    chrome.tabs.get(selectedExplorationTabId).then((tab) => {
-      if (tab) {
-        selectedExplorationTabInfo = { id: tab.id, url: tab.url, title: tab.title };
-      }
-    }).catch(() => {
-      // Tab no longer exists, clear selection
-      console.log("[Qontinui] Previously selected tab no longer exists, clearing");
-      selectedExplorationTabId = null;
-      selectedExplorationTabInfo = null;
-      chrome.storage.local.remove(['selectedExplorationTabId', 'selectedExplorationTabInfo']);
-    });
+    chrome.tabs
+      .get(selectedExplorationTabId)
+      .then((tab) => {
+        if (tab) {
+          selectedExplorationTabInfo = { id: tab.id, url: tab.url, title: tab.title };
+        }
+      })
+      .catch(() => {
+        // Tab no longer exists, clear selection
+        console.log("[Qontinui] Previously selected tab no longer exists, clearing");
+        selectedExplorationTabId = null;
+        selectedExplorationTabInfo = null;
+        chrome.storage.local.remove(["selectedExplorationTabId", "selectedExplorationTabInfo"]);
+      });
   }
 });
 
@@ -50,10 +167,10 @@ function persistSelectedTab() {
   if (selectedExplorationTabId !== null) {
     chrome.storage.local.set({
       selectedExplorationTabId,
-      selectedExplorationTabInfo
+      selectedExplorationTabInfo,
     });
   } else {
-    chrome.storage.local.remove(['selectedExplorationTabId', 'selectedExplorationTabInfo']);
+    chrome.storage.local.remove(["selectedExplorationTabId", "selectedExplorationTabInfo"]);
   }
 }
 
@@ -107,9 +224,9 @@ let activeCaptureSession = null;
  * Generate a UUID v4
  */
 function generateUUID() {
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-    const r = Math.random() * 16 | 0;
-    const v = c === 'x' ? r : (r & 0x3 | 0x8);
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function (c) {
+    const r = (Math.random() * 16) | 0;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
     return v.toString(16);
   });
 }
@@ -124,7 +241,7 @@ function startCaptureSession() {
     startedAt: Date.now(),
     captures: [],
     actions: [],
-    fingerprintCatalog: new Map()
+    fingerprintCatalog: new Map(),
   };
   console.log("[Qontinui] Started capture session:", sessionId);
   return { sessionId, startedAt: activeCaptureSession.startedAt };
@@ -142,11 +259,18 @@ function endCaptureSession() {
     ...activeCaptureSession,
     endedAt: Date.now(),
     // Convert Map to object for serialization
-    fingerprintCatalog: Object.fromEntries(activeCaptureSession.fingerprintCatalog)
+    fingerprintCatalog: Object.fromEntries(activeCaptureSession.fingerprintCatalog),
   };
 
-  console.log("[Qontinui] Ended capture session:", session.sessionId,
-    "with", session.captures.length, "captures and", session.actions.length, "actions");
+  console.log(
+    "[Qontinui] Ended capture session:",
+    session.sessionId,
+    "with",
+    session.captures.length,
+    "captures and",
+    session.actions.length,
+    "actions",
+  );
 
   activeCaptureSession = null;
   return session;
@@ -183,11 +307,17 @@ function createCaptureRecord(url, title, elements, triggeredBy = null) {
     title,
     elementFingerprints,
     elementCount: elements.length,
-    triggeredBy: triggeredBy || undefined
+    triggeredBy: triggeredBy || undefined,
   };
 
   activeCaptureSession.captures.push(captureRecord);
-  console.log("[Qontinui] Created capture:", captureId, "with", elementFingerprints.length, "fingerprints");
+  console.log(
+    "[Qontinui] Created capture:",
+    captureId,
+    "with",
+    elementFingerprints.length,
+    "fingerprints",
+  );
 
   return captureRecord;
 }
@@ -204,8 +334,8 @@ function recordAction(actionType, targetFingerprint, beforeCaptureId, afterCaptu
   const actionId = generateUUID();
 
   // Find the before and after captures
-  const beforeCapture = activeCaptureSession.captures.find(c => c.captureId === beforeCaptureId);
-  const afterCapture = activeCaptureSession.captures.find(c => c.captureId === afterCaptureId);
+  const beforeCapture = activeCaptureSession.captures.find((c) => c.captureId === beforeCaptureId);
+  const afterCapture = activeCaptureSession.captures.find((c) => c.captureId === afterCaptureId);
 
   if (!beforeCapture || !afterCapture) {
     console.warn("[Qontinui] Could not find before/after captures for action");
@@ -216,8 +346,8 @@ function recordAction(actionType, targetFingerprint, beforeCaptureId, afterCaptu
   const beforeSet = new Set(beforeCapture.elementFingerprints);
   const afterSet = new Set(afterCapture.elementFingerprints);
 
-  const addedFingerprints = [...afterSet].filter(fp => !beforeSet.has(fp));
-  const removedFingerprints = [...beforeSet].filter(fp => !afterSet.has(fp));
+  const addedFingerprints = [...afterSet].filter((fp) => !beforeSet.has(fp));
+  const removedFingerprints = [...beforeSet].filter((fp) => !afterSet.has(fp));
 
   const actionRecord = {
     actionId,
@@ -227,12 +357,18 @@ function recordAction(actionType, targetFingerprint, beforeCaptureId, afterCaptu
     beforeCaptureId,
     afterCaptureId,
     addedFingerprints,
-    removedFingerprints
+    removedFingerprints,
   };
 
   activeCaptureSession.actions.push(actionRecord);
-  console.log("[Qontinui] Recorded action:", actionType,
-    "added:", addedFingerprints.length, "removed:", removedFingerprints.length);
+  console.log(
+    "[Qontinui] Recorded action:",
+    actionType,
+    "added:",
+    addedFingerprints.length,
+    "removed:",
+    removedFingerprints.length,
+  );
 
   return actionRecord;
 }
@@ -251,127 +387,13 @@ function getCaptureSessionStatus() {
     startedAt: activeCaptureSession.startedAt,
     captureCount: activeCaptureSession.captures.length,
     actionCount: activeCaptureSession.actions.length,
-    uniqueFingerprints: activeCaptureSession.fingerprintCatalog.size
+    uniqueFingerprints: activeCaptureSession.fingerprintCatalog.size,
   };
 }
 
-/**
- * Connect to the runner's WebSocket endpoint
- * Only call this after verifying the runner is available via health check
- */
-function connectWebSocket() {
-  if (wsConnection && (wsConnection.readyState === WebSocket.CONNECTING || wsConnection.readyState === WebSocket.OPEN)) {
-    return;
-  }
-
-  console.log("[Qontinui] Connecting to runner WebSocket:", RUNNER_WS_URL);
-
-  try {
-    wsConnection = new WebSocket(RUNNER_WS_URL);
-
-    wsConnection.onopen = () => {
-      console.log("[Qontinui] WebSocket connected to runner");
-      wsConnected = true;
-      // Clear any pending reconnect
-      if (wsReconnectTimeout) {
-        clearTimeout(wsReconnectTimeout);
-        wsReconnectTimeout = null;
-      }
-    };
-
-    wsConnection.onclose = (event) => {
-      console.log("[Qontinui] WebSocket disconnected:", event.code, event.reason);
-      wsConnected = false;
-      wsConnection = null;
-      // Reject all pending requests
-      for (const [_requestId, pending] of wsPendingRequests.entries()) {
-        clearTimeout(pending.timeout);
-        pending.reject(new Error("WebSocket disconnected"));
-      }
-      wsPendingRequests.clear();
-      // Schedule reconnection (will check health first)
-      scheduleReconnect();
-    };
-
-    wsConnection.onerror = () => {
-      // Don't log - Chrome already logs WebSocket errors
-      // This is expected when runner disconnects
-      wsConnected = false;
-    };
-
-    wsConnection.onmessage = (event) => {
-      try {
-        const message = JSON.parse(event.data);
-        handleWebSocketMessage(message);
-      } catch (e) {
-        console.error("[Qontinui] Failed to parse WebSocket message:", e);
-      }
-    };
-  } catch {
-    // Silently schedule reconnect - don't log errors for expected failures
-    scheduleReconnect();
-  }
-}
-
-/**
- * Schedule WebSocket reconnection
- * Checks if runner is available before attempting to connect
- */
-function scheduleReconnect() {
-  if (wsReconnectTimeout) {
-    return; // Already scheduled
-  }
-  wsReconnectTimeout = setTimeout(() => {
-    wsReconnectTimeout = null;
-    // Check if runner is available before trying to connect
-    fetch(`${RUNNER_API}/health`, { method: "GET" })
-      .then((response) => {
-        if (response.ok) {
-          connectWebSocket();
-        } else {
-          scheduleReconnect();
-        }
-      })
-      .catch(() => {
-        // Runner not available, try again later
-        scheduleReconnect();
-      });
-  }, 5000);
-}
-
-/**
- * Handle incoming WebSocket messages from runner
- */
-async function handleWebSocketMessage(message) {
-  const { type, requestId, action, params } = message;
-
-  if (type === "EXPLORATION_COMMAND") {
-    // Runner is sending an exploration command to execute via the extension
-    console.log("[Qontinui] Received exploration command:", action, requestId);
-    try {
-      const result = await executeExplorationCommand(action, params || {});
-      sendWebSocketResponse(requestId, true, result);
-    } catch (error) {
-      console.error("[Qontinui] Exploration command failed:", error);
-      sendWebSocketResponse(requestId, false, null, error.message);
-    }
-  } else if (type === "EXPLORATION_RESPONSE") {
-    // Response to a request we sent to the runner
-    const pending = wsPendingRequests.get(requestId);
-    if (pending) {
-      clearTimeout(pending.timeout);
-      wsPendingRequests.delete(requestId);
-      if (message.success) {
-        pending.resolve(message.data);
-      } else {
-        pending.reject(new Error(message.error || "Unknown error"));
-      }
-    }
-  } else if (type === "PING") {
-    // Respond to ping with pong
-    sendWebSocketMessage({ type: "PONG", requestId });
-  }
-}
+// NOTE: WebSocket connection management has been moved to the offscreen document
+// (offscreen.js). The service worker no longer owns the WebSocket connection.
+// This eliminates the Chrome MV3 service worker termination problem.
 
 /**
  * Get the target tab for exploration commands.
@@ -410,8 +432,11 @@ async function executeExplorationCommand(action, params) {
       const allTabs = await chrome.tabs.query({});
       return {
         tabs: allTabs
-          .filter(t => t.url && !t.url.startsWith("chrome://") && !t.url.startsWith("chrome-extension://"))
-          .map(t => ({
+          .filter(
+            (t) =>
+              t.url && !t.url.startsWith("chrome://") && !t.url.startsWith("chrome-extension://"),
+          )
+          .map((t) => ({
             id: t.id,
             url: t.url,
             title: t.title,
@@ -433,7 +458,12 @@ async function executeExplorationCommand(action, params) {
             selectedExplorationTabId = params.tabId;
             selectedExplorationTabInfo = { id: tab.id, url: tab.url, title: tab.title };
             persistSelectedTab();
-            console.log("[Qontinui BG] Selected tab for exploration:", tab.url, "tabInfo:", selectedExplorationTabInfo);
+            console.log(
+              "[Qontinui BG] Selected tab for exploration:",
+              tab.url,
+              "tabInfo:",
+              selectedExplorationTabInfo,
+            );
             return { success: true, tabId: params.tabId, url: tab.url, title: tab.title };
           }
         } catch {
@@ -459,7 +489,7 @@ async function executeExplorationCommand(action, params) {
           selectedExplorationTabInfo = { id: tab.id, url: tab.url, title: tab.title };
           return {
             selectedTabId: selectedExplorationTabId,
-            selectedTabInfo: selectedExplorationTabInfo
+            selectedTabInfo: selectedExplorationTabInfo,
           };
         } catch {
           // Tab no longer exists
@@ -478,6 +508,31 @@ async function executeExplorationCommand(action, params) {
         return { url: targetTab.url, title: targetTab.title, id: targetTab.id };
       }
       throw new Error("No active tab found");
+    }
+
+    case "navigateTab": {
+      // Navigate a tab to a new URL
+      const navTabId = params.tabId || selectedExplorationTabId;
+      if (!navTabId) throw new Error("No tabId specified and no tab selected");
+      if (!params.url) throw new Error("No url specified");
+      const updatedTab = await chrome.tabs.update(navTabId, { url: params.url });
+      // Wait for page load
+      await new Promise((resolve) => {
+        const listener = (tabId, changeInfo) => {
+          if (tabId === navTabId && changeInfo.status === "complete") {
+            chrome.tabs.onUpdated.removeListener(listener);
+            resolve();
+          }
+        };
+        chrome.tabs.onUpdated.addListener(listener);
+        // Timeout after 15 seconds
+        setTimeout(() => {
+          chrome.tabs.onUpdated.removeListener(listener);
+          resolve();
+        }, 15000);
+      });
+      const finalTab = await chrome.tabs.get(navTabId);
+      return { id: finalTab.id, url: finalTab.url, title: finalTab.title };
     }
 
     case "capturePageScreenshot": {
@@ -499,7 +554,7 @@ async function executeExplorationCommand(action, params) {
         // Focus the tab's window to ensure we capture the right content
         await chrome.windows.update(targetTab.windowId, { focused: true });
         // Small delay to ensure window is focused
-        await new Promise(r => setTimeout(r, 50));
+        await new Promise((r) => setTimeout(r, 50));
 
         // If scroll-based capture is requested, scroll element into view
         const scrollToElement = params?.scrollToElement === true;
@@ -531,17 +586,24 @@ async function executeExplorationCommand(action, params) {
                 const isLeftOfViewport = elementRight < 0;
                 const isRightOfViewport = elementLeft > viewportWidth;
 
-                const needsScroll = isAboveViewport || isBelowViewport || isLeftOfViewport || isRightOfViewport;
+                const needsScroll =
+                  isAboveViewport || isBelowViewport || isLeftOfViewport || isRightOfViewport;
 
                 if (needsScroll) {
                   // Calculate scroll position to center the element in viewport
-                  const targetScrollY = Math.max(0, originalScrollY + elementTop - (viewportHeight / 2) + (bounds.height / 2));
-                  const targetScrollX = Math.max(0, originalScrollX + elementLeft - (viewportWidth / 2) + (bounds.width / 2));
+                  const targetScrollY = Math.max(
+                    0,
+                    originalScrollY + elementTop - viewportHeight / 2 + bounds.height / 2,
+                  );
+                  const targetScrollX = Math.max(
+                    0,
+                    originalScrollX + elementLeft - viewportWidth / 2 + bounds.width / 2,
+                  );
 
                   window.scrollTo({
                     left: targetScrollX,
                     top: targetScrollY,
-                    behavior: 'instant'
+                    behavior: "instant",
                   });
 
                   // Calculate new element position after scroll
@@ -561,10 +623,10 @@ async function executeExplorationCommand(action, params) {
                       x: bounds.x - scrollDeltaX,
                       y: bounds.y - scrollDeltaY,
                       width: bounds.width,
-                      height: bounds.height
+                      height: bounds.height,
                     },
                     viewportWidth,
-                    viewportHeight
+                    viewportHeight,
                   };
                 }
 
@@ -573,10 +635,10 @@ async function executeExplorationCommand(action, params) {
                   originalScrollX,
                   originalScrollY,
                   viewportWidth,
-                  viewportHeight
+                  viewportHeight,
                 };
               },
-              args: [elementBounds, restoreScroll]
+              args: [elementBounds, restoreScroll],
             });
 
             if (scrollResults && scrollResults[0]?.result) {
@@ -584,7 +646,7 @@ async function executeExplorationCommand(action, params) {
 
               if (scrollInfo.scrolled) {
                 // Wait for scroll to complete and page to render
-                await new Promise(r => setTimeout(r, 100));
+                await new Promise((r) => setTimeout(r, 100));
               }
             }
           } catch (scrollError) {
@@ -606,10 +668,10 @@ async function executeExplorationCommand(action, params) {
                 window.scrollTo({
                   left: originalX,
                   top: originalY,
-                  behavior: 'instant'
+                  behavior: "instant",
                 });
               },
-              args: [scrollInfo.originalScrollX, scrollInfo.originalScrollY]
+              args: [scrollInfo.originalScrollX, scrollInfo.originalScrollY],
             });
           } catch (restoreError) {
             console.warn("[Qontinui] Failed to restore scroll position:", restoreError.message);
@@ -621,15 +683,17 @@ async function executeExplorationCommand(action, params) {
           capturedAt: Date.now(),
           viewport: {
             width: scrollInfo?.viewportWidth || targetTab.width || 0,
-            height: scrollInfo?.viewportHeight || targetTab.height || 0
+            height: scrollInfo?.viewportHeight || targetTab.height || 0,
           },
           tabId: targetTab.id,
           url: targetTab.url,
           // Include scroll info so caller knows if/how the element was scrolled
-          scrollInfo: scrollInfo ? {
-            scrolled: scrollInfo.scrolled,
-            newBounds: scrollInfo.newBounds || null
-          } : null
+          scrollInfo: scrollInfo
+            ? {
+                scrolled: scrollInfo.scrolled,
+                newBounds: scrollInfo.newBounds || null,
+              }
+            : null,
         };
       } catch (e) {
         console.error("[Qontinui] Screenshot capture failed:", e.message);
@@ -662,17 +726,17 @@ async function executeExplorationCommand(action, params) {
       const hideFixedElements = params?.hideFixedElements ?? false;
       const progressRequestId = params?.progressRequestId ?? null;
 
-      // Helper to send progress updates via WebSocket
+      // Helper to send progress updates via WebSocket (through offscreen doc)
       const sendProgress = (currentTile, totalTiles, phase) => {
-        if (progressRequestId && wsConnected) {
-          sendWebSocketMessage({
+        if (progressRequestId && offscreenWsConnected) {
+          sendViaOffscreenWebSocket({
             type: "FULL_PAGE_CAPTURE_PROGRESS",
             requestId: progressRequestId,
             progress: {
               currentTile,
               totalTiles,
-              phase
-            }
+              phase,
+            },
           });
         }
       };
@@ -680,7 +744,7 @@ async function executeExplorationCommand(action, params) {
       try {
         // Focus the tab's window
         await chrome.windows.update(targetTab.windowId, { focused: true });
-        await new Promise(r => setTimeout(r, 50));
+        await new Promise((r) => setTimeout(r, 50));
 
         // Get page dimensions and initial scroll position
         const dimensionResults = await chrome.scripting.executeScript({
@@ -693,7 +757,7 @@ async function executeExplorationCommand(action, params) {
               document.body.offsetWidth,
               document.documentElement.offsetWidth,
               document.body.clientWidth,
-              document.documentElement.clientWidth
+              document.documentElement.clientWidth,
             );
             const totalHeight = Math.max(
               document.body.scrollHeight,
@@ -701,7 +765,7 @@ async function executeExplorationCommand(action, params) {
               document.body.offsetHeight,
               document.documentElement.offsetHeight,
               document.body.clientHeight,
-              document.documentElement.clientHeight
+              document.documentElement.clientHeight,
             );
 
             const viewportWidth = window.innerWidth;
@@ -714,15 +778,15 @@ async function executeExplorationCommand(action, params) {
             // Optionally hide fixed/sticky elements
             let hiddenElements = [];
             if (shouldHideFixed) {
-              const allElements = document.querySelectorAll('*');
-              allElements.forEach(el => {
+              const allElements = document.querySelectorAll("*");
+              allElements.forEach((el) => {
                 const style = window.getComputedStyle(el);
-                if (style.position === 'fixed' || style.position === 'sticky') {
+                if (style.position === "fixed" || style.position === "sticky") {
                   hiddenElements.push({
                     element: el,
-                    originalVisibility: el.style.visibility
+                    originalVisibility: el.style.visibility,
                   });
-                  el.style.visibility = 'hidden';
+                  el.style.visibility = "hidden";
                 }
               });
             }
@@ -734,10 +798,10 @@ async function executeExplorationCommand(action, params) {
               viewportHeight,
               originalScrollX,
               originalScrollY,
-              hiddenCount: hiddenElements.length
+              hiddenCount: hiddenElements.length,
             };
           },
-          args: [hideFixedElements]
+          args: [hideFixedElements],
         });
 
         if (!dimensionResults || !dimensionResults[0]?.result) {
@@ -750,10 +814,12 @@ async function executeExplorationCommand(action, params) {
           viewportWidth,
           viewportHeight,
           originalScrollX,
-          originalScrollY
+          originalScrollY,
         } = dimensionResults[0].result;
 
-        console.log(`[Qontinui] Full page capture: ${totalWidth}x${totalHeight}, viewport: ${viewportWidth}x${viewportHeight}`);
+        console.log(
+          `[Qontinui] Full page capture: ${totalWidth}x${totalHeight}, viewport: ${viewportWidth}x${viewportHeight}`,
+        );
 
         // Calculate tile grid
         const numCols = Math.ceil(totalWidth / viewportWidth);
@@ -763,7 +829,7 @@ async function executeExplorationCommand(action, params) {
         console.log(`[Qontinui] Capturing ${totalTiles} tiles (${numCols}x${numRows})`);
 
         // Send initial progress
-        sendProgress(0, totalTiles, 'capturing');
+        sendProgress(0, totalTiles, "capturing");
 
         const tiles = [];
 
@@ -780,29 +846,31 @@ async function executeExplorationCommand(action, params) {
                 window.scrollTo({
                   left: x,
                   top: y,
-                  behavior: 'instant'
+                  behavior: "instant",
                 });
               },
-              args: [scrollX, scrollY]
+              args: [scrollX, scrollY],
             });
 
             // Wait for scroll to complete and content to render
-            await new Promise(r => setTimeout(r, tileDelay));
+            await new Promise((r) => setTimeout(r, tileDelay));
 
             // Get actual scroll position (may differ if we hit page boundaries)
             const scrollPosResults = await chrome.scripting.executeScript({
               target: { tabId: targetTab.id },
               func: () => ({
                 actualScrollX: window.scrollX,
-                actualScrollY: window.scrollY
-              })
+                actualScrollY: window.scrollY,
+              }),
             });
 
             const actualScrollX = scrollPosResults?.[0]?.result?.actualScrollX ?? scrollX;
             const actualScrollY = scrollPosResults?.[0]?.result?.actualScrollY ?? scrollY;
 
             // Capture the visible viewport
-            const dataUrl = await chrome.tabs.captureVisibleTab(targetTab.windowId, { format: "png" });
+            const dataUrl = await chrome.tabs.captureVisibleTab(targetTab.windowId, {
+              format: "png",
+            });
             const base64 = dataUrl.split(",")[1];
 
             // Calculate tile dimensions (last tiles may be smaller)
@@ -816,18 +884,20 @@ async function executeExplorationCommand(action, params) {
               width: tileWidth,
               height: tileHeight,
               row,
-              col
+              col,
             });
 
-            console.log(`[Qontinui] Captured tile ${tiles.length}/${totalTiles} at (${actualScrollX}, ${actualScrollY})`);
+            console.log(
+              `[Qontinui] Captured tile ${tiles.length}/${totalTiles} at (${actualScrollX}, ${actualScrollY})`,
+            );
 
             // Send progress update
-            sendProgress(tiles.length, totalTiles, 'capturing');
+            sendProgress(tiles.length, totalTiles, "capturing");
           }
         }
 
         // Send stitching phase progress
-        sendProgress(totalTiles, totalTiles, 'stitching');
+        sendProgress(totalTiles, totalTiles, "stitching");
 
         // Restore original scroll position and show fixed elements
         await chrome.scripting.executeScript({
@@ -836,17 +906,17 @@ async function executeExplorationCommand(action, params) {
             window.scrollTo({
               left: origX,
               top: origY,
-              behavior: 'instant'
+              behavior: "instant",
             });
 
             // Note: We can't restore the original elements since we don't have references
             // In a future version, we could use a unique identifier system
           },
-          args: [originalScrollX, originalScrollY, hideFixedElements]
+          args: [originalScrollX, originalScrollY, hideFixedElements],
         });
 
         // Send completion progress
-        sendProgress(totalTiles, totalTiles, 'complete');
+        sendProgress(totalTiles, totalTiles, "complete");
 
         return {
           tiles,
@@ -856,7 +926,7 @@ async function executeExplorationCommand(action, params) {
           viewportHeight,
           capturedAt: Date.now(),
           tabId: targetTab.id,
-          url: targetTab.url
+          url: targetTab.url,
         };
       } catch (e) {
         console.error("[Qontinui] Full page screenshot capture failed:", e.message);
@@ -912,7 +982,7 @@ async function executeExplorationCommand(action, params) {
       return {
         ...activeCaptureSession,
         exportedAt: Date.now(),
-        fingerprintCatalog: Object.fromEntries(activeCaptureSession.fingerprintCatalog)
+        fingerprintCatalog: Object.fromEntries(activeCaptureSession.fingerprintCatalog),
       };
     }
 
@@ -942,19 +1012,19 @@ async function executeExplorationCommand(action, params) {
         await chrome.scripting.executeScript({
           target: { tabId: tabId },
           files: ["content-scripts/ui-bridge-recorder.js"],
-          world: "MAIN"
+          world: "MAIN",
         });
         await chrome.scripting.executeScript({
           target: { tabId: tabId },
           files: ["content-scripts/ui-bridge-recorder-bridge.js"],
-          world: "ISOLATED"
+          world: "ISOLATED",
         });
       } catch (e) {
         console.log("[Qontinui] Could not inject recorder scripts:", e.message);
       }
 
       // Small delay for scripts to initialize
-      await new Promise(r => setTimeout(r, 100));
+      await new Promise((r) => setTimeout(r, 100));
 
       // Send start command to content script
       return new Promise((resolve, reject) => {
@@ -986,9 +1056,11 @@ async function executeExplorationCommand(action, params) {
                 initialSnapshot: response.data.initialSnapshot,
               });
             } else {
-              reject(new Error(response?.data?.error || response?.error || "Failed to start recording"));
+              reject(
+                new Error(response?.data?.error || response?.error || "Failed to start recording"),
+              );
             }
-          }
+          },
         );
       });
     }
@@ -1008,7 +1080,10 @@ async function executeExplorationCommand(action, params) {
           (_response) => {
             if (chrome.runtime.lastError) {
               // Tab might be closed, still return what we have
-              console.warn("[Qontinui] Could not stop recording cleanly:", chrome.runtime.lastError.message);
+              console.warn(
+                "[Qontinui] Could not stop recording cleanly:",
+                chrome.runtime.lastError.message,
+              );
             }
 
             const result = {
@@ -1021,9 +1096,13 @@ async function executeExplorationCommand(action, params) {
 
             // Clear recording session
             activeRecordingSession = null;
-            console.log("[Qontinui] Recording stopped. Captured", result.snapshotCount, "snapshots");
+            console.log(
+              "[Qontinui] Recording stopped. Captured",
+              result.snapshotCount,
+              "snapshots",
+            );
             resolve(result);
-          }
+          },
         );
       });
     }
@@ -1072,7 +1151,7 @@ async function executeExplorationCommand(action, params) {
               return;
             }
             resolve(response?.data || { success: false });
-          }
+          },
         );
       });
     }
@@ -1087,7 +1166,13 @@ async function executeExplorationCommand(action, params) {
   // Handle exploration actions
   switch (action) {
     case "ping":
-      return { available: true, tabId: tab.id, url: tab.url, title: tab.title, isSelectedTab: tab.id === selectedExplorationTabId };
+      return {
+        available: true,
+        tabId: tab.id,
+        url: tab.url,
+        title: tab.title,
+        isSelectedTab: tab.id === selectedExplorationTabId,
+      };
 
     case "connect": {
       // Connect to the tab (verify UI Bridge is available)
@@ -1101,12 +1186,12 @@ async function executeExplorationCommand(action, params) {
           await chrome.scripting.executeScript({
             target: { tabId: tab.id },
             files: ["content-scripts/ui-bridge-inspector.js"],
-            world: "MAIN"
+            world: "MAIN",
           });
           await chrome.scripting.executeScript({
             target: { tabId: tab.id },
             files: ["content-scripts/ui-bridge-bridge.js"],
-            world: "ISOLATED"
+            world: "ISOLATED",
           });
           if (attempt === 0) {
             console.log("[Qontinui] Injected content scripts into tab", tab.id);
@@ -1120,7 +1205,7 @@ async function executeExplorationCommand(action, params) {
 
         // Wait for scripts to initialize (longer on retries)
         const delay = baseDelay * (attempt + 1);
-        await new Promise(r => setTimeout(r, delay));
+        await new Promise((r) => setTimeout(r, delay));
 
         try {
           const result = await new Promise((resolve, reject) => {
@@ -1129,24 +1214,37 @@ async function executeExplorationCommand(action, params) {
               { type: "UI_BRIDGE_COMMAND", action: "ping", params: {} },
               (response) => {
                 if (chrome.runtime.lastError) {
-                  reject(new Error(chrome.runtime.lastError.message || "Failed to communicate with content script. Try refreshing the page."));
+                  reject(
+                    new Error(
+                      chrome.runtime.lastError.message ||
+                        "Failed to communicate with content script. Try refreshing the page.",
+                    ),
+                  );
                   return;
                 }
                 if (response && response.success) {
-                  resolve({ tabId: tab.id, url: tab.url, title: tab.title, isSelectedTab: tab.id === selectedExplorationTabId });
+                  resolve({
+                    tabId: tab.id,
+                    url: tab.url,
+                    title: tab.title,
+                    isSelectedTab: tab.id === selectedExplorationTabId,
+                  });
                 } else {
                   reject(new Error(response?.error || "UI Bridge not available on this page"));
                 }
-              }
+              },
             );
           });
           return result; // Success - return immediately
         } catch (error) {
-          const isConnectionError = error.message.includes("Could not establish connection") ||
-                                    error.message.includes("Receiving end does not exist");
+          const isConnectionError =
+            error.message.includes("Could not establish connection") ||
+            error.message.includes("Receiving end does not exist");
 
           if (isConnectionError && attempt < maxRetries - 1) {
-            console.log(`[Qontinui] connect attempt ${attempt + 1} failed with connection error, retrying...`);
+            console.log(
+              `[Qontinui] connect attempt ${attempt + 1} failed with connection error, retrying...`,
+            );
             continue;
           }
           throw error;
@@ -1168,12 +1266,12 @@ async function executeExplorationCommand(action, params) {
           await chrome.scripting.executeScript({
             target: { tabId: tab.id },
             files: ["content-scripts/ui-bridge-inspector.js"],
-            world: "MAIN"
+            world: "MAIN",
           });
           await chrome.scripting.executeScript({
             target: { tabId: tab.id },
             files: ["content-scripts/ui-bridge-bridge.js"],
-            world: "ISOLATED"
+            world: "ISOLATED",
           });
         } catch {
           // Ignore - scripts may already exist
@@ -1181,7 +1279,7 @@ async function executeExplorationCommand(action, params) {
 
         // Wait for scripts to initialize (longer on retries)
         const delay = baseDelay * (attempt + 1);
-        await new Promise(r => setTimeout(r, delay));
+        await new Promise((r) => setTimeout(r, delay));
 
         try {
           const result = await new Promise((resolve, reject) => {
@@ -1198,17 +1296,20 @@ async function executeExplorationCommand(action, params) {
                 } else {
                   reject(new Error(response?.error || "Failed to get elements"));
                 }
-              }
+              },
             );
           });
           return result; // Success - return immediately
         } catch (error) {
-          const isConnectionError = error.message.includes("Could not establish connection") ||
-                                    error.message.includes("Receiving end does not exist");
+          const isConnectionError =
+            error.message.includes("Could not establish connection") ||
+            error.message.includes("Receiving end does not exist");
 
           if (isConnectionError && attempt < maxRetries - 1) {
             // Transient connection error - retry after backoff
-            console.log(`[Qontinui] getElements attempt ${attempt + 1} failed with connection error, retrying...`);
+            console.log(
+              `[Qontinui] getElements attempt ${attempt + 1} failed with connection error, retrying...`,
+            );
             continue;
           }
           // Non-connection error or final attempt - throw
@@ -1232,12 +1333,12 @@ async function executeExplorationCommand(action, params) {
           await chrome.scripting.executeScript({
             target: { tabId: tab.id },
             files: ["content-scripts/ui-bridge-inspector.js"],
-            world: "MAIN"
+            world: "MAIN",
           });
           await chrome.scripting.executeScript({
             target: { tabId: tab.id },
             files: ["content-scripts/ui-bridge-bridge.js"],
-            world: "ISOLATED"
+            world: "ISOLATED",
           });
         } catch {
           // Ignore - scripts may already exist
@@ -1245,7 +1346,7 @@ async function executeExplorationCommand(action, params) {
 
         // Wait for scripts to initialize (longer on retries)
         const delay = baseDelay * (attempt + 1);
-        await new Promise(r => setTimeout(r, delay));
+        await new Promise((r) => setTimeout(r, delay));
 
         try {
           const result = await new Promise((resolve, reject) => {
@@ -1262,16 +1363,19 @@ async function executeExplorationCommand(action, params) {
                 } else {
                   reject(new Error(response?.error || "Failed to execute action"));
                 }
-              }
+              },
             );
           });
           return result; // Success - return immediately
         } catch (error) {
-          const isConnectionError = error.message.includes("Could not establish connection") ||
-                                    error.message.includes("Receiving end does not exist");
+          const isConnectionError =
+            error.message.includes("Could not establish connection") ||
+            error.message.includes("Receiving end does not exist");
 
           if (isConnectionError && attempt < maxRetries - 1) {
-            console.log(`[Qontinui] executeAction attempt ${attempt + 1} failed with connection error, retrying...`);
+            console.log(
+              `[Qontinui] executeAction attempt ${attempt + 1} failed with connection error, retrying...`,
+            );
             continue;
           }
           throw error;
@@ -1279,6 +1383,93 @@ async function executeExplorationCommand(action, params) {
       }
 
       throw new Error("executeAction failed after retries");
+    }
+
+    case "navigate": {
+      // Navigate the connected tab to a new URL
+      if (!params?.url) throw new Error("No url specified");
+      // Use chrome.tabs.update for reliable navigation
+      await chrome.tabs.update(tab.id, { url: params.url });
+      // Wait for page load
+      await new Promise((resolve) => {
+        const listener = (tabId, changeInfo) => {
+          if (tabId === tab.id && changeInfo.status === "complete") {
+            chrome.tabs.onUpdated.removeListener(listener);
+            resolve();
+          }
+        };
+        chrome.tabs.onUpdated.addListener(listener);
+        setTimeout(() => {
+          chrome.tabs.onUpdated.removeListener(listener);
+          resolve();
+        }, 15000);
+      });
+      const finalTab = await chrome.tabs.get(tab.id);
+      return { id: finalTab.id, url: finalTab.url, title: finalTab.title };
+    }
+
+    case "getSpecs": {
+      // Get spec configs from the page's SpecStore
+      // Uses retry logic with exponential backoff to handle transient connection failures
+      const maxRetries = 3;
+      const baseDelay = 200;
+
+      for (let attempt = 0; attempt < maxRetries; attempt++) {
+        // Try to inject scripts if not already there
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            files: ["content-scripts/ui-bridge-inspector.js"],
+            world: "MAIN",
+          });
+          await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            files: ["content-scripts/ui-bridge-bridge.js"],
+            world: "ISOLATED",
+          });
+        } catch {
+          // Ignore - scripts may already exist
+        }
+
+        // Wait for scripts to initialize (longer on retries)
+        const delay = baseDelay * (attempt + 1);
+        await new Promise((r) => setTimeout(r, delay));
+
+        try {
+          const result = await new Promise((resolve, reject) => {
+            chrome.tabs.sendMessage(
+              tab.id,
+              { type: "UI_BRIDGE_COMMAND", action: "getSpecs", params: params || {} },
+              (response) => {
+                if (chrome.runtime.lastError) {
+                  reject(new Error(chrome.runtime.lastError.message));
+                  return;
+                }
+                if (response && response.success) {
+                  resolve(response.data);
+                } else {
+                  reject(new Error(response?.error || "Failed to get specs"));
+                }
+              },
+            );
+          });
+          return result; // Success - return immediately
+        } catch (error) {
+          const isConnectionError =
+            error.message.includes("Could not establish connection") ||
+            error.message.includes("Receiving end does not exist");
+
+          if (isConnectionError && attempt < maxRetries - 1) {
+            console.log(
+              `[Qontinui] getSpecs attempt ${attempt + 1} failed with connection error, retrying...`,
+            );
+            continue;
+          }
+          throw error;
+        }
+      }
+
+      throw new Error("getSpecs failed after retries");
     }
 
     case "captureSnapshot": {
@@ -1293,12 +1484,12 @@ async function executeExplorationCommand(action, params) {
           await chrome.scripting.executeScript({
             target: { tabId: tab.id },
             files: ["content-scripts/ui-bridge-inspector.js"],
-            world: "MAIN"
+            world: "MAIN",
           });
           await chrome.scripting.executeScript({
             target: { tabId: tab.id },
             files: ["content-scripts/ui-bridge-bridge.js"],
-            world: "ISOLATED"
+            world: "ISOLATED",
           });
         } catch {
           // Ignore - scripts may already exist
@@ -1306,7 +1497,7 @@ async function executeExplorationCommand(action, params) {
 
         // Wait for scripts to initialize (longer on retries)
         const delay = baseDelay * (attempt + 1);
-        await new Promise(r => setTimeout(r, delay));
+        await new Promise((r) => setTimeout(r, delay));
 
         try {
           const result = await new Promise((resolve, reject) => {
@@ -1327,16 +1518,19 @@ async function executeExplorationCommand(action, params) {
                 } else {
                   reject(new Error(response?.error || "Failed to capture snapshot"));
                 }
-              }
+              },
             );
           });
           return result; // Success - return immediately
         } catch (error) {
-          const isConnectionError = error.message.includes("Could not establish connection") ||
-                                    error.message.includes("Receiving end does not exist");
+          const isConnectionError =
+            error.message.includes("Could not establish connection") ||
+            error.message.includes("Receiving end does not exist");
 
           if (isConnectionError && attempt < maxRetries - 1) {
-            console.log(`[Qontinui] captureSnapshot attempt ${attempt + 1} failed with connection error, retrying...`);
+            console.log(
+              `[Qontinui] captureSnapshot attempt ${attempt + 1} failed with connection error, retrying...`,
+            );
             continue;
           }
           throw error;
@@ -1352,86 +1546,11 @@ async function executeExplorationCommand(action, params) {
 }
 
 /**
- * Send a response back to the runner via WebSocket
- */
-function sendWebSocketResponse(requestId, success, data, error = null) {
-  sendWebSocketMessage({
-    type: "EXPLORATION_RESPONSE",
-    requestId,
-    success,
-    data,
-    error,
-  });
-}
-
-/**
- * Send a message to the runner via WebSocket
- */
-function sendWebSocketMessage(message) {
-  if (wsConnection && wsConnection.readyState === WebSocket.OPEN) {
-    wsConnection.send(JSON.stringify(message));
-  } else {
-    console.warn("[Qontinui] Cannot send WebSocket message - not connected");
-  }
-}
-
-/**
- * Send a request to the runner and wait for response
- */
-function _sendWebSocketRequest(action, params = {}) {
-  return new Promise((resolve, reject) => {
-    if (!wsConnection || wsConnection.readyState !== WebSocket.OPEN) {
-      reject(new Error("WebSocket not connected"));
-      return;
-    }
-
-    const requestId = `ext-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-    const timeout = setTimeout(() => {
-      wsPendingRequests.delete(requestId);
-      reject(new Error(`Request timed out: ${action}`));
-    }, 30000); // 30 second timeout
-
-    wsPendingRequests.set(requestId, { resolve, reject, timeout });
-
-    sendWebSocketMessage({
-      type: "EXTENSION_REQUEST",
-      requestId,
-      action,
-      params,
-    });
-  });
-}
-
-/**
- * Check if WebSocket is connected to runner
+ * Check if the offscreen document's WebSocket is connected to runner.
+ * Uses the locally cached state (updated via OFFSCREEN_WS_STATE messages).
  */
 function isWebSocketConnected() {
-  return wsConnected && wsConnection && wsConnection.readyState === WebSocket.OPEN;
-}
-
-/**
- * Initialize WebSocket connection after a delay
- * This is called at the end of the file after all functions are defined
- */
-function initializeWebSocket() {
-  // Delay to allow service worker to fully initialize
-  setTimeout(() => {
-    // Check if runner is available before trying to connect
-    fetch(`${RUNNER_API}/health`, { method: "GET" })
-      .then((response) => {
-        if (response.ok) {
-          console.log("[Qontinui] Runner available, connecting WebSocket");
-          connectWebSocket();
-        } else {
-          console.log("[Qontinui] Runner returned non-OK status, scheduling reconnect");
-          scheduleReconnect();
-        }
-      })
-      .catch(() => {
-        console.log("[Qontinui] Runner not available, scheduling WebSocket reconnect");
-        scheduleReconnect();
-      });
-  }, 1000);
+  return offscreenWsConnected;
 }
 
 // =============================================================================
@@ -1467,38 +1586,38 @@ function persistState() {
 
 // Patterns to filter out (noise)
 const FILTER_PATTERNS = [
-  /\/api\/dev-debug\//,           // Dev debug endpoints
-  /\/monitors$/,                   // Monitor polling
-  /\/status$/,                     // Status polling
-  /\/health$/,                     // Health checks
-  /\/auth\/jwt\/refresh/,          // Token refresh
-  /\/auth\/refresh/,               // Token refresh
-  /\/_next\//,                     // Next.js internals
-  /\/favicon\.ico/,                // Favicons
+  /\/api\/dev-debug\//, // Dev debug endpoints
+  /\/monitors$/, // Monitor polling
+  /\/status$/, // Status polling
+  /\/health$/, // Health checks
+  /\/auth\/jwt\/refresh/, // Token refresh
+  /\/auth\/refresh/, // Token refresh
+  /\/_next\//, // Next.js internals
+  /\/favicon\.ico/, // Favicons
   /\.(js|css|png|jpg|jpeg|gif|svg|woff|woff2|ttf|eot)(\?|$)/i, // Static assets
-  /^chrome-extension:\/\//,        // Extension requests
-  /sockjs-node/,                   // Hot reload
-  /webpack/,                       // Webpack dev server
+  /^chrome-extension:\/\//, // Extension requests
+  /sockjs-node/, // Hot reload
+  /webpack/, // Webpack dev server
 ];
 
 // Domains to completely ignore (streaming, analytics, ads, etc.)
 const IGNORED_DOMAINS = [
-  /googlevideo\.com$/,             // YouTube video streaming
-  /youtube\.com$/,                 // YouTube API
-  /accounts\.google\.com$/,        // Google auth
-  /accounts\.youtube\.com$/,       // YouTube auth
-  /google-analytics\.com$/,        // Analytics
-  /googletagmanager\.com$/,        // Tag manager
-  /doubleclick\.net$/,             // Ads
-  /facebook\.com$/,                // Facebook
-  /fbcdn\.net$/,                   // Facebook CDN
-  /twitter\.com$/,                 // Twitter
-  /analytics/,                     // Generic analytics
-  /telemetry/,                     // Telemetry
-  /sentry\.io$/,                   // Error tracking
-  /hotjar\.com$/,                  // Heatmaps
-  /intercom\.io$/,                 // Chat widgets
-  /clarity\.ms$/,                  // Microsoft Clarity
+  /googlevideo\.com$/, // YouTube video streaming
+  /youtube\.com$/, // YouTube API
+  /accounts\.google\.com$/, // Google auth
+  /accounts\.youtube\.com$/, // YouTube auth
+  /google-analytics\.com$/, // Analytics
+  /googletagmanager\.com$/, // Tag manager
+  /doubleclick\.net$/, // Ads
+  /facebook\.com$/, // Facebook
+  /fbcdn\.net$/, // Facebook CDN
+  /twitter\.com$/, // Twitter
+  /analytics/, // Generic analytics
+  /telemetry/, // Telemetry
+  /sentry\.io$/, // Error tracking
+  /hotjar\.com$/, // Heatmaps
+  /intercom\.io$/, // Chat widgets
+  /clarity\.ms$/, // Microsoft Clarity
 ];
 
 // Methods to prioritize (show first)
@@ -1509,14 +1628,14 @@ const PRIORITY_METHODS = ["POST", "PUT", "PATCH", "DELETE"];
  */
 function shouldFilterUrl(url) {
   // Check URL patterns
-  if (FILTER_PATTERNS.some(pattern => pattern.test(url))) {
+  if (FILTER_PATTERNS.some((pattern) => pattern.test(url))) {
     return true;
   }
 
   // Check domain
   try {
     const urlObj = new URL(url);
-    if (IGNORED_DOMAINS.some(pattern => pattern.test(urlObj.hostname))) {
+    if (IGNORED_DOMAINS.some((pattern) => pattern.test(urlObj.hostname))) {
       return true;
     }
   } catch {
@@ -1682,9 +1801,9 @@ chrome.webRequest.onBeforeRequest.addListener(
         // Raw bytes - try to decode as text
         try {
           const decoder = new TextDecoder("utf-8");
-          const bytes = details.requestBody.raw.map(r => r.bytes).filter(Boolean);
+          const bytes = details.requestBody.raw.map((r) => r.bytes).filter(Boolean);
           if (bytes.length > 0) {
-            body = bytes.map(b => decoder.decode(b)).join("");
+            body = bytes.map((b) => decoder.decode(b)).join("");
             bodySource = "webRequest.raw";
           }
         } catch (e) {
@@ -1706,7 +1825,6 @@ chrome.webRequest.onBeforeRequest.addListener(
       }
     }
 
-
     // Store initial request data
     requestIdToData.set(details.requestId, {
       id: details.requestId,
@@ -1719,7 +1837,7 @@ chrome.webRequest.onBeforeRequest.addListener(
     });
   },
   { urls: ["<all_urls>"] },
-  ["requestBody"]
+  ["requestBody"],
 );
 
 // Capture request headers
@@ -1741,7 +1859,7 @@ chrome.webRequest.onSendHeaders.addListener(
     requestData.headers = headers;
   },
   { urls: ["<all_urls>"] },
-  ["requestHeaders", "extraHeaders"]
+  ["requestHeaders", "extraHeaders"],
 );
 
 // Finalize request when it completes
@@ -1755,11 +1873,19 @@ chrome.webRequest.onCompleted.addListener(
     // Second chance: Try to find intercepted body if we didn't get one earlier
     // This handles the timing case where the interceptor message arrives after onBeforeRequest
     if (!requestData.body) {
-      const interceptedBody = findInterceptedBody(requestData.method, requestData.url, requestData.timestamp);
+      const interceptedBody = findInterceptedBody(
+        requestData.method,
+        requestData.url,
+        requestData.timestamp,
+      );
       if (interceptedBody) {
         requestData.body = interceptedBody;
         requestData.bodySource = "interceptor-delayed";
-        console.log("[Qontinui] Found intercepted body (delayed) for", requestData.method, requestData.url);
+        console.log(
+          "[Qontinui] Found intercepted body (delayed) for",
+          requestData.method,
+          requestData.url,
+        );
       }
     }
 
@@ -1776,9 +1902,15 @@ chrome.webRequest.onCompleted.addListener(
     // Persist state so requests aren't lost if service worker terminates
     persistState();
 
-    console.log("[Qontinui] Captured:", details.method, details.url, details.statusCode, requestData.body ? "(with body)" : "(no body)");
+    console.log(
+      "[Qontinui] Captured:",
+      details.method,
+      details.url,
+      details.statusCode,
+      requestData.body ? "(with body)" : "(no body)",
+    );
   },
-  { urls: ["<all_urls>"] }
+  { urls: ["<all_urls>"] },
 );
 
 // Handle request errors
@@ -1787,7 +1919,7 @@ chrome.webRequest.onErrorOccurred.addListener(
     if (!isRecording) return;
     requestIdToData.delete(details.requestId);
   },
-  { urls: ["<all_urls>"] }
+  { urls: ["<all_urls>"] },
 );
 
 /**
@@ -1924,8 +2056,82 @@ async function captureCurrentTab(selector = null) {
   return result;
 }
 
-// Handle messages from popup and content scripts
+// Handle messages from popup, content scripts, and offscreen document
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // =============================================================================
+  // Messages from Offscreen Document (WebSocket connection manager)
+  // =============================================================================
+
+  // Offscreen doc received an exploration command from runner via WebSocket
+  if (message.type === "OFFSCREEN_EXPLORATION_COMMAND") {
+    (async () => {
+      try {
+        console.log(
+          "[Qontinui] Executing exploration command from offscreen:",
+          message.action,
+          message.requestId,
+        );
+        const result = await executeExplorationCommand(
+          message.action,
+          message.params || {},
+        );
+        sendResponse({ success: true, data: result });
+      } catch (error) {
+        console.error("[Qontinui] Exploration command failed:", error);
+        sendResponse({ success: false, error: error.message });
+      }
+    })();
+    return true; // Async response
+  }
+
+  // Offscreen doc reporting WebSocket connection state change
+  if (message.type === "OFFSCREEN_WS_STATE") {
+    offscreenWsConnected = message.connected;
+    console.log(
+      "[Qontinui] WebSocket state update from offscreen:",
+      message.connected ? "connected" : "disconnected",
+      "reconnects:",
+      message.reconnectCount,
+    );
+    return false;
+  }
+
+  // Offscreen doc requesting content script re-injection after reconnect
+  if (message.type === "OFFSCREEN_REQUEST_REINJECT") {
+    (async () => {
+      try {
+        const tabId = selectedExplorationTabId;
+        if (!tabId) {
+          console.log("[Qontinui] No selected tab for re-injection, skipping");
+          return;
+        }
+        console.log("[Qontinui] Re-injecting content scripts into tab", tabId);
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId },
+            files: ["content-scripts/ui-bridge-inspector.js"],
+            world: "MAIN",
+          });
+          await chrome.scripting.executeScript({
+            target: { tabId },
+            files: ["content-scripts/ui-bridge-bridge.js"],
+            world: "ISOLATED",
+          });
+          console.log("[Qontinui] Content scripts re-injected into tab", tabId);
+        } catch (e) {
+          console.log("[Qontinui] Could not re-inject content scripts:", e.message);
+        }
+      } catch (e) {
+        console.error("[Qontinui] Re-injection error:", e);
+      }
+    })();
+    return false;
+  }
+
+  // =============================================================================
+  // Messages from Content Scripts and Popup
+  // =============================================================================
+
   // Handle intercepted request body from content script
   if (message.action === "interceptedRequestBody") {
     if (!isRecording || !message.data || shouldFilterUrl(message.data.url)) {
@@ -1941,7 +2147,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       body: data.body,
       headers: data.headers,
       timestamp: data.timestamp,
-      source: data.source // 'fetch' or 'xhr'
+      source: data.source, // 'fetch' or 'xhr'
     });
 
     // Clean up old entries (older than 30 seconds)
@@ -1952,7 +2158,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
     }
 
-    console.log("[Qontinui] Stored intercepted body from", data.source, "for", data.method, data.url);
+    console.log(
+      "[Qontinui] Stored intercepted body from",
+      data.source,
+      "for",
+      data.method,
+      data.url,
+    );
     return false; // No async response needed
   }
 
@@ -1991,24 +2203,33 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // =============================================================================
 
   if (message.action === "getSelectedTab") {
-    console.log("[Qontinui BG] getSelectedTab handler called, current state:", { selectedExplorationTabId, selectedExplorationTabInfo });
+    console.log("[Qontinui BG] getSelectedTab handler called, current state:", {
+      selectedExplorationTabId,
+      selectedExplorationTabInfo,
+    });
     // Verify the tab still exists
     if (selectedExplorationTabId !== null) {
-      chrome.tabs.get(selectedExplorationTabId).then((tab) => {
-        selectedExplorationTabInfo = { id: tab.id, url: tab.url, title: tab.title };
-        console.log("[Qontinui BG] Sending selected tab response:", { selectedExplorationTabId, selectedExplorationTabInfo });
-        sendResponse({
-          selectedTabId: selectedExplorationTabId,
-          selectedTabInfo: selectedExplorationTabInfo
+      chrome.tabs
+        .get(selectedExplorationTabId)
+        .then((tab) => {
+          selectedExplorationTabInfo = { id: tab.id, url: tab.url, title: tab.title };
+          console.log("[Qontinui BG] Sending selected tab response:", {
+            selectedExplorationTabId,
+            selectedExplorationTabInfo,
+          });
+          sendResponse({
+            selectedTabId: selectedExplorationTabId,
+            selectedTabInfo: selectedExplorationTabInfo,
+          });
+        })
+        .catch(() => {
+          // Tab no longer exists
+          console.log("[Qontinui BG] Selected tab no longer exists, clearing");
+          selectedExplorationTabId = null;
+          selectedExplorationTabInfo = null;
+          persistSelectedTab();
+          sendResponse({ selectedTabId: null, selectedTabInfo: null });
         });
-      }).catch(() => {
-        // Tab no longer exists
-        console.log("[Qontinui BG] Selected tab no longer exists, clearing");
-        selectedExplorationTabId = null;
-        selectedExplorationTabInfo = null;
-        persistSelectedTab();
-        sendResponse({ selectedTabId: null, selectedTabInfo: null });
-      });
     } else {
       console.log("[Qontinui BG] No tab selected, sending null response");
       sendResponse({ selectedTabId: null, selectedTabInfo: null });
@@ -2026,14 +2247,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.action === "selectTabFromPopup") {
     const tabId = message.tabId;
-    chrome.tabs.get(tabId).then((tab) => {
-      selectedExplorationTabId = tabId;
-      selectedExplorationTabInfo = { id: tab.id, url: tab.url, title: tab.title };
-      persistSelectedTab();
-      sendResponse({ success: true, selectedTabInfo: selectedExplorationTabInfo });
-    }).catch((e) => {
-      sendResponse({ success: false, error: e.message });
-    });
+    chrome.tabs
+      .get(tabId)
+      .then((tab) => {
+        selectedExplorationTabId = tabId;
+        selectedExplorationTabInfo = { id: tab.id, url: tab.url, title: tab.title };
+        persistSelectedTab();
+        sendResponse({ success: true, selectedTabInfo: selectedExplorationTabInfo });
+      })
+      .catch((e) => {
+        sendResponse({ success: false, error: e.message });
+      });
     return true; // Async response
   }
 
@@ -2042,26 +2266,30 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // =============================================================================
 
   if (message.action === "getWebSocketStatus") {
-    sendResponse({
-      connected: isWebSocketConnected(),
-      url: RUNNER_WS_URL,
-    });
+    // Query offscreen document for live status
+    (async () => {
+      await ensureOffscreenDocument();
+      try {
+        const status = await sendToOffscreen({ type: "TO_OFFSCREEN_GET_STATUS" });
+        sendResponse(status || { connected: false });
+      } catch {
+        sendResponse({ connected: offscreenWsConnected });
+      }
+    })();
     return true;
   }
 
   if (message.action === "reconnectWebSocket") {
-    // Force reconnection
-    if (wsConnection) {
-      wsConnection.close();
-    }
-    wsConnection = null;
-    wsConnected = false;
-    if (wsReconnectTimeout) {
-      clearTimeout(wsReconnectTimeout);
-      wsReconnectTimeout = null;
-    }
-    connectWebSocket();
-    sendResponse({ success: true });
+    // Tell offscreen document to force reconnect
+    (async () => {
+      await ensureOffscreenDocument();
+      try {
+        await sendToOffscreen({ type: "TO_OFFSCREEN_RECONNECT" });
+        sendResponse({ success: true });
+      } catch (e) {
+        sendResponse({ success: false, error: e.message });
+      }
+    })();
     return true;
   }
 
@@ -2139,7 +2367,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.action === "getRequestAsCurl") {
-    const request = capturedRequests.find(r => r.id === message.requestId);
+    const request = capturedRequests.find((r) => r.id === message.requestId);
     if (request) {
       sendResponse({
         success: true,
@@ -2157,7 +2385,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === "sendRequestToRunner") {
     (async () => {
       try {
-        const request = capturedRequests.find(r => r.id === message.requestId);
+        const request = capturedRequests.find((r) => r.id === message.requestId);
         if (!request) {
           throw new Error("Request not found");
         }
@@ -2264,10 +2492,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           return;
         }
 
+        console.log(`[Qontinui] UI_BRIDGE_POPUP_COMMAND: action=${message.action}, tab=${tab.id}, url=${tab.url?.slice(0, 80)}`);
+
         // Use retry logic with content script injection to handle cases where
         // the page was loaded before the extension (content scripts not injected)
         const maxRetries = 3;
-        const baseDelay = 200;
+        const baseDelay = 300;
 
         for (let attempt = 0; attempt < maxRetries; attempt++) {
           // Try to inject content scripts first (they may already exist)
@@ -2275,12 +2505,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             await chrome.scripting.executeScript({
               target: { tabId: tab.id },
               files: ["content-scripts/ui-bridge-inspector.js"],
-              world: "MAIN"
+              world: "MAIN",
             });
             await chrome.scripting.executeScript({
               target: { tabId: tab.id },
               files: ["content-scripts/ui-bridge-bridge.js"],
-              world: "ISOLATED"
+              world: "ISOLATED",
             });
             if (attempt === 0) {
               console.log("[Qontinui] Injected UI Bridge scripts into tab", tab.id);
@@ -2288,13 +2518,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           } catch (_e) {
             // Scripts might already be there, or page doesn't allow injection
             if (attempt === 0) {
-              console.log("[Qontinui] Could not inject UI Bridge scripts (may already exist):", _e.message);
+              console.log(
+                "[Qontinui] Could not inject UI Bridge scripts (may already exist):",
+                _e.message,
+              );
             }
           }
 
           // Wait for scripts to initialize (longer on retries)
           const delay = baseDelay * (attempt + 1);
-          await new Promise(r => setTimeout(r, delay));
+          await new Promise((r) => setTimeout(r, delay));
 
           // Try to send the command (with timeout to prevent hanging)
           try {
@@ -2313,23 +2546,32 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 (response) => {
                   clearTimeout(timeout);
                   if (chrome.runtime.lastError) {
-                    reject(new Error(chrome.runtime.lastError.message || "Failed to communicate with content script"));
+                    reject(
+                      new Error(
+                        chrome.runtime.lastError.message ||
+                          "Failed to communicate with content script",
+                      ),
+                    );
                     return;
                   }
                   resolve(response || { success: false, error: "No response from content script" });
-                }
+                },
               );
             });
             // Success - send response and return
+            console.log(`[Qontinui] UI Bridge ping success:`, JSON.stringify(result).slice(0, 200));
             sendResponse(result);
             return;
           } catch (error) {
-            const isRetryableError = error.message.includes("Could not establish connection") ||
-                                     error.message.includes("Receiving end does not exist") ||
-                                     error.message.includes("timeout");
+            const isRetryableError =
+              error.message.includes("Could not establish connection") ||
+              error.message.includes("Receiving end does not exist") ||
+              error.message.includes("timeout");
 
             if (isRetryableError && attempt < maxRetries - 1) {
-              console.log(`[Qontinui] UI Bridge command attempt ${attempt + 1} failed (${error.message}), retrying...`);
+              console.log(
+                `[Qontinui] UI Bridge command attempt ${attempt + 1} failed (${error.message}), retrying...`,
+              );
               continue;
             }
             // Last attempt or non-retryable error - throw to outer catch
@@ -2372,11 +2614,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // Accumulate snapshot from recording
     if (activeRecordingSession && message.snapshot) {
       activeRecordingSession.snapshots.push(message.snapshot);
-      console.log("[Qontinui] Recorded snapshot", activeRecordingSession.snapshots.length, ":", message.snapshot.trigger);
+      console.log(
+        "[Qontinui] Recorded snapshot",
+        activeRecordingSession.snapshots.length,
+        ":",
+        message.snapshot.trigger,
+      );
 
-      // Forward to runner via WebSocket for real-time updates
-      if (wsConnected) {
-        sendWebSocketMessage({
+      // Forward to runner via WebSocket for real-time updates (through offscreen doc)
+      if (offscreenWsConnected) {
+        sendViaOffscreenWebSocket({
           type: "RECORDING_SNAPSHOT",
           snapshot: message.snapshot,
           sessionTabId: activeRecordingSession.tabId,
@@ -2393,5 +2640,5 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 });
 
-// Initialize WebSocket connection to runner (delayed to allow service worker startup)
-initializeWebSocket();
+// NOTE: WebSocket initialization is handled by the offscreen document (offscreen.js).
+// The offscreen document is created at the top of this file via ensureOffscreenDocument().

@@ -9,8 +9,8 @@
  * to communicate with the ISOLATED world bridge script.
  */
 
-(function() {
-  'use strict';
+(function () {
+  "use strict";
 
   // Avoid re-injecting
   if (window.__qontinuiInterceptorInstalled) {
@@ -34,7 +34,7 @@
     }
 
     // String
-    if (typeof body === 'string') {
+    if (typeof body === "string") {
       return body;
     }
 
@@ -59,20 +59,20 @@
     // Blob
     if (body instanceof Blob) {
       // Try to read as text if it's a text type
-      if (body.type && (body.type.includes('text') || body.type.includes('json'))) {
+      if (body.type && (body.type.includes("text") || body.type.includes("json"))) {
         try {
           return await body.text();
         } catch {
           return `[Blob: ${body.type}, ${body.size} bytes]`;
         }
       }
-      return `[Blob: ${body.type || 'unknown'}, ${body.size} bytes]`;
+      return `[Blob: ${body.type || "unknown"}, ${body.size} bytes]`;
     }
 
     // ArrayBuffer or TypedArray
     if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
       try {
-        const decoder = new TextDecoder('utf-8');
+        const decoder = new TextDecoder("utf-8");
         const text = decoder.decode(body);
         // Check if it looks like text/JSON
         if (/^[\x20-\x7E\s]*$/.test(text.substring(0, 100))) {
@@ -86,15 +86,15 @@
 
     // ReadableStream - can't easily capture without consuming
     if (body instanceof ReadableStream) {
-      return '[ReadableStream]';
+      return "[ReadableStream]";
     }
 
     // Object - stringify
-    if (typeof body === 'object') {
+    if (typeof body === "object") {
       try {
         return JSON.stringify(body);
       } catch {
-        return '[Object]';
+        return "[Object]";
       }
     }
 
@@ -106,10 +106,13 @@
    */
   function sendToBridge(requestInfo) {
     try {
-      window.postMessage({
-        type: '__QONTINUI_REQUEST_BODY__',
-        data: requestInfo
-      }, '*');
+      window.postMessage(
+        {
+          type: "__QONTINUI_REQUEST_BODY__",
+          data: requestInfo,
+        },
+        "*",
+      );
     } catch {
       // Ignore errors
     }
@@ -121,7 +124,7 @@
 
   const originalFetch = window.fetch;
 
-  window.fetch = async function(input, init) {
+  window.fetch = async function (input, init) {
     const requestId = generateRequestId();
     let url, method, headers, body;
 
@@ -140,15 +143,16 @@
             const cloned = input.clone();
             body = await cloned.text();
           } catch {
-            body = '[Unable to read Request body]';
+            body = "[Unable to read Request body]";
           }
         }
       } else {
         url = String(input);
-        method = init?.method || 'GET';
-        headers = init?.headers instanceof Headers
-          ? Object.fromEntries(init.headers.entries())
-          : (init?.headers || {});
+        method = init?.method || "GET";
+        headers =
+          init?.headers instanceof Headers
+            ? Object.fromEntries(init.headers.entries())
+            : init?.headers || {};
         body = await bodyToString(init?.body);
       }
 
@@ -160,9 +164,8 @@
         headers,
         body,
         timestamp: Date.now(),
-        source: 'fetch'
+        source: "fetch",
       });
-
     } catch {
       // Ignore capture errors - don't break the app
     }
@@ -179,25 +182,25 @@
   const XHRSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
   const XHRSend = XMLHttpRequest.prototype.send;
 
-  XMLHttpRequest.prototype.open = function(method, url) {
+  XMLHttpRequest.prototype.open = function (method, url) {
     this.__qontinui = {
       requestId: generateRequestId(),
       method: method,
       url: url,
       headers: {},
-      timestamp: Date.now()
+      timestamp: Date.now(),
     };
     return XHROpen.apply(this, arguments);
   };
 
-  XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+  XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
     if (this.__qontinui) {
       this.__qontinui.headers[name] = value;
     }
     return XHRSetRequestHeader.apply(this, arguments);
   };
 
-  XMLHttpRequest.prototype.send = function(body) {
+  XMLHttpRequest.prototype.send = function (body) {
     if (this.__qontinui) {
       (async () => {
         try {
@@ -209,7 +212,7 @@
             headers: this.__qontinui.headers,
             body: bodyStr,
             timestamp: this.__qontinui.timestamp,
-            source: 'xhr'
+            source: "xhr",
           });
         } catch {
           // Ignore capture errors

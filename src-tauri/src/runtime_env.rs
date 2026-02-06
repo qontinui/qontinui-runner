@@ -519,6 +519,7 @@ pub trait AiSessionContextTurnExt {
     ///
     /// This combines marking the session as a continuation and setting the
     /// turn count based on the previous session's output log.
+    #[allow(clippy::wrong_self_convention)]
     fn as_continuation_with_turns(
         self,
         previous_session_id: impl Into<String>,
@@ -543,7 +544,7 @@ impl AiSessionContextTurnExt for crate::execution_context::AiSessionContext {
         let previous_turns = count_turns_in_output(previous_output);
         // The new turn will be previous + 1
         let turn_count = previous_turns + 1;
-        self.as_continuation_of(previous_session_id)
+        self.with_continuation_of(previous_session_id)
             .with_turn_count(turn_count)
     }
 }

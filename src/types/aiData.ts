@@ -826,8 +826,6 @@ export interface StepExecutionConfig {
 export interface VerificationStepDetails {
   step_id: string;
   phase: string;
-  is_critical: boolean;
-  is_blocking: boolean;
   stdout?: string | null;
   stderr?: string | null;
   assertions_passed?: number | null;

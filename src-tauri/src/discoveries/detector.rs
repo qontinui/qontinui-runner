@@ -412,7 +412,7 @@ fn calculate_flaky_confidence(total_runs: u32, success_rate: f64) -> f64 {
     let rate_distance = (success_rate - 0.5).abs();
     let rate_confidence = 0.6 - rate_distance;
 
-    (sample_confidence + rate_confidence).max(0.0).min(0.95)
+    (sample_confidence + rate_confidence).clamp(0.0, 0.95)
 }
 
 #[cfg(test)]

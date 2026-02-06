@@ -817,6 +817,7 @@ impl TransitionBuilder {
         Self::default()
     }
 
+    #[allow(clippy::wrong_self_convention)]
     pub fn from_state(mut self, state: String) -> Self {
         self.from_state = Some(state);
         self
@@ -967,7 +968,7 @@ mod tests {
 
     #[test]
     fn test_anomaly_detection_timing() {
-        let conn = create_test_db();
+        let _conn = create_test_db();
 
         let mut expected_durations = HashMap::new();
         expected_durations.insert("StateA|StateB".to_string(), 100u64);
@@ -995,7 +996,7 @@ mod tests {
 
     #[test]
     fn test_anomaly_detection_confidence() {
-        let conn = create_test_db();
+        let _conn = create_test_db();
 
         let mut recorder = RunRecorder::new("config-1".into(), None);
 
