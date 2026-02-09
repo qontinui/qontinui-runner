@@ -770,6 +770,7 @@ mod tests {
             duration_ms: 1500,
             config: StepExecutionConfig::default(),
             verification_details: None,
+            output_data: None,
         };
 
         let wrapped = StepExecutionOutcome::from(step_result);
@@ -807,6 +808,7 @@ mod tests {
             duration_ms: 5000,
             config: StepExecutionConfig::default(),
             verification_details: None,
+            output_data: None,
         };
 
         let outcome = step_result.into_outcome(5000);
@@ -840,6 +842,7 @@ mod tests {
                 duration_ms: 1000,
                 config: StepExecutionConfig::default(),
                 verification_details: None,
+                output_data: None,
             }],
         };
 
@@ -871,6 +874,7 @@ mod tests {
                 duration_ms: 500,
                 config: StepExecutionConfig::default(),
                 verification_details: None,
+                output_data: None,
             }],
         };
 

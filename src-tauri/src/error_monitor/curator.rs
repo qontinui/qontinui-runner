@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use rusqlite::Connection;
 
-use crate::error_monitor::storage::ErrorEventStorage;
+use crate::error_monitor::storage::{ErrorEventStorage, LogSourceStorage};
 use crate::error_monitor::types::{ErrorQuery, ErrorSeverity, ErrorStatus, StoredErrorEvent};
 
 /// A curated collection of errors ready for debug agent analysis.
@@ -32,6 +32,9 @@ pub struct DebugContext {
     pub total_count: u32,
     /// Whether immediate action is recommended
     pub requires_immediate_action: bool,
+    /// Descriptions of log sources referenced by errors (source name -> description)
+    #[serde(default)]
+    pub source_descriptions: HashMap<String, String>,
 }
 
 /// A curated error with additional context for debugging.
@@ -169,6 +172,7 @@ impl DebugContextCurator {
                 focus_areas: vec![],
                 total_count: 0,
                 requires_immediate_action: false,
+                source_descriptions: HashMap::new(),
             });
         }
 
@@ -205,6 +209,9 @@ impl DebugContextCurator {
         let requires_immediate_action =
             !critical_errors.is_empty() || regular_errors.iter().any(|e| e.occurrence_count >= 5);
 
+        // Build source descriptions from log_sources table
+        let source_descriptions = Self::build_source_descriptions(conn, &errors);
+
         Ok(DebugContext {
             summary,
             critical_errors,
@@ -214,7 +221,35 @@ impl DebugContextCurator {
             focus_areas,
             total_count: errors.len() as u32,
             requires_immediate_action,
+            source_descriptions,
         })
+    }
+
+    /// Build a map of source name -> description from the log_sources table.
+    fn build_source_descriptions(
+        conn: &Connection,
+        errors: &[StoredErrorEvent],
+    ) -> HashMap<String, String> {
+        // Collect unique source names from errors
+        let unique_sources: std::collections::HashSet<&str> =
+            errors.iter().map(|e| e.log_source_name.as_str()).collect();
+
+        let mut descriptions = HashMap::new();
+
+        // Query log sources from DB to get their descriptions
+        if let Ok(log_sources) = LogSourceStorage::get_all(conn) {
+            for source in &log_sources {
+                if unique_sources.contains(source.name.as_str()) {
+                    if let Some(ref desc) = source.description {
+                        if !desc.is_empty() {
+                            descriptions.insert(source.name.clone(), desc.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        descriptions
     }
 
     /// Curate a single error with additional context.
@@ -552,11 +587,79 @@ impl DebugContextCurator {
         parts.join("\n")
     }
 
+    /// Check if a curated error is a UI Bridge spec verification failure.
+    /// Spec errors have messages starting with "SPEC: " and come from Runner Actions.
+    fn is_spec_error(error: &CuratedError) -> bool {
+        error.message.contains("SPEC: ") && error.source == "Runner Actions"
+    }
+
+    /// Classify errors in a DebugContext as spec failures vs runtime errors.
+    /// Returns (spec_count, runtime_count).
+    pub fn classify_errors(context: &DebugContext) -> (usize, usize) {
+        let all_errors = context
+            .critical_errors
+            .iter()
+            .chain(context.errors.iter())
+            .chain(context.warnings.iter());
+
+        let spec_count = all_errors
+            .clone()
+            .filter(|e| Self::is_spec_error(e))
+            .count();
+        let total = all_errors.count();
+        (spec_count, total - spec_count)
+    }
+
     /// Format the debug context as a string for AI consumption.
     pub fn format_for_ai(&self, context: &DebugContext) -> String {
         let mut output = String::new();
 
         output.push_str("# Error Analysis Report\n\n");
+
+        // Add source descriptions with context-aware messaging
+        if !context.source_descriptions.is_empty() {
+            let (spec_count, runtime_count) = Self::classify_errors(context);
+
+            output.push_str("## Log Sources\n\n");
+
+            if spec_count > 0 && runtime_count == 0 {
+                // ALL errors are spec failures
+                output.push_str("These errors are **UI Bridge spec verification failures**, NOT application runtime errors.\n\n");
+                output.push_str("UI Bridge specs are assertion-based tests defined in `.spec.uibridge.json` files that verify ");
+                output.push_str(
+                    "the state of UI elements (existence, text content, visibility, attributes). ",
+                );
+                output
+                    .push_str("A spec failure means the UI doesn't match the expected state.\n\n");
+                output.push_str("To fix spec failures:\n");
+                output.push_str(
+                    "1. Find the `.spec.uibridge.json` file containing the spec definition\n",
+                );
+                output.push_str("2. Check the `assertions` array to understand what's expected\n");
+                output.push_str("3. Determine whether the **app code** needs to change (UI not rendering correctly) ");
+                output.push_str(
+                    "or the **spec definition** needs updating (expectations are outdated)\n",
+                );
+                output.push_str("4. Do NOT look for Playwright tests or other test frameworks — these are UI Bridge specs\n\n");
+            } else if spec_count > 0 && runtime_count > 0 {
+                // MIXED: some spec, some runtime
+                output.push_str("These errors include BOTH application runtime errors and UI Bridge spec verification failures.\n\n");
+                output.push_str("**Runtime errors** come from application logs — fix the application code that produces them.\n");
+                output.push_str("**Spec failures** (messages starting with `SPEC: `) are UI Bridge assertion failures from ");
+                output.push_str("`.spec.uibridge.json` files — check whether the app UI or the spec definition needs updating.\n\n");
+            } else {
+                // NO spec failures — all runtime errors (original behavior)
+                output.push_str("These errors come from the following monitored log sources. ");
+                output.push_str("These are APPLICATION RUNTIME logs, NOT test failures. ");
+                output.push_str("Fix the application code that produces these errors.\n\n");
+            }
+
+            for (name, description) in &context.source_descriptions {
+                output.push_str(&format!("- **{}**: {}\n", name, description));
+            }
+            output.push('\n');
+        }
+
         output.push_str(&format!("## Summary\n{}\n\n", context.summary));
 
         if context.requires_immediate_action {

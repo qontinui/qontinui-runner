@@ -125,12 +125,12 @@ const TROUBLESHOOTING_ITEMS: TroubleshootingItem[] = [
     ],
   },
   {
-    title: "Configuration won't load",
-    description: "Loading a JSON or YAML config file fails or shows errors.",
+    title: "Workflow won't load",
+    description: "Loading or importing a workflow fails or shows errors.",
     solution: [
-      "Verify the config file is valid JSON or YAML (use a linter)",
-      "Check that the config follows the expected schema",
-      "Ensure all referenced images/assets exist at the specified paths",
+      "Verify the workflow file is valid JSON (use a linter)",
+      "Check that the workflow follows the expected schema",
+      "Ensure all referenced scripts and contexts exist",
       "Look for syntax errors like missing commas or brackets",
     ],
   },
@@ -145,23 +145,23 @@ const TROUBLESHOOTING_ITEMS: TroubleshootingItem[] = [
     ],
   },
   {
-    title: "Screenshots not capturing",
-    description: "Screen capture returns blank images or fails entirely.",
+    title: "SDK app not connecting",
+    description: "An SDK-integrated app won't connect to the runner via UI Bridge.",
     solution: [
-      "Ensure the target application is visible on screen",
-      "Check that the correct monitor is selected",
-      "Verify the runner has screen capture permissions",
-      "Try running the application as administrator (Windows)",
+      "Check that the runner is running (port 9876 must be active)",
+      "Verify the SDK app is running and has the UI Bridge SDK initialized",
+      "Check the SDK app console for connection errors",
+      "Try refreshing the SDK app and reconnecting",
     ],
   },
   {
     title: "Workflow execution hangs",
     description: "A workflow starts but never completes or times out.",
     solution: [
-      "Check the Logs tab for any error messages",
-      "Verify the expected UI state is actually visible on screen",
-      "Increase timeout values in the workflow configuration",
-      "Use the Stop button to halt execution and review logs",
+      "Check the AI Output tab for any error messages",
+      "Verify the AI provider API key is valid and has quota",
+      "Increase the max sessions or timeout values in the workflow",
+      "Use the Stop button to halt execution and review the session summary",
     ],
   },
 ];
@@ -176,27 +176,27 @@ interface DocLink {
 const DOCUMENTATION_LINKS: DocLink[] = [
   {
     title: "Getting Started Guide",
-    description: "Learn the basics of creating and running automation workflows",
-    url: "https://docs.qontinui.io/getting-started",
+    description: "Learn the basics of AI-assisted development workflows",
+    url: "https://github.com/qontinui/qontinui-runner#getting-started",
     icon: Rocket,
   },
   {
     title: "Configuration Reference",
-    description: "Complete reference for workflow configuration files",
-    url: "https://docs.qontinui.io/configuration",
+    description: "Complete reference for workflow and AI session configuration",
+    url: "https://github.com/qontinui/qontinui-runner/wiki",
     icon: FileText,
   },
   {
     title: "API Documentation",
-    description: "REST API and MCP integration documentation",
-    url: "https://docs.qontinui.io/api",
+    description: "MCP API and runner integration documentation",
+    url: "https://github.com/qontinui/qontinui-runner#api",
     icon: Zap,
   },
   {
-    title: "Troubleshooting Guide",
-    description: "In-depth solutions for common issues",
-    url: "https://docs.qontinui.io/troubleshooting",
-    icon: Wrench,
+    title: "Report Issues",
+    description: "Found a bug? Let us know on GitHub",
+    url: "https://github.com/qontinui/qontinui-runner/issues",
+    icon: Bug,
   },
 ];
 
@@ -316,9 +316,9 @@ function GettingStartedPage() {
       <div className="bg-card rounded-lg border border-border p-5">
         <h3 className="font-semibold mb-3">What is Qontinui Runner?</h3>
         <p className="text-sm text-muted-foreground leading-relaxed">
-          Qontinui Runner is a desktop application for executing visual automation workflows. It
-          uses computer vision and AI to interact with applications, making it possible to automate
-          tasks that traditional automation tools cannot handle.
+          Qontinui Runner is a desktop application for AI-assisted development with visual feedback
+          loops. It orchestrates AI sessions that can verify their own work, detect errors
+          automatically, and iterate toward goals with persistent knowledge across sessions.
         </p>
       </div>
 
@@ -331,9 +331,9 @@ function GettingStartedPage() {
               <Zap className="w-4 h-4 text-primary" />
             </div>
             <div>
-              <div className="font-medium">Visual Automation</div>
+              <div className="font-medium">UI Bridge Feedback</div>
               <p className="text-sm text-muted-foreground">
-                Automate any application using screen capture and image recognition
+                Get real-time visual feedback from your application via the UI Bridge
               </p>
             </div>
           </div>
@@ -353,9 +353,9 @@ function GettingStartedPage() {
               <Play className="w-4 h-4 text-primary" />
             </div>
             <div>
-              <div className="font-medium">Workflow Execution</div>
+              <div className="font-medium">Orchestrated Workflows</div>
               <p className="text-sm text-muted-foreground">
-                Run complex multi-step workflows with state management
+                Run multi-phase workflows with verification loops and self-healing
               </p>
             </div>
           </div>
@@ -383,19 +383,19 @@ function GettingStartedPage() {
             description="Set up your Claude or other AI provider API key in Settings"
           />
           <ChecklistItem
-            icon={ExternalLink}
-            label="Connect to a Project"
-            description="Link the runner to your Qontinui project for remote management"
+            icon={FolderOpen}
+            label="Set Working Directory"
+            description="Point the runner at your project's codebase"
           />
           <ChecklistItem
-            icon={FolderOpen}
-            label="Load a Configuration"
-            description="Import a workflow configuration file (JSON or YAML)"
+            icon={ExternalLink}
+            label="Integrate UI Bridge SDK"
+            description="Enable UI Bridge feedback from your target application"
           />
           <ChecklistItem
             icon={Play}
-            label="Run Your First Workflow"
-            description="Execute a workflow and observe the automation in action"
+            label="Create Your First Workflow"
+            description="Build a workflow with AI-powered setup, verification, and agentic steps"
           />
         </div>
       </div>
@@ -470,7 +470,7 @@ function DocumentationPage() {
         <h3 className="font-semibold mb-4">Additional Resources</h3>
         <div className="space-y-3">
           <a
-            href="https://github.com/qontinui/qontinui"
+            href="https://github.com/qontinui/qontinui-runner"
             target="_blank"
             rel="noopener noreferrer"
             className="flex items-center gap-3 text-sm hover:text-primary transition-colors"
@@ -480,7 +480,7 @@ function DocumentationPage() {
             <ExternalLink className="w-3 h-3 text-muted-foreground" />
           </a>
           <a
-            href="https://github.com/qontinui/qontinui/discussions"
+            href="https://github.com/qontinui/qontinui-runner/discussions"
             target="_blank"
             rel="noopener noreferrer"
             className="flex items-center gap-3 text-sm hover:text-primary transition-colors"
@@ -490,7 +490,7 @@ function DocumentationPage() {
             <ExternalLink className="w-3 h-3 text-muted-foreground" />
           </a>
           <a
-            href="https://github.com/qontinui/qontinui/releases"
+            href="https://github.com/qontinui/qontinui-runner/releases"
             target="_blank"
             rel="noopener noreferrer"
             className="flex items-center gap-3 text-sm hover:text-primary transition-colors"
@@ -700,7 +700,7 @@ interface VersionInfo {
 }
 
 function AboutPage() {
-  const [version, setVersion] = useState<string>("0.1.0");
+  const [version, setVersion] = useState<string>("1.0.0");
   const [buildDate] = useState<string>(() => {
     // In a real app, this would come from build-time constants
     return new Date().toLocaleDateString("en-US", {
@@ -745,7 +745,7 @@ function AboutPage() {
         <div className="flex items-center justify-between">
           <div>
             <h3 className="font-semibold">Qontinui Runner</h3>
-            <p className="text-sm text-muted-foreground mt-1">Desktop automation application</p>
+            <p className="text-sm text-muted-foreground mt-1">AI-assisted development tool</p>
           </div>
           <div className="text-right">
             <div className="text-2xl font-bold text-primary">v{version}</div>

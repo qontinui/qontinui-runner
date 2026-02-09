@@ -11,9 +11,6 @@ if (import.meta.env.DEV) {
   setDevelopmentMode(true);
 }
 
-// Add debugging
-console.log("Main.tsx loaded");
-
 // Create a client for react-query
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -29,7 +26,6 @@ if (!rootElement) {
   console.error("Root element not found!");
   document.body.innerHTML = '<div style="color: red; padding: 20px;">Root element not found!</div>';
 } else {
-  console.log("Root element found, rendering app...");
   ReactDOM.createRoot(rootElement).render(
     <React.StrictMode>
       <QueryClientProvider client={queryClient}>

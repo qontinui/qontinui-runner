@@ -76,6 +76,8 @@ export interface TaskRun {
   remaining_work?: string | null;
   /** Timestamp when the summary was generated */
   summary_generated_at?: string | null;
+  /** Workflow type: 'unified', 'legacy_session', 'automation_only', 'plan', or null */
+  workflow_type?: string | null;
   created_at: string;
   updated_at: string;
   completed_at?: string | null;

@@ -540,12 +540,115 @@ fn build_stages_heuristic(task_run: &TaskRun, steps: &[RecapStep]) -> Vec<StageR
     stages
 }
 
+/// Build stages for plan workflows from output_log phase markers.
+///
+/// Plan workflows write `=== Plan Phase N/M: Name ===` markers in the output_log.
+/// Each phase maps to an "agentic" stage with a display name like "Phase 1: Fix API".
+/// If a sweep ran, it shows as a "completion" stage named "Next Steps Sweep".
+fn build_stages_for_plan(task_run: &TaskRun, steps: &[RecapStep]) -> Vec<StageRecap> {
+    use regex::Regex;
+
+    let mut stages: Vec<StageRecap> = Vec::new();
+    let output_log = &task_run.output_log;
+
+    // Parse phase markers from output_log: "=== Plan Phase 1/3: Phase Name ==="
+    let phase_re = Regex::new(r"=== Plan Phase (\d+)/(\d+): (.+?) ===").unwrap();
+    let mut phase_infos: Vec<(u32, String)> = Vec::new();
+
+    for caps in phase_re.captures_iter(output_log) {
+        let phase_num: u32 = caps[1].parse().unwrap_or(1);
+        let phase_name = caps[3].to_string();
+        // Deduplicate (only add if not already present)
+        if !phase_infos.iter().any(|(n, _)| *n == phase_num) {
+            phase_infos.push((phase_num, phase_name));
+        }
+    }
+
+    // Create one stage per phase
+    for (phase_num, phase_name) in &phase_infos {
+        // Try to find steps matching this phase by iteration
+        let phase_steps: Vec<RecapStep> = steps
+            .iter()
+            .filter(|s| s.iteration == Some(*phase_num))
+            .cloned()
+            .collect();
+
+        let status = compute_stage_status(&phase_steps, task_run);
+        let started_at = get_earliest_timestamp(&phase_steps);
+        let ended_at = get_latest_timestamp(&phase_steps);
+        let duration_ms = match (&started_at, &ended_at) {
+            (Some(s), Some(e)) => calculate_duration_ms(s, e),
+            _ => None,
+        };
+
+        stages.push(StageRecap {
+            stage: "agentic".to_string(),
+            display_name: format!("Phase {}: {}", phase_num, phase_name),
+            status,
+            started_at,
+            ended_at,
+            duration_ms,
+            steps: phase_steps,
+            iteration: Some(*phase_num),
+        });
+    }
+
+    // Check if sweep ran (look for sweep markers in output_log)
+    let has_sweep = output_log.contains("=== Next Steps Sweep ===")
+        || output_log.contains("Starting next steps sweep");
+
+    if has_sweep {
+        // Sweep steps don't have a specific iteration; collect unassigned steps
+        let assigned_iterations: Vec<u32> = phase_infos.iter().map(|(n, _)| *n).collect();
+        let sweep_steps: Vec<RecapStep> = steps
+            .iter()
+            .filter(|s| {
+                s.iteration
+                    .map(|i| !assigned_iterations.contains(&i))
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+
+        let status = compute_stage_status(&sweep_steps, task_run);
+        let started_at = get_earliest_timestamp(&sweep_steps);
+        let ended_at = get_latest_timestamp(&sweep_steps);
+        let duration_ms = match (&started_at, &ended_at) {
+            (Some(s), Some(e)) => calculate_duration_ms(s, e),
+            _ => None,
+        };
+
+        stages.push(StageRecap {
+            stage: "completion".to_string(),
+            display_name: "Next Steps Sweep".to_string(),
+            status,
+            started_at,
+            ended_at,
+            duration_ms,
+            steps: sweep_steps,
+            iteration: None,
+        });
+    }
+
+    // If no phases found from markers, fall back to heuristic
+    if stages.is_empty() {
+        return build_stages_heuristic(task_run, steps);
+    }
+
+    stages
+}
+
 /// Build stages from transition history or heuristically from steps.
 pub fn build_stages(
     task_run: &TaskRun,
     steps: &[RecapStep],
     _verification_results: &[StoredVerificationResult],
 ) -> Vec<StageRecap> {
+    // Plan workflows use their own stage builder
+    if task_run.workflow_type.as_deref() == Some("plan") {
+        return build_stages_for_plan(task_run, steps);
+    }
+
     if let Some(ref history_json) = task_run.transition_history_json {
         if let Ok(transitions) = serde_json::from_str::<Vec<StageTransition>>(history_json) {
             if !transitions.is_empty() {

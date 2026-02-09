@@ -9,6 +9,22 @@
 const RUNNER_API = "http://localhost:9876";
 
 // =============================================================================
+// Service Worker Lifecycle Tracking
+// =============================================================================
+
+const SW_START_TIME = Date.now();
+let swWakeCount = 0;
+let lastSwWakeTime = Date.now();
+let offscreenCheckCount = 0;
+let offscreenRecreateCount = 0;
+let offscreenHealthCheckInterval = null;
+
+console.log("[Qontinui BG] Service worker started", {
+  startTime: new Date().toISOString(),
+  swWakeCount: ++swWakeCount,
+});
+
+// =============================================================================
 // Offscreen Document Lifecycle (WebSocket connection manager)
 // =============================================================================
 
@@ -28,12 +44,18 @@ async function ensureOffscreenDocument() {
   });
 
   if (existingContexts.length > 0) {
-    return; // Already exists
+    return true; // Already exists
   }
+
+  console.log("[Qontinui BG] Offscreen document NOT found — creating", {
+    offscreenRecreateCount,
+    swUptime: Math.round((Date.now() - SW_START_TIME) / 1000) + "s",
+  });
 
   // Prevent concurrent creation attempts
   if (offscreenCreating) {
-    return;
+    console.log("[Qontinui BG] Offscreen creation already in progress, skipping");
+    return false;
   }
 
   offscreenCreating = true;
@@ -43,16 +65,76 @@ async function ensureOffscreenDocument() {
       reasons: ["WORKERS"],
       justification: "Maintains persistent WebSocket connection to qontinui-runner",
     });
-    console.log("[Qontinui] Offscreen document created for WebSocket connection");
+    offscreenRecreateCount++;
+    console.log("[Qontinui BG] Offscreen document created", {
+      recreateCount: offscreenRecreateCount,
+    });
+    return true;
   } catch (e) {
     // May already exist from a race condition — that's fine
     if (!e.message?.includes("Only a single offscreen")) {
-      console.error("[Qontinui] Failed to create offscreen document:", e);
+      console.error("[Qontinui BG] Failed to create offscreen document:", e);
     }
+    return false;
   } finally {
     offscreenCreating = false;
   }
 }
+
+/**
+ * Periodically verify the offscreen document still exists.
+ * Chrome can close offscreen documents under memory pressure or other conditions.
+ * This ensures we detect and recover from unexpected closures.
+ */
+function startOffscreenHealthMonitor() {
+  if (offscreenHealthCheckInterval) return;
+
+  offscreenHealthCheckInterval = setInterval(async () => {
+    offscreenCheckCount++;
+    try {
+      const contexts = await chrome.runtime.getContexts({
+        contextTypes: ["OFFSCREEN_DOCUMENT"],
+        documentUrls: [chrome.runtime.getURL("offscreen.html")],
+      });
+
+      if (contexts.length === 0) {
+        console.warn("[Qontinui BG] OFFSCREEN DOCUMENT DISAPPEARED — recreating", {
+          checkNumber: offscreenCheckCount,
+          swUptime: Math.round((Date.now() - SW_START_TIME) / 1000) + "s",
+          offscreenWsConnected,
+        });
+        offscreenWsConnected = false;
+        await ensureOffscreenDocument();
+      } else {
+        // Periodically log health (every 5 minutes = every 10 checks at 30s interval)
+        if (offscreenCheckCount % 10 === 0) {
+          // Also query the offscreen doc for its WS status
+          try {
+            const status = await sendToOffscreen({ type: "TO_OFFSCREEN_GET_STATUS" });
+            console.log("[Qontinui BG] Offscreen health check OK", {
+              checkNumber: offscreenCheckCount,
+              wsConnected: status?.connected,
+              connectionAgeSec: status?.connectionAgeSec,
+              lastPongAgeSec: status?.lastPongAgeSec,
+              reconnectCount: status?.reconnectCount,
+              pingsSent: status?.pingsSent,
+              pongsReceived: status?.pongsReceived,
+              pendingRequests: status?.pendingRequests,
+              lastDisconnectReason: status?.lastDisconnectReason,
+            });
+          } catch {
+            console.warn("[Qontinui BG] Offscreen exists but not responding to status query");
+          }
+        }
+      }
+    } catch (e) {
+      console.error("[Qontinui BG] Offscreen health check error:", e.message);
+    }
+  }, 30000); // Check every 30 seconds
+}
+
+// Start the health monitor
+startOffscreenHealthMonitor();
 
 /**
  * Send a message to the offscreen document.
@@ -131,6 +213,37 @@ ensureOffscreenDocument();
     console.error("[Qontinui] Failed to re-inject content scripts:", e);
   }
 })();
+
+// Proactively inject content scripts when ANY tab finishes loading.
+// This ensures scripts are always fresh even if manifest injection misses
+// (e.g., after extension update, or if Chrome skips injection for some tabs).
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status !== "complete") return;
+  if (
+    !tab.url ||
+    tab.url.startsWith("chrome://") ||
+    tab.url.startsWith("chrome-extension://") ||
+    tab.url.startsWith("about:")
+  )
+    return;
+
+  (async () => {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        files: ["content-scripts/ui-bridge-inspector.js"],
+        world: "MAIN",
+      });
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        files: ["content-scripts/ui-bridge-bridge.js"],
+        world: "ISOLATED",
+      });
+    } catch {
+      // Tab may not allow injection (e.g., restricted pages)
+    }
+  })();
+});
 
 // Selected tab for exploration (null = use active tab)
 let selectedExplorationTabId = null;
@@ -422,6 +535,92 @@ async function getTargetTab() {
 }
 
 /**
+ * Call the UI Bridge inspector via chrome.scripting.executeScript.
+ * Bypasses the persistent ISOLATED world bridge content script, which breaks
+ * when the extension is reloaded (context invalidation).
+ *
+ * How it works:
+ *   1. Injects ui-bridge-inspector.js into MAIN world (idempotent — has cleanup guards)
+ *   2. Runs a one-shot function in ISOLATED world that sends a postMessage to
+ *      the MAIN world inspector and waits for the response
+ *   3. Returns the result — no persistent content script listeners needed
+ *
+ * Uses ISOLATED world for the func call because MAIN world func execution
+ * can hang on some pages. ISOLATED world is always safe.
+ */
+async function callInspectorDirect(tabId, action, params = {}) {
+  // Step 0: Unfreeze the tab if needed.
+  // Chrome freezes background tabs after inactivity (Energy Saver), which causes
+  // chrome.scripting.executeScript in MAIN world to hang indefinitely.
+  // See: https://github.com/w3c/webextensions/issues/527
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.frozen || !tab.active) {
+      console.log(
+        `[Qontinui BG] Tab ${tabId} needs activation (frozen=${tab.frozen}, active=${tab.active})`,
+      );
+      await chrome.tabs.update(tabId, { active: true });
+      // Brief delay for Chrome to unfreeze the tab's JS execution
+      await new Promise((r) => setTimeout(r, 200));
+    }
+  } catch (e) {
+    console.warn("[Qontinui BG] Failed to activate tab:", e.message);
+  }
+
+  // Step 1: Inject inspector script in MAIN world (idempotent — has cleanup guards)
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["content-scripts/ui-bridge-inspector.js"],
+      world: "MAIN",
+    });
+  } catch (e) {
+    throw new Error(`Failed to inject inspector: ${e.message}`);
+  }
+
+  // Step 2: Send command via postMessage from ISOLATED world and wait for response.
+  // ISOLATED world func execution is not subject to page CSP or MAIN world blocking.
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "ISOLATED",
+    func: (a, p) => {
+      return new Promise((resolve) => {
+        const requestId = `direct-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        const timeoutId = setTimeout(() => {
+          window.removeEventListener("message", handler);
+          resolve({ success: false, error: "Inspector response timeout (10s)" });
+        }, 10000);
+
+        function handler(event) {
+          if (!event.data || event.data.type !== "__QONTINUI_UI_BRIDGE_RESPONSE__") return;
+          if (event.data.requestId !== requestId) return;
+          clearTimeout(timeoutId);
+          window.removeEventListener("message", handler);
+          resolve(event.data.data || { success: false, error: event.data.error });
+        }
+        window.addEventListener("message", handler);
+
+        window.postMessage(
+          {
+            type: "__QONTINUI_UI_BRIDGE_REQUEST__",
+            requestId,
+            action: a,
+            params: p,
+          },
+          "*",
+        );
+      });
+    },
+    args: [action, params],
+  });
+
+  if (results && results[0] && results[0].result) {
+    return results[0].result;
+  }
+  throw new Error("No result from inspector");
+}
+
+/**
  * Execute an exploration command by forwarding to the target tab's content script
  */
 async function executeExplorationCommand(action, params) {
@@ -458,6 +657,12 @@ async function executeExplorationCommand(action, params) {
             selectedExplorationTabId = params.tabId;
             selectedExplorationTabInfo = { id: tab.id, url: tab.url, title: tab.title };
             persistSelectedTab();
+            // Prevent Chrome from freezing/discarding this tab
+            try {
+              await chrome.tabs.update(params.tabId, { autoDiscardable: false });
+            } catch (e) {
+              console.warn("[Qontinui BG] Failed to set autoDiscardable:", e.message);
+            }
             console.log(
               "[Qontinui BG] Selected tab for exploration:",
               tab.url,
@@ -1172,217 +1377,135 @@ async function executeExplorationCommand(action, params) {
         url: tab.url,
         title: tab.title,
         isSelectedTab: tab.id === selectedExplorationTabId,
+        _bgVersion: "direct-v2",
       };
+
+    case "_diagnose": {
+      // Diagnostic action to test each step of callInspectorDirect independently
+      const diag = { tabId: tab.id, url: tab.url, steps: {} };
+      // Activate tab first to unfreeze (Chrome freezes background tabs)
+      try {
+        if (!tab.active) {
+          await chrome.tabs.update(tab.id, { active: true });
+          await new Promise((r) => setTimeout(r, 150));
+          diag.tabWasFrozen = true;
+        }
+      } catch (e) {
+        diag.activateError = e.message;
+      }
+      try {
+        // Test 1: Can we inject a file in MAIN world?
+        const t1Start = Date.now();
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          files: ["content-scripts/ui-bridge-inspector.js"],
+          world: "MAIN",
+        });
+        diag.steps.injectFile = { ok: true, ms: Date.now() - t1Start };
+      } catch (e) {
+        diag.steps.injectFile = { ok: false, error: e.message };
+      }
+      try {
+        // Test 2: Can we run a func in MAIN world?
+        const t2Start = Date.now();
+        const r2 = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          world: "MAIN",
+          func: () => ({
+            hasInspector: typeof window.__qontinuiInspectorCommand === "function",
+            hasFlag: !!window.__QONTINUI_UI_BRIDGE_INSPECTOR__,
+          }),
+        });
+        diag.steps.mainFunc = { ok: true, ms: Date.now() - t2Start, result: r2?.[0]?.result };
+      } catch (e) {
+        diag.steps.mainFunc = { ok: false, error: e.message };
+      }
+      try {
+        // Test 3: Can we run a func in ISOLATED world?
+        const t3Start = Date.now();
+        const r3 = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          world: "ISOLATED",
+          func: () => "isolated-ok",
+        });
+        diag.steps.isolatedFunc = { ok: true, ms: Date.now() - t3Start, result: r3?.[0]?.result };
+      } catch (e) {
+        diag.steps.isolatedFunc = { ok: false, error: e.message };
+      }
+      try {
+        // Test 4: Can we postMessage from ISOLATED and get a response from MAIN?
+        const t4Start = Date.now();
+        const r4 = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          world: "ISOLATED",
+          func: () => {
+            return new Promise((resolve) => {
+              const rid = `diag-${Date.now()}`;
+              const to = setTimeout(() => {
+                window.removeEventListener("message", h);
+                resolve({ ok: false, error: "postMessage timeout 5s" });
+              }, 5000);
+              function h(ev) {
+                if (
+                  ev.data?.type === "__QONTINUI_UI_BRIDGE_RESPONSE__" &&
+                  ev.data?.requestId === rid
+                ) {
+                  clearTimeout(to);
+                  window.removeEventListener("message", h);
+                  resolve({ ok: true, data: ev.data.data });
+                }
+              }
+              window.addEventListener("message", h);
+              window.postMessage(
+                {
+                  type: "__QONTINUI_UI_BRIDGE_REQUEST__",
+                  requestId: rid,
+                  action: "ping",
+                  params: {},
+                },
+                "*",
+              );
+            });
+          },
+        });
+        diag.steps.postMessage = { ok: true, ms: Date.now() - t4Start, result: r4?.[0]?.result };
+      } catch (e) {
+        diag.steps.postMessage = { ok: false, error: e.message };
+      }
+      return diag;
+    }
 
     case "connect": {
       // Connect to the tab (verify UI Bridge is available)
-      // Uses retry logic with exponential backoff to handle transient connection failures
-      const maxRetries = 3;
-      const baseDelay = 200;
-
-      for (let attempt = 0; attempt < maxRetries; attempt++) {
-        // Try to inject content scripts first
-        try {
-          await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
-            files: ["content-scripts/ui-bridge-inspector.js"],
-            world: "MAIN",
-          });
-          await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
-            files: ["content-scripts/ui-bridge-bridge.js"],
-            world: "ISOLATED",
-          });
-          if (attempt === 0) {
-            console.log("[Qontinui] Injected content scripts into tab", tab.id);
-          }
-        } catch (_e) {
-          // Scripts might already be there, or page doesn't allow injection
-          if (attempt === 0) {
-            console.log("[Qontinui] Could not inject scripts (may already exist):", _e.message);
-          }
-        }
-
-        // Wait for scripts to initialize (longer on retries)
-        const delay = baseDelay * (attempt + 1);
-        await new Promise((r) => setTimeout(r, delay));
-
-        try {
-          const result = await new Promise((resolve, reject) => {
-            chrome.tabs.sendMessage(
-              tab.id,
-              { type: "UI_BRIDGE_COMMAND", action: "ping", params: {} },
-              (response) => {
-                if (chrome.runtime.lastError) {
-                  reject(
-                    new Error(
-                      chrome.runtime.lastError.message ||
-                        "Failed to communicate with content script. Try refreshing the page.",
-                    ),
-                  );
-                  return;
-                }
-                if (response && response.success) {
-                  resolve({
-                    tabId: tab.id,
-                    url: tab.url,
-                    title: tab.title,
-                    isSelectedTab: tab.id === selectedExplorationTabId,
-                  });
-                } else {
-                  reject(new Error(response?.error || "UI Bridge not available on this page"));
-                }
-              },
-            );
-          });
-          return result; // Success - return immediately
-        } catch (error) {
-          const isConnectionError =
-            error.message.includes("Could not establish connection") ||
-            error.message.includes("Receiving end does not exist");
-
-          if (isConnectionError && attempt < maxRetries - 1) {
-            console.log(
-              `[Qontinui] connect attempt ${attempt + 1} failed with connection error, retrying...`,
-            );
-            continue;
-          }
-          throw error;
-        }
+      // Uses callInspectorDirect which bypasses content script messaging entirely
+      const pingResult = await callInspectorDirect(tab.id, "ping", {});
+      if (pingResult && pingResult.success) {
+        return {
+          tabId: tab.id,
+          url: tab.url,
+          title: tab.title,
+          isSelectedTab: tab.id === selectedExplorationTabId,
+        };
       }
-
-      throw new Error("connect failed after retries");
+      throw new Error(pingResult?.error || "UI Bridge not available on this page");
     }
 
     case "getElements": {
-      // Get all elements with data-ui-id from the page
-      // Uses retry logic with exponential backoff to handle transient connection failures
-      const maxRetries = 3;
-      const baseDelay = 200; // Start with 200ms delay after injection
-
-      for (let attempt = 0; attempt < maxRetries; attempt++) {
-        // Try to inject scripts if not already there
-        try {
-          await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
-            files: ["content-scripts/ui-bridge-inspector.js"],
-            world: "MAIN",
-          });
-          await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
-            files: ["content-scripts/ui-bridge-bridge.js"],
-            world: "ISOLATED",
-          });
-        } catch {
-          // Ignore - scripts may already exist
-        }
-
-        // Wait for scripts to initialize (longer on retries)
-        const delay = baseDelay * (attempt + 1);
-        await new Promise((r) => setTimeout(r, delay));
-
-        try {
-          const result = await new Promise((resolve, reject) => {
-            chrome.tabs.sendMessage(
-              tab.id,
-              { type: "UI_BRIDGE_COMMAND", action: "getElements", params: params || {} },
-              (response) => {
-                if (chrome.runtime.lastError) {
-                  reject(new Error(chrome.runtime.lastError.message));
-                  return;
-                }
-                if (response && response.success) {
-                  resolve(response.data);
-                } else {
-                  reject(new Error(response?.error || "Failed to get elements"));
-                }
-              },
-            );
-          });
-          return result; // Success - return immediately
-        } catch (error) {
-          const isConnectionError =
-            error.message.includes("Could not establish connection") ||
-            error.message.includes("Receiving end does not exist");
-
-          if (isConnectionError && attempt < maxRetries - 1) {
-            // Transient connection error - retry after backoff
-            console.log(
-              `[Qontinui] getElements attempt ${attempt + 1} failed with connection error, retrying...`,
-            );
-            continue;
-          }
-          // Non-connection error or final attempt - throw
-          throw error;
-        }
+      // Get all elements from the page using direct inspector call
+      const result = await callInspectorDirect(tab.id, "getElements", params || {});
+      if (result && result.success) {
+        return result;
       }
-
-      // Should not reach here, but just in case
-      throw new Error("getElements failed after retries");
+      throw new Error(result?.error || "Failed to get elements");
     }
 
     case "executeAction": {
-      // Execute an action on an element
-      // Uses retry logic with exponential backoff to handle transient connection failures
-      const maxRetries = 3;
-      const baseDelay = 200;
-
-      for (let attempt = 0; attempt < maxRetries; attempt++) {
-        // Try to inject scripts if not already there
-        try {
-          await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
-            files: ["content-scripts/ui-bridge-inspector.js"],
-            world: "MAIN",
-          });
-          await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
-            files: ["content-scripts/ui-bridge-bridge.js"],
-            world: "ISOLATED",
-          });
-        } catch {
-          // Ignore - scripts may already exist
-        }
-
-        // Wait for scripts to initialize (longer on retries)
-        const delay = baseDelay * (attempt + 1);
-        await new Promise((r) => setTimeout(r, delay));
-
-        try {
-          const result = await new Promise((resolve, reject) => {
-            chrome.tabs.sendMessage(
-              tab.id,
-              { type: "UI_BRIDGE_COMMAND", action: "executeAction", params },
-              (response) => {
-                if (chrome.runtime.lastError) {
-                  reject(new Error(chrome.runtime.lastError.message));
-                  return;
-                }
-                if (response && response.success) {
-                  resolve(response.data);
-                } else {
-                  reject(new Error(response?.error || "Failed to execute action"));
-                }
-              },
-            );
-          });
-          return result; // Success - return immediately
-        } catch (error) {
-          const isConnectionError =
-            error.message.includes("Could not establish connection") ||
-            error.message.includes("Receiving end does not exist");
-
-          if (isConnectionError && attempt < maxRetries - 1) {
-            console.log(
-              `[Qontinui] executeAction attempt ${attempt + 1} failed with connection error, retrying...`,
-            );
-            continue;
-          }
-          throw error;
-        }
+      // Execute an action on an element using direct inspector call
+      const result = await callInspectorDirect(tab.id, "executeAction", params);
+      if (result && result.success !== false) {
+        return result;
       }
-
-      throw new Error("executeAction failed after retries");
+      throw new Error(result?.error || "Failed to execute action");
     }
 
     case "navigate": {
@@ -1409,135 +1532,23 @@ async function executeExplorationCommand(action, params) {
     }
 
     case "getSpecs": {
-      // Get spec configs from the page's SpecStore
-      // Uses retry logic with exponential backoff to handle transient connection failures
-      const maxRetries = 3;
-      const baseDelay = 200;
-
-      for (let attempt = 0; attempt < maxRetries; attempt++) {
-        // Try to inject scripts if not already there
-        try {
-          await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
-            files: ["content-scripts/ui-bridge-inspector.js"],
-            world: "MAIN",
-          });
-          await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
-            files: ["content-scripts/ui-bridge-bridge.js"],
-            world: "ISOLATED",
-          });
-        } catch {
-          // Ignore - scripts may already exist
-        }
-
-        // Wait for scripts to initialize (longer on retries)
-        const delay = baseDelay * (attempt + 1);
-        await new Promise((r) => setTimeout(r, delay));
-
-        try {
-          const result = await new Promise((resolve, reject) => {
-            chrome.tabs.sendMessage(
-              tab.id,
-              { type: "UI_BRIDGE_COMMAND", action: "getSpecs", params: params || {} },
-              (response) => {
-                if (chrome.runtime.lastError) {
-                  reject(new Error(chrome.runtime.lastError.message));
-                  return;
-                }
-                if (response && response.success) {
-                  resolve(response.data);
-                } else {
-                  reject(new Error(response?.error || "Failed to get specs"));
-                }
-              },
-            );
-          });
-          return result; // Success - return immediately
-        } catch (error) {
-          const isConnectionError =
-            error.message.includes("Could not establish connection") ||
-            error.message.includes("Receiving end does not exist");
-
-          if (isConnectionError && attempt < maxRetries - 1) {
-            console.log(
-              `[Qontinui] getSpecs attempt ${attempt + 1} failed with connection error, retrying...`,
-            );
-            continue;
-          }
-          throw error;
-        }
+      // Get spec configs from the page's SpecStore using direct inspector call
+      const result = await callInspectorDirect(tab.id, "getSpecs", params || {});
+      if (result && result.success) {
+        return result;
       }
-
-      throw new Error("getSpecs failed after retries");
+      throw new Error(result?.error || "Failed to get specs");
     }
 
     case "captureSnapshot": {
-      // Capture a DOM snapshot
-      // Uses retry logic with exponential backoff to handle transient connection failures
-      const maxRetries = 3;
-      const baseDelay = 200;
-
-      for (let attempt = 0; attempt < maxRetries; attempt++) {
-        // Try to inject scripts if not already there
-        try {
-          await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
-            files: ["content-scripts/ui-bridge-inspector.js"],
-            world: "MAIN",
-          });
-          await chrome.scripting.executeScript({
-            target: { tabId: tab.id },
-            files: ["content-scripts/ui-bridge-bridge.js"],
-            world: "ISOLATED",
-          });
-        } catch {
-          // Ignore - scripts may already exist
-        }
-
-        // Wait for scripts to initialize (longer on retries)
-        const delay = baseDelay * (attempt + 1);
-        await new Promise((r) => setTimeout(r, delay));
-
-        try {
-          const result = await new Promise((resolve, reject) => {
-            chrome.tabs.sendMessage(
-              tab.id,
-              { type: "UI_BRIDGE_COMMAND", action: "getStateSnapshot", params: params || {} },
-              (response) => {
-                if (chrome.runtime.lastError) {
-                  reject(new Error(chrome.runtime.lastError.message));
-                  return;
-                }
-                if (response && response.success) {
-                  // Add URL and title to the snapshot
-                  const snapshot = response.data || {};
-                  snapshot.url = tab.url;
-                  snapshot.title = tab.title;
-                  resolve(snapshot);
-                } else {
-                  reject(new Error(response?.error || "Failed to capture snapshot"));
-                }
-              },
-            );
-          });
-          return result; // Success - return immediately
-        } catch (error) {
-          const isConnectionError =
-            error.message.includes("Could not establish connection") ||
-            error.message.includes("Receiving end does not exist");
-
-          if (isConnectionError && attempt < maxRetries - 1) {
-            console.log(
-              `[Qontinui] captureSnapshot attempt ${attempt + 1} failed with connection error, retrying...`,
-            );
-            continue;
-          }
-          throw error;
-        }
+      // Capture a state snapshot using direct inspector call
+      const result = await callInspectorDirect(tab.id, "getStateSnapshot", params || {});
+      if (result) {
+        result.url = tab.url;
+        result.title = tab.title;
+        return result;
       }
-
-      throw new Error("captureSnapshot failed after retries");
+      throw new Error("Failed to capture snapshot");
     }
 
     default:
@@ -2071,10 +2082,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           message.action,
           message.requestId,
         );
-        const result = await executeExplorationCommand(
-          message.action,
-          message.params || {},
-        );
+        const result = await executeExplorationCommand(message.action, message.params || {});
         sendResponse({ success: true, data: result });
       } catch (error) {
         console.error("[Qontinui] Exploration command failed:", error);
@@ -2086,13 +2094,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   // Offscreen doc reporting WebSocket connection state change
   if (message.type === "OFFSCREEN_WS_STATE") {
+    const previousState = offscreenWsConnected;
     offscreenWsConnected = message.connected;
-    console.log(
-      "[Qontinui] WebSocket state update from offscreen:",
-      message.connected ? "connected" : "disconnected",
-      "reconnects:",
-      message.reconnectCount,
-    );
+    console.log("[Qontinui BG] WebSocket state change", {
+      previous: previousState ? "connected" : "disconnected",
+      current: message.connected ? "connected" : "disconnected",
+      reconnectCount: message.reconnectCount,
+      swUptime: Math.round((Date.now() - SW_START_TIME) / 1000) + "s",
+    });
     return false;
   }
 
@@ -2271,9 +2280,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       await ensureOffscreenDocument();
       try {
         const status = await sendToOffscreen({ type: "TO_OFFSCREEN_GET_STATUS" });
-        sendResponse(status || { connected: false });
-      } catch {
-        sendResponse({ connected: offscreenWsConnected });
+        // Augment with background-level info
+        sendResponse({
+          ...(status || { connected: false }),
+          _bg: {
+            swUptime: Math.round((Date.now() - SW_START_TIME) / 1000),
+            swWakeCount,
+            offscreenRecreateCount,
+            offscreenCheckCount,
+            offscreenWsConnected,
+          },
+        });
+      } catch (e) {
+        sendResponse({
+          connected: offscreenWsConnected,
+          _bg: {
+            swUptime: Math.round((Date.now() - SW_START_TIME) / 1000),
+            offscreenQueryError: e.message,
+          },
+        });
       }
     })();
     return true;
@@ -2282,10 +2307,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === "reconnectWebSocket") {
     // Tell offscreen document to force reconnect
     (async () => {
+      console.log("[Qontinui BG] Reconnect requested by popup/caller");
       await ensureOffscreenDocument();
       try {
         await sendToOffscreen({ type: "TO_OFFSCREEN_RECONNECT" });
         sendResponse({ success: true });
+      } catch (e) {
+        console.error("[Qontinui BG] Reconnect failed:", e.message);
+        sendResponse({ success: false, error: e.message });
+      }
+    })();
+    return true;
+  }
+
+  if (message.action === "getDebugLog") {
+    // Retrieve debug log from offscreen document
+    (async () => {
+      await ensureOffscreenDocument();
+      try {
+        const log = await sendToOffscreen({
+          type: "TO_OFFSCREEN_GET_DEBUG_LOG",
+          limit: message.limit || 100,
+          since: message.since || 0,
+          category: message.category || null,
+        });
+        sendResponse({ success: true, ...(log || {}) });
       } catch (e) {
         sendResponse({ success: false, error: e.message });
       }
@@ -2492,95 +2538,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           return;
         }
 
-        console.log(`[Qontinui] UI_BRIDGE_POPUP_COMMAND: action=${message.action}, tab=${tab.id}, url=${tab.url?.slice(0, 80)}`);
+        console.log(
+          `[Qontinui] UI_BRIDGE_POPUP_COMMAND: action=${message.action}, tab=${tab.id}, url=${tab.url?.slice(0, 80)}`,
+        );
 
-        // Use retry logic with content script injection to handle cases where
-        // the page was loaded before the extension (content scripts not injected)
-        const maxRetries = 3;
-        const baseDelay = 300;
-
-        for (let attempt = 0; attempt < maxRetries; attempt++) {
-          // Try to inject content scripts first (they may already exist)
-          try {
-            await chrome.scripting.executeScript({
-              target: { tabId: tab.id },
-              files: ["content-scripts/ui-bridge-inspector.js"],
-              world: "MAIN",
-            });
-            await chrome.scripting.executeScript({
-              target: { tabId: tab.id },
-              files: ["content-scripts/ui-bridge-bridge.js"],
-              world: "ISOLATED",
-            });
-            if (attempt === 0) {
-              console.log("[Qontinui] Injected UI Bridge scripts into tab", tab.id);
-            }
-          } catch (_e) {
-            // Scripts might already be there, or page doesn't allow injection
-            if (attempt === 0) {
-              console.log(
-                "[Qontinui] Could not inject UI Bridge scripts (may already exist):",
-                _e.message,
-              );
-            }
-          }
-
-          // Wait for scripts to initialize (longer on retries)
-          const delay = baseDelay * (attempt + 1);
-          await new Promise((r) => setTimeout(r, delay));
-
-          // Try to send the command (with timeout to prevent hanging)
-          try {
-            const result = await new Promise((resolve, reject) => {
-              const timeout = setTimeout(() => {
-                reject(new Error("Content script response timeout"));
-              }, 2000); // 2 second timeout per attempt
-
-              chrome.tabs.sendMessage(
-                tab.id,
-                {
-                  type: "UI_BRIDGE_COMMAND",
-                  action: message.action,
-                  params: message.params || {},
-                },
-                (response) => {
-                  clearTimeout(timeout);
-                  if (chrome.runtime.lastError) {
-                    reject(
-                      new Error(
-                        chrome.runtime.lastError.message ||
-                          "Failed to communicate with content script",
-                      ),
-                    );
-                    return;
-                  }
-                  resolve(response || { success: false, error: "No response from content script" });
-                },
-              );
-            });
-            // Success - send response and return
-            console.log(`[Qontinui] UI Bridge ping success:`, JSON.stringify(result).slice(0, 200));
-            sendResponse(result);
-            return;
-          } catch (error) {
-            const isRetryableError =
-              error.message.includes("Could not establish connection") ||
-              error.message.includes("Receiving end does not exist") ||
-              error.message.includes("timeout");
-
-            if (isRetryableError && attempt < maxRetries - 1) {
-              console.log(
-                `[Qontinui] UI Bridge command attempt ${attempt + 1} failed (${error.message}), retrying...`,
-              );
-              continue;
-            }
-            // Last attempt or non-retryable error - throw to outer catch
-            throw error;
-          }
-        }
-
-        // Should not reach here, but handle it
-        sendResponse({ success: false, error: "UI Bridge command failed after retries" });
+        // Use callInspectorDirect — bypasses content script messaging entirely
+        const result = await callInspectorDirect(tab.id, message.action, message.params || {});
+        console.log(`[Qontinui] UI Bridge command success:`, JSON.stringify(result).slice(0, 200));
+        // Wrap result to match expected response format (success + data)
+        sendResponse({ success: result.success !== false, data: result });
       } catch (error) {
         sendResponse({ success: false, error: error.message });
       }

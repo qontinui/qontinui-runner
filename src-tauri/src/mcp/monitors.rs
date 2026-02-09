@@ -1,13 +1,17 @@
-//! Monitor detection handlers for MCP API
+//! Monitor handlers for MCP API
 //!
-//! Provides monitor enumeration and configuration.
+//! Provides HTTP handlers for monitor information:
+//! list monitors with position, size, and spatial layout.
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode, response::Json};
 use std::sync::Arc;
-use tracing::info;
-
-use super::types::{api_error, ApiResponse, ApiState, MonitorInfoResponse, MonitorsResponse};
 use tauri::Manager;
+
+use crate::mcp::types::{api_error, ApiResponse, ApiState, MonitorInfoResponse, MonitorsResponse};
+
+// ============================================================================
+// Handlers
+// ============================================================================
 
 /// Get available monitors with position information
 pub async fn get_monitors(
@@ -114,4 +118,10 @@ pub async fn get_monitors(
         monitors: monitor_infos,
         available_descriptors: descriptors,
     })))
+}
+
+/// Create routes for this module.
+pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
+    use axum::routing::get;
+    axum::Router::new().route("/monitors", get(get_monitors))
 }

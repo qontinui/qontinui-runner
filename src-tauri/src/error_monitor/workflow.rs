@@ -162,17 +162,64 @@ impl ErrorFixWorkflowGenerator {
     fn build_ai_prompt(&self, context: &DebugContext, curator: &DebugContextCurator) -> String {
         let mut prompt = String::new();
 
-        prompt.push_str("You are a debug agent tasked with fixing application errors.\n\n");
+        let (spec_count, runtime_count) = DebugContextCurator::classify_errors(context);
+
+        if spec_count > 0 && runtime_count == 0 {
+            // ALL errors are spec failures
+            prompt.push_str("You are a debug agent tasked with fixing UI Bridge spec verification failures.\n\n");
+            prompt.push_str("IMPORTANT: These are UI Bridge spec assertion failures, NOT application runtime errors.\n");
+            prompt.push_str("UI Bridge specs are defined in `.spec.uibridge.json` files and verify UI element state ");
+            prompt.push_str("(existence, text content, visibility, attributes).\n\n");
+            prompt.push_str(
+                "Do NOT look for Playwright tests, Jest tests, or other test frameworks.\n",
+            );
+            prompt.push_str("Do NOT search for application crashes or runtime errors — the application may be running fine.\n\n");
+        } else if spec_count > 0 && runtime_count > 0 {
+            // MIXED
+            prompt.push_str("You are a debug agent tasked with fixing application errors and UI Bridge spec failures.\n\n");
+            prompt.push_str("IMPORTANT: The errors below include BOTH types:\n");
+            prompt.push_str(
+                "- **Application runtime errors** — fix the application code that produces them\n",
+            );
+            prompt.push_str("- **UI Bridge spec failures** (messages starting with `SPEC: `) — these are assertion failures ");
+            prompt.push_str("from `.spec.uibridge.json` files, not application crashes\n\n");
+        } else {
+            // NO spec failures — original behavior
+            prompt.push_str("You are a debug agent tasked with fixing application errors.\n\n");
+            prompt.push_str("IMPORTANT: The errors below come from application runtime logs, NOT from test suites.\n");
+            prompt.push_str("Do NOT look for or modify test files. Fix the actual application code that produces these errors.\n\n");
+        }
 
         // Add the formatted error context
         prompt.push_str(&curator.format_for_ai(context));
 
         prompt.push_str("\n## Your Task\n\n");
-        prompt.push_str("1. Analyze the errors above and identify root causes\n");
-        prompt.push_str("2. For each error, determine the fix needed\n");
-        prompt.push_str("3. Implement the fixes by modifying the relevant files\n");
-        prompt.push_str("4. Verify your fixes don't introduce new errors\n");
-        prompt.push_str("5. Document what you changed and why\n\n");
+
+        if spec_count > 0 && runtime_count == 0 {
+            prompt.push_str(
+                "1. Read the spec failure messages to understand which assertions failed\n",
+            );
+            prompt.push_str(
+                "2. Find the `.spec.uibridge.json` file containing the spec definition\n",
+            );
+            prompt
+                .push_str("3. Check the `assertions` array to understand the expected UI state\n");
+            prompt.push_str("4. Determine if the **app code** needs fixing (UI not rendering correctly) or the **spec** needs updating (expectations are outdated)\n");
+            prompt.push_str("5. Implement the fix and verify the assertions would now pass\n");
+            prompt.push_str("6. Document what you changed and why\n\n");
+        } else if spec_count > 0 {
+            prompt.push_str("1. Analyze all errors above and identify root causes\n");
+            prompt.push_str("2. For runtime errors: fix the application code that produces them\n");
+            prompt.push_str("3. For spec failures (SPEC: ...): find the `.spec.uibridge.json` file, check assertions, and fix either the app code or the spec definition\n");
+            prompt.push_str("4. Verify your fixes don't introduce new errors\n");
+            prompt.push_str("5. Document what you changed and why\n\n");
+        } else {
+            prompt.push_str("1. Analyze the errors above and identify root causes\n");
+            prompt.push_str("2. For each error, determine the fix needed\n");
+            prompt.push_str("3. Implement the fixes by modifying the relevant files\n");
+            prompt.push_str("4. Verify your fixes don't introduce new errors\n");
+            prompt.push_str("5. Document what you changed and why\n\n");
+        }
 
         if !context.patterns.is_empty() {
             prompt.push_str("## Detected Patterns to Address\n\n");

@@ -583,7 +583,6 @@ function TestConfig({
           </div>
         </>
       )}
-
     </div>
   );
 }
@@ -1392,9 +1391,7 @@ function GateConfig({
 }) {
   const requiredSteps = step.required_steps ?? [];
   // Available steps = all non-gate verification steps
-  const availableSteps = verificationSteps.filter(
-    (s) => s.type !== "gate" && s.id !== step.id,
-  );
+  const availableSteps = verificationSteps.filter((s) => s.type !== "gate" && s.id !== step.id);
 
   const toggleStep = (stepName: string) => {
     const updated = requiredSteps.includes(stepName)
@@ -1424,8 +1421,8 @@ function GateConfig({
           Required Steps ({requiredSteps.length} selected)
         </label>
         <p className="text-xs text-zinc-500 mb-2">
-          All selected steps must pass for this gate to pass. Gate results control whether
-          the agentic loop triggers.
+          All selected steps must pass for this gate to pass. Gate results control whether the
+          agentic loop triggers.
         </p>
         {availableSteps.length === 0 ? (
           <p className="text-xs text-zinc-500 italic">

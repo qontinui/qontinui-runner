@@ -24,6 +24,7 @@ import {
   CheckCircle,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
+import { isDevelopmentMode } from "qontinui-navigation";
 import { getAccentColors } from "@/design-system";
 
 const API_BASE = "http://localhost:9876";
@@ -348,7 +349,15 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
         });
       }
 
-      setItems(allItems);
+      // In production, hide automation-specific item types (macros, state exploration)
+      const isDevMode = isDevelopmentMode();
+      const hiddenTypes: ItemType[] = isDevMode ? [] : ["macro", "verification"];
+      const visibleItems =
+        hiddenTypes.length > 0
+          ? allItems.filter((item) => !hiddenTypes.includes(item.type))
+          : allItems;
+
+      setItems(visibleItems);
     } catch (error) {
       console.error("Failed to fetch library items:", error);
       onLog?.("error", `Failed to fetch library items: ${error}`);

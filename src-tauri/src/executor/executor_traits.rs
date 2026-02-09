@@ -144,6 +144,7 @@ mod tests {
             duration_ms: duration,
             config: StepExecutionConfig::default(),
             verification_details: None,
+            output_data: None,
         }
     }
 
@@ -160,6 +161,7 @@ mod tests {
             duration_ms: duration,
             config: StepExecutionConfig::default(),
             verification_details: None,
+            output_data: None,
         }
     }
 

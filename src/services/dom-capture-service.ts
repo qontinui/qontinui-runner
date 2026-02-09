@@ -61,8 +61,8 @@ export const domCaptureService = {
   },
 
   /**
-   * Submit a DOM capture from the browser extension.
-   * This is called by the extension when it captures a page.
+   * Submit a DOM capture from an external source.
+   * This is called when a page capture is received.
    * @param request - Capture request with HTML content
    */
   async submitFromExtension(request: CaptureFromExtensionRequest): Promise<DomCapture> {

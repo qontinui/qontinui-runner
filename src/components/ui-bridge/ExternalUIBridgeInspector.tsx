@@ -1,12 +1,12 @@
 /**
  * External UI Bridge Inspector
  *
- * Main inspector component that connects to an external browser via the
- * UI Bridge HTTP API. Unlike ConnectedUIBridgeInspector which shows the
- * runner's own UI, this shows elements from the target browser.
+ * Main inspector component that connects to external apps via the SDK
+ * UI Bridge. Unlike ConnectedUIBridgeInspector which shows the runner's
+ * own UI, this shows elements from the target application.
  *
  * Features:
- * - Browser tab connection
+ * - App/device connection via SDK
  * - Element discovery and tree view
  * - Action execution
  * - Raw API testing (Postman-like)
@@ -24,8 +24,6 @@ import {
   Terminal,
   RefreshCw,
   Eye,
-  EyeOff,
-  Crosshair,
   Copy,
   Check,
   Sparkles,
@@ -50,13 +48,17 @@ import {
   Square,
   Download,
   Network,
-  Compass,
   Loader2,
-  Maximize2,
   Monitor,
 } from "lucide-react";
-import { ConnectionPanel } from "./ConnectionPanel";
+import { ConnectionPanel, type ActiveSource } from "./ConnectionPanel";
 import { RawApiPanel } from "./RawApiPanel";
+import {
+  useAppDiscovery,
+  type DiscoveredApp,
+  type MobileDevice,
+  type ForwardDeviceResult,
+} from "../../hooks/useAppDiscovery";
 import { ElementTreeView } from "./ElementTreeView";
 import { EventTimelineView } from "./EventTimelineView";
 import { ActionExecutorView } from "./ActionExecutorView";
@@ -70,7 +72,8 @@ import {
   type ExplorationConfig,
   type ExplorationResult,
 } from "./ExplorationConfigDialog";
-import { useExternalUIBridge } from "../../hooks/useExternalUIBridge";
+import type { ExternalElement, PageContext } from "../../hooks/useExternalUIBridge";
+import { useSdkUIBridge } from "../../hooks/useSdkUIBridge";
 import { useElementThumbnails } from "../../hooks/useElementThumbnails";
 import { cropPreview } from "../../lib/thumbnail-cropper";
 import { generateAIContext } from "../../lib/ui-bridge";
@@ -81,9 +84,7 @@ type TabId = "elements" | "states" | "search" | "describe" | "nl" | "events" | "
 /**
  * Convert external element to UIBridgeElement format for existing components
  */
-function convertToUIBridgeElement(
-  element: ReturnType<typeof useExternalUIBridge>["elements"][number],
-): UIBridgeElement {
+function convertToUIBridgeElement(element: ExternalElement): UIBridgeElement {
   return {
     id: element.id,
     tagName: element.tagName,
@@ -118,13 +119,92 @@ function convertToUIBridgeElement(
 }
 
 export function ExternalUIBridgeInspector() {
-  const bridge = useExternalUIBridge();
+  const sdkBridge = useSdkUIBridge();
+  const discovery = useAppDiscovery();
+
+  // Active source tracking
+  const [activeSource, setActiveSource] = useState<ActiveSource>(null);
+  const [activeApp, setActiveApp] = useState<DiscoveredApp | null>(null);
+  const [activeMobileDevice, setActiveMobileDevice] = useState<MobileDevice | null>(null);
+
+  // Auto-scan for desktop apps on mount
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      discovery.scanDesktop();
+    }, 500);
+    return () => clearTimeout(timer);
+  }, []); // Only on mount
+
+  const handleConnectToApp = useCallback(
+    async (app: DiscoveredApp) => {
+      setActiveSource("desktop");
+      setActiveApp(app);
+      setActiveMobileDevice(null);
+      await sdkBridge.connect(app.url, {
+        appId: app.appId,
+        appName: app.appName,
+        appType: app.appType,
+        framework: app.framework,
+        port: app.port,
+      });
+    },
+    [sdkBridge],
+  );
+
+  const handleConnectToDevice = useCallback(
+    async (device: MobileDevice) => {
+      setActiveSource("mobile");
+      setActiveMobileDevice(device);
+      setActiveApp(null);
+
+      if (!device.uiBridge) {
+        // No UI Bridge detected on this device -- nothing to connect to.
+        // The ConnectionPanel already shows "No UI Bridge" for these devices.
+        return;
+      }
+
+      // The scan discovered a UI Bridge on the device, but the ADB port forward
+      // used during scanning was temporary. We need to create a persistent forward
+      // so the SDK client can reach the device.
+      const remotePort = device.uiBridge.port || 9876;
+      const forwardResult = await discovery.forwardDevice(device.deviceId, remotePort);
+
+      if (forwardResult) {
+        const localUrl = `http://localhost:${forwardResult.localPort}`;
+        await sdkBridge.connect(localUrl, {
+          appId: device.uiBridge.appId,
+          appName: device.uiBridge.appName,
+          appType: "mobile",
+          port: forwardResult.localPort,
+        });
+      }
+    },
+    [sdkBridge, discovery],
+  );
+
+  const handleDisconnectSource = useCallback(async () => {
+    await sdkBridge.disconnect();
+    setActiveSource(null);
+    setActiveApp(null);
+    setActiveMobileDevice(null);
+  }, [sdkBridge]);
+
+  // Build page context from SDK data
+  const pageContext: PageContext | null =
+    sdkBridge.elements.length > 0
+      ? {
+          url: sdkBridge.connectedApp?.port
+            ? `http://localhost:${sdkBridge.connectedApp.port}`
+            : "",
+          title: sdkBridge.connectedApp?.appName || "SDK App",
+          elements: sdkBridge.elements,
+          timestamp: Date.now(),
+        }
+      : null;
 
   const [activeTab, setActiveTab] = useState<TabId>("elements");
   const [events, setEvents] = useState<UIBridgeEvent[]>([]);
   const eventIdRef = useRef(0);
-  const [pickerActive, setPickerActive] = useState(false);
-  const [overlaysEnabled, setOverlaysEnabled] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [aiContextCopied, setAiContextCopied] = useState(false);
   const [accessibilityExpanded, setAccessibilityExpanded] = useState(false);
@@ -152,18 +232,18 @@ export function ExternalUIBridgeInspector() {
   const [showExplorationDialog, setShowExplorationDialog] = useState(false);
 
   // Convert elements for existing components
-  const uiBridgeElements = bridge.elements.map(convertToUIBridgeElement);
+  const uiBridgeElements = sdkBridge.elements.map(convertToUIBridgeElement);
 
   // Generate thumbnails from screenshot
   const {
     thumbnails,
     isProcessing: isProcessingThumbnails,
     progress: thumbnailProgress,
-  } = useElementThumbnails(bridge.elements, bridge.pageScreenshot?.data ?? null);
+  } = useElementThumbnails(sdkBridge.elements, sdkBridge.pageScreenshot?.data ?? null);
 
   // Generate larger preview for detail pane when element is selected
   useEffect(() => {
-    if (!bridge.selectedElement || !bridge.pageScreenshot?.data) {
+    if (!sdkBridge.selectedElement || !sdkBridge.pageScreenshot?.data) {
       setDetailPanePreview(null);
       return;
     }
@@ -174,8 +254,8 @@ export function ExternalUIBridgeInspector() {
       try {
         // Crop a medium-sized preview (256px) for the detail pane
         const preview = await cropPreview(
-          bridge.pageScreenshot!.data,
-          bridge.selectedElement!.bounds,
+          sdkBridge.pageScreenshot!.data,
+          sdkBridge.selectedElement!.bounds,
           256,
         );
         if (!cancelled && preview) {
@@ -191,11 +271,11 @@ export function ExternalUIBridgeInspector() {
     return () => {
       cancelled = true;
     };
-  }, [bridge.selectedElement, bridge.pageScreenshot]);
+  }, [sdkBridge.selectedElement, sdkBridge.pageScreenshot]);
 
   // Create snapshot for element tree (prefixed with _ as it's for future use)
   const _snapshot: UIBridgeSnapshot | null =
-    bridge.connectionStatus === "connected"
+    sdkBridge.connectionStatus === "connected"
       ? {
           elements: uiBridgeElements,
           states: [],
@@ -225,21 +305,21 @@ export function ExternalUIBridgeInspector() {
 
   // Handle refresh
   const handleRefresh = useCallback(async () => {
-    await bridge.refreshElements();
+    await sdkBridge.refreshElements();
     addEvent("element_discovered", {
-      result: { count: bridge.elements.length },
+      result: { count: sdkBridge.elements.length },
     });
-  }, [bridge, addEvent]);
+  }, [sdkBridge.refreshElements, sdkBridge.elements, addEvent]);
 
   // Handle element selection
   const handleSelectElement = useCallback(
     (elementId: string | null) => {
-      bridge.selectElement(elementId);
+      sdkBridge.selectElement(elementId);
       if (elementId) {
         addEvent("element_selected", { elementId });
       }
     },
-    [bridge, addEvent],
+    [sdkBridge.selectElement, addEvent],
   );
 
   // Handle action execution
@@ -247,7 +327,7 @@ export function ExternalUIBridgeInspector() {
     async (elementId: string, action: string, params?: Record<string, unknown>) => {
       const startTime = Date.now();
 
-      const result = await bridge.executeAction(elementId, action, params);
+      const result = await sdkBridge.executeAction(elementId, action, params);
 
       addEvent("action_executed", {
         elementId,
@@ -261,29 +341,8 @@ export function ExternalUIBridgeInspector() {
 
       return result;
     },
-    [bridge, addEvent],
+    [sdkBridge.executeAction, addEvent],
   );
-
-  // Handle picker toggle
-  const handleTogglePicker = useCallback(
-    async (enabled: boolean) => {
-      setPickerActive(enabled);
-      if (enabled) {
-        await bridge.enablePicker();
-        addEvent("picker_enabled", {});
-      } else {
-        bridge.disablePicker();
-        addEvent("picker_disabled", {});
-      }
-    },
-    [bridge, addEvent],
-  );
-
-  // Handle overlays toggle
-  const handleToggleOverlays = useCallback((enabled: boolean) => {
-    setOverlaysEnabled(enabled);
-    // In a full implementation, this would send a command to show/hide overlays
-  }, []);
 
   // Handle copy element ID
   const handleCopyId = useCallback(async (elementId: string) => {
@@ -309,7 +368,7 @@ export function ExternalUIBridgeInspector() {
 
   // Handle opening the large preview modal
   const handleOpenPreview = useCallback(async () => {
-    if (!bridge.selectedElement || !bridge.pageScreenshot?.data) {
+    if (!sdkBridge.selectedElement || !sdkBridge.pageScreenshot?.data) {
       return;
     }
 
@@ -319,19 +378,19 @@ export function ExternalUIBridgeInspector() {
     try {
       // Crop a larger preview (max 600px) from the original screenshot
       const largePreview = await cropPreview(
-        bridge.pageScreenshot.data,
-        bridge.selectedElement.bounds,
+        sdkBridge.pageScreenshot.data,
+        sdkBridge.selectedElement.bounds,
         600,
       );
       setLargePreviewData(largePreview);
     } catch (err) {
       console.error("[ExternalUIBridgeInspector] Failed to crop large preview:", err);
       // Fall back to thumbnail
-      setLargePreviewData(thumbnails.get(bridge.selectedElement.id) ?? null);
+      setLargePreviewData(thumbnails.get(sdkBridge.selectedElement.id) ?? null);
     } finally {
       setIsLoadingPreview(false);
     }
-  }, [bridge.selectedElement, bridge.pageScreenshot?.data, thumbnails]);
+  }, [sdkBridge.selectedElement, sdkBridge.pageScreenshot?.data, thumbnails]);
 
   // Handle closing the preview modal
   const handleClosePreview = useCallback(() => {
@@ -342,21 +401,21 @@ export function ExternalUIBridgeInspector() {
   // Handle export AI context
   const handleExportAIContext = useCallback(async () => {
     try {
-      const aiContext = generateAIContext(bridge.elements, {
-        pageTitle: bridge.connectedTabInfo?.title,
-        pageUrl: bridge.connectedTabInfo?.url,
+      const aiContext = generateAIContext(sdkBridge.elements, {
+        pageTitle: pageContext?.title,
+        pageUrl: pageContext?.url,
         interactiveOnly: true,
       });
       await navigator.clipboard.writeText(aiContext);
       setAiContextCopied(true);
       setTimeout(() => setAiContextCopied(false), 2000);
       addEvent("ai_context_exported", {
-        result: { elementCount: bridge.elements.length },
+        result: { elementCount: sdkBridge.elements.length },
       });
     } catch {
       // Ignore errors
     }
-  }, [bridge.elements, bridge.connectedTabInfo, addEvent]);
+  }, [sdkBridge.elements, pageContext, addEvent]);
 
   // Handle running fingerprint state discovery via Python library
   const handleRunDiscovery = useCallback(
@@ -480,7 +539,7 @@ export function ExternalUIBridgeInspector() {
           });
 
           // Refresh elements after exploration
-          await bridge.refreshElements();
+          await sdkBridge.refreshElements();
 
           // Switch to States tab if we discovered states
           if (result.stateDiscoveryResult && result.stateDiscoveryResult.states.length > 0) {
@@ -522,28 +581,33 @@ export function ExternalUIBridgeInspector() {
         setExplorationProgress(null);
       }
     },
-    [addEvent, bridge, isStopping],
+    [addEvent, sdkBridge, isStopping],
   );
 
   // Track previous connection status to only log once per connection
-  const prevConnectionStatus = useRef(bridge.connectionStatus);
+  const prevConnectionStatus = useRef(sdkBridge.connectionStatus);
 
   // Log connection status changes - only when transitioning TO connected
   useEffect(() => {
-    if (bridge.connectionStatus === "connected" && prevConnectionStatus.current !== "connected") {
+    if (
+      sdkBridge.connectionStatus === "connected" &&
+      prevConnectionStatus.current !== "connected"
+    ) {
       addEvent("navigation_completed", {
         result: {
-          elementCount: bridge.elements.length,
-          url: bridge.connectedTabInfo?.url,
+          elementCount: sdkBridge.elements.length,
+          url: sdkBridge.connectedApp?.port
+            ? `http://localhost:${sdkBridge.connectedApp.port}`
+            : undefined,
         },
       });
     }
-    prevConnectionStatus.current = bridge.connectionStatus;
-  }, [bridge.connectionStatus, bridge.elements.length, bridge.connectedTabInfo?.url, addEvent]);
+    prevConnectionStatus.current = sdkBridge.connectionStatus;
+  }, [sdkBridge.connectionStatus, sdkBridge.elements.length, sdkBridge.connectedApp, addEvent]);
 
   // Get selected element for action executor
-  const selectedUIBridgeElement = bridge.selectedElementId
-    ? uiBridgeElements.find((el) => el.id === bridge.selectedElementId)
+  const selectedUIBridgeElement = sdkBridge.selectedElementId
+    ? uiBridgeElements.find((el) => el.id === sdkBridge.selectedElementId)
     : undefined;
 
   const tabs: { id: TabId; label: string; icon: React.ReactNode; badge?: number }[] = [
@@ -551,13 +615,13 @@ export function ExternalUIBridgeInspector() {
       id: "elements",
       label: "Elements",
       icon: <Layers className="w-4 h-4" />,
-      badge: bridge.elements.length,
+      badge: sdkBridge.elements.length,
     },
     {
       id: "states",
       label: "States",
       icon: <Network className="w-4 h-4" />,
-      badge: bridge.cooccurrenceData?.stateCandidates.length,
+      badge: sdkBridge.cooccurrenceData?.stateCandidates.length,
     },
     {
       id: "search",
@@ -588,104 +652,55 @@ export function ExternalUIBridgeInspector() {
     <div className="flex flex-col h-full">
       {/* Connection Panel */}
       <ConnectionPanel
-        connectionStatus={bridge.connectionStatus}
-        isExtensionConnected={bridge.isExtensionConnected}
-        connectedTabInfo={bridge.connectedTabInfo}
-        browserTabs={bridge.browserTabs}
-        isLoadingTabs={bridge.isLoadingTabs}
-        error={bridge.error}
-        elementCount={bridge.elements.length}
-        onRefreshTabs={bridge.refreshTabs}
-        onConnectToTab={bridge.connectToTab}
-        onDisconnect={bridge.disconnect}
-        onCheckExtension={bridge.checkExtensionStatus}
+        error={sdkBridge.error || discovery.error}
+        sdkConnectionStatus={sdkBridge.connectionStatus}
+        webApps={discovery.webApps}
+        desktopApps={discovery.desktopApps}
+        mobileDevices={discovery.mobileDevices}
+        isScanningDesktop={discovery.isScanningDesktop}
+        isScanningMobile={discovery.isScanningMobile}
+        onScanDesktop={discovery.scanDesktop}
+        onScanMobile={discovery.scanMobile}
+        activeSource={activeSource}
+        activeApp={activeApp}
+        activeMobileDevice={activeMobileDevice}
+        onConnectToApp={handleConnectToApp}
+        onConnectToDevice={handleConnectToDevice}
+        onDisconnectSource={handleDisconnectSource}
       />
 
       {/* Toolbar */}
-      {bridge.connectionStatus === "connected" && (
+      {sdkBridge.connectionStatus === "connected" && (
         <div className="flex items-center gap-2 mb-3">
           <Button
             variant="outline"
             size="sm"
             onClick={handleRefresh}
-            disabled={bridge.isLoadingElements}
+            disabled={sdkBridge.isLoadingElements}
             title="Refresh elements"
           >
-            <RefreshCw className={`w-4 h-4 ${bridge.isLoadingElements ? "animate-spin" : ""}`} />
+            <RefreshCw className={`w-4 h-4 ${sdkBridge.isLoadingElements ? "animate-spin" : ""}`} />
           </Button>
+          {/* Capture monitor screenshot */}
           <Button
-            variant={pickerActive ? "primary" : "outline"}
+            variant="outline"
             size="sm"
-            onClick={() => handleTogglePicker(!pickerActive)}
-            title={pickerActive ? "Stop picker" : "Start element picker"}
+            onClick={() => sdkBridge.captureScreenshot()}
+            disabled={sdkBridge.isCapturingScreenshot}
+            title="Capture screenshot of app's monitor (uses Python executor)"
           >
-            <Crosshair className="w-4 h-4" />
-          </Button>
-          <Button
-            variant={overlaysEnabled ? "primary" : "outline"}
-            size="sm"
-            onClick={() => handleToggleOverlays(!overlaysEnabled)}
-            title={overlaysEnabled ? "Hide overlays" : "Show element overlays"}
-          >
-            {overlaysEnabled ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-          </Button>
-
-          {/* Screenshot Mode Toggle */}
-          <div className="h-4 w-px bg-border mx-1" />
-          <Button
-            variant={bridge.useFullPageCapture ? "primary" : "outline"}
-            size="sm"
-            onClick={() => bridge.setUseFullPageCapture(!bridge.useFullPageCapture)}
-            disabled={bridge.isCapturingFullPage}
-            title={
-              bridge.useFullPageCapture
-                ? "Full-page capture enabled (slower, captures entire page)"
-                : "Viewport capture (faster, captures only visible area)"
-            }
-          >
-            {bridge.isCapturingFullPage ? (
+            {sdkBridge.isCapturingScreenshot ? (
               <Loader2 className="w-4 h-4 animate-spin" />
-            ) : bridge.useFullPageCapture ? (
-              <Maximize2 className="w-4 h-4" />
             ) : (
-              <Monitor className="w-4 h-4" />
+              <Image className="w-4 h-4" />
             )}
           </Button>
-          {bridge.fullPageScreenshot && bridge.useFullPageCapture && (
-            <span className="text-[10px] text-muted-foreground">
-              {bridge.fullPageScreenshot.totalWidth}x{bridge.fullPageScreenshot.totalHeight}
-            </span>
-          )}
-
-          {/* Full-page capture progress indicator */}
-          {bridge.fullPageCaptureProgress && (
-            <div className="flex items-center gap-2 px-2 py-1 bg-muted/50 rounded-md text-xs">
-              <Loader2 className="w-3 h-3 animate-spin text-primary" />
-              <span className="text-muted-foreground">
-                {bridge.fullPageCaptureProgress.phase === "capturing"
-                  ? `Capturing: ${bridge.fullPageCaptureProgress.currentTile}/${bridge.fullPageCaptureProgress.totalTiles}`
-                  : bridge.fullPageCaptureProgress.phase === "stitching"
-                    ? "Stitching tiles..."
-                    : "Completing..."}
-              </span>
-              {bridge.fullPageCaptureProgress.totalTiles > 0 && (
-                <div className="w-16 h-1.5 bg-muted rounded-full overflow-hidden">
-                  <div
-                    className="h-full bg-primary transition-all duration-150"
-                    style={{
-                      width: `${(bridge.fullPageCaptureProgress.currentTile / bridge.fullPageCaptureProgress.totalTiles) * 100}%`,
-                    }}
-                  />
-                </div>
-              )}
-            </div>
-          )}
 
           <Button
             variant="outline"
             size="sm"
             onClick={handleExportAIContext}
-            disabled={bridge.elements.length === 0}
+            disabled={sdkBridge.elements.length === 0}
             title="Export AI context to clipboard"
           >
             {aiContextCopied ? (
@@ -698,20 +713,13 @@ export function ExternalUIBridgeInspector() {
 
           {/* Capture Session Controls */}
           <div className="h-4 w-px bg-border mx-1" />
-          {bridge.captureSession.active ? (
+          {sdkBridge.captureSession.active ? (
             <>
               <Button
                 variant="danger"
                 size="sm"
-                onClick={async () => {
-                  const session = await bridge.endCaptureSession();
-                  if (session) {
-                    // Copy to clipboard as JSON
-                    await navigator.clipboard.writeText(JSON.stringify(session, null, 2));
-                    console.log("[Session] Ended and copied to clipboard:", session);
-                  }
-                }}
-                title="Stop capture session and copy data to clipboard"
+                onClick={() => sdkBridge.stopCaptureSession()}
+                title="Stop capture session"
               >
                 <Square className="w-3 h-3 mr-1" />
                 <span className="text-xs">Stop</span>
@@ -720,21 +728,7 @@ export function ExternalUIBridgeInspector() {
                 variant="outline"
                 size="sm"
                 onClick={async () => {
-                  const session = await bridge.exportCaptureSession();
-                  if (session) {
-                    await navigator.clipboard.writeText(JSON.stringify(session, null, 2));
-                    console.log("[Session] Exported to clipboard:", session);
-                  }
-                }}
-                title="Export raw session data to clipboard"
-              >
-                <Download className="w-3 h-3" />
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={async () => {
-                  const cooccurrence = await bridge.generateCooccurrenceExport();
+                  const cooccurrence = await sdkBridge.generateCooccurrenceExport();
                   if (cooccurrence) {
                     await navigator.clipboard.writeText(JSON.stringify(cooccurrence, null, 2));
                     console.log(
@@ -753,15 +747,15 @@ export function ExternalUIBridgeInspector() {
               <div className="flex items-center gap-1 text-xs">
                 <Circle className="w-2 h-2 fill-red-500 text-red-500 animate-pulse" />
                 <span className="text-muted-foreground">
-                  {bridge.captureSession.captureCount || 0} caps
+                  {sdkBridge.captureSession.captureCount || 0} caps
                 </span>
                 <span className="text-muted-foreground">·</span>
                 <span className="text-muted-foreground">
-                  {bridge.captureSession.actionCount || 0} acts
+                  {sdkBridge.captureSession.actionCount || 0} acts
                 </span>
                 <span className="text-muted-foreground">·</span>
                 <span className="text-muted-foreground">
-                  {bridge.captureSession.uniqueFingerprints || 0} fps
+                  {sdkBridge.captureSession.uniqueFingerprints || 0} fps
                 </span>
               </div>
             </>
@@ -769,7 +763,7 @@ export function ExternalUIBridgeInspector() {
             <Button
               variant="outline"
               size="sm"
-              onClick={() => bridge.startCaptureSession()}
+              onClick={() => sdkBridge.startCaptureSession()}
               title="Start capture session for state machine discovery"
             >
               <Circle className="w-3 h-3 mr-1 text-red-500" />
@@ -777,55 +771,8 @@ export function ExternalUIBridgeInspector() {
             </Button>
           )}
 
-          {/* Auto-Explore Button */}
-          <div className="h-4 w-px bg-border mx-1" />
-          <Button
-            variant={isExploring ? "primary" : "outline"}
-            size="sm"
-            onClick={() => setShowExplorationDialog(true)}
-            disabled={bridge.connectionStatus !== "connected" || isExploring}
-            title="Automatically explore interactive elements and discover states"
-          >
-            {isExploring ? (
-              <>
-                <Loader2 className="w-3 h-3 mr-1 animate-spin" />
-                <span className="text-xs">Exploring...</span>
-              </>
-            ) : (
-              <>
-                <Compass className="w-3 h-3 mr-1" />
-                <span className="text-xs">Auto-Explore</span>
-              </>
-            )}
-          </Button>
-          {explorationResult && !isExploring && (
-            <button
-              onClick={() => setShowExplorationDialog(true)}
-              className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
-              title="Click to view details or run again"
-            >
-              <span>
-                {explorationResult.elementsExplored}/{explorationResult.elementsDiscovered} explored
-              </span>
-              {explorationResult.stateDiscoveryResult && (
-                <>
-                  <span>·</span>
-                  <span className="text-primary">
-                    {explorationResult.stateDiscoveryResult.states.length} states
-                  </span>
-                </>
-              )}
-              {explorationResult.errors.length > 0 && (
-                <>
-                  <span>·</span>
-                  <span className="text-destructive">{explorationResult.errors.length} errors</span>
-                </>
-              )}
-            </button>
-          )}
-
           <div className="flex-1" />
-          <div className="text-xs text-muted-foreground">{bridge.elements.length} elements</div>
+          <div className="text-xs text-muted-foreground">{sdkBridge.elements.length} elements</div>
         </div>
       )}
 
@@ -859,18 +806,10 @@ export function ExternalUIBridgeInspector() {
       <div className="flex-1 overflow-hidden">
         {activeTab === "elements" && (
           <div className="h-full flex flex-col">
-            {bridge.connectionStatus === "connected" ? (
+            {sdkBridge.connectionStatus === "connected" ? (
               <>
-                {/* Full-page capture progress indicator */}
-                {bridge.isCapturingFullPage && (
-                  <div className="flex items-center gap-2 mb-2 px-2 py-1.5 bg-blue-500/10 border border-blue-500/20 rounded-md text-xs text-blue-400">
-                    <Loader2 className="w-3 h-3 animate-spin" />
-                    <Maximize2 className="w-3 h-3" />
-                    <span>Capturing full page screenshot...</span>
-                  </div>
-                )}
                 {/* Thumbnail generation progress indicator */}
-                {isProcessingThumbnails && thumbnailProgress && !bridge.isCapturingFullPage && (
+                {isProcessingThumbnails && thumbnailProgress && (
                   <div className="flex items-center gap-2 mb-2 px-2 py-1.5 bg-muted/50 rounded-md text-xs text-muted-foreground">
                     <Loader2 className="w-3 h-3 animate-spin" />
                     <span>
@@ -889,47 +828,43 @@ export function ExternalUIBridgeInspector() {
                   elements={uiBridgeElements}
                   states={[]}
                   activeStates={[]}
-                  selectedElementId={bridge.selectedElementId}
+                  selectedElementId={sdkBridge.selectedElementId}
                   onSelectElement={handleSelectElement}
-                  loading={bridge.isLoadingElements}
+                  loading={sdkBridge.isLoadingElements}
                   thumbnails={thumbnails}
-                  isLoadingThumbnails={
-                    isProcessingThumbnails ||
-                    bridge.isCapturingScreenshot ||
-                    bridge.isCapturingFullPage
-                  }
-                  screenshotData={bridge.pageScreenshot?.data}
+                  isLoadingThumbnails={isProcessingThumbnails || sdkBridge.isCapturingScreenshot}
+                  screenshotData={sdkBridge.pageScreenshot?.data}
                 />
 
                 {/* Enhanced element details with copy */}
-                {bridge.selectedElement && (
+                {sdkBridge.selectedElement && (
                   <div className="mt-2 p-3 bg-muted/30 rounded-md border border-border/50 overflow-y-auto max-h-[400px]">
                     {/* Header with type, ref, and ID */}
                     <div className="flex items-center justify-between mb-2">
                       <div className="flex items-center gap-2">
-                        <Badge variant="default">{bridge.selectedElement.type}</Badge>
-                        {bridge.selectedElement.ref && (
+                        <Badge variant="default">{sdkBridge.selectedElement.type}</Badge>
+                        {sdkBridge.selectedElement.ref && (
                           <Badge variant="info" className="font-mono">
-                            {bridge.selectedElement.ref}
+                            {sdkBridge.selectedElement.ref}
                           </Badge>
                         )}
-                        {bridge.selectedElement.role && (
+                        {sdkBridge.selectedElement.role && (
                           <Badge
                             variant={
-                              bridge.selectedElement.accessibility?.hasExplicitRole
+                              sdkBridge.selectedElement.accessibility?.hasExplicitRole
                                 ? "purple"
                                 : "muted"
                             }
                             title={
-                              bridge.selectedElement.accessibility?.hasExplicitRole
+                              sdkBridge.selectedElement.accessibility?.hasExplicitRole
                                 ? "Explicit ARIA role"
                                 : "Implicit role from element type"
                             }
                           >
-                            {bridge.selectedElement.role}
+                            {sdkBridge.selectedElement.role}
                             <span className="ml-1 opacity-60 text-[9px]">
                               (
-                              {bridge.selectedElement.accessibility?.hasExplicitRole
+                              {sdkBridge.selectedElement.accessibility?.hasExplicitRole
                                 ? "explicit"
                                 : "implicit"}
                               )
@@ -937,14 +872,14 @@ export function ExternalUIBridgeInspector() {
                           </Badge>
                         )}
                         <span className="font-mono text-sm truncate">
-                          {bridge.selectedElement.id}
+                          {sdkBridge.selectedElement.id}
                         </span>
                       </div>
                       <button
                         className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
-                        onClick={() => handleCopyId(bridge.selectedElement!.id)}
+                        onClick={() => handleCopyId(sdkBridge.selectedElement!.id)}
                       >
-                        {copiedId === bridge.selectedElement.id ? (
+                        {copiedId === sdkBridge.selectedElement.id ? (
                           <>
                             <Check className="w-3 h-3" />
                             Copied
@@ -961,76 +896,78 @@ export function ExternalUIBridgeInspector() {
                     {/* Basic properties grid */}
                     <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
                       <div className="text-muted-foreground">Tag:</div>
-                      <div className="font-mono">{bridge.selectedElement.tagName}</div>
+                      <div className="font-mono">{sdkBridge.selectedElement.tagName}</div>
 
-                      {bridge.selectedElement.label && (
+                      {sdkBridge.selectedElement.label && (
                         <>
                           <div className="text-muted-foreground">Label:</div>
-                          <div className="truncate">{bridge.selectedElement.label}</div>
+                          <div className="truncate">{sdkBridge.selectedElement.label}</div>
                         </>
                       )}
 
                       {/* Show accessible name if different from label/text */}
-                      {bridge.selectedElement.accessibleName &&
-                        bridge.selectedElement.accessibleName !== bridge.selectedElement.label &&
-                        bridge.selectedElement.accessibleName !== bridge.selectedElement.text && (
+                      {sdkBridge.selectedElement.accessibleName &&
+                        sdkBridge.selectedElement.accessibleName !==
+                          sdkBridge.selectedElement.label &&
+                        sdkBridge.selectedElement.accessibleName !==
+                          sdkBridge.selectedElement.text && (
                           <>
                             <div className="text-muted-foreground">Accessible Name:</div>
                             <div className="truncate text-blue-400">
-                              {bridge.selectedElement.accessibleName}
+                              {sdkBridge.selectedElement.accessibleName}
                             </div>
                           </>
                         )}
 
-                      {bridge.selectedElement.text && (
+                      {sdkBridge.selectedElement.text && (
                         <>
                           <div className="text-muted-foreground">Text:</div>
-                          <div className="truncate">{bridge.selectedElement.text}</div>
+                          <div className="truncate">{sdkBridge.selectedElement.text}</div>
                         </>
                       )}
 
-                      {bridge.selectedElement.value !== undefined && (
+                      {sdkBridge.selectedElement.value !== undefined && (
                         <>
                           <div className="text-muted-foreground">Value:</div>
                           <div className="font-mono truncate">
-                            {bridge.selectedElement.value || "(empty)"}
+                            {sdkBridge.selectedElement.value || "(empty)"}
                           </div>
                         </>
                       )}
 
-                      {bridge.selectedElement.placeholder && (
+                      {sdkBridge.selectedElement.placeholder && (
                         <>
                           <div className="text-muted-foreground">Placeholder:</div>
-                          <div className="truncate">{bridge.selectedElement.placeholder}</div>
+                          <div className="truncate">{sdkBridge.selectedElement.placeholder}</div>
                         </>
                       )}
 
                       <div className="text-muted-foreground">Visible:</div>
-                      <div>{bridge.selectedElement.visible ? "Yes" : "No"}</div>
+                      <div>{sdkBridge.selectedElement.visible ? "Yes" : "No"}</div>
 
                       <div className="text-muted-foreground">Enabled:</div>
-                      <div>{bridge.selectedElement.enabled ? "Yes" : "No"}</div>
+                      <div>{sdkBridge.selectedElement.enabled ? "Yes" : "No"}</div>
 
                       <div className="text-muted-foreground">Has data-ui-id:</div>
-                      <div>{bridge.selectedElement.hasUiId ? "Yes" : "No"}</div>
+                      <div>{sdkBridge.selectedElement.hasUiId ? "Yes" : "No"}</div>
 
                       <div className="text-muted-foreground">Position:</div>
                       <div className="font-mono">
-                        {bridge.selectedElement.bounds.x.toFixed(0)},{" "}
-                        {bridge.selectedElement.bounds.y.toFixed(0)}
+                        {sdkBridge.selectedElement.bounds.x.toFixed(0)},{" "}
+                        {sdkBridge.selectedElement.bounds.y.toFixed(0)}
                       </div>
 
                       <div className="text-muted-foreground">Size:</div>
                       <div className="font-mono">
-                        {bridge.selectedElement.bounds.width.toFixed(0)} x{" "}
-                        {bridge.selectedElement.bounds.height.toFixed(0)}
+                        {sdkBridge.selectedElement.bounds.width.toFixed(0)} x{" "}
+                        {sdkBridge.selectedElement.bounds.height.toFixed(0)}
                       </div>
 
-                      {bridge.selectedElement.actions.length > 0 && (
+                      {sdkBridge.selectedElement.actions.length > 0 && (
                         <>
                           <div className="text-muted-foreground">Actions:</div>
                           <div className="flex flex-wrap gap-1">
-                            {bridge.selectedElement.actions.map((action) => (
+                            {sdkBridge.selectedElement.actions.map((action) => (
                               <Badge key={action} variant="muted" className="text-[10px]">
                                 {action}
                               </Badge>
@@ -1055,12 +992,12 @@ export function ExternalUIBridgeInspector() {
                         Accessibility States
                         {/* Quick indicators */}
                         <div className="flex gap-1 ml-auto">
-                          {bridge.selectedElement.is_interactive && (
+                          {sdkBridge.selectedElement.is_interactive && (
                             <Badge variant="success" size="sm" title="Interactive element">
                               <Pointer className="w-3 h-3" />
                             </Badge>
                           )}
-                          {bridge.selectedElement.accessibility?.isKeyboardAccessible && (
+                          {sdkBridge.selectedElement.accessibility?.isKeyboardAccessible && (
                             <Badge variant="info" size="sm" title="Keyboard accessible">
                               <Keyboard className="w-3 h-3" />
                             </Badge>
@@ -1073,51 +1010,57 @@ export function ExternalUIBridgeInspector() {
                           {/* Interaction States */}
                           <div className="flex flex-wrap gap-1.5">
                             <Badge
-                              variant={bridge.selectedElement.is_interactive ? "success" : "muted"}
+                              variant={
+                                sdkBridge.selectedElement.is_interactive ? "success" : "muted"
+                              }
                               size="sm"
                             >
                               <Pointer className="w-3 h-3 mr-1" />
-                              Interactive: {bridge.selectedElement.is_interactive ? "Yes" : "No"}
+                              Interactive: {sdkBridge.selectedElement.is_interactive ? "Yes" : "No"}
                             </Badge>
 
-                            {bridge.selectedElement.is_expanded !== undefined && (
+                            {sdkBridge.selectedElement.is_expanded !== undefined && (
                               <Badge
-                                variant={bridge.selectedElement.is_expanded ? "success" : "muted"}
+                                variant={
+                                  sdkBridge.selectedElement.is_expanded ? "success" : "muted"
+                                }
                                 size="sm"
                               >
-                                Expanded: {bridge.selectedElement.is_expanded ? "Yes" : "No"}
+                                Expanded: {sdkBridge.selectedElement.is_expanded ? "Yes" : "No"}
                               </Badge>
                             )}
 
-                            {bridge.selectedElement.is_pressed !== undefined && (
+                            {sdkBridge.selectedElement.is_pressed !== undefined && (
                               <Badge
-                                variant={bridge.selectedElement.is_pressed ? "success" : "muted"}
+                                variant={sdkBridge.selectedElement.is_pressed ? "success" : "muted"}
                                 size="sm"
                               >
-                                Pressed: {bridge.selectedElement.is_pressed ? "Yes" : "No"}
+                                Pressed: {sdkBridge.selectedElement.is_pressed ? "Yes" : "No"}
                               </Badge>
                             )}
 
-                            {bridge.selectedElement.is_selected !== undefined && (
+                            {sdkBridge.selectedElement.is_selected !== undefined && (
                               <Badge
-                                variant={bridge.selectedElement.is_selected ? "success" : "muted"}
+                                variant={
+                                  sdkBridge.selectedElement.is_selected ? "success" : "muted"
+                                }
                                 size="sm"
                               >
-                                Selected: {bridge.selectedElement.is_selected ? "Yes" : "No"}
+                                Selected: {sdkBridge.selectedElement.is_selected ? "Yes" : "No"}
                               </Badge>
                             )}
                           </div>
 
                           {/* Form States */}
-                          {(bridge.selectedElement.is_required ||
-                            bridge.selectedElement.is_readonly) && (
+                          {(sdkBridge.selectedElement.is_required ||
+                            sdkBridge.selectedElement.is_readonly) && (
                             <div className="flex flex-wrap gap-1.5">
-                              {bridge.selectedElement.is_required && (
+                              {sdkBridge.selectedElement.is_required && (
                                 <Badge variant="warning" size="sm">
                                   Required
                                 </Badge>
                               )}
-                              {bridge.selectedElement.is_readonly && (
+                              {sdkBridge.selectedElement.is_readonly && (
                                 <Badge variant="muted" size="sm">
                                   Read-only
                                 </Badge>
@@ -1127,18 +1070,18 @@ export function ExternalUIBridgeInspector() {
 
                           {/* Keyboard Accessibility */}
                           <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs mt-2">
-                            {bridge.selectedElement.accessibility?.tabIndex !== undefined && (
+                            {sdkBridge.selectedElement.accessibility?.tabIndex !== undefined && (
                               <>
                                 <div className="text-muted-foreground">Tab Index:</div>
                                 <div className="font-mono">
-                                  {bridge.selectedElement.accessibility.tabIndex}
+                                  {sdkBridge.selectedElement.accessibility.tabIndex}
                                 </div>
                               </>
                             )}
 
                             <div className="text-muted-foreground">In Tab Order:</div>
                             <div className="flex items-center gap-1">
-                              {bridge.selectedElement.accessibility?.isInTabOrder ? (
+                              {sdkBridge.selectedElement.accessibility?.isInTabOrder ? (
                                 <>
                                   <Check className="w-3 h-3 text-green-500" />
                                   <span className="text-green-500">Yes</span>
@@ -1150,7 +1093,7 @@ export function ExternalUIBridgeInspector() {
 
                             <div className="text-muted-foreground">Keyboard Accessible:</div>
                             <div className="flex items-center gap-1">
-                              {bridge.selectedElement.accessibility?.isKeyboardAccessible ? (
+                              {sdkBridge.selectedElement.accessibility?.isKeyboardAccessible ? (
                                 <>
                                   <Keyboard className="w-3 h-3 text-blue-400" />
                                   <span className="text-blue-400">Yes</span>
@@ -1161,55 +1104,55 @@ export function ExternalUIBridgeInspector() {
                             </div>
 
                             {/* ARIA attributes */}
-                            {bridge.selectedElement.accessibility?.ariaLabel && (
+                            {sdkBridge.selectedElement.accessibility?.ariaLabel && (
                               <>
                                 <div className="text-muted-foreground">aria-label:</div>
                                 <div className="truncate">
-                                  {bridge.selectedElement.accessibility.ariaLabel}
+                                  {sdkBridge.selectedElement.accessibility.ariaLabel}
                                 </div>
                               </>
                             )}
 
-                            {bridge.selectedElement.accessibility?.ariaLabelledBy && (
+                            {sdkBridge.selectedElement.accessibility?.ariaLabelledBy && (
                               <>
                                 <div className="text-muted-foreground">aria-labelledby:</div>
                                 <div className="font-mono truncate">
-                                  {bridge.selectedElement.accessibility.ariaLabelledBy}
+                                  {sdkBridge.selectedElement.accessibility.ariaLabelledBy}
                                 </div>
                               </>
                             )}
 
-                            {bridge.selectedElement.accessibility?.ariaDescribedBy && (
+                            {sdkBridge.selectedElement.accessibility?.ariaDescribedBy && (
                               <>
                                 <div className="text-muted-foreground">aria-describedby:</div>
                                 <div className="font-mono truncate">
-                                  {bridge.selectedElement.accessibility.ariaDescribedBy}
+                                  {sdkBridge.selectedElement.accessibility.ariaDescribedBy}
                                 </div>
                               </>
                             )}
 
-                            {bridge.selectedElement.accessibility?.accessibleDescription && (
+                            {sdkBridge.selectedElement.accessibility?.accessibleDescription && (
                               <>
                                 <div className="text-muted-foreground">Description:</div>
                                 <div className="truncate">
-                                  {bridge.selectedElement.accessibility.accessibleDescription}
+                                  {sdkBridge.selectedElement.accessibility.accessibleDescription}
                                 </div>
                               </>
                             )}
 
-                            {bridge.selectedElement.accessibility?.ariaLive &&
-                              bridge.selectedElement.accessibility.ariaLive !== "off" && (
+                            {sdkBridge.selectedElement.accessibility?.ariaLive &&
+                              sdkBridge.selectedElement.accessibility.ariaLive !== "off" && (
                                 <>
                                   <div className="text-muted-foreground">aria-live:</div>
                                   <div>
                                     <Badge variant="info" size="sm">
-                                      {bridge.selectedElement.accessibility.ariaLive}
+                                      {sdkBridge.selectedElement.accessibility.ariaLive}
                                     </Badge>
                                   </div>
                                 </>
                               )}
 
-                            {bridge.selectedElement.accessibility?.ariaHidden && (
+                            {sdkBridge.selectedElement.accessibility?.ariaHidden && (
                               <>
                                 <div className="text-muted-foreground">aria-hidden:</div>
                                 <div className="text-yellow-500">true</div>
@@ -1235,12 +1178,12 @@ export function ExternalUIBridgeInspector() {
                         Extraction Data
                         {/* Quick indicators */}
                         <div className="flex gap-1 ml-auto">
-                          {bridge.selectedElement.selector && (
+                          {sdkBridge.selectedElement.selector && (
                             <Badge variant="success" size="sm" title="Has CSS Selector">
                               CSS
                             </Badge>
                           )}
-                          {bridge.selectedElement.xpath && (
+                          {sdkBridge.selectedElement.xpath && (
                             <Badge variant="info" size="sm" title="Has XPath">
                               XPath
                             </Badge>
@@ -1252,7 +1195,7 @@ export function ExternalUIBridgeInspector() {
                         <div className="mt-2 pl-5 space-y-3">
                           {/* Selectors */}
                           <div className="space-y-2">
-                            {bridge.selectedElement.selector && (
+                            {sdkBridge.selectedElement.selector && (
                               <div className="space-y-1">
                                 <div className="flex items-center justify-between">
                                   <span className="text-xs text-muted-foreground flex items-center gap-1">
@@ -1263,7 +1206,7 @@ export function ExternalUIBridgeInspector() {
                                     className="flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground"
                                     onClick={() =>
                                       handleCopySelector(
-                                        bridge.selectedElement!.selector!,
+                                        sdkBridge.selectedElement!.selector!,
                                         "selector",
                                       )
                                     }
@@ -1282,12 +1225,12 @@ export function ExternalUIBridgeInspector() {
                                   </button>
                                 </div>
                                 <div className="font-mono text-[10px] bg-muted/50 px-2 py-1 rounded break-all select-all">
-                                  {bridge.selectedElement.selector}
+                                  {sdkBridge.selectedElement.selector}
                                 </div>
                               </div>
                             )}
 
-                            {bridge.selectedElement.xpath && (
+                            {sdkBridge.selectedElement.xpath && (
                               <div className="space-y-1">
                                 <div className="flex items-center justify-between">
                                   <span className="text-xs text-muted-foreground flex items-center gap-1">
@@ -1297,7 +1240,7 @@ export function ExternalUIBridgeInspector() {
                                   <button
                                     className="flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground"
                                     onClick={() =>
-                                      handleCopySelector(bridge.selectedElement!.xpath!, "xpath")
+                                      handleCopySelector(sdkBridge.selectedElement!.xpath!, "xpath")
                                     }
                                   >
                                     {copiedSelector === "xpath" ? (
@@ -1314,22 +1257,22 @@ export function ExternalUIBridgeInspector() {
                                   </button>
                                 </div>
                                 <div className="font-mono text-[10px] bg-muted/50 px-2 py-1 rounded break-all select-all">
-                                  {bridge.selectedElement.xpath}
+                                  {sdkBridge.selectedElement.xpath}
                                 </div>
                               </div>
                             )}
                           </div>
 
                           {/* CSS Classes */}
-                          {bridge.selectedElement.classes &&
-                            bridge.selectedElement.classes.length > 0 && (
+                          {sdkBridge.selectedElement.classes &&
+                            sdkBridge.selectedElement.classes.length > 0 && (
                               <div className="space-y-1">
                                 <span className="text-xs text-muted-foreground flex items-center gap-1">
                                   <Palette className="w-3 h-3" />
                                   CSS Classes:
                                 </span>
                                 <div className="flex flex-wrap gap-1">
-                                  {bridge.selectedElement.classes.map((cls, i) => (
+                                  {sdkBridge.selectedElement.classes.map((cls, i) => (
                                     <Badge
                                       key={i}
                                       variant="muted"
@@ -1343,11 +1286,11 @@ export function ExternalUIBridgeInspector() {
                             )}
 
                           {/* Link/Image Attributes */}
-                          {(bridge.selectedElement.href ||
-                            bridge.selectedElement.src ||
-                            bridge.selectedElement.alt) && (
+                          {(sdkBridge.selectedElement.href ||
+                            sdkBridge.selectedElement.src ||
+                            sdkBridge.selectedElement.alt) && (
                             <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
-                              {bridge.selectedElement.href && (
+                              {sdkBridge.selectedElement.href && (
                                 <>
                                   <div className="text-muted-foreground flex items-center gap-1">
                                     <Link className="w-3 h-3" />
@@ -1355,13 +1298,13 @@ export function ExternalUIBridgeInspector() {
                                   </div>
                                   <div
                                     className="font-mono truncate text-blue-400"
-                                    title={bridge.selectedElement.href}
+                                    title={sdkBridge.selectedElement.href}
                                   >
-                                    {bridge.selectedElement.href}
+                                    {sdkBridge.selectedElement.href}
                                   </div>
                                 </>
                               )}
-                              {bridge.selectedElement.src && (
+                              {sdkBridge.selectedElement.src && (
                                 <>
                                   <div className="text-muted-foreground flex items-center gap-1">
                                     <Image className="w-3 h-3" />
@@ -1369,57 +1312,58 @@ export function ExternalUIBridgeInspector() {
                                   </div>
                                   <div
                                     className="font-mono truncate"
-                                    title={bridge.selectedElement.src}
+                                    title={sdkBridge.selectedElement.src}
                                   >
-                                    {bridge.selectedElement.src}
+                                    {sdkBridge.selectedElement.src}
                                   </div>
                                 </>
                               )}
-                              {bridge.selectedElement.alt && (
+                              {sdkBridge.selectedElement.alt && (
                                 <>
                                   <div className="text-muted-foreground">alt:</div>
-                                  <div className="truncate">{bridge.selectedElement.alt}</div>
+                                  <div className="truncate">{sdkBridge.selectedElement.alt}</div>
                                 </>
                               )}
-                              {bridge.selectedElement.title && (
+                              {sdkBridge.selectedElement.title && (
                                 <>
                                   <div className="text-muted-foreground">title:</div>
-                                  <div className="truncate">{bridge.selectedElement.title}</div>
+                                  <div className="truncate">{sdkBridge.selectedElement.title}</div>
                                 </>
                               )}
                             </div>
                           )}
 
                           {/* Input Attributes */}
-                          {(bridge.selectedElement.inputType || bridge.selectedElement.name) && (
+                          {(sdkBridge.selectedElement.inputType ||
+                            sdkBridge.selectedElement.name) && (
                             <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
-                              {bridge.selectedElement.inputType && (
+                              {sdkBridge.selectedElement.inputType && (
                                 <>
                                   <div className="text-muted-foreground">Input Type:</div>
                                   <div className="font-mono">
-                                    {bridge.selectedElement.inputType}
+                                    {sdkBridge.selectedElement.inputType}
                                   </div>
                                 </>
                               )}
-                              {bridge.selectedElement.name && (
+                              {sdkBridge.selectedElement.name && (
                                 <>
                                   <div className="text-muted-foreground">Name:</div>
-                                  <div className="font-mono">{bridge.selectedElement.name}</div>
+                                  <div className="font-mono">{sdkBridge.selectedElement.name}</div>
                                 </>
                               )}
                             </div>
                           )}
 
                           {/* Data Attributes */}
-                          {bridge.selectedElement.dataAttributes &&
-                            Object.keys(bridge.selectedElement.dataAttributes).length > 0 && (
+                          {sdkBridge.selectedElement.dataAttributes &&
+                            Object.keys(sdkBridge.selectedElement.dataAttributes).length > 0 && (
                               <div className="space-y-1">
                                 <span className="text-xs text-muted-foreground flex items-center gap-1">
                                   <Database className="w-3 h-3" />
                                   Data Attributes:
                                 </span>
                                 <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs bg-muted/30 p-2 rounded">
-                                  {Object.entries(bridge.selectedElement.dataAttributes).map(
+                                  {Object.entries(sdkBridge.selectedElement.dataAttributes).map(
                                     ([key, value]) => (
                                       <div key={key} className="contents">
                                         <div className="text-muted-foreground font-mono">
@@ -1436,14 +1380,14 @@ export function ExternalUIBridgeInspector() {
                             )}
 
                           {/* Computed Styles */}
-                          {bridge.selectedElement.computedStyle && (
+                          {sdkBridge.selectedElement.computedStyle && (
                             <div className="space-y-1">
                               <span className="text-xs text-muted-foreground flex items-center gap-1">
                                 <Palette className="w-3 h-3" />
                                 Computed Styles:
                               </span>
                               <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs bg-muted/30 p-2 rounded">
-                                {bridge.selectedElement.computedStyle.color && (
+                                {sdkBridge.selectedElement.computedStyle.color && (
                                   <>
                                     <div className="text-muted-foreground">Color:</div>
                                     <div className="font-mono flex items-center gap-1">
@@ -1451,15 +1395,15 @@ export function ExternalUIBridgeInspector() {
                                         className="w-3 h-3 rounded border border-border/50"
                                         style={{
                                           backgroundColor:
-                                            bridge.selectedElement.computedStyle.color,
+                                            sdkBridge.selectedElement.computedStyle.color,
                                         }}
                                       />
-                                      {bridge.selectedElement.computedStyle.color}
+                                      {sdkBridge.selectedElement.computedStyle.color}
                                     </div>
                                   </>
                                 )}
-                                {bridge.selectedElement.computedStyle.backgroundColor &&
-                                  bridge.selectedElement.computedStyle.backgroundColor !==
+                                {sdkBridge.selectedElement.computedStyle.backgroundColor &&
+                                  sdkBridge.selectedElement.computedStyle.backgroundColor !==
                                     "rgba(0, 0, 0, 0)" && (
                                     <>
                                       <div className="text-muted-foreground">Background:</div>
@@ -1468,61 +1412,62 @@ export function ExternalUIBridgeInspector() {
                                           className="w-3 h-3 rounded border border-border/50"
                                           style={{
                                             backgroundColor:
-                                              bridge.selectedElement.computedStyle.backgroundColor,
+                                              sdkBridge.selectedElement.computedStyle
+                                                .backgroundColor,
                                           }}
                                         />
-                                        {bridge.selectedElement.computedStyle.backgroundColor}
+                                        {sdkBridge.selectedElement.computedStyle.backgroundColor}
                                       </div>
                                     </>
                                   )}
-                                {bridge.selectedElement.computedStyle.fontSize && (
+                                {sdkBridge.selectedElement.computedStyle.fontSize && (
                                   <>
                                     <div className="text-muted-foreground">Font Size:</div>
                                     <div className="font-mono">
-                                      {bridge.selectedElement.computedStyle.fontSize}
+                                      {sdkBridge.selectedElement.computedStyle.fontSize}
                                     </div>
                                   </>
                                 )}
-                                {bridge.selectedElement.computedStyle.fontWeight && (
+                                {sdkBridge.selectedElement.computedStyle.fontWeight && (
                                   <>
                                     <div className="text-muted-foreground">Font Weight:</div>
                                     <div className="font-mono">
-                                      {bridge.selectedElement.computedStyle.fontWeight}
+                                      {sdkBridge.selectedElement.computedStyle.fontWeight}
                                     </div>
                                   </>
                                 )}
-                                {bridge.selectedElement.computedStyle.display && (
+                                {sdkBridge.selectedElement.computedStyle.display && (
                                   <>
                                     <div className="text-muted-foreground">Display:</div>
                                     <div className="font-mono">
-                                      {bridge.selectedElement.computedStyle.display}
+                                      {sdkBridge.selectedElement.computedStyle.display}
                                     </div>
                                   </>
                                 )}
-                                {bridge.selectedElement.computedStyle.position &&
-                                  bridge.selectedElement.computedStyle.position !== "static" && (
+                                {sdkBridge.selectedElement.computedStyle.position &&
+                                  sdkBridge.selectedElement.computedStyle.position !== "static" && (
                                     <>
                                       <div className="text-muted-foreground">Position:</div>
                                       <div className="font-mono">
-                                        {bridge.selectedElement.computedStyle.position}
+                                        {sdkBridge.selectedElement.computedStyle.position}
                                       </div>
                                     </>
                                   )}
-                                {bridge.selectedElement.computedStyle.zIndex &&
-                                  bridge.selectedElement.computedStyle.zIndex !== "auto" && (
+                                {sdkBridge.selectedElement.computedStyle.zIndex &&
+                                  sdkBridge.selectedElement.computedStyle.zIndex !== "auto" && (
                                     <>
                                       <div className="text-muted-foreground">Z-Index:</div>
                                       <div className="font-mono">
-                                        {bridge.selectedElement.computedStyle.zIndex}
+                                        {sdkBridge.selectedElement.computedStyle.zIndex}
                                       </div>
                                     </>
                                   )}
-                                {bridge.selectedElement.computedStyle.opacity &&
-                                  bridge.selectedElement.computedStyle.opacity !== "1" && (
+                                {sdkBridge.selectedElement.computedStyle.opacity &&
+                                  sdkBridge.selectedElement.computedStyle.opacity !== "1" && (
                                     <>
                                       <div className="text-muted-foreground">Opacity:</div>
                                       <div className="font-mono">
-                                        {bridge.selectedElement.computedStyle.opacity}
+                                        {sdkBridge.selectedElement.computedStyle.opacity}
                                       </div>
                                     </>
                                   )}
@@ -1531,40 +1476,42 @@ export function ExternalUIBridgeInspector() {
                           )}
 
                           {/* Page Context */}
-                          {(bridge.selectedElement.sourceUrl ||
-                            bridge.selectedElement.viewportWidth) && (
+                          {(sdkBridge.selectedElement.sourceUrl ||
+                            sdkBridge.selectedElement.viewportWidth) && (
                             <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
-                              {bridge.selectedElement.sourceUrl && (
+                              {sdkBridge.selectedElement.sourceUrl && (
                                 <>
                                   <div className="text-muted-foreground">Source URL:</div>
                                   <div
                                     className="font-mono truncate text-blue-400"
-                                    title={bridge.selectedElement.sourceUrl}
+                                    title={sdkBridge.selectedElement.sourceUrl}
                                   >
-                                    {bridge.selectedElement.sourceUrl}
+                                    {sdkBridge.selectedElement.sourceUrl}
                                   </div>
                                 </>
                               )}
-                              {bridge.selectedElement.viewportWidth &&
-                                bridge.selectedElement.viewportHeight && (
+                              {sdkBridge.selectedElement.viewportWidth &&
+                                sdkBridge.selectedElement.viewportHeight && (
                                   <>
                                     <div className="text-muted-foreground">Viewport:</div>
                                     <div className="font-mono">
-                                      {bridge.selectedElement.viewportWidth} x{" "}
-                                      {bridge.selectedElement.viewportHeight}
+                                      {sdkBridge.selectedElement.viewportWidth} x{" "}
+                                      {sdkBridge.selectedElement.viewportHeight}
                                     </div>
                                   </>
                                 )}
-                              {bridge.selectedElement.depth !== undefined && (
+                              {sdkBridge.selectedElement.depth !== undefined && (
                                 <>
                                   <div className="text-muted-foreground">DOM Depth:</div>
-                                  <div className="font-mono">{bridge.selectedElement.depth}</div>
+                                  <div className="font-mono">{sdkBridge.selectedElement.depth}</div>
                                 </>
                               )}
-                              {bridge.selectedElement.tagIndex !== undefined && (
+                              {sdkBridge.selectedElement.tagIndex !== undefined && (
                                 <>
                                   <div className="text-muted-foreground">Tag Index:</div>
-                                  <div className="font-mono">{bridge.selectedElement.tagIndex}</div>
+                                  <div className="font-mono">
+                                    {sdkBridge.selectedElement.tagIndex}
+                                  </div>
                                 </>
                               )}
                             </div>
@@ -1574,7 +1521,7 @@ export function ExternalUIBridgeInspector() {
                     </div>
 
                     {/* Fingerprint Section - Collapsible */}
-                    {bridge.selectedElement.fingerprint && (
+                    {sdkBridge.selectedElement.fingerprint && (
                       <div className="mt-3 pt-2 border-t border-border/50">
                         <button
                           className="flex items-center gap-2 text-xs font-medium text-muted-foreground hover:text-foreground w-full"
@@ -1590,9 +1537,9 @@ export function ExternalUIBridgeInspector() {
                           {/* Quick indicators */}
                           <div className="flex gap-1 ml-auto">
                             <Badge variant="default" size="sm" className="font-mono text-[9px]">
-                              {bridge.selectedElement.fingerprint.hash}
+                              {sdkBridge.selectedElement.fingerprint.hash}
                             </Badge>
-                            {bridge.selectedElement.fingerprint.isRepeating && (
+                            {sdkBridge.selectedElement.fingerprint.isRepeating && (
                               <Badge variant="info" size="sm" title="Repeating element">
                                 <Repeat className="w-3 h-3" />
                               </Badge>
@@ -1613,7 +1560,7 @@ export function ExternalUIBridgeInspector() {
                                   className="flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground"
                                   onClick={() =>
                                     handleCopySelector(
-                                      bridge.selectedElement!.fingerprint!.hash,
+                                      sdkBridge.selectedElement!.fingerprint!.hash,
                                       "fingerprint",
                                     )
                                   }
@@ -1632,7 +1579,7 @@ export function ExternalUIBridgeInspector() {
                                 </button>
                               </div>
                               <div className="font-mono text-sm bg-muted/50 px-2 py-1 rounded select-all">
-                                {bridge.selectedElement.fingerprint.hash}
+                                {sdkBridge.selectedElement.fingerprint.hash}
                               </div>
                             </div>
 
@@ -1645,9 +1592,9 @@ export function ExternalUIBridgeInspector() {
                                 <div className="text-muted-foreground">Path:</div>
                                 <div
                                   className="font-mono text-[10px] truncate"
-                                  title={bridge.selectedElement.fingerprint.structuralPath}
+                                  title={sdkBridge.selectedElement.fingerprint.structuralPath}
                                 >
-                                  {bridge.selectedElement.fingerprint.structuralPath}
+                                  {sdkBridge.selectedElement.fingerprint.structuralPath}
                                 </div>
 
                                 <div className="text-muted-foreground flex items-center gap-1">
@@ -1656,18 +1603,18 @@ export function ExternalUIBridgeInspector() {
                                 </div>
                                 <div>
                                   <Badge variant="muted" size="sm">
-                                    {bridge.selectedElement.fingerprint.positionZone}
+                                    {sdkBridge.selectedElement.fingerprint.positionZone}
                                   </Badge>
                                 </div>
 
                                 <div className="text-muted-foreground">Landmark:</div>
                                 <div className="flex items-center gap-1">
                                   <Badge variant="purple" size="sm">
-                                    {bridge.selectedElement.fingerprint.landmarkContext}
+                                    {sdkBridge.selectedElement.fingerprint.landmarkContext}
                                   </Badge>
-                                  {bridge.selectedElement.fingerprint.landmarkLabel && (
+                                  {sdkBridge.selectedElement.fingerprint.landmarkLabel && (
                                     <span className="text-[10px] text-muted-foreground truncate">
-                                      ({bridge.selectedElement.fingerprint.landmarkLabel})
+                                      ({sdkBridge.selectedElement.fingerprint.landmarkLabel})
                                     </span>
                                   )}
                                 </div>
@@ -1682,22 +1629,22 @@ export function ExternalUIBridgeInspector() {
                               <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs bg-muted/30 p-2 rounded">
                                 <div className="text-muted-foreground">Role:</div>
                                 <div className="font-mono">
-                                  {bridge.selectedElement.fingerprint.role}
+                                  {sdkBridge.selectedElement.fingerprint.role}
                                 </div>
 
                                 <div className="text-muted-foreground">Tag:</div>
                                 <div className="font-mono">
-                                  {bridge.selectedElement.fingerprint.tagName}
+                                  {sdkBridge.selectedElement.fingerprint.tagName}
                                 </div>
 
-                                {bridge.selectedElement.fingerprint.accessibleName && (
+                                {sdkBridge.selectedElement.fingerprint.accessibleName && (
                                   <>
                                     <div className="text-muted-foreground">Name (normalized):</div>
                                     <div
                                       className="truncate"
-                                      title={bridge.selectedElement.fingerprint.accessibleName}
+                                      title={sdkBridge.selectedElement.fingerprint.accessibleName}
                                     >
-                                      {bridge.selectedElement.fingerprint.accessibleName}
+                                      {sdkBridge.selectedElement.fingerprint.accessibleName}
                                     </div>
                                   </>
                                 )}
@@ -1713,7 +1660,7 @@ export function ExternalUIBridgeInspector() {
                                 <div className="text-muted-foreground">Size Category:</div>
                                 <div>
                                   <Badge variant="muted" size="sm">
-                                    {bridge.selectedElement.fingerprint.sizeCategory}
+                                    {sdkBridge.selectedElement.fingerprint.sizeCategory}
                                   </Badge>
                                 </div>
 
@@ -1721,11 +1668,12 @@ export function ExternalUIBridgeInspector() {
                                 <div className="font-mono">
                                   top:{" "}
                                   {(
-                                    bridge.selectedElement.fingerprint.relativePosition.top * 100
+                                    sdkBridge.selectedElement.fingerprint.relativePosition.top * 100
                                   ).toFixed(0)}
                                   %, left:{" "}
                                   {(
-                                    bridge.selectedElement.fingerprint.relativePosition.left * 100
+                                    sdkBridge.selectedElement.fingerprint.relativePosition.left *
+                                    100
                                   ).toFixed(0)}
                                   %
                                 </div>
@@ -1733,8 +1681,8 @@ export function ExternalUIBridgeInspector() {
                             </div>
 
                             {/* Repeat Pattern */}
-                            {bridge.selectedElement.fingerprint.isRepeating &&
-                              bridge.selectedElement.fingerprint.repeatPattern && (
+                            {sdkBridge.selectedElement.fingerprint.isRepeating &&
+                              sdkBridge.selectedElement.fingerprint.repeatPattern && (
                                 <div className="space-y-1">
                                   <span className="text-xs text-muted-foreground font-medium flex items-center gap-1">
                                     <Repeat className="w-3 h-3" />
@@ -1744,43 +1692,44 @@ export function ExternalUIBridgeInspector() {
                                     <div className="text-muted-foreground">Type:</div>
                                     <div>
                                       <Badge variant="info" size="sm">
-                                        {bridge.selectedElement.fingerprint.repeatPattern.type}
+                                        {sdkBridge.selectedElement.fingerprint.repeatPattern.type}
                                       </Badge>
                                     </div>
 
                                     <div className="text-muted-foreground">Position:</div>
                                     <div className="font-mono">
-                                      {bridge.selectedElement.fingerprint.repeatPattern.index + 1}{" "}
-                                      of {bridge.selectedElement.fingerprint.repeatPattern.count}
+                                      {sdkBridge.selectedElement.fingerprint.repeatPattern.index +
+                                        1}{" "}
+                                      of {sdkBridge.selectedElement.fingerprint.repeatPattern.count}
                                     </div>
 
-                                    {bridge.selectedElement.fingerprint.repeatPattern
+                                    {sdkBridge.selectedElement.fingerprint.repeatPattern
                                       .itemSelector && (
                                       <>
                                         <div className="text-muted-foreground">Item Selector:</div>
                                         <div
                                           className="font-mono text-[10px] truncate"
                                           title={
-                                            bridge.selectedElement.fingerprint.repeatPattern
+                                            sdkBridge.selectedElement.fingerprint.repeatPattern
                                               .itemSelector
                                           }
                                         >
                                           {
-                                            bridge.selectedElement.fingerprint.repeatPattern
+                                            sdkBridge.selectedElement.fingerprint.repeatPattern
                                               .itemSelector
                                           }
                                         </div>
                                       </>
                                     )}
 
-                                    {bridge.selectedElement.fingerprint.repeatPattern
+                                    {sdkBridge.selectedElement.fingerprint.repeatPattern
                                       .containerTag && (
                                       <>
                                         <div className="text-muted-foreground">Container:</div>
                                         <div className="font-mono">
                                           &lt;
                                           {
-                                            bridge.selectedElement.fingerprint.repeatPattern
+                                            sdkBridge.selectedElement.fingerprint.repeatPattern
                                               .containerTag
                                           }
                                           &gt;
@@ -1788,13 +1737,13 @@ export function ExternalUIBridgeInspector() {
                                       </>
                                     )}
 
-                                    {bridge.selectedElement.fingerprint.repeatPattern
+                                    {sdkBridge.selectedElement.fingerprint.repeatPattern
                                       .containerRole && (
                                       <>
                                         <div className="text-muted-foreground">Container Role:</div>
                                         <div className="font-mono">
                                           {
-                                            bridge.selectedElement.fingerprint.repeatPattern
+                                            sdkBridge.selectedElement.fingerprint.repeatPattern
                                               .containerRole
                                           }
                                         </div>
@@ -1809,12 +1758,12 @@ export function ExternalUIBridgeInspector() {
                     )}
 
                     {/* Element Preview Thumbnail */}
-                    {bridge.selectedElement &&
-                      (detailPanePreview || thumbnails.get(bridge.selectedElement.id)) && (
+                    {sdkBridge.selectedElement &&
+                      (detailPanePreview || thumbnails.get(sdkBridge.selectedElement.id)) && (
                         <div className="mt-3 pt-2 border-t border-border/50">
                           <div className="text-xs font-semibold mb-1.5">Preview</div>
                           <img
-                            src={`data:image/png;base64,${detailPanePreview || thumbnails.get(bridge.selectedElement.id)}`}
+                            src={`data:image/png;base64,${detailPanePreview || thumbnails.get(sdkBridge.selectedElement.id)}`}
                             alt="Element preview"
                             className="max-h-64 max-w-64 object-contain rounded border border-border cursor-pointer hover:border-primary transition-colors"
                             onClick={handleOpenPreview}
@@ -1828,7 +1777,7 @@ export function ExternalUIBridgeInspector() {
                       <Button
                         variant="outline"
                         size="sm"
-                        onClick={() => bridge.highlightElement(bridge.selectedElement!.id)}
+                        onClick={() => sdkBridge.highlightElement(sdkBridge.selectedElement!.id)}
                       >
                         <Eye className="w-3.5 h-3.5 mr-1" />
                         Highlight
@@ -1842,10 +1791,12 @@ export function ExternalUIBridgeInspector() {
                 )}
 
                 {/* Full image preview modal */}
-                {bridge.selectedElement && showElementPreview && (
+                {sdkBridge.selectedElement && showElementPreview && (
                   <ImageViewerModal
-                    imageData={largePreviewData || thumbnails.get(bridge.selectedElement.id) || ""}
-                    title={`Preview: ${bridge.selectedElement.id}${isLoadingPreview ? " (loading...)" : ""}`}
+                    imageData={
+                      largePreviewData || thumbnails.get(sdkBridge.selectedElement.id) || ""
+                    }
+                    title={`Preview: ${sdkBridge.selectedElement.id}${isLoadingPreview ? " (loading...)" : ""}`}
                     isOpen={showElementPreview}
                     onClose={handleClosePreview}
                   />
@@ -1854,7 +1805,7 @@ export function ExternalUIBridgeInspector() {
             ) : (
               <div className="flex flex-col items-center justify-center h-full text-muted-foreground text-sm gap-2">
                 <Layers className="w-8 h-8 opacity-50" />
-                <p>Connect to a browser tab to view elements</p>
+                <p>Connect to an app to view elements</p>
               </div>
             )}
           </div>
@@ -1862,20 +1813,20 @@ export function ExternalUIBridgeInspector() {
 
         {activeTab === "states" && (
           <StateDiscoveryPanel
-            cooccurrenceData={bridge.cooccurrenceData}
-            isLoading={bridge.isLoadingCooccurrence}
-            sessionActive={bridge.captureSession.active}
-            captureCount={bridge.captureSession.captureCount || 0}
-            onRefresh={bridge.generateCooccurrenceExport}
+            cooccurrenceData={sdkBridge.cooccurrenceData}
+            isLoading={sdkBridge.isLoadingCooccurrence}
+            sessionActive={sdkBridge.captureSession.active}
+            captureCount={sdkBridge.captureSession.captureCount || 0}
+            onRefresh={sdkBridge.generateCooccurrenceExport}
             onSelectFingerprint={(hash) => {
               // Find element with this fingerprint hash and select it
-              const element = bridge.elements.find((el) => el.fingerprint?.hash === hash);
+              const element = sdkBridge.elements.find((el) => el.fingerprint?.hash === hash);
               if (element) {
                 handleSelectElement(element.id);
                 setActiveTab("elements");
               }
             }}
-            disabled={bridge.connectionStatus !== "connected"}
+            disabled={sdkBridge.connectionStatus !== "connected"}
             onRunDiscovery={handleRunDiscovery}
             isRunningDiscovery={isRunningDiscovery}
             discoveryResult={discoveryResult}
@@ -1884,31 +1835,31 @@ export function ExternalUIBridgeInspector() {
 
         {activeTab === "search" && (
           <SearchComparisonPanel
-            elements={bridge.elements}
+            elements={sdkBridge.elements}
             onSelectElement={handleSelectElement}
-            onHighlightElement={bridge.highlightElement}
-            disabled={bridge.connectionStatus !== "connected"}
+            onHighlightElement={sdkBridge.highlightElement}
+            disabled={sdkBridge.connectionStatus !== "connected"}
           />
         )}
 
         {activeTab === "describe" && (
           <ElementDescriptionPanel
-            elements={bridge.elements}
-            selectedElement={bridge.selectedElement}
-            pageContext={bridge.pageContext}
+            elements={sdkBridge.elements}
+            selectedElement={sdkBridge.selectedElement}
+            pageContext={pageContext}
             onSelectElement={handleSelectElement}
-            disabled={bridge.connectionStatus !== "connected"}
+            disabled={sdkBridge.connectionStatus !== "connected"}
           />
         )}
 
         {activeTab === "nl" && (
           <NaturalLanguagePanel
-            elements={bridge.elements}
+            elements={sdkBridge.elements}
             onSelectElement={handleSelectElement}
-            onHighlightElement={bridge.highlightElement}
+            onHighlightElement={sdkBridge.highlightElement}
             onExecuteAction={handleExecuteAction}
-            pageContext={bridge.pageContext}
-            disabled={bridge.connectionStatus !== "connected"}
+            pageContext={pageContext}
+            disabled={sdkBridge.connectionStatus !== "connected"}
           />
         )}
 
@@ -1918,16 +1869,16 @@ export function ExternalUIBridgeInspector() {
           <ActionExecutorView
             element={selectedUIBridgeElement}
             onExecuteAction={handleExecuteAction}
-            disabled={bridge.connectionStatus !== "connected" || !selectedUIBridgeElement}
+            disabled={sdkBridge.connectionStatus !== "connected" || !selectedUIBridgeElement}
           />
         )}
 
         {activeTab === "api" && (
           <RawApiPanel
-            onSendCommand={bridge.sendCommand}
-            lastResult={bridge.lastCommandResult}
-            commandHistory={bridge.commandHistory}
-            onClearHistory={bridge.clearCommandHistory}
+            onSendCommand={sdkBridge.sendCommand}
+            lastResult={sdkBridge.lastCommandResult}
+            commandHistory={sdkBridge.commandHistory}
+            onClearHistory={sdkBridge.clearCommandHistory}
             disabled={false} // Raw API can work even without connection to a tab
           />
         )}

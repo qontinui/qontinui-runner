@@ -45,6 +45,7 @@ import {
   Terminal,
   Wifi,
 } from "lucide-react";
+import { isDevelopmentMode } from "qontinui-navigation";
 import { useExecution } from "../../contexts/ExecutionContext";
 import { useRunSelection } from "../../contexts/RunSelectionContext";
 import {
@@ -151,6 +152,8 @@ function SidebarNav({
     });
   };
 
+  const isDevMode = isDevelopmentMode();
+
   const navGroups: NavGroup[] = [
     {
       id: "ai-session",
@@ -170,13 +173,31 @@ function SidebarNav({
         { id: "events", label: "Events", icon: <List className="w-4 h-4" /> },
         { id: "api-requests", label: "API Requests", icon: <Globe className="w-4 h-4" /> },
         { id: "mcp-calls", label: "MCP Calls", icon: <Wifi className="w-4 h-4" /> },
-        { id: "image-recognition", label: "Image Recognition", icon: <Eye className="w-4 h-4" /> },
+        // Image Recognition - only shown in development mode (visual automation feature)
+        ...(isDevMode
+          ? [
+              {
+                id: "image-recognition" as DataCategory,
+                label: "Image Recognition",
+                icon: <Eye className="w-4 h-4" />,
+              },
+            ]
+          : []),
         {
           id: "playwright-tests",
           label: "Playwright Tests",
           icon: <TestTube className="w-4 h-4" />,
         },
-        { id: "awas-steps", label: "AWAS Steps", icon: <Bot className="w-4 h-4" /> },
+        // AWAS Steps - only shown in development mode
+        ...(isDevMode
+          ? [
+              {
+                id: "awas-steps" as DataCategory,
+                label: "AWAS Steps",
+                icon: <Bot className="w-4 h-4" />,
+              },
+            ]
+          : []),
         {
           id: "execution-spans",
           label: "Execution Spans",
@@ -193,17 +214,38 @@ function SidebarNav({
         { id: "dom-snapshots", label: "DOM Snapshots", icon: <Code className="w-4 h-4" /> },
       ],
     },
-    {
-      id: "mobile",
-      label: "Mobile",
-      icon: <Smartphone className="w-4 h-4" />,
-      items: [
-        { id: "mobile-state", label: "App State", icon: <Activity className="w-4 h-4" /> },
-        { id: "mobile-screenshots", label: "Screenshots", icon: <Camera className="w-4 h-4" /> },
-        { id: "mobile-logs", label: "Logs", icon: <Terminal className="w-4 h-4" /> },
-        { id: "mobile-errors", label: "Errors", icon: <AlertCircle className="w-4 h-4" /> },
-      ],
-    },
+    // Mobile group - only shown in development mode (unfinished feature)
+    ...(isDevMode
+      ? [
+          {
+            id: "mobile",
+            label: "Mobile",
+            icon: <Smartphone className="w-4 h-4" />,
+            items: [
+              {
+                id: "mobile-state" as DataCategory,
+                label: "App State",
+                icon: <Activity className="w-4 h-4" />,
+              },
+              {
+                id: "mobile-screenshots" as DataCategory,
+                label: "Screenshots",
+                icon: <Camera className="w-4 h-4" />,
+              },
+              {
+                id: "mobile-logs" as DataCategory,
+                label: "Logs",
+                icon: <Terminal className="w-4 h-4" />,
+              },
+              {
+                id: "mobile-errors" as DataCategory,
+                label: "Errors",
+                icon: <AlertCircle className="w-4 h-4" />,
+              },
+            ],
+          },
+        ]
+      : []),
     {
       id: "configuration",
       label: "Configuration",

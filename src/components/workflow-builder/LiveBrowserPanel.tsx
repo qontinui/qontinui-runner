@@ -1,19 +1,18 @@
 /**
  * LiveBrowserPanel.tsx
  *
- * Live Browser Mode panel for connecting to open browser tabs, mobile devices,
- * or Tauri apps and generating verification tests + agentic prompts without
- * requiring a pre-built state machine configuration.
+ * Live Browser Mode panel for connecting to mobile devices or Tauri apps
+ * and generating verification tests + agentic prompts without requiring
+ * a pre-built state machine configuration.
  *
  * Features:
- * - Target selection (browser tabs via extension, mobile via ADB)
- * - Live element discovery from the connected page
- * - Element picker for selecting elements to verify
+ * - Target selection (mobile via ADB)
+ * - Live element discovery from the connected target
  * - Manual semantic context entry for AI agentic prompts
  * - Playwright test generation from selected elements
  */
 
-import React, { useState, useCallback, useEffect, useMemo } from "react";
+import { useState, useCallback, useEffect, useMemo } from "react";
 import {
   X,
   Loader2,
@@ -29,9 +28,6 @@ import {
   Play,
   Plus,
   Check,
-  Crosshair,
-  Wifi,
-  WifiOff,
   ExternalLink,
   Bot,
   FileCode,
@@ -257,21 +253,17 @@ export function LiveBrowserPanel({
     connectionStatus,
     connectedTarget,
     error,
-    browserTabs,
     mobileDevices,
     isLoadingTargets,
     elements,
     isLoadingElements,
     selectedElementId,
     refreshTargets,
-    connectToTab,
     connectToMobile,
     disconnect,
     refreshElements,
     selectElement: _selectElement,
     highlightElement,
-    enablePicker,
-    isExtensionConnected,
   } = useLiveBrowser();
 
   // UI State
@@ -525,33 +517,12 @@ export function LiveBrowserPanel({
           {/* Targets Tab */}
           {activeTab === "targets" && (
             <div className="space-y-4">
-              {/* Extension Status */}
-              <div
-                className={`flex items-center gap-3 p-3 rounded-lg ${
-                  isExtensionConnected
-                    ? "bg-green-500/10 border border-green-500/30"
-                    : "bg-amber-500/10 border border-amber-500/30"
-                }`}
-              >
-                {isExtensionConnected ? (
-                  <Wifi className="w-5 h-5 text-green-400" />
-                ) : (
-                  <WifiOff className="w-5 h-5 text-amber-400" />
-                )}
+              {/* Refresh Targets */}
+              <div className="flex items-center justify-between p-3 rounded-lg bg-zinc-800/50 border border-zinc-700">
                 <div className="flex-1">
-                  <p
-                    className={
-                      isExtensionConnected
-                        ? "text-green-400 font-medium"
-                        : "text-amber-400 font-medium"
-                    }
-                  >
-                    {isExtensionConnected ? "Extension Connected" : "Extension Not Connected"}
-                  </p>
+                  <p className="text-zinc-200 font-medium">Available Targets</p>
                   <p className="text-xs text-zinc-400">
-                    {isExtensionConnected
-                      ? "Qontinui DevTools extension is connected and ready"
-                      : "Install the Qontinui DevTools extension from the extension folder"}
+                    Connect to a mobile device or Tauri app to discover elements
                   </p>
                 </div>
                 <button
@@ -564,82 +535,6 @@ export function LiveBrowserPanel({
                     className={`w-4 h-4 text-zinc-400 ${isLoadingTargets ? "animate-spin" : ""}`}
                   />
                 </button>
-              </div>
-
-              {/* Browser Tabs */}
-              <div className="border border-zinc-700 rounded-lg overflow-hidden">
-                <button
-                  onClick={() => toggleSection("browser")}
-                  className="w-full flex items-center gap-2 px-4 py-3 bg-zinc-800/50 hover:bg-zinc-800 transition-colors"
-                >
-                  {expandedSections.has("browser") ? (
-                    <ChevronDown className="w-4 h-4 text-zinc-400" />
-                  ) : (
-                    <ChevronRight className="w-4 h-4 text-zinc-400" />
-                  )}
-                  <Globe className="w-4 h-4 text-blue-400" />
-                  <span className="font-medium text-zinc-200">Browser Tabs</span>
-                  <span className="text-xs text-zinc-500 ml-auto">
-                    {browserTabs.length} available
-                  </span>
-                </button>
-
-                {expandedSections.has("browser") && (
-                  <div className="divide-y divide-zinc-800">
-                    {isLoadingTargets ? (
-                      <div className="flex items-center gap-2 px-4 py-8 justify-center text-zinc-500">
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                        <span>Loading tabs...</span>
-                      </div>
-                    ) : browserTabs.length === 0 ? (
-                      <div className="px-4 py-8 text-center text-zinc-500">
-                        <p>No browser tabs found</p>
-                        <p className="text-xs mt-1">
-                          Make sure the extension is installed and enabled
-                        </p>
-                      </div>
-                    ) : (
-                      browserTabs.map((tab) => (
-                        <div
-                          key={tab.id}
-                          className={`flex items-center gap-3 px-4 py-3 hover:bg-zinc-800/50 transition-colors ${
-                            connectedTarget?.type === "browser" && connectedTarget?.id === tab.id
-                              ? "bg-cyan-500/10"
-                              : ""
-                          }`}
-                        >
-                          {tab.favIconUrl ? (
-                            <img src={tab.favIconUrl} className="w-4 h-4" alt="" />
-                          ) : (
-                            <Globe className="w-4 h-4 text-zinc-500" />
-                          )}
-                          <div className="flex-1 min-w-0">
-                            <p className="text-sm text-zinc-200 truncate">{tab.title}</p>
-                            <p className="text-xs text-zinc-500 truncate">{tab.url}</p>
-                          </div>
-                          {connectedTarget?.type === "browser" && connectedTarget?.id === tab.id ? (
-                            <span className="text-xs text-cyan-400 px-2 py-1 rounded bg-cyan-500/20">
-                              Connected
-                            </span>
-                          ) : (
-                            <button
-                              onClick={() => connectToTab(tab.id)}
-                              disabled={connectionStatus === "connecting"}
-                              className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium bg-cyan-600 hover:bg-cyan-500 text-white rounded transition-colors disabled:opacity-50"
-                            >
-                              {connectionStatus === "connecting" ? (
-                                <Loader2 className="w-3 h-3 animate-spin" />
-                              ) : (
-                                <Play className="w-3 h-3" />
-                              )}
-                              Connect
-                            </button>
-                          )}
-                        </div>
-                      ))
-                    )}
-                  </div>
-                )}
               </div>
 
               {/* Mobile Devices */}
@@ -744,13 +639,6 @@ export function LiveBrowserPanel({
                 >
                   <RefreshCw className={`w-4 h-4 ${isLoadingElements ? "animate-spin" : ""}`} />
                   Refresh
-                </button>
-                <button
-                  onClick={enablePicker}
-                  className="flex items-center gap-2 px-3 py-2 text-sm bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg transition-colors"
-                >
-                  <Crosshair className="w-4 h-4" />
-                  Pick Element
                 </button>
                 {selectedForTest.length > 0 && (
                   <button

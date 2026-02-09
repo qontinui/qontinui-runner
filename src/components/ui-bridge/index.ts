@@ -17,6 +17,7 @@ export type {
 export { ConnectedUIBridgeInspector } from "./ConnectedUIBridgeInspector";
 export { ExternalUIBridgeInspector } from "./ExternalUIBridgeInspector";
 export { ConnectionPanel } from "./ConnectionPanel";
+export type { ActiveSource } from "./ConnectionPanel";
 export { RawApiPanel } from "./RawApiPanel";
 export { SearchComparisonPanel } from "./SearchComparisonPanel";
 export { ElementDescriptionPanel } from "./ElementDescriptionPanel";

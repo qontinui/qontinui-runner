@@ -1039,7 +1039,6 @@ test('${formName || "test"}', async ({ page }) => {
             "warning",
             "AI response didn't contain valid Playwright code. Check AI Output tab.",
           );
-          console.log("AI output:", output);
         }
       } else {
         onLog("error", "Failed to generate script: No output from AI task");

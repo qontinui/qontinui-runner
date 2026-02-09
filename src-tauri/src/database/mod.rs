@@ -5878,6 +5878,102 @@ impl CheckpointDb {
         Ok(task_runs)
     }
 
+    /// Get recent task runs with optional workflow_type filter.
+    /// When workflow_type is provided, only returns task runs matching that type.
+    pub fn get_recent_task_runs_filtered(
+        &self,
+        limit: u32,
+        workflow_type: Option<&str>,
+    ) -> Result<Vec<TaskRun>, String> {
+        let conn = self.get_conn()?;
+
+        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(wt) =
+            workflow_type
+        {
+            (
+                    r#"
+                    SELECT id, task_name, prompt, task_type, status, sessions_count, max_sessions, error_message, auto_continue,
+                           config_id, workflow_name, COALESCE(summary, ai_summary) as summary, ai_summary,
+                           goal_achieved, remaining_work, summary_generated_at,
+                           workspace_id, triggered_by, workflow_type,
+                           created_at, updated_at, completed_at
+                    FROM task_runs
+                    WHERE workflow_type = ?1
+                    ORDER BY updated_at DESC
+                    LIMIT ?2
+                    "#.to_string(),
+                    vec![
+                        Box::new(wt.to_string()) as Box<dyn rusqlite::types::ToSql>,
+                        Box::new(limit),
+                    ],
+                )
+        } else {
+            (
+                    r#"
+                    SELECT id, task_name, prompt, task_type, status, sessions_count, max_sessions, error_message, auto_continue,
+                           config_id, workflow_name, COALESCE(summary, ai_summary) as summary, ai_summary,
+                           goal_achieved, remaining_work, summary_generated_at,
+                           workspace_id, triggered_by, workflow_type,
+                           created_at, updated_at, completed_at
+                    FROM task_runs
+                    ORDER BY updated_at DESC
+                    LIMIT ?1
+                    "#.to_string(),
+                    vec![Box::new(limit) as Box<dyn rusqlite::types::ToSql>],
+                )
+        };
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+
+        let task_runs = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                Ok(TaskRun {
+                    id: row.get(0)?,
+                    task_name: row.get(1)?,
+                    prompt: row.get(2)?,
+                    task_type: row
+                        .get::<_, Option<String>>(3)?
+                        .unwrap_or_else(|| "task".to_string()),
+                    status: row.get(4)?,
+                    sessions_count: row.get::<_, i64>(5)? as u32,
+                    max_sessions: row.get::<_, Option<i64>>(6)?.map(|v| v as u32),
+                    output_log: String::new(),
+                    error_message: row.get(7)?,
+                    auto_continue: row.get::<_, i32>(8)? != 0,
+                    execution_steps_json: None,
+                    log_sources_json: None,
+                    config_id: row.get(9)?,
+                    workflow_name: row.get(10)?,
+                    summary: row.get(11)?,
+                    ai_summary: row.get(12)?,
+                    goal_achieved: row.get::<_, Option<i32>>(13)?.map(|v| v != 0),
+                    remaining_work: row.get(14)?,
+                    summary_generated_at: row.get(15)?,
+                    transition_history_json: None,
+                    workflow_type: row.get(18)?,
+                    workspace_id: row.get(16)?,
+                    triggered_by: row.get(17)?,
+                    parent_task_run_id: None,
+                    root_task_run_id: None,
+                    depth: 0,
+                    bridge_id: None,
+                    created_at: row.get(19)?,
+                    updated_at: row.get(20)?,
+                    completed_at: row.get(21)?,
+                })
+            })
+            .map_err(|e| format!("Failed to execute query: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(task_runs)
+    }
+
     /// Get the last N characters of output for continuation context.
     pub fn get_task_output_tail(&self, id: &str, chars: usize) -> Result<String, String> {
         let task_run = self

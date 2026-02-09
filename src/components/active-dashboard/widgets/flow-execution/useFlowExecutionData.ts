@@ -259,9 +259,7 @@ export function useFlowExecutionData(): FlowExecutionData {
  */
 export function useFlowExecutionReset() {
   const reset = useCallback(() => {
-    // This would need to be connected to the state somehow
-    // For now, flow state resets when a new flow starts
-    console.log("Flow execution state reset requested");
+    // Flow state resets when a new flow starts
   }, []);
 
   return reset;

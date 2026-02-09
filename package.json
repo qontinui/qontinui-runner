@@ -1,11 +1,11 @@
 {
   "name": "qontinui-runner",
   "private": true,
-  "version": "0.1.0",
+  "version": "1.0.0-beta.1",
   "type": "module",
   "scripts": {
-    "dev": "cross-env TEMP=D:/qontinui_parent_directory/.temp TMP=D:/qontinui_parent_directory/.temp vite",
-    "build": "cross-env TEMP=D:/qontinui_parent_directory/.temp TMP=D:/qontinui_parent_directory/.temp tsc && vite build",
+    "dev": "vite",
+    "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "npx tauri",
     "lint": "eslint src/**/*.{ts,tsx} --report-unused-disable-directives",

@@ -55,7 +55,6 @@ export const setupExecutionHandlers: HandlerSetupFunction = (context) => {
         };
       }) => {
         console.log("[EXECUTION_HANDLER] execution_started event received");
-        console.log("[EXECUTION_HANDLER] Full payload:", JSON.stringify(payload, null, 2));
         setExecutionActive(true);
 
         // Start execution run reporting using the new unified service

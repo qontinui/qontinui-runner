@@ -225,6 +225,42 @@ impl ErrorMonitorService {
             tracing::error!("Failed to load sources from settings: {}", e);
         }
 
+        // Clean up stale spec verification errors that were stored before the filter was added.
+        // Spec events (action_failed with "SPEC: " prefix) are verification test results,
+        // not application errors, and should not trigger Quick Fix workflows.
+        {
+            let db = self.db.clone();
+            match tokio::task::spawn_blocking(move || -> Result<usize, String> {
+                let conn = db.connection_string()?;
+                conn.execute(
+                    "UPDATE error_events \
+                     SET status = 'resolved', resolved_at = datetime('now') \
+                     WHERE log_source_name = 'Runner Actions' \
+                       AND message LIKE 'SPEC: %' \
+                       AND status IN ('new', 'acknowledged')",
+                    [],
+                )
+                .map_err(|e| format!("SQL error: {}", e))
+            })
+            .await
+            {
+                Ok(Ok(count)) => {
+                    if count > 0 {
+                        tracing::info!(
+                            "Cleaned up {} stale spec verification error(s) on startup",
+                            count
+                        );
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("Failed to clean up spec verification errors: {}", e);
+                }
+                Err(e) => {
+                    tracing::warn!("Task join error cleaning up spec errors: {}", e);
+                }
+            }
+        }
+
         // Emit started event
         let _ = self.event_tx.send(ErrorMonitorEvent::Started).await;
 
@@ -708,6 +744,14 @@ impl ErrorMonitorService {
     /// Extract error message from a JSONL event if it indicates an error.
     /// Returns None for success events, Some(message) for error events.
     fn extract_jsonl_error(&self, json: &serde_json::Value) -> Option<String> {
+        // Skip spec verification step failures — these are expected during
+        // verification loops and are not application errors. The spec system
+        // runs assertions against UI elements; failures mean "not yet fixed",
+        // not "application crashed".
+        if self.is_spec_verification_event(json) {
+            return None;
+        }
+
         // Check for status fields that indicate success - skip these
         let success_statuses = [
             "success",
@@ -755,6 +799,68 @@ impl ErrorMonitorService {
 
         // No error indicators found
         None
+    }
+
+    /// Check if a JSONL event is a spec verification event.
+    /// Spec events have action names starting with "SPEC: " and are generated
+    /// by the UI Bridge spec handler during verification loops. These are
+    /// expected failures (assertions not yet met) rather than application errors.
+    fn is_spec_verification_event(&self, json: &serde_json::Value) -> bool {
+        // Check event_type
+        let event_type = json
+            .get("event_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if event_type != "action_failed" {
+            return false;
+        }
+
+        // Check if the action name starts with "SPEC: "
+        if let Some(node) = json.get("node") {
+            if let Some(name) = node.get("name").and_then(|v| v.as_str()) {
+                if name.starts_with("SPEC: ") {
+                    return true;
+                }
+            }
+        }
+
+        // Also check top-level name field
+        if let Some(name) = json.get("name").and_then(|v| v.as_str()) {
+            if name.starts_with("SPEC: ") {
+                return true;
+            }
+        }
+
+        // Check nested data field — events with event_subtype="complete" may nest
+        // the action_failed info inside a stringified "data" JSON field
+        if let Some(data_str) = json.get("data").and_then(|v| v.as_str()) {
+            if let Ok(data) = serde_json::from_str::<serde_json::Value>(data_str) {
+                if let Some(name) = data.get("step_name").and_then(|v| v.as_str()) {
+                    if name.starts_with("SPEC: ") {
+                        return true;
+                    }
+                }
+                // Also check nested node.name in data
+                if let Some(node) = data.get("node") {
+                    if let Some(name) = node.get("name").and_then(|v| v.as_str()) {
+                        if name.starts_with("SPEC: ") {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check data as object (not stringified)
+        if let Some(data) = json.get("data").and_then(|v| v.as_object()) {
+            if let Some(name) = data.get("step_name").and_then(|v| v.as_str()) {
+                if name.starts_with("SPEC: ") {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
     /// Find the status field in a JSON object, checking common nesting patterns.
@@ -838,6 +944,43 @@ impl ErrorMonitorService {
             });
         if let Some(err) = error_msg {
             parts.push(err.to_string());
+        }
+
+        // Extract node.metadata for richer error context (assertion details,
+        // stderr output, command info, etc.). Serialize as compact JSON and
+        // append to the message so the error monitor stores actionable details.
+        if let Some(metadata) = json
+            .get("node")
+            .and_then(|n| n.get("metadata"))
+            .and_then(|m| m.as_object())
+        {
+            // Extract key metadata fields that provide actionable context
+            let mut context_parts = Vec::new();
+            for key in &[
+                "passed_count",
+                "failed_count",
+                "assertions_detail",
+                "stderr",
+                "exit_code",
+                "spec_group_name",
+            ] {
+                if let Some(val) = metadata.get(*key) {
+                    let val_str = if val.is_string() {
+                        val.as_str().unwrap_or("").to_string()
+                    } else {
+                        val.to_string()
+                    };
+                    // Truncate very large values to keep message manageable
+                    if val_str.len() > 500 {
+                        context_parts.push(format!("{}={:.500}...", key, val_str));
+                    } else {
+                        context_parts.push(format!("{}={}", key, val_str));
+                    }
+                }
+            }
+            if !context_parts.is_empty() {
+                parts.push(format!("[{}]", context_parts.join(", ")));
+            }
         }
 
         if parts.is_empty() {

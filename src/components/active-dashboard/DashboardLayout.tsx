@@ -13,6 +13,9 @@ import { widgetRegistry } from "../../types/dashboard/widget-registry";
 import { WidgetHeader } from "./WidgetHeader";
 import { IdleState } from "./IdleState";
 
+import { useSessionState } from "../../hooks/useSessionState";
+import { useCurrentTaskRunId } from "../../contexts/TaskContext";
+
 // Import hooks directly to call them statically (avoids dynamic hook issues)
 import { useGuiAutomationData } from "./widgets/gui-automation";
 import { usePlaywrightData } from "./widgets/playwright";
@@ -270,6 +273,35 @@ function CopyConversationButton({ entries }: { entries: { line: string }[] }) {
 }
 
 /**
+ * Session state indicator for the AI Conversation widget header.
+ * Shows a colored dot with label reflecting the current Claude session state.
+ */
+function SessionStateIndicator() {
+  const taskRunId = useCurrentTaskRunId();
+  const { state, isActive } = useSessionState(taskRunId);
+
+  if (!isActive || !state) return null;
+
+  const config: Record<string, { color: string; label: string }> = {
+    created: { color: "bg-zinc-400", label: "Starting" },
+    initializing: { color: "bg-amber-400 animate-pulse", label: "Initializing" },
+    ready: { color: "bg-emerald-500", label: "Ready" },
+    processing: { color: "bg-blue-500 animate-pulse", label: "Processing" },
+    interrupting: { color: "bg-amber-500 animate-pulse", label: "Interrupting" },
+    closing: { color: "bg-zinc-400", label: "Closing" },
+  };
+
+  const { color, label } = config[state] ?? { color: "bg-zinc-400", label: state };
+
+  return (
+    <div className="flex items-center gap-1.5" title={`Session: ${label}`}>
+      <div className={cn("w-2 h-2 rounded-full", color)} />
+      <span className="text-[10px] text-muted-foreground font-medium">{label}</span>
+    </div>
+  );
+}
+
+/**
  * AI Conversation widget renderer - calls useAiConversationData statically.
  */
 const AiConversationRenderer = memo(function AiConversationRenderer({
@@ -297,7 +329,12 @@ const AiConversationRenderer = memo(function AiConversationRenderer({
         isActive={true}
         detailRoute={config.detailRoute}
         onViewAll={onNavigateToDetail}
-        actions={<CopyConversationButton entries={data.entries} />}
+        actions={
+          <div className="flex items-center gap-3">
+            <SessionStateIndicator />
+            <CopyConversationButton entries={data.entries} />
+          </div>
+        }
       />
       <div className="h-[calc(100%-48px)] overflow-hidden">
         <FullComponent

@@ -29,7 +29,7 @@ export function registeredToDiscovered(el: RegisteredElement): DiscoveredElement
 }
 
 /**
- * Convert an ExternalElement (from Chrome extension via UI Bridge HTTP API)
+ * Convert an ExternalElement (from SDK app or legacy extension via UI Bridge HTTP API)
  * to a DiscoveredElement that SpecExecutor can evaluate assertions against.
  */
 export function externalToDiscovered(ext: ExternalElement): DiscoveredElement {
@@ -45,8 +45,7 @@ export function externalToDiscovered(ext: ExternalElement): DiscoveredElement {
       visible: ext.visible,
       enabled: ext.enabled,
       focused: ext.focused,
-      textContent:
-        ext.text || ext.accessibleName || ext.accessibility?.accessibleName,
+      textContent: ext.text || ext.accessibleName || ext.accessibility?.accessibleName,
       value: ext.value,
       checked: ext.checked,
       rect: ext.bounds

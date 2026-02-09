@@ -127,7 +127,20 @@ export function AiTab({
   const [activeSessions, setActiveSessions] = useState<ActiveSessionInfo[]>([]);
 
   // Session/workflow filter
-  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(() => {
+    // Check for pending navigation from Recap page
+    try {
+      const pending = localStorage.getItem("qontinui-ai-output-navigate");
+      if (pending) {
+        // Don't consume yet - we need loops to be available first
+        // Just signal that we have a pending navigation
+        return null;
+      }
+    } catch {
+      // Ignore
+    }
+    return null;
+  });
 
   // Run management (for deletion)
   const [isManagingRuns, setIsManagingRuns] = useState(false);
@@ -163,6 +176,52 @@ export function AiTab({
     () => groupEntriesIntoLoops(runFilteredAiOutputLines),
     [runFilteredAiOutputLines],
   );
+
+  // Handle pending navigation from Recap page (auto-select matching session)
+  useEffect(() => {
+    if (loops.length === 0) return;
+
+    try {
+      const pending = localStorage.getItem("qontinui-ai-output-navigate");
+      if (!pending) return;
+
+      // Consume the navigation intent immediately
+      localStorage.removeItem("qontinui-ai-output-navigate");
+
+      const { phase, phaseIteration } = JSON.parse(pending) as {
+        phase: string;
+        phaseIteration?: number;
+      };
+
+      // Find matching loop: match phase, and optionally phaseIteration
+      let matchedLoop: AiLoop | undefined;
+
+      if (phaseIteration !== undefined) {
+        // Prefer exact match on phase + phaseIteration
+        matchedLoop = loops.find(
+          (loop) =>
+            loop.phase === phase &&
+            loop.entries.length > 0 &&
+            loop.entries[0].phaseIteration === phaseIteration,
+        );
+      }
+
+      // Fall back to just phase match (pick last one of that phase)
+      if (!matchedLoop) {
+        const phaseLoops = loops.filter((loop) => loop.phase === phase);
+        if (phaseLoops.length > 0) {
+          matchedLoop = phaseLoops[phaseLoops.length - 1];
+        }
+      }
+
+      if (matchedLoop) {
+        setSelectedSessionId(matchedLoop.id);
+      }
+    } catch {
+      // Ignore parse errors
+      localStorage.removeItem("qontinui-ai-output-navigate");
+    }
+  }, [loops]);
 
   // Persist stats collapse state
   useEffect(() => {

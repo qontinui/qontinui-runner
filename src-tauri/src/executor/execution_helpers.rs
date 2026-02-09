@@ -251,6 +251,7 @@ pub mod result_builder {
             duration_ms,
             config: StepExecutionConfig::default(),
             verification_details: None,
+            output_data: None,
         }
     }
 
@@ -279,6 +280,7 @@ pub mod result_builder {
             duration_ms,
             config: StepExecutionConfig::default(),
             verification_details: None,
+            output_data: None,
         }
     }
 
@@ -301,6 +303,7 @@ pub mod result_builder {
             duration_ms,
             config: StepExecutionConfig::default(),
             verification_details: None,
+            output_data: None,
         }
     }
 
@@ -331,6 +334,7 @@ pub mod result_builder {
             duration_ms,
             config: StepExecutionConfig::default(),
             verification_details: None,
+            output_data: None,
         }
     }
 }

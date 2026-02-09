@@ -719,18 +719,28 @@ pub fn build_steps(
         }
     }
 
-    // 4. Build steps from step_execution events for setup, agentic, and completion phases
-    // Note: verification steps are captured from workflow_verification_phase_results when available,
-    // but if verification was interrupted (no results stored), we fall back to events.
+    // 4. Build steps from step_execution events as a FALLBACK only.
+    // Skip entirely if we have checkpoints — they are the authoritative source and cover all phases.
+    // Also skip verification events if we have verification phase results (more detailed).
+    let has_checkpoints = !step_checkpoints.is_empty();
     let has_verification_results = !workflow_verification_results.is_empty();
 
     info!(
-        "Processing {} events for steps (has_verification_results={})",
+        "Processing {} events for steps (has_checkpoints={}, has_verification_results={})",
         events.len(),
+        has_checkpoints,
         has_verification_results
     );
 
+    if has_checkpoints {
+        info!("Skipping step_execution events — workflow_step_checkpoints are authoritative");
+    }
+
     for event in events {
+        // If checkpoints exist, they already cover all workflow phases — skip events entirely
+        if has_checkpoints {
+            break;
+        }
         if event.event_type != "step_execution" {
             continue;
         }

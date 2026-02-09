@@ -109,6 +109,7 @@ interface FullStateResponse {
     workflow_name: string | null;
     started_at: string;
     sessions_count: number;
+    max_sessions: number | null;
   };
   orchestrator_state: {
     state_name: string;
@@ -198,6 +199,11 @@ export interface WorkflowExecutionState {
   lastEventTimestamp: number | null;
   isReconnecting: boolean;
 
+  // === Plan-specific ===
+  planPhaseName: string | null;
+  planPhaseIndex: number | null;
+  planTotalPhases: number | null;
+
   // === Metadata ===
   workflowName: string | null;
   taskName: string | null;
@@ -276,6 +282,9 @@ const DEFAULT_STATE: WorkflowExecutionState = {
   connectionMethod: null,
   lastEventTimestamp: null,
   isReconnecting: false,
+  planPhaseName: null,
+  planPhaseIndex: null,
+  planTotalPhases: null,
   workflowName: null,
   taskName: null,
   stepStats: DEFAULT_STEP_STATS,
@@ -672,13 +681,32 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
       const isComplete = data.orchestrator_state?.state_name?.includes("complete") ?? false;
       const isStopped = data.orchestrator_state?.state_name === "stopped";
 
+      // Extract plan phase details from state_data for plan workflows
+      // State data is structured as e.g. { PhaseRunning: { phase_index: 0, phase_name: "Fix API" } }
+      const stateData = data.orchestrator_state?.state_data as Record<
+        string,
+        Record<string, unknown>
+      > | null;
+      const isPlan = data.task_run.workflow_type === "plan";
+      const planInner = stateData
+        ? (stateData.PhaseRunning ??
+          stateData.PhaseComplete ??
+          stateData.Failed ??
+          stateData.Stopped)
+        : null;
+      const planPhaseName = isPlan && planInner ? ((planInner.phase_name as string) ?? null) : null;
+      const planPhaseIndex =
+        isPlan && planInner ? ((planInner.phase_index as number) ?? null) : null;
+      const planTotalPhases = isPlan ? (data.task_run.max_sessions ?? null) : null;
+
       setState((prev) => ({
         ...prev,
         taskRunId: data.task_run.id,
         workflowStage,
         workflowStageDisplay: data.orchestrator_state?.workflow_stage_display ?? null,
         stateName: data.orchestrator_state?.state_name ?? null,
-        isOrchestrated: data.task_run.workflow_type === "unified",
+        isOrchestrated:
+          data.task_run.workflow_type === "unified" || data.task_run.workflow_type === "plan",
         iteration: data.orchestrator_state?.iteration ?? 1,
         maxIterations: 10, // TODO: Get from workflow definition
         hasVerificationPlan: false, // TODO: Get from orchestrator state
@@ -698,6 +726,9 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
         isLoading: false,
         error: null,
         isReconnecting: false,
+        planPhaseName,
+        planPhaseIndex,
+        planTotalPhases,
         workflowName: data.task_run.workflow_name,
         taskName: data.task_run.task_name,
         stepStats,

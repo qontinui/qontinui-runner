@@ -264,6 +264,10 @@ export function DashboardPage({
           isOrchestrated={state.isOrchestrated}
           iteration={state.isOrchestrated ? state.iteration : undefined}
           maxIterations={state.isOrchestrated ? state.maxIterations : undefined}
+          isPlan={state.planPhaseName != null || state.planPhaseIndex != null}
+          planPhaseName={state.planPhaseName}
+          planPhaseIndex={state.planPhaseIndex}
+          planTotalPhases={state.planTotalPhases}
           onPlayPause={handlePlayPause}
           onStop={handleStop}
         />

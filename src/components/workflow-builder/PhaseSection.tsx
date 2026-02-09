@@ -27,7 +27,13 @@ interface PhaseSectionProps {
   ) => React.ReactNode;
 }
 
-export function PhaseSection({ phase, steps, onAddStep, headerActions, renderStep }: PhaseSectionProps) {
+export function PhaseSection({
+  phase,
+  steps,
+  onAddStep,
+  headerActions,
+  renderStep,
+}: PhaseSectionProps) {
   const { state, togglePhase, selectStep, removeStep } = useWorkflowBuilder();
   const phaseInfo = PHASE_INFO[phase];
   const isExpanded = state.expandedPhases[phase];

@@ -18,7 +18,7 @@ use tracing::{debug, error, info, warn};
 /// Too much output can exceed context limits
 const MAX_OUTPUT_FOR_SUMMARY: usize = 50000;
 
-/// Prompt template for summary generation
+/// Prompt template for summary generation (successful/completed tasks)
 const SUMMARY_PROMPT_TEMPLATE: &str = r#"You are summarizing a completed workflow run. The workflow follows a multi-phase structure:
 
 1. **Setup** - Initial configuration and preparation steps
@@ -32,6 +32,7 @@ Your job is to produce a SHORT, COMPREHENSIVE recap of the ENTIRE workflow - not
 - Do NOT include internal markers like `[STEP_COMPLETE:...]`, `[SESSION_START:...]`, `[TASK_COMPLETE]`, or `[FINDING:...]` in your summary text
 - Write in plain prose, no markdown formatting
 - Be specific about what was accomplished (files changed, tests run, repos pushed, etc.)
+- If verification passed on the first iteration with no agentic work needed, say so clearly
 
 Respond in this exact JSON format only, with no other text:
 ```json
@@ -49,10 +50,54 @@ If the goal was not achieved, set goal_achieved to false and provide remaining_w
 
 ## Task Prompt
 {task_prompt}
-{findings_section}
+{workflow_metadata}{findings_section}
 ## Task Output (Last {output_chars} characters)
 
-The output below contains `[SESSION_START:N]` markers indicating different AI sessions/phases. Earlier sessions are typically setup or agentic work; later sessions are verification and completion.
+The output below contains `[SESSION_START:N]` markers indicating different AI sessions/phases. Earlier sessions are typically setup or agentic work; later sessions are verification and completion. `[USER_MESSAGE]...[/USER_MESSAGE]` blocks indicate messages sent by the user during interactive sessions.
+
+{task_output}
+"#;
+
+/// Prompt template for summary generation of failed/stopped tasks
+const FAILURE_SUMMARY_PROMPT_TEMPLATE: &str = r#"You are summarizing a workflow run that **{task_status}**. The workflow follows a multi-phase structure:
+
+1. **Setup** - Initial configuration and preparation steps
+2. **Verification/Agentic loop** - Iterative cycles of AI work (agentic) and automated checks (verification)
+3. **Completion** - Final wrap-up steps (only runs if verification passes)
+
+The workflow did NOT complete successfully. Your job is to produce a SHORT, CLEAR explanation of what happened and why it failed/stopped.
+
+**Important:**
+- Focus on explaining WHY the workflow failed or was stopped
+- Describe what was attempted before the failure
+- Be specific about error messages, failed steps, or missing prerequisites
+- Do NOT include internal markers like `[STEP_COMPLETE:...]`, `[SESSION_START:...]`, `[TASK_COMPLETE]`, or `[FINDING:...]` in your summary text
+- Write in plain prose, no markdown formatting
+
+Respond in this exact JSON format only, with no other text:
+```json
+{
+  "summary": "Your 2-5 sentence explanation of what happened and why the workflow failed/stopped...",
+  "goal_achieved": false,
+  "remaining_work": "What needs to be done to succeed next time..."
+}
+```
+
+## Task Name
+{task_name}
+
+## Task Status
+{task_status}
+
+## Error Message
+{error_message}
+
+## Task Prompt
+{task_prompt}
+{workflow_metadata}{findings_section}
+## Task Output (Last {output_chars} characters)
+
+The output below contains `[SESSION_START:N]` markers indicating different AI sessions/phases. Earlier sessions are typically setup or agentic work; later sessions are verification and completion. `[USER_MESSAGE]...[/USER_MESSAGE]` blocks indicate messages sent by the user during interactive sessions.
 
 {task_output}
 "#;
@@ -145,6 +190,96 @@ pub(crate) fn format_findings_for_summary(findings: &[Finding]) -> String {
     parts.join("\n")
 }
 
+/// Build a workflow metadata section for the summary prompt.
+///
+/// Includes verification phase results and transition history so the summary AI
+/// has structured context beyond just the raw output log.
+fn build_workflow_metadata(
+    db: &CheckpointDb,
+    task_run_id: &str,
+    task: &crate::database::TaskRun,
+) -> String {
+    let mut parts = Vec::new();
+
+    // Add verification phase results (structured data from database)
+    let verification_results = db
+        .get_all_verification_phase_results(task_run_id)
+        .unwrap_or_default();
+
+    if !verification_results.is_empty() {
+        parts.push("\n## Verification Results\n".to_string());
+        for result in &verification_results {
+            let iteration = result
+                .get("iteration")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let all_passed = result
+                .get("all_passed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let passed = result
+                .get("passed_steps")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let failed = result
+                .get("failed_steps")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let total = result
+                .get("total_steps")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
+            let status = if all_passed { "PASSED" } else { "FAILED" };
+            parts.push(format!(
+                "- Iteration {}: {} ({} passed, {} failed out of {} steps)",
+                iteration, status, passed, failed, total
+            ));
+
+            // Include brief step details for failed steps
+            if let Some(step_results) = result.get("step_results").and_then(|v| v.as_array()) {
+                for sr in step_results {
+                    let success = sr.get("success").and_then(|v| v.as_bool()).unwrap_or(true);
+                    if !success {
+                        let name = sr
+                            .get("step_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let err = sr.get("error").and_then(|v| v.as_str()).unwrap_or("");
+                        let truncated = if err.len() > 150 { &err[..150] } else { err };
+                        parts.push(format!("  - FAILED: {} - {}", name, truncated));
+                    }
+                }
+            }
+        }
+        parts.push(String::new()); // blank line
+    }
+
+    // Add transition history (phases that ran and in what order)
+    if let Some(ref history_json) = task.transition_history_json {
+        if let Ok(transitions) = serde_json::from_str::<Vec<serde_json::Value>>(history_json) {
+            if !transitions.is_empty() {
+                parts.push("## Workflow Phases Executed\n".to_string());
+                for t in &transitions {
+                    let phase = t.get("stage").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    let iteration = t.get("iteration").and_then(|v| v.as_u64());
+                    let iter_str = iteration
+                        .map(|i| format!(" (iteration {})", i))
+                        .unwrap_or_default();
+                    parts.push(format!("- {}{}", phase, iter_str));
+                }
+                parts.push(String::new()); // blank line
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        String::new()
+    } else {
+        parts.join("\n")
+    }
+}
+
 /// Generate a summary for a completed task run
 ///
 /// This function:
@@ -178,16 +313,8 @@ pub fn generate_task_summary(
         return Err("Task already has a summary".to_string());
     }
 
-    // Skip if task is in a terminal error state
-    // Note: We allow generation while task is "running" since the Summary step
-    // in the completion phase may call this before the task is marked complete
-    if task.status == "failed" || task.status == "stopped" {
-        warn!(
-            "Task {} has terminal status ({}), skipping summary",
-            task_run_id, task.status
-        );
-        return Err(format!("Task has terminal status: {}", task.status));
-    }
+    // Determine if this is a failed/stopped task (affects prompt template choice)
+    let is_failure = task.status == "failed" || task.status == "stopped";
 
     // Fetch findings for this task run
     let findings = db.get_findings_for_task(task_run_id).unwrap_or_else(|e| {
@@ -195,6 +322,9 @@ pub fn generate_task_summary(
         Vec::new()
     });
     let findings_section = format_findings_for_summary(&findings);
+
+    // Build structured workflow metadata (verification results, transition history)
+    let workflow_metadata = build_workflow_metadata(db, task_run_id, &task);
 
     // Prepare the output for summarization: strip markers first, then truncate
     let cleaned_output = strip_output_markers(&task.output_log);
@@ -209,13 +339,30 @@ pub fn generate_task_summary(
     // Get the task prompt (may be empty for some task types)
     let task_prompt = task.prompt.as_deref().unwrap_or("(No prompt recorded)");
 
-    // Build the summary prompt
-    let prompt = SUMMARY_PROMPT_TEMPLATE
-        .replace("{task_name}", &task.task_name)
-        .replace("{task_prompt}", task_prompt)
-        .replace("{findings_section}", &findings_section)
-        .replace("{output_chars}", &truncated_output.len().to_string())
-        .replace("{task_output}", &truncated_output);
+    // Build the summary prompt using appropriate template
+    let prompt = if is_failure {
+        let error_message = task
+            .error_message
+            .as_deref()
+            .unwrap_or("(No error message recorded)");
+        FAILURE_SUMMARY_PROMPT_TEMPLATE
+            .replace("{task_name}", &task.task_name)
+            .replace("{task_status}", &task.status)
+            .replace("{error_message}", error_message)
+            .replace("{task_prompt}", task_prompt)
+            .replace("{workflow_metadata}", &workflow_metadata)
+            .replace("{findings_section}", &findings_section)
+            .replace("{output_chars}", &truncated_output.len().to_string())
+            .replace("{task_output}", &truncated_output)
+    } else {
+        SUMMARY_PROMPT_TEMPLATE
+            .replace("{task_name}", &task.task_name)
+            .replace("{task_prompt}", task_prompt)
+            .replace("{workflow_metadata}", &workflow_metadata)
+            .replace("{findings_section}", &findings_section)
+            .replace("{output_chars}", &truncated_output.len().to_string())
+            .replace("{task_output}", &truncated_output)
+    };
 
     debug!(
         "Summary prompt length: {} chars, output length: {} chars, findings: {}",
@@ -267,11 +414,13 @@ fn parse_summary_response(response: &str) -> Result<SummaryResult, String> {
     let parsed: serde_json::Value =
         serde_json::from_str(&json_str).map_err(|e| format!("Failed to parse JSON: {}", e))?;
 
-    let summary = parsed
+    // Strip any output markers the AI might have included in its response.
+    // The prompt instructs the AI not to include these, but it sometimes does anyway.
+    let raw_summary = parsed
         .get("summary")
         .and_then(|v| v.as_str())
-        .ok_or("Missing 'summary' field in response")?
-        .to_string();
+        .ok_or("Missing 'summary' field in response")?;
+    let summary = strip_output_markers(raw_summary).trim().to_string();
 
     let goal_achieved = parsed
         .get("goal_achieved")
@@ -282,7 +431,8 @@ fn parse_summary_response(response: &str) -> Result<SummaryResult, String> {
         if v.is_null() {
             None
         } else {
-            v.as_str().map(String::from)
+            v.as_str()
+                .map(|s| strip_output_markers(s).trim().to_string())
         }
     });
 
@@ -411,6 +561,57 @@ mod tests {
         assert!(stripped.contains("Did some setup work"));
         assert!(stripped.contains("More output here"));
         assert!(stripped.contains("Final line"));
+    }
+
+    #[test]
+    fn test_strip_output_markers_preserves_user_messages() {
+        let output = "\
+            [SESSION_START:1]\n\
+            Starting work...\n\
+            [STEP_COMPLETE:setup-0]\n\
+            [USER_MESSAGE]\n\
+            Can you also fix the tests?\n\
+            [/USER_MESSAGE]\n\
+            Sure, I'll fix the tests now.\n\
+            [TASK_COMPLETE]\n\
+            Done!\n";
+
+        let stripped = strip_output_markers(output);
+
+        // User message markers and content should be preserved
+        assert!(
+            stripped.contains("[USER_MESSAGE]"),
+            "USER_MESSAGE open tag should be preserved"
+        );
+        assert!(
+            stripped.contains("[/USER_MESSAGE]"),
+            "USER_MESSAGE close tag should be preserved"
+        );
+        assert!(
+            stripped.contains("Can you also fix the tests?"),
+            "User message content should be preserved"
+        );
+
+        // Other markers should still be stripped
+        assert!(
+            !stripped.contains("[STEP_COMPLETE:"),
+            "STEP_COMPLETE should be stripped"
+        );
+        assert!(
+            !stripped.contains("[TASK_COMPLETE]"),
+            "TASK_COMPLETE should be stripped"
+        );
+
+        // Session markers should be preserved (existing behavior)
+        assert!(
+            stripped.contains("[SESSION_START:1]"),
+            "SESSION_START should be preserved"
+        );
+
+        // Regular output should be preserved
+        assert!(stripped.contains("Starting work..."));
+        assert!(stripped.contains("Sure, I'll fix the tests now."));
+        assert!(stripped.contains("Done!"));
     }
 
     #[test]

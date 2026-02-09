@@ -448,7 +448,12 @@
    */
   function discoverNonInteractiveElements() {
     const selectors = [
-      "h1", "h2", "h3", "h4", "h5", "h6",
+      "h1",
+      "h2",
+      "h3",
+      "h4",
+      "h5",
+      "h6",
       "p",
       '[role="heading"]',
       '[role="banner"]',
@@ -484,10 +489,14 @@
         tagName: el.tagName.toLowerCase(),
         type: "text",
         bounds: {
-          x: rect.x, y: rect.y,
-          width: rect.width, height: rect.height,
-          top: rect.top, right: rect.right,
-          bottom: rect.bottom, left: rect.left,
+          x: rect.x,
+          y: rect.y,
+          width: rect.width,
+          height: rect.height,
+          top: rect.top,
+          right: rect.right,
+          bottom: rect.bottom,
+          left: rect.left,
         },
         visible: true,
         enabled: true,
@@ -528,10 +537,14 @@
         tagName: el.tagName.toLowerCase(),
         type: "text",
         bounds: {
-          x: rect.x, y: rect.y,
-          width: rect.width, height: rect.height,
-          top: rect.top, right: rect.right,
-          bottom: rect.bottom, left: rect.left,
+          x: rect.x,
+          y: rect.y,
+          width: rect.width,
+          height: rect.height,
+          top: rect.top,
+          right: rect.right,
+          bottom: rect.bottom,
+          left: rect.left,
         },
         visible: true,
         enabled: true,
@@ -2123,6 +2136,861 @@
     };
   }
 
+  // ==========================================================================
+  // Visual Analysis - Color Utilities
+  // ==========================================================================
+
+  /**
+   * Parse a CSS color string (rgb, rgba, hex) into {r, g, b, a} components.
+   * Returns null if parsing fails.
+   */
+  function parseColor(colorString) {
+    if (!colorString || colorString === "transparent") return { r: 0, g: 0, b: 0, a: 0 };
+    // rgb(r, g, b) or rgba(r, g, b, a)
+    const rgbMatch = colorString.match(
+      /rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*(?:,\s*([\d.]+))?\s*\)/,
+    );
+    if (rgbMatch) {
+      return {
+        r: parseInt(rgbMatch[1], 10),
+        g: parseInt(rgbMatch[2], 10),
+        b: parseInt(rgbMatch[3], 10),
+        a: rgbMatch[4] !== undefined ? parseFloat(rgbMatch[4]) : 1,
+      };
+    }
+    // #rrggbb or #rgb
+    const hexMatch = colorString.match(/^#([0-9a-f]{3,8})$/i);
+    if (hexMatch) {
+      const hex = hexMatch[1];
+      if (hex.length === 3) {
+        return {
+          r: parseInt(hex[0] + hex[0], 16),
+          g: parseInt(hex[1] + hex[1], 16),
+          b: parseInt(hex[2] + hex[2], 16),
+          a: 1,
+        };
+      }
+      if (hex.length >= 6) {
+        return {
+          r: parseInt(hex.slice(0, 2), 16),
+          g: parseInt(hex.slice(2, 4), 16),
+          b: parseInt(hex.slice(4, 6), 16),
+          a: hex.length === 8 ? parseInt(hex.slice(6, 8), 16) / 255 : 1,
+        };
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Blend a semi-transparent foreground color over an opaque background.
+   */
+  function blendColors(fg, bg) {
+    const a = fg.a;
+    return {
+      r: Math.round(fg.r * a + bg.r * (1 - a)),
+      g: Math.round(fg.g * a + bg.g * (1 - a)),
+      b: Math.round(fg.b * a + bg.b * (1 - a)),
+      a: 1,
+    };
+  }
+
+  /**
+   * Walk up the DOM tree to find the effective background color behind an element.
+   * Blends semi-transparent backgrounds along the way.
+   */
+  function getEffectiveBackgroundColor(el) {
+    let current = el;
+    const layers = [];
+    while (current && current !== document.documentElement) {
+      try {
+        const bg = window.getComputedStyle(current).backgroundColor;
+        const parsed = parseColor(bg);
+        if (parsed && parsed.a > 0) {
+          layers.unshift(parsed);
+          if (parsed.a === 1) break; // opaque - stop here
+        }
+      } catch {
+        break;
+      }
+      current = current.parentElement;
+    }
+    // Start with white (page default)
+    let result = { r: 255, g: 255, b: 255, a: 1 };
+    for (const layer of layers) {
+      result = blendColors(layer, result);
+    }
+    return result;
+  }
+
+  /**
+   * Calculate WCAG 2.1 relative luminance.
+   */
+  function relativeLuminance(r, g, b) {
+    const [rs, gs, bs] = [r, g, b].map((c) => {
+      c = c / 255;
+      return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+    });
+    return 0.2126 * rs + 0.7152 * gs + 0.0722 * bs;
+  }
+
+  /**
+   * Calculate WCAG contrast ratio between two colors.
+   */
+  function contrastRatio(c1, c2) {
+    const L1 = relativeLuminance(c1.r, c1.g, c1.b);
+    const L2 = relativeLuminance(c2.r, c2.g, c2.b);
+    const lighter = Math.max(L1, L2);
+    const darker = Math.min(L1, L2);
+    return (lighter + 0.05) / (darker + 0.05);
+  }
+
+  /**
+   * Check if two colors are approximately equal within a tolerance.
+   */
+  function colorsMatch(c1, c2, tolerance) {
+    tolerance = tolerance || 5;
+    return (
+      Math.abs(c1.r - c2.r) <= tolerance &&
+      Math.abs(c1.g - c2.g) <= tolerance &&
+      Math.abs(c1.b - c2.b) <= tolerance
+    );
+  }
+
+  /**
+   * Convert a parsed color to a CSS string for reporting.
+   */
+  function colorToString(c) {
+    if (!c) return "unknown";
+    if (c.a < 1) return `rgba(${c.r}, ${c.g}, ${c.b}, ${c.a.toFixed(2)})`;
+    return `rgb(${c.r}, ${c.g}, ${c.b})`;
+  }
+
+  // ==========================================================================
+  // Visual Analysis - Collect Visible Elements
+  // ==========================================================================
+
+  /**
+   * Collect all visible elements with their bounds and computed styles in a
+   * single reflow pass, to avoid layout thrashing during analysis.
+   */
+  function collectVisibleElementData(scope) {
+    const root = scope ? document.querySelector(scope) : document.body;
+    if (!root) return [];
+
+    const all = root.querySelectorAll("*");
+    const data = [];
+    for (let i = 0; i < all.length; i++) {
+      const el = all[i];
+      // Skip invisible and script/style/meta elements
+      const tag = el.tagName.toLowerCase();
+      if (
+        tag === "script" ||
+        tag === "style" ||
+        tag === "meta" ||
+        tag === "link" ||
+        tag === "noscript" ||
+        tag === "template"
+      )
+        continue;
+
+      const style = window.getComputedStyle(el);
+      if (style.display === "none") continue;
+      if (style.visibility === "hidden") continue;
+
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 && rect.height === 0) continue;
+
+      data.push({
+        el,
+        tag,
+        rect: {
+          x: rect.x,
+          y: rect.y,
+          width: rect.width,
+          height: rect.height,
+          top: rect.top,
+          right: rect.right,
+          bottom: rect.bottom,
+          left: rect.left,
+        },
+        style: {
+          color: style.color,
+          backgroundColor: style.backgroundColor,
+          fontSize: style.fontSize,
+          fontWeight: style.fontWeight,
+          fontFamily: style.fontFamily,
+          display: style.display,
+          position: style.position,
+          opacity: style.opacity,
+          zIndex: style.zIndex,
+          overflow: style.overflow,
+          overflowX: style.overflowX,
+          overflowY: style.overflowY,
+          borderRadius: style.borderRadius,
+          boxShadow: style.boxShadow,
+          borderWidth: style.borderWidth,
+          pointerEvents: style.pointerEvents,
+          flexDirection: style.flexDirection,
+          gap: style.gap,
+          textAlign: style.textAlign,
+          lineHeight: style.lineHeight,
+        },
+        selector: buildUniqueSelector(el),
+        text: (el.textContent || "").trim().slice(0, 100),
+        isInteractive: el.matches(
+          'a[href], button, input, select, textarea, [role="button"], [role="link"], [tabindex]',
+        ),
+        parent: el.parentElement,
+        children: Array.from(el.children),
+      });
+    }
+    return data;
+  }
+
+  // ==========================================================================
+  // Visual Analysis - Layout Analysis
+  // ==========================================================================
+
+  function analyzeLayout(params) {
+    const startTime = performance.now();
+    const tolerance = params?.tolerance || 2;
+    const maxElements = params?.maxElements || 500;
+    const checks = params?.checks || [
+      "overlap",
+      "alignment",
+      "spacing",
+      "overflow",
+      "stacking",
+      "viewport",
+    ];
+    const findings = [];
+    const elements = collectVisibleElementData(params?.scope);
+    const subset = elements.slice(0, maxElements);
+
+    // Build parent-children map
+    const childrenMap = new Map();
+    for (const item of subset) {
+      if (!item.parent) continue;
+      if (!childrenMap.has(item.parent)) childrenMap.set(item.parent, []);
+      childrenMap.get(item.parent).push(item);
+    }
+
+    // --- Overlap Detection ---
+    if (checks.includes("overlap")) {
+      for (const [, siblings] of childrenMap) {
+        if (siblings.length < 2) continue;
+        for (let i = 0; i < siblings.length; i++) {
+          for (let j = i + 1; j < siblings.length; j++) {
+            const a = siblings[i],
+              b = siblings[j];
+            // Skip if either is positioned (intentional overlay)
+            if (
+              a.style.position === "absolute" ||
+              a.style.position === "fixed" ||
+              b.style.position === "absolute" ||
+              b.style.position === "fixed"
+            )
+              continue;
+            if (a.style.pointerEvents === "none" || b.style.pointerEvents === "none") continue;
+
+            const overlapX = Math.max(
+              0,
+              Math.min(a.rect.right, b.rect.right) - Math.max(a.rect.left, b.rect.left),
+            );
+            const overlapY = Math.max(
+              0,
+              Math.min(a.rect.bottom, b.rect.bottom) - Math.max(a.rect.top, b.rect.top),
+            );
+
+            if (overlapX > tolerance && overlapY > tolerance) {
+              findings.push({
+                type: "overlap",
+                severity: a.isInteractive || b.isInteractive ? "error" : "warning",
+                category: "layout",
+                elementA: { selector: a.selector, bounds: a.rect },
+                elementB: { selector: b.selector, bounds: b.rect },
+                overlapArea: Math.round(overlapX * overlapY),
+                context: `Siblings overlap by ${Math.round(overlapX)}x${Math.round(overlapY)}px`,
+              });
+            }
+          }
+        }
+      }
+    }
+
+    // --- Alignment Analysis ---
+    if (checks.includes("alignment")) {
+      for (const [, siblings] of childrenMap) {
+        if (siblings.length < 3) continue;
+        // Check left-edge alignment
+        const lefts = siblings.map((s) => Math.round(s.rect.left));
+        const leftMode = mostCommon(lefts);
+        for (const sib of siblings) {
+          const dev = Math.abs(Math.round(sib.rect.left) - leftMode);
+          if (dev > tolerance && dev < 50) {
+            findings.push({
+              type: "alignment",
+              severity: "warning",
+              category: "layout",
+              element: { selector: sib.selector, leftEdge: Math.round(sib.rect.left) },
+              expectedEdge: leftMode,
+              deviation: dev,
+              context: `Left edge ${Math.round(sib.rect.left)}px deviates from group mode ${leftMode}px`,
+            });
+          }
+        }
+      }
+    }
+
+    // --- Spacing Consistency ---
+    if (checks.includes("spacing")) {
+      for (const [, siblings] of childrenMap) {
+        if (siblings.length < 3) continue;
+        // Sort by position (top for vertical, left for horizontal)
+        const sorted = [...siblings].sort((a, b) => a.rect.top - b.rect.top);
+        const isVertical =
+          Math.abs(sorted[0].rect.top - sorted[sorted.length - 1].rect.top) >
+          Math.abs(sorted[0].rect.left - sorted[sorted.length - 1].rect.left);
+        const gaps = [];
+        for (let i = 1; i < sorted.length; i++) {
+          const gap = isVertical
+            ? sorted[i].rect.top - sorted[i - 1].rect.bottom
+            : sorted[i].rect.left - sorted[i - 1].rect.right;
+          gaps.push(Math.round(gap));
+        }
+        if (gaps.length < 2) continue;
+        const mean = gaps.reduce((a, b) => a + b, 0) / gaps.length;
+        if (mean <= 0) continue; // overlapping or zero-gap — skip
+        for (let i = 0; i < gaps.length; i++) {
+          if (Math.abs(gaps[i] - mean) > Math.max(tolerance, mean * 0.4)) {
+            findings.push({
+              type: "spacingInconsistency",
+              severity: "warning",
+              category: "layout",
+              container: { selector: buildUniqueSelector(sorted[0].parent) },
+              gaps,
+              meanGap: Math.round(mean),
+              outlierIndex: i,
+              outlierGap: gaps[i],
+              context: `Gap ${gaps[i]}px at index ${i} deviates from mean ${Math.round(mean)}px`,
+            });
+            break; // one finding per container
+          }
+        }
+      }
+    }
+
+    // --- Overflow Detection ---
+    if (checks.includes("overflow")) {
+      for (const item of subset) {
+        if (item.children.length === 0) continue;
+        const pOverflow = item.style.overflow;
+        // Only flag if overflow is visible (default) — hidden/scroll/auto handle it
+        if (pOverflow !== "visible" && pOverflow !== "") continue;
+        const pRect = item.rect;
+        // Only check containers with explicit sizing
+        if (pRect.width === 0 || pRect.height === 0) continue;
+
+        for (const child of item.children) {
+          const childData = subset.find((d) => d.el === child);
+          if (!childData) continue;
+          const cRect = childData.rect;
+          const rightOverflow = cRect.right - pRect.right;
+          const bottomOverflow = cRect.bottom - pRect.bottom;
+
+          if (rightOverflow > tolerance) {
+            findings.push({
+              type: "overflow",
+              severity: "warning",
+              category: "layout",
+              parent: { selector: item.selector, overflow: pOverflow },
+              child: { selector: childData.selector },
+              direction: "right",
+              amount: Math.round(rightOverflow),
+              context: `Child extends ${Math.round(rightOverflow)}px beyond parent right edge`,
+            });
+          }
+          if (bottomOverflow > tolerance) {
+            findings.push({
+              type: "overflow",
+              severity: "warning",
+              category: "layout",
+              parent: { selector: item.selector, overflow: pOverflow },
+              child: { selector: childData.selector },
+              direction: "bottom",
+              amount: Math.round(bottomOverflow),
+              context: `Child extends ${Math.round(bottomOverflow)}px beyond parent bottom edge`,
+            });
+          }
+        }
+      }
+    }
+
+    // --- Stacking / Z-Index Issues ---
+    if (checks.includes("stacking")) {
+      const positioned = subset.filter(
+        (d) => d.style.position === "absolute" || d.style.position === "fixed",
+      );
+      for (let i = 0; i < positioned.length; i++) {
+        for (let j = i + 1; j < positioned.length; j++) {
+          const a = positioned[i],
+            b = positioned[j];
+          // Check overlap
+          const overlapX =
+            Math.min(a.rect.right, b.rect.right) - Math.max(a.rect.left, b.rect.left);
+          const overlapY =
+            Math.min(a.rect.bottom, b.rect.bottom) - Math.max(a.rect.top, b.rect.top);
+          if (overlapX <= 0 || overlapY <= 0) continue;
+
+          const zA = parseInt(a.style.zIndex, 10) || 0;
+          const zB = parseInt(b.style.zIndex, 10) || 0;
+          // Flag if lower-z element is interactive (hidden behind higher-z)
+          if (zA < zB && a.isInteractive) {
+            findings.push({
+              type: "stacking",
+              severity: "error",
+              category: "layout",
+              obscuredElement: { selector: a.selector, zIndex: zA, isInteractive: true },
+              obscuringElement: { selector: b.selector, zIndex: zB },
+              context: `Interactive element (z-index:${zA}) hidden behind element (z-index:${zB})`,
+            });
+          } else if (zB < zA && b.isInteractive) {
+            findings.push({
+              type: "stacking",
+              severity: "error",
+              category: "layout",
+              obscuredElement: { selector: b.selector, zIndex: zB, isInteractive: true },
+              obscuringElement: { selector: a.selector, zIndex: zA },
+              context: `Interactive element (z-index:${zB}) hidden behind element (z-index:${zA})`,
+            });
+          }
+        }
+      }
+    }
+
+    // --- Viewport Overflow ---
+    if (checks.includes("viewport")) {
+      const vw = window.innerWidth,
+        vh = window.innerHeight;
+      for (const item of subset) {
+        if (item.style.position === "fixed" || item.style.position === "sticky") continue;
+        if (item.rect.right > vw + tolerance && item.rect.width < vw) {
+          findings.push({
+            type: "viewportOverflow",
+            severity: "warning",
+            category: "layout",
+            element: { selector: item.selector },
+            direction: "right",
+            amount: Math.round(item.rect.right - vw),
+            context: `Element extends ${Math.round(item.rect.right - vw)}px beyond right viewport edge`,
+          });
+        }
+      }
+    }
+
+    return {
+      success: true,
+      timestamp: Date.now(),
+      url: window.location.href,
+      viewportSize: { width: window.innerWidth, height: window.innerHeight },
+      summary: {
+        errors: findings.filter((f) => f.severity === "error").length,
+        warnings: findings.filter((f) => f.severity === "warning").length,
+        info: findings.filter((f) => f.severity === "info").length,
+        checksRun: checks,
+        elementsAnalyzed: subset.length,
+        durationMs: Math.round(performance.now() - startTime),
+      },
+      findings,
+    };
+  }
+
+  /**
+   * Find the most common value in an array of numbers.
+   */
+  function mostCommon(arr) {
+    const counts = {};
+    let maxCount = 0,
+      mode = arr[0];
+    for (const v of arr) {
+      counts[v] = (counts[v] || 0) + 1;
+      if (counts[v] > maxCount) {
+        maxCount = counts[v];
+        mode = v;
+      }
+    }
+    return mode;
+  }
+
+  // ==========================================================================
+  // Visual Analysis - Color Analysis
+  // ==========================================================================
+
+  function analyzeColors(params) {
+    const startTime = performance.now();
+    const wcagLevel = params?.wcagLevel || "AA";
+    const checks = params?.checks || ["contrast", "consistency", "fontConsistency"];
+    const findings = [];
+    const elements = collectVisibleElementData(params?.scope);
+    const maxElements = params?.maxElements || 500;
+    const subset = elements.slice(0, maxElements);
+
+    // --- Contrast Ratio ---
+    if (checks.includes("contrast")) {
+      // Only check elements that contain direct text
+      const textElements = subset.filter((d) => {
+        if (!d.text) return false;
+        // Check that this element has direct text nodes (not just child element text)
+        for (const node of d.el.childNodes) {
+          if (node.nodeType === Node.TEXT_NODE && node.textContent.trim()) return true;
+        }
+        return false;
+      });
+
+      for (const item of textElements) {
+        const fg = parseColor(item.style.color);
+        if (!fg) continue;
+        const bg = getEffectiveBackgroundColor(item.el);
+        const effectiveFg = fg.a < 1 ? blendColors(fg, bg) : fg;
+        const ratio = contrastRatio(effectiveFg, bg);
+
+        const fontSize = parseFloat(item.style.fontSize);
+        const fontWeight = parseInt(item.style.fontWeight, 10) || 400;
+        const isLargeText = fontSize >= 24 || (fontSize >= 18.66 && fontWeight >= 700);
+
+        let required;
+        if (wcagLevel === "AAA") {
+          required = isLargeText ? 4.5 : 7;
+        } else {
+          required = isLargeText ? 3 : 4.5;
+        }
+
+        if (ratio < required) {
+          findings.push({
+            type: "contrast",
+            severity: ratio < 3 ? "error" : "warning",
+            category: "color",
+            element: { selector: item.selector, text: item.text.slice(0, 60) },
+            foreground: colorToString(effectiveFg),
+            background: colorToString(bg),
+            contrastRatio: Math.round(ratio * 100) / 100,
+            requiredRatio: required,
+            wcagLevel,
+            isLargeText,
+            context: `Contrast ${ratio.toFixed(1)}:1 fails WCAG ${wcagLevel} (requires ${required}:1)`,
+          });
+        }
+      }
+    }
+
+    // --- Color Consistency ---
+    if (checks.includes("consistency")) {
+      const groups = {
+        button: subset.filter((d) => d.el.matches('button, [role="button"], input[type="submit"]')),
+        link: subset.filter((d) => d.el.matches('a[href], [role="link"]')),
+        heading: subset.filter((d) => d.el.matches("h1, h2, h3, h4, h5, h6")),
+        input: subset.filter((d) =>
+          d.el.matches("input:not([type=hidden]):not([type=submit]), textarea, select"),
+        ),
+      };
+
+      for (const [groupName, groupItems] of Object.entries(groups)) {
+        if (groupItems.length < 2) continue;
+        // Collect colors used
+        const colorBuckets = {};
+        for (const item of groupItems) {
+          const c = parseColor(item.style.color);
+          if (!c) continue;
+          const key = `rgb(${c.r},${c.g},${c.b})`;
+          if (!colorBuckets[key]) colorBuckets[key] = { count: 0, examples: [] };
+          colorBuckets[key].count++;
+          if (colorBuckets[key].examples.length < 2) colorBuckets[key].examples.push(item.selector);
+        }
+
+        const bucketKeys = Object.keys(colorBuckets);
+        if (bucketKeys.length > 1) {
+          // Find the dominant color
+          let dominant = bucketKeys[0];
+          for (const k of bucketKeys) {
+            if (colorBuckets[k].count > colorBuckets[dominant].count) dominant = k;
+          }
+          // Report outliers
+          for (const k of bucketKeys) {
+            if (k === dominant) continue;
+            if (
+              colorBuckets[k].count <= 2 &&
+              colorBuckets[dominant].count > colorBuckets[k].count * 2
+            ) {
+              findings.push({
+                type: "colorInconsistency",
+                severity: "warning",
+                category: "color",
+                group: groupName,
+                outlierColor: k,
+                dominantColor: dominant,
+                outlierCount: colorBuckets[k].count,
+                dominantCount: colorBuckets[dominant].count,
+                examples: colorBuckets[k].examples,
+                context: `${colorBuckets[k].count} ${groupName}(s) use ${k} while ${colorBuckets[dominant].count} use ${dominant}`,
+              });
+            }
+          }
+        }
+      }
+    }
+
+    // --- Font Consistency ---
+    if (checks.includes("fontConsistency")) {
+      const headings = subset.filter((d) => d.el.matches("h1, h2, h3, h4, h5, h6"));
+      // Check heading size hierarchy
+      const headingSizes = {};
+      for (const h of headings) {
+        const level = parseInt(h.tag.charAt(1), 10);
+        const size = parseFloat(h.style.fontSize);
+        if (!headingSizes[level]) headingSizes[level] = [];
+        headingSizes[level].push({ size, selector: h.selector });
+      }
+      const levels = Object.keys(headingSizes).map(Number).sort();
+      for (let i = 1; i < levels.length; i++) {
+        const prevAvg =
+          headingSizes[levels[i - 1]].reduce((a, b) => a + b.size, 0) /
+          headingSizes[levels[i - 1]].length;
+        const currAvg =
+          headingSizes[levels[i]].reduce((a, b) => a + b.size, 0) / headingSizes[levels[i]].length;
+        if (currAvg >= prevAvg) {
+          findings.push({
+            type: "headingHierarchy",
+            severity: "warning",
+            category: "typography",
+            higherLevel: `h${levels[i - 1]}`,
+            lowerLevel: `h${levels[i]}`,
+            higherSize: Math.round(prevAvg * 10) / 10,
+            lowerSize: Math.round(currAvg * 10) / 10,
+            context: `h${levels[i]} (${currAvg.toFixed(1)}px) is not smaller than h${levels[i - 1]} (${prevAvg.toFixed(1)}px)`,
+          });
+        }
+      }
+    }
+
+    return {
+      success: true,
+      timestamp: Date.now(),
+      url: window.location.href,
+      viewportSize: { width: window.innerWidth, height: window.innerHeight },
+      summary: {
+        errors: findings.filter((f) => f.severity === "error").length,
+        warnings: findings.filter((f) => f.severity === "warning").length,
+        info: findings.filter((f) => f.severity === "info").length,
+        checksRun: checks,
+        elementsAnalyzed: subset.length,
+        durationMs: Math.round(performance.now() - startTime),
+      },
+      findings,
+    };
+  }
+
+  // ==========================================================================
+  // Visual Analysis - Image Analysis
+  // ==========================================================================
+
+  function analyzeImages(params) {
+    const startTime = performance.now();
+    const checks = params?.checks || [
+      "broken",
+      "altText",
+      "aspectRatio",
+      "icons",
+      "sizeOptimization",
+    ];
+    const distortionThreshold = params?.distortionThreshold || 5;
+    const oversizeThreshold = params?.oversizeThreshold || 3;
+    const findings = [];
+    const root = params?.scope ? document.querySelector(params.scope) : document.body;
+    if (!root) return { success: false, error: "Scope not found" };
+
+    const images = root.querySelectorAll("img");
+    const svgs = root.querySelectorAll("svg");
+
+    // --- Broken Images ---
+    if (checks.includes("broken")) {
+      for (const img of images) {
+        if (!img.src && !img.getAttribute("src")) continue;
+        if (img.complete && (img.naturalWidth === 0 || img.naturalHeight === 0)) {
+          findings.push({
+            type: "brokenImage",
+            severity: "error",
+            category: "image",
+            element: { selector: buildUniqueSelector(img), src: img.src || "" },
+            context: "Image failed to load (naturalWidth=0)",
+          });
+        }
+      }
+    }
+
+    // --- Missing Alt Text ---
+    if (checks.includes("altText")) {
+      for (const img of images) {
+        const role = img.getAttribute("role");
+        if (role === "presentation" || role === "none") continue;
+        const alt = img.getAttribute("alt");
+        if (alt === null || alt === undefined) {
+          findings.push({
+            type: "missingAltText",
+            severity: "error",
+            category: "image",
+            element: { selector: buildUniqueSelector(img), src: img.src || "" },
+            context: "Image has no alt attribute",
+          });
+        } else if (alt.trim() === "" && role !== "presentation" && role !== "none") {
+          // Empty alt is valid for decorative images, flag as info
+          findings.push({
+            type: "emptyAltText",
+            severity: "info",
+            category: "image",
+            element: { selector: buildUniqueSelector(img), src: img.src || "" },
+            context: "Image has empty alt text (verify it is decorative)",
+          });
+        }
+      }
+    }
+
+    // --- Aspect Ratio Distortion ---
+    if (checks.includes("aspectRatio")) {
+      for (const img of images) {
+        if (!img.complete || img.naturalWidth === 0 || img.naturalHeight === 0) continue;
+        const rect = img.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        // Skip if object-fit handles it
+        const objectFit = window.getComputedStyle(img).objectFit;
+        if (objectFit === "cover" || objectFit === "contain" || objectFit === "fill") continue;
+
+        const naturalRatio = img.naturalWidth / img.naturalHeight;
+        const displayedRatio = rect.width / rect.height;
+        const distortion = (Math.abs(naturalRatio - displayedRatio) / naturalRatio) * 100;
+
+        if (distortion > distortionThreshold) {
+          findings.push({
+            type: "imageDistortion",
+            severity: "warning",
+            category: "image",
+            element: { selector: buildUniqueSelector(img), src: img.src || "" },
+            naturalAspectRatio: Math.round(naturalRatio * 100) / 100,
+            displayedAspectRatio: Math.round(displayedRatio * 100) / 100,
+            distortionPercent: Math.round(distortion),
+            context: `Image distorted by ${Math.round(distortion)}%`,
+          });
+        }
+      }
+    }
+
+    // --- Icon Rendering ---
+    if (checks.includes("icons")) {
+      for (const svg of svgs) {
+        const rect = svg.getBoundingClientRect();
+        // Only check small SVGs that are likely icons
+        if (rect.width > 64 || rect.height > 64) continue;
+        if (rect.width === 0 && rect.height === 0) {
+          findings.push({
+            type: "iconNotRendered",
+            severity: "warning",
+            category: "image",
+            element: { selector: buildUniqueSelector(svg) },
+            context: "SVG icon has 0x0 dimensions (may not be rendering)",
+          });
+        }
+      }
+    }
+
+    // --- Image Size Optimization ---
+    if (checks.includes("sizeOptimization")) {
+      const dpr = window.devicePixelRatio || 1;
+      for (const img of images) {
+        if (!img.complete || img.naturalWidth === 0) continue;
+        const rect = img.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+
+        const naturalArea = img.naturalWidth * img.naturalHeight;
+        const displayArea = rect.width * rect.height;
+        const effectiveRatio = naturalArea / (displayArea * dpr * dpr);
+
+        if (effectiveRatio > oversizeThreshold) {
+          findings.push({
+            type: "oversizedImage",
+            severity: "info",
+            category: "image",
+            element: { selector: buildUniqueSelector(img), src: img.src || "" },
+            naturalSize: { width: img.naturalWidth, height: img.naturalHeight },
+            displayedSize: { width: Math.round(rect.width), height: Math.round(rect.height) },
+            oversizeRatio: Math.round(effectiveRatio),
+            devicePixelRatio: dpr,
+            context: `Image is ${Math.round(effectiveRatio)}x larger than needed (accounting for ${dpr}x DPR)`,
+          });
+        }
+      }
+    }
+
+    return {
+      success: true,
+      timestamp: Date.now(),
+      url: window.location.href,
+      summary: {
+        errors: findings.filter((f) => f.severity === "error").length,
+        warnings: findings.filter((f) => f.severity === "warning").length,
+        info: findings.filter((f) => f.severity === "info").length,
+        checksRun: checks,
+        imagesAnalyzed: images.length,
+        svgsAnalyzed: svgs.length,
+        durationMs: Math.round(performance.now() - startTime),
+      },
+      findings,
+    };
+  }
+
+  // ==========================================================================
+  // Visual Analysis - Combined Audit
+  // ==========================================================================
+
+  function auditPage(params) {
+    const startTime = performance.now();
+    const minSeverity = params?.severity || "warning";
+    const severityOrder = { error: 0, warning: 1, info: 2 };
+    const minLevel = severityOrder[minSeverity] ?? 1;
+
+    const layoutResult = analyzeLayout({ scope: params?.scope, ...params?.layout });
+    const colorResult = analyzeColors({ scope: params?.scope, ...params?.colors });
+    const imageResult = analyzeImages({ scope: params?.scope, ...params?.images });
+
+    let allFindings = [...layoutResult.findings, ...colorResult.findings, ...imageResult.findings];
+
+    // Filter by minimum severity
+    allFindings = allFindings.filter((f) => (severityOrder[f.severity] ?? 2) <= minLevel);
+
+    // Sort: errors first, then warnings, then info
+    allFindings.sort((a, b) => (severityOrder[a.severity] ?? 2) - (severityOrder[b.severity] ?? 2));
+
+    return {
+      success: true,
+      timestamp: Date.now(),
+      url: window.location.href,
+      viewportSize: { width: window.innerWidth, height: window.innerHeight },
+      summary: {
+        errors: allFindings.filter((f) => f.severity === "error").length,
+        warnings: allFindings.filter((f) => f.severity === "warning").length,
+        info: allFindings.filter((f) => f.severity === "info").length,
+        checksRun: [
+          ...layoutResult.summary.checksRun,
+          ...colorResult.summary.checksRun,
+          ...imageResult.summary.checksRun,
+        ],
+        elementsAnalyzed: layoutResult.summary.elementsAnalyzed,
+        imagesAnalyzed: imageResult.summary.imagesAnalyzed || 0,
+        durationMs: Math.round(performance.now() - startTime),
+      },
+      findings: allFindings,
+    };
+  }
+
   // Message handler for bridge communication (named function for cleanup on reinstall)
   function handleBridgeMessage(event) {
     if (event.source !== window) return;
@@ -2225,7 +3093,7 @@
           const storeFromUIBridge = window.__UI_BRIDGE__?.specs?.getGlobalSpecStore?.();
           const storeFromWindow = window.__QONTINUI_SPEC_STORE__;
           const specStore =
-            (storeFromUIBridge && storeFromUIBridge.count > 0)
+            storeFromUIBridge && storeFromUIBridge.count > 0
               ? storeFromUIBridge
               : storeFromWindow || storeFromUIBridge;
           if (specStore && typeof specStore.getAll === "function") {
@@ -2252,6 +3120,18 @@
         }
         break;
       }
+      case "analyzeLayout":
+        response = analyzeLayout(params);
+        break;
+      case "analyzeColors":
+        response = analyzeColors(params);
+        break;
+      case "analyzeImages":
+        response = analyzeImages(params);
+        break;
+      case "auditPage":
+        response = auditPage(params);
+        break;
       default:
         response = { success: false, error: `Unknown action: ${action}` };
     }
@@ -2270,6 +3150,111 @@
 
   // Listen for messages from bridge
   window.addEventListener("message", handleBridgeMessage);
+
+  // Expose direct command handler for chrome.scripting.executeScript calls.
+  // This bypasses the ISOLATED world bridge entirely, making commands robust
+  // against content script context invalidation.
+  window.__qontinuiInspectorCommand = function (action, params) {
+    // Reuse the same switch logic as handleBridgeMessage but return directly
+    switch (action) {
+      case "ping": {
+        const hasUIBridge =
+          !!window.__UI_BRIDGE__ || document.querySelector("[data-ui-id]") !== null;
+        return {
+          success: true,
+          available: hasUIBridge,
+          version: window.__UI_BRIDGE__?.version || "2.0.0",
+        };
+      }
+      case "getElements": {
+        let elements = getAllInteractiveElements();
+        if (params?.includeNonInteractive) {
+          const existingIds = new Set(elements.map((el) => el.id));
+          const nonInteractive = discoverNonInteractiveElements();
+          let nextRef = elements.length + 1;
+          for (const el of nonInteractive) {
+            if (!existingIds.has(el.id)) {
+              existingIds.add(el.id);
+              elements.push({ ...el, ref: `@e${nextRef++}` });
+            }
+          }
+        }
+        const snapshot = getStateSnapshot();
+        return {
+          success: true,
+          elements: elements,
+          activeStatesCount: snapshot.activeStates?.length || 0,
+          transitionsCount: snapshot.transitions?.length || 0,
+          isUIBridgeInstrumented: document.querySelector("[data-ui-id]") !== null,
+        };
+      }
+      case "getElementState":
+        return getElementState(params?.elementId);
+      case "enablePicker":
+        enablePicker();
+        return { success: true };
+      case "disablePicker":
+        disablePicker();
+        return { success: true };
+      case "showOverlays":
+        showOverlays();
+        return { success: true };
+      case "hideOverlays":
+        hideOverlays();
+        return { success: true };
+      case "highlightElement":
+        return highlightElement(params?.elementId);
+      case "clearHighlight":
+        return clearHighlight();
+      case "executeAction":
+        return executeAction(params?.elementId, params?.action, params?.params || {});
+      case "getStateSnapshot":
+        return getStateSnapshot();
+      case "navigate":
+        if (params?.url) {
+          window.location.href = params.url;
+          return { success: true, url: params.url };
+        }
+        return { success: false, error: "No url specified" };
+      case "getSpecs": {
+        try {
+          const storeFromUIBridge = window.__UI_BRIDGE__?.specs?.getGlobalSpecStore?.();
+          const storeFromWindow = window.__QONTINUI_SPEC_STORE__;
+          const specStore =
+            storeFromUIBridge && storeFromUIBridge.count > 0
+              ? storeFromUIBridge
+              : storeFromWindow || storeFromUIBridge;
+          if (specStore && typeof specStore.getAll === "function") {
+            const allConfigs = specStore.getAll();
+            const specs = [];
+            if (allConfigs instanceof Map) {
+              for (const [id, config] of allConfigs) {
+                specs.push({ specId: id, config });
+              }
+            } else if (typeof allConfigs === "object" && allConfigs !== null) {
+              for (const [id, config] of Object.entries(allConfigs)) {
+                specs.push({ specId: id, config });
+              }
+            }
+            return { success: true, specs };
+          }
+          return { success: true, specs: [] };
+        } catch (e) {
+          return { success: false, error: "Failed to read specs: " + (e.message || String(e)) };
+        }
+      }
+      case "analyzeLayout":
+        return analyzeLayout(params);
+      case "analyzeColors":
+        return analyzeColors(params);
+      case "analyzeImages":
+        return analyzeImages(params);
+      case "auditPage":
+        return auditPage(params);
+      default:
+        return { success: false, error: `Unknown action: ${action}` };
+    }
+  };
 
   // Store cleanup function for extension reinstall handling
   window.__qontinuiUIBridgeInspectorCleanup = function () {

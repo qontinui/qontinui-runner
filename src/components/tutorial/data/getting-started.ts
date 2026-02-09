@@ -10,7 +10,7 @@ export const gettingStartedTutorial: Tutorial = {
   id: "getting-started",
   title: "Welcome to Qontinui Runner",
   description:
-    "Learn the basics of the Qontinui Runner desktop application. This tutorial covers navigation, key features, and how to get started with visual automation.",
+    "Get up and running with Qontinui Runner. Configure your AI provider, set up a project, and run your first agentic workflow.",
   duration: "5 minutes",
   difficulty: "beginner",
   mode: "contextual",
@@ -18,36 +18,59 @@ export const gettingStartedTutorial: Tutorial = {
   category: "Getting Started",
   tags: ["basics", "introduction", "navigation"],
   learningObjectives: [
-    "Understand the main sections of the Runner interface",
-    "Learn how to navigate using the sidebar",
-    "Discover key features for automation",
+    "Configure an AI provider to power your workflows",
+    "Understand the sidebar navigation and main sections",
+    "Build and run your first agentic workflow",
   ],
   steps: [
     {
       id: "welcome",
       title: "Welcome to Qontinui Runner!",
-      content: `Qontinui Runner is your desktop companion for running visual automations.
+      content: `Qontinui Runner enables autonomous AI-assisted development. AI agents work on your codebase with real-time visual feedback, self-verification, and iterative improvement.
 
-This powerful tool allows you to:
-• Execute automation workflows on your local machine
-• Monitor automation progress in real-time
-• Integrate with AI for intelligent analysis
-• Debug and troubleshoot automation issues
+With Qontinui Runner you can:
+• Run agentic workflows that automate development tasks
+• Watch AI agents work with real-time logs and screenshots
+• Verify results automatically with built-in checks
+• Iterate until the task is done right
 
-Let's take a quick tour of the interface!`,
+Let's get you set up!`,
+      estimatedDuration: 1,
+    },
+    {
+      id: "configure-ai",
+      title: "Configure Your AI Provider",
+      content: `First, set up an AI provider so the runner can work with AI agents.
+
+Go to **Settings > AI Providers** in the sidebar.
+
+**Recommended:** Select **Claude Code CLI** if you have a Claude Code subscription — it's the easiest option with no per-token cost.
+
+**Alternative:** Select **Claude API** or **Gemini** and enter your API key.
+
+After configuring, click **Test Connection** to verify everything works.`,
+      tips: [
+        "Claude Code CLI works with your existing subscription",
+        "API keys are stored securely in your OS keychain",
+      ],
+      targetElement: {
+        selector: "sidebar",
+        highlightType: "spotlight",
+        position: "right",
+      },
       estimatedDuration: 1,
     },
     {
       id: "sidebar-navigation",
       title: "Navigate with the Sidebar",
-      content: `The sidebar on the left is your main navigation hub. It's organized into logical groups:
+      content: `The sidebar on the left is your main navigation hub:
 
-**RUN** - Execute and control your automations
-**OBSERVE** - Monitor logs, screenshots, and results
-**BUILD** - Configure and manage workflows
-**OTHER** - Settings, help, and additional tools
+**RUN** — Dashboard and execution controls
+**OBSERVE** — Logs, screenshots, and test results
+**BUILD** — Workflow builder, test builder, and script tools
+**OTHER** — Settings, help, and additional tools
 
-Click any icon to switch between different sections of the app.`,
+Click any icon to switch between sections.`,
       tips: [
         "The sidebar collapses to icons only to save space",
         "Hover over icons to see tooltips with section names",
@@ -60,17 +83,18 @@ Click any icon to switch between different sections of the app.`,
       estimatedDuration: 1,
     },
     {
-      id: "execute-tab",
-      title: "The Execute Tab",
-      content: `The Execute tab is where you'll spend most of your time. Here you can:
+      id: "build-workflow",
+      title: "Build a Workflow",
+      content: `Open the **Workflow Builder** from the BUILD section of the sidebar.
 
-• **Load configurations** - Import your automation workflow files
-• **Select workflows** - Choose which automation to run
-• **Choose monitors** - Pick which screen(s) to automate
-• **Start/Stop execution** - Control your automations
+A workflow defines what the AI should do. It has four phases:
+• **Setup** — One-time preparation steps (run once)
+• **Verification** — Check if the task is complete
+• **Agentic** — AI works on the task (loops with verification)
+• **Completion** — Final steps after success
 
-This is your mission control for running automations!`,
-      action: "Look for the Execute tab in the sidebar (play icon)",
+Click a phase button to add your first step.`,
+      action: "Open the Workflow Builder in the sidebar",
       targetElement: {
         selector: "execute-tab",
         highlightType: "border",
@@ -79,56 +103,37 @@ This is your mission control for running automations!`,
       estimatedDuration: 1,
     },
     {
-      id: "logs-section",
-      title: "Monitoring with Logs",
-      content: `The Logs section gives you real-time visibility into what's happening:
+      id: "run-workflow",
+      title: "Run Your Workflow",
+      content: `Once your workflow has steps, go to the **Dashboard** and start a new run.
 
-• **General logs** - Overall automation status and events
-• **Action logs** - Detailed record of each automation step
-• **Image recognition** - Results from visual pattern matching
-• **AI output** - Responses from AI analysis
+The dashboard shows:
+• **Live execution status** — What the AI is doing right now
+• **Logs** — Real-time output from each step
+• **Verification results** — Whether checks are passing
+• **AI conversation** — The full AI interaction
 
-Use logs to understand automation behavior and debug issues.`,
+You can stop execution at any time.`,
       tips: [
-        "Logs are searchable - use the filter to find specific events",
-        "Click on log entries to see more details",
-        "Logs persist between sessions for debugging",
-      ],
-      estimatedDuration: 1,
-    },
-    {
-      id: "settings-overview",
-      title: "Configure Your Experience",
-      content: `The Settings section lets you customize the Runner:
-
-• **AI Settings** - Configure AI providers and models
-• **General** - Appearance and behavior options
-• **Storage** - Manage screenshots and data
-• **Advanced** - Debug options and technical settings
-
-We recommend setting up AI integration to unlock intelligent automation features.`,
-      tips: [
-        "Start with the AI Settings if you want to use AI analysis",
-        "Check Advanced settings for debugging options",
+        "Use the Logs tab to see detailed output from each step",
+        "The AI tab shows the full conversation with the AI agent",
       ],
       estimatedDuration: 1,
     },
     {
       id: "ready-to-go",
       title: "You're Ready!",
-      content: `Congratulations! You now know the basics of Qontinui Runner.
+      content: `You now know the basics of Qontinui Runner.
 
-**Next Steps:**
-1. Load a configuration file to get started
-2. Explore the Workflow Execution tutorial for hands-on practice
-3. Set up AI integration for intelligent automation
+**Quick recap:**
+1. Configure your AI provider in Settings
+2. Build a workflow in the Workflow Builder
+3. Run it from the Dashboard and watch the AI work
 
-You can access this tutorial and others anytime from the Help section.
-
-Happy automating!`,
+Check the **Help** tab for more tutorials, troubleshooting tips, and documentation links.`,
       tips: [
-        "Check the Help tab for more tutorials",
-        "Documentation is available online for advanced features",
+        "The Help tab has interactive tutorials for each feature",
+        "Visit github.com/qontinui/qontinui-runner for documentation",
       ],
       estimatedDuration: 1,
     },

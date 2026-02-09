@@ -337,6 +337,9 @@ mainTabs.forEach((tab) => {
 chrome.storage.local.get(["selectedPopupTab"], (result) => {
   if (result.selectedPopupTab) {
     switchToMainTab(result.selectedPopupTab);
+  } else {
+    // Bridge tab is the default active tab — trigger its status check
+    checkUIBridgeStatus();
   }
 });
 
@@ -612,11 +615,14 @@ safeSendMessage({ action: "getRecordingStatus" }).then((response) => {
  * Send command to UI Bridge content script via background
  */
 async function sendUIBridgeCommand(action, params = {}, timeoutMs) {
-  return safeSendMessage({
-    type: "UI_BRIDGE_POPUP_COMMAND",
-    action,
-    params,
-  }, timeoutMs);
+  return safeSendMessage(
+    {
+      type: "UI_BRIDGE_POPUP_COMMAND",
+      action,
+      params,
+    },
+    timeoutMs,
+  );
 }
 
 /**
@@ -662,7 +668,10 @@ async function checkUIBridgeStatus() {
     const response = await sendUIBridgeCommand("ping", {}, 12000);
 
     lastResponse = response;
-    console.log(`[Qontinui Popup] Ping attempt ${attempt + 1}/${maxRetries}:`, JSON.stringify(response));
+    console.log(
+      `[Qontinui Popup] Ping attempt ${attempt + 1}/${maxRetries}:`,
+      JSON.stringify(response),
+    );
 
     if (response?.success && response?.data?.available) {
       const version = response.data.version || "unknown";
@@ -679,7 +688,8 @@ async function checkUIBridgeStatus() {
 
   // Show diagnostic info: what did the last response look like?
   const diag = lastResponse
-    ? (lastResponse.error || `success=${lastResponse.success}, available=${lastResponse.data?.available}`)
+    ? lastResponse.error ||
+      `success=${lastResponse.success}, available=${lastResponse.data?.available}`
     : "no response (timeout)";
   console.warn("[Qontinui Popup] UI Bridge not found. Last response:", lastResponse);
   updateUIBridgeStatus(false, `UI Bridge not found (${diag})`);

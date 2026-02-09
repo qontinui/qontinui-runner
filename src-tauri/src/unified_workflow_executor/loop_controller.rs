@@ -13,6 +13,7 @@
 //! 6. The loop respects external stop requests (via stop_ai_analysis endpoint)
 
 use std::sync::Arc;
+use tauri::Manager;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::config_storage::ConfigStorage;
@@ -20,6 +21,7 @@ use crate::event_system::EventBroadcaster;
 use crate::orchestrator::integration::StageTransition;
 use crate::step_executor::ExecutionStepConfig;
 use crate::step_registry::StepEventLogger;
+use crate::summary_generator::generate_task_summary_async;
 use crate::workflow_state::{StateMachine, WorkflowState};
 use crate::AppState;
 
@@ -77,6 +79,14 @@ impl LoopController {
             checkpoint_db: app_state.checkpoint_db.clone(),
             app_handle,
         }
+    }
+
+    /// Enable interactive sessions on all phase executors via the session manager.
+    pub fn with_session_manager(mut self, sm: Arc<crate::claude_session::SessionManager>) -> Self {
+        self.setup_executor.set_session_manager(sm.clone());
+        self.agentic_executor.set_session_manager(sm.clone());
+        self.completion_executor.set_session_manager(sm);
+        self
     }
 
     /// Run the complete workflow with verification-agentic loop.
@@ -316,6 +326,46 @@ impl LoopController {
                     &logger,
                 )
                 .await;
+
+            // Append setup phase results to output_log so output is visible immediately
+            {
+                let mut setup_output = format!(
+                    "\n=== Setup Phase ===\nSteps: {}\nSuccess: {}\n",
+                    setup_results.len(),
+                    setup_success,
+                );
+                for sr in &setup_results {
+                    setup_output.push_str(&format!(
+                        "  [{}] {} - {} ({}ms)\n",
+                        if sr.success { "OK" } else { "FAIL" },
+                        sr.step_type,
+                        sr.step_name,
+                        sr.duration_ms,
+                    ));
+                    if let Some(ref details) = sr.verification_details {
+                        if let Some(ref stdout) = details.stdout {
+                            if !stdout.is_empty() {
+                                setup_output.push_str(&format!("    stdout: {}\n", stdout));
+                            }
+                        }
+                        if let Some(ref stderr) = details.stderr {
+                            if !stderr.is_empty() {
+                                setup_output.push_str(&format!("    stderr: {}\n", stderr));
+                            }
+                        }
+                    }
+                    if let Some(ref err) = sr.error {
+                        setup_output.push_str(&format!("    error: {}\n", err));
+                    }
+                }
+                let _ = self.checkpoint_db.append_task_output_ex(
+                    &config.execution_id,
+                    &setup_output,
+                    false, // don't increment session count for setup
+                    false,
+                );
+            }
+
             all_step_results.extend(setup_results);
 
             if !setup_success {
@@ -327,6 +377,20 @@ impl LoopController {
                 );
                 self.mark_task_failed(&config.execution_id, "Setup phase failed")
                     .await;
+
+                // Fire-and-forget summary generation for the failed task
+                let db = self.checkpoint_db.clone();
+                let exec_id = config.execution_id.clone();
+                tokio::spawn(async move {
+                    match generate_task_summary_async(db, exec_id.clone()).await {
+                        Ok(_) => info!("Generated summary for failed task {}", exec_id),
+                        Err(e) => warn!(
+                            "Failed to generate summary for failed task {}: {}",
+                            exec_id, e
+                        ),
+                    }
+                });
+
                 return WorkflowResult {
                     success: false,
                     verification_passed: false,
@@ -520,6 +584,46 @@ impl LoopController {
                     &logger,
                 )
                 .await;
+
+            // Append completion phase results to output_log
+            {
+                let mut completion_output = format!(
+                    "\n=== Completion Phase ===\nSteps: {}\nSuccess: {}\n",
+                    completion_results.len(),
+                    completion_success,
+                );
+                for sr in &completion_results {
+                    completion_output.push_str(&format!(
+                        "  [{}] {} - {} ({}ms)\n",
+                        if sr.success { "OK" } else { "FAIL" },
+                        sr.step_type,
+                        sr.step_name,
+                        sr.duration_ms,
+                    ));
+                    if let Some(ref details) = sr.verification_details {
+                        if let Some(ref stdout) = details.stdout {
+                            if !stdout.is_empty() {
+                                completion_output.push_str(&format!("    stdout: {}\n", stdout));
+                            }
+                        }
+                        if let Some(ref stderr) = details.stderr {
+                            if !stderr.is_empty() {
+                                completion_output.push_str(&format!("    stderr: {}\n", stderr));
+                            }
+                        }
+                    }
+                    if let Some(ref err) = sr.error {
+                        completion_output.push_str(&format!("    error: {}\n", err));
+                    }
+                }
+                let _ = self.checkpoint_db.append_task_output_ex(
+                    &config.execution_id,
+                    &completion_output,
+                    false, // don't increment session count for completion
+                    false,
+                );
+            }
+
             all_step_results.extend(completion_results);
 
             if !completion_success {
@@ -536,6 +640,19 @@ impl LoopController {
             // Note: We mark as completed even for unfixable errors because the AI
             // did its job and determined the errors cannot be fixed automatically.
             self.mark_task_completed(&config.execution_id).await;
+
+            // Fire-and-forget summary generation for the completed task
+            let db = self.checkpoint_db.clone();
+            let exec_id = config.execution_id.clone();
+            tokio::spawn(async move {
+                match generate_task_summary_async(db, exec_id.clone()).await {
+                    Ok(_) => info!("Generated summary for completed task {}", exec_id),
+                    Err(e) => warn!(
+                        "Failed to generate summary for completed task {}: {}",
+                        exec_id, e
+                    ),
+                }
+            });
 
             // Resolve targeted errors on successful completion (verification passed)
             // Do NOT resolve errors if the AI signaled unfixable - they're still unresolved
@@ -572,6 +689,19 @@ impl LoopController {
                     ),
                 );
                 // Don't mark as failed - stop_ai_analysis already marked it as "stopped"
+
+                // Fire-and-forget summary generation for stopped task
+                let db = self.checkpoint_db.clone();
+                let exec_id = config.execution_id.clone();
+                tokio::spawn(async move {
+                    match generate_task_summary_async(db, exec_id.clone()).await {
+                        Ok(_) => info!("Generated summary for stopped task {}", exec_id),
+                        Err(e) => warn!(
+                            "Failed to generate summary for stopped task {}: {}",
+                            exec_id, e
+                        ),
+                    }
+                });
             } else {
                 let reason = if loop_result.critical_failure {
                     "Critical verification failure"
@@ -588,6 +718,20 @@ impl LoopController {
                     ),
                 );
                 self.mark_task_failed(&config.execution_id, reason).await;
+
+                // Fire-and-forget summary generation for failed task
+                let db = self.checkpoint_db.clone();
+                let exec_id = config.execution_id.clone();
+                tokio::spawn(async move {
+                    match generate_task_summary_async(db, exec_id.clone()).await {
+                        Ok(_) => info!("Generated summary for failed task {}", exec_id),
+                        Err(e) => warn!(
+                            "Failed to generate summary for failed task {}: {}",
+                            exec_id, e
+                        ),
+                    }
+                });
+
                 info!("=== WORKFLOW FAILED ===");
             }
         }
@@ -735,6 +879,44 @@ impl LoopController {
             // Add step results to overall results
             all_step_results.extend(step_results);
 
+            // Log verification results to output_log so the summary AI has context
+            {
+                let status = if verification_result.all_passed {
+                    "PASSED"
+                } else if verification_result.critical_failure {
+                    "CRITICAL FAILURE"
+                } else {
+                    "FAILED"
+                };
+                let summary_line = format!(
+                    "\n--- Verification (Iteration {}): {} ({} passed, {} failed, {} total) ---\n",
+                    iteration,
+                    status,
+                    verification_result.passed_steps,
+                    verification_result.failed_steps,
+                    verification_result.total_steps,
+                );
+
+                // Include brief details of failed steps
+                let mut details = String::new();
+                for sr in &verification_result.step_results {
+                    if !sr.success {
+                        let err = sr.error.as_deref().unwrap_or("unknown error");
+                        // Truncate long error messages
+                        let truncated = if err.len() > 200 { &err[..200] } else { err };
+                        details
+                            .push_str(&format!("  - {} [FAILED]: {}\n", sr.step_name, truncated));
+                    }
+                }
+
+                let _ = self.checkpoint_db.append_task_output_ex(
+                    &config.execution_id,
+                    &format!("{}{}", summary_line, details),
+                    false,
+                    false,
+                );
+            }
+
             // Store verification result in database for Recap page
             if let Ok(result_json) = serde_json::to_value(&verification_result) {
                 let _ = self.checkpoint_db.store_verification_phase_result(
@@ -822,6 +1004,21 @@ impl LoopController {
             );
 
             let failure_context = verification_result.build_failure_context();
+
+            // Detect regressions from previous iteration (iteration 2+)
+            let failure_context = if iteration > 1 {
+                match detect_regression(
+                    &self.checkpoint_db,
+                    &config.execution_id,
+                    iteration,
+                    &verification_result,
+                ) {
+                    Some(warning) => format!("{}\n\n{}", warning, failure_context),
+                    None => failure_context,
+                }
+            } else {
+                failure_context
+            };
 
             // -----------------------------------------------------------------
             // AGENTIC PHASE
@@ -1321,12 +1518,18 @@ pub async fn resume_interrupted_workflows(
                         task_id.clone(),
                         task_name.clone(),
                         async move {
+                            let session_manager: Arc<crate::claude_session::SessionManager> =
+                                app_handle_for_spawn
+                                    .state::<Arc<crate::claude_session::SessionManager>>()
+                                    .inner()
+                                    .clone();
                             let mut controller = LoopController::new(
                                 app_state_for_spawn,
                                 config_storage_for_spawn,
                                 app_handle_for_spawn,
                                 pid_tracker_for_spawn,
-                            );
+                            )
+                            .with_session_manager(session_manager);
 
                             info!(
                                 "Starting resume of workflow '{}' from iteration {}",
@@ -1466,12 +1669,18 @@ pub async fn resume_interrupted_workflows(
                         task_id.clone(),
                         task_name.clone(),
                         async move {
+                            let session_manager: Arc<crate::claude_session::SessionManager> =
+                                app_handle_for_spawn
+                                    .state::<Arc<crate::claude_session::SessionManager>>()
+                                    .inner()
+                                    .clone();
                             let mut controller = LoopController::new(
                                 app_state_for_spawn,
                                 config_storage_for_spawn,
                                 app_handle_for_spawn,
                                 pid_tracker_for_spawn,
-                            );
+                            )
+                            .with_session_manager(session_manager);
 
                             // Build execution steps from workflow definition with explicit phase assignment
                             let setup_automation_steps = convert_json_steps_with_phase(
@@ -1702,4 +1911,112 @@ pub fn extract_prompt_steps_with_phase(
             Some(config)
         })
         .collect()
+}
+
+// =============================================================================
+// Regression Detection
+// =============================================================================
+
+/// Compare current verification results with the previous iteration to detect regressions.
+///
+/// Returns a warning string if regressions are found (steps that were passing before
+/// but now fail), or None if no regressions detected.
+fn detect_regression(
+    checkpoint_db: &crate::database::CheckpointDb,
+    execution_id: &str,
+    current_iteration: u32,
+    current_result: &crate::step_executor::VerificationPhaseResult,
+) -> Option<String> {
+    if current_iteration <= 1 {
+        return None;
+    }
+
+    // Retrieve previous iteration result
+    let prev_result =
+        match checkpoint_db.get_verification_phase_result(execution_id, current_iteration - 1) {
+            Ok(Some(val)) => val,
+            _ => return None,
+        };
+
+    // Extract previous step results
+    let prev_step_results = prev_result.get("step_results").and_then(|v| v.as_array())?;
+
+    // Build a map of step_name -> success for previous iteration
+    let mut prev_step_status: std::collections::HashMap<String, bool> =
+        std::collections::HashMap::new();
+    for step in prev_step_results {
+        if let (Some(name), Some(success)) = (
+            step.get("step_name").and_then(|v| v.as_str()),
+            step.get("success").and_then(|v| v.as_bool()),
+        ) {
+            prev_step_status.insert(name.to_string(), success);
+        }
+    }
+
+    // Find regressions: steps that were passing before but now fail
+    let mut newly_broken: Vec<String> = Vec::new();
+    for result in &current_result.step_results {
+        if !result.success {
+            if let Some(&prev_passed) = prev_step_status.get(&result.step_name) {
+                if prev_passed {
+                    newly_broken.push(result.step_name.clone());
+                }
+            }
+        }
+    }
+
+    // Compare overall scores
+    let prev_passed = prev_result
+        .get("passed_steps")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let prev_total = prev_result
+        .get("total_steps")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let curr_passed = current_result.passed_steps as u64;
+    let curr_total = current_result.total_steps as u64;
+
+    // Only warn if there are actual regressions
+    if newly_broken.is_empty() && curr_passed >= prev_passed {
+        return None;
+    }
+
+    let mut warning = String::new();
+    warning.push_str("## REGRESSION WARNING\n\n");
+    warning.push_str("Your changes in the previous iteration caused regressions.\n\n");
+
+    if !newly_broken.is_empty() {
+        warning.push_str(&format!(
+            "**Previously passing, now failing:** {}\n",
+            newly_broken.join(", ")
+        ));
+    }
+
+    if curr_passed < prev_passed {
+        warning.push_str(&format!(
+            "**Score change:** {}/{} passed -> {}/{} passed ({} more failures)\n",
+            prev_passed,
+            prev_total,
+            curr_passed,
+            curr_total,
+            prev_passed - curr_passed
+        ));
+    }
+
+    warning.push_str(
+        "\nConsider whether your changes were correct or if they had unintended side effects.\n",
+    );
+
+    info!(
+        "REGRESSION-DETECT: iteration {} has {} newly broken steps (was {}/{}, now {}/{})",
+        current_iteration,
+        newly_broken.len(),
+        prev_passed,
+        prev_total,
+        curr_passed,
+        curr_total
+    );
+
+    Some(warning)
 }

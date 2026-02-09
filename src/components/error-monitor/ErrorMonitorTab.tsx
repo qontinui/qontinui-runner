@@ -91,6 +91,10 @@ function StatusBadge({ status }: { status: ErrorStatus }) {
       label: "Recurring",
       className: "bg-orange-500/20 text-orange-500",
     },
+    promoted: {
+      label: "Promoted",
+      className: "bg-purple-500/20 text-purple-500",
+    },
   };
 
   const config = statusConfig[status] || { label: status, className: "" };
@@ -279,7 +283,12 @@ function EmptyState() {
 export function ErrorMonitorTab() {
   const [searchText, setSearchText] = useState("");
   const [selectedSeverities, setSelectedSeverities] = useState<ErrorSeverity[]>([]);
-  const [selectedStatuses, setSelectedStatuses] = useState<ErrorStatus[]>([]);
+  const [selectedStatuses, setSelectedStatuses] = useState<ErrorStatus[]>([
+    "new",
+    "acknowledged",
+    "in_progress",
+    "promoted",
+  ]);
   const [showFilters, setShowFilters] = useState(false);
   const [expandedErrorId, setExpandedErrorId] = useState<number | null>(null);
   // Data hooks

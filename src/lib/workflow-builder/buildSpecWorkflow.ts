@@ -67,10 +67,7 @@ export function buildSpecWorkflow(input: BuildSpecWorkflowInput): UnifiedWorkflo
   } = input;
 
   // Resolve element source: explicit param > spec metadata > "control"
-  const metadataSource = specConfig.metadata?.elementSource as
-    | "control"
-    | "external"
-    | undefined;
+  const metadataSource = specConfig.metadata?.elementSource as "control" | "external" | undefined;
   const elementSource = input.elementSource ?? metadataSource ?? "control";
 
   const now = new Date().toISOString();
@@ -83,10 +80,15 @@ export function buildSpecWorkflow(input: BuildSpecWorkflowInput): UnifiedWorkflo
   // Setup steps: navigate to page URL if provided
   const setupSteps: PromptStep[] = [];
   // Note: We don't add a ScriptStep for navigation in spec workflow mode
-  // because the page is already connected via the Chrome extension.
+  // because the page is already connected via the SDK or extension.
   // The workflow assumes the page is already loaded.
 
   // Verification steps: each selected group becomes a SpecStep
+  const sourceExplanation =
+    elementSource === "external"
+      ? "Elements are fetched from an external SDK-connected app. The AI must fix the web application code so these assertions pass when checked against the live page."
+      : "Elements are fetched from the runner's own webview (control mode).";
+
   const verificationSteps: SpecStep[] = selectedGroups.map((group) => {
     const enabledAssertions = group.assertions.filter((a) => a.enabled);
     const assertionDescriptions = enabledAssertions
@@ -100,7 +102,7 @@ export function buildSpecWorkflow(input: BuildSpecWorkflowInput): UnifiedWorkflo
       name: group.name,
       spec_group: group,
       element_source: elementSource,
-      description: `${group.description}\n\nAssertions:\n${assertionDescriptions}`,
+      description: `${group.description}\n\nElement source: ${elementSource} — ${sourceExplanation}\n\nAssertions:\n${assertionDescriptions}`,
     };
   });
 

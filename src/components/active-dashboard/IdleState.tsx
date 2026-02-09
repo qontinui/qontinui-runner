@@ -25,7 +25,11 @@ export function IdleState({
 
         <div>
           <h2 className="text-2xl font-semibold text-foreground">No Active Workflow</h2>
-          <p className="mt-2 text-muted-foreground">Run a workflow to get started</p>
+          <p className="mt-2 text-muted-foreground">
+            {lastRunWorkflowId
+              ? "Run a workflow to get started"
+              : "Create a workflow in the Workflow Builder, then run it here"}
+          </p>
         </div>
 
         <div className="flex flex-col gap-3">

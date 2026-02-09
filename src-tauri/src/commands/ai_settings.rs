@@ -89,6 +89,7 @@ pub fn get_ai_settings() -> Result<CommandResponse, String> {
 /// * `model` - Claude API model name
 /// * `max_tokens` - Maximum tokens for API calls
 /// * `auto_refine_video_after_iterations` - Default iteration threshold for video in auto-refine
+/// * `interactive_sessions_enabled` - Enable interactive bidirectional CLI sessions
 ///
 /// # Returns
 /// * `Ok(CommandResponse)` - Success
@@ -103,10 +104,11 @@ pub fn save_ai_settings(
     model: String,
     max_tokens: u32,
     auto_refine_video_after_iterations: Option<u32>,
+    interactive_sessions_enabled: Option<bool>,
 ) -> Result<CommandResponse, String> {
     info!(
-        "Saving AI settings: provider={}, execution_mode={}, timeout={}s, config_dir={:?}, video_after_iterations={:?}",
-        provider, execution_mode, timeout_seconds, config_dir, auto_refine_video_after_iterations
+        "Saving AI settings: provider={}, execution_mode={}, timeout={}s, config_dir={:?}, video_after_iterations={:?}, interactive={:?}",
+        provider, execution_mode, timeout_seconds, config_dir, auto_refine_video_after_iterations, interactive_sessions_enabled
     );
 
     let ai_provider = match provider.as_str() {
@@ -145,6 +147,8 @@ pub fn save_ai_settings(
         compression: existing_settings.compression,
         retry: existing_settings.retry,
         routing: existing_settings.routing,
+        interactive_sessions_enabled: interactive_sessions_enabled
+            .unwrap_or(existing_settings.interactive_sessions_enabled),
     };
 
     settings::save_ai_settings(ai_settings)
@@ -225,10 +229,11 @@ pub fn save_gemini_settings(
             temperature,
         },
         auto_refine_video_after_iterations: existing_settings.auto_refine_video_after_iterations,
-        // Preserve compression, retry, and routing settings
+        // Preserve compression, retry, routing, and interactive settings
         compression: existing_settings.compression,
         retry: existing_settings.retry,
         routing: existing_settings.routing,
+        interactive_sessions_enabled: existing_settings.interactive_sessions_enabled,
     };
 
     settings::save_ai_settings(ai_settings)
@@ -736,6 +741,7 @@ pub fn save_agentic_settings(
         compression: compression_config,
         retry: retry_config,
         routing: routing_config,
+        interactive_sessions_enabled: existing_settings.interactive_sessions_enabled,
     };
 
     settings::save_ai_settings(ai_settings)

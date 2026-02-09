@@ -77,7 +77,7 @@ export function AgenticPromptEditor({
           <p className="text-[10px] text-neutral-500 mt-1">
             {elementSource === "control"
               ? "Specs run against the runner's own UI elements"
-              : "Specs run against an external browser tab via the Chrome extension"}
+              : "Specs run against an external browser tab via SDK connection"}
           </p>
         </div>
       )}

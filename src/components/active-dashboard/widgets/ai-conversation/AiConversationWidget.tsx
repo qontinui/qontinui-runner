@@ -7,13 +7,14 @@
  * Note: The widget header is rendered by DashboardLayout, not by this component.
  */
 
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { Bot, Loader2 } from "lucide-react";
 import { cn } from "../../../../lib/utils";
 import { ScrollArea } from "../../../ui/ScrollArea";
 import type { BaseWidgetProps } from "../../../../types/dashboard/widget-props";
 import { useAiConversationData } from "./useAiConversationData";
 import { AiMessageDisplay, groupEntriesBySource } from "../../../shared";
+import { MessageInput } from "./MessageInput";
 import { getAccentColors } from "@/design-system";
 
 /**
@@ -84,7 +85,8 @@ export function AiConversationWidget({
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // Use shared grouping function for consistent behavior with AiOutputTab
-  const groups = groupEntriesBySource(entries);
+  // Memoize to prevent unnecessary re-renders of child components
+  const groups = useMemo(() => groupEntriesBySource(entries), [entries]);
 
   // Auto-scroll to bottom when new messages arrive
   useEffect(() => {
@@ -117,6 +119,9 @@ export function AiConversationWidget({
           )}
         </div>
       </ScrollArea>
+
+      {/* Message input for interactive sessions */}
+      <MessageInput />
     </div>
   );
 }

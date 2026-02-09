@@ -57,9 +57,10 @@ const COLOR_CLASSES: Record<string, { bg: string; text: string }> = {
 
 interface StepItemProps {
   step: RecapStep;
+  onClick?: () => void;
 }
 
-function StepItem({ step }: StepItemProps) {
+function StepItem({ step, onClick }: StepItemProps) {
   // Use icon_type if available, falling back to step_type
   const {
     icon: Icon,
@@ -73,10 +74,24 @@ function StepItem({ step }: StepItemProps) {
   // Don't show error if it's identical to the summary (avoid duplication)
   const showError = step.error && step.error !== displaySummary;
 
+  const isClickable = !!onClick;
+
   return (
     <div
       data-ui-id={`recap-staged-step-${step.step_type}`}
-      className="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-muted/30 transition-colors"
+      className={`flex items-center gap-3 px-3 py-2 rounded-lg transition-colors ${
+        isClickable ? "hover:bg-muted/50 cursor-pointer" : "hover:bg-muted/30"
+      }`}
+      onClick={onClick}
+      role={isClickable ? "button" : undefined}
+      tabIndex={isClickable ? 0 : undefined}
+      onKeyDown={
+        isClickable
+          ? (e) => {
+              if (e.key === "Enter" || e.key === " ") onClick?.();
+            }
+          : undefined
+      }
     >
       {/* Status icon */}
       {getStatusIcon(step.status)}
@@ -117,16 +132,20 @@ function StepItem({ step }: StepItemProps) {
         )}
         {showError && <p className="text-xs text-red-400 truncate mt-0.5">{step.error}</p>}
       </div>
+
+      {/* Navigate hint for clickable steps */}
+      {isClickable && <ChevronRight className="w-4 h-4 text-muted-foreground flex-shrink-0" />}
     </div>
   );
 }
 
 interface StageSectionProps {
   stage: StageRecap;
+  onAiStepClick?: (phase: string, iteration?: number) => void;
 }
 
-function StageSection({ stage }: StageSectionProps) {
-  const [expanded, setExpanded] = useState(stage.status === "failed" || stage.status === "running");
+function StageSection({ stage, onAiStepClick }: StageSectionProps) {
+  const [expanded, setExpanded] = useState(false);
 
   const stageKey = stage.stage as WorkflowStage;
   const config = WORKFLOW_STAGE_CONFIG[stageKey];
@@ -178,7 +197,15 @@ function StageSection({ stage }: StageSectionProps) {
       {expanded && stage.steps.length > 0 && (
         <div className="border-t border-border p-2 space-y-1">
           {stage.steps.map((step, i) => (
-            <StepItem key={`${step.name}-${i}`} step={step} />
+            <StepItem
+              key={`${step.name}-${i}`}
+              step={step}
+              onClick={
+                step.step_type === "ai_session" && onAiStepClick
+                  ? () => onAiStepClick(stage.stage, stage.iteration)
+                  : undefined
+              }
+            />
           ))}
         </div>
       )}
@@ -188,6 +215,7 @@ function StageSection({ stage }: StageSectionProps) {
 
 interface StagedTimelineProps {
   stages: StageRecap[];
+  onAiStepClick?: (phase: string, iteration?: number) => void;
 }
 
 // Default stage order and labels
@@ -201,7 +229,7 @@ const STAGE_LABELS: Record<WorkflowStage, string> = {
   completion: "Completion",
 };
 
-export function StagedTimeline({ stages }: StagedTimelineProps) {
+export function StagedTimeline({ stages, onAiStepClick }: StagedTimelineProps) {
   // Build a map of existing stages for quick lookup
   const stageMap = new Map<string, StageRecap>();
   stages.forEach((s) => {
@@ -228,22 +256,36 @@ export function StagedTimeline({ stages }: StagedTimelineProps) {
     }
   });
 
-  // Sort stages chronologically by started_at timestamp
-  // This preserves the actual execution order including iteration loops
+  // Sort stages by phase order (matching backend logic in stage_builder.rs).
+  // Phase order is the primary sort; timestamps are only used within the same phase+iteration.
   allStages.sort((a, b) => {
-    // Stages with timestamps should be sorted by time
+    const phaseOrder: Record<string, number> = {
+      setup: 0,
+      verification: 1,
+      agentic: 2,
+      completion: 3,
+    };
+    const aPhase = phaseOrder[a.stage] ?? 2;
+    const bPhase = phaseOrder[b.stage] ?? 2;
+    const aIter = a.iteration ?? 0;
+    const bIter = b.iteration ?? 0;
+
+    // Setup always first, completion always last
+    if (aPhase === 0 || bPhase === 0 || aPhase === 3 || bPhase === 3) {
+      return aPhase - bPhase;
+    }
+
+    // For verification and agentic: sort by iteration first
+    if (aIter !== bIter) return aIter - bIter;
+
+    // Same iteration: verification before agentic
+    if (aPhase !== bPhase) return aPhase - bPhase;
+
+    // Same phase and iteration: use timestamps if available
     if (a.started_at && b.started_at) {
       return new Date(a.started_at).getTime() - new Date(b.started_at).getTime();
     }
-    // Stages with timestamps come before those without
-    if (a.started_at && !b.started_at) return -1;
-    if (!a.started_at && b.started_at) return 1;
-    // For stages without timestamps, use the default phase order
-    const aIndex = DEFAULT_STAGES.indexOf(a.stage as WorkflowStage);
-    const bIndex = DEFAULT_STAGES.indexOf(b.stage as WorkflowStage);
-    if (aIndex !== bIndex) return aIndex - bIndex;
-    // Same phase - sort by iteration
-    return (a.iteration ?? 0) - (b.iteration ?? 0);
+    return 0;
   });
 
   if (allStages.length === 0) {
@@ -258,7 +300,11 @@ export function StagedTimeline({ stages }: StagedTimelineProps) {
   return (
     <div data-ui-id="recap-staged-timeline" className="space-y-3">
       {allStages.map((stage, index) => (
-        <StageSection key={`${stage.stage}-${stage.iteration ?? index}`} stage={stage} />
+        <StageSection
+          key={`${stage.stage}-${stage.iteration ?? index}`}
+          stage={stage}
+          onAiStepClick={onAiStepClick}
+        />
       ))}
     </div>
   );

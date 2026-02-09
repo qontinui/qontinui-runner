@@ -1,269 +1,444 @@
 /**
  * Connection Panel
  *
- * Shows the UI Bridge extension connection status and allows
- * selecting a browser tab to inspect.
+ * Two-section layout for discovering and connecting to UI Bridge targets:
+ * 1. Desktop Apps - SDK-embedded apps discovered via port scanning (primary)
+ * 2. Mobile Devices - discovered via ADB
  */
 
-import { useState, useCallback } from "react";
-import { Card, CardHeader, CardTitle, CardContent } from "../ui/Card";
+import { useState } from "react";
+import { Card, CardContent } from "../ui/Card";
 import { Button } from "../ui/Button";
 import { Badge } from "../ui/Badge";
 import {
-  Globe,
   RefreshCw,
-  Link,
-  Unlink,
-  Chrome,
   AlertCircle,
   Check,
   ChevronDown,
   ChevronRight,
-  ExternalLink,
+  Monitor,
+  Smartphone,
+  Scan,
+  Wifi,
+  WifiOff,
 } from "lucide-react";
-import type { BrowserTab, ConnectionStatus } from "../../hooks/useExternalUIBridge";
+import type { ConnectionStatus } from "../../hooks/useExternalUIBridge";
+import type { DiscoveredApp, MobileDevice } from "../../hooks/useAppDiscovery";
+
+// ============================================================================
+// Types
+// ============================================================================
+
+export type ActiveSource = "desktop" | "mobile" | null;
 
 interface ConnectionPanelProps {
-  connectionStatus: ConnectionStatus;
-  isExtensionConnected: boolean;
-  connectedTabInfo: BrowserTab | null;
-  browserTabs: BrowserTab[];
-  isLoadingTabs: boolean;
+  // Discovery props
+  webApps: DiscoveredApp[];
+  desktopApps: DiscoveredApp[];
+  mobileDevices: MobileDevice[];
+  isScanningDesktop: boolean;
+  isScanningMobile: boolean;
+  onScanDesktop: () => Promise<void>;
+  onScanMobile: () => Promise<void>;
+
+  // Active source tracking
+  activeSource: ActiveSource;
+  activeApp: DiscoveredApp | null;
+  activeMobileDevice: MobileDevice | null;
+  onConnectToApp: (app: DiscoveredApp) => void;
+  onConnectToDevice: (device: MobileDevice) => void;
+  onDisconnectSource: () => void;
+
+  // SDK connection status (for desktop/mobile apps)
+  sdkConnectionStatus?: ConnectionStatus;
+
+  // Error display
   error: string | null;
-  elementCount: number;
-  onRefreshTabs: () => Promise<void>;
-  onConnectToTab: (tabId: number) => Promise<void>;
-  onDisconnect: () => void;
-  onCheckExtension: () => Promise<boolean>;
 }
 
+// ============================================================================
+// Component
+// ============================================================================
+
 export function ConnectionPanel({
-  connectionStatus,
-  isExtensionConnected,
-  connectedTabInfo,
-  browserTabs,
-  isLoadingTabs,
+  desktopApps,
+  mobileDevices,
+  isScanningDesktop,
+  isScanningMobile,
+  onScanDesktop,
+  onScanMobile,
+  activeSource,
+  activeApp,
+  activeMobileDevice,
+  onConnectToApp,
+  onConnectToDevice,
+  onDisconnectSource,
+  sdkConnectionStatus,
   error,
-  elementCount,
-  onRefreshTabs,
-  onConnectToTab,
-  onDisconnect,
-  onCheckExtension,
 }: ConnectionPanelProps) {
-  const [showTabList, setShowTabList] = useState(false);
-  const [isConnecting, setIsConnecting] = useState(false);
+  const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({
+    desktop: true,
+    mobile: true,
+  });
 
-  const handleRefreshTabs = useCallback(async () => {
-    await onCheckExtension();
-    await onRefreshTabs();
-    setShowTabList(true);
-  }, [onCheckExtension, onRefreshTabs]);
-
-  const handleConnectToTab = useCallback(
-    async (tabId: number) => {
-      setIsConnecting(true);
-      try {
-        await onConnectToTab(tabId);
-        setShowTabList(false);
-      } finally {
-        setIsConnecting(false);
-      }
-    },
-    [onConnectToTab],
-  );
-
-  const getStatusBadge = () => {
-    switch (connectionStatus) {
-      case "connected":
-        return (
-          <Badge variant="success" className="gap-1">
-            <Check className="w-3 h-3" />
-            Connected
-          </Badge>
-        );
-      case "connecting":
-        return (
-          <Badge variant="warning" className="gap-1">
-            <RefreshCw className="w-3 h-3 animate-spin" />
-            Connecting
-          </Badge>
-        );
-      case "error":
-        return (
-          <Badge variant="danger" className="gap-1">
-            <AlertCircle className="w-3 h-3" />
-            Error
-          </Badge>
-        );
-      default:
-        return (
-          <Badge variant="muted" className="gap-1">
-            <Unlink className="w-3 h-3" />
-            Disconnected
-          </Badge>
-        );
-    }
-  };
-
-  const getExtensionBadge = () => {
-    if (isExtensionConnected) {
-      return (
-        <Badge variant="outline" className="gap-1 text-green-500 border-green-500/30">
-          <Chrome className="w-3 h-3" />
-          Extension Ready
-        </Badge>
-      );
-    }
-    return (
-      <Badge variant="outline" className="gap-1 text-muted-foreground">
-        <Chrome className="w-3 h-3" />
-        Extension Not Connected
-      </Badge>
-    );
+  const toggleSection = (section: string) => {
+    setExpandedSections((prev) => ({ ...prev, [section]: !prev[section] }));
   };
 
   return (
     <Card variant="borderless" className="mb-3">
-      <CardHeader className="py-2">
-        <CardTitle className="flex items-center gap-2 text-base">
-          <Globe className="w-4 h-4 text-primary" />
-          Browser Connection
-        </CardTitle>
-        <div className="flex items-center gap-2">
-          {getStatusBadge()}
-          {getExtensionBadge()}
-        </div>
-      </CardHeader>
-
-      <CardContent className="pt-0 pb-3 space-y-3">
-        {/* Connected tab info */}
-        {connectedTabInfo && connectionStatus === "connected" && (
-          <div className="p-2 bg-accent/10 border border-accent/20 rounded-md">
-            <div className="flex items-start gap-2">
-              <Link className="w-4 h-4 text-accent mt-0.5 shrink-0" />
-              <div className="flex-1 min-w-0">
-                <div className="font-medium text-sm truncate">{connectedTabInfo.title}</div>
-                <div className="text-xs text-muted-foreground truncate flex items-center gap-1">
-                  <span>{connectedTabInfo.url}</span>
-                  <a
-                    href={connectedTabInfo.url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-primary hover:underline inline-flex"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    <ExternalLink className="w-3 h-3" />
-                  </a>
-                </div>
-                <div className="text-xs text-muted-foreground mt-1">
-                  {elementCount} elements discovered
-                </div>
-              </div>
-              <Button variant="outline" size="sm" onClick={onDisconnect}>
-                Disconnect
-              </Button>
-            </div>
-          </div>
-        )}
-
+      <CardContent className="pt-2 pb-2 space-y-0">
         {/* Error message */}
         {error && (
-          <div className="p-2 bg-destructive/10 border border-destructive/30 rounded-md text-sm text-destructive flex items-start gap-2">
+          <div className="p-2 mb-2 bg-destructive/10 border border-destructive/30 rounded-md text-sm text-destructive flex items-start gap-2">
             <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
             <span>{error}</span>
           </div>
         )}
 
-        {/* Tab selection */}
-        {connectionStatus !== "connected" && (
-          <div>
-            <div className="flex items-center gap-2 mb-2">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={handleRefreshTabs}
-                disabled={isLoadingTabs}
-              >
-                <RefreshCw className={`w-3.5 h-3.5 mr-1 ${isLoadingTabs ? "animate-spin" : ""}`} />
-                {isLoadingTabs ? "Loading..." : "Refresh Tabs"}
-              </Button>
-              {browserTabs.length > 0 && (
-                <button
-                  className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
-                  onClick={() => setShowTabList(!showTabList)}
+        {/* ================================================================ */}
+        {/* Section 1: Desktop Apps (SDK - Primary) */}
+        {/* ================================================================ */}
+        <SectionHeader
+          icon={<Monitor className="w-4 h-4" />}
+          title="Desktop Apps"
+          expanded={expandedSections.desktop}
+          onToggle={() => toggleSection("desktop")}
+          badge={
+            activeSource === "desktop" && activeApp ? (
+              sdkConnectionStatus === "connecting" ? (
+                <Badge
+                  variant="outline"
+                  className="gap-1 text-[10px] text-yellow-500 border-yellow-500/30"
                 >
-                  {showTabList ? (
-                    <ChevronDown className="w-3.5 h-3.5" />
+                  <RefreshCw className="w-2.5 h-2.5 animate-spin" />
+                  Connecting...
+                </Badge>
+              ) : sdkConnectionStatus === "connected" ? (
+                <Badge variant="success" className="gap-1 text-[10px]">
+                  <Check className="w-2.5 h-2.5" />
+                  {activeApp.appName}
+                </Badge>
+              ) : sdkConnectionStatus === "error" ? (
+                <Badge variant="danger" className="gap-1 text-[10px]">
+                  <AlertCircle className="w-2.5 h-2.5" />
+                  Error
+                </Badge>
+              ) : (
+                <Badge variant="muted" className="gap-1 text-[10px]">
+                  {activeApp.appName}
+                </Badge>
+              )
+            ) : desktopApps.length > 0 ? (
+              <Badge variant="muted" className="text-[10px]">
+                {desktopApps.length} found
+              </Badge>
+            ) : null
+          }
+          action={
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-6 w-6 p-0"
+              onClick={(e) => {
+                e.stopPropagation();
+                onScanDesktop();
+              }}
+              disabled={isScanningDesktop}
+            >
+              <Scan className={`w-3.5 h-3.5 ${isScanningDesktop ? "animate-spin" : ""}`} />
+            </Button>
+          }
+        />
+        {expandedSections.desktop && (
+          <div className="pl-6 pb-2">
+            {activeSource === "desktop" && activeApp && (
+              <div
+                className={`p-2 rounded-md mb-2 ${
+                  sdkConnectionStatus === "connected"
+                    ? "bg-accent/10 border border-accent/20"
+                    : sdkConnectionStatus === "connecting"
+                      ? "bg-yellow-500/10 border border-yellow-500/20"
+                      : sdkConnectionStatus === "error"
+                        ? "bg-destructive/10 border border-destructive/20"
+                        : "bg-muted/30 border border-border/50"
+                }`}
+              >
+                <div className="flex items-center gap-2">
+                  {sdkConnectionStatus === "connecting" ? (
+                    <RefreshCw className="w-4 h-4 text-yellow-500 shrink-0 animate-spin" />
                   ) : (
-                    <ChevronRight className="w-3.5 h-3.5" />
+                    <Monitor className="w-4 h-4 text-accent shrink-0" />
                   )}
-                  {browserTabs.length} tab{browserTabs.length !== 1 ? "s" : ""} available
-                </button>
-              )}
-            </div>
-
-            {/* Tab list */}
-            {showTabList && browserTabs.length > 0 && (
-              <div className="space-y-1 max-h-48 overflow-y-auto">
-                {browserTabs.map((tab) => (
-                  <button
-                    key={tab.id}
-                    className="w-full p-2 text-left bg-muted/30 hover:bg-muted/50 rounded-md transition-colors disabled:opacity-50"
-                    onClick={() => handleConnectToTab(tab.id)}
-                    disabled={isConnecting || connectionStatus === "connecting"}
-                  >
-                    <div className="flex items-start gap-2">
-                      {tab.favIconUrl ? (
-                        <img
-                          src={tab.favIconUrl}
-                          alt=""
-                          className="w-4 h-4 mt-0.5 shrink-0"
-                          onError={(e) => {
-                            (e.target as HTMLImageElement).style.display = "none";
-                          }}
-                        />
-                      ) : (
-                        <Globe className="w-4 h-4 mt-0.5 shrink-0 text-muted-foreground" />
-                      )}
-                      <div className="flex-1 min-w-0">
-                        <div className="text-sm font-medium truncate">{tab.title}</div>
-                        <div className="text-xs text-muted-foreground truncate">{tab.url}</div>
-                      </div>
-                      {tab.active && (
-                        <Badge variant="muted" className="text-[10px]">
-                          Active
-                        </Badge>
-                      )}
+                  <div className="flex-1 min-w-0">
+                    <div className="font-medium text-sm">{activeApp.appName}</div>
+                    <div className="text-xs text-muted-foreground">
+                      :{activeApp.port}
+                      {activeApp.framework && ` \u00B7 ${activeApp.framework}`}
+                      {activeApp.elementCount != null &&
+                        ` \u00B7 ${activeApp.elementCount} elements`}
                     </div>
-                  </button>
-                ))}
+                  </div>
+                  <Button variant="outline" size="sm" onClick={onDisconnectSource}>
+                    Disconnect
+                  </Button>
+                </div>
               </div>
             )}
 
-            {/* No tabs message */}
-            {showTabList && browserTabs.length === 0 && !isLoadingTabs && (
-              <div className="text-sm text-muted-foreground text-center py-4">
-                {isExtensionConnected
-                  ? "No browser tabs found. Open a page in your browser."
-                  : "Extension not connected. Make sure the Qontinui DevTools extension is installed and enabled."}
+            {(activeSource !== "desktop" || !activeApp) && (
+              <>
+                {desktopApps.length > 0 ? (
+                  <div className="flex flex-wrap gap-2">
+                    {desktopApps.map((app) => (
+                      <AppCard
+                        key={`${app.appId}-${app.port}`}
+                        app={app}
+                        isActive={activeApp?.appId === app.appId && activeSource === "desktop"}
+                        onClick={() => onConnectToApp(app)}
+                      />
+                    ))}
+                  </div>
+                ) : (
+                  <div className="text-xs text-muted-foreground">
+                    {isScanningDesktop
+                      ? "Scanning..."
+                      : "No SDK-embedded apps found. Click scan to discover."}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        )}
+
+        <div className="border-t border-border/50" />
+
+        {/* ================================================================ */}
+        {/* Section 2: Mobile Devices */}
+        {/* ================================================================ */}
+        <SectionHeader
+          icon={<Smartphone className="w-4 h-4" />}
+          title="Mobile Devices"
+          expanded={expandedSections.mobile}
+          onToggle={() => toggleSection("mobile")}
+          badge={
+            activeSource === "mobile" && activeMobileDevice ? (
+              <Badge variant="success" className="gap-1 text-[10px]">
+                <Check className="w-2.5 h-2.5" />
+                {activeMobileDevice.model || activeMobileDevice.deviceId}
+              </Badge>
+            ) : mobileDevices.length > 0 ? (
+              <Badge variant="muted" className="text-[10px]">
+                {mobileDevices.length} device{mobileDevices.length !== 1 ? "s" : ""}
+              </Badge>
+            ) : null
+          }
+          action={
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-6 w-6 p-0"
+              onClick={(e) => {
+                e.stopPropagation();
+                onScanMobile();
+              }}
+              disabled={isScanningMobile}
+            >
+              <Scan className={`w-3.5 h-3.5 ${isScanningMobile ? "animate-spin" : ""}`} />
+            </Button>
+          }
+        />
+        {expandedSections.mobile && (
+          <div className="pl-6 pb-2">
+            {activeSource === "mobile" && activeMobileDevice && (
+              <div className="p-2 bg-accent/10 border border-accent/20 rounded-md mb-2">
+                <div className="flex items-center gap-2">
+                  <Smartphone className="w-4 h-4 text-accent shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <div className="font-medium text-sm">
+                      {activeMobileDevice.model || activeMobileDevice.deviceId}
+                    </div>
+                    <div className="text-xs text-muted-foreground">
+                      {activeMobileDevice.deviceType === "emulator"
+                        ? "Emulator"
+                        : "Physical Device"}
+                      {activeMobileDevice.uiBridge && ` \u00B7 UI Bridge available`}
+                    </div>
+                  </div>
+                  <Button variant="outline" size="sm" onClick={onDisconnectSource}>
+                    Disconnect
+                  </Button>
+                </div>
               </div>
             )}
 
-            {/* Help text */}
-            {!showTabList && !isExtensionConnected && (
-              <div className="text-xs text-muted-foreground">
-                <p>To inspect browser elements:</p>
-                <ol className="list-decimal list-inside mt-1 space-y-0.5">
-                  <li>Install the Qontinui DevTools browser extension</li>
-                  <li>Open a page in your browser</li>
-                  <li>Click "Refresh Tabs" above to see available pages</li>
-                </ol>
-              </div>
+            {(activeSource !== "mobile" || !activeMobileDevice) && (
+              <>
+                {mobileDevices.length > 0 ? (
+                  <div className="flex flex-wrap gap-2">
+                    {mobileDevices.map((device) => (
+                      <DeviceCard
+                        key={device.deviceId}
+                        device={device}
+                        isActive={
+                          activeMobileDevice?.deviceId === device.deviceId &&
+                          activeSource === "mobile"
+                        }
+                        onClick={() => onConnectToDevice(device)}
+                      />
+                    ))}
+                  </div>
+                ) : (
+                  <div className="text-xs text-muted-foreground">
+                    {isScanningMobile
+                      ? "Scanning..."
+                      : "No mobile devices found. Connect a device via ADB and click scan."}
+                  </div>
+                )}
+              </>
             )}
           </div>
         )}
       </CardContent>
     </Card>
+  );
+}
+
+// ============================================================================
+// Sub-Components
+// ============================================================================
+
+function SectionHeader({
+  icon,
+  title,
+  subtitle,
+  expanded,
+  onToggle,
+  badge,
+  action,
+}: {
+  icon: React.ReactNode;
+  title: string;
+  subtitle?: string;
+  expanded: boolean;
+  onToggle: () => void;
+  badge?: React.ReactNode;
+  action?: React.ReactNode;
+}) {
+  return (
+    <button
+      className="w-full flex items-center gap-2 py-2 text-left hover:bg-muted/30 rounded-sm transition-colors"
+      onClick={onToggle}
+    >
+      {expanded ? (
+        <ChevronDown className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+      ) : (
+        <ChevronRight className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+      )}
+      <span className="text-muted-foreground">{icon}</span>
+      <span className="text-sm font-medium flex-1">
+        {title}
+        {subtitle && (
+          <span className="text-[10px] font-normal text-muted-foreground ml-1.5">{subtitle}</span>
+        )}
+      </span>
+      {badge}
+      {action}
+    </button>
+  );
+}
+
+function AppCard({
+  app,
+  isActive,
+  onClick,
+}: {
+  app: DiscoveredApp;
+  isActive: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      className={`p-2 text-left rounded-md border transition-colors min-w-[140px] ${
+        isActive
+          ? "border-primary bg-primary/10 ring-1 ring-primary/30"
+          : "border-border/50 bg-muted/20 hover:bg-muted/40"
+      }`}
+      onClick={onClick}
+    >
+      <div className="flex items-center gap-1.5 mb-1">
+        <Monitor className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+        <span className="text-sm font-medium truncate">{app.appName}</span>
+      </div>
+      <div className="text-xs text-muted-foreground space-y-0.5">
+        <div>
+          :{app.port}
+          {app.framework ? ` \u00B7 ${app.framework}` : ""}
+        </div>
+        {app.elementCount != null && <div>{app.elementCount} elements</div>}
+        {app.capabilities.length > 0 && (
+          <div className="flex flex-wrap gap-1 mt-1">
+            {app.capabilities.slice(0, 3).map((cap) => (
+              <Badge key={cap} variant="muted" className="text-[9px] px-1 py-0">
+                {cap}
+              </Badge>
+            ))}
+          </div>
+        )}
+      </div>
+    </button>
+  );
+}
+
+function DeviceCard({
+  device,
+  isActive,
+  onClick,
+}: {
+  device: MobileDevice;
+  isActive: boolean;
+  onClick: () => void;
+}) {
+  const isOnline = device.status === "online";
+  const hasUiBridge = !!device.uiBridge;
+
+  return (
+    <button
+      className={`p-2 text-left rounded-md border transition-colors min-w-[140px] ${
+        isActive
+          ? "border-primary bg-primary/10 ring-1 ring-primary/30"
+          : isOnline
+            ? "border-border/50 bg-muted/20 hover:bg-muted/40"
+            : "border-border/30 bg-muted/10 opacity-60"
+      }`}
+      onClick={onClick}
+      disabled={!isOnline}
+    >
+      <div className="flex items-center gap-1.5 mb-1">
+        <Smartphone className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+        <span className="text-sm font-medium truncate">{device.model || device.deviceId}</span>
+      </div>
+      <div className="text-xs text-muted-foreground space-y-0.5">
+        <div className="flex items-center gap-1">
+          {device.deviceType === "emulator" ? "Emulator" : "Device"}
+          {isOnline ? (
+            <Wifi className="w-3 h-3 text-green-500" />
+          ) : (
+            <WifiOff className="w-3 h-3 text-muted-foreground" />
+          )}
+        </div>
+        {hasUiBridge ? (
+          <div className="flex items-center gap-1 text-green-500">
+            <Check className="w-3 h-3" />
+            UI Bridge
+          </div>
+        ) : isOnline ? (
+          <div className="text-muted-foreground">No UI Bridge</div>
+        ) : (
+          <div className="text-muted-foreground">{device.status}</div>
+        )}
+      </div>
+    </button>
   );
 }
 

@@ -66,6 +66,12 @@ export interface DashboardState {
   iteration: number;
   /** Maximum iterations */
   maxIterations: number;
+  /** Plan phase name (only for plan workflows) */
+  planPhaseName: string | null;
+  /** Plan phase index (only for plan workflows) */
+  planPhaseIndex: number | null;
+  /** Total plan phases (only for plan workflows) */
+  planTotalPhases: number | null;
 }
 
 /**
@@ -284,6 +290,9 @@ export function useDashboardState(): UseDashboardStateResult {
       isOrchestrated: orchestratorState.isOrchestrated,
       iteration: orchestratorState.iteration,
       maxIterations: orchestratorState.maxIterations,
+      planPhaseName: orchestratorState.planPhaseName,
+      planPhaseIndex: orchestratorState.planPhaseIndex,
+      planTotalPhases: orchestratorState.planTotalPhases,
     }),
     [
       layout,
@@ -301,6 +310,9 @@ export function useDashboardState(): UseDashboardStateResult {
       orchestratorState.isOrchestrated,
       orchestratorState.iteration,
       orchestratorState.maxIterations,
+      orchestratorState.planPhaseName,
+      orchestratorState.planPhaseIndex,
+      orchestratorState.planTotalPhases,
     ],
   );
 

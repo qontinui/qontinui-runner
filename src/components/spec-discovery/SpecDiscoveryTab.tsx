@@ -5,7 +5,7 @@
  * and generate verification workflows.
  *
  * Key features:
- *   - Real-time connection to browser tabs (via Qontinui DevTools extension)
+ *   - Real-time connection to browser tabs
  *   - Mobile device support (via ADB)
  *   - Spec discovery from connected pages
  *   - Spec group selection for workflow generation
@@ -18,7 +18,6 @@ import {
   Globe,
   Smartphone,
   RefreshCw,
-  Plug,
   Play,
   Zap,
   Layers,
@@ -104,8 +103,7 @@ interface PersistedState {
 function loadPersistedState(): Partial<PersistedState> {
   try {
     const stored =
-      localStorage.getItem(STORAGE_KEY) ||
-      localStorage.getItem("live-page-generator-state"); // backward compat
+      localStorage.getItem(STORAGE_KEY) || localStorage.getItem("live-page-generator-state"); // backward compat
     if (stored) {
       return JSON.parse(stored);
     }
@@ -195,7 +193,6 @@ export function SpecDiscoveryTab({
     browserTabs,
     mobileDevices,
     isLoadingTargets,
-    isExtensionConnected,
     connectionStatus,
     connectedTarget,
     elements,
@@ -576,29 +573,12 @@ export function SpecDiscoveryTab({
               ) : (
                 <div className="text-center py-4 text-text-muted text-xs">
                   <p>No targets found.</p>
-                  <p className="text-[10px] mt-1">Install Qontinui DevTools extension</p>
+                  <p className="text-[10px] mt-1">Connect a browser tab or mobile device</p>
                 </div>
               )}
             </div>
           </div>
           <div className="border-t border-border px-4 py-2">
-            <div className="flex items-center gap-2">
-              <span
-                className={cn(
-                  "h-2 w-2 rounded-full",
-                  isExtensionConnected ? "bg-brand-success animate-pulse" : "bg-text-muted",
-                )}
-              />
-              <span className="text-xs text-text-muted">
-                {isExtensionConnected ? "Extension Connected" : "Extension Not Connected"}
-              </span>
-              <Plug
-                className={cn(
-                  "ml-auto h-3 w-3",
-                  isExtensionConnected ? "text-brand-success" : "text-text-muted",
-                )}
-              />
-            </div>
             {/* Discover Specs button — shown when connected */}
             {connectionStatus === "connected" && (
               <button
@@ -1032,10 +1012,7 @@ export function SpecDiscoveryTab({
                     </button>
                     <button
                       onClick={() =>
-                        copyToClipboard(
-                          JSON.stringify(generatedWorkflow, null, 2),
-                          "Workflow JSON",
-                        )
+                        copyToClipboard(JSON.stringify(generatedWorkflow, null, 2), "Workflow JSON")
                       }
                       className="flex items-center justify-center gap-2 px-4 rounded-lg bg-surface-hover text-text-primary hover:bg-surface-active transition-colors"
                     >

@@ -76,7 +76,9 @@ export function PageAnalyzer({ onAnalysisComplete, initialAnalyses }: PageAnalyz
 
   // Add analysis state
   const [showAddMenu, setShowAddMenu] = useState(false);
-  const [addMode, setAddMode] = useState<"playwright" | "vision" | "step_output" | "live_browser" | null>(null);
+  const [addMode, setAddMode] = useState<
+    "playwright" | "vision" | "step_output" | "live_browser" | null
+  >(null);
   // Step output sub-mode: select from recent outputs or run a new step
   const [stepOutputMode, setStepOutputMode] = useState<"recent" | "run_api">("recent");
   const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -344,18 +346,25 @@ export function PageAnalyzer({ onAnalysisComplete, initialAnalyses }: PageAnalyz
       return;
     }
 
-    const liveBrowserElements: LiveBrowserElement[] = liveBrowser.elements.map((el: DiscoveredElement) => ({
-      id: el.id,
-      tagName: el.tagName,
-      type: el.type,
-      text: el.text,
-      label: el.label,
-      value: el.value,
-      checked: el.checked,
-      visible: el.visible,
-      enabled: el.enabled,
-      bounds: { x: el.bounds.x, y: el.bounds.y, width: el.bounds.width, height: el.bounds.height },
-    }));
+    const liveBrowserElements: LiveBrowserElement[] = liveBrowser.elements.map(
+      (el: DiscoveredElement) => ({
+        id: el.id,
+        tagName: el.tagName,
+        type: el.type,
+        text: el.text,
+        label: el.label,
+        value: el.value,
+        checked: el.checked,
+        visible: el.visible,
+        enabled: el.enabled,
+        bounds: {
+          x: el.bounds.x,
+          y: el.bounds.y,
+          width: el.bounds.width,
+          height: el.bounds.height,
+        },
+      }),
+    );
 
     const analysisData: LiveBrowserAnalysis = {
       elements: liveBrowserElements,
@@ -747,16 +756,6 @@ export function PageAnalyzer({ onAnalysisComplete, initialAnalyses }: PageAnalyz
           {/* Live Browser Options */}
           {addMode === "live_browser" && (
             <div className="space-y-3">
-              {/* Extension status */}
-              <div className={`flex items-center gap-2 p-2 rounded text-xs ${
-                liveBrowser.isExtensionConnected
-                  ? "bg-green-500/10 border border-green-500/30 text-green-400"
-                  : "bg-amber-500/10 border border-amber-500/30 text-amber-400"
-              }`}>
-                <Zap className="w-3 h-3" />
-                {liveBrowser.isExtensionConnected ? "Extension connected" : "Extension not connected"}
-              </div>
-
               {/* Browser tabs */}
               {liveBrowser.isLoadingTargets ? (
                 <div className="flex items-center gap-2 text-sm text-neutral-500">
@@ -767,7 +766,9 @@ export function PageAnalyzer({ onAnalysisComplete, initialAnalyses }: PageAnalyz
                 <div className="space-y-2">
                   <div className="flex items-center gap-2 p-2 bg-cyan-500/10 border border-cyan-500/30 rounded">
                     <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
-                    <span className="text-sm text-cyan-400 truncate flex-1">{liveBrowser.connectedTarget.name}</span>
+                    <span className="text-sm text-cyan-400 truncate flex-1">
+                      {liveBrowser.connectedTarget.name}
+                    </span>
                     <button
                       onClick={liveBrowser.disconnect}
                       className="text-xs text-neutral-400 hover:text-neutral-200"
@@ -783,9 +784,7 @@ export function PageAnalyzer({ onAnalysisComplete, initialAnalyses }: PageAnalyz
                   </div>
                 </div>
               ) : liveBrowser.browserTabs.length === 0 ? (
-                <p className="text-sm text-neutral-400">
-                  No browser tabs found. Make sure the extension is installed and enabled.
-                </p>
+                <p className="text-sm text-neutral-400">No browser tabs found.</p>
               ) : (
                 <div className="max-h-48 overflow-y-auto space-y-1">
                   {liveBrowser.browserTabs.map((tab) => (
@@ -839,7 +838,9 @@ export function PageAnalyzer({ onAnalysisComplete, initialAnalyses }: PageAnalyz
             disabled={
               isAnalyzing ||
               (addMode === "playwright" && !selectedScriptId) ||
-              (addMode === "live_browser" && (liveBrowser.connectionStatus !== "connected" || liveBrowser.elements.length === 0)) ||
+              (addMode === "live_browser" &&
+                (liveBrowser.connectionStatus !== "connected" ||
+                  liveBrowser.elements.length === 0)) ||
               (addMode === "step_output" &&
                 stepOutputMode === "recent" &&
                 selectedStepOutputIds.length === 0) ||
@@ -1116,7 +1117,9 @@ export function PageAnalyzer({ onAnalysisComplete, initialAnalyses }: PageAnalyz
                             {analysis.data.elements.slice(0, 20).map((el, idx) => (
                               <tr key={el.id} className="border-t border-neutral-700">
                                 <td className="px-2 py-1 text-neutral-500">{idx + 1}</td>
-                                <td className="px-2 py-1 text-neutral-200 font-mono text-[10px]">{el.id}</td>
+                                <td className="px-2 py-1 text-neutral-200 font-mono text-[10px]">
+                                  {el.id}
+                                </td>
                                 <td className="px-2 py-1 text-neutral-400">{el.type}</td>
                                 <td className="px-2 py-1 text-neutral-400 truncate max-w-[200px]">
                                   {el.text || el.label || "-"}

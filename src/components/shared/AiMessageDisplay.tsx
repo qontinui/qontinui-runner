@@ -159,7 +159,7 @@ export interface AiMessageEntry {
   id: string;
   timestamp: number;
   line: string;
-  source: string; // "prompt", "claude", "response", "user_hint", or orchestrator sources
+  source: string; // "prompt", "claude", "response", "user_hint", "user_message", or orchestrator sources
 }
 
 /**
@@ -328,6 +328,27 @@ function PromptLogBlock({ group, isAnimated }: { group: MessageGroup; isAnimated
       <div className={cn("flex items-center gap-2 text-xs font-semibold mb-2", blueColors.text)}>
         <MessageSquare className="w-4 h-4" />
         <span>PROMPT</span>
+        <span className="text-muted-foreground font-normal ml-auto">
+          {formatTimestamp(group.timestamp)}
+        </span>
+      </div>
+      <MarkdownViewer content={group.combinedText} isAnimated={isAnimated} />
+    </div>
+  );
+}
+
+/**
+ * Renders a user message in log mode.
+ * Visually distinct from prompts with a "YOU" label and User icon.
+ */
+function UserMessageLogBlock({ group, isAnimated }: { group: MessageGroup; isAnimated?: boolean }) {
+  const blueColors = getAccentColors("blue");
+
+  return (
+    <div className={cn("rounded-lg p-3 mb-3", blueColors.bg, "border", blueColors.border)}>
+      <div className={cn("flex items-center gap-2 text-xs font-semibold mb-2", blueColors.text)}>
+        <User className="w-4 h-4" />
+        <span>YOU</span>
         <span className="text-muted-foreground font-normal ml-auto">
           {formatTimestamp(group.timestamp)}
         </span>
@@ -654,7 +675,7 @@ function FindingBanner({ group }: { group: MessageGroup }) {
  * Renders a message bubble for chat mode.
  */
 function ChatBubble({ group, isAnimated }: { group: MessageGroup; isAnimated?: boolean }) {
-  const isUser = group.source === "prompt";
+  const isUser = group.source === "prompt" || group.source === "user_message";
   const isHint = group.source === "user_hint";
   const blueColors = getAccentColors("blue");
   const purpleColors = getAccentColors("purple");
@@ -669,7 +690,7 @@ function ChatBubble({ group, isAnimated }: { group: MessageGroup; isAnimated?: b
       ? { bg: purpleColors.bg, border: purpleColors.border }
       : { bg: "bg-muted/50", border: "border-border" };
 
-  const label = isHint ? "Hint" : isUser ? "User" : "AI";
+  const label = isHint ? "Hint" : isUser ? "You" : "AI";
 
   return (
     <div className={cn("flex gap-3 px-4 py-3", isUser ? "flex-row-reverse" : "flex-row")}>
@@ -731,6 +752,8 @@ function MessageBlock({ group, mode, isAnimated, index }: MessageBlockProps) {
   switch (group.source) {
     case "prompt":
       return <PromptLogBlock group={group} isAnimated={isAnimated} />;
+    case "user_message":
+      return <UserMessageLogBlock group={group} isAnimated={isAnimated} />;
     case "user_hint":
       return <UserHintLogBlock group={group} isAnimated={isAnimated} />;
     case "claude":

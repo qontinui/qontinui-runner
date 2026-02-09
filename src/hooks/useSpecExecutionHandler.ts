@@ -35,7 +35,7 @@ interface SpecExecuteRequestPayload {
   group: SpecGroup;
   element_source: "control" | "external";
   options?: SpecExecutionOptions;
-  /** External elements provided by Rust (fetched from Chrome extension) */
+  /** External elements provided by Rust */
   elements?: ExternalElement[];
 }
 
@@ -112,7 +112,7 @@ export function useSpecExecutionHandler(): void {
               requestId,
               success: false,
               error:
-                "No external elements provided. Ensure the Chrome extension is connected and the page has elements.",
+                "No external elements provided. Ensure an SDK app is connected and has elements.",
             });
             return;
           }

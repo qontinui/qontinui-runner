@@ -108,6 +108,7 @@ pub use flow::*;
 pub use flow_executor::*;
 #[allow(unused_imports)]
 pub use hooks::*;
+#[allow(unused_imports)]
 pub use integration::*;
 #[allow(unused_imports)]
 pub use interrupt::*;

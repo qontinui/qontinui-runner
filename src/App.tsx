@@ -140,6 +140,7 @@ import { ActiveDashboardPage } from "./components/active-dashboard";
 import { HistoryTab } from "./components/HistoryTab";
 import { ExecuteTab } from "./components/ExecuteTab";
 import { WorkflowQueueTab } from "./components/workflow-queue";
+import { RunPlanTab } from "./components/run-plan";
 // Monitor/Observe components
 import { ExecutionReport } from "./components/findings";
 import { StateExplorerTab } from "./components/state-explorer";
@@ -183,7 +184,9 @@ type LogSubTab = "general" | "image" | "actions";
 type MainTabId =
   | "gui-automation"
   | "workflow-queue"
+  | "run-plan"
   | "active"
+  | "runs"
   | "history"
   | "error-monitor"
   // Observe group - new structure
@@ -251,7 +254,9 @@ type MainTabId =
 const VALID_TAB_IDS: MainTabId[] = [
   "gui-automation",
   "workflow-queue",
+  "run-plan",
   "active",
+  "runs",
   "history",
   "error-monitor",
   // New observe tabs
@@ -329,6 +334,7 @@ function migrateTabId(stored: string | null): MainTabId {
   // Map old tab names to new ones
   const migrations: Record<string, MainTabId> = {
     run: "gui-automation", // Execute tab renamed to GUI Automation
+    history: "runs", // History tab renamed to Runs
     "ai-workflows": "run-ai-output",
     "ai-builder": "unified-workflow-builder",
     builder: "unified-workflow-builder",
@@ -639,6 +645,7 @@ function AppContent() {
 
   // State for "Run Last Workflow" button
   const [isRunningLastWorkflow, setIsRunningLastWorkflow] = useState(false);
+  const [runLastWorkflowError, setRunLastWorkflowError] = useState<string | null>(null);
 
   // The last workflow can be re-run if we have a workflow_name
   const lastRunWorkflowId = lastRun?.workflow_name ?? null;
@@ -715,10 +722,18 @@ function AppContent() {
           setActiveTab("active");
         } else {
           console.warn("[APP] Workflow not found in DB or inline cache:", lastRun.workflow_name);
+          setRunLastWorkflowError(
+            `Workflow "${lastRun.workflow_name}" not found. It may have been lost after a runner restart.`,
+          );
+          setTimeout(() => setRunLastWorkflowError(null), 6000);
         }
       }
     } catch (error) {
       console.error("[APP] Failed to run last workflow:", error);
+      setRunLastWorkflowError(
+        `Failed to run workflow: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      setTimeout(() => setRunLastWorkflowError(null), 6000);
     } finally {
       setIsRunningLastWorkflow(false);
     }
@@ -996,6 +1011,17 @@ function AppContent() {
           <WorkflowQueueTab onNavigateToActive={() => setActiveTab("active")} onLog={addLog} />
         );
 
+      case "run-plan":
+        return (
+          <RunPlanTab
+            onNavigateToActive={() => setActiveTab("active")}
+            onGoToRecap={(taskRunId) => {
+              localStorage.setItem("qontinui-selected-task-run-id", taskRunId);
+              setActiveTab("run-recap");
+            }}
+          />
+        );
+
       case "active":
         return (
           <ActiveDashboardPage
@@ -1008,11 +1034,19 @@ function AppContent() {
           />
         );
 
+      case "runs":
       case "history":
         return (
           <HistoryTab
             onNavigateToRun={() => setActiveTab("gui-automation")}
-            onNavigateToAi={() => setActiveTab("ai")}
+            onNavigateToAi={(runId) => {
+              try {
+                localStorage.setItem("qontinui-selected-task-run-id", JSON.stringify(runId));
+              } catch {
+                // Ignore storage errors
+              }
+              setActiveTab("run-recap");
+            }}
           />
         );
 
@@ -1029,7 +1063,19 @@ function AppContent() {
           <RunSelectionProvider>
             <RunPageLayout title="Recap" icon={ClipboardCheck}>
               <div className="h-full overflow-hidden">
-                <RunRecapTab />
+                <RunRecapTab
+                  onNavigateToAiOutput={(phase, iteration) => {
+                    try {
+                      localStorage.setItem(
+                        "qontinui-ai-output-navigate",
+                        JSON.stringify({ phase, phaseIteration: iteration }),
+                      );
+                    } catch {
+                      // Ignore storage errors
+                    }
+                    setActiveTab("run-ai-output");
+                  }}
+                />
               </div>
             </RunPageLayout>
           </RunSelectionProvider>
@@ -1692,6 +1738,24 @@ function AppContent() {
               setShowLogSourcePicker(false);
             }}
           />
+        )}
+
+        {/* Run Last Workflow error toast */}
+        {runLastWorkflowError && (
+          <div className="fixed bottom-4 right-4 p-4 rounded-lg shadow-lg border max-w-md z-toast bg-card border-destructive/50">
+            <div className="flex items-start gap-3">
+              <div className="flex-1 min-w-0">
+                <h4 className="font-medium text-sm text-destructive">Workflow Not Found</h4>
+                <p className="text-sm text-muted-foreground mt-1">{runLastWorkflowError}</p>
+              </div>
+              <button
+                onClick={() => setRunLastWorkflowError(null)}
+                className="text-muted-foreground hover:text-foreground flex-shrink-0"
+              >
+                &times;
+              </button>
+            </div>
+          </div>
         )}
 
         {/* Performance Overlay (dev mode only, toggle with Ctrl+Shift+P) */}

@@ -1,6 +1,18 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Bot, Check, X, Play, Eye, EyeOff, Zap, Terminal, Video, Sparkles } from "lucide-react";
+import {
+  Bot,
+  Check,
+  X,
+  Play,
+  Eye,
+  EyeOff,
+  Zap,
+  Terminal,
+  Video,
+  Sparkles,
+  MessageSquare,
+} from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import { getAccentColors, getStatusColors } from "@/design-system";
 import { TutorialTrigger } from "../tutorial";
@@ -50,6 +62,7 @@ const DEFAULT_AI_SETTINGS: AiSettingsType = {
     temperature: 0.7,
   },
   auto_refine_video_after_iterations: 3,
+  interactive_sessions_enabled: true,
 };
 
 const PROVIDER_OPTIONS: { value: AiProvider; label: string; description: string }[] = [
@@ -204,6 +217,9 @@ export function AiSettings({ onLog }: AiSettingsProps) {
           auto_refine_video_after_iterations:
             result.data.auto_refine_video_after_iterations ??
             DEFAULT_AI_SETTINGS.auto_refine_video_after_iterations,
+          interactive_sessions_enabled:
+            result.data.interactive_sessions_enabled ??
+            DEFAULT_AI_SETTINGS.interactive_sessions_enabled,
         });
         onLog("debug", "AI settings loaded");
       }
@@ -258,6 +274,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
         model: settings.claude_api.model,
         maxTokens: settings.claude_api.max_tokens,
         autoRefineVideoAfterIterations: settings.auto_refine_video_after_iterations,
+        interactiveSessionsEnabled: settings.interactive_sessions_enabled,
       });
 
       if (!result || !result.success) {
@@ -1092,6 +1109,56 @@ export function AiSettings({ onLog }: AiSettingsProps) {
               <strong>Note:</strong> Video frames use significantly more tokens than screenshots.
               Only recommended for complex failures where screenshots alone aren't sufficient.
             </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Session Mode */}
+      <div
+        className="space-y-4 rounded-lg bg-card/50 p-4"
+        data-ui-id="settings-ai-session-mode-section"
+      >
+        <h4 className="font-medium text-sm flex items-center gap-2">
+          <MessageSquare className="w-4 h-4 text-primary" />
+          Session Mode
+        </h4>
+
+        <div className="space-y-2">
+          <label className="flex items-center justify-between cursor-pointer p-3 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
+            <div className="space-y-1">
+              <div className="text-sm font-medium">Interactive Sessions</div>
+              <div className="text-xs text-muted-foreground">
+                Enable bidirectional communication with the AI CLI. When enabled, you can send
+                messages during execution and the AI maintains conversation context across turns.
+                When disabled, sessions use one-shot inline mode.
+              </div>
+            </div>
+            <button
+              onClick={() =>
+                setSettings((prev) => ({
+                  ...prev,
+                  interactive_sessions_enabled: !prev.interactive_sessions_enabled,
+                }))
+              }
+              className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 ml-4 ${
+                settings.interactive_sessions_enabled ? "bg-primary" : "bg-muted"
+              }`}
+              data-ui-id="settings-ai-interactive-sessions-toggle"
+            >
+              <span
+                className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                  settings.interactive_sessions_enabled ? "translate-x-4" : "translate-x-1"
+                }`}
+              />
+            </button>
+          </label>
+        </div>
+
+        <div className="p-3 bg-primary/5 rounded-lg">
+          <div className="text-xs text-muted-foreground">
+            <strong className="text-foreground">Note:</strong> Interactive mode provides richer AI
+            sessions with message queuing and multi-turn conversations. Disable this if you
+            experience stability issues or prefer simpler one-shot execution.
           </div>
         </div>
       </div>

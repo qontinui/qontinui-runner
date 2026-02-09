@@ -190,11 +190,11 @@ pub async fn get_run_details(
     }
 }
 
-/// Get recent runs for a config.
+/// Get recent runs, optionally filtered by config.
 #[tauri::command]
 pub async fn get_recent_runs(
     state: State<'_, Arc<AppState>>,
-    config_id: String,
+    config_id: Option<String>,
     limit: Option<u32>,
 ) -> Result<TieredInfoResponse<Vec<RunDetails>>, String> {
     let db = &state.checkpoint_db;
@@ -202,7 +202,13 @@ pub async fn get_recent_runs(
 
     let limit = limit.unwrap_or(10);
 
-    match tiered_info::get_all_recent_runs(&conn, &config_id, limit) {
+    let result = if let Some(ref cid) = config_id {
+        tiered_info::get_all_recent_runs(&conn, cid, limit)
+    } else {
+        crate::mcp::automation_runs::get_all_recent_runs(&conn, limit)
+    };
+
+    match result {
         Ok(runs) => Ok(TieredInfoResponse::ok(runs)),
         Err(e) => Ok(TieredInfoResponse::err(e)),
     }

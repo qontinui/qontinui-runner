@@ -167,8 +167,6 @@ class ExecutionReportingServiceImpl {
         configuration,
       };
 
-      console.log(`[ExecutionReporting] Full input: ${JSON.stringify(input, null, 2)}`);
-
       const response = await invoke<ExecutionRunResponse>("create_execution_run", { input });
 
       this.activeRunId = response.run_id;

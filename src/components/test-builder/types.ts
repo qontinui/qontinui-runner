@@ -398,7 +398,12 @@ export interface ReferenceDocument {
 import type { StepOutput, StepOutputType } from "../../types/step-output";
 
 // Analysis source type (extended to include step_output and live_browser)
-export type AnalysisSourceType = "playwright" | "vision" | "api_request" | "step_output" | "live_browser";
+export type AnalysisSourceType =
+  | "playwright"
+  | "vision"
+  | "api_request"
+  | "step_output"
+  | "live_browser";
 
 // API Request analysis result (from executing a saved API request)
 export interface ApiRequestAnalysis {

@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Qontinui Runner",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "identifier": "com.qontinui.runner",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -18,11 +18,11 @@
         "height": 800,
         "minWidth": 1200,
         "minHeight": 700,
-        "devtools": true
+        "devtools": false
       }
     ],
     "security": {
-      "csp": null,
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost data: blob:; font-src 'self' data:; connect-src 'self' http://127.0.0.1:9876 http://localhost:9876 ws://127.0.0.1:9876 ws://localhost:9876 https://api.anthropic.com https://github.com https://*.githubusercontent.com ipc: http://ipc.localhost; media-src 'self' asset: http://asset.localhost blob:",
       "assetProtocol": {
         "enable": true,
         "scope": ["**"]
@@ -39,11 +39,14 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": ["binaries/qontinui-executor"]
+    "externalBin": ["binaries/qontinui-executor"],
+    "createUpdaterArtifacts": true
   },
   "plugins": {
     "updater": {
-      "endpoints": [],
+      "endpoints": [
+        "https://github.com/qontinui/qontinui-runner/releases/latest/download/latest.json"
+      ],
       "pubkey": ""
     }
   }

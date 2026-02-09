@@ -423,11 +423,238 @@ function preprocessThinkingSections(content: string): string {
   // Don't forget remaining thinking lines
   if (thinkingLines.length > 0) {
     const contentHash = hashContent(thinkingLines.join("\n"));
-    result.push(`<div data-thinking-section="true" data-content-id="${contentHash}">\n\n${thinkingLines.join("\n")}\n\n</div>`);
+    result.push(
+      `<div data-thinking-section="true" data-content-id="${contentHash}">\n\n${thinkingLines.join("\n")}\n\n</div>`,
+    );
   }
 
   return result.join("\n");
 }
+
+/**
+ * Stable ReactMarkdown component overrides.
+ * Defined at module level so references never change between renders.
+ * This prevents ReactMarkdown from tearing down and rebuilding its DOM tree
+ * on every parent re-render, which would break interactive elements like
+ * ThinkingSection (the DOM node swap between mousedown/mouseup kills click events).
+ */
+const REMARK_PLUGINS = [remarkGfm];
+const REHYPE_PLUGINS = [rehypeRaw];
+
+function MarkdownDiv({ className, ...props }: Record<string, unknown>) {
+  // Check for thinking section
+  if (props["data-thinking-section"]) {
+    return (
+      <ThinkingSection contentId={props["data-content-id"] as string}>
+        {props.children as React.ReactNode}
+      </ThinkingSection>
+    );
+  }
+
+  // Check for finding data attributes
+  const categoryId = props["data-finding-category"] as string | undefined;
+  const severity = props["data-finding-severity"] as string | undefined;
+
+  if (categoryId) {
+    const category = getCategoryById(categoryId);
+    const colorClasses = category
+      ? getCategoryColorClasses(category.color)
+      : getCategoryColorClasses("slate");
+
+    const Icon = category ? iconMap[category.icon] || Info : Info;
+    const categoryName = category ? category.name : categoryId;
+
+    return (
+      <div className={`my-4 rounded-lg border ${colorClasses.border} overflow-hidden bg-card`}>
+        <div
+          className={`flex items-center gap-2 px-3 py-2 ${colorClasses.bg} border-b ${colorClasses.border}`}
+        >
+          <Icon className={`w-4 h-4 ${colorClasses.text}`} />
+          <span className={`font-semibold ${colorClasses.text}`}>{categoryName}</span>
+          {severity && (
+            <span className="ml-auto text-[10px] uppercase tracking-wider font-medium px-1.5 py-0.5 rounded-full bg-background/50 opacity-70">
+              {severity}
+            </span>
+          )}
+        </div>
+        <div className="p-3 bg-background/50">{props.children as React.ReactNode}</div>
+      </div>
+    );
+  }
+
+  const { children: divChildren, node: _node, ...restProps } = props;
+  return (
+    <div className={className as string} {...(restProps as React.HTMLAttributes<HTMLDivElement>)}>
+      {divChildren as React.ReactNode}
+    </div>
+  );
+}
+
+function MarkdownH1({ children }: { children?: React.ReactNode }) {
+  return (
+    <h1 className="text-lg font-bold text-foreground mt-4 mb-2 pb-1 border-b border-border">
+      {children}
+    </h1>
+  );
+}
+
+function MarkdownH2({ children }: { children?: React.ReactNode }) {
+  return (
+    <h2 className="text-base font-semibold text-foreground mt-4 mb-2 pb-1 border-b border-border/50">
+      {children}
+    </h2>
+  );
+}
+
+function MarkdownH3({ children }: { children?: React.ReactNode }) {
+  return (
+    <h3 className="text-sm font-semibold text-foreground mt-3 mb-1.5 flex items-center gap-2">
+      <span className="w-1 h-4 bg-primary/50 rounded-full" />
+      {children}
+    </h3>
+  );
+}
+
+function MarkdownH4({ children }: { children?: React.ReactNode }) {
+  return (
+    <h4 className="text-xs font-semibold text-muted-foreground mt-2 mb-1 uppercase tracking-wider">
+      {children}
+    </h4>
+  );
+}
+
+function MarkdownPre({ children }: { children?: React.ReactNode }) {
+  const codeElement = React.Children.toArray(children).find(
+    (child) => React.isValidElement(child) && child.type === "code",
+  ) as React.ReactElement | undefined;
+
+  if (codeElement) {
+    const codeProps = codeElement.props as {
+      className?: string;
+      children?: React.ReactNode;
+    };
+    const match = /language-(\w+)/.exec(codeProps.className || "");
+    const language = match ? match[1] : "";
+    const code = extractTextContent(codeProps.children);
+
+    if (language) {
+      return <SyntaxHighlightedCodeBlock code={code} language={language} />;
+    }
+  }
+
+  return <SimpleCodeBlock>{children}</SimpleCodeBlock>;
+}
+
+function MarkdownCode({
+  className,
+  children,
+  ...props
+}: {
+  className?: string;
+  children?: React.ReactNode;
+}) {
+  const match = /language-(\w+)/.exec(className || "");
+  const isInline = !match && typeof children === "string" && !children.includes("\n");
+  return isInline ? (
+    <code
+      className="bg-muted/70 px-1.5 py-0.5 rounded font-mono text-[11px] text-foreground"
+      {...props}
+    >
+      {children}
+    </code>
+  ) : (
+    <code className={cn("bg-transparent font-mono text-xs", className)} {...props}>
+      {children}
+    </code>
+  );
+}
+
+function MarkdownP({ children }: { children?: React.ReactNode }) {
+  const processedChildren = React.Children.map(children, (child) => {
+    if (typeof child === "string") {
+      const parts = processFilePaths(child);
+      return parts.length === 1 && typeof parts[0] === "string" ? parts[0] : <>{parts}</>;
+    }
+    return child;
+  });
+
+  return <p className="mb-2 last:mb-0 leading-relaxed">{processedChildren}</p>;
+}
+
+function MarkdownUl({ children }: { children?: React.ReactNode }) {
+  return <ul className="list-disc list-inside mb-2 space-y-1 pl-2">{children}</ul>;
+}
+
+function MarkdownOl({ children }: { children?: React.ReactNode }) {
+  return <ol className="list-decimal list-inside mb-2 space-y-1 pl-2">{children}</ol>;
+}
+
+function MarkdownLi({ children }: { children?: React.ReactNode }) {
+  return <li className="text-foreground/90">{children}</li>;
+}
+
+function MarkdownBlockquote({ children }: { children?: React.ReactNode }) {
+  return (
+    <blockquote className="border-l-2 border-primary/50 pl-3 my-2 italic text-muted-foreground">
+      {children}
+    </blockquote>
+  );
+}
+
+function MarkdownA({ href, children }: { href?: string; children?: React.ReactNode }) {
+  return (
+    <a href={href} className="text-primary underline underline-offset-2 hover:text-primary/80">
+      {children}
+    </a>
+  );
+}
+
+function MarkdownHr() {
+  return <hr className="my-4 border-border" />;
+}
+
+function MarkdownTable({ children }: { children?: React.ReactNode }) {
+  return (
+    <div className="overflow-x-auto my-2">
+      <table className="min-w-full divide-y divide-border border border-border">{children}</table>
+    </div>
+  );
+}
+
+function MarkdownTh({ children }: { children?: React.ReactNode }) {
+  return (
+    <th className="px-3 py-2 bg-muted/50 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider border-b border-border">
+      {children}
+    </th>
+  );
+}
+
+function MarkdownTd({ children }: { children?: React.ReactNode }) {
+  return (
+    <td className="px-3 py-2 text-sm whitespace-nowrap border-b border-border/50">{children}</td>
+  );
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const MARKDOWN_COMPONENTS: Record<string, React.ComponentType<any>> = {
+  div: MarkdownDiv,
+  h1: MarkdownH1,
+  h2: MarkdownH2,
+  h3: MarkdownH3,
+  h4: MarkdownH4,
+  pre: MarkdownPre,
+  code: MarkdownCode,
+  p: MarkdownP,
+  ul: MarkdownUl,
+  ol: MarkdownOl,
+  li: MarkdownLi,
+  blockquote: MarkdownBlockquote,
+  a: MarkdownA,
+  hr: MarkdownHr,
+  table: MarkdownTable,
+  th: MarkdownTh,
+  td: MarkdownTd,
+};
 
 export function MarkdownViewer({ content, className, isAnimated = false }: MarkdownViewerProps) {
   // Pre-process content
@@ -458,180 +685,9 @@ export function MarkdownViewer({ content, className, isAnimated = false }: Markd
       )}
     >
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        rehypePlugins={[rehypeRaw]}
-        components={{
-          div: ({ className, ...props }: Record<string, unknown>) => {
-            // Check for thinking section
-            if (props["data-thinking-section"]) {
-              return (
-                <ThinkingSection contentId={props["data-content-id"] as string}>
-                  {props.children as React.ReactNode}
-                </ThinkingSection>
-              );
-            }
-
-            // Check for finding data attributes
-            const categoryId = props["data-finding-category"] as string | undefined;
-            const severity = props["data-finding-severity"] as string | undefined;
-
-            if (categoryId) {
-              const category = getCategoryById(categoryId);
-              const colorClasses = category
-                ? getCategoryColorClasses(category.color)
-                : getCategoryColorClasses("slate");
-
-              const Icon = category ? iconMap[category.icon] || Info : Info;
-              const categoryName = category ? category.name : categoryId;
-
-              return (
-                <div
-                  className={`my-4 rounded-lg border ${colorClasses.border} overflow-hidden bg-card`}
-                >
-                  <div
-                    className={`flex items-center gap-2 px-3 py-2 ${colorClasses.bg} border-b ${colorClasses.border}`}
-                  >
-                    <Icon className={`w-4 h-4 ${colorClasses.text}`} />
-                    <span className={`font-semibold ${colorClasses.text}`}>{categoryName}</span>
-                    {severity && (
-                      <span className="ml-auto text-[10px] uppercase tracking-wider font-medium px-1.5 py-0.5 rounded-full bg-background/50 opacity-70">
-                        {severity}
-                      </span>
-                    )}
-                  </div>
-                  <div className="p-3 bg-background/50">{props.children as React.ReactNode}</div>
-                </div>
-              );
-            }
-
-            const { children: divChildren, node: _node, ...restProps } = props;
-            return (
-              <div
-                className={className as string}
-                {...(restProps as React.HTMLAttributes<HTMLDivElement>)}
-              >
-                {divChildren as React.ReactNode}
-              </div>
-            );
-          },
-          // Enhanced headers with visual hierarchy
-          h1: ({ children }) => (
-            <h1 className="text-lg font-bold text-foreground mt-4 mb-2 pb-1 border-b border-border">
-              {children}
-            </h1>
-          ),
-          h2: ({ children }) => (
-            <h2 className="text-base font-semibold text-foreground mt-4 mb-2 pb-1 border-b border-border/50">
-              {children}
-            </h2>
-          ),
-          h3: ({ children }) => (
-            <h3 className="text-sm font-semibold text-foreground mt-3 mb-1.5 flex items-center gap-2">
-              <span className="w-1 h-4 bg-primary/50 rounded-full" />
-              {children}
-            </h3>
-          ),
-          h4: ({ children }) => (
-            <h4 className="text-xs font-semibold text-muted-foreground mt-2 mb-1 uppercase tracking-wider">
-              {children}
-            </h4>
-          ),
-          // Syntax-highlighted code blocks
-          pre: ({ children }) => {
-            // Extract code element and its properties
-            const codeElement = React.Children.toArray(children).find(
-              (child) => React.isValidElement(child) && child.type === "code",
-            ) as React.ReactElement | undefined;
-
-            if (codeElement) {
-              const codeProps = codeElement.props as {
-                className?: string;
-                children?: React.ReactNode;
-              };
-              const match = /language-(\w+)/.exec(codeProps.className || "");
-              const language = match ? match[1] : "";
-              const code = extractTextContent(codeProps.children);
-
-              if (language) {
-                return <SyntaxHighlightedCodeBlock code={code} language={language} />;
-              }
-            }
-
-            return <SimpleCodeBlock>{children}</SimpleCodeBlock>;
-          },
-          code: ({ className, children, ...props }) => {
-            const match = /language-(\w+)/.exec(className || "");
-            // Check if this is inline code (no language class and short content)
-            const isInline = !match && typeof children === "string" && !children.includes("\n");
-            return isInline ? (
-              <code
-                className="bg-muted/70 px-1.5 py-0.5 rounded font-mono text-[11px] text-foreground"
-                {...props}
-              >
-                {children}
-              </code>
-            ) : (
-              <code className={cn("bg-transparent font-mono text-xs", className)} {...props}>
-                {children}
-              </code>
-            );
-          },
-          // Better paragraph spacing with file path detection
-          p: ({ children }) => {
-            // Process children to detect and highlight file paths
-            const processedChildren = React.Children.map(children, (child) => {
-              if (typeof child === "string") {
-                const parts = processFilePaths(child);
-                return parts.length === 1 && typeof parts[0] === "string" ? parts[0] : <>{parts}</>;
-              }
-              return child;
-            });
-
-            return <p className="mb-2 last:mb-0 leading-relaxed">{processedChildren}</p>;
-          },
-          // Styled lists
-          ul: ({ children }) => (
-            <ul className="list-disc list-inside mb-2 space-y-1 pl-2">{children}</ul>
-          ),
-          ol: ({ children }) => (
-            <ol className="list-decimal list-inside mb-2 space-y-1 pl-2">{children}</ol>
-          ),
-          li: ({ children }) => <li className="text-foreground/90">{children}</li>,
-          // Styled blockquotes
-          blockquote: ({ children }) => (
-            <blockquote className="border-l-2 border-primary/50 pl-3 my-2 italic text-muted-foreground">
-              {children}
-            </blockquote>
-          ),
-          // Better link styling
-          a: ({ href, children }) => (
-            <a
-              href={href}
-              className="text-primary underline underline-offset-2 hover:text-primary/80"
-            >
-              {children}
-            </a>
-          ),
-          // Horizontal rules
-          hr: () => <hr className="my-4 border-border" />,
-          table: ({ children }) => (
-            <div className="overflow-x-auto my-2">
-              <table className="min-w-full divide-y divide-border border border-border">
-                {children}
-              </table>
-            </div>
-          ),
-          th: ({ children }) => (
-            <th className="px-3 py-2 bg-muted/50 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider border-b border-border">
-              {children}
-            </th>
-          ),
-          td: ({ children }) => (
-            <td className="px-3 py-2 text-sm whitespace-nowrap border-b border-border/50">
-              {children}
-            </td>
-          ),
-        }}
+        remarkPlugins={REMARK_PLUGINS}
+        rehypePlugins={REHYPE_PLUGINS}
+        components={MARKDOWN_COMPONENTS}
       >
         {processedContent}
       </ReactMarkdown>

@@ -70,7 +70,7 @@ export function useDomCaptureHtml(id: string | null) {
 }
 
 /**
- * Hook to submit a DOM capture from the browser extension.
+ * Hook to submit a DOM capture from an external source.
  * Returns a mutation that can be called with capture data.
  */
 export function useSubmitDomCapture() {
@@ -88,7 +88,7 @@ export function useSubmitDomCapture() {
 
 /**
  * Hook to invalidate DOM capture queries.
- * Useful when you know captures have changed (e.g., after extension capture).
+ * Useful when you know captures have changed (e.g., after receiving a new capture).
  */
 export function useInvalidateDomCaptures() {
   const queryClient = useQueryClient();

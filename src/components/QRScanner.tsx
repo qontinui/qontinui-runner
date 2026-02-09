@@ -78,8 +78,6 @@ export function QRScanner({ onScan, onError, onClose }: QRScannerProps) {
 
         // Success callback
         const onScanSuccess = (decodedText: string) => {
-          console.log("QR Code detected:", decodedText);
-
           // Validate that it's valid JSON
           try {
             JSON.parse(decodedText);

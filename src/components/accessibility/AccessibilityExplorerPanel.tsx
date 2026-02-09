@@ -568,8 +568,8 @@ export function AccessibilityExplorerPanel({
     setSelectedNode(null);
   };
 
-  const handleCopyRef = useCallback((ref: string) => {
-    console.log("Copied ref:", ref);
+  const handleCopyRef = useCallback((_ref: string) => {
+    // Copy handled by the tree component
   }, []);
 
   const handleCopyAllRefs = useCallback(() => {

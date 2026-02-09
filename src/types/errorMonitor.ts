@@ -19,7 +19,8 @@ export type ErrorStatus =
   | "in_progress"
   | "resolved"
   | "ignored"
-  | "recurring";
+  | "recurring"
+  | "promoted";
 
 /** Parser type for log sources */
 export type ParserType = "python" | "javascript" | "rust" | "generic";

@@ -525,44 +525,34 @@ fn tail_file(path: &PathBuf, num_lines: u32) -> Result<(Vec<String>, u64), Strin
 // Migration Command
 // ============================================================================
 
-/// Migrate sources from per-project configs to global
-/// This is a one-time migration that deduplicates sources by path
-#[tauri::command]
-pub fn migrate_project_sources_to_global() -> Result<CommandResponse, String> {
-    info!("Migrating per-project log sources to global");
+/// Implementation of migrate logic, callable from HTTP handlers
+pub fn migrate_project_sources_to_global_impl() -> Result<u32, String> {
+    info!("Migrating per-project log sources to global (impl)");
 
     let mut settings = settings::get_global_log_source_settings();
-    let mut migrated_count = 0;
+    let mut migrated_count: u32 = 0;
 
-    // Get all project configs
     let projects_dir = dirs::home_dir()
         .ok_or("Failed to get home directory")?
         .join(".qontinui")
         .join("projects");
 
     if !projects_dir.exists() {
-        return Ok(CommandResponse {
-            success: true,
-            message: Some("No project configs found to migrate".to_string()),
-            data: Some(serde_json::json!({ "migrated": 0 })),
-        });
+        return Ok(0);
     }
 
-    // Collect existing paths to avoid duplicates
     let existing_paths: std::collections::HashSet<String> = settings
         .sources
         .iter()
         .map(|s| s.path.to_lowercase())
         .collect();
 
-    // Read each project config
     if let Ok(entries) = fs::read_dir(&projects_dir) {
         for entry in entries.flatten() {
             let config_path = entry.path().join("config.json");
             if config_path.exists() {
                 if let Ok(content) = fs::read_to_string(&config_path) {
                     if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
-                        // Check for profiles first, then legacy log_sources
                         let sources_to_migrate: Vec<serde_json::Value> = if let Some(profiles) =
                             config.get("profiles").and_then(|p| p.as_array())
                         {
@@ -583,12 +573,10 @@ pub fn migrate_project_sources_to_global() -> Result<CommandResponse, String> {
 
                         for source in sources_to_migrate {
                             if let Some(path) = source.get("path").and_then(|p| p.as_str()) {
-                                // Skip if we already have this path
                                 if existing_paths.contains(&path.to_lowercase()) {
                                     continue;
                                 }
 
-                                // Convert to GlobalLogSource
                                 let name = source
                                     .get("name")
                                     .and_then(|n| n.as_str())
@@ -617,7 +605,6 @@ pub fn migrate_project_sources_to_global() -> Result<CommandResponse, String> {
                                     .and_then(|p| p.as_str())
                                     .map(|s| s.to_string());
 
-                                // Infer category from name
                                 let category = infer_category_from_name(&name);
 
                                 let global_source = GlobalLogSource {
@@ -656,7 +643,14 @@ pub fn migrate_project_sources_to_global() -> Result<CommandResponse, String> {
         .map_err(|e| format!("Failed to save settings: {}", e))?;
 
     info!("Migrated {} log sources to global", migrated_count);
+    Ok(migrated_count)
+}
 
+/// Migrate sources from per-project configs to global
+/// This is a one-time migration that deduplicates sources by path
+#[tauri::command]
+pub fn migrate_project_sources_to_global() -> Result<CommandResponse, String> {
+    let migrated_count = migrate_project_sources_to_global_impl()?;
     Ok(CommandResponse {
         success: true,
         message: Some(format!("Migrated {} log sources to global", migrated_count)),

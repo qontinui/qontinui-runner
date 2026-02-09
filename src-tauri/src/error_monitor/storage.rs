@@ -606,6 +606,31 @@ impl ErrorEventStorage {
         Ok(())
     }
 
+    /// Auto-resolve any unresolved SPEC verification error events.
+    ///
+    /// SPEC events (action_failed with "SPEC: " prefix) are verification test results,
+    /// not application errors. The JSONL preprocessor now filters them out, but older
+    /// events may still exist in the database from before the filter was added.
+    /// This cleans them up on startup.
+    pub fn auto_resolve_spec_events(conn: &Connection) -> Result<usize, String> {
+        let count = conn
+            .execute(
+                r#"
+                UPDATE error_events SET
+                    status = 'resolved',
+                    resolution_notes = 'Auto-resolved: SPEC verification results are not application errors',
+                    resolved_at = datetime('now')
+                WHERE status IN ('new', 'acknowledged', 'in_progress')
+                  AND message LIKE '%SPEC: %'
+                  AND message LIKE 'action_failed%'
+                "#,
+                [],
+            )
+            .map_err(|e| format!("Failed to auto-resolve spec events: {}", e))?;
+
+        Ok(count)
+    }
+
     /// Get error summary statistics
     pub fn get_summary(
         conn: &Connection,

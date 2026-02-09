@@ -30,7 +30,7 @@ use tracing::{error, info, instrument, warn};
 
 use crate::database::CreateTaskRunEventInput;
 use crate::execution_context::AiSessionContext;
-use crate::mcp_api::{FindingContext, ProgressContext, FINDING_INSTRUCTIONS};
+use crate::mcp::shared::{FindingContext, ProgressContext, FINDING_INSTRUCTIONS};
 use crate::runtime_env::{
     get_available_mcp_tools, AiSessionContextExt, AiSessionContextToolsExt, ExecutionContextExt,
 };
@@ -267,6 +267,9 @@ pub struct UnifiedAiSessionExecutor {
     app_state: Arc<AppState>,
     app_handle: tauri::AppHandle,
     pid_tracker: Arc<std::sync::Mutex<Vec<u32>>>,
+    /// Optional session manager for interactive bidirectional sessions.
+    /// When present, sessions use the stream-json protocol for multi-turn interaction.
+    pub(crate) session_manager: Option<Arc<crate::claude_session::SessionManager>>,
 }
 
 impl UnifiedAiSessionExecutor {
@@ -280,7 +283,17 @@ impl UnifiedAiSessionExecutor {
             app_state,
             app_handle,
             pid_tracker,
+            session_manager: None,
         }
+    }
+
+    /// Set the session manager for interactive mode.
+    pub fn with_session_manager(
+        mut self,
+        session_manager: Arc<crate::claude_session::SessionManager>,
+    ) -> Self {
+        self.session_manager = Some(session_manager);
+        self
     }
 
     /// Execute an AI session with the given configuration and prompt.
@@ -313,7 +326,7 @@ impl UnifiedAiSessionExecutor {
         let start_time = std::time::Instant::now();
 
         // Get workspace root
-        let workspace_root = crate::mcp_api::get_workspace_paths_internal()
+        let workspace_root = crate::mcp::shared::get_workspace_paths_internal()
             .map(|(root, _, _)| root.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string());
 
@@ -382,24 +395,64 @@ impl UnifiedAiSessionExecutor {
         // Transform prompt based on config flags
         let transformed_prompt = self.transform_prompt(config, prompt);
 
-        // Run Claude session
+        // Determine whether to use interactive mode.
+        // Interactive requires BOTH a session manager AND the setting to be enabled.
+        let interactive_enabled = get_ai_settings().interactive_sessions_enabled;
+        let use_interactive = self.session_manager.is_some() && interactive_enabled;
+
+        if !use_interactive && self.session_manager.is_some() {
+            info!(
+                "UNIFIED-AI-SESSION: Interactive sessions disabled by setting, falling back to inline mode"
+            );
+        }
+
+        // Run Claude session (interactive if session manager is available AND setting enabled, otherwise inline)
         let workspace_for_claude = workspace_root;
         let sid_for_claude = session_id.clone();
         let timeout = config.timeout_seconds;
+        let session_manager = if use_interactive {
+            self.session_manager.clone()
+        } else {
+            None
+        };
+        let task_run_id_for_claude = config.task_run_id.clone();
 
         let result = tokio::task::spawn_blocking(move || {
-            crate::mcp_api::run_claude_session_with_retry(
-                &workspace_for_claude,
-                &transformed_prompt,
-                &sid_for_claude,
-                &app_handle,
-                timeout,
-                session_ctx,
-                finding_ctx,
-                progress_ctx,
-                Some(pid_tracker),
-                Some(&retry_config),
-            )
+            if let Some(ref sm) = session_manager {
+                // Interactive mode: bidirectional stream-json session
+                crate::claude_session::runner::run_claude_session_interactive_with_retry(
+                    &workspace_for_claude,
+                    &transformed_prompt,
+                    &sid_for_claude,
+                    &app_handle,
+                    timeout,
+                    session_ctx,
+                    finding_ctx,
+                    progress_ctx,
+                    Some(pid_tracker),
+                    Some(&retry_config),
+                    sm,
+                    &task_run_id_for_claude,
+                )
+            } else {
+                // Inline mode: one-shot session (either no session manager or interactive disabled)
+                info!(
+                    "UNIFIED-AI-SESSION: Using inline (non-interactive) mode for session {}",
+                    sid_for_claude
+                );
+                crate::claude_session::runner::run_claude_session_with_retry(
+                    &workspace_for_claude,
+                    &transformed_prompt,
+                    &sid_for_claude,
+                    &app_handle,
+                    timeout,
+                    session_ctx,
+                    finding_ctx,
+                    progress_ctx,
+                    Some(pid_tracker),
+                    Some(&retry_config),
+                )
+            }
         })
         .await;
 

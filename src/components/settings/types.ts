@@ -131,6 +131,10 @@ export interface AiSettings {
   gemini_api?: GeminiApiSettings;
   /** Default iteration threshold for including video in auto-refine (0 = never) */
   auto_refine_video_after_iterations: number;
+  /** Enable interactive bidirectional CLI sessions (stream-json protocol).
+   * When true, sessions use multi-turn interactive mode with message queuing.
+   * When false, sessions use one-shot inline mode. */
+  interactive_sessions_enabled: boolean;
 }
 
 export interface AiConnectionTestResult {

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 use crate::executor::with_default_bridge;
-use crate::mcp_api::{api_error, ApiResponse, ApiState};
+use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
 // ============================================================================
 // Request/Response Types

@@ -147,6 +147,15 @@ pub struct AiSettings {
     /// Task routing configuration for model selection based on complexity
     #[serde(default)]
     pub routing: RoutingConfig,
+    /// Enable interactive bidirectional CLI sessions (stream-json protocol).
+    /// When true and a SessionManager is available, sessions use multi-turn interactive mode.
+    /// When false, sessions always use the one-shot inline mode.
+    #[serde(default = "default_interactive_sessions_enabled")]
+    pub interactive_sessions_enabled: bool,
+}
+
+fn default_interactive_sessions_enabled() -> bool {
+    true
 }
 
 fn default_auto_refine_video_after_iterations() -> u32 {
@@ -165,6 +174,7 @@ impl Default for AiSettings {
             compression: CompressionConfig::default(),
             retry: RetryConfig::default(),
             routing: RoutingConfig::default(),
+            interactive_sessions_enabled: default_interactive_sessions_enabled(),
         }
     }
 }
@@ -904,6 +914,20 @@ pub fn get_ai_settings() -> AiSettings {
 /// Save AI settings
 pub fn save_ai_settings(ai_settings: AiSettings) -> Result<(), String> {
     crate::config_facade::save_setting(ai_settings)
+}
+
+/// Get the interactive sessions enabled setting
+pub fn get_interactive_sessions_enabled() -> bool {
+    let settings = load_settings();
+    settings.ai.interactive_sessions_enabled
+}
+
+/// Save the interactive sessions enabled setting
+pub fn save_interactive_sessions_enabled(enabled: bool) -> Result<(), String> {
+    info!("Saving interactive sessions enabled setting: {}", enabled);
+    let mut settings = load_settings();
+    settings.ai.interactive_sessions_enabled = enabled;
+    save_settings(&settings)
 }
 
 /// Get the auto-continue AI workflow setting

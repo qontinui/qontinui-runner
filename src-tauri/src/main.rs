@@ -17,6 +17,8 @@ mod auth;
 mod backup;
 mod check_executor;
 mod check_generation;
+mod claude_protocol;
+mod claude_session;
 mod commands;
 mod config;
 mod config_facade;
@@ -46,6 +48,7 @@ mod mcp_client;
 mod mcp_embedded;
 mod orchestrator;
 mod paths;
+mod plan_executor;
 mod playwright;
 mod prompts;
 mod rag;
@@ -127,6 +130,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting Qontinui Runner v{}", env!("CARGO_PKG_VERSION"));
 
+    // TODO: The Sentry guard is scoped to this block — when it drops, Sentry shuts down.
+    // Move _guard to the outer scope so it lives for the entire application lifetime.
+    // Also, the panic handler in logging.rs re-initializes Sentry redundantly.
+    // Consolidate into a single initialization here and remove the duplicate in setup_panic_handler().
     #[cfg(not(debug_assertions))]
     {
         if let Ok(dsn) = std::env::var("SENTRY_DSN") {
@@ -241,6 +248,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Create MCP client manager for calling external MCP servers
     let mcp_client_manager = mcp_client::McpClientManager::new(checkpoint_db.clone());
 
+    // Create session manager for interactive Claude CLI sessions
+    let session_manager = Arc::new(claude_session::SessionManager::new());
+
     // Create shared AppState for both Tauri and MCP API
     let shared_app_state = Arc::new(AppState {
         bridge_manager: TokioMutex::new(None), // Initialized in setup() when app_handle is available
@@ -267,8 +277,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(shared_app_state)
         .manage(rag_state)
+        .manage(session_manager) // For interactive AI chat commands
         .manage(checkpoint_db.clone()) // For error_monitor commands that need direct db access
         .invoke_handler(tauri::generate_handler![
+            // Interactive AI chat commands (send messages, interrupt, query state)
+            commands::ai_chat::send_user_message,
+            commands::ai_chat::interrupt_ai_session,
+            commands::ai_chat::get_ai_session_state,
             // Authentication commands
             commands::auth::login,
             commands::auth::logout,
@@ -949,14 +964,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             drop(extraction_lock);
 
             // Start MCP API server in background using the shared AppState
-            info!("Starting MCP API server on port {}", mcp_api::MCP_API_PORT);
+            info!("Starting MCP API server on port {}", crate::mcp::types::MCP_API_PORT);
             let mcp_app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 // Wait a bit for app to fully initialize
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
                 info!("MCP API server task starting...");
-                match mcp_api::start_server(mcp_app_state, mcp_rag_state, mcp_app_handle, mcp_api::MCP_API_PORT).await {
+                match mcp_api::start_server(mcp_app_state, mcp_rag_state, mcp_app_handle, crate::mcp::types::MCP_API_PORT).await {
                     Ok(_) => info!("MCP API server stopped normally"),
                     Err(e) => error!("MCP API server error: {}", e),
                 }
@@ -1011,6 +1026,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         let _ = ee.stop();
                     }
                 };
+
+                // Close all interactive Claude sessions
+                if let Some(sm) =
+                    window.try_state::<Arc<claude_session::SessionManager>>()
+                {
+                    sm.close_all_sessions();
+                }
 
                 // Stop error monitor service
                 let app_state_clone2 = app_state.inner().clone();

@@ -30,7 +30,8 @@ import { StagedTimeline } from "./StagedTimeline";
 import { StepsTimeline } from "./StepsTimeline";
 import { VerificationTab } from "./VerificationTab";
 import { KnowledgeTab } from "./KnowledgeTab";
-import { AutomationTab } from "./AutomationTab";
+// AutomationTab hidden for production - visual automation feature
+// import { AutomationTab } from "./AutomationTab";
 import { ContextTab } from "./ContextTab";
 import { getAccentColors, getStatusColors } from "@/design-system";
 
@@ -38,7 +39,11 @@ import { getAccentColors, getStatusColors } from "@/design-system";
 // Main Component
 // ============================================================================
 
-export function RunRecapTab() {
+interface RunRecapTabProps {
+  onNavigateToAiOutput?: (phase: string, iteration?: number) => void;
+}
+
+export function RunRecapTab({ onNavigateToAiOutput }: RunRecapTabProps = {}) {
   const runSelection = useRunSelectionOptional();
   const selectedRun = runSelection?.selectedRun;
   const { data, isLoading, error, refetch } = useTaskRunRecap(runSelection?.selectedRunId);
@@ -239,9 +244,6 @@ export function RunRecapTab() {
           <TabsTrigger data-ui-id="recap-tab-knowledge" value="knowledge">
             Knowledge
           </TabsTrigger>
-          <TabsTrigger data-ui-id="recap-tab-automation" value="automation">
-            Automation
-          </TabsTrigger>
           <TabsTrigger data-ui-id="recap-tab-context" value="context">
             Context
           </TabsTrigger>
@@ -250,9 +252,9 @@ export function RunRecapTab() {
         {/* Timeline Tab */}
         <TabsContent value="timeline" className="space-y-3">
           {data.stages && data.stages.length > 0 ? (
-            <StagedTimeline stages={data.stages} />
+            <StagedTimeline stages={data.stages} onAiStepClick={onNavigateToAiOutput} />
           ) : (
-            <StepsTimeline steps={data.steps} />
+            <StepsTimeline steps={data.steps} onAiStepClick={onNavigateToAiOutput} />
           )}
         </TabsContent>
 
@@ -264,11 +266,6 @@ export function RunRecapTab() {
         {/* Knowledge Tab */}
         <TabsContent value="knowledge">
           <KnowledgeTab taskRunId={taskRunId} />
-        </TabsContent>
-
-        {/* Automation Tab */}
-        <TabsContent value="automation">
-          <AutomationTab taskRunId={taskRunId} stats={data.stats} />
         </TabsContent>
 
         {/* Context Tab */}

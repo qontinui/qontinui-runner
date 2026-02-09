@@ -78,6 +78,7 @@ import {
   Wifi,
   Terminal,
   AlertCircle,
+  ListChecks,
 } from "lucide-react";
 
 // Import shared navigation structure and state management
@@ -104,8 +105,7 @@ import {
   deserializeState,
 } from "qontinui-navigation";
 
-// Import ModeSwitcher component
-import { ModeSwitcher } from "./ModeSwitcher";
+// ModeSwitcher removed for initial release — locked to developer mode
 
 // ============================================================================
 // Icon Mapping
@@ -162,6 +162,7 @@ const ICON_MAP: Record<IconName, LucideIcon> = {
   Wifi,
   Terminal,
   AlertCircle,
+  ListChecks,
 };
 
 function getIconComponent(iconName: IconName): LucideIcon {
@@ -239,7 +240,7 @@ function buildNavigationGroups(mode: AppMode): ResolvedNavigationGroup[] {
  * Check if a navigation item ID requires developer mode.
  * Returns true if the item is only available in developer mode.
  */
-function requiresDeveloperMode(itemId: string): boolean {
+function _requiresDeveloperMode(itemId: string): boolean {
   const item = findItemById(itemId);
   if (!item) return false;
   // If item has modes defined and doesn't include "automation", it requires developer mode
@@ -712,17 +713,8 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
   // Build navigation groups based on current mode
   const navigationGroups = useMemo(() => buildNavigationGroups(appMode), [appMode]);
 
-  // Handle mode change
-  const handleModeChange = useCallback((mode: AppMode) => {
-    dispatch(navigationActions.setAppMode(mode));
-  }, []);
-
-  // Auto-switch to developer mode when active tab requires it
-  useEffect(() => {
-    if (appMode === "automation" && requiresDeveloperMode(activeTab)) {
-      dispatch(navigationActions.setAppMode("developer"));
-    }
-  }, [activeTab, appMode]);
+  // Mode is locked to "developer" for initial release.
+  // handleModeChange and auto-switch useEffect removed.
 
   // Flyout state
   const [openFlyout, setOpenFlyout] = useState<{
@@ -887,8 +879,7 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
         style={{ width: collapsed ? SIDEBAR_WIDTH_COLLAPSED : SIDEBAR_WIDTH_EXPANDED }}
         aria-label="Main navigation"
       >
-        {/* Mode Switcher */}
-        <ModeSwitcher mode={appMode} onModeChange={handleModeChange} collapsed={collapsed} />
+        {/* Mode Switcher removed — locked to developer mode for initial release */}
 
         {/* Navigation Groups */}
         <div className="flex-1 overflow-y-auto py-2 px-2 space-y-4">

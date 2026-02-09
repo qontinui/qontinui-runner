@@ -13,7 +13,7 @@ use super::types::{
     CriterionType, Finding, IterationVerificationResults, VerificationPlan, VerificationResult,
 };
 use crate::execution_context::AiSessionContext;
-use crate::mcp_api::emit_ai_output;
+use crate::mcp::shared::emit_ai_output;
 
 // ============================================================================
 // Output Source Constants

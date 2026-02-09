@@ -19,9 +19,10 @@ const STEP_ITEM_HEIGHT = 56;
 
 interface StepsTimelineProps {
   steps: RecapStep[];
+  onAiStepClick?: (phase: string, iteration?: number) => void;
 }
 
-export function StepsTimeline({ steps }: StepsTimelineProps) {
+export function StepsTimeline({ steps, onAiStepClick }: StepsTimelineProps) {
   // Use virtual scrolling for large lists
   const useVirtualScroll = steps.length > VIRTUAL_SCROLL_THRESHOLD;
 
@@ -29,10 +30,18 @@ export function StepsTimeline({ steps }: StepsTimelineProps) {
   const renderVirtualItem = useCallback(
     (step: RecapStep, index: number, style: CSSProperties) => (
       <div style={style}>
-        <StepItem key={`${step.name}-${index}`} step={step} />
+        <StepItem
+          key={`${step.name}-${index}`}
+          step={step}
+          onAiStepClick={
+            step.step_type === "ai_session" && onAiStepClick
+              ? () => onAiStepClick(step.phase || "agentic")
+              : undefined
+          }
+        />
       </div>
     ),
-    [],
+    [onAiStepClick],
   );
 
   // Key extractor for virtual list
@@ -69,7 +78,15 @@ export function StepsTimeline({ steps }: StepsTimelineProps) {
         /* Regular scrolling for small lists */
         <div data-ui-id="recap-steps-list" className="p-2 space-y-1 max-h-[400px] overflow-y-auto">
           {steps.map((step, index) => (
-            <StepItem key={`${step.name}-${index}`} step={step} />
+            <StepItem
+              key={`${step.name}-${index}`}
+              step={step}
+              onAiStepClick={
+                step.step_type === "ai_session" && onAiStepClick
+                  ? () => onAiStepClick(step.phase || "agentic")
+                  : undefined
+              }
+            />
           ))}
         </div>
       )}

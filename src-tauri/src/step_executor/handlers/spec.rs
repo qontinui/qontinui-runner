@@ -312,6 +312,22 @@ impl StepHandler for SpecHandler {
             obj.insert("passed_count".to_string(), json!(passed_count));
             obj.insert("failed_count".to_string(), json!(failed_count));
             obj.insert("duration_ms".to_string(), json!(duration_ms));
+
+            // Include assertion-level results for richer error context.
+            // This helps the error monitor provide actionable details about
+            // which specific assertions failed and what was expected.
+            if let Some(assertions) = result.get("assertions") {
+                obj.insert("assertions_detail".to_string(), assertions.clone());
+            }
+
+            // Include the spec group definition so error consumers know
+            // which spec file and assertions are involved.
+            if let Some(spec_name) = spec_group.get("name") {
+                obj.insert("spec_group_name".to_string(), spec_name.clone());
+            }
+            if let Some(spec_id) = spec_group.get("id") {
+                obj.insert("spec_group_id".to_string(), spec_id.clone());
+            }
         }
 
         if passed {

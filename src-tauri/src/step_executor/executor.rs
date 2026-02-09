@@ -1400,6 +1400,9 @@ pub struct StepExecutionResult {
     /// Verification-specific fields (for test/check steps in verification phase)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification_details: Option<VerificationStepDetails>,
+    /// Additional output data from the step handler (e.g., spec assertion results)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_data: Option<serde_json::Value>,
 }
 
 /// Verification-specific details for test and check steps
@@ -1655,6 +1658,99 @@ impl VerificationPhaseResult {
                         }
                     }
                 }
+
+                // For spec steps, extract per-assertion details from output_data
+                if result.step_type == "spec" {
+                    if let Some(ref output_data) = result.output_data {
+                        if let Some(assertion_results) = output_data
+                            .get("spec_result")
+                            .and_then(|sr| sr.get("assertionResults"))
+                            .and_then(|ar| ar.as_array())
+                        {
+                            context.push_str("**Assertion Details:**\n");
+                            for ar in assertion_results {
+                                let passed =
+                                    ar.get("passed").and_then(|v| v.as_bool()).unwrap_or(false);
+                                let status = if passed { "PASSED" } else { "FAILED" };
+                                let target =
+                                    ar.get("target").and_then(|v| v.as_str()).unwrap_or("?");
+                                let target_desc = ar
+                                    .get("targetDescription")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+
+                                context.push_str(&format!("- [{}] {}", status, target));
+                                if !target_desc.is_empty() && target_desc != target {
+                                    context.push_str(&format!(" ({})", target_desc));
+                                }
+                                context.push('\n');
+
+                                // Search details (confidence, match reasons)
+                                if let Some(search) = ar.get("searchDetails") {
+                                    let confidence = search
+                                        .get("confidence")
+                                        .and_then(|v| v.as_f64())
+                                        .unwrap_or(0.0);
+                                    let reasons = search
+                                        .get("matchReasons")
+                                        .and_then(|v| v.as_array())
+                                        .map(|arr| {
+                                            arr.iter()
+                                                .filter_map(|r| r.as_str())
+                                                .collect::<Vec<_>>()
+                                                .join(", ")
+                                        })
+                                        .unwrap_or_default();
+                                    let candidates = search
+                                        .get("candidateCount")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
+                                    context.push_str(&format!(
+                                        "  Element found: yes (confidence: {:.2}, match: \"{}\", candidates: {})\n",
+                                        confidence, reasons, candidates
+                                    ));
+                                } else if !passed {
+                                    // Element was not found at all
+                                    if ar.get("failureReason").and_then(|v| v.as_str())
+                                        == Some("Element could not be found")
+                                    {
+                                        context.push_str("  Element found: no\n");
+                                    }
+                                }
+
+                                // Expected vs actual for failures
+                                if !passed {
+                                    let expected = ar
+                                        .get("expected")
+                                        .map(|v| format!("{}", v))
+                                        .unwrap_or_default();
+                                    let actual = ar
+                                        .get("actual")
+                                        .map(|v| format!("{}", v))
+                                        .unwrap_or_default();
+                                    if !expected.is_empty() || !actual.is_empty() {
+                                        context.push_str(&format!(
+                                            "  Expected: {}, Actual: {}\n",
+                                            expected, actual
+                                        ));
+                                    }
+                                    if let Some(reason) =
+                                        ar.get("failureReason").and_then(|v| v.as_str())
+                                    {
+                                        context.push_str(&format!("  Reason: {}\n", reason));
+                                    }
+                                    if let Some(suggestion) =
+                                        ar.get("suggestion").and_then(|v| v.as_str())
+                                    {
+                                        context
+                                            .push_str(&format!("  Suggestion: {}\n", suggestion));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 context.push('\n');
             }
         }
@@ -2517,7 +2613,8 @@ impl StepExecutor {
                 None,
             );
 
-            let (success, error, screenshot_path) = self.execute_single_step(step).await;
+            let (success, error, screenshot_path, _output_data) =
+                self.execute_single_step(step).await;
 
             // Take post-step screenshot if requested (and step succeeded)
             let final_screenshot =
@@ -2611,6 +2708,7 @@ impl StepExecutor {
                         .or_else(|| step.shell_command_working_directory.clone()),
                 },
                 verification_details: None,
+                output_data: None,
             });
         }
 
@@ -2989,18 +3087,28 @@ impl StepExecutor {
         }
     }
 
-    /// Execute a single step and return (success, error, screenshot_path)
+    /// Execute a single step and return (success, error, screenshot_path, output_data)
     async fn execute_single_step(
         &self,
         step: &ExecutionStepConfig,
-    ) -> (bool, Option<String>, Option<String>) {
+    ) -> (
+        bool,
+        Option<String>,
+        Option<String>,
+        Option<serde_json::Value>,
+    ) {
         // Try to use the handler registry for polymorphic dispatch.
         // This is the new modular approach - handlers are self-contained and testable.
         // If no handler is registered, fall back to the legacy match statement below.
         if let Some(handler) = self.handler_registry.get(&step.step_type) {
             let context = self.create_handler_context();
             let result = handler.execute(step, &context).await;
-            return (result.success, result.error, result.screenshot_path);
+            return (
+                result.success,
+                result.error,
+                result.screenshot_path,
+                result.output_data,
+            );
         }
 
         // Legacy match statement for step types not yet migrated to handlers.
@@ -3027,11 +3135,16 @@ impl StepExecutor {
                         )
                         .await
                     {
-                        Ok(result) => (result.success, result.error, None),
-                        Err(e) => (false, Some(format!("Workflow error: {}", e)), None),
+                        Ok(result) => (result.success, result.error, None, None),
+                        Err(e) => (false, Some(format!("Workflow error: {}", e)), None, None),
                     }
                 } else {
-                    (false, Some("No workflow name specified".to_string()), None)
+                    (
+                        false,
+                        Some("No workflow name specified".to_string()),
+                        None,
+                        None,
+                    )
                 }
             }
             "state" => {
@@ -3049,12 +3162,22 @@ impl StepExecutor {
                                     state_name
                                 );
                             }
-                            (result.success, result.error, None)
+                            (result.success, result.error, None, None)
                         }
-                        Err(e) => (false, Some(format!("State navigation error: {}", e)), None),
+                        Err(e) => (
+                            false,
+                            Some(format!("State navigation error: {}", e)),
+                            None,
+                            None,
+                        ),
                     }
                 } else {
-                    (false, Some("No state name specified".to_string()), None)
+                    (
+                        false,
+                        Some("No state name specified".to_string()),
+                        None,
+                        None,
+                    )
                 }
             }
             "action" => {
@@ -3070,13 +3193,15 @@ impl StepExecutor {
                             result.success,
                             result.message.filter(|_| !result.success),
                             None,
+                            None,
                         ),
-                        Err(e) => (false, Some(format!("Action error: {}", e)), None),
+                        Err(e) => (false, Some(format!("Action error: {}", e)), None, None),
                     }
                 } else {
                     (
                         false,
                         Some("No action type or image ID specified".to_string()),
+                        None,
                         None,
                     )
                 }
@@ -3206,7 +3331,7 @@ impl StepExecutor {
                             res.error.clone(),
                         )
                         .await;
-                        (res.success, res.error, res.absolute_path)
+                        (res.success, res.error, res.absolute_path, None)
                     }
                     Err(e) => {
                         let error_msg = format!("Screenshot error: {}", e);
@@ -3270,26 +3395,30 @@ impl StepExecutor {
                             Some(error_msg.clone()),
                         )
                         .await;
-                        (false, Some(error_msg), None)
+                        (false, Some(error_msg), None, None)
                     }
                 }
             }
             "playwright" => {
                 // If we have inline script content (from combined scripts), run it directly
                 if let Some(ref script_content) = step.playwright_script_content {
-                    self.run_playwright_inline(
-                        script_content,
-                        step.playwright_target_url.as_deref(),
-                        step.name.as_deref().unwrap_or("combined_script"),
-                    )
-                    .await
+                    let (s, e, p) = self
+                        .run_playwright_inline(
+                            script_content,
+                            step.playwright_target_url.as_deref(),
+                            step.name.as_deref().unwrap_or("combined_script"),
+                        )
+                        .await;
+                    (s, e, p, None)
                 } else if let Some(ref script_id) = step.playwright_script_id {
                     // Otherwise, run by script ID
-                    self.run_playwright_script(script_id).await
+                    let (s, e, p) = self.run_playwright_script(script_id).await;
+                    (s, e, p, None)
                 } else {
                     (
                         false,
                         Some("No Playwright script ID or content specified".to_string()),
+                        None,
                         None,
                     )
                 }
@@ -3353,8 +3482,13 @@ impl StepExecutor {
                 let result = if let Some(ref test_id) = step.test_id {
                     // Execute stored verification test by ID
                     match self.execute_verification_test(test_id, is_critical).await {
-                        Ok((success, error)) => (success, error, None),
-                        Err(e) => (false, Some(format!("Test execution error: {}", e)), None),
+                        Ok((success, error)) => (success, error, None, None),
+                        Err(e) => (
+                            false,
+                            Some(format!("Test execution error: {}", e)),
+                            None,
+                            None,
+                        ),
                     }
                 } else if step.test_type.as_deref() == Some("repository") {
                     // Repository test: run a command in the working directory
@@ -3383,18 +3517,20 @@ impl StepExecutor {
                     };
                     // Timeouts are disabled by default
                     let timeout = step.timeout_seconds;
-                    self.execute_shell_command_step(&temp_step, timeout).await
+                    let (s, e, p) = self.execute_shell_command_step(&temp_step, timeout).await;
+                    (s, e, p, None)
                 } else {
                     (
                         false,
                         Some("No test ID specified and test_type is not 'repository'".to_string()),
+                        None,
                         None,
                     )
                 };
 
                 let end_timestamp = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
                 let duration = end_timestamp - timestamp;
-                let (success, ref error_opt, _) = result;
+                let (success, ref error_opt, _, _) = result;
 
                 // Build completed/failed node
                 let completed_node = json!({
@@ -3540,7 +3676,7 @@ impl StepExecutor {
                 // Emit to Tauri frontend for action log refresh
                 self.emit_tree_event("action_completed", &completed_node, end_timestamp, sequence);
 
-                (true, None, None)
+                (true, None, None, None)
             }
             // ================================================================
             // MCP Call Step Type
@@ -3549,19 +3685,22 @@ impl StepExecutor {
                 if let (Some(ref server_id), Some(ref tool_name)) =
                     (&step.mcp_server_id, &step.mcp_tool_name)
                 {
-                    self.execute_mcp_call(
-                        server_id,
-                        tool_name,
-                        step.mcp_arguments.clone().unwrap_or(serde_json::json!({})),
-                        timeout,
-                        step.name.as_deref(),
-                        step.mcp_fail_on_error.unwrap_or(true),
-                    )
-                    .await
+                    let (s, e, p) = self
+                        .execute_mcp_call(
+                            server_id,
+                            tool_name,
+                            step.mcp_arguments.clone().unwrap_or(serde_json::json!({})),
+                            timeout,
+                            step.name.as_deref(),
+                            step.mcp_fail_on_error.unwrap_or(true),
+                        )
+                        .await;
+                    (s, e, p, None)
                 } else {
                     (
                         false,
                         Some("Server ID and tool name required for MCP call".to_string()),
+                        None,
                         None,
                     )
                 }
@@ -3569,25 +3708,32 @@ impl StepExecutor {
             // ================================================================
             // Shell Command Step Type
             // ================================================================
-            "shell_command" => self.execute_shell_command_step(step, timeout).await,
+            "shell_command" => {
+                let (s, e, p) = self.execute_shell_command_step(step, timeout).await;
+                (s, e, p, None)
+            }
             // ================================================================
             // Script Step Type (Playwright inline code)
             // ================================================================
             "script" => {
                 // Script steps contain inline Playwright code - treat like playwright
                 if let Some(ref script_content) = step.playwright_script_content {
-                    self.run_playwright_inline(
-                        script_content,
-                        step.playwright_target_url.as_deref(),
-                        step.name.as_deref().unwrap_or("script"),
-                    )
-                    .await
+                    let (s, e, p) = self
+                        .run_playwright_inline(
+                            script_content,
+                            step.playwright_target_url.as_deref(),
+                            step.name.as_deref().unwrap_or("script"),
+                        )
+                        .await;
+                    (s, e, p, None)
                 } else if let Some(ref script_id) = step.playwright_script_id {
-                    self.run_playwright_script(script_id).await
+                    let (s, e, p) = self.run_playwright_script(script_id).await;
+                    (s, e, p, None)
                 } else {
                     (
                         false,
                         Some("No script code or script ID specified".to_string()),
+                        None,
                         None,
                     )
                 }
@@ -3610,13 +3756,19 @@ impl StepExecutor {
                         )
                         .await
                     {
-                        Ok(result) => (result.success, result.error, None),
-                        Err(e) => (false, Some(format!("Workflow ref error: {}", e)), None),
+                        Ok(result) => (result.success, result.error, None, None),
+                        Err(e) => (
+                            false,
+                            Some(format!("Workflow ref error: {}", e)),
+                            None,
+                            None,
+                        ),
                     }
                 } else {
                     (
                         false,
                         Some("No workflow name specified for workflow_ref".to_string()),
+                        None,
                         None,
                     )
                 }
@@ -3638,8 +3790,9 @@ impl StepExecutor {
                                 result.success,
                                 result.message.filter(|_| !result.success),
                                 None,
+                                None,
                             ),
-                            Err(e) => (false, Some(format!("GUI action error: {}", e)), None),
+                            Err(e) => (false, Some(format!("GUI action error: {}", e)), None, None),
                         }
                     } else {
                         // For type/hotkey actions that don't need a target image
@@ -3653,11 +3806,13 @@ impl StepExecutor {
                                         action_type
                                     )),
                                     None,
+                                    None,
                                 )
                             }
                             _ => (
                                 false,
                                 Some("No target image ID specified for GUI action".to_string()),
+                                None,
                                 None,
                             ),
                         }
@@ -3667,35 +3822,44 @@ impl StepExecutor {
                         false,
                         Some("No action type specified for GUI action".to_string()),
                         None,
+                        None,
                     )
                 }
             }
             // ================================================================
             // API Request Step Type
             // ================================================================
-            "api_request" => self.execute_api_request_step(step, timeout).await,
+            "api_request" => {
+                let (s, e, p) = self.execute_api_request_step(step, timeout).await;
+                (s, e, p, None)
+            }
             // ================================================================
             // Check Step Type (code quality checks)
             // ================================================================
-            "check" => self.execute_check_step(step, timeout).await,
+            "check" => {
+                let (s, e, p) = self.execute_check_step(step, timeout).await;
+                (s, e, p, None)
+            }
             // ================================================================
             // Check Group Step Type (run all checks in a group)
             // ================================================================
             "check_group" => {
                 let (success, error, summary, _check_results) =
                     self.execute_check_group_step(step, timeout).await;
-                (success, error, summary)
+                (success, error, summary, None)
             }
             // ================================================================
             // Macro Step Type (runs a saved macro by ID)
             // ================================================================
             "macro" => {
                 if let Some(ref macro_id) = step.macro_id {
-                    self.execute_macro_step(macro_id, step.monitor_index).await
+                    let (s, e, p) = self.execute_macro_step(macro_id, step.monitor_index).await;
+                    (s, e, p, None)
                 } else {
                     (
                         false,
                         Some("No macro ID specified for macro step".to_string()),
+                        None,
                         None,
                     )
                 }
@@ -3703,7 +3867,10 @@ impl StepExecutor {
             // ================================================================
             // Log Watch Step Type (deterministic error detection from logs)
             // ================================================================
-            "log_watch" => self.execute_log_watch_step(step).await,
+            "log_watch" => {
+                let (s, e, p) = self.execute_log_watch_step(step).await;
+                (s, e, p, None)
+            }
             // ================================================================
             // Shell Step Type (execute shell command)
             // ================================================================
@@ -3712,13 +3879,14 @@ impl StepExecutor {
                 let timeout = step.timeout_seconds;
                 let (success, error, output) = self.execute_shell_command_step(step, timeout).await;
                 // Return output as the third element for potential logging
-                (success, error, output)
+                (success, error, output, None)
             }
             _ => {
                 warn!("Unknown step type: {}", step.step_type);
                 (
                     false,
                     Some(format!("Unknown step type: {}", step.step_type)),
+                    None,
                     None,
                 )
             }
@@ -4044,6 +4212,7 @@ impl StepExecutor {
         use crate::step_metadata::{StepDetails, StepMetadata};
         use crate::step_types::StepType;
         use crate::test_executor::TestStatus;
+        use crate::workflow_state::{CheckpointManager, StepCheckpoint};
         use std::time::Instant;
 
         // For workflow sequence children, use parent ID for event logging (FK constraint)
@@ -4101,6 +4270,7 @@ impl StepExecutor {
                         working_directory: None,
                     },
                     verification_details: None,
+                    output_data: None,
                 };
                 step_results.push(result);
                 skipped_steps += 1;
@@ -4115,7 +4285,10 @@ impl StepExecutor {
                 .unwrap_or_else(|| format!("Step {}", index + 1));
 
             // Execute based on step type
-            let (success, error, verification_details) = match step.step_type.as_str() {
+            let (success, error, verification_details, step_output_data) = match step
+                .step_type
+                .as_str()
+            {
                 "test" => {
                     if let Some(ref test_id) = step.test_id {
                         match self.execute_verification_test_with_details(test_id).await {
@@ -4157,6 +4330,7 @@ impl StepExecutor {
                                         test_result.error.clone()
                                     },
                                     Some(details),
+                                    None,
                                 )
                             }
                             Err(e) => (
@@ -4171,15 +4345,17 @@ impl StepExecutor {
                                     stderr: Some(e),
                                     ..Default::default()
                                 }),
+                                None,
                             ),
                         }
                     } else {
-                        (false, Some("No test_id specified".to_string()), None)
+                        (false, Some("No test_id specified".to_string()), None, None)
                     }
                 }
                 "check" => {
                     // Execute check step (shell command for checks like lint, typecheck, etc.)
-                    let (success, error, output) = self.execute_single_step(step).await;
+                    let (success, error, output, handler_output_data) =
+                        self.execute_single_step(step).await;
                     let details = VerificationStepDetails {
                         step_id: step
                             .name
@@ -4189,7 +4365,7 @@ impl StepExecutor {
                         stdout: output, // Capture output for AI context
                         ..Default::default()
                     };
-                    (success, error, Some(details))
+                    (success, error, Some(details), handler_output_data)
                 }
                 "shell" => {
                     // Execute shell command step
@@ -4206,7 +4382,7 @@ impl StepExecutor {
                         stdout: output, // Capture output for AI context
                         ..Default::default()
                     };
-                    (success, error, Some(details))
+                    (success, error, Some(details), None)
                 }
                 "check_group" => {
                     // Execute check group - runs all checks in the group
@@ -4226,7 +4402,7 @@ impl StepExecutor {
                         check_results,
                         ..Default::default()
                     };
-                    (success, error, Some(details))
+                    (success, error, Some(details), None)
                 }
                 "gate" => {
                     // Gate step: evaluate results of required steps
@@ -4281,11 +4457,12 @@ impl StepExecutor {
                         warn!("Gate '{}' failed with stop_on_failure - skipping remaining verification steps", step_name);
                     }
 
-                    (gate_passed, error_msg, None)
+                    (gate_passed, error_msg, None, None)
                 }
                 _ => {
                     // For other step types, use the generic executor
-                    let (success, error, output) = self.execute_single_step(step).await;
+                    let (success, error, output, handler_output_data) =
+                        self.execute_single_step(step).await;
                     // Still capture output even for unknown step types
                     let details = if output.is_some() {
                         Some(VerificationStepDetails {
@@ -4300,7 +4477,7 @@ impl StepExecutor {
                     } else {
                         None
                     };
-                    (success, error, details)
+                    (success, error, details, handler_output_data)
                 }
             };
 
@@ -4361,6 +4538,7 @@ impl StepExecutor {
                         .or_else(|| step.shell_command_working_directory.clone()),
                 },
                 verification_details,
+                output_data: step_output_data,
             };
 
             // Emit completion event for this step (real-time UI update)
@@ -4396,6 +4574,37 @@ impl StepExecutor {
 
                 if let Err(e) = self.app_state.checkpoint_db.create_task_run_event(&event) {
                     warn!("Failed to emit verification step completion event: {}", e);
+                }
+            }
+
+            // Update step checkpoint to reflect completion progressively
+            // (enables real-time UI updates via /task-runs/{id}/full-state)
+            {
+                let checkpoint_mgr =
+                    CheckpointManager::new(self.app_state.checkpoint_db.clone(), "unified");
+                let cp_step_type =
+                    StepType::from_str_compat(&step.step_type).unwrap_or(StepType::CheckGroup);
+                let mut checkpoint = StepCheckpoint::new(
+                    execution_id,
+                    "unified",
+                    "verification",
+                    Some(iteration),
+                    index,
+                    cp_step_type.as_str(),
+                )
+                .with_step_name(&result.step_name);
+
+                if result.success {
+                    checkpoint.mark_success(None, duration_ms as i64);
+                } else {
+                    checkpoint.mark_failed(
+                        result.error.as_deref().unwrap_or("Unknown error"),
+                        duration_ms as i64,
+                    );
+                }
+
+                if let Err(e) = checkpoint_mgr.save_step(&checkpoint) {
+                    warn!("Failed to update verification step checkpoint: {}", e);
                 }
             }
 
@@ -6719,6 +6928,7 @@ mod tests {
                     duration_ms: 1000,
                     config: StepExecutionConfig::default(),
                     verification_details: None,
+                    output_data: None,
                 },
                 StepExecutionResult {
                     step_index: 1,
@@ -6732,6 +6942,7 @@ mod tests {
                     duration_ms: 500,
                     config: StepExecutionConfig::default(),
                     verification_details: None,
+                    output_data: None,
                 },
             ],
             captured_logs: None,

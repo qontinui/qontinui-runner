@@ -61,6 +61,14 @@ export interface ControlBarProps {
   iteration?: number;
   /** Max iterations */
   maxIterations?: number;
+  /** Whether this is a plan workflow */
+  isPlan?: boolean;
+  /** Plan phase name */
+  planPhaseName?: string | null;
+  /** Plan phase index (zero-based) */
+  planPhaseIndex?: number | null;
+  /** Total number of plan phases */
+  planTotalPhases?: number | null;
   /** Execution stats data */
   statsData?: ExecutionStatsData;
   /** Whether to show inline stats (compact mode) */
@@ -222,6 +230,43 @@ function WorkflowStageIndicator({
   );
 }
 
+// Plan phase indicator for plan workflows
+function PlanPhaseIndicator({
+  phaseName,
+  phaseIndex,
+  totalPhases,
+  isRunning,
+}: {
+  phaseName: string | null;
+  phaseIndex: number | null;
+  totalPhases: number | null;
+  isRunning: boolean;
+}) {
+  const colors = getAccentColors("green");
+  const displayIndex = phaseIndex != null ? phaseIndex + 1 : null;
+
+  return (
+    <div className="flex items-center gap-2">
+      {displayIndex != null && totalPhases != null && (
+        <div
+          className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md ${colors.bg} ${colors.text} ${colors.border} border ${isRunning ? "animate-phase-glow" : ""}`}
+          title={`Phase ${displayIndex} of ${totalPhases}${phaseName ? `: ${phaseName}` : ""}`}
+        >
+          <span className="font-mono">{displayIndex}</span>
+          <span className="opacity-60">/</span>
+          <span className="font-mono opacity-80">{totalPhases}</span>
+          {phaseName && (
+            <>
+              <span className="opacity-40 mx-1">|</span>
+              <span className="truncate max-w-[200px]">{phaseName}</span>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function ControlBar({
   taskName,
   phase = "idle",
@@ -231,6 +276,10 @@ export function ControlBar({
   isOrchestrated = false,
   iteration,
   maxIterations,
+  isPlan = false,
+  planPhaseName,
+  planPhaseIndex,
+  planTotalPhases,
   statsData,
   showInlineStats = false,
   phaseStepCounts,
@@ -264,8 +313,17 @@ export function ControlBar({
 
       {/* Center: Workflow Stage Indicator (for orchestrated) or Phase Badge + Status */}
       <div className="flex items-center gap-3 flex-shrink-0">
-        {/* Show workflow stage indicator for orchestrated workflows */}
-        {isOrchestrated && (
+        {/* Show plan phase indicator for plan workflows */}
+        {isOrchestrated && isPlan && (
+          <PlanPhaseIndicator
+            phaseName={planPhaseName ?? null}
+            phaseIndex={planPhaseIndex ?? null}
+            totalPhases={planTotalPhases ?? null}
+            isRunning={isRunning}
+          />
+        )}
+        {/* Show workflow stage indicator for non-plan orchestrated workflows */}
+        {isOrchestrated && !isPlan && (
           <WorkflowStageIndicator
             currentStage={workflowStage ?? null}
             isRunning={isRunning}

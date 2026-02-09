@@ -252,6 +252,7 @@ impl StepExecutorAdapter {
                 duration_ms,
                 config: Default::default(),
                 verification_details: None,
+                output_data: None,
             }
         }
     }
@@ -601,6 +602,7 @@ mod tests {
                 duration_ms: 100,
                 config: Default::default(),
                 verification_details: None,
+                output_data: None,
             },
             StepExecutionResult {
                 step_index: 1,
@@ -614,6 +616,7 @@ mod tests {
                 duration_ms: 50,
                 config: Default::default(),
                 verification_details: None,
+                output_data: None,
             },
         ];
 

@@ -52,6 +52,10 @@ export interface OrchestratorStateResponse {
   // Mapped workflow stage for UI
   workflow_stage: WorkflowStage | null;
   workflow_stage_display: string | null;
+  // Plan-specific fields
+  plan_phase_name?: string | null;
+  plan_phase_index?: number | null;
+  plan_total_phases?: number | null;
 }
 
 /**
@@ -82,6 +86,12 @@ export interface OrchestratorStateResult {
   error: string | null;
   /** Refresh the state */
   refresh: () => Promise<void>;
+  /** Plan phase name (only for plan workflows) */
+  planPhaseName: string | null;
+  /** Plan phase index, zero-based (only for plan workflows) */
+  planPhaseIndex: number | null;
+  /** Total number of plan phases (only for plan workflows) */
+  planTotalPhases: number | null;
 }
 
 /**
@@ -227,6 +237,9 @@ export function useOrchestratorState(
       isLoading: unifiedContext.isLoading,
       error: unifiedContext.error,
       refresh: unifiedContext.refresh,
+      planPhaseName: unifiedContext.planPhaseName ?? null,
+      planPhaseIndex: unifiedContext.planPhaseIndex ?? null,
+      planTotalPhases: unifiedContext.planTotalPhases ?? null,
     };
   }
 
@@ -241,10 +254,14 @@ export function useOrchestratorState(
     isPaused: state?.is_paused ?? false,
     isStopped: state?.is_stopped ?? false,
     // Consider orchestrated if we have a valid response with workflow stage
-    isOrchestrated: state !== null && state.workflow_type === "unified",
+    isOrchestrated:
+      state !== null && (state.workflow_type === "unified" || state.workflow_type === "plan"),
     isLoading,
     error,
     refresh: fetchState,
+    planPhaseName: state?.plan_phase_name ?? null,
+    planPhaseIndex: state?.plan_phase_index ?? null,
+    planTotalPhases: state?.plan_total_phases ?? null,
   };
 }
 

@@ -77,7 +77,7 @@ interface UnifiedRun {
 
 interface HistoryTabProps {
   onNavigateToRun: () => void;
-  onNavigateToAi: () => void;
+  onNavigateToAi: (runId: string) => void;
 }
 
 export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps) {
@@ -537,7 +537,7 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps)
                       if (run.type === "gui") {
                         onNavigateToRun();
                       } else {
-                        onNavigateToAi();
+                        onNavigateToAi(run.id);
                       }
                     }}
                     className="p-1 rounded hover:bg-muted"
@@ -629,7 +629,7 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps)
                     if (run.type === "gui") {
                       onNavigateToRun();
                     } else {
-                      onNavigateToAi();
+                      onNavigateToAi(run.id);
                     }
                   }}
                   className="p-1 rounded hover:bg-muted"

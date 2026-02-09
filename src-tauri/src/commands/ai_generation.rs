@@ -1013,7 +1013,7 @@ fn parse_ai_description_response(content: &str) -> Result<ElementAiDescription, 
 // ============================================================================
 
 /// Build provider-specific settings based on AI configuration
-fn build_provider_settings(ai_settings: &crate::settings::AiSettings) -> serde_json::Value {
+pub fn build_provider_settings(ai_settings: &crate::settings::AiSettings) -> serde_json::Value {
     use crate::settings;
 
     match ai_settings.provider {

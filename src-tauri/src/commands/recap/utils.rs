@@ -180,6 +180,9 @@ pub fn map_state_to_stage(state: &str) -> Option<&'static str> {
         "deterministic_verification" => Some("verification"),
         "ai_verification" => Some("verification"),
         "ai_summary" => Some("completion"),
+        // Plan executor states
+        "phase_running" | "phase_complete" => Some("agentic"),
+        "sweep_running" | "sweep_complete" => Some("completion"),
         // Non-stage states
         "initialize" | "init" | "complete" | "stopped" | "paused" => None,
         _ => None,
@@ -224,10 +227,14 @@ pub fn extract_output_summary(output_log: &str) -> Option<String> {
         .lines()
         .filter(|line| {
             let trimmed = line.trim();
-            !trimmed.is_empty()
-                && !trimmed.starts_with("[SESSION_START:")
-                && !trimmed.starts_with("---")
-                && !trimmed.starts_with("===")
+            !(trimmed.is_empty()
+                || trimmed.starts_with("[SESSION_START:")
+                || (trimmed.starts_with("[STEP_COMPLETE:") && trimmed.ends_with(']'))
+                || trimmed.starts_with("[TASK_COMPLETE]")
+                || trimmed.starts_with("[FINDING:")
+                || trimmed == "[/FINDING]"
+                || trimmed.starts_with("---")
+                || trimmed.starts_with("==="))
         })
         .collect();
 
@@ -291,11 +298,19 @@ fn extract_markdown_summary_section(text: &str) -> Option<String> {
 
     let summary_content = &content[..section_end];
 
-    // Clean up the content: join lines, remove excessive whitespace
+    // Clean up the content: join lines, remove excessive whitespace and internal markers
     let lines: Vec<&str> = summary_content
         .lines()
         .map(|l| l.trim())
-        .filter(|l| !l.is_empty() && !l.starts_with("---") && !l.starts_with("==="))
+        .filter(|l| {
+            !(l.is_empty()
+                || l.starts_with("---")
+                || l.starts_with("===")
+                || (l.starts_with("[STEP_COMPLETE:") && l.ends_with(']'))
+                || l.starts_with("[TASK_COMPLETE]")
+                || l.starts_with("[FINDING:")
+                || *l == "[/FINDING]")
+        })
         .collect();
 
     if lines.is_empty() {

@@ -161,9 +161,6 @@ export function AiTestGenerator({
   onTestGenerated,
   onCancel,
 }: AiTestGeneratorProps) {
-  // Debug: Log component mount
-  console.log("[AiTestGenerator] Component rendering, testType:", testType);
-
   const [prompt, setPrompt] = useState("");
   const [isGenerating, setIsGenerating] = useState(false);
   const [generatedCode, setGeneratedCode] = useState<string | null>(null);
@@ -182,15 +179,12 @@ export function AiTestGenerator({
   useEffect(() => {
     const fetchRecentRuns = async () => {
       try {
-        console.log("[AiTestGenerator] Fetching recent task runs...");
         const response = await invoke<{
           success: boolean;
           data?: TaskRunSummary[];
           message?: string;
         }>("list_recent_task_runs", { limit: 20 });
-        console.log("[AiTestGenerator] Response:", response);
         if (response.success && response.data) {
-          console.log("[AiTestGenerator] Setting recentTaskRuns:", response.data.length, "runs");
           setRecentTaskRuns(response.data);
           // Log render with dropdown state
           logRender("AiTestGenerator", "task_runs_loaded", {

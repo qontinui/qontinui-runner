@@ -1,14 +1,18 @@
 //! Shared types and structs for MCP API
 //!
 //! Contains all request/response types used across the MCP API modules.
+//! This is the authoritative location for ApiState and core API types.
 
 // These types are used for JSON serialization via serde - the compiler doesn't
 // see the fields as "used" but they are accessed at runtime during serialization.
 #![allow(dead_code)]
 
+use axum::extract::ws::Message;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::action_service::UnifiedActionService;
 use crate::commands::rag::RAGState;
 use crate::commands::AppState;
 use crate::config_storage::ConfigStorage;
@@ -16,20 +20,48 @@ use crate::config_storage::ConfigStorage;
 /// Default port for the MCP API server
 pub const MCP_API_PORT: u16 = 9876;
 
-/// Shared state for the API server
-///
-/// NOTE: The authoritative definition is in mcp_api.rs - this is kept for reference.
-/// See mcp_api.rs for the full struct with all fields including:
-/// - action_service: Arc<UnifiedActionService>
-/// - current_ai_pids: Arc<std::sync::Mutex<Vec<u32>>>
+/// Chrome extension connection state (WebSocket, pending requests, health tracking).
+pub struct ExtensionState {
+    /// Channel sender for outgoing WebSocket messages.
+    /// The WebSocket handler task exclusively owns the SplitSink and reads from this channel.
+    /// All other tasks (HTTP handlers, ping/pong) push messages through this channel,
+    /// eliminating lock contention that previously caused keepalive failures.
+    pub ws_sender: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Message>>>>,
+    /// Pending command requests (requestId -> oneshot sender for response)
+    pub pending_requests:
+        Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>>>,
+    /// Connection status
+    pub connected: Arc<std::sync::atomic::AtomicBool>,
+    /// Timestamp of last pong received (epoch millis)
+    pub last_pong: Arc<std::sync::atomic::AtomicI64>,
+    /// Timestamp when connected (epoch millis, 0 if not connected)
+    pub connected_since: Arc<std::sync::atomic::AtomicI64>,
+    /// Number of reconnections since runner start
+    pub reconnect_count: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Shared state for the API server (authoritative definition)
 pub struct ApiState {
     pub app_state: Arc<AppState>,
     pub rag_state: Arc<RAGState>,
     pub app_handle: tauri::AppHandle,
-    /// Currently loaded config ID (for config storage tracking)
+    /// Currently loaded config ID (for tracking which config is active)
     pub current_config_id: std::sync::Mutex<Option<String>>,
-    /// Config storage for persistence
+    /// Persistent storage for configurations
     pub config_storage: Arc<tokio::sync::Mutex<ConfigStorage>>,
+    /// Unified action service for deterministic execution
+    pub action_service: Arc<UnifiedActionService>,
+    /// Currently running AI process PIDs (for stopping)
+    pub current_ai_pids: Arc<std::sync::Mutex<Vec<u32>>>,
+    /// Pending UI Bridge requests waiting for frontend response
+    pub ui_bridge_pending:
+        Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>>>,
+    /// Chrome extension connection state
+    pub extension: ExtensionState,
+    /// Web extraction state tracking
+    pub extraction_state: Arc<crate::mcp::extraction::ExtractionState>,
+    /// SDK app connections manager (supports multiple simultaneous connections)
+    pub sdk_connection: Arc<tokio::sync::Mutex<crate::mcp::sdk_client::SdkConnectionManager>>,
 }
 
 /// Response for API endpoints
@@ -48,6 +80,14 @@ impl<T: Serialize> ApiResponse<T> {
             success: true,
             data: Some(data),
             error: None,
+        }
+    }
+
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            data: None,
+            error: Some(message.into()),
         }
     }
 }

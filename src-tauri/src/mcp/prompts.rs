@@ -1,45 +1,23 @@
-//! Prompt library handlers for MCP API
+//! Prompt library CRUD handlers for MCP API
 //!
-//! Provides handlers for managing prompts and scriptlets.
+//! Provides HTTP handlers for managing saved prompts:
+//! list, get, create, update, delete, search, import/export, duplicate.
+//!
+//! Note: The `run_prompt` handler remains in mcp_api.rs due to its deep
+//! coupling with AI session management, database task runs, and ApiState fields.
 
-use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
-    Json,
-};
+use axum::{extract::State, http::StatusCode, response::Json};
 use serde::Deserialize;
 use std::sync::Arc;
 
-use super::types::{api_error, ApiResponse, ApiState};
-use crate::prompts::{self, SavedPrompt};
-use crate::scriptlets::{self, Scriptlet};
+use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use crate::prompts;
 
 // ============================================================================
-// Prompt Library Handlers
+// Request Types
 // ============================================================================
 
-#[derive(Debug, Deserialize)]
-pub struct SearchQuery {
-    pub q: Option<String>,
-    pub category: Option<String>,
-    pub tag: Option<String>,
-}
-
-pub async fn list_prompts(
-) -> Result<Json<ApiResponse<Vec<SavedPrompt>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let list = prompts::get_all_prompts();
-    Ok(Json(ApiResponse::success(list)))
-}
-
-pub async fn get_prompt(
-    Path(id): Path<String>,
-) -> Result<Json<ApiResponse<SavedPrompt>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match prompts::get_prompt(&id) {
-        Some(prompt) => Ok(Json(ApiResponse::success(prompt))),
-        None => Err((StatusCode::NOT_FOUND, Json(api_error("Prompt not found")))),
-    }
-}
-
+/// Request to create a new prompt
 #[derive(Debug, Deserialize)]
 pub struct CreatePromptRequest {
     pub name: String,
@@ -50,19 +28,106 @@ pub struct CreatePromptRequest {
     pub category: String,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Maximum number of sessions (null = unlimited)
     #[serde(default)]
     pub max_sessions: Option<u32>,
-    /// AI provider override (e.g., "gemini_api", "claude_cli")
+    /// AI provider (e.g., "anthropic", "openai")
     #[serde(default)]
     pub provider: Option<String>,
-    /// AI model override (e.g., "gemini-3-flash-preview")
+    /// AI model to use
     #[serde(default)]
     pub model: Option<String>,
+    /// Whether this prompt requires the orchestrator for planning and verification
+    /// This is a system-level configuration set at prompt creation time
+    #[serde(default)]
+    pub requires_orchestrator: bool,
+    /// Goal description for the orchestrator (used for planning)
+    #[serde(default)]
+    pub orchestrator_goal: Option<String>,
+    /// Maximum iterations for the orchestrator (default: 10)
+    #[serde(default)]
+    pub orchestrator_max_iterations: Option<u32>,
 }
 
+/// Request to update an existing prompt
+#[derive(Debug, Deserialize)]
+pub struct UpdatePromptRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    /// Maximum number of sessions (null = unlimited)
+    #[serde(default)]
+    pub max_sessions: Option<Option<u32>>,
+    /// AI provider (e.g., "anthropic", "openai")
+    #[serde(default)]
+    pub provider: Option<Option<String>>,
+    /// AI model to use
+    #[serde(default)]
+    pub model: Option<Option<String>>,
+    /// Whether this prompt requires the orchestrator for planning and verification
+    #[serde(default)]
+    pub requires_orchestrator: Option<bool>,
+    /// Goal description for the orchestrator (used for planning)
+    #[serde(default)]
+    pub orchestrator_goal: Option<Option<String>>,
+    /// Maximum iterations for the orchestrator
+    #[serde(default)]
+    pub orchestrator_max_iterations: Option<Option<u32>>,
+}
+
+/// Request to import prompts
+#[derive(Debug, Deserialize)]
+pub struct ImportPromptsRequest {
+    /// JSON array of prompts to import
+    pub prompts_json: String,
+}
+
+/// Request to duplicate a prompt
+#[derive(Debug, Deserialize)]
+pub struct DuplicatePromptRequest {
+    /// Optional new name (defaults to "Original Name (Copy)")
+    #[serde(default)]
+    pub new_name: Option<String>,
+}
+
+// ============================================================================
+// Handlers
+// ============================================================================
+
+/// List all prompts
+pub async fn list_prompts(
+    State(_state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<Vec<prompts::SavedPrompt>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let prompts = prompts::get_all_prompts();
+    Ok(Json(ApiResponse::success(prompts)))
+}
+
+/// Get a single prompt by ID
+pub async fn get_prompt(
+    State(_state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<ApiResponse<prompts::SavedPrompt>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match prompts::get_prompt(&id) {
+        Some(prompt) => Ok(Json(ApiResponse::success(prompt))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Prompt not found: {}", id))),
+        )),
+    }
+}
+
+/// Create a new prompt
 pub async fn create_prompt(
+    State(_state): State<Arc<ApiState>>,
     Json(request): Json<CreatePromptRequest>,
-) -> Result<Json<ApiResponse<SavedPrompt>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<Json<ApiResponse<prompts::SavedPrompt>>, (StatusCode, Json<ApiResponse<()>>)> {
     match prompts::create_prompt(
         request.name,
         request.description,
@@ -72,30 +137,21 @@ pub async fn create_prompt(
         request.max_sessions,
         request.provider,
         request.model,
+        request.requires_orchestrator,
+        request.orchestrator_goal,
+        request.orchestrator_max_iterations,
     ) {
         Ok(prompt) => Ok(Json(ApiResponse::success(prompt))),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
     }
 }
 
-#[derive(Debug, Deserialize)]
-pub struct UpdatePromptRequest {
-    pub name: Option<String>,
-    pub description: Option<String>,
-    pub content: Option<String>,
-    pub category: Option<String>,
-    pub tags: Option<Vec<String>>,
-    pub max_sessions: Option<Option<u32>>,
-    /// AI provider override (e.g., "gemini_api", "claude_cli")
-    pub provider: Option<Option<String>>,
-    /// AI model override (e.g., "gemini-3-flash-preview")
-    pub model: Option<Option<String>>,
-}
-
+/// Update an existing prompt
 pub async fn update_prompt(
-    Path(id): Path<String>,
+    State(_state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
     Json(request): Json<UpdatePromptRequest>,
-) -> Result<Json<ApiResponse<SavedPrompt>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<Json<ApiResponse<prompts::SavedPrompt>>, (StatusCode, Json<ApiResponse<()>>)> {
     match prompts::update_prompt(
         &id,
         request.name,
@@ -106,14 +162,19 @@ pub async fn update_prompt(
         request.max_sessions,
         request.provider,
         request.model,
+        request.requires_orchestrator,
+        request.orchestrator_goal,
+        request.orchestrator_max_iterations,
     ) {
         Ok(prompt) => Ok(Json(ApiResponse::success(prompt))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+        Err(e) => Err((StatusCode::NOT_FOUND, Json(api_error(e)))),
     }
 }
 
+/// Delete a prompt
 pub async fn delete_prompt(
-    Path(id): Path<String>,
+    State(_state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
     match prompts::delete_prompt(&id) {
         Ok(()) => Ok(Json(ApiResponse::success(()))),
@@ -121,226 +182,78 @@ pub async fn delete_prompt(
     }
 }
 
-pub async fn duplicate_prompt(
-    Path(id): Path<String>,
-) -> Result<Json<ApiResponse<SavedPrompt>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match prompts::duplicate_prompt(&id, None) {
-        Ok(prompt) => Ok(Json(ApiResponse::success(prompt))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-    }
-}
-
-pub async fn search_prompts(
-    Query(query): Query<SearchQuery>,
-) -> Result<Json<ApiResponse<Vec<SavedPrompt>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let prompts_list = if let Some(q) = query.q {
-        prompts::search_prompts(&q)
-    } else {
-        prompts::get_all_prompts()
-    };
-
-    // Filter by category if provided
-    let prompts_list = if let Some(category) = query.category {
-        prompts_list
-            .into_iter()
-            .filter(|p| p.category == category)
-            .collect()
-    } else {
-        prompts_list
-    };
-
-    // Filter by tag if provided
-    let prompts_list = if let Some(tag) = query.tag {
-        prompts_list
-            .into_iter()
-            .filter(|p| p.tags.contains(&tag))
-            .collect()
-    } else {
-        prompts_list
-    };
-
-    Ok(Json(ApiResponse::success(prompts_list)))
-}
-
+/// Get all categories
 pub async fn get_prompt_categories(
+    State(_state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<Vec<String>>>, (StatusCode, Json<ApiResponse<()>>)> {
     let categories = prompts::get_categories();
     Ok(Json(ApiResponse::success(categories)))
 }
 
+/// Get all tags
 pub async fn get_prompt_tags(
+    State(_state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<Vec<String>>>, (StatusCode, Json<ApiResponse<()>>)> {
     let tags = prompts::get_all_tags();
     Ok(Json(ApiResponse::success(tags)))
 }
 
-#[derive(Debug, Deserialize)]
-pub struct ImportPromptsRequest {
-    pub prompts_json: String,
-}
-
+/// Import prompts from JSON
 pub async fn import_prompts(
+    State(_state): State<Arc<ApiState>>,
     Json(request): Json<ImportPromptsRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<Json<ApiResponse<Vec<prompts::SavedPrompt>>>, (StatusCode, Json<ApiResponse<()>>)> {
     match prompts::import_prompts(&request.prompts_json) {
-        Ok(imported) => Ok(Json(ApiResponse::success(serde_json::json!({
-            "imported": imported.len()
-        })))),
+        Ok(imported) => Ok(Json(ApiResponse::success(imported))),
         Err(e) => Err((StatusCode::BAD_REQUEST, Json(api_error(e)))),
     }
 }
 
+/// Export all prompts as JSON
 pub async fn export_prompts(
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match prompts::export_prompts() {
-        Ok(json_str) => {
-            // Parse the JSON string to return as structured data
-            match serde_json::from_str::<serde_json::Value>(&json_str) {
-                Ok(value) => Ok(Json(ApiResponse::success(value))),
-                Err(e) => Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(api_error(format!("Failed to parse export: {}", e))),
-                )),
-            }
-        }
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct RunPromptRequest {
-    pub id: String,
-    pub variables: Option<std::collections::HashMap<String, String>>,
-}
-
-pub async fn run_prompt(
     State(_state): State<Arc<ApiState>>,
-    Json(request): Json<RunPromptRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // Get the prompt
-    let prompt = match prompts::get_prompt(&request.id) {
-        Some(p) => p,
-        None => return Err((StatusCode::NOT_FOUND, Json(api_error("Prompt not found")))),
-    };
-
-    // Apply variable substitution if provided
-    let mut final_content = prompt.content.clone();
-    if let Some(vars) = request.variables {
-        for (key, value) in vars {
-            final_content = final_content.replace(&format!("{{{{{}}}}}", key), &value);
-        }
-    }
-
-    Ok(Json(ApiResponse::success(serde_json::json!({
-        "prompt_id": request.id,
-        "content": final_content,
-        "started": true
-    }))))
-}
-
-// ============================================================================
-// Scriptlet Handlers
-// ============================================================================
-
-pub async fn list_scriptlets(
-) -> Result<Json<ApiResponse<Vec<Scriptlet>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let list = scriptlets::get_all_scriptlets();
-    Ok(Json(ApiResponse::success(list)))
-}
-
-pub async fn get_scriptlet(
-    Path(id): Path<String>,
-) -> Result<Json<ApiResponse<Scriptlet>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match scriptlets::get_scriptlet(&id) {
-        Some(scriptlet) => Ok(Json(ApiResponse::success(scriptlet))),
-        None => Err((
-            StatusCode::NOT_FOUND,
-            Json(api_error("Scriptlet not found")),
-        )),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CreateScriptletRequest {
-    pub name: String,
-    #[serde(default)]
-    pub description: String,
-    pub content: String,
-    #[serde(default)]
-    pub category: String,
-}
-
-pub async fn create_scriptlet(
-    Json(request): Json<CreateScriptletRequest>,
-) -> Result<Json<ApiResponse<Scriptlet>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match scriptlets::create_scriptlet(
-        request.name,
-        request.description,
-        request.content,
-        request.category,
-    ) {
-        Ok(scriptlet) => Ok(Json(ApiResponse::success(scriptlet))),
+) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match prompts::export_prompts() {
+        Ok(json) => Ok(Json(ApiResponse::success(json))),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
     }
 }
 
-#[derive(Debug, Deserialize)]
-pub struct UpdateScriptletRequest {
-    pub name: Option<String>,
-    pub description: Option<String>,
-    pub content: Option<String>,
-    pub category: Option<String>,
-}
-
-pub async fn update_scriptlet(
-    Path(id): Path<String>,
-    Json(request): Json<UpdateScriptletRequest>,
-) -> Result<Json<ApiResponse<Scriptlet>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match scriptlets::update_scriptlet(
-        &id,
-        request.name,
-        request.description,
-        request.content,
-        request.category,
-    ) {
-        Ok(scriptlet) => Ok(Json(ApiResponse::success(scriptlet))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-    }
-}
-
-pub async fn delete_scriptlet(
-    Path(id): Path<String>,
-) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match scriptlets::delete_scriptlet(&id) {
-        Ok(()) => Ok(Json(ApiResponse::success(()))),
+/// Duplicate a prompt
+pub async fn duplicate_prompt(
+    State(_state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(request): Json<DuplicatePromptRequest>,
+) -> Result<Json<ApiResponse<prompts::SavedPrompt>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match prompts::duplicate_prompt(&id, request.new_name) {
+        Ok(prompt) => Ok(Json(ApiResponse::success(prompt))),
         Err(e) => Err((StatusCode::NOT_FOUND, Json(api_error(e)))),
     }
 }
 
-pub async fn search_scriptlets(
-    Query(query): Query<SearchQuery>,
-) -> Result<Json<ApiResponse<Vec<Scriptlet>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let scriptlets_list = if let Some(q) = query.q {
-        scriptlets::search_scriptlets(&q)
-    } else {
-        scriptlets::get_all_scriptlets()
-    };
-
-    // Filter by category if provided
-    let scriptlets_list = if let Some(category) = query.category {
-        scriptlets_list
-            .into_iter()
-            .filter(|s| s.category == category)
-            .collect()
-    } else {
-        scriptlets_list
-    };
-
-    Ok(Json(ApiResponse::success(scriptlets_list)))
+/// Search prompts by query
+pub async fn search_prompts(
+    State(_state): State<Arc<ApiState>>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<ApiResponse<Vec<prompts::SavedPrompt>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let query = params.get("q").map(|s| s.as_str()).unwrap_or("");
+    let results = prompts::search_prompts(query);
+    Ok(Json(ApiResponse::success(results)))
 }
 
-pub async fn get_scriptlet_categories(
-) -> Result<Json<ApiResponse<Vec<String>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let categories = scriptlets::get_categories();
-    Ok(Json(ApiResponse::success(categories)))
+/// Create routes for this module.
+pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
+    use axum::routing::{delete, get, post, put};
+    axum::Router::new()
+        .route("/prompts", get(list_prompts))
+        .route("/prompts", post(create_prompt))
+        .route("/prompts/search", get(search_prompts))
+        .route("/prompts/categories", get(get_prompt_categories))
+        .route("/prompts/tags", get(get_prompt_tags))
+        .route("/prompts/import", post(import_prompts))
+        .route("/prompts/export", get(export_prompts))
+        .route("/prompts/:id", get(get_prompt))
+        .route("/prompts/:id", put(update_prompt))
+        .route("/prompts/:id", delete(delete_prompt))
+        .route("/prompts/:id/duplicate", post(duplicate_prompt))
 }

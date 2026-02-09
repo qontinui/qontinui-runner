@@ -1,9 +1,10 @@
 [package]
 name = "qontinui-runner"
-version = "0.1.0"
+version = "1.0.0"
 description = "Desktop application for running Qontinui automation projects"
 authors = ["Qontinui <contact@qontinui.org>"]
 edition = "2021"
+default-run = "qontinui-runner"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -86,6 +87,10 @@ tree-sitter-rust = "0.23"
 streaming-iterator = "0.1"  # For iterating over tree-sitter query matches
 syn = { version = "2.0", features = ["full", "parsing", "visit"] }
 proc-macro2 = { version = "1.0", features = ["span-locations"] }
+
+[[bin]]
+name = "mock_claude_cli"
+path = "src/bin/mock_claude_cli.rs"
 
 [dev-dependencies]
 tempfile = "3"

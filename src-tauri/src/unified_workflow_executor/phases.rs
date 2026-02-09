@@ -168,6 +168,103 @@ fn format_duration_ms(ms: i64) -> String {
 }
 
 // =============================================================================
+// Iteration Context Builder
+// =============================================================================
+
+/// Build context from previous iterations for the AI to reference.
+///
+/// Includes findings from the findings database and previous verification
+/// results so the AI can understand what was tried and what happened.
+fn build_unified_iteration_context(
+    checkpoint_db: &CheckpointDb,
+    execution_id: &str,
+    current_iteration: u32,
+) -> Option<String> {
+    let mut sections = Vec::new();
+
+    // 1. Collect findings from the findings database
+    if let Ok(findings) = checkpoint_db.get_findings_for_task(execution_id) {
+        if !findings.is_empty() {
+            let mut findings_lines = vec!["### Findings from Previous Iterations".to_string()];
+            for finding in &findings {
+                let status_str = finding.status.as_str();
+                let category_str = finding.category.as_str();
+                findings_lines.push(format!(
+                    "- [{}:{}] {}",
+                    category_str, status_str, finding.title
+                ));
+                if !finding.description.is_empty() {
+                    // Truncate long descriptions
+                    let desc = if finding.description.len() > 200 {
+                        format!("{}...", &finding.description[..200])
+                    } else {
+                        finding.description.clone()
+                    };
+                    findings_lines.push(format!("  {}", desc));
+                }
+            }
+            sections.push(findings_lines.join("\n"));
+        }
+    }
+
+    // 2. Collect previous verification results
+    let mut verification_lines = vec!["### Previous Verification Results".to_string()];
+    let mut has_prev_results = false;
+    for iter in 1..current_iteration {
+        if let Ok(Some(result)) = checkpoint_db.get_verification_phase_result(execution_id, iter) {
+            has_prev_results = true;
+            let passed = result
+                .get("passed_steps")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let total = result
+                .get("total_steps")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let failed = result
+                .get("failed_steps")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let all_passed = result
+                .get("all_passed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            let status = if all_passed {
+                "ALL PASSED".to_string()
+            } else {
+                format!("{}/{} passed, {} failed", passed, total, failed)
+            };
+            verification_lines.push(format!("- Iteration {}: {}", iter, status));
+
+            // List failed step names from previous iterations
+            if let Some(step_results) = result.get("step_results").and_then(|v| v.as_array()) {
+                let failed_names: Vec<_> = step_results
+                    .iter()
+                    .filter(|s| s.get("success").and_then(|v| v.as_bool()) == Some(false))
+                    .filter_map(|s| s.get("step_name").and_then(|v| v.as_str()))
+                    .collect();
+                if !failed_names.is_empty() {
+                    verification_lines.push(format!("  Failed: {}", failed_names.join(", ")));
+                }
+            }
+        }
+    }
+    if has_prev_results {
+        sections.push(verification_lines.join("\n"));
+    }
+
+    if sections.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "---\n\n## Previous Iteration Context\n\n{}",
+        sections.join("\n\n")
+    ))
+}
+
+// =============================================================================
 // Setup Phase Executor
 // =============================================================================
 
@@ -198,6 +295,11 @@ impl SetupExecutor {
             ai_executor: UnifiedAiSessionExecutor::new(app_state, app_handle, pid_tracker),
             checkpoint_db,
         }
+    }
+
+    /// Enable interactive sessions via the session manager.
+    pub fn set_session_manager(&mut self, sm: Arc<crate::claude_session::SessionManager>) {
+        self.ai_executor.session_manager = Some(sm);
     }
 
     /// Run setup steps. Returns true if successful.
@@ -560,6 +662,7 @@ impl VerificationExecutor {
                         duration_ms: 0,
                         config: crate::step_executor::StepExecutionConfig::default(),
                         verification_details: None,
+                        output_data: None,
                     };
 
                     return (
@@ -764,6 +867,11 @@ impl AgenticExecutor {
         }
     }
 
+    /// Enable interactive sessions via the session manager.
+    pub fn set_session_manager(&mut self, sm: Arc<crate::claude_session::SessionManager>) {
+        self.ai_executor.session_manager = Some(sm);
+    }
+
     /// Run the AI with the given prompt and failure context.
     ///
     /// This calls Claude directly (no session system, no orchestrator).
@@ -869,6 +977,36 @@ impl AgenticExecutor {
         } else {
             enhanced_prompt
         };
+
+        // For iteration 2+, add context from previous iterations (findings + verification results)
+        let enhanced_prompt = if iteration > 1 {
+            match build_unified_iteration_context(
+                &self.checkpoint_db,
+                &config.execution_id,
+                iteration,
+            ) {
+                Some(ctx) => {
+                    info!(
+                        "AGENTIC-PHASE: Appending iteration context ({} chars) for iteration {}",
+                        ctx.len(),
+                        iteration
+                    );
+                    format!("{}\n\n{}", enhanced_prompt, ctx)
+                }
+                None => enhanced_prompt,
+            }
+        } else {
+            enhanced_prompt
+        };
+
+        // Append safety instructions to prevent AI from modifying runner internals
+        let enhanced_prompt = format!(
+            "{}\n\n## Important Constraints\n\n\
+            - Do NOT modify the runner's SQLite database directly. Configuration changes must go through the runner UI or API.\n\
+            - Do NOT modify workflow JSON files in the parent directory. Fix the application code instead.\n\
+            - Focus on fixing the source code that the verification tests are checking.",
+            enhanced_prompt
+        );
 
         // Use the unified AI session executor with timing
         let ai_config =
@@ -1003,6 +1141,11 @@ impl CompletionExecutor {
             ai_executor: UnifiedAiSessionExecutor::new(app_state, app_handle, pid_tracker),
             checkpoint_db,
         }
+    }
+
+    /// Enable interactive sessions via the session manager.
+    pub fn set_session_manager(&mut self, sm: Arc<crate::claude_session::SessionManager>) {
+        self.ai_executor.session_manager = Some(sm);
     }
 
     /// Run completion steps.

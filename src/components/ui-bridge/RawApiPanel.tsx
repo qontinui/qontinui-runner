@@ -40,22 +40,17 @@ interface RawApiPanelProps {
 
 // Predefined commands for quick access
 const PRESET_COMMANDS = [
-  { action: "listTabs", params: {}, description: "List all browser tabs" },
   { action: "getElements", params: {}, description: "Get all UI Bridge elements" },
-  { action: "getPageContext", params: {}, description: "Get page context info" },
-  { action: "connect", params: {}, description: "Connect to selected tab" },
+  { action: "getSnapshot", params: {}, description: "Get full UI snapshot" },
+  { action: "getComponents", params: {}, description: "Get UI components" },
+  { action: "discover", params: {}, description: "Discover available elements" },
   {
     action: "executeAction",
     params: { elementId: "", action: "click" },
     description: "Execute action on element",
   },
-  {
-    action: "highlightElement",
-    params: { elementId: "" },
-    description: "Highlight element in page",
-  },
-  { action: "enablePicker", params: {}, description: "Enable element picker" },
-  { action: "disablePicker", params: {}, description: "Disable element picker" },
+  { action: "aiSearch", params: { query: "" }, description: "AI-powered element search" },
+  { action: "aiExecute", params: { instruction: "" }, description: "AI-powered action execution" },
 ];
 
 export function RawApiPanel({
@@ -126,7 +121,7 @@ export function RawApiPanel({
           <Terminal className="w-4 h-4 text-primary" />
           <span className="font-medium">Raw API</span>
         </div>
-        <div className="text-xs text-muted-foreground">POST /extension/command</div>
+        <div className="text-xs text-muted-foreground">SDK API</div>
       </div>
 
       {/* Presets */}

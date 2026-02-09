@@ -612,7 +612,7 @@ export interface AwasExtractElementsStep extends BaseStep {
  *
  * Verifies UI state by running a SpecGroup against live UI Bridge elements.
  * Elements are sourced from the runner's own registry ("control") or from
- * an external browser tab via Chrome extension ("external").
+ * an external SDK-connected app ("external").
  *
  * Returns a boolean based on whether all assertions in the group passed.
  * The full SpecGroupResult (per-assertion pass/fail, durations) is available

@@ -50,12 +50,22 @@ function getStepIcon(stepType: string): LucideIcon {
 interface StepItemProps {
   step: RecapStep;
   depth?: number;
+  onAiStepClick?: () => void;
 }
 
-export function StepItem({ step, depth = 0 }: StepItemProps) {
+export function StepItem({ step, depth = 0, onAiStepClick }: StepItemProps) {
   const [expanded, setExpanded] = useState(step.status === "failed");
   const hasChildren = step.children && step.children.length > 0;
+  const isClickable = hasChildren || !!onAiStepClick;
   const Icon = getStepIcon(step.step_type);
+
+  const handleClick = () => {
+    if (onAiStepClick) {
+      onAiStepClick();
+    } else if (hasChildren) {
+      setExpanded(!expanded);
+    }
+  };
 
   return (
     <div
@@ -64,13 +74,13 @@ export function StepItem({ step, depth = 0 }: StepItemProps) {
     >
       <button
         data-ui-id="recap-step-toggle-btn"
-        onClick={() => hasChildren && setExpanded(!expanded)}
+        onClick={handleClick}
         className={`
           w-full flex items-center gap-3 p-3 rounded-lg text-left transition-colors
-          ${hasChildren ? "hover:bg-muted/50 cursor-pointer" : "cursor-default"}
+          ${isClickable ? "hover:bg-muted/50 cursor-pointer" : "cursor-default"}
           ${step.status === "failed" ? "bg-red-500/5" : ""}
         `}
-        disabled={!hasChildren}
+        disabled={!isClickable}
       >
         {/* Expand/collapse indicator */}
         <div className="w-4 h-4 flex-shrink-0">
@@ -125,6 +135,9 @@ export function StepItem({ step, depth = 0 }: StepItemProps) {
             <p className="text-xs text-red-400 truncate mt-0.5">{step.error}</p>
           )}
         </div>
+
+        {/* Navigate hint for AI steps */}
+        {onAiStepClick && <ChevronRight className="w-4 h-4 text-muted-foreground flex-shrink-0" />}
       </button>
 
       {/* Children */}

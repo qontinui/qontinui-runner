@@ -95,7 +95,6 @@ export function AuthProvider({ children }: AuthProviderProps) {
     refreshCallCountRef.current += 1;
     const callNum = refreshCallCountRef.current;
     console.log(`[AUTH] refreshAuth() called (call #${callNum})`);
-    console.log("[AUTH] refreshAuth() stack trace:", new Error().stack);
     try {
       setError(null);
       console.log(`[AUTH] refreshAuth() #${callNum} - invoking refresh_token command...`);
