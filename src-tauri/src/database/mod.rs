@@ -4311,18 +4311,35 @@ impl CheckpointDb {
         // Migration to version 53: Add preflight_check_enabled to unified_workflows
         if current_version < 53 {
             info!("Migrating database to version 53 (adding preflight_check_enabled to unified_workflows)");
-            conn.execute_batch(
-                r#"
-                -- Add preflight_check_enabled column: enables automatic pre-flight environment check
-                -- When enabled (default), runs a check for disk space, Node.js, Python, Rust, Git at start of setup
-                ALTER TABLE unified_workflows ADD COLUMN preflight_check_enabled INTEGER DEFAULT 1;
 
-                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (53, datetime('now'));
-                "#,
+            // Check if column already exists (idempotent migration)
+            let column_exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('unified_workflows') WHERE name = 'preflight_check_enabled'",
+                    [],
+                    |row| row.get::<_, i32>(0),
+                )
+                .map(|count| count > 0)
+                .unwrap_or(false);
+
+            if !column_exists {
+                conn.execute(
+                    "ALTER TABLE unified_workflows ADD COLUMN preflight_check_enabled INTEGER DEFAULT 1",
+                    [],
+                )
+                .map_err(|e| format!("Failed to add preflight_check_enabled column: {}", e))?;
+                info!("Added preflight_check_enabled column to unified_workflows");
+            } else {
+                info!("Column preflight_check_enabled already exists, skipping ALTER TABLE");
+            }
+
+            conn.execute(
+                "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (53, datetime('now'))",
+                [],
             )
-            .map_err(|e| format!("Failed to migrate to version 53: {}", e))?;
+            .map_err(|e| format!("Failed to update schema version to 53: {}", e))?;
 
-            info!("Successfully migrated to version 53 (preflight_check_enabled added)");
+            info!("Successfully migrated to version 53 (preflight_check_enabled)");
         }
 
         // Migration to version 54: Add result_data to task_runs, generated_by_task_run_id to unified_workflows

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Pre-commit hook to block commit messages with Claude attribution
 
 commit_msg_file="$1"
