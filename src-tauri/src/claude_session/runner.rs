@@ -33,7 +33,9 @@ fn extract_text_from_stream_json(json_line: &str) -> Option<String> {
             let content = parsed.get("message")?.get("content")?.as_array()?;
             let mut text_parts = Vec::new();
             for item in content {
-                if item.get("type")?.as_str()? == "text" {
+                // Use and_then to gracefully skip items without a "type" field
+                // instead of ? which would abort the entire function
+                if item.get("type").and_then(|t| t.as_str()) == Some("text") {
                     if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
                         text_parts.push(text.to_string());
                     }
@@ -54,20 +56,30 @@ fn extract_text_from_stream_json(json_line: &str) -> Option<String> {
                 .map(|s| s.to_string())
         }
         "result" => {
-            // Final result - extract text from content blocks
-            let content = parsed.get("result")?.get("content")?.as_array()?;
-            let mut text_parts = Vec::new();
-            for item in content {
-                if item.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                        text_parts.push(text.to_string());
+            // Claude Code stream-json returns result as a plain string
+            if let Some(text) = parsed.get("result").and_then(|r| r.as_str()) {
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(text.to_string())
+                }
+            } else if let Some(content) = parsed.get("result").and_then(|r| r.get("content")).and_then(|c| c.as_array()) {
+                // Fallback: handle object format with content array
+                let mut text_parts = Vec::new();
+                for item in content {
+                    if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                            text_parts.push(text.to_string());
+                        }
                     }
                 }
-            }
-            if text_parts.is_empty() {
-                None
+                if text_parts.is_empty() {
+                    None
+                } else {
+                    Some(text_parts.join(""))
+                }
             } else {
-                Some(text_parts.join(""))
+                None
             }
         }
         _ => None,

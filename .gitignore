@@ -107,3 +107,6 @@ web-extraction*.png
 
 # SQLite databases
 *.db
+
+# Template artifact directories
+src-tauri/{{artifact_dir}}/

@@ -161,7 +161,11 @@ pub struct ProgressContext {
     pub task_run_id: String,
 }
 
-/// Emit AI output event to frontend
+/// Emit AI output event to frontend and persist to file.
+///
+/// Previously, persistence depended on a fragile round-trip:
+///   Rust emit → Tauri event → frontend JS → invoke Tauri command → file write
+/// Now we also write directly to ai-output.jsonl from Rust for reliability.
 pub fn emit_ai_output(
     app_handle: &tauri::AppHandle,
     line: &str,
@@ -169,13 +173,10 @@ pub fn emit_ai_output(
     action_id: Option<&str>,
     session_ctx: Option<&AiSessionContext>,
 ) {
+    let now = chrono::Utc::now().timestamp_millis();
     let event = AiOutputEvent {
-        id: format!(
-            "ai-{}-{}",
-            chrono::Utc::now().timestamp_millis(),
-            rand::random::<u32>()
-        ),
-        timestamp: chrono::Utc::now().timestamp_millis(),
+        id: format!("ai-{}-{}", now, rand::random::<u32>()),
+        timestamp: now,
         line: line.to_string(),
         source: source.to_string(),
         action_id: action_id.map(|s| s.to_string()),
@@ -194,6 +195,24 @@ pub fn emit_ai_output(
     if let Ok(json) = serde_json::to_value(&event) {
         crate::event_system::broadcast_ws_notification(app_handle, "ai-output", &json);
     }
+
+    // Persist directly to ai-output.jsonl (don't rely on frontend round-trip)
+    let entry = crate::commands::logging::AiOutputEntry {
+        id: event.id,
+        timestamp: event.timestamp,
+        line: event.line,
+        source: event.source,
+        action_id: event.action_id,
+        task_run_id: event.task_run_id,
+        session_id: event.session_id,
+        session_name: event.session_name,
+        phase: event.phase,
+        phase_iteration: event.phase_iteration,
+        screenshot_path: None,
+        screenshot_width: None,
+        screenshot_height: None,
+    };
+    let _ = crate::commands::logging::append_ai_output_log(entry);
 }
 
 /// Write AI debug log to file

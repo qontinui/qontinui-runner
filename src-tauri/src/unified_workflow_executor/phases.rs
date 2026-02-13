@@ -788,6 +788,7 @@ impl SetupExecutor {
                 if !setup_prompt.is_empty() {
                     // Use the unified AI session executor with sub-step metadata
                     let config = AiSessionConfig::setup(execution_id, workflow_name, &step_name)
+                        .with_checkpoint_id(&ai_checkpoint.id)
                         .with_sub_step_metadata(sub_step_metadata);
 
                     let (result, duration_ms) = timeout_helper::timed_result_async(
@@ -1514,7 +1515,8 @@ impl AgenticExecutor {
 
         // Use the unified AI session executor with timing
         let ai_config =
-            AiSessionConfig::agentic(&config.execution_id, &config.workflow_name, iteration);
+            AiSessionConfig::agentic(&config.execution_id, &config.workflow_name, iteration)
+                .with_checkpoint_id(&checkpoint.id);
 
         let (result, duration_ms) = timeout_helper::timed_result_async(self.ai_executor.execute(
             &ai_config,
@@ -1975,6 +1977,7 @@ impl CompletionExecutor {
                         &step_name,
                         iterations_run,
                     )
+                    .with_checkpoint_id(&ai_checkpoint.id)
                     .with_sub_step_metadata(sub_step_metadata);
 
                     let (result, duration_ms) = timeout_helper::timed_result_async(
