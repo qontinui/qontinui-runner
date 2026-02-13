@@ -5,7 +5,7 @@
  * has low confidence. Uses the runner's AI infrastructure for LLM calls.
  */
 
-import type { ExternalElement } from "../../hooks/useExternalUIBridge";
+import type { ExternalElement } from "../../types/ui-bridge-types";
 
 // =============================================================================
 // Types

@@ -1,7 +1,7 @@
 //! DOM Capture handlers for MCP API
 //!
-//! Provides HTTP handlers for managing DOM captures from the browser extension:
-//! list, get, get HTML content, receive from extension.
+//! Provides HTTP handlers for managing DOM captures:
+//! list, get, get HTML content, receive DOM capture data.
 
 use axum::{
     extract::Path,

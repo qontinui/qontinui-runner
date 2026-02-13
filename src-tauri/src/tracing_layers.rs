@@ -397,7 +397,9 @@ impl SqliteSpanLayer {
         };
 
         let attributes_json = serde_json::to_string(&entry.attributes).unwrap_or_default();
-        let exec_id = execution_id.unwrap_or("");
+        // Use None (NULL in SQL) when no execution_id, not empty string
+        // Empty string violates FK constraint, NULL is allowed
+        let exec_id: Option<&str> = execution_id.filter(|s| !s.is_empty());
 
         let result = conn.execute(
             "INSERT INTO execution_spans (

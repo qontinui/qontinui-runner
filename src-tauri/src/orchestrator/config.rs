@@ -170,7 +170,6 @@ impl EnhancedOrchestratorConfig {
         Self {
             base: BaseConfig {
                 max_iterations: 15,
-                ai_timeout_seconds: 600,
                 ..Default::default()
             },
             context: ContextConfig {
@@ -292,8 +291,6 @@ impl EnhancedOrchestratorConfig {
 pub struct BaseConfig {
     /// Maximum iterations before stopping
     pub max_iterations: u32,
-    /// Timeout for AI calls in seconds
-    pub ai_timeout_seconds: u64,
     /// Working directory for commands
     pub working_directory: String,
     /// Enable planning phase
@@ -308,7 +305,6 @@ impl Default for BaseConfig {
     fn default() -> Self {
         Self {
             max_iterations: 10,
-            ai_timeout_seconds: 300,
             working_directory: ".".to_string(),
             enable_planning: true,
             enable_ai_verification: true,
@@ -704,12 +700,6 @@ impl EnhancedOrchestratorConfigBuilder {
     /// Set maximum iterations.
     pub fn max_iterations(mut self, max: u32) -> Self {
         self.config.base.max_iterations = max;
-        self
-    }
-
-    /// Set AI timeout.
-    pub fn ai_timeout(mut self, secs: u64) -> Self {
-        self.config.base.ai_timeout_seconds = secs;
         self
     }
 

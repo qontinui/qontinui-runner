@@ -28,6 +28,7 @@ mod database;
 mod debug_lifecycle;
 mod discoveries;
 mod display;
+mod doctor;
 mod dom_capture;
 mod error;
 mod error_monitor; // Must be declared before error (error re-exports ErrorSeverity from error_monitor)
@@ -87,6 +88,7 @@ use commands::AppState;
 use database::CheckpointDb;
 use display::profiles::ActionLogProfile;
 use display::DisplayProcessor;
+use doctor::{start_doctor_async, DoctorConfig};
 use error_monitor::{start_error_monitor_async, ErrorMonitorConfig};
 use logging::{init_logging, setup_panic_handler, LoggingConfig};
 use std::sync::{Arc, Mutex};
@@ -264,6 +266,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         run_recording_handler,
         mcp_client_manager: tokio::sync::Mutex::new(mcp_client_manager),
         error_monitor_handle: TokioMutex::new(None), // Initialized in setup()
+        doctor_handle: TokioMutex::new(None),        // Initialized in setup()
     });
     let mcp_app_state = shared_app_state.clone();
     let mcp_rag_state = rag_state.clone();
@@ -834,6 +837,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             error_monitor::workflow::generate_error_fix_workflow,
             error_monitor::workflow::generate_single_error_fix_workflow,
             error_monitor::workflow::check_fixable_errors,
+            // Doctor health monitoring commands
+            doctor::commands::doctor_get_status,
+            doctor::commands::stop_process_by_pid,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");
@@ -1002,6 +1008,42 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 info!("Error monitor service started and handle stored in AppState");
             });
 
+            // Start Doctor health monitoring service in background
+            info!("Starting Doctor health monitoring service");
+            let app_state_for_doctor = app.state::<Arc<AppState>>().inner().clone();
+            let app_handle_for_doctor = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let doctor_config = DoctorConfig::default();
+                let (doctor_handle, mut doctor_event_rx) =
+                    start_doctor_async(doctor_config).await;
+
+                // Store the handle in AppState
+                let mut handle_lock = app_state_for_doctor.doctor_handle.lock().await;
+                *handle_lock = Some(doctor_handle);
+                info!("Doctor service started and handle stored in AppState");
+
+                // Bridge Doctor events to Tauri frontend events
+                drop(handle_lock); // Release lock before entering event loop
+                while let Some(event) = doctor_event_rx.recv().await {
+                    let event_name = match &event {
+                        doctor::DoctorEvent::Warning { .. } => "doctor-warning",
+                        doctor::DoctorEvent::Stuck { .. } => "doctor-stuck",
+                        doctor::DoctorEvent::Healthy { .. } => "doctor-healthy",
+                    };
+                    if let Err(e) = tauri::Emitter::emit(&app_handle_for_doctor, event_name, &event) {
+                        tracing::warn!("Failed to emit Doctor event: {}", e);
+                    }
+                }
+            });
+
+            // Start embedding backfill job in background
+            info!("Starting embedding backfill job");
+            let embedding_db = app.state::<Arc<AppState>>().inner().checkpoint_db.clone();
+            database::embedding_jobs::start_embedding_job(
+                embedding_db,
+                database::embedding_jobs::EmbeddingJobConfig::default(),
+            );
+
             info!("Tauri application setup complete");
             Ok(())
         })
@@ -1044,6 +1086,20 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             error!("Failed to stop error monitor service: {}", e);
                         } else {
                             info!("Error monitor service stopped");
+                        }
+                    }
+                });
+
+                // Stop Doctor health monitoring service
+                let app_state_clone3 = app_state.inner().clone();
+                tauri::async_runtime::spawn(async move {
+                    let handle_lock = app_state_clone3.doctor_handle.lock().await;
+                    if let Some(ref handle) = *handle_lock {
+                        info!("Stopping Doctor service");
+                        if let Err(e) = handle.shutdown().await {
+                            error!("Failed to stop Doctor service: {}", e);
+                        } else {
+                            info!("Doctor service stopped");
                         }
                     }
                 });

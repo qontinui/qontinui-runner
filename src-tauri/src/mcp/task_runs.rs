@@ -333,6 +333,34 @@ pub async fn get_workflow_state(
 }
 
 // =============================================================================
+// Result Data (generated_workflow_id, etc.)
+// =============================================================================
+
+/// Get the result_data JSON for a task run.
+///
+/// Returns the JSON object stored in task_runs.result_data (e.g. generated_workflow_id
+/// from workflow generation). Returns empty object {} if no result_data is set.
+pub async fn get_task_run_result_data(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let result_data = state
+        .app_state
+        .checkpoint_db
+        .get_task_run_result_data(&id)
+        .map_err(|e| (StatusCode::NOT_FOUND, e))?;
+
+    match result_data {
+        Some(json_str) => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&json_str).unwrap_or(serde_json::json!({}));
+            Ok(Json(parsed))
+        }
+        None => Ok(Json(serde_json::json!({}))),
+    }
+}
+
+// =============================================================================
 // Full Workflow State (for frontend restart recovery)
 // =============================================================================
 
@@ -355,6 +383,8 @@ pub struct FullWorkflowStateResponse {
     current_step_progress: Option<StepProgressData>,
     /// Computed resume point
     resume_point: ResumePointData,
+    /// Phases defined in the workflow (e.g., ["setup", "verification", "agentic", "completion"])
+    defined_phases: Vec<String>,
 }
 
 /// Task run summary for full state response.
@@ -523,6 +553,41 @@ pub async fn get_full_workflow_state(
         &orchestrator_state,
     );
 
+    // Determine defined phases from the workflow definition
+    let defined_phases = if task_run.workflow_type.as_deref() == Some("unified") {
+        if let Some(ref wn) = task_run.workflow_name {
+            match state.app_state.checkpoint_db.get_unified_workflow_by_name(wn) {
+                Ok(Some(wf)) => {
+                    let mut phases = Vec::new();
+                    if !wf.setup_steps.is_empty() {
+                        phases.push("setup".to_string());
+                    }
+                    if !wf.verification_steps.is_empty() {
+                        phases.push("verification".to_string());
+                    }
+                    if !wf.agentic_steps.is_empty() {
+                        phases.push("agentic".to_string());
+                    }
+                    if !wf.completion_steps.is_empty() {
+                        phases.push("completion".to_string());
+                    }
+                    phases
+                }
+                _ => vec!["setup", "verification", "agentic", "completion"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+            }
+        } else {
+            vec!["setup", "verification", "agentic", "completion"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        }
+    } else {
+        vec![]
+    };
+
     Ok(Json(FullWorkflowStateResponse {
         task_run: TaskRunSummary {
             id: task_run.id,
@@ -538,6 +603,7 @@ pub async fn get_full_workflow_state(
         checkpoints,
         current_step_progress,
         resume_point,
+        defined_phases,
     }))
 }
 
@@ -724,6 +790,10 @@ pub async fn stop_task_run(
         None,
     );
 
+    // Broadcast task-run-update to both Tauri + WebSocket
+    let broadcaster = crate::event_system::EventBroadcaster::new(state.app_handle.clone());
+    broadcaster.task_run_update(&id, "stopped", None, None);
+
     info!("Task {} stopped, killed {} process(es)", id, killed_count);
 
     Ok(Json(serde_json::json!({
@@ -764,9 +834,10 @@ pub async fn generate_task_summary(
     // Run summary generation in a blocking task
     let db = state.app_state.checkpoint_db.clone();
     let task_id = id.clone();
+    let doctor_handle = state.doctor_handle.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        summary_generator::generate_task_summary(&db, &task_id)
+        summary_generator::generate_task_summary(&db, &task_id, doctor_handle.as_ref())
     })
     .await
     .map_err(|e| {
@@ -854,8 +925,9 @@ pub async fn resume_task_run(
     Json(request): Json<ResumeTaskRunRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     use crate::unified_workflow_executor::{
-        convert_json_steps_with_phase, extract_prompt_steps_with_phase,
-        extract_workflow_id_from_task_id, LoopConfig, LoopController,
+        convert_all_json_steps_with_phase, convert_json_steps_with_phase,
+        extract_prompt_steps_with_phase, extract_workflow_id_from_task_id, LoopConfig,
+        LoopController,
     };
 
     info!("Resume task run request: {}", id);
@@ -938,7 +1010,7 @@ pub async fn resume_task_run(
     );
     let setup_prompt_steps = extract_prompt_steps_with_phase(&workflow.setup_steps, Some("setup"));
     let verification_steps =
-        convert_json_steps_with_phase(&workflow.verification_steps, 0, Some("verification"));
+        convert_all_json_steps_with_phase(&workflow.verification_steps, 0, Some("verification"));
     // Prepend health check steps if enabled and URLs configured
     // Health checks run BEFORE log_watch to catch server down before scanning logs
     let verification_steps = crate::unified_workflows::prepend_health_check_steps(
@@ -965,7 +1037,6 @@ pub async fn resume_task_run(
 
     let loop_config = LoopConfig {
         max_iterations: workflow.max_iterations,
-        timeout_seconds: workflow.timeout_seconds, // Use workflow setting
         base_prompt: String::new(),
         workflow_name: task_run.task_name.clone(),
         workflow_id: workflow_id.clone(),
@@ -973,6 +1044,8 @@ pub async fn resume_task_run(
         targeted_error_ids: workflow.targeted_error_ids.clone(),
         starting_iteration,
         run_agentic_first,
+        artifact_dir: None,
+        is_dev_mode: cfg!(debug_assertions),
     };
 
     // Spawn the workflow execution in background with panic protection
@@ -1177,6 +1250,50 @@ pub async fn get_task_run_verification_results(
             "iteration": query.iteration,
             "failed_only": query.failed_only
         }
+    })))
+}
+
+/// Get workflow verification phase results for a task run.
+///
+/// Returns step-executor-based verification results from unified workflow execution,
+/// grouped by iteration. Each iteration contains individual step results including
+/// test results, check group results with individual check details, etc.
+pub async fn get_task_run_verification_phase_results(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Verify task exists
+    let _task = state
+        .app_state
+        .checkpoint_db
+        .get_task_run(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
+
+    // Get all workflow verification phase results
+    let results = state
+        .app_state
+        .checkpoint_db
+        .get_all_verification_phase_results(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let count = results.len();
+    let passed_iterations = results
+        .iter()
+        .filter(|r| {
+            r.get("all_passed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        })
+        .count();
+    let failed_iterations = count - passed_iterations;
+
+    Ok(Json(serde_json::json!({
+        "task_run_id": id,
+        "results": results,
+        "count": count,
+        "passed_iterations": passed_iterations,
+        "failed_iterations": failed_iterations
     })))
 }
 
@@ -2296,6 +2413,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/task-runs/:id", get(get_task_run).delete(delete_task_run))
         .route("/task-runs/:id/output", get(get_task_output))
         .route("/task-runs/:id/workflow-state", get(get_workflow_state))
+        .route("/task-runs/:id/result-data", get(get_task_run_result_data))
         .route("/task-runs/:id/orchestrator-state", get(get_workflow_state)) // Alias for backward compatibility
         .route("/task-runs/:id/full-state", get(get_full_workflow_state)) // Full state for restart recovery
         .route("/task-runs/:id/stop", post(stop_task_run))
@@ -2320,6 +2438,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/task-runs/:id/verification-results",
             get(get_task_run_verification_results),
+        )
+        .route(
+            "/task-runs/:id/verification-phase-results",
+            get(get_task_run_verification_phase_results),
         )
         .route("/task-runs/:id/mcp-calls", get(get_task_run_mcp_calls))
         .route(

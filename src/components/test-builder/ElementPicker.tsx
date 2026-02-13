@@ -121,11 +121,19 @@ export function ElementPicker({
       <div className="flex items-center justify-between p-3 border-b border-neutral-700">
         <div className="flex items-center gap-2">
           <Layers className="w-4 h-4 text-blue-400" />
-          <span className="text-sm font-medium text-neutral-200">
+          <span
+            data-content-role="heading"
+            data-content-label="detected elements header"
+            className="text-sm font-medium text-neutral-200"
+          >
             Detected Elements ({analysis.elements.length})
           </span>
         </div>
-        <span className="text-xs text-neutral-500">
+        <span
+          data-content-role="badge"
+          data-content-label="analysis source"
+          className="text-xs text-neutral-500"
+        >
           Source: {analysis.source === "playwright" ? "Browser DOM" : "Vision Analysis"}
         </span>
       </div>
@@ -194,12 +202,20 @@ export function ElementPicker({
                       <span className="flex-shrink-0 w-5 h-5 flex items-center justify-center bg-amber-500 text-black text-xs font-medium rounded">
                         {index + 1}
                       </span>
-                      <span className="text-sm font-medium text-neutral-200 truncate">
+                      <span
+                        data-content-role="label"
+                        data-content-label="element label"
+                        className="text-sm font-medium text-neutral-200 truncate"
+                      >
                         {element.label}
                       </span>
                     </div>
                     <div className="mt-1 text-xs text-neutral-500">
-                      <span className="inline-block px-1.5 py-0.5 bg-neutral-800 rounded mr-2">
+                      <span
+                        data-content-role="badge"
+                        data-content-label="element type"
+                        className="inline-block px-1.5 py-0.5 bg-neutral-800 rounded mr-2"
+                      >
                         {element.element_type}
                       </span>
                       {element.text_content && (
@@ -207,7 +223,11 @@ export function ElementPicker({
                       )}
                     </div>
                     {element.selector && (
-                      <div className="mt-1 text-xs text-neutral-600 font-mono truncate">
+                      <div
+                        data-content-role="code"
+                        data-content-label="element selector"
+                        className="mt-1 text-xs text-neutral-600 font-mono truncate"
+                      >
                         {element.selector}
                       </div>
                     )}
@@ -230,8 +250,10 @@ export function ElementPicker({
                 </div>
                 {/* Confidence and bounds */}
                 <div className="mt-1 flex items-center gap-3 text-xs text-neutral-600">
-                  <span>Confidence: {Math.round(element.confidence * 100)}%</span>
-                  <span>
+                  <span data-content-role="metric" data-content-label="element confidence">
+                    {Math.round(element.confidence * 100)}%
+                  </span>
+                  <span data-content-role="metric" data-content-label="element bounds">
                     ({element.bounding_box.x}, {element.bounding_box.y}){" "}
                     {element.bounding_box.width}x{element.bounding_box.height}
                   </span>

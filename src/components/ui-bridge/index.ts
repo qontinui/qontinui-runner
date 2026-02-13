@@ -15,7 +15,6 @@ export type {
 } from "./UIBridgeInspectorPanel";
 
 export { ConnectedUIBridgeInspector } from "./ConnectedUIBridgeInspector";
-export { ExternalUIBridgeInspector } from "./ExternalUIBridgeInspector";
 export { ConnectionPanel } from "./ConnectionPanel";
 export type { ActiveSource } from "./ConnectionPanel";
 export { RawApiPanel } from "./RawApiPanel";
@@ -26,3 +25,4 @@ export { ElementTreeView } from "./ElementTreeView";
 export { EventTimelineView } from "./EventTimelineView";
 export { ActionExecutorView } from "./ActionExecutorView";
 export { LazyThumbnail } from "./LazyThumbnail";
+export { SdkUIBridgeInspector } from "./SdkUIBridgeInspector";

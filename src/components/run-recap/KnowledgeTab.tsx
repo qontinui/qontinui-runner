@@ -137,7 +137,11 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
               data-ui-id={`recap-findings-${severity}`}
               className={`mb-3 rounded-lg border ${colors.border} ${colors.bg}`}
             >
-              <div className={`px-3 py-2 font-medium ${colors.text} capitalize`}>
+              <div
+                data-content-role="heading"
+                data-content-label={`${severity} findings`}
+                className={`px-3 py-2 font-medium ${colors.text} capitalize`}
+              >
                 {severity} ({severityFindings.length})
               </div>
               <div className="divide-y divide-border/50">

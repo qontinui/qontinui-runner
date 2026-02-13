@@ -29,6 +29,7 @@
 use crate::config::QontinuiConfig;
 use crate::database::CheckpointDb;
 use crate::display::DisplayProcessor;
+use crate::doctor::DoctorHandle;
 use crate::error_monitor::ErrorMonitorHandle;
 use crate::executor::{BridgeManager, ExtractionExecutor};
 use crate::mcp_client::McpClientManager;
@@ -140,6 +141,10 @@ pub struct AppState {
     /// Error monitor handle for application log monitoring.
     /// Used to monitor log files for errors and integrate with debug context.
     pub error_monitor_handle: TokioMutex<Option<ErrorMonitorHandle>>,
+    /// Doctor health monitoring handle for AI process health tracking.
+    /// The Doctor observes process health (CPU, memory, process tree, stdout activity)
+    /// and emits events when processes appear stuck. It never kills processes.
+    pub doctor_handle: TokioMutex<Option<DoctorHandle>>,
 }
 
 /// Standard response structure for command handlers.

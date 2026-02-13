@@ -114,11 +114,13 @@ export function StatusBanner({
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
           {icon}
-          <span data-ui-id="recap-status-label" className="font-medium">
+          <span data-ui-id="recap-status-label" data-content-role="status" className="font-medium">
             {label}
           </span>
           <span
             data-ui-id="recap-goal-indicator"
+            data-content-role="status"
+            data-content-label="goal status"
             className={`text-xs px-2 py-0.5 rounded-full ${
               goalAchieved === true
                 ? "bg-green-500/20 text-green-400"
@@ -133,6 +135,7 @@ export function StatusBanner({
           {loopResult && loopResult.iterations_run > 0 && (
             <span
               data-ui-id="recap-iterations-badge"
+              data-content-role="badge"
               className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-400"
             >
               <Repeat className="w-3 h-3" />
@@ -140,7 +143,12 @@ export function StatusBanner({
             </span>
           )}
         </div>
-        <div data-ui-id="recap-duration" className="flex items-center gap-2 text-sm">
+        <div
+          data-ui-id="recap-duration"
+          data-content-role="metric"
+          data-content-label="run duration"
+          className="flex items-center gap-2 text-sm"
+        >
           <Clock className="w-4 h-4" />
           <span>
             Duration: {duration !== undefined ? formatDuration(duration) : "In progress..."}
@@ -150,7 +158,11 @@ export function StatusBanner({
 
       {/* Loop summary row */}
       {loopResult && loopResult.summary && (
-        <div data-ui-id="recap-loop-summary" className="text-sm opacity-90">
+        <div
+          data-ui-id="recap-loop-summary"
+          data-content-role="body-text"
+          className="text-sm opacity-90"
+        >
           {loopResult.summary}
         </div>
       )}
@@ -162,13 +174,23 @@ export function StatusBanner({
           className="flex flex-wrap items-center gap-4 text-sm opacity-80"
         >
           {formattedStartTime && (
-            <div data-ui-id="recap-start-time" className="flex items-center gap-2">
+            <div
+              data-ui-id="recap-start-time"
+              data-content-role="metric"
+              data-content-label="start time"
+              className="flex items-center gap-2"
+            >
               <Calendar className="w-4 h-4" />
               <span>Started: {formattedStartTime}</span>
             </div>
           )}
           {formattedEndTime && (
-            <div data-ui-id="recap-end-time" className="flex items-center gap-2">
+            <div
+              data-ui-id="recap-end-time"
+              data-content-role="metric"
+              data-content-label="end time"
+              className="flex items-center gap-2"
+            >
               <Calendar className="w-4 h-4" />
               <span>Ended: {formattedEndTime}</span>
             </div>

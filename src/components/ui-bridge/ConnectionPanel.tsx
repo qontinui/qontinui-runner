@@ -22,7 +22,7 @@ import {
   Wifi,
   WifiOff,
 } from "lucide-react";
-import type { ConnectionStatus } from "../../hooks/useExternalUIBridge";
+import type { ConnectionStatus } from "../../types/ui-bridge-types";
 import type { DiscoveredApp, MobileDevice } from "../../hooks/useAppDiscovery";
 
 // ============================================================================

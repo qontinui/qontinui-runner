@@ -127,7 +127,7 @@ export function ExecutionStatsCard({
         {/* Steps progress */}
         <div className="flex items-center gap-1.5">
           <Activity className="h-3.5 w-3.5 text-muted-foreground" />
-          <span className="font-mono">
+          <span data-content-role="metric" data-content-label="step progress" className="font-mono">
             {completedSteps}/{totalSteps}
           </span>
         </div>
@@ -135,28 +135,46 @@ export function ExecutionStatsCard({
         {/* Success rate */}
         <div className="flex items-center gap-1.5">
           <CheckCircle2 className={cn("h-3.5 w-3.5", successColors.text)} />
-          <span className={cn("font-mono", successColors.text)}>{successRate.toFixed(0)}%</span>
+          <span
+            data-content-role="metric"
+            data-content-label="success rate"
+            className={cn("font-mono", successColors.text)}
+          >
+            {successRate.toFixed(0)}%
+          </span>
         </div>
 
         {/* Failed count (if any) */}
         {failedSteps > 0 && (
           <div className="flex items-center gap-1.5">
             <XCircle className={cn("h-3.5 w-3.5", errorColors.text)} />
-            <span className={cn("font-mono", errorColors.text)}>{failedSteps}</span>
+            <span
+              data-content-role="metric"
+              data-content-label="failed steps"
+              className={cn("font-mono", errorColors.text)}
+            >
+              {failedSteps}
+            </span>
           </div>
         )}
 
         {/* Elapsed time */}
         <div className="flex items-center gap-1.5">
           <Clock className="h-3.5 w-3.5 text-muted-foreground" />
-          <span className="font-mono">{elapsedDisplay}</span>
+          <span data-content-role="metric" data-content-label="elapsed time" className="font-mono">
+            {elapsedDisplay}
+          </span>
         </div>
 
         {/* Iteration */}
         {iteration !== undefined && maxIterations !== undefined && maxIterations > 1 && (
           <div className="flex items-center gap-1.5">
             <RefreshCw className="h-3.5 w-3.5 text-muted-foreground" />
-            <span className="font-mono">
+            <span
+              data-content-role="metric"
+              data-content-label="iteration progress"
+              className="font-mono"
+            >
               {iteration}/{maxIterations}
             </span>
           </div>
@@ -175,10 +193,18 @@ export function ExecutionStatsCard({
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <TrendingUp className="h-4 w-4 text-muted-foreground" />
-            <span className="text-xs font-medium">Execution Stats</span>
+            <span
+              data-content-role="heading"
+              data-content-level="3"
+              className="text-xs font-medium"
+            >
+              Execution Stats
+            </span>
           </div>
           {currentStage && stageColors && (
             <Badge
+              data-content-role="badge"
+              data-content-label="current stage"
               className={cn(
                 "text-[10px] border",
                 stageColors.bg,
@@ -199,10 +225,18 @@ export function ExecutionStatsCard({
         <div className="space-y-1">
           <div className="flex items-center gap-1.5 text-muted-foreground">
             <Activity className="h-3.5 w-3.5" />
-            <span className="text-[10px] uppercase tracking-wide">Steps</span>
+            <span data-content-role="label" className="text-[10px] uppercase tracking-wide">
+              Steps
+            </span>
           </div>
           <div className="flex items-baseline gap-1">
-            <span className="text-lg font-semibold font-mono">{completedSteps}</span>
+            <span
+              data-content-role="metric"
+              data-content-label="completed steps"
+              className="text-lg font-semibold font-mono"
+            >
+              {completedSteps}
+            </span>
             <span className="text-xs text-muted-foreground">/ {totalSteps}</span>
           </div>
           {/* Progress bar */}
@@ -221,10 +255,14 @@ export function ExecutionStatsCard({
         <div className="space-y-1">
           <div className="flex items-center gap-1.5 text-muted-foreground">
             <CheckCircle2 className="h-3.5 w-3.5" />
-            <span className="text-[10px] uppercase tracking-wide">Success</span>
+            <span data-content-role="label" className="text-[10px] uppercase tracking-wide">
+              Success
+            </span>
           </div>
           <div className="flex items-baseline gap-1">
             <span
+              data-content-role="metric"
+              data-content-label="success rate"
               className={cn(
                 "text-lg font-semibold font-mono",
                 successRate >= 80 ? successColors.text : errorColors.text,
@@ -234,7 +272,13 @@ export function ExecutionStatsCard({
             </span>
           </div>
           {failedSteps > 0 && (
-            <span className={cn("text-xs", errorColors.text)}>{failedSteps} failed</span>
+            <span
+              data-content-role="metric"
+              data-content-label="failed steps"
+              className={cn("text-xs", errorColors.text)}
+            >
+              {failedSteps} failed
+            </span>
           )}
         </div>
 
@@ -242,10 +286,18 @@ export function ExecutionStatsCard({
         <div className="space-y-1">
           <div className="flex items-center gap-1.5 text-muted-foreground">
             <Clock className="h-3.5 w-3.5" />
-            <span className="text-[10px] uppercase tracking-wide">Elapsed</span>
+            <span data-content-role="label" className="text-[10px] uppercase tracking-wide">
+              Elapsed
+            </span>
           </div>
           <div className="flex items-center gap-1.5">
-            <span className="text-lg font-semibold font-mono">{elapsedDisplay}</span>
+            <span
+              data-content-role="metric"
+              data-content-label="elapsed time"
+              className="text-lg font-semibold font-mono"
+            >
+              {elapsedDisplay}
+            </span>
             {isRunning && (
               <Loader2 className={cn("h-3.5 w-3.5 animate-spin", pendingColors.text)} />
             )}
@@ -257,10 +309,18 @@ export function ExecutionStatsCard({
           <div className="space-y-1">
             <div className="flex items-center gap-1.5 text-muted-foreground">
               <RefreshCw className="h-3.5 w-3.5" />
-              <span className="text-[10px] uppercase tracking-wide">Iteration</span>
+              <span data-content-role="label" className="text-[10px] uppercase tracking-wide">
+                Iteration
+              </span>
             </div>
             <div className="flex items-baseline gap-1">
-              <span className="text-lg font-semibold font-mono">{iteration}</span>
+              <span
+                data-content-role="metric"
+                data-content-label="iteration progress"
+                className="text-lg font-semibold font-mono"
+              >
+                {iteration}
+              </span>
               <span className="text-xs text-muted-foreground">/ {maxIterations}</span>
             </div>
           </div>

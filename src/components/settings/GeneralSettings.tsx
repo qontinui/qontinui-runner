@@ -248,8 +248,18 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
           <div className="p-3 rounded-lg bg-muted/30">
             <div className="space-y-3">
               <div className="space-y-1">
-                <div className="text-sm font-medium">Startup Profile</div>
-                <div className="text-xs text-muted-foreground">
+                <div
+                  data-content-role="label"
+                  data-content-label="startup profile"
+                  className="text-sm font-medium"
+                >
+                  Startup Profile
+                </div>
+                <div
+                  data-content-role="description"
+                  data-content-label="startup profile description"
+                  className="text-xs text-muted-foreground"
+                >
                   Choose which profile to use when the application starts
                 </div>
               </div>

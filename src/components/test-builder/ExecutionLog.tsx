@@ -57,16 +57,24 @@ export function ExecutionLog({ result }: ExecutionLogProps) {
           ) : (
             <X className="w-5 h-5 text-red-400" />
           )}
-          <span className={`font-medium ${result.success ? "text-green-400" : "text-red-400"}`}>
+          <span
+            data-content-role="status"
+            data-content-label="execution result"
+            className={`font-medium ${result.success ? "text-green-400" : "text-red-400"}`}
+          >
             {result.success ? "Execution Successful" : "Execution Failed"}
           </span>
         </div>
         <div className="flex items-center gap-4 text-sm text-neutral-400">
-          <span className="flex items-center gap-1">
+          <span
+            data-content-role="metric"
+            data-content-label="total duration"
+            className="flex items-center gap-1"
+          >
             <Clock className="w-4 h-4" />
             {result.total_duration_ms}ms
           </span>
-          <span>
+          <span data-content-role="metric" data-content-label="steps passed">
             {result.step_results.filter((s) => s.success).length}/{result.step_results.length} steps
             passed
           </span>
@@ -94,7 +102,10 @@ export function ExecutionLog({ result }: ExecutionLogProps) {
       {/* All extracted variables */}
       {Object.keys(result.all_variables).length > 0 && (
         <div className="p-3 bg-purple-900/20 border border-purple-700/30 rounded">
-          <div className="flex items-center gap-2 text-xs font-medium text-purple-400 uppercase mb-2">
+          <div
+            data-content-role="heading"
+            className="flex items-center gap-2 text-xs font-medium text-purple-400 uppercase mb-2"
+          >
             <Variable className="w-4 h-4" />
             All Extracted Variables
           </div>
@@ -165,9 +176,21 @@ function StepResult({ step, isExpanded, onToggle }: StepResultProps) {
 
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
-            <span className="font-medium text-neutral-200">{step.step_name}</span>
+            <span
+              data-content-role="label"
+              data-content-label="step name"
+              className="font-medium text-neutral-200"
+            >
+              {step.step_name}
+            </span>
             <StatusBadge code={step.response.status_code} />
-            <span className="text-xs text-neutral-500">{step.duration_ms}ms</span>
+            <span
+              data-content-role="metric"
+              data-content-label="step duration"
+              className="text-xs text-neutral-500"
+            >
+              {step.duration_ms}ms
+            </span>
           </div>
           <div className="text-xs text-neutral-500 truncate">
             {step.request.method} {step.request.url}
@@ -194,7 +217,12 @@ function StepResult({ step, isExpanded, onToggle }: StepResultProps) {
 
           {/* Request details */}
           <div className="space-y-2">
-            <div className="text-xs font-medium text-neutral-400 uppercase">Request</div>
+            <div
+              data-content-role="heading"
+              className="text-xs font-medium text-neutral-400 uppercase"
+            >
+              Request
+            </div>
             <div className="p-2 bg-neutral-950 rounded">
               <div className="flex items-center gap-2 text-sm">
                 <MethodBadge method={step.request.method} />
@@ -213,9 +241,18 @@ function StepResult({ step, isExpanded, onToggle }: StepResultProps) {
 
           {/* Response details */}
           <div className="space-y-2">
-            <div className="text-xs font-medium text-neutral-400 uppercase flex items-center gap-2">
+            <div
+              data-content-role="heading"
+              className="text-xs font-medium text-neutral-400 uppercase flex items-center gap-2"
+            >
               Response
-              <span className="text-neutral-500">({step.response.size_bytes} bytes)</span>
+              <span
+                data-content-role="metric"
+                data-content-label="response size"
+                className="text-neutral-500"
+              >
+                ({step.response.size_bytes} bytes)
+              </span>
             </div>
             <div className="p-2 bg-neutral-950 rounded">
               <pre className="text-xs text-neutral-400 overflow-auto max-h-48">
@@ -227,7 +264,10 @@ function StepResult({ step, isExpanded, onToggle }: StepResultProps) {
           {/* Extracted variables */}
           {Object.keys(step.extracted_variables).length > 0 && (
             <div className="space-y-2">
-              <div className="text-xs font-medium text-purple-400 uppercase flex items-center gap-2">
+              <div
+                data-content-role="heading"
+                className="text-xs font-medium text-purple-400 uppercase flex items-center gap-2"
+              >
                 <Variable className="w-3 h-3" />
                 Extracted Variables
               </div>

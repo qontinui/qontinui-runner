@@ -17,6 +17,7 @@ use tauri::Manager;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::config_storage::ConfigStorage;
+use crate::doctor::DoctorHandle;
 use crate::event_system::EventBroadcaster;
 use crate::orchestrator::integration::StageTransition;
 use crate::step_executor::ExecutionStepConfig;
@@ -44,6 +45,7 @@ pub struct LoopController {
     completion_executor: CompletionExecutor,
     checkpoint_db: Arc<crate::database::CheckpointDb>,
     app_handle: tauri::AppHandle,
+    doctor_handle: Option<DoctorHandle>,
 }
 
 impl LoopController {
@@ -53,6 +55,11 @@ impl LoopController {
         app_handle: tauri::AppHandle,
         pid_tracker: Arc<std::sync::Mutex<Vec<u32>>>,
     ) -> Self {
+        let doctor_handle = app_state
+            .doctor_handle
+            .try_lock()
+            .ok()
+            .and_then(|guard| guard.clone());
         Self {
             setup_executor: SetupExecutor::new(
                 app_state.clone(),
@@ -78,6 +85,7 @@ impl LoopController {
             ),
             checkpoint_db: app_state.checkpoint_db.clone(),
             app_handle,
+            doctor_handle,
         }
     }
 
@@ -115,16 +123,69 @@ impl LoopController {
     )]
     pub async fn run(
         &mut self,
-        config: LoopConfig,
-        setup_automation_steps: Vec<ExecutionStepConfig>,
-        setup_prompt_steps: Vec<ExecutionStepConfig>,
-        verification_steps: Vec<ExecutionStepConfig>,
-        agentic_steps: Vec<ExecutionStepConfig>,
-        completion_automation_steps: Vec<ExecutionStepConfig>,
-        completion_prompt_steps: Vec<ExecutionStepConfig>,
+        mut config: LoopConfig,
+        mut setup_automation_steps: Vec<ExecutionStepConfig>,
+        mut setup_prompt_steps: Vec<ExecutionStepConfig>,
+        mut verification_steps: Vec<ExecutionStepConfig>,
+        mut agentic_steps: Vec<ExecutionStepConfig>,
+        mut completion_automation_steps: Vec<ExecutionStepConfig>,
+        mut completion_prompt_steps: Vec<ExecutionStepConfig>,
     ) -> WorkflowResult {
         let start = std::time::Instant::now();
         let mut all_step_results = Vec::new();
+
+        // =====================================================================
+        // PROPAGATE TASK RUN ID to phase executors
+        // =====================================================================
+        // The execution_id is the task_run_id. Phase executors need it so their
+        // StepExecutor/HandlerContext can write result_data (e.g. generated_workflow_id).
+        self.setup_executor
+            .set_task_run_id(config.execution_id.clone());
+        self.verification_executor
+            .set_task_run_id(config.execution_id.clone());
+        self.completion_executor
+            .set_task_run_id(config.execution_id.clone());
+
+        // =====================================================================
+        // CREATE ARTIFACT DIRECTORY
+        // =====================================================================
+        if config.artifact_dir.is_none() {
+            if let Ok(app_data_dir) = self.app_handle.path().app_data_dir() {
+                let artifact_dir = app_data_dir.join("artifacts").join(&config.execution_id);
+                if let Err(e) = std::fs::create_dir_all(&artifact_dir) {
+                    warn!(
+                        "Failed to create artifact directory {:?}: {}",
+                        artifact_dir, e
+                    );
+                } else {
+                    info!("Artifact directory: {:?}", artifact_dir);
+                    config.artifact_dir = Some(artifact_dir);
+                }
+            }
+        }
+
+        // =====================================================================
+        // APPLY VARIABLE SUBSTITUTION to all step fields
+        // =====================================================================
+        if let Some(ref artifact_dir) = config.artifact_dir {
+            let artifact_dir_str = artifact_dir.to_string_lossy().replace('\\', "/");
+            let exec_id = &config.execution_id;
+            let substitute = |steps: &mut Vec<ExecutionStepConfig>| {
+                for step in steps.iter_mut() {
+                    substitute_step_vars(step, &artifact_dir_str, exec_id);
+                }
+            };
+            substitute(&mut setup_automation_steps);
+            substitute(&mut setup_prompt_steps);
+            substitute(&mut verification_steps);
+            substitute(&mut agentic_steps);
+            substitute(&mut completion_automation_steps);
+            substitute(&mut completion_prompt_steps);
+            info!(
+                "Applied variable substitution (artifact_dir={}, execution_id={})",
+                artifact_dir_str, exec_id
+            );
+        }
 
         // =====================================================================
         // DETERMINE RESUME POINT (must happen before transition loading)
@@ -181,14 +242,7 @@ impl LoopController {
             "=== UNIFIED WORKFLOW START: {} (id: {}) ===",
             config.workflow_name, config.execution_id
         );
-        let timeout_str = match config.timeout_seconds {
-            Some(t) => format!("{}s", t),
-            None => "disabled".to_string(),
-        };
-        info!(
-            "Configuration: max_iterations={}, timeout={}",
-            config.max_iterations, timeout_str
-        );
+        info!("Configuration: max_iterations={}", config.max_iterations);
         info!(
             "Steps: setup_auto={}, setup_prompt={}, verification={}, agentic={}, completion_auto={}, completion_prompt={}",
             setup_automation_steps.len(),
@@ -322,7 +376,6 @@ impl LoopController {
                     &setup_prompt_steps,
                     &config.execution_id,
                     &config.workflow_name,
-                    config.timeout_seconds,
                     &logger,
                 )
                 .await;
@@ -381,8 +434,9 @@ impl LoopController {
                 // Fire-and-forget summary generation for the failed task
                 let db = self.checkpoint_db.clone();
                 let exec_id = config.execution_id.clone();
+                let doctor_handle = self.doctor_handle.clone();
                 tokio::spawn(async move {
-                    match generate_task_summary_async(db, exec_id.clone()).await {
+                    match generate_task_summary_async(db, exec_id.clone(), doctor_handle).await {
                         Ok(_) => info!("Generated summary for failed task {}", exec_id),
                         Err(e) => warn!(
                             "Failed to generate summary for failed task {}: {}",
@@ -435,9 +489,12 @@ impl LoopController {
                 agentic_iteration,
             );
 
-            // Build context for agentic phase (we don't have the verification result,
-            // so we'll use a generic context)
-            let agentic_context = "Resuming from interrupted agentic phase. Please continue fixing the issues from where you left off.".to_string();
+            // Build context for agentic phase from stored verification data
+            let agentic_context = build_resume_agentic_context(
+                &self.checkpoint_db,
+                &config.execution_id,
+                agentic_iteration,
+            );
 
             let agentic_outcome = self
                 .agentic_executor
@@ -446,6 +503,7 @@ impl LoopController {
                     agentic_iteration,
                     &agentic_context,
                     !agentic_steps.is_empty(),
+                    &agentic_steps,
                     &logger,
                 )
                 .await;
@@ -486,6 +544,7 @@ impl LoopController {
                 &resumed_config,
                 &verification_steps,
                 !agentic_steps.is_empty(),
+                &agentic_steps,
                 &mut all_step_results,
                 &mut transitions,
                 &mut current_stage,
@@ -522,6 +581,7 @@ impl LoopController {
                 &adjusted_config,
                 &verification_steps,
                 !agentic_steps.is_empty(),
+                &agentic_steps,
                 &mut all_step_results,
                 &mut transitions,
                 &mut current_stage,
@@ -579,7 +639,6 @@ impl LoopController {
                     &completion_prompt_steps,
                     &config.execution_id,
                     &config.workflow_name,
-                    config.timeout_seconds,
                     loop_result.iterations_run,
                     &logger,
                 )
@@ -639,13 +698,15 @@ impl LoopController {
             // Mark task as completed
             // Note: We mark as completed even for unfixable errors because the AI
             // did its job and determined the errors cannot be fixed automatically.
-            self.mark_task_completed(&config.execution_id).await;
+            self.mark_task_completed(&config.execution_id, Some(&config.workflow_id))
+                .await;
 
             // Fire-and-forget summary generation for the completed task
             let db = self.checkpoint_db.clone();
             let exec_id = config.execution_id.clone();
+            let doctor_handle = self.doctor_handle.clone();
             tokio::spawn(async move {
-                match generate_task_summary_async(db, exec_id.clone()).await {
+                match generate_task_summary_async(db, exec_id.clone(), doctor_handle).await {
                     Ok(_) => info!("Generated summary for completed task {}", exec_id),
                     Err(e) => warn!(
                         "Failed to generate summary for completed task {}: {}",
@@ -693,8 +754,9 @@ impl LoopController {
                 // Fire-and-forget summary generation for stopped task
                 let db = self.checkpoint_db.clone();
                 let exec_id = config.execution_id.clone();
+                let doctor_handle = self.doctor_handle.clone();
                 tokio::spawn(async move {
-                    match generate_task_summary_async(db, exec_id.clone()).await {
+                    match generate_task_summary_async(db, exec_id.clone(), doctor_handle).await {
                         Ok(_) => info!("Generated summary for stopped task {}", exec_id),
                         Err(e) => warn!(
                             "Failed to generate summary for stopped task {}: {}",
@@ -722,8 +784,9 @@ impl LoopController {
                 // Fire-and-forget summary generation for failed task
                 let db = self.checkpoint_db.clone();
                 let exec_id = config.execution_id.clone();
+                let doctor_handle = self.doctor_handle.clone();
                 tokio::spawn(async move {
-                    match generate_task_summary_async(db, exec_id.clone()).await {
+                    match generate_task_summary_async(db, exec_id.clone(), doctor_handle).await {
                         Ok(_) => info!("Generated summary for failed task {}", exec_id),
                         Err(e) => warn!(
                             "Failed to generate summary for failed task {}: {}",
@@ -734,6 +797,37 @@ impl LoopController {
 
                 info!("=== WORKFLOW FAILED ===");
             }
+        }
+
+        // Record learning outcome for meta-workflows (fire-and-forget)
+        if config.workflow_name.starts_with("AI Generate:") || config.is_dev_mode {
+            let db = self.checkpoint_db.clone();
+            let outcome = crate::orchestrator::learning_recorder::WorkflowOutcome {
+                task_run_id: config.execution_id.clone(),
+                workflow_name: config.workflow_name.clone(),
+                category: "meta".to_string(),
+                status: if loop_result.verification_passed {
+                    "complete".to_string()
+                } else {
+                    "failed".to_string()
+                },
+                duration_secs: start.elapsed().as_secs_f64(),
+                iterations: loop_result.iterations_run,
+                verification_passed: loop_result.verification_passed,
+                max_iterations_reached: loop_result.max_iterations_reached,
+                was_stopped: loop_result.was_stopped,
+                tools_used: Vec::new(),
+                files_modified: Vec::new(),
+                error_type: None,
+                error_message: None,
+            };
+            tokio::spawn(async move {
+                if let Err(e) = db.with_conn(|conn| {
+                    crate::orchestrator::learning_recorder::record_workflow_learning(conn, &outcome)
+                }) {
+                    warn!("Failed to record learning outcome: {}", e);
+                }
+            });
         }
 
         WorkflowResult {
@@ -751,7 +845,7 @@ impl LoopController {
     /// The AI cannot bypass this by outputting [TASK_COMPLETE] or similar.
     #[instrument(
         name = "workflow.verification_agentic_loop",
-        skip(self, verification_steps, all_step_results, transitions, current_stage, logger),
+        skip(self, verification_steps, agentic_steps, all_step_results, transitions, current_stage, logger),
         fields(
             execution_id = %config.execution_id,
             max_iterations = config.max_iterations,
@@ -764,6 +858,7 @@ impl LoopController {
         config: &LoopConfig,
         verification_steps: &[ExecutionStepConfig],
         has_agentic_steps: bool,
+        agentic_steps: &[ExecutionStepConfig],
         all_step_results: &mut Vec<crate::step_executor::StepExecutionResult>,
         transitions: &mut Vec<StageTransition>,
         current_stage: &mut String,
@@ -812,6 +907,15 @@ impl LoopController {
                 warn!(
                     "Failed to reset task status to running for iteration {}: {}",
                     iteration, e
+                );
+            } else {
+                // Broadcast task-run-update to both Tauri + WebSocket
+                let broadcaster = EventBroadcaster::new(self.app_handle.clone());
+                broadcaster.task_run_update(
+                    &config.execution_id,
+                    "running",
+                    Some(iteration),
+                    None,
                 );
             }
 
@@ -918,9 +1022,11 @@ impl LoopController {
             }
 
             // Store verification result in database for Recap page
+            // Use parent task ID for workflow sequences (same remapping as step checkpoints)
             if let Ok(result_json) = serde_json::to_value(&verification_result) {
+                let parent_id = get_parent_task_id(&config.execution_id);
                 let _ = self.checkpoint_db.store_verification_phase_result(
-                    &config.execution_id,
+                    &parent_id,
                     iteration,
                     &result_json,
                 );
@@ -1045,6 +1151,7 @@ impl LoopController {
                     iteration,
                     &failure_context,
                     has_agentic_steps,
+                    agentic_steps,
                     logger,
                 )
                 .await;
@@ -1160,11 +1267,26 @@ impl LoopController {
         }
     }
 
-    async fn mark_task_completed(&self, execution_id: &str) {
+    async fn mark_task_completed(&self, execution_id: &str, workflow_id: Option<&str>) {
         if let Err(e) = self.checkpoint_db.complete_task_run(execution_id) {
             error!("Failed to mark task {} as completed: {}", execution_id, e);
         } else {
             info!("Marked task {} as COMPLETED", execution_id);
+            // Broadcast task-run-update to both Tauri + WebSocket
+            let broadcaster = EventBroadcaster::new(self.app_handle.clone());
+            broadcaster.task_run_update(execution_id, "completed", None, None);
+
+            // Fire-and-forget: try to promote workflow to example library
+            if let Some(wf_id) = workflow_id {
+                let db = self.checkpoint_db.clone();
+                let wf_id = wf_id.to_string();
+                let _ = db.with_conn(|conn| {
+                    crate::workflow_generation::example_workflows::try_promote_on_success(
+                        conn, &wf_id,
+                    );
+                    Ok(())
+                });
+            }
         }
     }
 
@@ -1173,6 +1295,14 @@ impl LoopController {
             error!("Failed to mark task {} as failed: {}", execution_id, e);
         } else {
             info!("Marked task {} as FAILED: {}", execution_id, reason);
+            // Broadcast task-run-update to both Tauri + WebSocket
+            let broadcaster = EventBroadcaster::new(self.app_handle.clone());
+            broadcaster.task_run_update(
+                execution_id,
+                "failed",
+                None,
+                Some(serde_json::json!({ "reason": reason })),
+            );
         }
     }
 
@@ -1286,53 +1416,47 @@ impl LoopController {
     /// After successful persistence, broadcasts an `orchestrator-state-change` event
     /// to both Tauri frontend and WebSocket clients in real-time.
     ///
-    /// Note: For workflow sequence children (e.g., workflow-sequence-X-workflow-N),
-    /// we skip state persistence since they don't have task_run records.
-    /// The parent sequence task_run tracks overall status.
+    /// For workflow sequence children (e.g., workflow-sequence-X-workflow-N),
+    /// state is persisted under the parent sequence ID since children don't have
+    /// their own task_run records.
     fn persist_workflow_state(&self, execution_id: &str, state: &UnifiedWorkflowState) {
-        // Skip persistence for workflow sequence children - they don't have task_run records
-        // and would fail the foreign key constraint
-        let parent_id = get_parent_task_id(execution_id);
-        if parent_id != execution_id {
-            debug!(
-                "Skipping state persistence for sequence child {} (parent: {})",
-                execution_id, parent_id
-            );
-            return;
-        }
+        // For workflow sequence children (e.g., workflow-sequence-X-workflow-N),
+        // persist under the parent ID since children don't have their own task_run records.
+        let persist_id = get_parent_task_id(execution_id);
 
         let state_machine = StateMachine::new(
             self.checkpoint_db.clone(),
-            execution_id,
+            &persist_id,
             "unified",
             state.clone(),
         );
 
         if let Err(e) = state_machine.persist() {
-            warn!(
-                "Failed to persist workflow state for {}: {}",
-                execution_id, e
-            );
+            warn!("Failed to persist workflow state for {}: {}", persist_id, e);
         } else {
             debug!(
-                "Persisted workflow state '{}' for execution {}",
+                "Persisted workflow state '{}' for execution {} (db key: {})",
                 state.name(),
-                execution_id
+                execution_id,
+                persist_id
             );
 
             // Broadcast real-time event to notify all clients (Tauri + WebSocket) of state change
             let broadcaster = EventBroadcaster::new(self.app_handle.clone());
             broadcaster.orchestrator_state_change(
-                execution_id,
+                &persist_id,
                 state.name(),
                 state.iteration().unwrap_or(0),
                 state.phase().unwrap_or("unknown"),
             );
 
-            debug!(
-                "Broadcast orchestrator-state-change event for {} (state: {})",
-                execution_id,
-                state.name()
+            // Also broadcast step-progress so widgets watching step data refetch
+            broadcaster.step_progress(
+                &persist_id,
+                0,
+                state.name(),
+                state.phase().unwrap_or("unknown"),
+                None,
             );
         }
     }
@@ -1356,11 +1480,12 @@ impl LoopController {
             transitions.push(transition);
             *current_stage = to_stage.to_string();
 
-            // Persist to database
+            // Persist to database (use parent ID for sequence children)
+            let persist_id = get_parent_task_id(execution_id);
             if let Ok(json) = serde_json::to_string(&transitions) {
                 if let Err(e) = self
                     .checkpoint_db
-                    .update_task_run_transition_history(execution_id, &json)
+                    .update_task_run_transition_history(&persist_id, &json)
                 {
                     warn!("Failed to persist transition history: {}", e);
                 }
@@ -1554,7 +1679,7 @@ pub async fn resume_interrupted_workflows(
                                 &workflow.setup_steps,
                                 Some("setup"),
                             );
-                            let verification_steps = convert_json_steps_with_phase(
+                            let verification_steps = convert_all_json_steps_with_phase(
                                 &workflow.verification_steps,
                                 0,
                                 Some("verification"),
@@ -1595,14 +1720,15 @@ pub async fn resume_interrupted_workflows(
 
                             let loop_config = super::types::LoopConfig {
                                 max_iterations: workflow.max_iterations,
-                                timeout_seconds: workflow.timeout_seconds, // Use workflow setting
-                                base_prompt: String::new(),                // Not used for resume
+                                base_prompt: String::new(), // Not used for resume
                                 workflow_name: task_name.clone(),
                                 workflow_id: wf_id_for_spawn.to_string(),
                                 execution_id: task_id.clone(),
                                 targeted_error_ids: workflow.targeted_error_ids.clone(),
                                 starting_iteration,
                                 run_agentic_first,
+                                artifact_dir: None,
+                                is_dev_mode: cfg!(debug_assertions),
                             };
 
                             controller
@@ -1698,7 +1824,7 @@ pub async fn resume_interrupted_workflows(
                                 &workflow.setup_steps,
                                 Some("setup"),
                             );
-                            let verification_steps = convert_json_steps_with_phase(
+                            let verification_steps = convert_all_json_steps_with_phase(
                                 &workflow.verification_steps,
                                 0,
                                 Some("verification"),
@@ -1734,7 +1860,6 @@ pub async fn resume_interrupted_workflows(
 
                             let loop_config = super::types::LoopConfig {
                                 max_iterations: workflow.max_iterations,
-                                timeout_seconds: workflow.timeout_seconds,
                                 base_prompt: String::new(),
                                 workflow_name: task_name.clone(),
                                 workflow_id: wf_id.to_string(),
@@ -1742,6 +1867,8 @@ pub async fn resume_interrupted_workflows(
                                 targeted_error_ids: workflow.targeted_error_ids.clone(),
                                 starting_iteration,
                                 run_agentic_first,
+                                artifact_dir: None,
+                                is_dev_mode: cfg!(debug_assertions),
                             };
 
                             controller
@@ -1812,6 +1939,82 @@ pub fn extract_workflow_id_from_task_id(task_id: &str) -> Option<String> {
 /// If `explicit_phase` is provided, it will be set on all steps that don't
 /// already have a phase specified. This ensures steps from setup_steps array
 /// get phase="setup", etc.
+/// Variables available for substitution in step fields.
+pub struct SubstitutionVars {
+    pub artifact_dir: Option<String>,
+    pub execution_id: String,
+    pub iteration: u32,
+}
+
+/// Apply variable substitution to a JSON step value.
+///
+/// Replaces template variables in all string values within the JSON:
+/// - `{{artifact_dir}}` → artifact directory path (forward slashes)
+/// - `{{execution_id}}` → the task run ID
+/// - `{{iteration}}` → current iteration number
+pub fn apply_variable_substitution(
+    step: &serde_json::Value,
+    vars: &SubstitutionVars,
+) -> serde_json::Value {
+    let mut json_str = serde_json::to_string(step).unwrap_or_default();
+
+    if let Some(ref artifact_dir) = vars.artifact_dir {
+        // Use forward slashes on all platforms for consistency
+        let normalized = artifact_dir.replace('\\', "/");
+        json_str = json_str.replace("{{artifact_dir}}", &normalized);
+    }
+    json_str = json_str.replace("{{execution_id}}", &vars.execution_id);
+    json_str = json_str.replace("{{iteration}}", &vars.iteration.to_string());
+
+    serde_json::from_str(&json_str).unwrap_or_else(|_| step.clone())
+}
+
+/// Apply variable substitution to a slice of JSON step values.
+pub fn apply_substitution_to_steps(
+    steps: &[serde_json::Value],
+    vars: &SubstitutionVars,
+) -> Vec<serde_json::Value> {
+    steps
+        .iter()
+        .map(|s| apply_variable_substitution(s, vars))
+        .collect()
+}
+
+/// Apply variable substitution to an ExecutionStepConfig's string fields.
+///
+/// Replaces `{{artifact_dir}}` and `{{execution_id}}` in all relevant
+/// Option<String> fields. This is called after the artifact directory
+/// is created but before steps are executed.
+fn substitute_step_vars(step: &mut ExecutionStepConfig, artifact_dir: &str, execution_id: &str) {
+    let sub = |s: &mut Option<String>| {
+        if let Some(val) = s {
+            if val.contains("{{artifact_dir}}") || val.contains("{{execution_id}}") {
+                *val = val
+                    .replace("{{artifact_dir}}", artifact_dir)
+                    .replace("{{execution_id}}", execution_id);
+            }
+        }
+    };
+
+    sub(&mut step.output_path);
+    sub(&mut step.input_path);
+    sub(&mut step.artifact_input_path);
+    sub(&mut step.ai_review_input_path);
+    sub(&mut step.shell_command);
+    sub(&mut step.shell_command_working_directory);
+    sub(&mut step.check_command);
+    sub(&mut step.check_working_directory);
+
+    // Also substitute in prompt content (may reference artifact paths)
+    if let Some(ref mut content) = step.prompt_content {
+        if content.contains("{{artifact_dir}}") || content.contains("{{execution_id}}") {
+            *content = content
+                .replace("{{artifact_dir}}", artifact_dir)
+                .replace("{{execution_id}}", execution_id);
+        }
+    }
+}
+
 pub fn convert_json_steps_to_execution_steps(
     steps: &[serde_json::Value],
     monitor: i32,
@@ -1837,6 +2040,57 @@ pub fn convert_json_steps_with_phase(
             let step_type = step.get("type").and_then(|t| t.as_str()).unwrap_or("");
             step_type != "prompt" && step_type != "ai_session"
         })
+        .filter_map(|step| {
+            let mut config = if let Ok(mut config) =
+                serde_json::from_value::<ExecutionStepConfig>(step.clone())
+            {
+                if config.monitor_index.is_none() {
+                    config.monitor_index = Some(monitor);
+                }
+                config
+            } else {
+                // Fall back to minimal conversion
+                let step_type = step.get("type").and_then(|t| t.as_str())?;
+                ExecutionStepConfig {
+                    step_type: step_type.to_string(),
+                    name: step
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string()),
+                    monitor_index: Some(monitor),
+                    ..Default::default()
+                }
+            };
+
+            // Set explicit phase if not already set
+            if config.phase.is_none() {
+                if let Some(phase_str) = explicit_phase {
+                    if let Some(phase) = StepPhase::from_str_opt(phase_str) {
+                        config.set_phase(phase);
+                    }
+                }
+            }
+
+            Some(config)
+        })
+        .collect()
+}
+
+/// Convert ALL JSON steps (including prompt-type) to ExecutionStepConfig with explicit phase.
+///
+/// Unlike `convert_json_steps_with_phase` which filters out prompt steps,
+/// this function preserves all step types in their original order.
+/// This is needed for the verification phase where prompt-type steps
+/// (AI-evaluated checks) must be included so that gate steps can reference them.
+pub fn convert_all_json_steps_with_phase(
+    steps: &[serde_json::Value],
+    monitor: i32,
+    explicit_phase: Option<&str>,
+) -> Vec<ExecutionStepConfig> {
+    use crate::step_executor::StepPhase;
+
+    steps
+        .iter()
         .filter_map(|step| {
             let mut config = if let Ok(mut config) =
                 serde_json::from_value::<ExecutionStepConfig>(step.clone())
@@ -2019,4 +2273,135 @@ fn detect_regression(
     );
 
     Some(warning)
+}
+
+// =============================================================================
+// Resume Context Builder
+// =============================================================================
+
+/// Build agentic context from stored verification data when resuming from an
+/// interrupted agentic phase.
+///
+/// Tries multiple data sources in order:
+/// 1. Verification phase result from database (full structured result)
+/// 2. Step checkpoints from database (step names + error messages)
+/// 3. Fallback generic message
+fn build_resume_agentic_context(
+    checkpoint_db: &Arc<crate::database::CheckpointDb>,
+    execution_id: &str,
+    iteration: u32,
+) -> String {
+    // Strategy 1: Try loading the full verification phase result.
+    // The result may be stored under the execution_id or a child ID.
+    if let Ok(Some(result_json)) =
+        checkpoint_db.get_verification_phase_result(execution_id, iteration)
+    {
+        // Try to deserialize into VerificationPhaseResult and use build_failure_context()
+        if let Ok(result) =
+            serde_json::from_value::<crate::step_executor::VerificationPhaseResult>(result_json)
+        {
+            let context = result.build_failure_context();
+            if !context.is_empty() {
+                info!(
+                    "RESUME: Built agentic context from verification phase result ({} chars)",
+                    context.len()
+                );
+                return context;
+            }
+        }
+    }
+
+    // Strategy 2: Build context from step checkpoints (which remap to parent ID).
+    let checkpoint_mgr =
+        crate::workflow_state::CheckpointManager::new(checkpoint_db.clone(), "unified");
+    if let Ok(checkpoints) =
+        checkpoint_mgr.get_completed_steps(execution_id, "verification", Some(iteration))
+    {
+        if !checkpoints.is_empty() {
+            let failed: Vec<_> = checkpoints
+                .iter()
+                .filter(|cp| {
+                    matches!(
+                        cp.status,
+                        crate::workflow_state::StepCheckpointStatus::Failed
+                    )
+                })
+                .collect();
+
+            if !failed.is_empty() {
+                let total = checkpoints.len();
+                let passed = checkpoints
+                    .iter()
+                    .filter(|cp| {
+                        matches!(
+                            cp.status,
+                            crate::workflow_state::StepCheckpointStatus::Success
+                        )
+                    })
+                    .count();
+
+                let mut context = String::new();
+                context.push_str("## Verification Results (Resumed)\n\n");
+                context.push_str(&format!(
+                    "**Status:** {} of {} verification steps passed\n\n",
+                    passed, total
+                ));
+                context.push_str("### Failed Steps\n\n");
+
+                for cp in &failed {
+                    let name = cp.step_name.as_deref().unwrap_or("unknown");
+                    let step_type = &cp.step_type;
+                    context.push_str(&format!("#### {} ({})\n", name, step_type));
+
+                    if let Some(ref error) = cp.error {
+                        context.push_str(&format!("**Error:** {}\n", error));
+                    }
+
+                    // If result_json is available (e.g., for successful steps that later
+                    // became relevant), include it
+                    if let Some(ref result_str) = cp.result_json {
+                        if let Ok(result_data) =
+                            serde_json::from_str::<serde_json::Value>(result_str)
+                        {
+                            // Extract stdout/output if present
+                            if let Some(output) = result_data
+                                .get("stdout")
+                                .or_else(|| result_data.get("output"))
+                                .and_then(|v| v.as_str())
+                            {
+                                if !output.is_empty() {
+                                    let truncated = if output.len() > 2000 {
+                                        format!(
+                                            "{}...\n[truncated, {} more chars]",
+                                            &output[..2000],
+                                            output.len() - 2000
+                                        )
+                                    } else {
+                                        output.to_string()
+                                    };
+                                    context.push_str(&format!(
+                                        "**Output:**\n```\n{}\n```\n",
+                                        truncated
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
+                    context.push('\n');
+                }
+
+                info!(
+                    "RESUME: Built agentic context from step checkpoints ({} chars, {} failed steps)",
+                    context.len(),
+                    failed.len()
+                );
+                return context;
+            }
+        }
+    }
+
+    // Strategy 3: Fallback
+    info!("RESUME: No verification data found, using fallback context");
+    "Resuming from interrupted agentic phase. The previous verification found failures. Please investigate and fix the issues.".to_string()
 }

@@ -441,9 +441,19 @@ export function McpCallStepEditor({ step, open, onClose, onSave }: McpCallStepEd
             {serverId && (
               <p className="text-xs text-zinc-500 mt-1">
                 {isConnected ? (
-                  <span className="text-green-400">Connected - {tools.length} tools available</span>
+                  <span
+                    data-content-role="status"
+                    data-content-label="server connection status"
+                    className="text-green-400"
+                  >
+                    Connected - {tools.length} tools available
+                  </span>
                 ) : (
-                  <span className="text-yellow-500">
+                  <span
+                    data-content-role="status"
+                    data-content-label="server connection status"
+                    className="text-yellow-500"
+                  >
                     Not connected - click Connect to load tools
                   </span>
                 )}

@@ -995,10 +995,18 @@ function ApiRequestConfig({
       {/* Summary display */}
       <div className="p-3 bg-zinc-800 border border-zinc-700 rounded-md space-y-2">
         <div className="flex items-center gap-2">
-          <span className="px-2 py-0.5 text-xs font-medium rounded bg-cyan-500/20 text-cyan-400">
+          <span
+            data-content-role="badge"
+            data-content-label="HTTP method"
+            className="px-2 py-0.5 text-xs font-medium rounded bg-cyan-500/20 text-cyan-400"
+          >
             {step.method}
           </span>
-          <span className="text-sm text-zinc-300 truncate flex-1 font-mono">
+          <span
+            data-content-role="body-text"
+            data-content-label="request URL"
+            className="text-sm text-zinc-300 truncate flex-1 font-mono"
+          >
             {step.url || "No URL configured"}
           </span>
         </div>
@@ -1066,16 +1074,30 @@ function McpCallConfig({
       {/* Summary display */}
       <div className="p-3 bg-zinc-800 border border-zinc-700 rounded-md space-y-2">
         <div className="flex items-center gap-2">
-          <span className="px-2 py-0.5 text-xs font-medium rounded bg-purple-500/20 text-purple-400">
+          <span
+            data-content-role="badge"
+            className="px-2 py-0.5 text-xs font-medium rounded bg-purple-500/20 text-purple-400"
+          >
             MCP
           </span>
-          <span className="text-sm text-zinc-300 truncate flex-1 font-mono">
+          <span
+            data-content-role="body-text"
+            data-content-label="MCP server name"
+            className="text-sm text-zinc-300 truncate flex-1 font-mono"
+          >
             {step.server_name || step.server_id || "No server configured"}
           </span>
         </div>
         {step.tool_name && (
           <p className="text-xs text-zinc-400">
-            Tool: <span className="text-zinc-300 font-mono">{step.tool_name}</span>
+            Tool:{" "}
+            <span
+              data-content-role="label"
+              data-content-label="MCP tool name"
+              className="text-zinc-300 font-mono"
+            >
+              {step.tool_name}
+            </span>
           </p>
         )}
         {step.extractions && step.extractions.length > 0 && (
@@ -1134,7 +1156,10 @@ function AwasDiscoverConfig({
   return (
     <div className="space-y-4">
       <div className="p-3 bg-teal-900/20 border border-teal-700/50 rounded-md">
-        <div className="flex items-center gap-2 text-teal-400 text-sm font-medium mb-1">
+        <div
+          data-content-role="heading"
+          className="flex items-center gap-2 text-teal-400 text-sm font-medium mb-1"
+        >
           <Search className="w-4 h-4" />
           AWAS Manifest Discovery
         </div>
@@ -1186,7 +1211,10 @@ function AwasExecuteConfig({
   return (
     <div className="space-y-4">
       <div className="p-3 bg-teal-900/20 border border-teal-700/50 rounded-md">
-        <div className="flex items-center gap-2 text-teal-400 text-sm font-medium mb-1">
+        <div
+          data-content-role="heading"
+          className="flex items-center gap-2 text-teal-400 text-sm font-medium mb-1"
+        >
           <Play className="w-4 h-4" />
           AWAS Action Execution
         </div>
@@ -1256,7 +1284,10 @@ function AwasCheckSupportConfig({
   return (
     <div className="space-y-4">
       <div className="p-3 bg-teal-900/20 border border-teal-700/50 rounded-md">
-        <div className="flex items-center gap-2 text-teal-400 text-sm font-medium mb-1">
+        <div
+          data-content-role="heading"
+          className="flex items-center gap-2 text-teal-400 text-sm font-medium mb-1"
+        >
           <CheckCircle className="w-4 h-4" />
           AWAS Support Check
         </div>
@@ -1296,7 +1327,10 @@ function AwasListActionsConfig({
   return (
     <div className="space-y-4">
       <div className="p-3 bg-teal-900/20 border border-teal-700/50 rounded-md">
-        <div className="flex items-center gap-2 text-teal-400 text-sm font-medium mb-1">
+        <div
+          data-content-role="heading"
+          className="flex items-center gap-2 text-teal-400 text-sm font-medium mb-1"
+        >
           <List className="w-4 h-4" />
           AWAS List Actions
         </div>
@@ -1336,7 +1370,10 @@ function AwasExtractElementsConfig({
   return (
     <div className="space-y-4">
       <div className="p-3 bg-teal-900/20 border border-teal-700/50 rounded-md">
-        <div className="flex items-center gap-2 text-teal-400 text-sm font-medium mb-1">
+        <div
+          data-content-role="heading"
+          className="flex items-center gap-2 text-teal-400 text-sm font-medium mb-1"
+        >
           <FileSearch className="w-4 h-4" />
           AWAS Element Extraction
         </div>

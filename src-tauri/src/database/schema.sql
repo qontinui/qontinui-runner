@@ -1,5 +1,5 @@
 -- SQLite Schema for qontinui-runner
--- Version: 53
+-- Version: 55
 --
 -- This schema provides persistent storage for task runs, settings,
 -- prompts, and scheduler state.
@@ -35,6 +35,7 @@
 -- Version 44 adds error monitoring system (log_sources, error_events tables with FTS).
 -- Version 45 adds bridge_id to task_runs for multi-bridge support.
 -- Version 53 adds preflight_check_enabled to unified_workflows for automatic pre-flight environment checks.
+-- Version 55 adds embedding BLOB columns for hybrid RAG search and workflow_generation_feedback table.
 
 -- Schema version tracking
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -238,9 +239,16 @@ CREATE TABLE IF NOT EXISTS task_runs (
     -- Workflow type ('unified', 'legacy_session', 'automation_only', or NULL for legacy)
     workflow_type TEXT,  -- Unified workflows should only have status modified by LoopController
 
+    -- Structured result data (JSON blob for meta-workflow outputs, etc.)
+    result_data TEXT,  -- JSON: e.g. {"generated_workflow_id": "..."}
+
     -- Web integration
     workspace_id TEXT,  -- Links task to a workspace/organization from qontinui-web
     triggered_by TEXT,  -- Identifies who/what triggered the task run
+
+    -- Embedding vectors for hybrid RAG search (384-dim MiniLM as f32 BLOB, 1536 bytes each)
+    prompt_embedding BLOB,   -- Embedding of the task prompt/description
+    summary_embedding BLOB,  -- Embedding of the AI-generated summary
 
     -- Timestamps
     created_at TEXT NOT NULL,
@@ -309,6 +317,10 @@ CREATE TABLE IF NOT EXISTS task_run_findings (
     question TEXT,
     input_options TEXT,            -- JSON array of options
     user_response TEXT,
+
+    -- Embedding vectors for hybrid RAG search (384-dim MiniLM as f32 BLOB)
+    title_embedding BLOB,        -- Embedding of the finding title
+    description_embedding BLOB,  -- Embedding of the finding description
 
     -- Timestamps
     detected_at TEXT NOT NULL,
@@ -606,6 +618,9 @@ CREATE TABLE IF NOT EXISTS task_knowledge (
     resolution_notes TEXT,
     resolved_at TEXT,
 
+    -- Embedding vector for hybrid RAG search (384-dim MiniLM as f32 BLOB)
+    content_embedding BLOB,  -- Embedding of the knowledge content
+
     created_at TEXT NOT NULL,
 
     FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
@@ -814,14 +829,29 @@ CREATE TABLE IF NOT EXISTS unified_workflows (
     -- Pre-flight check configuration
     preflight_check_enabled INTEGER DEFAULT 1,  -- 1 = enabled (default), 0 = disabled
 
+    -- Generation tracking (for workflows created by meta-workflows)
+    generated_by_task_run_id TEXT,  -- Links back to the meta-workflow task_run that created this
+
+    -- Embedding vector for hybrid RAG search (384-dim MiniLM as f32 BLOB)
+    description_embedding BLOB,  -- Embedding of the workflow description
+
+    -- Example library status for RAG-based generation
+    -- 'pending' = not yet in library (auto-added on first successful AI-generated run)
+    -- 'active' = in the example library, available for RAG retrieval
+    -- 'excluded' = user opted out, never auto-added
+    example_status TEXT DEFAULT 'pending',
+
     -- Timestamps
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+
+    FOREIGN KEY (generated_by_task_run_id) REFERENCES task_runs(id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_unified_workflows_category ON unified_workflows(category);
 CREATE INDEX IF NOT EXISTS idx_unified_workflows_updated_at ON unified_workflows(updated_at);
 CREATE INDEX IF NOT EXISTS idx_unified_workflows_name ON unified_workflows(name);
+CREATE INDEX IF NOT EXISTS idx_unified_workflows_example_status ON unified_workflows(example_status);
 
 -- =============================================================================
 -- Task Run Event Logs (Phase 10: Hybrid Event Logging)
@@ -1063,6 +1093,7 @@ CREATE TABLE IF NOT EXISTS learning_outcomes (
     error_type TEXT,
     error_message TEXT,
     feedback TEXT,  -- JSON array
+    context_embedding BLOB,  -- Embedding of task context (384-dim MiniLM as f32 BLOB)
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_learning_outcomes_task_id ON learning_outcomes(task_id);
@@ -1077,6 +1108,7 @@ CREATE TABLE IF NOT EXISTS learning_patterns (
     confidence REAL NOT NULL,
     occurrences INTEGER NOT NULL DEFAULT 1,
     context TEXT,  -- JSON with additional context
+    description_embedding BLOB,  -- Embedding of pattern description (384-dim MiniLM as f32 BLOB)
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -1734,6 +1766,9 @@ CREATE TABLE IF NOT EXISTS error_events (
     resolved_by_task_run_id TEXT,           -- Which workflow fixed this error
     resolution_notes TEXT,
 
+    -- Embedding vector for hybrid RAG search (384-dim MiniLM as f32 BLOB)
+    message_embedding BLOB,  -- Embedding of the error message
+
     -- Status timestamps
     acknowledged_at TEXT,
     resolved_at TEXT
@@ -1775,6 +1810,47 @@ CREATE TRIGGER IF NOT EXISTS error_events_au AFTER UPDATE ON error_events BEGIN
     INSERT INTO error_events_fts(rowid, message, stack_trace, error_type)
     VALUES (new.id, new.message, new.stack_trace, new.error_type);
 END;
+
+-- =============================================================================
+-- Workflow Generation Feedback (Version 55)
+-- =============================================================================
+-- Captures structured feedback when users edit, delete, or rate AI-generated workflows.
+-- Replaces info! log-only feedback with queryable DB records for self-improvement.
+
+CREATE TABLE IF NOT EXISTS workflow_generation_feedback (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL,              -- The workflow that received feedback
+    task_run_id TEXT,                       -- The meta-workflow task run that generated it
+
+    -- Feedback type: 'edit', 'delete', 'rating', 'fork'
+    feedback_type TEXT NOT NULL,
+
+    -- Edit details (when feedback_type = 'edit')
+    edited_field TEXT,                      -- Which field was changed (e.g., 'setup_steps', 'description')
+    old_value TEXT,                         -- Previous value (JSON for complex fields)
+    new_value TEXT,                         -- New value (JSON for complex fields)
+
+    -- Delete details (when feedback_type = 'delete')
+    delete_reason TEXT,                     -- Optional reason for deletion
+
+    -- Rating details (when feedback_type = 'rating')
+    rating INTEGER,                         -- 1-5 star rating
+    rating_comment TEXT,                    -- Optional comment with the rating
+
+    -- Context
+    workflow_category TEXT,                 -- Category of the workflow at time of feedback
+    workflow_description TEXT,              -- Description of the workflow at time of feedback
+
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+
+    FOREIGN KEY (workflow_id) REFERENCES unified_workflows(id) ON DELETE CASCADE,
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_wgf_workflow_id ON workflow_generation_feedback(workflow_id);
+CREATE INDEX IF NOT EXISTS idx_wgf_task_run_id ON workflow_generation_feedback(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_wgf_feedback_type ON workflow_generation_feedback(feedback_type);
+CREATE INDEX IF NOT EXISTS idx_wgf_created_at ON workflow_generation_feedback(created_at);
 
 -- =============================================================================
 -- Recording & Playback System (Version 46)
@@ -1984,4 +2060,4 @@ CREATE INDEX IF NOT EXISTS idx_spans_duration ON execution_spans(duration_ms);
 -- Initialize singleton tables
 INSERT OR IGNORE INTO gui_lock (id, holder_session_id, acquired_at) VALUES (1, NULL, NULL);
 INSERT OR IGNORE INTO scheduler_settings (id) VALUES (1);
-INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (52, datetime('now'));
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (55, datetime('now'));

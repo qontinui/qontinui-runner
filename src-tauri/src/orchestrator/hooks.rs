@@ -389,15 +389,9 @@ impl HookExecutor {
             HookAction::Command {
                 command,
                 working_dir,
-                timeout_seconds,
+                timeout_seconds: _,
                 env,
-            } => self.execute_command(
-                command,
-                working_dir.as_deref(),
-                *timeout_seconds,
-                env,
-                context,
-            ),
+            } => self.execute_command(command, working_dir.as_deref(), env, context),
             HookAction::Webhook {
                 url,
                 method,
@@ -428,7 +422,6 @@ impl HookExecutor {
         &self,
         command: &str,
         working_dir: Option<&str>,
-        _timeout_seconds: u64,
         env: &HashMap<String, String>,
         context: &HookContext,
     ) -> Result<String, String> {

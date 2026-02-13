@@ -92,8 +92,18 @@ function TestListItem({
       )}
       <Icon className="w-4 h-4 flex-shrink-0 text-muted-foreground" />
       <div className="flex-1 min-w-0">
-        <div className="text-sm font-medium truncate">{test.name}</div>
-        <div className="text-xs text-muted-foreground truncate">
+        <div
+          data-content-role="label"
+          data-content-label="test name"
+          className="text-sm font-medium truncate"
+        >
+          {test.name}
+        </div>
+        <div
+          data-content-role="badge"
+          data-content-label="test type"
+          className="text-xs text-muted-foreground truncate"
+        >
           {testTypeLabels[test.test_type]}
         </div>
       </div>
@@ -355,7 +365,13 @@ export function TestLibraryPanel({ onOpenAiTab }: TestLibraryPanelProps) {
       {/* Selection Mode Header */}
       {isSelectionMode && (
         <div className="flex items-center justify-between px-4 py-2 bg-red-500/10 border-b border-red-500/30">
-          <span className="text-sm text-red-400">{selectedIds.size} selected</span>
+          <span
+            data-content-role="metric"
+            data-content-label="selection count"
+            className="text-sm text-red-400"
+          >
+            {selectedIds.size} selected
+          </span>
           <div className="flex items-center gap-2">
             <button
               onClick={() => setSelectedIds(new Set(filteredTests.map((t) => t.id)))}
@@ -398,7 +414,13 @@ export function TestLibraryPanel({ onOpenAiTab }: TestLibraryPanelProps) {
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <div className="w-2 h-2 bg-amber-500 rounded-full animate-pulse" />
-              <span className="text-xs text-amber-400 font-medium">Unsaved Draft</span>
+              <span
+                data-content-role="status"
+                data-content-label="draft status"
+                className="text-xs text-amber-400 font-medium"
+              >
+                Unsaved Draft
+              </span>
             </div>
             <button
               onClick={discardDraft}
@@ -430,7 +452,13 @@ export function TestLibraryPanel({ onOpenAiTab }: TestLibraryPanelProps) {
                 <div className="flex items-center gap-2 px-2 py-1 text-xs font-semibold text-muted-foreground/70 uppercase">
                   <Icon className="w-3 h-3" />
                   {testTypeLabels[type as TestType]}
-                  <span className="text-muted-foreground/50">({tests.length})</span>
+                  <span
+                    data-content-role="metric"
+                    data-content-label="group count"
+                    className="text-muted-foreground/50"
+                  >
+                    ({tests.length})
+                  </span>
                 </div>
                 <div className="space-y-0.5">
                   {tests.map((test) => (
@@ -473,7 +501,11 @@ export function TestLibraryPanel({ onOpenAiTab }: TestLibraryPanelProps) {
       {/* Footer with stats and import/export */}
       <div className="p-3 border-t border-border/50">
         <div className="flex items-center justify-between">
-          <span className="text-xs text-muted-foreground">
+          <span
+            data-content-role="metric"
+            data-content-label="total test count"
+            className="text-xs text-muted-foreground"
+          >
             {state.tests.length} test{state.tests.length !== 1 ? "s" : ""} total
           </span>
           <div className="flex items-center gap-1">

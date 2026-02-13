@@ -15,8 +15,8 @@
 //! ```ignore
 //! let executor = UnifiedAiSessionExecutor::new(app_state, app_handle, pid_tracker);
 //!
-//! // Timeout is disabled by default (None) - the session runs until completion
-//! // or manual stop. Use .with_timeout(Some(300)) to set an inactivity timeout.
+//! // The session runs until completion or manual stop.
+//! // Health monitoring is handled by the Doctor service.
 //! let config = AiSessionConfig::setup("exec-123", "My Workflow", "Setup AI Task");
 //!
 //! let result = executor.execute(&config, "Fix the code", logger).await;
@@ -29,6 +29,7 @@ use tauri::Emitter;
 use tracing::{error, info, instrument, warn};
 
 use crate::database::CreateTaskRunEventInput;
+use crate::doctor::DoctorHandle;
 use crate::execution_context::AiSessionContext;
 use crate::mcp::shared::{FindingContext, ProgressContext, FINDING_INSTRUCTIONS};
 use crate::runtime_env::{
@@ -38,7 +39,7 @@ use crate::settings::get_ai_settings;
 use crate::step_metadata::{StepDetails, StepMetadata};
 use crate::step_registry::{StepEventKind, StepEventLogger};
 use crate::step_types::StepType;
-use crate::unified_workflow_executor::WorkflowPhase;
+use crate::unified_workflow_executor::{get_parent_task_id, WorkflowPhase};
 use crate::AppState;
 
 // =============================================================================
@@ -56,9 +57,6 @@ pub struct AiSessionConfig {
     pub phase: WorkflowPhase,
     /// Iteration number (required for Verification/Agentic phases).
     pub iteration: Option<u32>,
-    /// Optional inactivity timeout in seconds for the AI session.
-    /// None = no timeout (default, recommended), Some(N) = kill after N seconds of inactivity.
-    pub timeout_seconds: Option<u64>,
     /// Human-readable name of the step (for logging).
     pub step_name: String,
     /// Whether to prepend autonomous execution context to the prompt.
@@ -77,8 +75,6 @@ pub struct AiSessionConfig {
 
 impl AiSessionConfig {
     /// Create a configuration for a setup phase AI session.
-    ///
-    /// Timeout defaults to None (disabled). Use `with_timeout()` to set one.
     pub fn setup(
         task_run_id: impl Into<String>,
         workflow_name: impl Into<String>,
@@ -89,7 +85,6 @@ impl AiSessionConfig {
             workflow_name: workflow_name.into(),
             phase: WorkflowPhase::Setup,
             iteration: None,
-            timeout_seconds: None,
             step_name: step_name.into(),
             add_autonomous_context: true,
             append_finding_instructions: false,
@@ -100,8 +95,6 @@ impl AiSessionConfig {
     }
 
     /// Create a configuration for an agentic phase AI session.
-    ///
-    /// Timeout defaults to None (disabled). Use `with_timeout()` to set one.
     pub fn agentic(
         task_run_id: impl Into<String>,
         workflow_name: impl Into<String>,
@@ -112,7 +105,6 @@ impl AiSessionConfig {
             workflow_name: workflow_name.into(),
             phase: WorkflowPhase::Agentic,
             iteration: Some(iteration),
-            timeout_seconds: None,
             step_name: format!("Fix issues (iteration {})", iteration),
             add_autonomous_context: true,
             append_finding_instructions: true,
@@ -123,8 +115,6 @@ impl AiSessionConfig {
     }
 
     /// Create a configuration for a completion phase AI session.
-    ///
-    /// Timeout defaults to None (disabled). Use `with_timeout()` to set one.
     pub fn completion(
         task_run_id: impl Into<String>,
         workflow_name: impl Into<String>,
@@ -136,7 +126,6 @@ impl AiSessionConfig {
             workflow_name: workflow_name.into(),
             phase: WorkflowPhase::Completion,
             iteration: Some(iterations_run), // Used for turn count calculation
-            timeout_seconds: None,
             step_name: step_name.into(),
             add_autonomous_context: false,
             append_finding_instructions: true,
@@ -144,15 +133,6 @@ impl AiSessionConfig {
             checkpoint_id: None,
             sub_step_metadata: None,
         }
-    }
-
-    /// Set an optional inactivity timeout.
-    ///
-    /// If the AI produces no output for this many seconds, the session will be killed.
-    /// By default, timeout is disabled (None) - the session runs until completion or manual stop.
-    pub fn with_timeout(mut self, timeout_seconds: Option<u64>) -> Self {
-        self.timeout_seconds = timeout_seconds;
-        self
     }
 
     /// Set the checkpoint ID for progress tracking.
@@ -335,6 +315,12 @@ impl UnifiedAiSessionExecutor {
         let retry_config = get_ai_settings().retry;
         let app_handle = self.app_handle.clone();
 
+        // Extract DoctorHandle for health monitoring registration
+        let doctor_handle: Option<DoctorHandle> = {
+            let lock = self.app_state.doctor_handle.lock().await;
+            lock.clone()
+        };
+
         // Get available MCP tools before creating session context
         let available_tools = get_available_mcp_tools(&self.app_state).await;
 
@@ -409,7 +395,6 @@ impl UnifiedAiSessionExecutor {
         // Run Claude session (interactive if session manager is available AND setting enabled, otherwise inline)
         let workspace_for_claude = workspace_root;
         let sid_for_claude = session_id.clone();
-        let timeout = config.timeout_seconds;
         let session_manager = if use_interactive {
             self.session_manager.clone()
         } else {
@@ -418,6 +403,7 @@ impl UnifiedAiSessionExecutor {
         let task_run_id_for_claude = config.task_run_id.clone();
 
         let result = tokio::task::spawn_blocking(move || {
+            let doctor_ref = doctor_handle.as_ref();
             if let Some(ref sm) = session_manager {
                 // Interactive mode: bidirectional stream-json session
                 crate::claude_session::runner::run_claude_session_interactive_with_retry(
@@ -425,7 +411,6 @@ impl UnifiedAiSessionExecutor {
                     &transformed_prompt,
                     &sid_for_claude,
                     &app_handle,
-                    timeout,
                     session_ctx,
                     finding_ctx,
                     progress_ctx,
@@ -433,6 +418,7 @@ impl UnifiedAiSessionExecutor {
                     Some(&retry_config),
                     sm,
                     &task_run_id_for_claude,
+                    doctor_ref,
                 )
             } else {
                 // Inline mode: one-shot session (either no session manager or interactive disabled)
@@ -445,12 +431,12 @@ impl UnifiedAiSessionExecutor {
                     &transformed_prompt,
                     &sid_for_claude,
                     &app_handle,
-                    timeout,
                     session_ctx,
                     finding_ctx,
                     progress_ctx,
                     Some(pid_tracker),
                     Some(&retry_config),
+                    doctor_ref,
                 )
             }
         })
@@ -578,8 +564,12 @@ impl UnifiedAiSessionExecutor {
             "source": "claude",
         });
 
+        // For workflow sequence children (e.g., workflow-sequence-X-workflow-N),
+        // remap to the parent task ID since only the parent has a task_runs record.
+        let task_run_id = get_parent_task_id(&config.task_run_id);
+
         let event = CreateTaskRunEventInput {
-            task_run_id: config.task_run_id.clone(),
+            task_run_id,
             event_type: "ai_output".to_string(),
             event_subtype: Some(phase_label.to_string()),
             message,
@@ -811,14 +801,12 @@ mod tests {
 
     #[test]
     fn test_ai_session_config_setup() {
-        let config =
-            AiSessionConfig::setup("task-123", "My Workflow", "Setup Step").with_timeout(Some(300));
+        let config = AiSessionConfig::setup("task-123", "My Workflow", "Setup Step");
         assert_eq!(config.phase, WorkflowPhase::Setup);
         assert!(config.iteration.is_none());
         assert!(config.add_autonomous_context);
         assert!(!config.append_finding_instructions);
         assert!(config.strip_completion_markers);
-        assert_eq!(config.timeout_seconds, Some(300));
         assert!(config.checkpoint_id.is_none());
     }
 
@@ -831,25 +819,22 @@ mod tests {
 
     #[test]
     fn test_ai_session_config_agentic() {
-        let config = AiSessionConfig::agentic("task-123", "My Workflow", 3).with_timeout(Some(300));
+        let config = AiSessionConfig::agentic("task-123", "My Workflow", 3);
         assert_eq!(config.phase, WorkflowPhase::Agentic);
         assert_eq!(config.iteration, Some(3));
         assert!(config.add_autonomous_context);
         assert!(config.append_finding_instructions);
         assert!(config.strip_completion_markers);
-        assert_eq!(config.timeout_seconds, Some(300));
     }
 
     #[test]
     fn test_ai_session_config_completion() {
-        let config = AiSessionConfig::completion("task-123", "My Workflow", "Completion Step", 5)
-            .with_timeout(Some(300));
+        let config = AiSessionConfig::completion("task-123", "My Workflow", "Completion Step", 5);
         assert_eq!(config.phase, WorkflowPhase::Completion);
         assert_eq!(config.iteration, Some(5)); // iterations_run for turn count
         assert!(!config.add_autonomous_context);
         assert!(config.append_finding_instructions);
         assert!(config.strip_completion_markers);
-        assert_eq!(config.timeout_seconds, Some(300));
     }
 
     #[test]

@@ -116,6 +116,10 @@ pub struct ExecutionStepConfig {
     #[serde(rename = "type")]
     pub step_type: String,
 
+    /// Step ID from the workflow definition (UUID)
+    #[serde(default)]
+    pub id: Option<String>,
+
     /// Step name (workflow name, state name, or description)
     #[serde(default)]
     pub name: Option<String>,
@@ -347,6 +351,48 @@ pub struct ExecutionStepConfig {
     #[serde(alias = "expectedStatus")]
     pub expected_status: Option<u16>,
 
+    /// Check (ai_review): Prompt instructions for the AI reviewer
+    #[serde(alias = "aiReviewPrompt", alias = "ai_review_prompt")]
+    pub ai_review_prompt: Option<String>,
+
+    /// Check (ai_review): Path to file to review (supports {{artifact_dir}} substitution)
+    #[serde(alias = "aiReviewInputPath", alias = "ai_review_input_path")]
+    pub ai_review_input_path: Option<String>,
+
+    /// Check (ai_review): Also validate input as a workflow JSON before AI review
+    #[serde(
+        alias = "aiReviewValidateAsWorkflow",
+        alias = "ai_review_validate_as_workflow",
+        default
+    )]
+    pub ai_review_validate_as_workflow: Option<bool>,
+
+    // ========================================================================
+    // Prompt Step Response Mode Fields
+    // ========================================================================
+    /// Prompt execution mode: "session" (default) or "response" (simple prompt→response)
+    #[serde(alias = "promptMode", alias = "prompt_mode")]
+    pub prompt_mode: Option<String>,
+
+    /// Path to write AI response output (supports {{artifact_dir}} substitution)
+    #[serde(alias = "outputPath", alias = "output_path")]
+    pub output_path: Option<String>,
+
+    /// Path to read input from (content appended to prompt)
+    #[serde(alias = "inputPath", alias = "input_path")]
+    pub input_path: Option<String>,
+
+    /// Whether this step should only run in dev mode
+    #[serde(alias = "devModeOnly", alias = "dev_mode_only", default)]
+    pub dev_mode_only: Option<bool>,
+
+    // ========================================================================
+    // Save Workflow Artifact Step Fields
+    // ========================================================================
+    /// SaveWorkflowArtifact: Path to workflow JSON file to save
+    #[serde(alias = "artifactInputPath", alias = "artifact_input_path")]
+    pub artifact_input_path: Option<String>,
+
     // ========================================================================
     // Macro Step Fields
     // ========================================================================
@@ -446,79 +492,9 @@ impl ExecutionStepConfig {
         Self {
             step_type: "workflow".to_string(),
             name: Some(name.to_string()),
-            action_type: None,
-            target_image_id: None,
-            target_image_name: None,
-            monitor_index: None,
-            take_screenshot: false,
-            screenshot_delay: 0,
-            screenshot_monitor: None,
-            playwright_script_id: None,
-            playwright_script_content: None,
-            playwright_target_url: None,
-            prompt_content: None,
-            timeout_seconds: None, // No timeout by default
-            initial_state_ids: None,
             is_setup: Some(true), // Workflow is setup by default
-            phase: None,
             run_on_subsequent_iterations: Some(true), // Default: run on all iterations for fresh data
-            test_id: None,
-            test_type: None,
-            test_is_critical: None,
-            sub_step_id: None,
-            // AWAS fields
-            awas_url: None,
-            awas_action_id: None,
-            awas_params: None,
-            awas_html: None,
-            awas_base_url: None,
-            // MCP fields
-            mcp_server_id: None,
-            mcp_server_name: None,
-            mcp_tool_name: None,
-            mcp_arguments: None,
-            mcp_fail_on_error: None,
-            // Shell command fields
-            shell_command: None,
-            shell_command_id: None,
-            shell_command_working_directory: None,
-            shell_command_fail_on_error: None,
-            // API request fields
-            api_method: None,
-            api_url: None,
-            api_headers: None,
-            api_body: None,
-            api_content_type: None,
-            api_output_variable: None,
-            api_extractions: None,
-            api_timeout_ms: None,
-            // Check fields
-            check_type: None,
-            check_command: None,
-            check_working_directory: None,
-            check_auto_fix: None,
-            check_url: None,
-            expected_status: None,
-            // Macro fields
-            macro_id: None,
-            // Check group fields
-            check_group_id: None,
-            // Spec fields
-            spec_group_json: None,
-            spec_element_source: None,
-            spec_stop_on_failure: None,
-            spec_prefetched_elements: None,
-            // Log watch fields
-            log_sources: None,
-            time_window_seconds: None,
-            error_patterns: None,
-            // Error resolved fields
-            error_id: None,
-            error_pattern: None,
-            error_source: None,
-            // Gate fields
-            gate_required_steps: None,
-            gate_stop_on_failure: None,
+            ..Default::default()
         }
     }
 
@@ -527,79 +503,11 @@ impl ExecutionStepConfig {
         Self {
             step_type: "workflow".to_string(),
             name: Some(name.to_string()),
-            action_type: None,
-            target_image_id: None,
-            target_image_name: None,
-            monitor_index: None,
             take_screenshot: true,
             screenshot_delay: delay,
-            screenshot_monitor: None,
-            playwright_script_id: None,
-            playwright_script_content: None,
-            playwright_target_url: None,
-            prompt_content: None,
-            timeout_seconds: None, // No timeout by default
-            initial_state_ids: None,
             is_setup: Some(true), // Workflow is setup by default
-            phase: None,
             run_on_subsequent_iterations: Some(true), // Default: run on all iterations for fresh data
-            test_id: None,
-            test_type: None,
-            test_is_critical: None,
-            sub_step_id: None,
-            // AWAS fields
-            awas_url: None,
-            awas_action_id: None,
-            awas_params: None,
-            awas_html: None,
-            awas_base_url: None,
-            // MCP fields
-            mcp_server_id: None,
-            mcp_server_name: None,
-            mcp_tool_name: None,
-            mcp_arguments: None,
-            mcp_fail_on_error: None,
-            // Shell command fields
-            shell_command: None,
-            shell_command_id: None,
-            shell_command_working_directory: None,
-            shell_command_fail_on_error: None,
-            // API request fields
-            api_method: None,
-            api_url: None,
-            api_headers: None,
-            api_body: None,
-            api_content_type: None,
-            api_output_variable: None,
-            api_extractions: None,
-            api_timeout_ms: None,
-            // Check fields
-            check_type: None,
-            check_command: None,
-            check_working_directory: None,
-            check_auto_fix: None,
-            check_url: None,
-            expected_status: None,
-            // Macro fields
-            macro_id: None,
-            // Check group fields
-            check_group_id: None,
-            // Spec fields
-            spec_group_json: None,
-            spec_element_source: None,
-            spec_stop_on_failure: None,
-            spec_prefetched_elements: None,
-            // Log watch fields
-            log_sources: None,
-            time_window_seconds: None,
-            error_patterns: None,
-            // Error resolved fields
-            error_id: None,
-            error_pattern: None,
-            error_source: None,
-            // Gate fields
-            gate_required_steps: None,
-            gate_stop_on_failure: None,
+            ..Default::default()
         }
     }
 
@@ -608,79 +516,13 @@ impl ExecutionStepConfig {
         Self {
             step_type: "screenshot".to_string(),
             name: Some("Capture Screenshot".to_string()),
-            action_type: None,
-            target_image_id: None,
-            target_image_name: None,
             monitor_index: monitor,
             take_screenshot: true,
             screenshot_delay: delay,
             screenshot_monitor: monitor.map(|m| serde_json::Value::Number(m.into())),
-            playwright_script_id: None,
-            playwright_script_content: None,
-            playwright_target_url: None,
-            prompt_content: None,
-            timeout_seconds: None, // No timeout by default
-            initial_state_ids: None,
             is_setup: Some(false), // Screenshot is verification, not setup
-            phase: None,
             run_on_subsequent_iterations: Some(true), // Verification runs on all iterations
-            test_id: None,
-            test_type: None,
-            test_is_critical: None,
-            sub_step_id: None,
-            // AWAS fields
-            awas_url: None,
-            awas_action_id: None,
-            awas_params: None,
-            awas_html: None,
-            awas_base_url: None,
-            // MCP fields
-            mcp_server_id: None,
-            mcp_server_name: None,
-            mcp_tool_name: None,
-            mcp_arguments: None,
-            mcp_fail_on_error: None,
-            // Shell command fields
-            shell_command: None,
-            shell_command_id: None,
-            shell_command_working_directory: None,
-            shell_command_fail_on_error: None,
-            // API request fields
-            api_method: None,
-            api_url: None,
-            api_headers: None,
-            api_body: None,
-            api_content_type: None,
-            api_output_variable: None,
-            api_extractions: None,
-            api_timeout_ms: None,
-            // Check fields
-            check_type: None,
-            check_command: None,
-            check_working_directory: None,
-            check_auto_fix: None,
-            check_url: None,
-            expected_status: None,
-            // Macro fields
-            macro_id: None,
-            // Check group fields
-            check_group_id: None,
-            // Spec fields
-            spec_group_json: None,
-            spec_element_source: None,
-            spec_stop_on_failure: None,
-            spec_prefetched_elements: None,
-            // Log watch fields
-            log_sources: None,
-            time_window_seconds: None,
-            error_patterns: None,
-            // Error resolved fields
-            error_id: None,
-            error_pattern: None,
-            error_source: None,
-            // Gate fields
-            gate_required_steps: None,
-            gate_stop_on_failure: None,
+            ..Default::default()
         }
     }
 
@@ -693,79 +535,10 @@ impl ExecutionStepConfig {
         Self {
             step_type: "awas_discover".to_string(),
             name: Some(format!("AWAS Discover: {}", url)),
-            action_type: None,
-            target_image_id: None,
-            target_image_name: None,
-            monitor_index: None,
-            take_screenshot: false,
-            screenshot_delay: 0,
-            screenshot_monitor: None,
-            playwright_script_id: None,
-            playwright_script_content: None,
-            playwright_target_url: None,
-            prompt_content: None,
-            timeout_seconds: None, // No timeout by default
-            initial_state_ids: None,
             is_setup: Some(true), // AWAS discover is typically setup
-            phase: None,
             run_on_subsequent_iterations: Some(false), // Usually only discover once
-            test_id: None,
-            test_type: None,
-            test_is_critical: None,
-            sub_step_id: None,
-            // AWAS fields
             awas_url: Some(url.to_string()),
-            awas_action_id: None,
-            awas_params: None,
-            awas_html: None,
-            awas_base_url: None,
-            // MCP fields
-            mcp_server_id: None,
-            mcp_server_name: None,
-            mcp_tool_name: None,
-            mcp_arguments: None,
-            mcp_fail_on_error: None,
-            // Shell command fields
-            shell_command: None,
-            shell_command_id: None,
-            shell_command_working_directory: None,
-            shell_command_fail_on_error: None,
-            // API request fields
-            api_method: None,
-            api_url: None,
-            api_headers: None,
-            api_body: None,
-            api_content_type: None,
-            api_output_variable: None,
-            api_extractions: None,
-            api_timeout_ms: None,
-            // Check fields
-            check_type: None,
-            check_command: None,
-            check_working_directory: None,
-            check_auto_fix: None,
-            check_url: None,
-            expected_status: None,
-            // Macro fields
-            macro_id: None,
-            // Check group fields
-            check_group_id: None,
-            // Spec fields
-            spec_group_json: None,
-            spec_element_source: None,
-            spec_stop_on_failure: None,
-            spec_prefetched_elements: None,
-            // Log watch fields
-            log_sources: None,
-            time_window_seconds: None,
-            error_patterns: None,
-            // Error resolved fields
-            error_id: None,
-            error_pattern: None,
-            error_source: None,
-            // Gate fields
-            gate_required_steps: None,
-            gate_stop_on_failure: None,
+            ..Default::default()
         }
     }
 
@@ -774,79 +547,12 @@ impl ExecutionStepConfig {
         Self {
             step_type: "awas_execute".to_string(),
             name: Some(format!("AWAS Execute: {}", action_id)),
-            action_type: None,
-            target_image_id: None,
-            target_image_name: None,
-            monitor_index: None,
-            take_screenshot: false,
-            screenshot_delay: 0,
-            screenshot_monitor: None,
-            playwright_script_id: None,
-            playwright_script_content: None,
-            playwright_target_url: None,
-            prompt_content: None,
-            timeout_seconds: None, // No timeout by default
-            initial_state_ids: None,
             is_setup: Some(false), // AWAS execute is typically an action step
-            phase: None,
             run_on_subsequent_iterations: Some(true),
-            test_id: None,
-            test_type: None,
-            test_is_critical: None,
-            sub_step_id: None,
-            // AWAS fields
             awas_url: Some(url.to_string()),
             awas_action_id: Some(action_id.to_string()),
             awas_params: params,
-            awas_html: None,
-            awas_base_url: None,
-            // MCP fields
-            mcp_server_id: None,
-            mcp_server_name: None,
-            mcp_tool_name: None,
-            mcp_arguments: None,
-            mcp_fail_on_error: None,
-            // Shell command fields
-            shell_command: None,
-            shell_command_id: None,
-            shell_command_working_directory: None,
-            shell_command_fail_on_error: None,
-            // API request fields
-            api_method: None,
-            api_url: None,
-            api_headers: None,
-            api_body: None,
-            api_content_type: None,
-            api_output_variable: None,
-            api_extractions: None,
-            api_timeout_ms: None,
-            // Check fields
-            check_type: None,
-            check_command: None,
-            check_working_directory: None,
-            check_auto_fix: None,
-            check_url: None,
-            expected_status: None,
-            // Macro fields
-            macro_id: None,
-            // Check group fields
-            check_group_id: None,
-            // Spec fields
-            spec_group_json: None,
-            spec_element_source: None,
-            spec_stop_on_failure: None,
-            spec_prefetched_elements: None,
-            // Log watch fields
-            log_sources: None,
-            time_window_seconds: None,
-            error_patterns: None,
-            // Error resolved fields
-            error_id: None,
-            error_pattern: None,
-            error_source: None,
-            // Gate fields
-            gate_required_steps: None,
-            gate_stop_on_failure: None,
+            ..Default::default()
         }
     }
 
@@ -855,79 +561,10 @@ impl ExecutionStepConfig {
         Self {
             step_type: "awas_check_support".to_string(),
             name: Some(format!("AWAS Check Support: {}", url)),
-            action_type: None,
-            target_image_id: None,
-            target_image_name: None,
-            monitor_index: None,
-            take_screenshot: false,
-            screenshot_delay: 0,
-            screenshot_monitor: None,
-            playwright_script_id: None,
-            playwright_script_content: None,
-            playwright_target_url: None,
-            prompt_content: None,
-            timeout_seconds: None, // No timeout by default
-            initial_state_ids: None,
             is_setup: Some(true), // Check support is typically setup
-            phase: None,
             run_on_subsequent_iterations: Some(false),
-            test_id: None,
-            test_type: None,
-            test_is_critical: None,
-            sub_step_id: None,
-            // AWAS fields
             awas_url: Some(url.to_string()),
-            awas_action_id: None,
-            awas_params: None,
-            awas_html: None,
-            awas_base_url: None,
-            // MCP fields
-            mcp_server_id: None,
-            mcp_server_name: None,
-            mcp_tool_name: None,
-            mcp_arguments: None,
-            mcp_fail_on_error: None,
-            // Shell command fields
-            shell_command: None,
-            shell_command_id: None,
-            shell_command_working_directory: None,
-            shell_command_fail_on_error: None,
-            // API request fields
-            api_method: None,
-            api_url: None,
-            api_headers: None,
-            api_body: None,
-            api_content_type: None,
-            api_output_variable: None,
-            api_extractions: None,
-            api_timeout_ms: None,
-            // Check fields
-            check_type: None,
-            check_command: None,
-            check_working_directory: None,
-            check_auto_fix: None,
-            check_url: None,
-            expected_status: None,
-            // Macro fields
-            macro_id: None,
-            // Check group fields
-            check_group_id: None,
-            // Spec fields
-            spec_group_json: None,
-            spec_element_source: None,
-            spec_stop_on_failure: None,
-            spec_prefetched_elements: None,
-            // Log watch fields
-            log_sources: None,
-            time_window_seconds: None,
-            error_patterns: None,
-            // Error resolved fields
-            error_id: None,
-            error_pattern: None,
-            error_source: None,
-            // Gate fields
-            gate_required_steps: None,
-            gate_stop_on_failure: None,
+            ..Default::default()
         }
     }
 
@@ -936,79 +573,9 @@ impl ExecutionStepConfig {
         Self {
             step_type: "awas_list_actions".to_string(),
             name: Some("AWAS List Actions".to_string()),
-            action_type: None,
-            target_image_id: None,
-            target_image_name: None,
-            monitor_index: None,
-            take_screenshot: false,
-            screenshot_delay: 0,
-            screenshot_monitor: None,
-            playwright_script_id: None,
-            playwright_script_content: None,
-            playwright_target_url: None,
-            prompt_content: None,
-            timeout_seconds: None, // No timeout by default
-            initial_state_ids: None,
             is_setup: Some(false),
-            phase: None,
             run_on_subsequent_iterations: Some(true),
-            test_id: None,
-            test_type: None,
-            test_is_critical: None,
-            sub_step_id: None,
-            // AWAS fields
-            awas_url: None,
-            awas_action_id: None,
-            awas_params: None,
-            awas_html: None,
-            awas_base_url: None,
-            // MCP fields
-            mcp_server_id: None,
-            mcp_server_name: None,
-            mcp_tool_name: None,
-            mcp_arguments: None,
-            mcp_fail_on_error: None,
-            // Shell command fields
-            shell_command: None,
-            shell_command_id: None,
-            shell_command_working_directory: None,
-            shell_command_fail_on_error: None,
-            // API request fields
-            api_method: None,
-            api_url: None,
-            api_headers: None,
-            api_body: None,
-            api_content_type: None,
-            api_output_variable: None,
-            api_extractions: None,
-            api_timeout_ms: None,
-            // Check fields
-            check_type: None,
-            check_command: None,
-            check_working_directory: None,
-            check_auto_fix: None,
-            check_url: None,
-            expected_status: None,
-            // Macro fields
-            macro_id: None,
-            // Check group fields
-            check_group_id: None,
-            // Spec fields
-            spec_group_json: None,
-            spec_element_source: None,
-            spec_stop_on_failure: None,
-            spec_prefetched_elements: None,
-            // Log watch fields
-            log_sources: None,
-            time_window_seconds: None,
-            error_patterns: None,
-            // Error resolved fields
-            error_id: None,
-            error_pattern: None,
-            error_source: None,
-            // Gate fields
-            gate_required_steps: None,
-            gate_stop_on_failure: None,
+            ..Default::default()
         }
     }
 
@@ -1017,79 +584,11 @@ impl ExecutionStepConfig {
         Self {
             step_type: "awas_extract_elements".to_string(),
             name: Some("AWAS Extract Elements".to_string()),
-            action_type: None,
-            target_image_id: None,
-            target_image_name: None,
-            monitor_index: None,
-            take_screenshot: false,
-            screenshot_delay: 0,
-            screenshot_monitor: None,
-            playwright_script_id: None,
-            playwright_script_content: None,
-            playwright_target_url: None,
-            prompt_content: None,
-            timeout_seconds: None, // No timeout by default
-            initial_state_ids: None,
             is_setup: Some(false),
-            phase: None,
             run_on_subsequent_iterations: Some(true),
-            test_id: None,
-            test_type: None,
-            test_is_critical: None,
-            sub_step_id: None,
-            // AWAS fields
-            awas_url: None,
-            awas_action_id: None,
-            awas_params: None,
             awas_html: Some(html.to_string()),
             awas_base_url: base_url.map(|s| s.to_string()),
-            // MCP fields
-            mcp_server_id: None,
-            mcp_server_name: None,
-            mcp_tool_name: None,
-            mcp_arguments: None,
-            mcp_fail_on_error: None,
-            // Shell command fields
-            shell_command: None,
-            shell_command_id: None,
-            shell_command_working_directory: None,
-            shell_command_fail_on_error: None,
-            // API request fields
-            api_method: None,
-            api_url: None,
-            api_headers: None,
-            api_body: None,
-            api_content_type: None,
-            api_output_variable: None,
-            api_extractions: None,
-            api_timeout_ms: None,
-            // Check fields
-            check_type: None,
-            check_command: None,
-            check_working_directory: None,
-            check_auto_fix: None,
-            check_url: None,
-            expected_status: None,
-            // Macro fields
-            macro_id: None,
-            // Check group fields
-            check_group_id: None,
-            // Spec fields
-            spec_group_json: None,
-            spec_element_source: None,
-            spec_stop_on_failure: None,
-            spec_prefetched_elements: None,
-            // Log watch fields
-            log_sources: None,
-            time_window_seconds: None,
-            error_patterns: None,
-            // Error resolved fields
-            error_id: None,
-            error_pattern: None,
-            error_source: None,
-            // Gate fields
-            gate_required_steps: None,
-            gate_stop_on_failure: None,
+            ..Default::default()
         }
     }
 
@@ -1106,79 +605,13 @@ impl ExecutionStepConfig {
         Self {
             step_type: "mcp_call".to_string(),
             name: Some(format!("MCP Call: {}", tool_name)),
-            action_type: None,
-            target_image_id: None,
-            target_image_name: None,
-            monitor_index: None,
-            take_screenshot: false,
-            screenshot_delay: 0,
-            screenshot_monitor: None,
-            playwright_script_id: None,
-            playwright_script_content: None,
-            playwright_target_url: None,
-            prompt_content: None,
-            timeout_seconds: None, // No timeout by default
-            initial_state_ids: None,
             is_setup: Some(false),
-            phase: None,
             run_on_subsequent_iterations: Some(true),
-            test_id: None,
-            test_type: None,
-            test_is_critical: None,
-            sub_step_id: None,
-            // AWAS fields
-            awas_url: None,
-            awas_action_id: None,
-            awas_params: None,
-            awas_html: None,
-            awas_base_url: None,
-            // MCP fields
             mcp_server_id: Some(server_id.to_string()),
-            mcp_server_name: None,
             mcp_tool_name: Some(tool_name.to_string()),
             mcp_arguments: arguments,
             mcp_fail_on_error: Some(true),
-            // Shell command fields
-            shell_command: None,
-            shell_command_id: None,
-            shell_command_working_directory: None,
-            shell_command_fail_on_error: None,
-            // API request fields
-            api_method: None,
-            api_url: None,
-            api_headers: None,
-            api_body: None,
-            api_content_type: None,
-            api_output_variable: None,
-            api_extractions: None,
-            api_timeout_ms: None,
-            // Check fields
-            check_type: None,
-            check_command: None,
-            check_working_directory: None,
-            check_auto_fix: None,
-            check_url: None,
-            expected_status: None,
-            // Macro fields
-            macro_id: None,
-            // Check group fields
-            check_group_id: None,
-            // Spec fields
-            spec_group_json: None,
-            spec_element_source: None,
-            spec_stop_on_failure: None,
-            spec_prefetched_elements: None,
-            // Log watch fields
-            log_sources: None,
-            time_window_seconds: None,
-            error_patterns: None,
-            // Error resolved fields
-            error_id: None,
-            error_pattern: None,
-            error_source: None,
-            // Gate fields
-            gate_required_steps: None,
-            gate_stop_on_failure: None,
+            ..Default::default()
         }
     }
 
@@ -1187,79 +620,10 @@ impl ExecutionStepConfig {
         Self {
             step_type: "macro".to_string(),
             name: name.map(|n| n.to_string()),
-            action_type: None,
-            target_image_id: None,
-            target_image_name: None,
-            monitor_index: None,
-            take_screenshot: false,
-            screenshot_delay: 0,
-            screenshot_monitor: None,
-            playwright_script_id: None,
-            playwright_script_content: None,
-            playwright_target_url: None,
-            prompt_content: None,
-            timeout_seconds: None, // No timeout by default
-            initial_state_ids: None,
             is_setup: Some(true), // Macro is setup by default
-            phase: None,
             run_on_subsequent_iterations: Some(true),
-            test_id: None,
-            test_type: None,
-            test_is_critical: None,
-            sub_step_id: None,
-            // AWAS fields
-            awas_url: None,
-            awas_action_id: None,
-            awas_params: None,
-            awas_html: None,
-            awas_base_url: None,
-            // MCP fields
-            mcp_server_id: None,
-            mcp_server_name: None,
-            mcp_tool_name: None,
-            mcp_arguments: None,
-            mcp_fail_on_error: None,
-            // Shell command fields
-            shell_command: None,
-            shell_command_id: None,
-            shell_command_working_directory: None,
-            shell_command_fail_on_error: None,
-            // API request fields
-            api_method: None,
-            api_url: None,
-            api_headers: None,
-            api_body: None,
-            api_content_type: None,
-            api_output_variable: None,
-            api_extractions: None,
-            api_timeout_ms: None,
-            // Check fields
-            check_type: None,
-            check_command: None,
-            check_working_directory: None,
-            check_auto_fix: None,
-            check_url: None,
-            expected_status: None,
-            // Macro fields
             macro_id: Some(macro_id.to_string()),
-            // Check group fields
-            check_group_id: None,
-            // Spec fields
-            spec_group_json: None,
-            spec_element_source: None,
-            spec_stop_on_failure: None,
-            spec_prefetched_elements: None,
-            // Log watch fields
-            log_sources: None,
-            time_window_seconds: None,
-            error_patterns: None,
-            // Error resolved fields
-            error_id: None,
-            error_pattern: None,
-            error_source: None,
-            // Gate fields
-            gate_required_steps: None,
-            gate_stop_on_failure: None,
+            ..Default::default()
         }
     }
 
@@ -1381,6 +745,9 @@ pub struct StepExecutionResult {
     pub step_type: String,
     /// Step name for display
     pub step_name: String,
+    /// Step ID from the workflow definition (UUID), used for gate matching
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_id: Option<String>,
     /// Whether the step succeeded
     pub success: bool,
     /// Error message if failed
@@ -1594,6 +961,65 @@ pub struct VerificationPhaseResult {
     pub gate_based_evaluation: bool,
 }
 
+/// Extract a text representation from a handler's output_data for AI context.
+///
+/// Handlers store their output in different shapes inside `output_data`.
+/// This function tries common patterns to extract human-readable text:
+/// 1. `output_data.output` — combined stdout+stderr (used by check handler)
+/// 2. `output_data.summary` — text summary (used by check_group handler)
+/// 3. `output_data` as a top-level string
+/// 4. Fallback: pretty-printed JSON (truncated)
+fn extract_text_from_output_data(output_data: &Option<serde_json::Value>) -> Option<String> {
+    let data = output_data.as_ref()?;
+
+    // 1. Direct string field "output" (check handler puts combined stdout+stderr here)
+    if let Some(output) = data.get("output").and_then(|v| v.as_str()) {
+        if !output.is_empty() {
+            return Some(output.to_string());
+        }
+    }
+
+    // 2. "summary" field (check_group handler, etc.)
+    if let Some(summary) = data.get("summary").and_then(|v| v.as_str()) {
+        if !summary.is_empty() {
+            return Some(summary.to_string());
+        }
+    }
+
+    // 3. Top-level string value
+    if let Some(s) = data.as_str() {
+        if !s.is_empty() {
+            return Some(s.to_string());
+        }
+    }
+
+    // 4. Render as pretty JSON for any other structured output
+    // Skip trivial values that wouldn't be useful to the AI
+    if data.is_null() {
+        return None;
+    }
+    if let Some(obj) = data.as_object() {
+        if obj.is_empty() {
+            return None;
+        }
+        // Skip if only contains "skipped": true (disabled steps)
+        if obj.len() == 2 && obj.contains_key("skipped") {
+            return None;
+        }
+    }
+
+    let json_str = serde_json::to_string_pretty(data).ok()?;
+    if json_str.len() > 4000 {
+        Some(format!(
+            "{}...\n[truncated, {} more chars]",
+            &json_str[..4000],
+            json_str.len() - 4000
+        ))
+    } else {
+        Some(json_str)
+    }
+}
+
 impl VerificationPhaseResult {
     /// Build a failure context string for the agentic phase
     ///
@@ -1659,92 +1085,139 @@ impl VerificationPhaseResult {
                     }
                 }
 
-                // For spec steps, extract per-assertion details from output_data
-                if result.step_type == "spec" {
-                    if let Some(ref output_data) = result.output_data {
-                        if let Some(assertion_results) = output_data
-                            .get("spec_result")
-                            .and_then(|sr| sr.get("assertionResults"))
-                            .and_then(|ar| ar.as_array())
-                        {
-                            context.push_str("**Assertion Details:**\n");
-                            for ar in assertion_results {
-                                let passed =
-                                    ar.get("passed").and_then(|v| v.as_bool()).unwrap_or(false);
-                                let status = if passed { "PASSED" } else { "FAILED" };
-                                let target =
-                                    ar.get("target").and_then(|v| v.as_str()).unwrap_or("?");
-                                let target_desc = ar
-                                    .get("targetDescription")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
+                // === Generic structured data extraction ===
+                // These render structured details based on data presence, not step type.
+                // Any step that produces check_results or assertion results gets them rendered.
 
-                                context.push_str(&format!("- [{}] {}", status, target));
-                                if !target_desc.is_empty() && target_desc != target {
-                                    context.push_str(&format!(" ({})", target_desc));
+                // Individual check results (e.g., from check_group steps)
+                if let Some(ref details) = result.verification_details {
+                    if let Some(ref checks) = details.check_results {
+                        for check in checks {
+                            if check.status == "failed" {
+                                context.push_str(&format!("**Check: {} [FAILED]**\n", check.name));
+                                if let Some(ref err) = check.error_message {
+                                    context.push_str(&format!("Error: {}\n", err));
                                 }
-                                context.push('\n');
-
-                                // Search details (confidence, match reasons)
-                                if let Some(search) = ar.get("searchDetails") {
-                                    let confidence = search
-                                        .get("confidence")
-                                        .and_then(|v| v.as_f64())
-                                        .unwrap_or(0.0);
-                                    let reasons = search
-                                        .get("matchReasons")
-                                        .and_then(|v| v.as_array())
-                                        .map(|arr| {
-                                            arr.iter()
-                                                .filter_map(|r| r.as_str())
-                                                .collect::<Vec<_>>()
-                                                .join(", ")
-                                        })
-                                        .unwrap_or_default();
-                                    let candidates = search
-                                        .get("candidateCount")
-                                        .and_then(|v| v.as_u64())
-                                        .unwrap_or(0);
-                                    context.push_str(&format!(
-                                        "  Element found: yes (confidence: {:.2}, match: \"{}\", candidates: {})\n",
-                                        confidence, reasons, candidates
-                                    ));
-                                } else if !passed {
-                                    // Element was not found at all
-                                    if ar.get("failureReason").and_then(|v| v.as_str())
-                                        == Some("Element could not be found")
-                                    {
-                                        context.push_str("  Element found: no\n");
+                                if let Some(ref output) = check.output {
+                                    if !output.is_empty() {
+                                        let truncated = if output.len() > 3000 {
+                                            format!(
+                                                "{}...\n[truncated, {} more chars]",
+                                                &output[..3000],
+                                                output.len() - 3000
+                                            )
+                                        } else {
+                                            output.clone()
+                                        };
+                                        context.push_str(&format!("```\n{}\n```\n", truncated));
                                     }
                                 }
-
-                                // Expected vs actual for failures
-                                if !passed {
-                                    let expected = ar
-                                        .get("expected")
-                                        .map(|v| format!("{}", v))
-                                        .unwrap_or_default();
-                                    let actual = ar
-                                        .get("actual")
-                                        .map(|v| format!("{}", v))
-                                        .unwrap_or_default();
-                                    if !expected.is_empty() || !actual.is_empty() {
+                                if !check.issues.is_empty() {
+                                    context.push_str("Issues:\n");
+                                    for issue in check.issues.iter().take(30) {
+                                        context.push_str(&format!("- {}", issue.file));
+                                        if let Some(line) = issue.line {
+                                            context.push_str(&format!(":{}", line));
+                                            if let Some(col) = issue.column {
+                                                context.push_str(&format!(":{}", col));
+                                            }
+                                        }
+                                        if let Some(ref code) = issue.code {
+                                            context.push_str(&format!(" [{}]", code));
+                                        }
+                                        context.push_str(&format!(" {}\n", issue.message));
+                                    }
+                                    if check.issues.len() > 30 {
                                         context.push_str(&format!(
-                                            "  Expected: {}, Actual: {}\n",
-                                            expected, actual
+                                            "  ... and {} more issues\n",
+                                            check.issues.len() - 30
                                         ));
                                     }
-                                    if let Some(reason) =
-                                        ar.get("failureReason").and_then(|v| v.as_str())
-                                    {
-                                        context.push_str(&format!("  Reason: {}\n", reason));
-                                    }
-                                    if let Some(suggestion) =
-                                        ar.get("suggestion").and_then(|v| v.as_str())
-                                    {
-                                        context
-                                            .push_str(&format!("  Suggestion: {}\n", suggestion));
-                                    }
+                                }
+                                context.push('\n');
+                            }
+                        }
+                    }
+                }
+
+                // Spec assertion results (from output_data, any step producing spec_result)
+                if let Some(ref output_data) = result.output_data {
+                    if let Some(assertion_results) = output_data
+                        .get("spec_result")
+                        .and_then(|sr| sr.get("assertionResults"))
+                        .and_then(|ar| ar.as_array())
+                    {
+                        context.push_str("**Assertion Details:**\n");
+                        for ar in assertion_results {
+                            let passed =
+                                ar.get("passed").and_then(|v| v.as_bool()).unwrap_or(false);
+                            let status = if passed { "PASSED" } else { "FAILED" };
+                            let target = ar.get("target").and_then(|v| v.as_str()).unwrap_or("?");
+                            let target_desc = ar
+                                .get("targetDescription")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+
+                            context.push_str(&format!("- [{}] {}", status, target));
+                            if !target_desc.is_empty() && target_desc != target {
+                                context.push_str(&format!(" ({})", target_desc));
+                            }
+                            context.push('\n');
+
+                            if let Some(search) = ar.get("searchDetails") {
+                                let confidence = search
+                                    .get("confidence")
+                                    .and_then(|v| v.as_f64())
+                                    .unwrap_or(0.0);
+                                let reasons = search
+                                    .get("matchReasons")
+                                    .and_then(|v| v.as_array())
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .filter_map(|r| r.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    })
+                                    .unwrap_or_default();
+                                let candidates = search
+                                    .get("candidateCount")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                context.push_str(&format!(
+                                    "  Element found: yes (confidence: {:.2}, match: \"{}\", candidates: {})\n",
+                                    confidence, reasons, candidates
+                                ));
+                            } else if !passed
+                                && ar.get("failureReason").and_then(|v| v.as_str())
+                                    == Some("Element could not be found")
+                            {
+                                context.push_str("  Element found: no\n");
+                            }
+
+                            if !passed {
+                                let expected = ar
+                                    .get("expected")
+                                    .map(|v| format!("{}", v))
+                                    .unwrap_or_default();
+                                let actual = ar
+                                    .get("actual")
+                                    .map(|v| format!("{}", v))
+                                    .unwrap_or_default();
+                                if !expected.is_empty() || !actual.is_empty() {
+                                    context.push_str(&format!(
+                                        "  Expected: {}, Actual: {}\n",
+                                        expected, actual
+                                    ));
+                                }
+                                if let Some(reason) =
+                                    ar.get("failureReason").and_then(|v| v.as_str())
+                                {
+                                    context.push_str(&format!("  Reason: {}\n", reason));
+                                }
+                                if let Some(suggestion) =
+                                    ar.get("suggestion").and_then(|v| v.as_str())
+                                {
+                                    context.push_str(&format!("  Suggestion: {}\n", suggestion));
                                 }
                             }
                         }
@@ -2051,13 +1524,21 @@ impl StepExecutor {
         }
     }
 
-    /// Set the task run ID for database logging
+    /// Set the task run ID for database logging (builder pattern).
     ///
     /// When set, AWAS step results will be saved to the database.
     pub fn with_task_run_id(mut self, task_run_id: String) -> Self {
         self.runtime_context = RuntimeContext::with_task_run_id(&task_run_id);
         self.task_run_id = Some(task_run_id);
         self
+    }
+
+    /// Set the task run ID for database logging (mutable setter).
+    ///
+    /// Same as `with_task_run_id` but takes `&mut self` for use after construction.
+    pub fn set_task_run_id(&mut self, task_run_id: String) {
+        self.runtime_context = RuntimeContext::with_task_run_id(&task_run_id);
+        self.task_run_id = Some(task_run_id);
     }
 
     /// Set a variable in the runtime context for variable expansion in commands.
@@ -2431,13 +1912,8 @@ impl StepExecutor {
         Some(ExecutionStepConfig {
             step_type: "playwright".to_string(),
             name: Some(format!("Combined: {}", script_names.join(" + "))),
-            action_type: None,
-            target_image_id: None,
-            target_image_name: None,
-            monitor_index: None,
             take_screenshot: steps.iter().any(|s| s.take_screenshot),
             screenshot_delay: steps.iter().map(|s| s.screenshot_delay).max().unwrap_or(0),
-            screenshot_monitor: None,
             // Use the first script ID for fallback if no content is available
             playwright_script_id: script_ids.first().cloned(),
             // Combined script content
@@ -2447,7 +1923,6 @@ impl StepExecutor {
                 Some(combined_content_parts.join("\n\n"))
             },
             playwright_target_url: target_url,
-            prompt_content: None,
             timeout_seconds: Some(
                 steps
                     .iter()
@@ -2455,67 +1930,9 @@ impl StepExecutor {
                     .sum::<u64>()
                     .max(60),
             ),
-            initial_state_ids: None,
             is_setup: Some(false), // Combined step is treated as verification
-            phase: None,
             run_on_subsequent_iterations: Some(true), // Always runs
-            test_id: None,
-            test_type: None,
-            test_is_critical: None,
-            sub_step_id: None,
-            // AWAS fields
-            awas_url: None,
-            awas_action_id: None,
-            awas_params: None,
-            awas_html: None,
-            awas_base_url: None,
-            // MCP fields
-            mcp_server_id: None,
-            mcp_server_name: None,
-            mcp_tool_name: None,
-            mcp_arguments: None,
-            mcp_fail_on_error: None,
-            // Shell command fields
-            shell_command: None,
-            shell_command_id: None,
-            shell_command_working_directory: None,
-            shell_command_fail_on_error: None,
-            // API request fields
-            api_method: None,
-            api_url: None,
-            api_headers: None,
-            api_body: None,
-            api_content_type: None,
-            api_output_variable: None,
-            api_extractions: None,
-            api_timeout_ms: None,
-            // Check fields
-            check_type: None,
-            check_command: None,
-            check_working_directory: None,
-            check_auto_fix: None,
-            check_url: None,
-            expected_status: None,
-            // Macro fields
-            macro_id: None,
-            // Check group fields
-            check_group_id: None,
-            // Spec fields
-            spec_group_json: None,
-            spec_element_source: None,
-            spec_stop_on_failure: None,
-            spec_prefetched_elements: None,
-            // Log watch fields
-            log_sources: None,
-            time_window_seconds: None,
-            error_patterns: None,
-            // Error resolved fields
-            error_id: None,
-            error_pattern: None,
-            error_source: None,
-            // Gate fields
-            gate_required_steps: None,
-            gate_stop_on_failure: None,
+            ..Default::default()
         })
     }
 
@@ -2676,6 +2093,7 @@ impl StepExecutor {
                 step_index: index,
                 step_type: step.step_type.clone(),
                 step_name,
+                step_id: step.id.clone(),
                 success,
                 error,
                 screenshot_path: final_screenshot,
@@ -4248,6 +3666,7 @@ impl StepExecutor {
                         .clone()
                         .unwrap_or_else(|| format!("Step {}", index + 1)),
                     step_type: step.step_type.clone(),
+                    step_id: step.id.clone(),
                     success: false,
                     error: Some("Skipped due to critical failure".to_string()),
                     screenshot_path: None,
@@ -4285,7 +3704,7 @@ impl StepExecutor {
                 .unwrap_or_else(|| format!("Step {}", index + 1));
 
             // Execute based on step type
-            let (success, error, verification_details, step_output_data) = match step
+            let (success, error, mut verification_details, step_output_data) = match step
                 .step_type
                 .as_str()
             {
@@ -4354,7 +3773,8 @@ impl StepExecutor {
                 }
                 "check" => {
                     // Execute check step (shell command for checks like lint, typecheck, etc.)
-                    let (success, error, output, handler_output_data) =
+                    // Output is extracted by post-match normalization from handler_output_data.
+                    let (success, error, _screenshot, handler_output_data) =
                         self.execute_single_step(step).await;
                     let details = VerificationStepDetails {
                         step_id: step
@@ -4362,7 +3782,7 @@ impl StepExecutor {
                             .clone()
                             .unwrap_or_else(|| format!("step-{}", index)),
                         phase: "verification".to_string(),
-                        stdout: output, // Capture output for AI context
+                        // stdout filled by post-match normalization from handler_output_data
                         ..Default::default()
                     };
                     (success, error, Some(details), handler_output_data)
@@ -4412,10 +3832,13 @@ impl StepExecutor {
                     let mut missing_ids = Vec::new();
 
                     for req_id in &required_ids {
-                        // Look up the required step in accumulated results by matching step name
-                        // (step_id in VerificationStepDetails is set to step.name)
+                        // Look up the required step in accumulated results by matching:
+                        // 1. step_name (human-readable name)
+                        // 2. step_id on the result (UUID from workflow definition)
+                        // 3. step_id in verification_details (set to step.name for some step types)
                         let found = step_results.iter().find(|r| {
                             r.step_name == *req_id
+                                || r.step_id.as_deref() == Some(req_id)
                                 || r.verification_details
                                     .as_ref()
                                     .is_some_and(|d| d.step_id == *req_id)
@@ -4460,26 +3883,48 @@ impl StepExecutor {
                     (gate_passed, error_msg, None, None)
                 }
                 _ => {
-                    // For other step types, use the generic executor
-                    let (success, error, output, handler_output_data) =
+                    // Generic handler for all other step types in verification.
+                    // Output is captured by the post-match normalization block below.
+                    let (success, error, screenshot, handler_output_data) =
                         self.execute_single_step(step).await;
-                    // Still capture output even for unknown step types
-                    let details = if output.is_some() {
-                        Some(VerificationStepDetails {
-                            step_id: step
-                                .name
-                                .clone()
-                                .unwrap_or_else(|| format!("step-{}", index)),
-                            phase: "verification".to_string(),
-                            stdout: output,
-                            ..Default::default()
-                        })
-                    } else {
-                        None
-                    };
+                    let details = screenshot.map(|s| VerificationStepDetails {
+                        step_id: step
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| format!("step-{}", index)),
+                        phase: "verification".to_string(),
+                        stdout: Some(s),
+                        ..Default::default()
+                    });
                     (success, error, details, handler_output_data)
                 }
             };
+
+            // === Post-match normalization ===
+            // Ensure every verification step has VerificationStepDetails with stdout
+            // populated. This makes output available to the agentic phase regardless
+            // of step type. Handlers put their output in different places (stdout,
+            // output_data, check_results), so we normalize here.
+            if verification_details.is_none() {
+                // No verification_details at all — extract text from output_data
+                let extracted = extract_text_from_output_data(&step_output_data);
+                if extracted.is_some() || !success {
+                    verification_details = Some(VerificationStepDetails {
+                        step_id: step
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| format!("step-{}", index)),
+                        phase: "verification".to_string(),
+                        stdout: extracted,
+                        ..Default::default()
+                    });
+                }
+            } else if let Some(ref mut details) = verification_details {
+                // verification_details exists but stdout is None — fill from output_data
+                if details.stdout.is_none() {
+                    details.stdout = extract_text_from_output_data(&step_output_data);
+                }
+            }
 
             let duration_ms = step_start.elapsed().as_millis() as u64;
 
@@ -4506,6 +3951,7 @@ impl StepExecutor {
                 step_index: index,
                 step_name,
                 step_type: step.step_type.clone(),
+                step_id: step.id.clone(),
                 success,
                 error,
                 screenshot_path: None,
@@ -4594,17 +4040,35 @@ impl StepExecutor {
                 )
                 .with_step_name(&result.step_name);
 
+                let result_json_str = serde_json::to_string(&result).ok();
                 if result.success {
-                    checkpoint.mark_success(None, duration_ms as i64);
+                    checkpoint.mark_success(result_json_str, duration_ms as i64);
                 } else {
                     checkpoint.mark_failed(
                         result.error.as_deref().unwrap_or("Unknown error"),
                         duration_ms as i64,
                     );
+                    // Also store result_json for failed steps so resume can access details
+                    checkpoint.result_json = result_json_str;
                 }
 
                 if let Err(e) = checkpoint_mgr.save_step(&checkpoint) {
                     warn!("Failed to update verification step checkpoint: {}", e);
+                }
+
+                // Broadcast step-progress to WebSocket clients so the web dashboard refetches
+                if let Some(ref app_handle) = self.app_handle {
+                    let status = if result.success { "success" } else { "failed" };
+                    crate::event_system::broadcast_ws_notification(
+                        app_handle,
+                        "step-progress",
+                        &serde_json::json!({
+                            "task_run_id": execution_id,
+                            "step_index": index,
+                            "step_name": result.step_name,
+                            "status": status,
+                        }),
+                    );
                 }
             }
 
@@ -6920,6 +6384,7 @@ mod tests {
                     step_index: 0,
                     step_type: "workflow".to_string(),
                     step_name: "Login".to_string(),
+                    step_id: None,
                     success: true,
                     error: None,
                     screenshot_path: Some("screenshot1.png".to_string()),
@@ -6934,6 +6399,7 @@ mod tests {
                     step_index: 1,
                     step_type: "screenshot".to_string(),
                     step_name: "Capture".to_string(),
+                    step_id: None,
                     success: true,
                     error: None,
                     screenshot_path: Some("screenshot2.png".to_string()),

@@ -149,6 +149,7 @@ interface FullStateResponse {
     from_step: number | null;
     description: string;
   };
+  defined_phases?: string[];
 }
 
 /**
@@ -401,7 +402,11 @@ function checkpointToStep(cp: StepCheckpoint): TimelineStep {
 /**
  * Group steps by phase and build phase groups.
  */
-function buildPhaseGroups(steps: TimelineStep[], currentStage: WorkflowStage | null): PhaseGroup[] {
+function buildPhaseGroups(
+  steps: TimelineStep[],
+  currentStage: WorkflowStage | null,
+  definedPhases?: WorkflowStage[],
+): PhaseGroup[] {
   const groups = new Map<WorkflowStage, TimelineStep[]>();
 
   for (const step of steps) {
@@ -412,7 +417,12 @@ function buildPhaseGroups(steps: TimelineStep[], currentStage: WorkflowStage | n
 
   const PHASE_ORDER: WorkflowStage[] = ["setup", "verification", "agentic", "completion"];
 
-  return PHASE_ORDER.filter((phase) => groups.has(phase)).map((phase) => {
+  // Show phases that have steps OR are defined in the workflow
+  const phasesToShow = PHASE_ORDER.filter(
+    (phase) => groups.has(phase) || (definedPhases && definedPhases.includes(phase)),
+  );
+
+  return phasesToShow.map((phase) => {
     const phaseSteps = groups.get(phase) || [];
     const completed = phaseSteps.filter(
       (s) => s.status === "success" || s.status === "failed",
@@ -421,6 +431,7 @@ function buildPhaseGroups(steps: TimelineStep[], currentStage: WorkflowStage | n
     const failed = phaseSteps.filter((s) => s.status === "failed").length;
     const isActive = phase === currentStage;
     const isComplete = phaseSteps.length > 0 && completed === phaseSteps.length;
+    const isUpcoming = phaseSteps.length === 0 && !isActive;
 
     // Group by iteration for verification/agentic phases
     const hasIterations = phase === "verification" || phase === "agentic";
@@ -437,6 +448,7 @@ function buildPhaseGroups(steps: TimelineStep[], currentStage: WorkflowStage | n
           : undefined,
       isActive,
       isComplete,
+      isUpcoming,
       stats: {
         total: phaseSteps.length,
         completed,
@@ -627,21 +639,40 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
       // Determine workflow stage
       const workflowStage = data.orchestrator_state?.workflow_stage as WorkflowStage | null;
 
-      // Build phase groups
-      const phaseGroups = buildPhaseGroups(steps, workflowStage);
+      // Map defined phases from backend
+      const definedPhases = data.defined_phases?.map((p) => mapPhase(p));
+
+      // Build phase groups (including upcoming phases from workflow definition)
+      const phaseGroups = buildPhaseGroups(steps, workflowStage, definedPhases);
 
       // Calculate elapsed time
       const startTime = new Date(data.task_run.started_at).getTime();
-      const elapsedTime = Math.floor((Date.now() - startTime) / 1000);
 
-      // Calculate stats
-      const stepStats = calculateStepStats(steps, elapsedTime);
-      const timelineStats = calculateTimelineStats(phaseGroups, elapsedTime);
-
-      // Find last completed checkpoint
+      // Find last completed checkpoint (used for elapsed time freeze)
       const completedCheckpoints = checkpoints.filter(
         (cp) => cp.status === "success" || cp.status === "failed",
       );
+
+      // Calculate step stats first (needed to detect all-steps-done)
+      const rawElapsedTime = Math.floor((Date.now() - startTime) / 1000);
+      const stepStats = calculateStepStats(steps, rawElapsedTime);
+
+      // If all steps are done, freeze elapsed time at the last step's completion
+      // rather than continuing to count while post-step processing runs.
+      const lastCompletedTime =
+        completedCheckpoints.length > 0 && completedCheckpoints[completedCheckpoints.length - 1].completedAt
+          ? new Date(completedCheckpoints[completedCheckpoints.length - 1].completedAt!).getTime()
+          : null;
+      const allStepsFinished =
+        stepStats.total > 0 && stepStats.pending === 0 && stepStats.completed === stepStats.total;
+      const elapsedTime =
+        allStepsFinished && lastCompletedTime
+          ? Math.floor((lastCompletedTime - startTime) / 1000)
+          : rawElapsedTime;
+
+      // Recalculate stats with potentially frozen elapsed time
+      const finalStepStats = allStepsFinished ? calculateStepStats(steps, elapsedTime) : stepStats;
+      const timelineStats = calculateTimelineStats(phaseGroups, elapsedTime);
       const lastCompletedCheckpoint =
         completedCheckpoints.length > 0
           ? completedCheckpoints[completedCheckpoints.length - 1]
@@ -675,11 +706,18 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
         failed: "failed",
         stopped: "stopped",
       };
-      const status = statusMap[data.task_run.status] ?? "idle";
+      let status = statusMap[data.task_run.status] ?? "idle";
 
       // Determine terminal states
       const isComplete = data.orchestrator_state?.state_name?.includes("complete") ?? false;
       const isStopped = data.orchestrator_state?.state_name === "stopped";
+
+      // Detect "effectively complete" — all steps finished but backend still
+      // doing post-step work (e.g., summary generation). Freeze the timer and
+      // mark as completed so the UI stops showing running animations.
+      if (status === "running" && allStepsFinished) {
+        status = "completed";
+      }
 
       // Extract plan phase details from state_data for plan workflows
       // State data is structured as e.g. { PhaseRunning: { phase_index: 0, phase_name: "Fix API" } }
@@ -731,7 +769,7 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
         planTotalPhases,
         workflowName: data.task_run.workflow_name,
         taskName: data.task_run.task_name,
-        stepStats,
+        stepStats: finalStepStats,
         timelineStats,
       }));
 

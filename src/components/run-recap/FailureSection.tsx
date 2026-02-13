@@ -29,8 +29,15 @@ export function FailureSection({ failure }: FailureSectionProps) {
 
       {failure.failed_step && (
         <div className="ml-8 text-sm">
-          <span className="text-muted-foreground">Failed at: </span>
-          <span data-ui-id="recap-failed-step" className="text-red-400 font-medium">
+          <span data-content-role="label" className="text-muted-foreground">
+            Failed at:{" "}
+          </span>
+          <span
+            data-ui-id="recap-failed-step"
+            data-content-role="label"
+            data-content-label="failed step"
+            className="text-red-400 font-medium"
+          >
             {failure.failed_step}
           </span>
         </div>
@@ -38,8 +45,15 @@ export function FailureSection({ failure }: FailureSectionProps) {
 
       {failure.error_type && (
         <div className="ml-8 text-sm">
-          <span className="text-muted-foreground">Error type: </span>
-          <span data-ui-id="recap-error-type" className="text-red-400">
+          <span data-content-role="label" className="text-muted-foreground">
+            Error type:{" "}
+          </span>
+          <span
+            data-ui-id="recap-error-type"
+            data-content-role="label"
+            data-content-label="error type"
+            className="text-red-400"
+          >
             {failure.error_type}
           </span>
         </div>

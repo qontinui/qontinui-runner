@@ -6,6 +6,7 @@
 
 #![allow(dead_code)]
 
+use crate::commands::AppState;
 use crate::settings::{
     self, GlobalLogSource, GlobalLogSourceProfile, GlobalLogSourceSettings,
     LogSourceAiSelectionMode, LogSourceCategory,
@@ -14,6 +15,8 @@ use chrono::Utc;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use std::sync::Arc;
+use tauri::State;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -1093,10 +1096,11 @@ pub struct AiSuggestedLogSource {
 /// Returns suggestions as `AiSuggestedLogSource` items that can be
 /// directly added to global settings.
 #[tauri::command]
-pub fn find_log_sources_with_ai(
+pub async fn find_log_sources_with_ai(
     application_name: String,
     project_directory: Option<String>,
-) -> CommandResponse {
+    state: State<'_, Arc<AppState>>,
+) -> Result<CommandResponse, String> {
     use crate::ai_provider;
     use std::path::Path;
 
@@ -1207,10 +1211,11 @@ pub fn find_log_sources_with_ai(
         os_info
     );
 
-    let response = ai_provider::run_prompt_sync(&prompt, 60);
+    let doctor_handle = state.doctor_handle.lock().await.clone();
+    let response = ai_provider::run_prompt_sync(&prompt, doctor_handle.as_ref());
 
     if !response.success {
-        return CommandResponse {
+        return Ok(CommandResponse {
             success: false,
             message: Some(
                 response
@@ -1218,7 +1223,7 @@ pub fn find_log_sources_with_ai(
                     .unwrap_or_else(|| "AI request failed".to_string()),
             ),
             data: None,
-        };
+        });
     }
 
     let output = response.output.trim();
@@ -1241,11 +1246,11 @@ pub fn find_log_sources_with_ai(
                 suggestions.len(),
                 application_name
             );
-            CommandResponse {
+            Ok(CommandResponse {
                 success: true,
                 message: None,
                 data: Some(serde_json::to_value(suggestions).unwrap_or_default()),
-            }
+            })
         }
         Err(e) => {
             warn!(
@@ -1253,14 +1258,14 @@ pub fn find_log_sources_with_ai(
                 e,
                 &json_str[..json_str.len().min(500)]
             );
-            CommandResponse {
+            Ok(CommandResponse {
                 success: false,
                 message: Some(format!(
                     "Failed to parse AI suggestions: {}. The AI may have returned an invalid format.",
                     e
                 )),
                 data: Some(serde_json::json!({ "raw_response": output })),
-            }
+            })
         }
     }
 }

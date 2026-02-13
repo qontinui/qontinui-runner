@@ -21,7 +21,7 @@ import type {
   CaptureRecord,
   CaptureSessionStatus,
   CooccurrenceExport,
-} from "./useExternalUIBridge";
+} from "../types/ui-bridge-types";
 import {
   generateFingerprints,
   extractFingerprintHashes,

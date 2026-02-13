@@ -170,6 +170,10 @@ pub struct UnifiedWorkflow {
     #[serde(default = "default_preflight_check_enabled")]
     pub preflight_check_enabled: bool,
 
+    /// Task run ID that generated this workflow (for meta-workflow tracking)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_by_task_run_id: Option<String>,
+
     /// ISO 8601 timestamp of creation
     pub created_at: String,
     /// ISO 8601 timestamp of last modification (serialized as "modified_at" to match frontend)
@@ -233,27 +237,33 @@ pub struct CreateUnifiedWorkflowRequest {
     #[serde(default)]
     pub skip_ai_summary: bool,
     #[serde(default)]
-    pub log_source_selection: LogSourceSelection,
+    pub log_source_selection: Option<LogSourceSelection>,
     #[serde(default)]
-    pub context_ids: Vec<String>,
+    pub context_ids: Option<Vec<String>>,
     #[serde(default)]
-    pub disabled_context_ids: Vec<String>,
-    #[serde(default = "default_auto_include_contexts")]
-    pub auto_include_contexts: bool,
+    pub disabled_context_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub auto_include_contexts: Option<bool>,
     /// Custom developer prompt template for this workflow
     pub prompt_template: Option<String>,
     /// Whether to automatically include a log_watch step before verification
-    #[serde(default = "default_log_watch_enabled")]
-    pub log_watch_enabled: bool,
+    #[serde(default)]
+    pub log_watch_enabled: Option<bool>,
     /// Whether to automatically include health check steps before verification
-    #[serde(default = "default_health_check_enabled")]
-    pub health_check_enabled: bool,
+    #[serde(default)]
+    pub health_check_enabled: Option<bool>,
     /// URLs to health check before verification (user-configurable)
     #[serde(default)]
-    pub health_check_urls: Vec<HealthCheckUrl>,
+    pub health_check_urls: Option<Vec<HealthCheckUrl>>,
     /// Whether to automatically include a pre-flight environment check at the start of setup
-    #[serde(default = "default_preflight_check_enabled")]
-    pub preflight_check_enabled: bool,
+    #[serde(default)]
+    pub preflight_check_enabled: Option<bool>,
+    /// Error IDs targeted by this workflow (for auto-resolution on success)
+    #[serde(default)]
+    pub targeted_error_ids: Option<Vec<i64>>,
+    /// Task run ID that generated this workflow (for meta-workflow tracking)
+    #[serde(default)]
+    pub generated_by_task_run_id: Option<String>,
 }
 
 /// Request body for updating a unified workflow

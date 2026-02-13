@@ -211,7 +211,11 @@ export function TestPropertiesPanel({ code, onSave }: TestPropertiesPanelProps) 
           <Settings className="w-4 h-4" />
           Properties
           {isDraftSelected && (
-            <span className="px-1.5 py-0.5 text-xs bg-amber-500/20 text-amber-400 rounded">
+            <span
+              data-content-role="badge"
+              data-content-label="draft indicator"
+              className="px-1.5 py-0.5 text-xs bg-amber-500/20 text-amber-400 rounded"
+            >
               Draft
             </span>
           )}
@@ -414,6 +418,8 @@ export function TestPropertiesPanel({ code, onSave }: TestPropertiesPanelProps) 
               {tags.map((tag) => (
                 <span
                   key={tag}
+                  data-content-role="badge"
+                  data-content-label="test tag"
                   className="inline-flex items-center gap-1 px-2 py-0.5 text-xs bg-muted rounded-full"
                 >
                   {tag}
@@ -430,15 +436,27 @@ export function TestPropertiesPanel({ code, onSave }: TestPropertiesPanelProps) 
         {selectedTest && (
           <div className="pt-4 border-t border-border/50 space-y-2 text-xs text-muted-foreground">
             <div>
-              <span className="font-medium">Created:</span>{" "}
-              {new Date(selectedTest.created_at).toLocaleString()}
+              <span data-content-role="label" className="font-medium">
+                Created:
+              </span>{" "}
+              <span data-content-role="body-text" data-content-label="created date">
+                {new Date(selectedTest.created_at).toLocaleString()}
+              </span>
             </div>
             <div>
-              <span className="font-medium">Updated:</span>{" "}
-              {new Date(selectedTest.updated_at).toLocaleString()}
+              <span data-content-role="label" className="font-medium">
+                Updated:
+              </span>{" "}
+              <span data-content-role="body-text" data-content-label="updated date">
+                {new Date(selectedTest.updated_at).toLocaleString()}
+              </span>
             </div>
             {selectedTest.ai_generated && (
-              <div className="flex items-center gap-1 text-primary">
+              <div
+                data-content-role="badge"
+                data-content-label="ai generated indicator"
+                className="flex items-center gap-1 text-primary"
+              >
                 <Sparkles className="w-3 h-3" />
                 AI Generated
               </div>

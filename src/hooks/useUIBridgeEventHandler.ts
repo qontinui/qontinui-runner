@@ -49,7 +49,11 @@ type UIBridgeRequestType =
   | "discover"
   | "get_snapshot"
   | "get_specs"
-  | "get_spec";
+  | "get_spec"
+  | "page_refresh"
+  | "page_navigate"
+  | "page_go_back"
+  | "page_go_forward";
 
 /**
  * Payload structure for UI Bridge requests from Rust
@@ -72,6 +76,7 @@ interface UIBridgeRequestPayload {
     };
   };
   specId?: string;
+  url?: string;
   params?: Record<string, unknown>;
   options?: {
     root?: string;
@@ -442,6 +447,65 @@ export function useUIBridgeEventHandler(): void {
               type,
               success: true,
               data: { specId, config: specConfig },
+              timestamp: Date.now(),
+            });
+            break;
+          }
+
+          case "page_refresh": {
+            window.location.reload();
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: { success: true, url: window.location.href },
+              timestamp: Date.now(),
+            });
+            break;
+          }
+
+          case "page_navigate": {
+            const { url } = payload;
+            if (!url) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: "url is required",
+                timestamp: Date.now(),
+              });
+              return;
+            }
+            window.location.href = url;
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: { success: true, url },
+              timestamp: Date.now(),
+            });
+            break;
+          }
+
+          case "page_go_back": {
+            window.history.back();
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: { success: true, url: window.location.href },
+              timestamp: Date.now(),
+            });
+            break;
+          }
+
+          case "page_go_forward": {
+            window.history.forward();
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: { success: true, url: window.location.href },
               timestamp: Date.now(),
             });
             break;

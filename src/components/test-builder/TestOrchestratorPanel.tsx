@@ -410,9 +410,21 @@ export function TestOrchestratorPanel({ onTestGenerated, onLog }: TestOrchestrat
                           >
                             {req.method}
                           </span>
-                          <span className="text-sm text-neutral-200 truncate">{req.name}</span>
+                          <span
+                            data-content-role="label"
+                            data-content-label="request name"
+                            className="text-sm text-neutral-200 truncate"
+                          >
+                            {req.name}
+                          </span>
                         </div>
-                        <div className="text-xs text-neutral-500 truncate">{req.url}</div>
+                        <div
+                          data-content-role="code"
+                          data-content-label="request url"
+                          className="text-xs text-neutral-500 truncate"
+                        >
+                          {req.url}
+                        </div>
                       </div>
                     </label>
                   ))
@@ -420,7 +432,11 @@ export function TestOrchestratorPanel({ onTestGenerated, onLog }: TestOrchestrat
               </div>
 
               {selectedRequestIds.size > 0 && (
-                <div className="text-xs text-neutral-500">
+                <div
+                  data-content-role="metric"
+                  data-content-label="selected requests count"
+                  className="text-xs text-neutral-500"
+                >
                   {selectedRequestIds.size} request(s) selected
                 </div>
               )}
@@ -511,7 +527,9 @@ export function TestOrchestratorPanel({ onTestGenerated, onLog }: TestOrchestrat
         {phase === "review" && plan && (
           <div className="p-4 space-y-4">
             <div className="flex items-center justify-between">
-              <h3 className="text-sm font-medium text-neutral-200">Execution Plan</h3>
+              <h3 data-content-role="heading" className="text-sm font-medium text-neutral-200">
+                Execution Plan
+              </h3>
               <div className="flex items-center gap-2">
                 <button
                   onClick={reset}
@@ -575,8 +593,14 @@ export function TestOrchestratorPanel({ onTestGenerated, onLog }: TestOrchestrat
         {phase === "executing" && plan && (
           <div className="p-4 space-y-4">
             <div className="flex items-center justify-between">
-              <h3 className="text-sm font-medium text-neutral-200">Executing Plan</h3>
-              <div className="text-sm text-neutral-400">
+              <h3 data-content-role="heading" className="text-sm font-medium text-neutral-200">
+                Executing Plan
+              </h3>
+              <div
+                data-content-role="metric"
+                data-content-label="execution progress"
+                className="text-sm text-neutral-400"
+              >
                 Step {currentStepIndex + 1} of {plan.steps.length}
               </div>
             </div>
@@ -610,18 +634,35 @@ export function TestOrchestratorPanel({ onTestGenerated, onLog }: TestOrchestrat
           <div className="p-4 space-y-4 overflow-auto">
             <div className="flex items-center gap-2 text-green-400">
               <Check className="w-5 h-5" />
-              <h3 className="text-sm font-medium">Test Generated Successfully</h3>
+              <h3 data-content-role="status" className="text-sm font-medium">
+                Test Generated Successfully
+              </h3>
             </div>
 
             {/* Test info */}
             <div className="p-3 bg-neutral-800 rounded border border-neutral-700">
-              <div className="text-sm font-medium text-neutral-200">{generatedTest.name}</div>
-              <div className="text-xs text-neutral-400 mt-1">{generatedTest.description}</div>
+              <div
+                data-content-role="label"
+                data-content-label="generated test name"
+                className="text-sm font-medium text-neutral-200"
+              >
+                {generatedTest.name}
+              </div>
+              <div
+                data-content-role="description"
+                data-content-label="generated test description"
+                className="text-xs text-neutral-400 mt-1"
+              >
+                {generatedTest.description}
+              </div>
             </div>
 
             {/* Explanation */}
             <div className="p-3 bg-purple-900/20 border border-purple-700/30 rounded">
-              <div className="text-xs font-medium text-purple-400 uppercase mb-1">
+              <div
+                data-content-role="heading"
+                className="text-xs font-medium text-purple-400 uppercase mb-1"
+              >
                 AI Explanation
               </div>
               <p className="text-sm text-purple-300">{generatedTest.explanation}</p>

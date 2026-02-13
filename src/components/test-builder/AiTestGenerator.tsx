@@ -523,7 +523,9 @@ export function AiTestGenerator({
       <div className="flex items-center justify-between p-3 border-b border-neutral-700">
         <div className="flex items-center gap-2">
           <Sparkles className="w-4 h-4 text-purple-400" />
-          <span className="text-sm font-medium text-neutral-200">AI Test Generator</span>
+          <span data-content-role="heading" className="text-sm font-medium text-neutral-200">
+            AI Test Generator
+          </span>
         </div>
         {onCancel && (
           <button
@@ -628,10 +630,21 @@ export function AiTestGenerator({
                       ) : (
                         <FileText className="w-3 h-3 text-green-400" />
                       )}
-                      <span className="text-neutral-300 max-w-24 truncate" title={doc.filename}>
+                      <span
+                        data-content-role="label"
+                        data-content-label="document name"
+                        className="text-neutral-300 max-w-24 truncate"
+                        title={doc.filename}
+                      >
                         {doc.name}
                       </span>
-                      <span className="text-neutral-500">({doc.type})</span>
+                      <span
+                        data-content-role="badge"
+                        data-content-label="document type"
+                        className="text-neutral-500"
+                      >
+                        ({doc.type})
+                      </span>
                       <button
                         onClick={() => handleRemoveDocument(doc.id)}
                         className="p-0.5 text-neutral-500 hover:text-red-400 transition-colors"
@@ -694,7 +707,11 @@ export function AiTestGenerator({
               {selectedTaskRunId && workflowRunContext && (
                 <div className="p-2 bg-neutral-800/50 rounded border border-neutral-700 text-xs">
                   <div className="flex items-center justify-between mb-2">
-                    <span className="text-neutral-300 font-medium">
+                    <span
+                      data-content-role="label"
+                      data-content-label="task run name"
+                      className="text-neutral-300 font-medium"
+                    >
                       {workflowRunContext.task_run.task_name}
                     </span>
                     <button
@@ -785,8 +802,20 @@ export function AiTestGenerator({
                           detail.success ? "bg-green-500" : "bg-red-500"
                         }`}
                       />
-                      <span className="text-neutral-300">{detail.name}</span>
-                      <span className="text-neutral-500">({detail.type})</span>
+                      <span
+                        data-content-role="label"
+                        data-content-label="step output name"
+                        className="text-neutral-300"
+                      >
+                        {detail.name}
+                      </span>
+                      <span
+                        data-content-role="badge"
+                        data-content-label="step output type"
+                        className="text-neutral-500"
+                      >
+                        ({detail.type})
+                      </span>
                       {detail.duration !== undefined && (
                         <span className="text-neutral-600">{detail.duration}ms</span>
                       )}
@@ -926,7 +955,9 @@ export function AiTestGenerator({
 
       {/* Footer */}
       <div className="p-2 border-t border-neutral-700 text-xs text-neutral-500">
-        Test type: {testType} | AI-generated tests should be reviewed before use
+        <span data-content-role="body-text" data-content-label="footer info">
+          Test type: {testType} | AI-generated tests should be reviewed before use
+        </span>
       </div>
     </div>
   );

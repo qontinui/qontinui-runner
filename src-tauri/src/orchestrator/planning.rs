@@ -15,6 +15,7 @@ use super::types::{
     CriterionType, SuccessCriterion, VerificationMethod, VerificationPlan, WorkerDomain,
 };
 use crate::ai_router::TaskContext;
+use crate::doctor::DoctorHandle;
 
 /// Context provided to the planning agent for goal analysis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -574,7 +575,6 @@ pub struct PlanCreationResult {
 /// * `db` - Database handle for storing the plan
 /// * `task_run_id` - The task run this plan is for
 /// * `context` - Planning context with goal, project hints, etc.
-/// * `timeout_seconds` - Timeout for AI call (0 = use default)
 ///
 /// # Returns
 /// `PlanCreationResult` with the plan and storage info, or error string
@@ -582,7 +582,7 @@ pub fn create_verification_plan(
     db: &crate::database::CheckpointDb,
     task_run_id: &str,
     context: &PlanningContext,
-    timeout_seconds: u64,
+    doctor_handle: Option<&DoctorHandle>,
 ) -> Result<PlanCreationResult, String> {
     use tracing::{debug, error};
 
@@ -607,7 +607,7 @@ pub fn create_verification_plan(
 
     // Call the AI provider with routing
     let ai_response =
-        crate::ai_provider::run_prompt_with_routing(&full_prompt, &task_context, timeout_seconds);
+        crate::ai_provider::run_prompt_with_routing(&full_prompt, &task_context, doctor_handle);
 
     if !ai_response.success {
         let error_msg = ai_response
@@ -679,13 +679,12 @@ pub fn create_verification_plan(
 /// * `task_run_id` - The task run being replanned
 /// * `workspace_root` - Path to workspace for project detection
 /// * `replan_reason` - Why the replan was requested
-/// * `timeout_seconds` - Timeout for AI call
 pub fn create_replan(
     db: &crate::database::CheckpointDb,
     task_run_id: &str,
     workspace_root: &str,
     replan_reason: &str,
-    timeout_seconds: u64,
+    doctor_handle: Option<&DoctorHandle>,
 ) -> Result<PlanCreationResult, String> {
     info!(
         "Creating replan for task: {} (reason: {})",
@@ -709,7 +708,7 @@ pub fn create_replan(
         Some(replan_reason.to_string()),
     );
 
-    create_verification_plan(db, task_run_id, &context, timeout_seconds)
+    create_verification_plan(db, task_run_id, &context, doctor_handle)
 }
 
 /// Quick plan creation for simple tasks without full context.
@@ -720,10 +719,10 @@ pub fn create_simple_plan(
     task_run_id: &str,
     goal: &str,
     workspace_root: &str,
-    timeout_seconds: u64,
+    doctor_handle: Option<&DoctorHandle>,
 ) -> Result<PlanCreationResult, String> {
     let context = create_planning_context(goal, workspace_root, None, None, None);
-    create_verification_plan(db, task_run_id, &context, timeout_seconds)
+    create_verification_plan(db, task_run_id, &context, doctor_handle)
 }
 
 // ============================================================================
@@ -824,7 +823,7 @@ pub fn ensure_verification_plan(
     task_run_id: &str,
     goal: &str,
     workspace_root: &str,
-    timeout_seconds: u64,
+    doctor_handle: Option<&DoctorHandle>,
 ) -> Result<VerificationPlan, String> {
     // Check if a plan already exists
     if let Some(stored_plan) = db.get_latest_verification_plan(task_run_id)? {
@@ -837,7 +836,7 @@ pub fn ensure_verification_plan(
 
     // Create a new plan
     info!("Creating new verification plan for task {}", task_run_id);
-    let result = create_simple_plan(db, task_run_id, goal, workspace_root, timeout_seconds)?;
+    let result = create_simple_plan(db, task_run_id, goal, workspace_root, doctor_handle)?;
     Ok(result.plan)
 }
 

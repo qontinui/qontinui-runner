@@ -259,6 +259,7 @@ fn parse_mypy_output(stdout: &str, stderr: &str) -> ParsedOutput {
     let combined = format!("{}\n{}", stdout, stderr);
 
     // Mypy format: file.py:line:column: error: message
+    //          or: file.py:line: note: message (no column)
     for line in combined.lines() {
         if let Some(parsed) = parse_mypy_line(line) {
             files_with_issues.insert(parsed.file.clone());
@@ -266,12 +267,22 @@ fn parse_mypy_output(stdout: &str, stderr: &str) -> ParsedOutput {
         }
     }
 
-    let issues_found = issues.len() as u32;
     let error_count = issues
         .iter()
         .filter(|i| i.severity == IssueSeverity::Error)
         .count() as u32;
-    let warning_count = issues_found - error_count;
+    let warning_count = issues
+        .iter()
+        .filter(|i| i.severity == IssueSeverity::Warning)
+        .count() as u32;
+    let note_count = issues
+        .iter()
+        .filter(|i| i.severity == IssueSeverity::Info)
+        .count() as u32;
+
+    // Only errors and warnings count as actionable issues.
+    // Notes (e.g. [annotation-unchecked]) are informational and should not cause failures.
+    let issues_found = error_count + warning_count;
 
     ParsedOutput {
         issues_found,
@@ -282,10 +293,11 @@ fn parse_mypy_output(stdout: &str, stderr: &str) -> ParsedOutput {
             summary: Some(CheckSummary {
                 total_files: 0,
                 files_with_issues: files_with_issues.len() as u32,
-                total_issues: issues_found,
+                total_issues: error_count + warning_count + note_count,
                 issues_by_severity: HashMap::from([
                     ("error".to_string(), error_count),
                     ("warning".to_string(), warning_count),
+                    ("note".to_string(), note_count),
                 ]),
             }),
             tool_data: HashMap::new(),
@@ -294,7 +306,9 @@ fn parse_mypy_output(stdout: &str, stderr: &str) -> ParsedOutput {
 }
 
 fn parse_mypy_line(line: &str) -> Option<CheckIssue> {
-    // Format: file.py:line:column: severity: message
+    // Mypy output has two formats:
+    //   file.py:line:column: severity: message   (with column)
+    //   file.py:line: severity: message           (without column)
     let parts: Vec<&str> = line.splitn(4, ':').collect();
     if parts.len() < 4 {
         return None;
@@ -302,18 +316,25 @@ fn parse_mypy_line(line: &str) -> Option<CheckIssue> {
 
     let file = parts[0].trim().to_string();
     let line_num = parts[1].trim().parse().ok();
-    let column = parts[2].trim().parse().ok();
-    let rest = parts[3..].join(":");
-    let rest = rest.trim();
 
-    let (severity, message) = if let Some(stripped) = rest.strip_prefix(" error:") {
-        (IssueSeverity::Error, stripped.trim().to_string())
-    } else if let Some(stripped) = rest.strip_prefix(" warning:") {
-        (IssueSeverity::Warning, stripped.trim().to_string())
-    } else if let Some(stripped) = rest.strip_prefix(" note:") {
-        (IssueSeverity::Info, stripped.trim().to_string())
+    // parts[2] is either a column number or a severity keyword (error/warning/note)
+    let col_or_severity = parts[2].trim();
+    let (column, severity, message) = if let Ok(col) = col_or_severity.parse::<u32>() {
+        // Has column: file:line:col: severity: message
+        // parts[3] = " severity: message"
+        let rest = parts[3].trim();
+        let (sev, msg) = parse_mypy_severity(rest);
+        (Some(col), sev, msg)
     } else {
-        (IssueSeverity::Error, rest.to_string())
+        // No column: file:line: severity: message
+        // parts[2] = " severity", parts[3] = " message"
+        let severity = match col_or_severity {
+            "error" => IssueSeverity::Error,
+            "warning" => IssueSeverity::Warning,
+            "note" => IssueSeverity::Info,
+            _ => IssueSeverity::Error,
+        };
+        (None, severity, parts[3].trim().to_string())
     };
 
     Some(CheckIssue {
@@ -328,6 +349,19 @@ fn parse_mypy_line(line: &str) -> Option<CheckIssue> {
         fixable: false,
         fix_applied: None,
     })
+}
+
+/// Parse severity prefix from a mypy message fragment (used when column is present)
+fn parse_mypy_severity(rest: &str) -> (IssueSeverity, String) {
+    if let Some(stripped) = rest.strip_prefix("error:") {
+        (IssueSeverity::Error, stripped.trim().to_string())
+    } else if let Some(stripped) = rest.strip_prefix("warning:") {
+        (IssueSeverity::Warning, stripped.trim().to_string())
+    } else if let Some(stripped) = rest.strip_prefix("note:") {
+        (IssueSeverity::Info, stripped.trim().to_string())
+    } else {
+        (IssueSeverity::Error, rest.to_string())
+    }
 }
 
 // ============================================================================
@@ -891,13 +925,46 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_mypy_line() {
+    fn test_parse_mypy_line_error_with_column() {
         let line = "src/main.py:10:5: error: Incompatible types";
         let issue = parse_mypy_line(line).unwrap();
         assert_eq!(issue.file, "src/main.py");
         assert_eq!(issue.line, Some(10));
         assert_eq!(issue.column, Some(5));
         assert_eq!(issue.severity, IssueSeverity::Error);
+        assert_eq!(issue.message, "Incompatible types");
+    }
+
+    #[test]
+    fn test_parse_mypy_line_note_without_column() {
+        let line = "backend/services/auth.py:30: note: By default the bodies of untyped functions are not checked  [annotation-unchecked]";
+        let issue = parse_mypy_line(line).unwrap();
+        assert_eq!(issue.file, "backend/services/auth.py");
+        assert_eq!(issue.line, Some(30));
+        assert_eq!(issue.column, None);
+        assert_eq!(issue.severity, IssueSeverity::Info);
+        assert!(issue.message.contains("annotation-unchecked"));
+    }
+
+    #[test]
+    fn test_parse_mypy_line_error_without_column() {
+        let line = "scripts/migrate.py:21: error: Library stubs not installed for \"requests\"  [import-untyped]";
+        let issue = parse_mypy_line(line).unwrap();
+        assert_eq!(issue.file, "scripts/migrate.py");
+        assert_eq!(issue.line, Some(21));
+        assert_eq!(issue.column, None);
+        assert_eq!(issue.severity, IssueSeverity::Error);
+        assert!(issue.message.contains("Library stubs"));
+    }
+
+    #[test]
+    fn test_parse_mypy_output_notes_not_counted_as_failures() {
+        let stdout = "app/service.py:30: note: By default the bodies of untyped functions are not checked  [annotation-unchecked]\napp/service.py:32: note: By default the bodies of untyped functions are not checked  [annotation-unchecked]\nSuccess: no issues found in 100 source files\n";
+        let parsed = parse_mypy_output(stdout, "");
+        // Notes should not count as issues_found (which drives pass/fail)
+        assert_eq!(parsed.issues_found, 0);
+        // But they should still be in the structured output
+        assert_eq!(parsed.structured_output.issues.len(), 2);
     }
 
     #[test]

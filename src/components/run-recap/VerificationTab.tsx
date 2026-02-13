@@ -334,10 +334,16 @@ export function VerificationTab({ taskRunId }: VerificationTabProps) {
             </div>
           </div>
           <div className="text-right">
-            <div className="text-2xl font-bold">
+            <div
+              data-content-role="metric"
+              data-content-label="verification pass rate"
+              className="text-2xl font-bold"
+            >
               {data.passed_iterations}/{data.count}
             </div>
-            <div className="text-xs opacity-80">iterations passed</div>
+            <div data-content-role="label" className="text-xs opacity-80">
+              iterations passed
+            </div>
           </div>
         </div>
       </div>

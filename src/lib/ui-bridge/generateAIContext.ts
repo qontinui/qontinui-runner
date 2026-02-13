@@ -5,7 +5,7 @@
  * similar to what the Accessibility Explorer provides.
  */
 
-import type { ExternalElement } from "../../hooks/useExternalUIBridge";
+import type { ExternalElement } from "../../types/ui-bridge-types";
 
 export interface AIContextOptions {
   /** Page title (optional) */

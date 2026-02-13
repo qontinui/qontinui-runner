@@ -65,6 +65,7 @@ pub async fn scan_workspace_handler(
 
 /// Generate check suggestions using AI based on workspace scan results
 pub async fn generate_checks_handler(
+    State(api_state): State<Arc<ApiState>>,
     Json(request): Json<crate::check_generation::GenerateChecksRequest>,
 ) -> Result<
     Json<ApiResponse<crate::check_generation::GenerateChecksResponse>>,
@@ -77,16 +78,20 @@ pub async fn generate_checks_handler(
         request.workspace_scan.projects.len()
     );
 
+    // Clone doctor handle so it can be moved into the blocking closure
+    let doctor_handle = api_state.doctor_handle.clone();
+
     // Run generation in blocking task since it may call AI
-    let result = tokio::task::spawn_blocking(move || generate_checks(&request))
-        .await
-        .map_err(|e| {
-            error!("Check generation task failed: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Generation task failed: {}", e))),
-            )
-        })?;
+    let result =
+        tokio::task::spawn_blocking(move || generate_checks(&request, doctor_handle.as_ref()))
+            .await
+            .map_err(|e| {
+                error!("Check generation task failed: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Generation task failed: {}", e))),
+                )
+            })?;
 
     info!(
         "Check generation complete: {} suggestions, success={}",

@@ -10,7 +10,7 @@ import { X, Download, Copy, Check, FileJson, ChevronDown, ChevronRight, Eye } fr
 import { Badge } from "../ui/Badge";
 import { Button } from "../ui/Button";
 import { getStatusColors } from "@/design-system";
-import type { CooccurrenceExport } from "../../hooks/useExternalUIBridge";
+import type { CooccurrenceExport } from "../../types/ui-bridge-types";
 import type { FingerprintDiscoveryResult } from "./StateDiscoveryPanel";
 import {
   exportToAutomationConfig,

@@ -163,7 +163,11 @@ export function PhaseSection({
           )}
         </button>
         <div className="flex items-center gap-2">
-          <span className={`text-xs ${colors.textMuted} hidden sm:block`}>
+          <span
+            data-content-role="description"
+            data-content-label="phase description"
+            className={`text-xs ${colors.textMuted} hidden sm:block`}
+          >
             {phaseInfo.description}
           </span>
           {headerActions}

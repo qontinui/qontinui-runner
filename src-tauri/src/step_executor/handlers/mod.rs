@@ -89,6 +89,9 @@ mod test;
 mod workflow;
 mod workflow_ref;
 
+// Save workflow artifact handler
+mod save_workflow_artifact;
+
 // UI Bridge Spec handler
 pub mod spec;
 
@@ -122,6 +125,9 @@ pub use workflow_ref::WorkflowRefHandler;
 
 // Spec handler re-exports
 pub use spec::SpecHandler;
+
+// Save workflow artifact re-export
+pub use save_workflow_artifact::SaveWorkflowArtifactHandler;
 
 // AWAS handler re-exports
 pub use awas_check_support::AwasCheckSupportHandler;
@@ -433,6 +439,9 @@ impl HandlerRegistry {
 
         // UI Bridge Spec handler
         registry.register(SpecHandler);
+
+        // Save workflow artifact handler
+        registry.register(SaveWorkflowArtifactHandler);
 
         // AWAS handlers
         registry.register(AwasDiscoverHandler);

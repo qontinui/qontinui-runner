@@ -191,6 +191,10 @@ impl DebugContextCurator {
             }
         }
 
+        // Enrich investigation hints with past resolutions from hybrid search
+        Self::enrich_with_past_resolutions(conn, &mut critical_errors);
+        Self::enrich_with_past_resolutions(conn, &mut regular_errors);
+
         // Sort by priority score
         critical_errors.sort_by(|a, b| b.priority_score.cmp(&a.priority_score));
         regular_errors.sort_by(|a, b| b.priority_score.cmp(&a.priority_score));
@@ -250,6 +254,49 @@ impl DebugContextCurator {
         }
 
         descriptions
+    }
+
+    /// Enrich curated errors with past resolution hints from the findings database.
+    ///
+    /// For each critical/error-level error, queries task_run_findings for resolved
+    /// entries with similar messages and appends the resolution approach to
+    /// investigation_hints. Falls back gracefully if no matches are found.
+    fn enrich_with_past_resolutions(conn: &Connection, errors: &mut [CuratedError]) {
+        for error in errors.iter_mut() {
+            // Search for resolved findings with similar messages
+            let sql = r#"
+                SELECT title, resolution
+                FROM task_run_findings
+                WHERE status = 'resolved'
+                  AND resolution IS NOT NULL
+                  AND (title LIKE ?1 OR description LIKE ?1)
+                ORDER BY resolved_at DESC
+                LIMIT 2
+            "#;
+
+            // Use a substring of the error message for matching
+            let search_term = if error.message.len() > 80 {
+                format!("%{}%", &error.message[..80])
+            } else {
+                format!("%{}%", error.message)
+            };
+
+            if let Ok(mut stmt) = conn.prepare(sql) {
+                let hints: Vec<String> = stmt
+                    .query_map(rusqlite::params![search_term], |row| {
+                        let title: String = row.get(0)?;
+                        let resolution: String = row.get(1)?;
+                        Ok(format!("Past resolution for '{}': {}", title, resolution))
+                    })
+                    .ok()
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                    .unwrap_or_default();
+
+                if !hints.is_empty() {
+                    error.investigation_hints.extend(hints);
+                }
+            }
+        }
     }
 
     /// Curate a single error with additional context.

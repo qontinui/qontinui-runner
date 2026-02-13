@@ -70,6 +70,7 @@ pub mod interrupt;
 pub mod knowledge;
 pub mod layers;
 pub mod learning;
+pub mod learning_recorder;
 pub mod ledger;
 pub mod memory;
 pub mod output;

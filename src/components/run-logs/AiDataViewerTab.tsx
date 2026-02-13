@@ -776,16 +776,30 @@ function PlaywrightResultsDisplay({ taskRunId }: { taskRunId: string }) {
     <div className="space-y-4">
       {/* Summary stats */}
       <div className="flex items-center gap-4 px-3 py-2 bg-muted/30 rounded-md">
-        <span className="text-sm font-medium">Test Results:</span>
-        <span className={`flex items-center gap-1 text-sm ${getStatusColors("success").text}`}>
+        <span data-content-role="label" className="text-sm font-medium">
+          Test Results:
+        </span>
+        <span
+          data-content-role="metric"
+          data-content-label="tests passed"
+          className={`flex items-center gap-1 text-sm ${getStatusColors("success").text}`}
+        >
           <CheckCircle className="w-4 h-4" />
           {playwrightData.passed} passed
         </span>
-        <span className={`flex items-center gap-1 text-sm ${getStatusColors("error").text}`}>
+        <span
+          data-content-role="metric"
+          data-content-label="tests failed"
+          className={`flex items-center gap-1 text-sm ${getStatusColors("error").text}`}
+        >
           <XCircle className="w-4 h-4" />
           {playwrightData.failed} failed
         </span>
-        <span className="text-xs text-muted-foreground ml-auto">
+        <span
+          data-content-role="metric"
+          data-content-label="total tests"
+          className="text-xs text-muted-foreground ml-auto"
+        >
           {playwrightData.count} total tests
         </span>
       </div>
@@ -1064,16 +1078,30 @@ function ApiRequestsDisplay({ taskRunId }: { taskRunId: string }) {
     <div className="space-y-4">
       {/* Summary stats */}
       <div className="flex items-center gap-4 px-3 py-2 bg-muted/30 rounded-md">
-        <span className="text-sm font-medium">API Requests:</span>
-        <span className={`flex items-center gap-1 text-sm ${getStatusColors("success").text}`}>
+        <span data-content-role="label" className="text-sm font-medium">
+          API Requests:
+        </span>
+        <span
+          data-content-role="metric"
+          data-content-label="API requests successful"
+          className={`flex items-center gap-1 text-sm ${getStatusColors("success").text}`}
+        >
           <CheckCircle className="w-4 h-4" />
           {apiData.success_count} successful
         </span>
-        <span className={`flex items-center gap-1 text-sm ${getStatusColors("error").text}`}>
+        <span
+          data-content-role="metric"
+          data-content-label="API requests failed"
+          className={`flex items-center gap-1 text-sm ${getStatusColors("error").text}`}
+        >
           <XCircle className="w-4 h-4" />
           {apiData.failed_count} failed
         </span>
-        <span className="text-xs text-muted-foreground ml-auto">
+        <span
+          data-content-role="metric"
+          data-content-label="total API requests"
+          className="text-xs text-muted-foreground ml-auto"
+        >
           {apiData.count} total requests
         </span>
       </div>
@@ -1633,7 +1661,9 @@ function ScreenshotsSection() {
             {selectedRun.completed_at
               ? ` -> ${formatTimestamp(selectedRun.completed_at)}`
               : " -> (still running)"}
-            <span className="ml-2 px-2 py-0.5 rounded bg-muted">SQLite</span>
+            <span data-content-role="badge" className="ml-2 px-2 py-0.5 rounded bg-muted">
+              SQLite
+            </span>
           </div>
         )}
         <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
@@ -1652,7 +1682,9 @@ function ScreenshotsSection() {
             <span className="font-medium">Time range:</span>{" "}
             {formatTimestamp(selectedRun.created_at)}
             {" -> (still running)"}
-            <span className="ml-2 px-2 py-0.5 rounded bg-muted">File System (real-time)</span>
+            <span data-content-role="badge" className="ml-2 px-2 py-0.5 rounded bg-muted">
+              File System (real-time)
+            </span>
           </div>
         )}
         <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">

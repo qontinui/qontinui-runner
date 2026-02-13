@@ -44,11 +44,21 @@ export function TestStepsPreview({ steps }: TestStepsPreviewProps) {
             <div className="flex-1 min-w-0">
               <div className="flex items-center gap-2">
                 <StepTypeBadge type={step.step_type} />
-                <span className="text-sm text-neutral-200">{step.action}</span>
+                <span
+                  data-content-role="body-text"
+                  data-content-label="step action"
+                  className="text-sm text-neutral-200"
+                >
+                  {step.action}
+                </span>
               </div>
               <div className="text-xs text-neutral-500 mt-1 flex items-center gap-1">
-                <span className="text-neutral-600">Expected:</span>
-                {step.expected}
+                <span data-content-role="label" className="text-neutral-600">
+                  Expected:
+                </span>
+                <span data-content-role="body-text" data-content-label="step expected outcome">
+                  {step.expected}
+                </span>
               </div>
             </div>
           </div>
@@ -57,10 +67,18 @@ export function TestStepsPreview({ steps }: TestStepsPreviewProps) {
 
       {/* Summary */}
       <div className="flex items-center gap-4 text-xs text-neutral-500 px-1">
-        <span>{countByType(steps, "setup")} setup</span>
-        <span>{countByType(steps, "request")} request(s)</span>
-        <span>{countByType(steps, "assertion")} assertion(s)</span>
-        <span>{countByType(steps, "cleanup")} cleanup</span>
+        <span data-content-role="metric" data-content-label="setup count">
+          {countByType(steps, "setup")} setup
+        </span>
+        <span data-content-role="metric" data-content-label="request count">
+          {countByType(steps, "request")} request(s)
+        </span>
+        <span data-content-role="metric" data-content-label="assertion count">
+          {countByType(steps, "assertion")} assertion(s)
+        </span>
+        <span data-content-role="metric" data-content-label="cleanup count">
+          {countByType(steps, "cleanup")} cleanup
+        </span>
       </div>
     </div>
   );

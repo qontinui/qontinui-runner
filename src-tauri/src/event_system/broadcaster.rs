@@ -184,16 +184,17 @@ impl EventBroadcaster {
         status: &str,
         details: Option<serde_json::Value>,
     ) {
-        let event_data = serde_json::json!({
-            "task_run_id": task_run_id,
-            "step_index": step_index,
-            "step_name": step_name,
-            "status": status,
-            "details": details,
-            "timestamp": chrono::Utc::now().timestamp_millis()
-        });
-
-        self.broadcast_or_warn(AppEvent::executor_event("step_progress", event_data));
+        let event = match details {
+            Some(d) => AppEvent::step_progress_with_details(
+                task_run_id,
+                step_index,
+                step_name,
+                status,
+                d,
+            ),
+            None => AppEvent::step_progress(task_run_id, step_index, step_name, status),
+        };
+        self.broadcast_or_warn(event);
     }
 
     /// Broadcast a task run update event.
@@ -206,15 +207,19 @@ impl EventBroadcaster {
         iteration: Option<u32>,
         details: Option<serde_json::Value>,
     ) {
-        let event_data = serde_json::json!({
-            "task_run_id": task_run_id,
-            "status": status,
-            "iteration": iteration,
-            "details": details,
-            "timestamp": chrono::Utc::now().timestamp_millis()
-        });
-
-        self.broadcast_or_warn(AppEvent::executor_event("task_run_update", event_data));
+        let event = match (iteration, details) {
+            (Some(iter), Some(d)) => {
+                AppEvent::task_run_update_with_details(task_run_id, status, Some(iter), d)
+            }
+            (Some(iter), None) => {
+                AppEvent::task_run_update_with_iteration(task_run_id, status, iter)
+            }
+            (None, Some(d)) => {
+                AppEvent::task_run_update_with_details(task_run_id, status, None, d)
+            }
+            (None, None) => AppEvent::task_run_update(task_run_id, status),
+        };
+        self.broadcast_or_warn(event);
     }
 
     /// Broadcast an executor event with additional WebSocket support.
@@ -285,6 +290,33 @@ impl EventBroadcaster {
     pub fn broadcast_raw_or_warn(&self, event_name: &str, payload: &serde_json::Value) {
         if let Err(e) = self.broadcast_raw(event_name, payload) {
             warn!("{}", e);
+        }
+    }
+}
+
+/// Broadcast a notification to WebSocket clients only (not Tauri IPC).
+///
+/// This is a lightweight helper for call sites that already emit to Tauri via
+/// `app_handle.emit()` and just need to also notify WebSocket clients.
+/// The frontend uses these notifications as triggers to refetch data via REST,
+/// so the payload content is less important than the channel name.
+pub fn broadcast_ws_notification(
+    app_handle: &AppHandle,
+    channel: &str,
+    payload: &serde_json::Value,
+) {
+    if let Some(state) = app_handle.try_state::<Arc<AppState>>() {
+        let ws_event = serde_json::json!({
+            "channel": channel,
+            "payload": payload
+        });
+        if let Err(e) = state.event_broadcast.send(ws_event) {
+            if state.event_broadcast.receiver_count() > 0 {
+                warn!(
+                    "Failed to broadcast WS notification for {}: {}",
+                    channel, e
+                );
+            }
         }
     }
 }

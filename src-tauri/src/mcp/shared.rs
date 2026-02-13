@@ -189,6 +189,11 @@ pub fn emit_ai_output(
     if let Err(e) = app_handle.emit("ai-output", &event) {
         warn!("Failed to emit AI output event: {}", e);
     }
+
+    // Also broadcast to WebSocket clients
+    if let Ok(json) = serde_json::to_value(&event) {
+        crate::event_system::broadcast_ws_notification(app_handle, "ai-output", &json);
+    }
 }
 
 /// Write AI debug log to file

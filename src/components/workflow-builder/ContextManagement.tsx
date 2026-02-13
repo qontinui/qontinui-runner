@@ -211,7 +211,10 @@ export function ContextManagement() {
       project: `${getAccentColors("purple").bg} ${getAccentColors("purple").text}`,
     };
     return (
-      <span className={`text-[10px] px-1.5 py-0.5 rounded ${colors[scope] || "bg-zinc-700"}`}>
+      <span
+        data-content-role="badge"
+        className={`text-[10px] px-1.5 py-0.5 rounded ${colors[scope] || "bg-zinc-700"}`}
+      >
         {scope}
       </span>
     );
@@ -321,7 +324,11 @@ export function ContextManagement() {
                   </button>
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2">
-                      <span className="font-medium text-sm text-zinc-200 truncate">
+                      <span
+                        data-content-role="label"
+                        data-content-label="context name"
+                        className="font-medium text-sm text-zinc-200 truncate"
+                      >
                         {context.name}
                       </span>
                       {renderScopeBadge(context.scope)}
@@ -371,7 +378,10 @@ export function ContextManagement() {
                     if (ctxs.length === 0) return null;
                     return (
                       <div key={scope}>
-                        <div className="px-3 py-1 text-xs font-medium text-zinc-500 bg-zinc-800/50 capitalize">
+                        <div
+                          data-content-role="heading"
+                          className="px-3 py-1 text-xs font-medium text-zinc-500 bg-zinc-800/50 capitalize"
+                        >
                           {scope}
                         </div>
                         {ctxs.map((ctx) => (

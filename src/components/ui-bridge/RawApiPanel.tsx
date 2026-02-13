@@ -19,7 +19,7 @@ import {
   Clock,
   Terminal,
 } from "lucide-react";
-import type { CommandResult } from "../../hooks/useExternalUIBridge";
+import type { CommandResult } from "../../types/ui-bridge-types";
 
 interface RawApiPanelProps {
   onSendCommand: <T = unknown>(

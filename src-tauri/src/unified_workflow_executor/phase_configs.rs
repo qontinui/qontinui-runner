@@ -22,8 +22,6 @@ pub struct SetupConfig {
     pub execution_id: String,
     /// Workflow name
     pub workflow_name: String,
-    /// Optional inactivity timeout in seconds (None = no timeout)
-    pub timeout_seconds: Option<u64>,
 }
 
 impl SetupConfig {
@@ -34,7 +32,6 @@ impl SetupConfig {
             prompt_steps: Vec::new(),
             execution_id: execution_id.into(),
             workflow_name: workflow_name.into(),
-            timeout_seconds: None,
         }
     }
 
@@ -49,13 +46,6 @@ impl SetupConfig {
     #[must_use]
     pub fn with_prompt_steps(mut self, steps: Vec<ExecutionStepConfig>) -> Self {
         self.prompt_steps = steps;
-        self
-    }
-
-    /// Set timeout.
-    #[must_use]
-    pub fn with_timeout(mut self, timeout: Option<u64>) -> Self {
-        self.timeout_seconds = timeout;
         self
     }
 }
@@ -127,8 +117,6 @@ pub struct VerificationResult {
 pub struct AgenticConfig {
     /// Maximum iterations
     pub max_iterations: u32,
-    /// Optional timeout in seconds
-    pub timeout_seconds: Option<u64>,
     /// Base prompt for the AI
     pub base_prompt: String,
     /// Workflow name
@@ -154,7 +142,6 @@ impl AgenticConfig {
     ) -> Self {
         Self {
             max_iterations: 5,
-            timeout_seconds: None,
             base_prompt: String::new(),
             workflow_name: workflow_name.into(),
             workflow_id: String::new(),
@@ -185,13 +172,6 @@ impl AgenticConfig {
         self.has_agentic_steps = has_steps;
         self
     }
-
-    /// Set the timeout.
-    #[must_use]
-    pub fn with_timeout(mut self, timeout: Option<u64>) -> Self {
-        self.timeout_seconds = timeout;
-        self
-    }
 }
 
 // =============================================================================
@@ -209,8 +189,6 @@ pub struct CompletionConfig {
     pub execution_id: String,
     /// Workflow name
     pub workflow_name: String,
-    /// Optional inactivity timeout in seconds
-    pub timeout_seconds: Option<u64>,
     /// Number of verification-agentic iterations that ran
     pub iterations_run: u32,
 }
@@ -227,7 +205,6 @@ impl CompletionConfig {
             prompt_steps: Vec::new(),
             execution_id: execution_id.into(),
             workflow_name: workflow_name.into(),
-            timeout_seconds: None,
             iterations_run,
         }
     }
@@ -243,13 +220,6 @@ impl CompletionConfig {
     #[must_use]
     pub fn with_prompt_steps(mut self, steps: Vec<ExecutionStepConfig>) -> Self {
         self.prompt_steps = steps;
-        self
-    }
-
-    /// Set timeout.
-    #[must_use]
-    pub fn with_timeout(mut self, timeout: Option<u64>) -> Self {
-        self.timeout_seconds = timeout;
         self
     }
 }

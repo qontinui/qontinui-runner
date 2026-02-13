@@ -106,23 +106,41 @@ export function TestExecutionPanel() {
         <div className="flex items-center gap-4">
           <div className="flex items-center gap-2">
             <Terminal className="w-4 h-4 text-muted-foreground" />
-            <span className="text-sm font-medium">Execution</span>
+            <span data-content-role="heading" className="text-sm font-medium">
+              Execution
+            </span>
           </div>
 
           {/* Status indicator */}
           <div className="flex items-center gap-2">
             {getStatusIcon()}
-            <span className={`text-sm font-medium ${getStatusColor()}`}>{getStatusText()}</span>
+            <span
+              data-content-role="status"
+              data-content-label="execution status"
+              className={`text-sm font-medium ${getStatusColor()}`}
+            >
+              {getStatusText()}
+            </span>
           </div>
 
           {/* Duration */}
           {state.lastResult && (
-            <span className="text-xs text-muted-foreground">{state.lastResult.duration_ms}ms</span>
+            <span
+              data-content-role="metric"
+              data-content-label="execution duration"
+              className="text-xs text-muted-foreground"
+            >
+              {state.lastResult.duration_ms}ms
+            </span>
           )}
 
           {/* Assertions */}
           {state.lastResult && (
-            <span className="text-xs text-muted-foreground">
+            <span
+              data-content-role="metric"
+              data-content-label="assertions count"
+              className="text-xs text-muted-foreground"
+            >
               {state.lastResult.assertions_passed}/
               {state.lastResult.assertions_passed + state.lastResult.assertions_failed} assertions
             </span>

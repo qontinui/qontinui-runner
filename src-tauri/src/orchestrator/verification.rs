@@ -13,6 +13,8 @@ use std::process::Command;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
+use crate::doctor::DoctorHandle;
+
 /// Build an enhanced PATH that includes Node.js tools and local node_modules.
 ///
 /// On Windows, npm tools like npx, eslint, prettier are .cmd batch files that may not be
@@ -716,13 +718,13 @@ Respond with JSON only."#,
 /// This executor is deliberately isolated from worker context.
 /// It only has access to screenshots and evaluation prompts.
 pub struct AiVerifier {
-    /// Timeout for AI calls in seconds
-    pub timeout_seconds: u64,
+    /// Doctor health monitor handle for tracking AI processes.
+    doctor_handle: Option<DoctorHandle>,
 }
 
 impl AiVerifier {
-    pub fn new(timeout_seconds: u64) -> Self {
-        Self { timeout_seconds }
+    pub fn new(doctor_handle: Option<DoctorHandle>) -> Self {
+        Self { doctor_handle }
     }
 
     /// Run a single AI verification check.
@@ -775,7 +777,7 @@ impl AiVerifier {
         let ai_response = crate::ai_provider::run_prompt_with_routing(
             &full_prompt,
             &task_context,
-            self.timeout_seconds,
+            self.doctor_handle.as_ref(),
         );
 
         if !ai_response.success {
@@ -898,7 +900,6 @@ impl AiVerifier {
         // Clone data for moving into tasks
         let screenshot = Arc::new(screenshot_base64.to_string());
         let goal_summary = Arc::new(plan.goal_summary.clone());
-        let timeout = self.timeout_seconds;
 
         // Spawn tasks for each criterion
         let mut handles = Vec::new();
@@ -907,9 +908,10 @@ impl AiVerifier {
             let criterion_clone = criterion.clone();
             let screenshot_clone = Arc::clone(&screenshot);
             let goal_clone = Arc::clone(&goal_summary);
+            let doctor_handle_clone = self.doctor_handle.clone();
 
             let handle = tokio::task::spawn_blocking(move || {
-                let verifier = AiVerifier::new(timeout);
+                let verifier = AiVerifier::new(doctor_handle_clone);
                 verifier.verify_criterion(&criterion_clone, &screenshot_clone, &goal_clone)
             });
 
@@ -955,10 +957,10 @@ pub struct VerificationOrchestrator {
 }
 
 impl VerificationOrchestrator {
-    pub fn new(working_directory: String, ai_timeout_seconds: u64) -> Self {
+    pub fn new(working_directory: String, doctor_handle: Option<DoctorHandle>) -> Self {
         Self {
             deterministic_verifier: DeterministicVerifier::new(working_directory),
-            ai_verifier: AiVerifier::new(ai_timeout_seconds),
+            ai_verifier: AiVerifier::new(doctor_handle),
         }
     }
 

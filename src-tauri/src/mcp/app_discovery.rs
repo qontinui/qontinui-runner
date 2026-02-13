@@ -37,6 +37,7 @@ pub struct DiscoveredApp {
     pub framework: Option<String>,
     pub url: String,
     pub port: u16,
+    pub base_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     pub capabilities: Vec<String>,
@@ -79,6 +80,8 @@ pub struct RegisterAppRequest {
     pub framework: Option<String>,
     pub url: String,
     pub port: u16,
+    #[serde(default)]
+    pub base_path: String,
 }
 
 // ============================================================================
@@ -100,7 +103,11 @@ const DESKTOP_APP_PORTS: &[u16] = &[
     3333, // Desktop misc
 ];
 
-const HEALTH_PATHS: &[&str] = &["/ui-bridge/health", "/health"];
+const HEALTH_PATHS: &[(&str, &str)] = &[
+    ("/api/ui-bridge/health", "/api/ui-bridge"),
+    ("/ui-bridge/health", "/ui-bridge"),
+    ("/health", ""),
+];
 const SCAN_TIMEOUT_MS: u64 = 500;
 
 // ============================================================================
@@ -109,8 +116,8 @@ const SCAN_TIMEOUT_MS: u64 = 500;
 
 /// Check a single port for UI Bridge health endpoint
 async fn check_port(port: u16) -> Option<DiscoveredApp> {
-    for path in HEALTH_PATHS {
-        match check_health(port, path).await {
+    for (health_path, base_path) in HEALTH_PATHS {
+        match check_health(port, health_path, base_path).await {
             Some(app) => return Some(app),
             None => continue,
         }
@@ -119,7 +126,7 @@ async fn check_port(port: u16) -> Option<DiscoveredApp> {
 }
 
 /// Check a specific health endpoint on a port
-async fn check_health(port: u16, path: &str) -> Option<DiscoveredApp> {
+async fn check_health(port: u16, path: &str, base_path: &str) -> Option<DiscoveredApp> {
     let url = format!("http://localhost:{}{}", port, path);
 
     let client = reqwest::Client::builder()
@@ -169,6 +176,7 @@ async fn check_health(port: u16, path: &str) -> Option<DiscoveredApp> {
             .map(String::from),
         url: format!("http://localhost:{}", port),
         port,
+        base_path: base_path.to_string(),
         version: ui_bridge
             .get("version")
             .and_then(|v| v.as_str())
@@ -503,7 +511,7 @@ async fn forward_device(
     let local_port: u16 = local_port_str.parse().map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::error(&format!(
+            Json(ApiResponse::error(format!(
                 "Failed to parse local port from ADB output: '{}'",
                 local_port_str
             ))),
@@ -534,6 +542,7 @@ async fn register_app(
         framework: req.framework,
         url: req.url,
         port: req.port,
+        base_path: req.base_path,
         version: None,
         capabilities: Vec::new(),
         element_count: None,

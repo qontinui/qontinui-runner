@@ -295,19 +295,37 @@ export function McpSettings({ onLog }: McpSettingsProps) {
           {/* Server info */}
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2">
-              <span className="font-medium text-sm truncate">{server.name}</span>
+              <span
+                data-content-role="label"
+                data-content-label="server name"
+                className="font-medium text-sm truncate"
+              >
+                {server.name}
+              </span>
               {!server.enabled && (
-                <span className="text-[10px] px-1.5 py-0.5 bg-muted rounded text-muted-foreground">
+                <span
+                  data-content-role="badge"
+                  data-content-label="disabled badge"
+                  className="text-[10px] px-1.5 py-0.5 bg-muted rounded text-muted-foreground"
+                >
                   Disabled
                 </span>
               )}
               {server.autoStart && (
-                <span className="text-[10px] px-1.5 py-0.5 bg-primary/10 rounded text-primary">
+                <span
+                  data-content-role="badge"
+                  data-content-label="auto-start badge"
+                  className="text-[10px] px-1.5 py-0.5 bg-primary/10 rounded text-primary"
+                >
                   Auto-start
                 </span>
               )}
             </div>
-            <div className="text-xs text-muted-foreground truncate">
+            <div
+              data-content-role="body-text"
+              data-content-label="server endpoint"
+              className="text-xs text-muted-foreground truncate"
+            >
               {server.transport === "stdio" ? server.command : server.url || "No URL"}
             </div>
           </div>
@@ -315,17 +333,30 @@ export function McpSettings({ onLog }: McpSettingsProps) {
           {/* Connection status */}
           <div className="flex items-center gap-1.5">
             {status?.connected ? (
-              <span className="flex items-center gap-1 text-xs text-green-500">
+              <span
+                data-content-role="status"
+                data-content-label="server connected"
+                className="flex items-center gap-1 text-xs text-green-500"
+              >
                 <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
                 Connected
               </span>
             ) : status?.error ? (
-              <span className="flex items-center gap-1 text-xs text-red-500" title={status.error}>
+              <span
+                data-content-role="status"
+                data-content-label="server error"
+                className="flex items-center gap-1 text-xs text-red-500"
+                title={status.error}
+              >
                 <span className="w-2 h-2 rounded-full bg-red-500" />
                 Error
               </span>
             ) : (
-              <span className="flex items-center gap-1 text-xs text-muted-foreground">
+              <span
+                data-content-role="status"
+                data-content-label="server disconnected"
+                className="flex items-center gap-1 text-xs text-muted-foreground"
+              >
                 <span className="w-2 h-2 rounded-full bg-muted" />
                 Disconnected
               </span>
@@ -383,7 +414,11 @@ export function McpSettings({ onLog }: McpSettingsProps) {
           <div className="border-t border-border p-3 bg-muted/20">
             {status?.connected && status.tools && status.tools.length > 0 ? (
               <div className="space-y-2">
-                <div className="text-xs font-medium text-muted-foreground">
+                <div
+                  data-content-role="label"
+                  data-content-label="available tools count"
+                  className="text-xs font-medium text-muted-foreground"
+                >
                   Available Tools ({status.tools.length})
                 </div>
                 <div className="grid gap-2">
@@ -394,7 +429,13 @@ export function McpSettings({ onLog }: McpSettingsProps) {
                     >
                       <div className="flex items-center gap-2">
                         <Wrench className="w-3.5 h-3.5 text-primary" />
-                        <span className="font-mono text-xs">{tool.name}</span>
+                        <span
+                          data-content-role="label"
+                          data-content-label="tool name"
+                          className="font-mono text-xs"
+                        >
+                          {tool.name}
+                        </span>
                       </div>
                       {tool.description && (
                         <p className="text-[10px] text-muted-foreground mt-1 ml-5">

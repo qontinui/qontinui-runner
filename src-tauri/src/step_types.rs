@@ -87,6 +87,12 @@ pub enum StepType {
     AwasExtractElements,
 
     // ========================================================================
+    // Artifact Steps
+    // ========================================================================
+    /// Save a generated workflow JSON to the library
+    SaveWorkflowArtifact,
+
+    // ========================================================================
     // Utility Steps
     // ========================================================================
     /// Execute a saved macro
@@ -203,6 +209,9 @@ impl StepType {
             StepType::AwasListActions => Some(10_000), // 10 seconds
             StepType::AwasExtractElements => Some(10_000), // 10 seconds
 
+            // Artifact
+            StepType::SaveWorkflowArtifact => Some(5_000), // 5 seconds (DB write)
+
             // Utility
             StepType::Macro => Some(60_000), // 60 seconds
         }
@@ -265,6 +274,11 @@ impl StepType {
             "awas_list_actions" | "awaslistactions" => Some(StepType::AwasListActions),
             "awas_extract_elements" | "awasextractelements" => Some(StepType::AwasExtractElements),
 
+            // Artifact
+            "save_workflow_artifact" | "saveworkflowartifact" => {
+                Some(StepType::SaveWorkflowArtifact)
+            }
+
             // Utility
             "macro" => Some(StepType::Macro),
 
@@ -304,6 +318,7 @@ impl StepType {
             StepType::AwasCheckSupport => "awas_check_support",
             StepType::AwasListActions => "awas_list_actions",
             StepType::AwasExtractElements => "awas_extract_elements",
+            StepType::SaveWorkflowArtifact => "save_workflow_artifact",
             StepType::Macro => "macro",
         }
     }

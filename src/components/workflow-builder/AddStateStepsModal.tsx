@@ -372,7 +372,11 @@ export function AddStateStepsModal({
                     <p className={`font-medium ${configTypeInfo.iconColor}`}>
                       {configTypeInfo.label}
                     </p>
-                    <span className="text-xs text-zinc-500">
+                    <span
+                      data-content-role="metric"
+                      data-content-label="state count"
+                      className="text-xs text-zinc-500"
+                    >
                       ({states.length} state{states.length !== 1 ? "s" : ""})
                     </span>
                   </div>
@@ -436,12 +440,18 @@ export function AddStateStepsModal({
                                 {state.name}
                               </span>
                               {summary.isInitial && (
-                                <span className="text-xs px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-400">
+                                <span
+                                  data-content-role="badge"
+                                  className="text-xs px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-400"
+                                >
                                   Initial
                                 </span>
                               )}
                               {summary.isFinal && (
-                                <span className="text-xs px-1.5 py-0.5 rounded bg-green-500/20 text-green-400">
+                                <span
+                                  data-content-role="badge"
+                                  className="text-xs px-1.5 py-0.5 rounded bg-green-500/20 text-green-400"
+                                >
                                   Final
                                 </span>
                               )}
@@ -575,7 +585,10 @@ export function AddStateStepsModal({
                                 Vision Test (qontinui_vision)
                               </span>
                               {configTypeInfo.recommendedVision && (
-                                <span className="text-xs px-1.5 py-0.5 rounded bg-green-500/20 text-green-400">
+                                <span
+                                  data-content-role="badge"
+                                  className="text-xs px-1.5 py-0.5 rounded bg-green-500/20 text-green-400"
+                                >
                                   Recommended
                                 </span>
                               )}
@@ -601,7 +614,10 @@ export function AddStateStepsModal({
                               <TestTube className="w-4 h-4 text-zinc-400" />
                               <span className="text-sm text-zinc-300">Playwright Test</span>
                               {configTypeInfo.recommendedPlaywright && (
-                                <span className="text-xs px-1.5 py-0.5 rounded bg-green-500/20 text-green-400">
+                                <span
+                                  data-content-role="badge"
+                                  className="text-xs px-1.5 py-0.5 rounded bg-green-500/20 text-green-400"
+                                >
                                   Recommended
                                 </span>
                               )}

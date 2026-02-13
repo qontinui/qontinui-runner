@@ -200,8 +200,18 @@ export function TestEditorPanel({ onCodeChange, code }: TestEditorPanelProps) {
       <div className="flex items-center justify-between px-4 py-2 border-b border-border/50 bg-muted/20">
         <div className="flex items-center gap-2">
           <FileCode className="w-4 h-4 text-muted-foreground" />
-          <span className="text-sm font-medium">{selectedTest.name}</span>
-          <span className="text-xs text-muted-foreground px-2 py-0.5 bg-muted rounded">
+          <span
+            data-content-role="label"
+            data-content-label="test name"
+            className="text-sm font-medium"
+          >
+            {selectedTest.name}
+          </span>
+          <span
+            data-content-role="badge"
+            data-content-label="editor language"
+            className="text-xs text-muted-foreground px-2 py-0.5 bg-muted rounded"
+          >
             {language}
           </span>
         </div>

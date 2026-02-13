@@ -3,6 +3,7 @@
 //! This module contains all data structures used by the verification-agentic loop.
 
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// Result of a single iteration of the verification-agentic loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,9 +96,6 @@ impl LoopResult {
 pub struct LoopConfig {
     /// Maximum number of iterations before giving up
     pub max_iterations: u32,
-    /// Optional inactivity timeout in seconds for AI execution.
-    /// None = no timeout (recommended), Some(N) = kill AI after N seconds of inactivity.
-    pub timeout_seconds: Option<u64>,
     /// The base prompt for the AI
     pub base_prompt: String,
     /// Workflow name (for logging)
@@ -116,6 +114,13 @@ pub struct LoopConfig {
     /// a fix before verification runs (since verification may pass immediately
     /// if it only checks current state, not whether fixes were applied).
     pub run_agentic_first: bool,
+    /// Artifact directory for sharing files between phases.
+    /// Created automatically at the start of execution.
+    /// Steps can reference it via `{{artifact_dir}}` variable substitution.
+    pub artifact_dir: Option<PathBuf>,
+    /// Whether this is a dev mode execution (enables dev-only features like
+    /// self-analysis steps and learning outcome recording).
+    pub is_dev_mode: bool,
 }
 
 /// Phase of workflow execution.

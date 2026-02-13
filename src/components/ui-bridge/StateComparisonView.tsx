@@ -11,7 +11,7 @@ import { X, Hash, MapPin, Fingerprint, Percent, Layers, ArrowRight } from "lucid
 import { Badge } from "../ui/Badge";
 import { Button } from "../ui/Button";
 import type { FingerprintDiscoveryResult } from "./StateDiscoveryPanel";
-import type { ElementFingerprint } from "../../hooks/useExternalUIBridge";
+import type { ElementFingerprint } from "../../types/ui-bridge-types";
 
 interface StateComparisonViewProps {
   /** First state to compare */

@@ -236,7 +236,12 @@ export function AISummarySection({
             <div>
               <h2 className="font-semibold text-lg text-foreground">AI Summary</h2>
               {summaryGeneratedAt && (
-                <p data-ui-id="recap-summary-timestamp" className="text-xs text-muted-foreground">
+                <p
+                  data-ui-id="recap-summary-timestamp"
+                  data-content-role="metric"
+                  data-content-label="summary generation time"
+                  className="text-xs text-muted-foreground"
+                >
                   Generated {new Date(summaryGeneratedAt).toLocaleString()}
                 </p>
               )}
@@ -246,6 +251,8 @@ export function AISummarySection({
           {goalAchieved !== undefined && goalAchieved !== null && (
             <span
               data-ui-id="recap-goal-badge"
+              data-content-role="badge"
+              data-content-label="goal achievement"
               className={`flex items-center gap-2 px-3 py-1.5 text-sm font-medium rounded-full ${
                 goalAchieved
                   ? `${getStatusColors("success").bg} ${getStatusColors("success").text}`
@@ -289,7 +296,13 @@ export function AISummarySection({
           >
             <div className="flex items-center gap-2 mb-2">
               <AlertTriangle className={`w-4 h-4 ${getAccentColors("amber").text}`} />
-              <span className={`font-medium ${getAccentColors("amber").text}`}>Remaining Work</span>
+              <span
+                data-content-role="heading"
+                data-content-level="3"
+                className={`font-medium ${getAccentColors("amber").text}`}
+              >
+                Remaining Work
+              </span>
             </div>
             <p className="text-amber-300/90 whitespace-pre-wrap">{remainingWork}</p>
           </div>
@@ -307,7 +320,7 @@ export function AISummarySection({
       <div className="rounded-xl border border-border bg-muted/20 p-5">
         <div className="flex items-center gap-3 text-muted-foreground">
           <Loader2 className="w-5 h-5 animate-spin" />
-          <span>Generating AI summary...</span>
+          <span data-content-role="status">Generating AI summary...</span>
         </div>
       </div>
     );
@@ -323,7 +336,9 @@ export function AISummarySection({
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3 text-muted-foreground">
             <FileText className="w-5 h-5 opacity-50" />
-            <span data-ui-id="recap-ai-summary-text">No AI summary available for this run.</span>
+            <span data-ui-id="recap-ai-summary-text" data-content-role="status">
+              No AI summary available for this run.
+            </span>
           </div>
           <button
             data-ui-id="recap-generate-summary-btn"
@@ -348,7 +363,7 @@ export function AISummarySection({
     >
       <div className="flex items-center gap-3 text-muted-foreground">
         <FileText className="w-5 h-5 opacity-50" />
-        <span data-ui-id="recap-ai-summary-text">
+        <span data-ui-id="recap-ai-summary-text" data-content-role="status">
           Run in progress. Summary will be available after completion.
         </span>
       </div>

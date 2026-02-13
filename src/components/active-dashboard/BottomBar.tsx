@@ -137,7 +137,11 @@ export function BottomBar({
             />
           </svg>
         </div>
-        <span className="text-sm text-foreground font-medium">
+        <span
+          data-content-role="metric"
+          data-content-label="iteration progress"
+          className="text-sm text-foreground font-medium"
+        >
           Iteration {iteration}/{maxIterations}
         </span>
       </div>
@@ -147,6 +151,8 @@ export function BottomBar({
         {/* Orchestrator Agent Badge */}
         {currentOrchestratorAgent && AgentIcon && agentColors && isRunning && (
           <Badge
+            data-content-role="badge"
+            data-content-label="orchestrator agent"
             className={cn(
               agentColors.bg,
               agentColors.text,
@@ -165,7 +171,13 @@ export function BottomBar({
           {activeActivity && ActivityIcon && isRunning && (
             <div className="flex items-center gap-1.5 flex-shrink-0">
               <ActivityIcon className="w-4 h-4 text-muted-foreground" />
-              <span className="text-xs text-muted-foreground">{activityInfo?.displayName}:</span>
+              <span
+                data-content-role="label"
+                data-content-label="activity type"
+                className="text-xs text-muted-foreground"
+              >
+                {activityInfo?.displayName}:
+              </span>
             </div>
           )}
           <p className="text-sm text-foreground font-medium truncate">
@@ -176,7 +188,11 @@ export function BottomBar({
 
       {/* Right: Connection Status */}
       <div className="flex items-center justify-end w-[20%]">
-        <Badge className={cn(successColors.bg, successColors.text, "border", successColors.border)}>
+        <Badge
+          data-content-role="status"
+          data-content-label="connection status"
+          className={cn(successColors.bg, successColors.text, "border", successColors.border)}
+        >
           <Wifi className="mr-1.5 h-3 w-3" />
           Connected
         </Badge>

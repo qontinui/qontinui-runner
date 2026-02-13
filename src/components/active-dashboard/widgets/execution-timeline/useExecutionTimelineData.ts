@@ -548,6 +548,7 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
         currentIteration,
         isActive,
         isComplete,
+        isUpcoming: false,
         stats: {
           total: steps.length,
           completed,

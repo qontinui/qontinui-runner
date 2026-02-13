@@ -367,10 +367,20 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
           <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2 text-xs">
             {Object.entries(exportSummary).map(([key, count]) => (
               <div key={key} className="flex justify-between items-center p-2 bg-muted/30 rounded">
-                <span className="text-muted-foreground">
+                <span
+                  data-content-role="label"
+                  data-content-label="data category"
+                  className="text-muted-foreground"
+                >
                   {categoryLabels[key as keyof ExportSummary]}
                 </span>
-                <span className="font-medium">{count}</span>
+                <span
+                  data-content-role="metric"
+                  data-content-label="data count"
+                  className="font-medium"
+                >
+                  {count}
+                </span>
               </div>
             ))}
           </div>
@@ -513,16 +523,50 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
 
             <div className="grid grid-cols-2 gap-4 text-sm">
               <div>
-                <span className="text-muted-foreground">Version:</span>{" "}
-                <span className="font-medium">{importPreview.manifest.version}</span>
+                <span
+                  data-content-role="label"
+                  data-content-label="version label"
+                  className="text-muted-foreground"
+                >
+                  Version:
+                </span>{" "}
+                <span
+                  data-content-role="body-text"
+                  data-content-label="version value"
+                  className="font-medium"
+                >
+                  {importPreview.manifest.version}
+                </span>
               </div>
               <div>
-                <span className="text-muted-foreground">App Version:</span>{" "}
-                <span className="font-medium">{importPreview.manifest.app_version}</span>
+                <span
+                  data-content-role="label"
+                  data-content-label="app version label"
+                  className="text-muted-foreground"
+                >
+                  App Version:
+                </span>{" "}
+                <span
+                  data-content-role="body-text"
+                  data-content-label="app version value"
+                  className="font-medium"
+                >
+                  {importPreview.manifest.app_version}
+                </span>
               </div>
               <div className="col-span-2">
-                <span className="text-muted-foreground">Created:</span>{" "}
-                <span className="font-medium">
+                <span
+                  data-content-role="label"
+                  data-content-label="created label"
+                  className="text-muted-foreground"
+                >
+                  Created:
+                </span>{" "}
+                <span
+                  data-content-role="body-text"
+                  data-content-label="created date"
+                  className="font-medium"
+                >
                   {new Date(importPreview.manifest.created_at).toLocaleString()}
                 </span>
               </div>
@@ -687,7 +731,11 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
               ) : (
                 <AlertCircle className="w-3.5 h-3.5" />
               )}
-              <span className="text-xs font-medium">
+              <span
+                data-content-role="status"
+                data-content-label="import result"
+                className="text-xs font-medium"
+              >
                 {importResult.success ? "Import Successful" : "Import Completed with Errors"}
               </span>
             </div>

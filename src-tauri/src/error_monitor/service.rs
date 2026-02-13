@@ -511,9 +511,10 @@ impl ErrorMonitorService {
         let watcher = notify::recommended_watcher(move |result: Result<Event, notify::Error>| {
             if let Ok(event) = result {
                 for path in event.paths {
-                    let tx = tx.clone();
-                    // Use blocking send since we're in a sync callback
-                    let _ = tx.blocking_send(path);
+                    // Use try_send since we're in notify's thread which is outside the Tokio runtime.
+                    // blocking_send requires a Tokio context. try_send is non-blocking and will
+                    // drop the message if the channel is full - acceptable since we poll periodically.
+                    let _ = tx.try_send(path);
                 }
             }
         });

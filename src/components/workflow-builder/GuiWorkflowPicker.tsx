@@ -126,7 +126,9 @@ export function GuiWorkflowPicker({
       {selectedWorkflowId && !selectedWorkflow && (
         <div className="mt-1 flex items-center gap-1 text-xs text-amber-400">
           <AlertCircle className="w-3 h-3" />
-          <span>Selected workflow not found in current config</span>
+          <span data-content-role="status" data-content-label="workflow selection warning">
+            Selected workflow not found in current config
+          </span>
         </div>
       )}
 
@@ -160,7 +162,10 @@ export function GuiWorkflowPicker({
                 <div key={group.category}>
                   {/* Category Header */}
                   {groupedWorkflows.length > 1 && (
-                    <div className="px-3 py-1.5 bg-zinc-750 text-xs font-medium text-zinc-500 uppercase tracking-wider">
+                    <div
+                      data-content-role="heading"
+                      className="px-3 py-1.5 bg-zinc-750 text-xs font-medium text-zinc-500 uppercase tracking-wider"
+                    >
                       {group.category}
                     </div>
                   )}

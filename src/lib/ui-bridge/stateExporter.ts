@@ -5,7 +5,7 @@
  * into the GUI automation config format used by qontinui.
  */
 
-import type { CooccurrenceExport, ElementFingerprint } from "../../hooks/useExternalUIBridge";
+import type { CooccurrenceExport, ElementFingerprint } from "../../types/ui-bridge-types";
 import type { FingerprintDiscoveryResult } from "../../components/ui-bridge/StateDiscoveryPanel";
 
 /**

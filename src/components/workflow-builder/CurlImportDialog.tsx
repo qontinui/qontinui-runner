@@ -191,17 +191,24 @@ export function CurlImportDialog({ isOpen, onClose, onImport, phase }: CurlImpor
           {/* Parsed Result Preview */}
           {parsedResult && (
             <div className="space-y-3 p-4 bg-muted rounded-lg">
-              <div className="flex items-center gap-2 text-sm font-medium text-green-500">
+              <div
+                data-content-role="status"
+                className="flex items-center gap-2 text-sm font-medium text-green-500"
+              >
                 <Check className="w-4 h-4" />
                 Successfully parsed
               </div>
 
               <div className="space-y-2">
                 <div className="flex items-center gap-2">
-                  <span className="text-xs font-medium text-muted-foreground uppercase">
+                  <span
+                    data-content-role="label"
+                    className="text-xs font-medium text-muted-foreground uppercase"
+                  >
                     Method:
                   </span>
                   <span
+                    data-content-role="badge"
                     className={`px-2 py-0.5 text-xs font-medium rounded ${
                       parsedResult.method === "GET"
                         ? "bg-green-500/20 text-green-400"
@@ -219,13 +226,27 @@ export function CurlImportDialog({ isOpen, onClose, onImport, phase }: CurlImpor
                 </div>
 
                 <div>
-                  <span className="text-xs font-medium text-muted-foreground uppercase">URL:</span>
-                  <div className="text-sm font-mono mt-1 break-all">{parsedResult.url}</div>
+                  <span
+                    data-content-role="label"
+                    className="text-xs font-medium text-muted-foreground uppercase"
+                  >
+                    URL:
+                  </span>
+                  <div
+                    data-content-role="body-text"
+                    data-content-label="parsed URL"
+                    className="text-sm font-mono mt-1 break-all"
+                  >
+                    {parsedResult.url}
+                  </div>
                 </div>
 
                 {Object.keys(parsedResult.headers).length > 0 && (
                   <div>
-                    <span className="text-xs font-medium text-muted-foreground uppercase">
+                    <span
+                      data-content-role="label"
+                      className="text-xs font-medium text-muted-foreground uppercase"
+                    >
                       Headers: ({Object.keys(parsedResult.headers).length})
                     </span>
                     <div className="mt-1 space-y-1">
@@ -247,7 +268,10 @@ export function CurlImportDialog({ isOpen, onClose, onImport, phase }: CurlImpor
 
                 {parsedResult.body && (
                   <div>
-                    <span className="text-xs font-medium text-muted-foreground uppercase">
+                    <span
+                      data-content-role="label"
+                      className="text-xs font-medium text-muted-foreground uppercase"
+                    >
                       Body:
                     </span>
                     <pre className="text-xs font-mono mt-1 p-2 bg-background rounded max-h-24 overflow-auto">

@@ -32,8 +32,11 @@ pub async fn plan_test_orchestration(
         .list_saved_api_requests()
         .map_err(|e| format!("Failed to list saved requests: {}", e))?;
 
+    // Extract DoctorHandle for AI health monitoring
+    let doctor_handle = state.doctor_handle.lock().await.clone();
+
     // Create the plan using AI
-    match create_orchestration_plan(&request, &saved_requests) {
+    match create_orchestration_plan(&request, &saved_requests, doctor_handle.as_ref()) {
         Ok(plan) => Ok(CommandResponse {
             success: true,
             message: Some(format!(
@@ -115,9 +118,11 @@ pub async fn generate_test_from_orchestration(
     plan: TestOrchestrationPlan,
     test_type: String,
     additional_instructions: Option<String>,
-    _state: State<'_, Arc<AppState>>,
+    state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
     info!("Generating {} test from orchestration execution", test_type);
+
+    let doctor_handle = state.doctor_handle.lock().await.clone();
 
     let request = GenerateTestRequest {
         execution_result,
@@ -126,7 +131,7 @@ pub async fn generate_test_from_orchestration(
         additional_instructions,
     };
 
-    match generate_test_from_execution(&request) {
+    match generate_test_from_execution(&request, doctor_handle.as_ref()) {
         Ok(test) => Ok(CommandResponse {
             success: true,
             message: Some(format!("Generated {} test: {}", test_type, test.name)),

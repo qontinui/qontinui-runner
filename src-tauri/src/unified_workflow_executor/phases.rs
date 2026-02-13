@@ -29,12 +29,17 @@ use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{debug, info, instrument, warn};
 
+use crate::ai_provider::run_prompt_with_routing;
+use crate::ai_router::TaskContext;
 use crate::config_storage::ConfigStorage;
 use crate::database::CheckpointDb;
+use crate::doctor::DoctorHandle;
 use crate::executor::{
     prompt_builder, timeout_helper, ExecutionOutcome, Executor, ExecutorContext, ExecutorError,
     FromContext, IntoOutcome,
 };
+use crate::findings::storage as finding_storage;
+use crate::findings::{FindingParser, ParsedFinding};
 use crate::step_executor::{
     handlers::spec::fetch_external_elements, ExecutionStepConfig, StepExecutionResult,
     StepExecutor, VerificationPhaseResult,
@@ -168,6 +173,191 @@ fn format_duration_ms(ms: i64) -> String {
 }
 
 // =============================================================================
+// Prompt Response Mode Helper
+// =============================================================================
+
+/// Execute a single prompt step in "response" mode.
+///
+/// This runs a simple prompt->response AI call instead of a full Claude CLI session.
+/// Used for meta-workflows and other cases where a full session is overkill.
+///
+/// Findings ([FINDING:...] markers) in the AI response are parsed and stored
+/// in the database. Finding markers are stripped from the output before saving
+/// to output_path so the saved artifact contains clean content.
+async fn execute_prompt_response_mode(
+    step: &ExecutionStepConfig,
+    db: &CheckpointDb,
+    task_run_id: Option<&str>,
+    doctor_handle: Option<DoctorHandle>,
+) -> Result<String, String> {
+    // Build the prompt content
+    let mut prompt = step.prompt_content.clone().unwrap_or_default();
+
+    // If input_path is specified, read the file and append to prompt
+    if let Some(ref input_path) = step.input_path {
+        match std::fs::read_to_string(input_path) {
+            Ok(content) => {
+                prompt = format!("{}\n\n## Input File Content\n\n{}", prompt, content);
+            }
+            Err(e) => {
+                return Err(format!("Failed to read input file '{}': {}", input_path, e));
+            }
+        }
+    }
+
+    if prompt.trim().is_empty() {
+        return Err("Prompt content is empty for response mode step".to_string());
+    }
+
+    // Build task context for AI routing
+    let task_context = TaskContext::from_prompt(&prompt);
+
+    // Run in blocking task since run_prompt_with_routing is sync
+    let result = tokio::task::spawn_blocking(move || {
+        run_prompt_with_routing(&prompt, &task_context, doctor_handle.as_ref())
+    })
+    .await
+    .map_err(|e| format!("Prompt execution task panicked: {}", e))?;
+
+    if !result.success {
+        return Err(format!(
+            "AI prompt failed: {}",
+            result.error.unwrap_or_else(|| "Unknown error".to_string())
+        ));
+    }
+
+    let output_text = result.output;
+
+    // Detect empty AI response — Claude CLI can exit 0 with no output
+    if output_text.trim().is_empty() {
+        return Err(
+            "AI returned an empty response. The CLI process exited successfully but produced no output. \
+             This can happen if the prompt was too long, the model timed out, or there was a transient API error. \
+             Try running again."
+                .to_string(),
+        );
+    }
+
+    // Parse findings from the AI response and store them
+    let findings = parse_findings_from_response(&output_text);
+    if !findings.is_empty() {
+        if let Some(task_id) = task_run_id {
+            store_parsed_findings(db, task_id, &findings);
+        } else {
+            info!(
+                "Response mode: found {} findings but no task_run_id to store them",
+                findings.len()
+            );
+        }
+    }
+
+    // Strip finding markers from the output before saving to file
+    let clean_output = if findings.is_empty() {
+        output_text.clone()
+    } else {
+        crate::summary_generator::strip_output_markers(&output_text)
+    };
+
+    // Write to output_path if specified (using clean output without finding markers)
+    if let Some(ref output_path) = step.output_path {
+        // If the output path is a .json file, extract JSON from the response.
+        // AI models often include explanatory text before/after JSON output.
+        let write_content = if output_path.ends_with(".json") {
+            let extracted = crate::workflow_generation::extract_json_from_response(&clean_output);
+            tracing::info!(
+                "Response mode: extracted JSON ({} bytes) from response ({} bytes)",
+                extracted.len(),
+                clean_output.len()
+            );
+            if extracted.trim().is_empty() {
+                return Err(format!(
+                    "AI response ({} bytes) did not contain valid JSON for output file '{}'",
+                    clean_output.len(),
+                    output_path
+                ));
+            }
+            extracted
+        } else {
+            clean_output.clone()
+        };
+
+        // Ensure parent directory exists
+        if let Some(parent) = std::path::Path::new(output_path).parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return Err(format!("Failed to create output directory: {}", e));
+            }
+        }
+        if let Err(e) = std::fs::write(output_path, &write_content) {
+            return Err(format!(
+                "Failed to write output to '{}': {}",
+                output_path, e
+            ));
+        }
+        tracing::info!(
+            "Response mode: wrote {} bytes to '{}'",
+            write_content.len(),
+            output_path
+        );
+    }
+
+    Ok(output_text)
+}
+
+/// Parse [FINDING:...] markers from a response-mode AI output.
+///
+/// Uses FindingParser to extract structured findings from the full text.
+fn parse_findings_from_response(text: &str) -> Vec<ParsedFinding> {
+    let mut parser = FindingParser::new();
+    let mut findings = Vec::new();
+
+    for line in text.lines() {
+        if let Some(finding) = parser.process_line(line) {
+            findings.push(finding);
+        }
+    }
+
+    if !findings.is_empty() {
+        info!(
+            "Response mode: parsed {} findings from AI output",
+            findings.len()
+        );
+    }
+
+    findings
+}
+
+/// Store parsed findings in the database for a given task run.
+fn store_parsed_findings(db: &CheckpointDb, task_run_id: &str, findings: &[ParsedFinding]) {
+    let conn = match db.connection() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                "Failed to get database connection for storing findings: {}",
+                e
+            );
+            return;
+        }
+    };
+
+    for (idx, parsed) in findings.iter().enumerate() {
+        let session_num = (idx + 1) as u32;
+        match finding_storage::insert_finding(&conn, task_run_id, session_num, parsed) {
+            Ok(finding) => {
+                info!(
+                    "Response mode: stored finding [{}:{}] '{}'",
+                    finding.category.as_str(),
+                    finding.severity.as_str(),
+                    finding.title
+                );
+            }
+            Err(e) => {
+                warn!("Failed to store finding from response mode: {}", e);
+            }
+        }
+    }
+}
+
+// =============================================================================
 // Iteration Context Builder
 // =============================================================================
 
@@ -273,6 +463,7 @@ fn build_unified_iteration_context(
 /// Handles both automation steps (shell commands, workflows) and prompt steps (AI tasks).
 /// AI session execution is delegated to the UnifiedAiSessionExecutor.
 pub struct SetupExecutor {
+    app_state: Arc<AppState>,
     executor: StepExecutor,
     ai_executor: UnifiedAiSessionExecutor,
     checkpoint_db: Arc<CheckpointDb>,
@@ -287,6 +478,7 @@ impl SetupExecutor {
     ) -> Self {
         let checkpoint_db = app_state.checkpoint_db.clone();
         Self {
+            app_state: app_state.clone(),
             executor: StepExecutor::with_app_handle(
                 app_state.clone(),
                 config_storage,
@@ -302,12 +494,15 @@ impl SetupExecutor {
         self.ai_executor.session_manager = Some(sm);
     }
 
+    /// Set the task run ID on the inner step executor for database logging.
+    pub fn set_task_run_id(&mut self, task_run_id: String) {
+        self.executor.set_task_run_id(task_run_id);
+    }
+
     /// Run setup steps. Returns true if successful.
     ///
     /// Executes automation steps first (shell commands, etc.), then prompt steps (AI tasks).
     /// The logger is required for consistent step event logging.
-    ///
-    /// `timeout_seconds` is optional - None means no timeout (default, recommended).
     ///
     /// Step checkpointing is integrated for resume capability.
     #[instrument(
@@ -326,11 +521,28 @@ impl SetupExecutor {
         prompt_steps: &[ExecutionStepConfig],
         execution_id: &str,
         workflow_name: &str,
-        timeout_seconds: Option<u64>,
         logger: &StepEventLogger,
     ) -> (bool, Vec<StepExecutionResult>) {
         let mut all_results = Vec::new();
         let mut overall_success = true;
+
+        // Filter out dev_mode_only steps when not in dev mode
+        let automation_steps: Vec<ExecutionStepConfig> = automation_steps
+            .iter()
+            .filter(|step| {
+                if step.dev_mode_only.unwrap_or(false) && !cfg!(debug_assertions) {
+                    info!(
+                        "SETUP-PHASE: Skipping dev-mode-only automation step: {:?}",
+                        step.name
+                    );
+                    false
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+        let automation_steps = automation_steps.as_slice();
 
         // Create checkpoint manager for step-level checkpointing
         let checkpoint_mgr = CheckpointManager::new(self.checkpoint_db.clone(), "unified");
@@ -420,43 +632,139 @@ impl SetupExecutor {
                 prompt_steps.len()
             );
 
-            // Checkpoint the AI step as a single step
-            let ai_step_idx = automation_steps.len();
-            let step_name =
-                prompt_builder::consolidate_step_names_with_default(prompt_steps, "Setup AI Task");
+            // Separate response-mode steps from session-mode steps
+            let mut session_prompt_steps = Vec::new();
+            let mut response_step_count = 0usize;
+            for step in prompt_steps {
+                // Skip dev_mode_only steps when not in dev mode
+                if step.dev_mode_only.unwrap_or(false) && !cfg!(debug_assertions) {
+                    info!("Skipping dev-mode-only step: {:?}", step.name);
+                    continue;
+                }
 
-            // Use Some(0) instead of None for iteration to ensure SQLite's
-            // UNIQUE constraint works correctly (NULL != NULL in SQLite)
-            let mut ai_checkpoint = StepCheckpoint::new(
-                execution_id,
-                "unified",
-                "setup",
-                Some(0),
-                ai_step_idx,
-                "ai_session",
-            )
-            .with_step_name(&step_name);
-            ai_checkpoint.mark_started();
-            if let Err(e) = checkpoint_mgr.save_step(&ai_checkpoint) {
-                warn!("Failed to save setup AI step checkpoint: {}", e);
+                if step.prompt_mode.as_deref() == Some("response") {
+                    let step_name = step.name.as_deref().unwrap_or("Response Prompt");
+                    info!(
+                        "SETUP-PHASE: Executing response-mode prompt step: {}",
+                        step_name
+                    );
+
+                    // Checkpoint the response-mode prompt step as "running"
+                    let step_idx = automation_steps.len() + response_step_count;
+                    let mut resp_checkpoint = StepCheckpoint::new(
+                        execution_id,
+                        "unified",
+                        "setup",
+                        Some(0),
+                        step_idx,
+                        "prompt",
+                    )
+                    .with_step_name(step_name);
+                    resp_checkpoint.mark_started();
+                    if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
+                        warn!("Failed to save setup response-mode step checkpoint: {}", e);
+                    }
+
+                    let doctor_handle = self.app_state.doctor_handle.lock().await.clone();
+                    let start = std::time::Instant::now();
+                    match execute_prompt_response_mode(
+                        step,
+                        &self.checkpoint_db,
+                        None,
+                        doctor_handle,
+                    )
+                    .await
+                    {
+                        Ok(output) => {
+                            let duration_ms = start.elapsed().as_millis() as u64;
+                            info!(
+                                "SETUP-PHASE: Response-mode step '{}' completed successfully ({} bytes)",
+                                step_name,
+                                output.len()
+                            );
+                            // Save completion checkpoint
+                            let mut resp_checkpoint = StepCheckpoint::new(
+                                execution_id,
+                                "unified",
+                                "setup",
+                                Some(0),
+                                step_idx,
+                                "prompt",
+                            )
+                            .with_step_name(step_name);
+                            resp_checkpoint.mark_success(Some(output.clone()), duration_ms as i64);
+                            if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
+                                warn!("Failed to save setup response-mode step completion checkpoint: {}", e);
+                            }
+                            response_step_count += 1;
+                            all_results.push(StepExecutionResult {
+                                step_index: all_results.len(),
+                                step_type: "prompt".to_string(),
+                                step_name: step_name.to_string(),
+                                step_id: step.id.clone(),
+                                success: true,
+                                error: None,
+                                screenshot_path: None,
+                                started_at: None,
+                                ended_at: None,
+                                duration_ms,
+                                config: crate::step_executor::StepExecutionConfig::default(),
+                                verification_details: None,
+                                output_data: Some(serde_json::json!({ "output": output })),
+                            });
+                        }
+                        Err(e) => {
+                            let duration_ms = start.elapsed().as_millis() as u64;
+                            warn!(
+                                "SETUP-PHASE: Response-mode step '{}' failed: {}",
+                                step_name, e
+                            );
+                            // Save failure checkpoint
+                            let mut resp_checkpoint = StepCheckpoint::new(
+                                execution_id,
+                                "unified",
+                                "setup",
+                                Some(0),
+                                step_idx,
+                                "prompt",
+                            )
+                            .with_step_name(step_name);
+                            resp_checkpoint.mark_failed(&e, duration_ms as i64);
+                            if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
+                                warn!("Failed to save setup response-mode step failure checkpoint: {}", e);
+                            }
+                            all_results.push(StepExecutionResult {
+                                step_index: all_results.len(),
+                                step_type: "prompt".to_string(),
+                                step_name: step_name.to_string(),
+                                step_id: step.id.clone(),
+                                success: false,
+                                error: Some(e),
+                                screenshot_path: None,
+                                started_at: None,
+                                ended_at: None,
+                                duration_ms,
+                                config: crate::step_executor::StepExecutionConfig::default(),
+                                verification_details: None,
+                                output_data: None,
+                            });
+                            return (false, all_results);
+                        }
+                    }
+                } else {
+                    session_prompt_steps.push(step.clone());
+                }
             }
 
-            // Use structured prompts for granular sub-step tracking
-            let (setup_prompt, sub_step_metadata) =
-                prompt_builder::consolidate_prompts_structured(prompt_steps, "setup");
+            // Run remaining session-mode prompt steps via consolidated AI session
+            if !session_prompt_steps.is_empty() {
+                // Checkpoint the AI step as a single step (after any response-mode steps)
+                let ai_step_idx = automation_steps.len() + response_step_count;
+                let step_name = prompt_builder::consolidate_step_names_with_default(
+                    &session_prompt_steps,
+                    "Setup AI Task",
+                );
 
-            if !setup_prompt.is_empty() {
-                // Use the unified AI session executor with sub-step metadata
-                let config = AiSessionConfig::setup(execution_id, workflow_name, &step_name)
-                    .with_timeout(timeout_seconds)
-                    .with_sub_step_metadata(sub_step_metadata);
-
-                let (result, duration_ms) = timeout_helper::timed_result_async(
-                    self.ai_executor.execute(&config, &setup_prompt, logger),
-                )
-                .await;
-                let duration_ms = duration_ms as i64;
-                overall_success = overall_success && result.success;
                 // Use Some(0) instead of None for iteration to ensure SQLite's
                 // UNIQUE constraint works correctly (NULL != NULL in SQLite)
                 let mut ai_checkpoint = StepCheckpoint::new(
@@ -468,19 +776,51 @@ impl SetupExecutor {
                     "ai_session",
                 )
                 .with_step_name(&step_name);
-
-                if result.success {
-                    ai_checkpoint.mark_success(Some(result.output.clone()), duration_ms);
-                } else {
-                    ai_checkpoint.mark_failed("AI session failed", duration_ms);
-                }
-
+                ai_checkpoint.mark_started();
                 if let Err(e) = checkpoint_mgr.save_step(&ai_checkpoint) {
-                    warn!("Failed to save setup AI step completion checkpoint: {}", e);
+                    warn!("Failed to save setup AI step checkpoint: {}", e);
                 }
 
-                if !result.success {
-                    warn!("SETUP-PHASE: AI prompt steps failed");
+                // Use structured prompts for granular sub-step tracking
+                let (setup_prompt, sub_step_metadata) =
+                    prompt_builder::consolidate_prompts_structured(&session_prompt_steps, "setup");
+
+                if !setup_prompt.is_empty() {
+                    // Use the unified AI session executor with sub-step metadata
+                    let config = AiSessionConfig::setup(execution_id, workflow_name, &step_name)
+                        .with_sub_step_metadata(sub_step_metadata);
+
+                    let (result, duration_ms) = timeout_helper::timed_result_async(
+                        self.ai_executor.execute(&config, &setup_prompt, logger),
+                    )
+                    .await;
+                    let duration_ms = duration_ms as i64;
+                    overall_success = overall_success && result.success;
+                    // Use Some(0) instead of None for iteration to ensure SQLite's
+                    // UNIQUE constraint works correctly (NULL != NULL in SQLite)
+                    let mut ai_checkpoint = StepCheckpoint::new(
+                        execution_id,
+                        "unified",
+                        "setup",
+                        Some(0),
+                        ai_step_idx,
+                        "ai_session",
+                    )
+                    .with_step_name(&step_name);
+
+                    if result.success {
+                        ai_checkpoint.mark_success(Some(result.output.clone()), duration_ms);
+                    } else {
+                        ai_checkpoint.mark_failed("AI session failed", duration_ms);
+                    }
+
+                    if let Err(e) = checkpoint_mgr.save_step(&ai_checkpoint) {
+                        warn!("Failed to save setup AI step completion checkpoint: {}", e);
+                    }
+
+                    if !result.success {
+                        warn!("SETUP-PHASE: AI prompt steps failed");
+                    }
                 }
             }
         }
@@ -518,7 +858,6 @@ impl SetupExecutor {
                 &config.prompt_steps,
                 &config.execution_id,
                 &config.workflow_name,
-                config.timeout_seconds,
                 logger,
             )
             .await;
@@ -557,6 +896,11 @@ impl VerificationExecutor {
         }
     }
 
+    /// Set the task run ID on the inner step executor for database logging.
+    pub fn set_task_run_id(&mut self, task_run_id: String) {
+        self.executor.set_task_run_id(task_run_id);
+    }
+
     /// Run verification steps.
     ///
     /// Returns (verification_result, step_results)
@@ -583,6 +927,24 @@ impl VerificationExecutor {
         workflow_name: &str,
         logger: &StepEventLogger,
     ) -> (VerificationPhaseResult, Vec<StepExecutionResult>) {
+        // Filter out dev_mode_only steps when not in dev mode
+        let steps: Vec<ExecutionStepConfig> = steps
+            .iter()
+            .filter(|step| {
+                if step.dev_mode_only.unwrap_or(false) && !cfg!(debug_assertions) {
+                    info!(
+                        "VERIFICATION-PHASE: Skipping dev-mode-only step: {:?}",
+                        step.name
+                    );
+                    false
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+        let steps = steps.as_slice();
+
         if steps.is_empty() {
             info!(
                 "VERIFICATION-PHASE: No verification steps defined (iteration {})",
@@ -654,6 +1016,7 @@ impl VerificationExecutor {
                         step_index: 0,
                         step_type: "ui_bridge_connectivity".to_string(),
                         step_name: "UI Bridge Extension Connectivity Check".to_string(),
+                        step_id: None,
                         success: false,
                         error: Some(error_msg.clone()),
                         screenshot_path: None,
@@ -850,6 +1213,7 @@ impl VerificationExecutor {
 /// Executes the AI agentic phase with failure context.
 /// AI session execution is delegated to the UnifiedAiSessionExecutor.
 pub struct AgenticExecutor {
+    app_state: Arc<AppState>,
     ai_executor: UnifiedAiSessionExecutor,
     checkpoint_db: Arc<CheckpointDb>,
 }
@@ -862,6 +1226,7 @@ impl AgenticExecutor {
     ) -> Self {
         let checkpoint_db = app_state.checkpoint_db.clone();
         Self {
+            app_state: app_state.clone(),
             ai_executor: UnifiedAiSessionExecutor::new(app_state, app_handle, pid_tracker),
             checkpoint_db,
         }
@@ -882,7 +1247,7 @@ impl AgenticExecutor {
     /// to help the AI understand where to resume long operations.
     #[instrument(
         name = "workflow.phase.agentic",
-        skip(self, config, failure_context, logger),
+        skip(self, config, failure_context, agentic_steps, logger),
         fields(
             execution_id = %config.execution_id,
             iteration = iteration,
@@ -896,6 +1261,7 @@ impl AgenticExecutor {
         iteration: u32,
         failure_context: &str,
         has_agentic_steps: bool,
+        agentic_steps: &[ExecutionStepConfig],
         logger: &StepEventLogger,
     ) -> AgenticOutcome {
         if !has_agentic_steps {
@@ -903,6 +1269,144 @@ impl AgenticExecutor {
                 "AGENTIC-PHASE: No agentic steps defined, skipping (iteration {})",
                 iteration
             );
+            return AgenticOutcome::Skipped;
+        }
+
+        // Filter out dev_mode_only steps when not in dev mode
+        let agentic_steps: Vec<ExecutionStepConfig> = agentic_steps
+            .iter()
+            .filter(|step| {
+                if step.dev_mode_only.unwrap_or(false) && !cfg!(debug_assertions) {
+                    info!(
+                        "AGENTIC-PHASE: Skipping dev-mode-only step: {:?}",
+                        step.name
+                    );
+                    false
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+        let agentic_steps = agentic_steps.as_slice();
+
+        if agentic_steps.is_empty() {
+            info!(
+                "AGENTIC-PHASE: All agentic steps are dev-mode-only, skipping (iteration {})",
+                iteration
+            );
+            return AgenticOutcome::Skipped;
+        }
+
+        // Check if any agentic step uses response mode
+        let has_response_mode = agentic_steps
+            .iter()
+            .any(|s| s.prompt_mode.as_deref() == Some("response"));
+
+        // If response mode, handle with simple prompt->response instead of full session
+        if has_response_mode {
+            info!(
+                "AGENTIC-PHASE: Using response mode for iteration {}",
+                iteration
+            );
+
+            // Build a temporary step with failure context appended to the prompt
+            for step in agentic_steps {
+                if step.prompt_mode.as_deref() != Some("response") {
+                    continue;
+                }
+
+                let step_name = step.name.as_deref().unwrap_or("Agentic Response Prompt");
+
+                // Checkpoint the response-mode agentic step as "running"
+                let checkpoint_mgr = CheckpointManager::new(self.checkpoint_db.clone(), "unified");
+                let mut resp_checkpoint = StepCheckpoint::new(
+                    &config.execution_id,
+                    "unified",
+                    "agentic",
+                    Some(iteration),
+                    0,
+                    "prompt",
+                )
+                .with_step_name(step_name);
+                resp_checkpoint.mark_started();
+                if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
+                    warn!("Failed to save agentic response-mode step checkpoint: {}", e);
+                }
+
+                // Create a modified step with failure context appended to the prompt
+                let mut modified_step = step.clone();
+                let base_prompt = modified_step.prompt_content.clone().unwrap_or_default();
+                let enhanced = if failure_context.is_empty() {
+                    base_prompt
+                } else {
+                    format!(
+                        "{}\n\n---\n\nThe following verification checks FAILED. Please fix these issues:\n\n{}\n\nFix the issues above and ensure all checks pass.",
+                        base_prompt, failure_context
+                    )
+                };
+                modified_step.prompt_content = Some(enhanced);
+
+                let doctor_handle = self.app_state.doctor_handle.lock().await.clone();
+                let start = std::time::Instant::now();
+                match execute_prompt_response_mode(
+                    &modified_step,
+                    &self.checkpoint_db,
+                    Some(&config.execution_id),
+                    doctor_handle,
+                )
+                .await
+                {
+                    Ok(output) => {
+                        let duration_ms = start.elapsed().as_millis() as u64;
+                        info!(
+                            "AGENTIC-PHASE: Response-mode step '{}' completed ({} bytes, {}ms)",
+                            step_name,
+                            output.len(),
+                            duration_ms
+                        );
+                        // Save completion checkpoint
+                        let mut resp_checkpoint = StepCheckpoint::new(
+                            &config.execution_id,
+                            "unified",
+                            "agentic",
+                            Some(iteration),
+                            0,
+                            "prompt",
+                        )
+                        .with_step_name(step_name);
+                        resp_checkpoint.mark_success(Some(output.clone()), duration_ms as i64);
+                        if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
+                            warn!("Failed to save agentic response-mode step completion checkpoint: {}", e);
+                        }
+                        return AgenticOutcome::Success { output };
+                    }
+                    Err(e) => {
+                        let duration_ms = start.elapsed().as_millis() as u64;
+                        warn!(
+                            "AGENTIC-PHASE: Response-mode step '{}' failed ({}ms): {}",
+                            step_name, duration_ms, e
+                        );
+                        // Save failure checkpoint
+                        let mut resp_checkpoint = StepCheckpoint::new(
+                            &config.execution_id,
+                            "unified",
+                            "agentic",
+                            Some(iteration),
+                            0,
+                            "prompt",
+                        )
+                        .with_step_name(step_name);
+                        resp_checkpoint.mark_failed(&e, duration_ms as i64);
+                        if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
+                            warn!("Failed to save agentic response-mode step failure checkpoint: {}", e);
+                        }
+                        return AgenticOutcome::Error { error: e };
+                    }
+                }
+            }
+
+            // If we get here, no response-mode steps were found (shouldn't happen)
             return AgenticOutcome::Skipped;
         }
 
@@ -1010,8 +1514,7 @@ impl AgenticExecutor {
 
         // Use the unified AI session executor with timing
         let ai_config =
-            AiSessionConfig::agentic(&config.execution_id, &config.workflow_name, iteration)
-                .with_timeout(config.timeout_seconds);
+            AiSessionConfig::agentic(&config.execution_id, &config.workflow_name, iteration);
 
         let (result, duration_ms) = timeout_helper::timed_result_async(self.ai_executor.execute(
             &ai_config,
@@ -1119,6 +1622,7 @@ impl AgenticExecutor {
 /// Executes the completion phase (runs once after verification passes).
 /// AI session execution is delegated to the UnifiedAiSessionExecutor.
 pub struct CompletionExecutor {
+    app_state: Arc<AppState>,
     executor: StepExecutor,
     ai_executor: UnifiedAiSessionExecutor,
     checkpoint_db: Arc<CheckpointDb>,
@@ -1133,6 +1637,7 @@ impl CompletionExecutor {
     ) -> Self {
         let checkpoint_db = app_state.checkpoint_db.clone();
         Self {
+            app_state: app_state.clone(),
             executor: StepExecutor::with_app_handle(
                 app_state.clone(),
                 config_storage,
@@ -1148,6 +1653,11 @@ impl CompletionExecutor {
         self.ai_executor.session_manager = Some(sm);
     }
 
+    /// Set the task run ID on the inner step executor for database logging.
+    pub fn set_task_run_id(&mut self, task_run_id: String) {
+        self.executor.set_task_run_id(task_run_id);
+    }
+
     /// Run completion steps.
     ///
     /// This should ONLY be called when verification has passed.
@@ -1155,7 +1665,6 @@ impl CompletionExecutor {
     /// # Arguments
     /// * `iterations_run` - Number of verification-agentic iterations that were executed.
     ///   Used to calculate the correct turn number for the completion phase.
-    /// * `timeout_seconds` - Optional inactivity timeout. None means no timeout (default).
     /// * `logger` - Required logger for consistent step event logging.
     ///
     /// Step checkpointing is integrated for resume capability.
@@ -1176,12 +1685,29 @@ impl CompletionExecutor {
         prompt_steps: &[ExecutionStepConfig],
         execution_id: &str,
         workflow_name: &str,
-        timeout_seconds: Option<u64>,
         iterations_run: u32,
         logger: &StepEventLogger,
     ) -> (bool, Vec<StepExecutionResult>) {
         let mut all_results = Vec::new();
         let mut overall_success = true;
+
+        // Filter out dev_mode_only automation steps when not in dev mode
+        let automation_steps: Vec<ExecutionStepConfig> = automation_steps
+            .iter()
+            .filter(|step| {
+                if step.dev_mode_only.unwrap_or(false) && !cfg!(debug_assertions) {
+                    info!(
+                        "COMPLETION-PHASE: Skipping dev-mode-only automation step: {:?}",
+                        step.name
+                    );
+                    false
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+        let automation_steps = automation_steps.as_slice();
 
         // Create checkpoint manager for step-level checkpointing
         let checkpoint_mgr = CheckpointManager::new(self.checkpoint_db.clone(), "unified");
@@ -1273,62 +1799,144 @@ impl CompletionExecutor {
                 prompt_steps.len()
             );
 
-            // Checkpoint the AI step as a single step
-            let ai_step_idx = automation_steps.len();
-            let step_name = prompt_builder::consolidate_step_names_with_default(
-                prompt_steps,
-                "Completion AI Task",
-            );
+            // Separate response-mode steps from session-mode steps
+            let mut session_prompt_steps = Vec::new();
+            let mut response_step_count = 0usize;
+            for step in prompt_steps {
+                // Skip dev_mode_only steps when not in dev mode
+                if step.dev_mode_only.unwrap_or(false) && !cfg!(debug_assertions) {
+                    info!("Skipping dev-mode-only step: {:?}", step.name);
+                    continue;
+                }
 
-            // Use Some(0) instead of None for iteration to ensure SQLite's
-            // UNIQUE constraint works correctly (NULL != NULL in SQLite)
-            let mut ai_checkpoint = StepCheckpoint::new(
-                execution_id,
-                "unified",
-                "completion",
-                Some(0),
-                ai_step_idx,
-                "ai_session",
-            )
-            .with_step_name(&step_name);
-            ai_checkpoint.mark_started();
-            if let Err(e) = checkpoint_mgr.save_step(&ai_checkpoint) {
-                warn!("Failed to save completion AI step checkpoint: {}", e);
-            }
+                if step.prompt_mode.as_deref() == Some("response") {
+                    let step_name = step.name.as_deref().unwrap_or("Response Prompt");
+                    info!(
+                        "COMPLETION-PHASE: Executing response-mode prompt step: {}",
+                        step_name
+                    );
 
-            // Use structured prompts for granular sub-step tracking
-            let (mut completion_prompt, sub_step_metadata) =
-                prompt_builder::consolidate_prompts_structured(prompt_steps, "completion");
+                    // Checkpoint the response-mode prompt step as "running"
+                    let step_idx = automation_steps.len() + response_step_count;
+                    let mut resp_checkpoint = StepCheckpoint::new(
+                        execution_id,
+                        "unified",
+                        "completion",
+                        Some(0),
+                        step_idx,
+                        "prompt",
+                    )
+                    .with_step_name(step_name);
+                    resp_checkpoint.mark_started();
+                    if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
+                        warn!("Failed to save completion response-mode step checkpoint: {}", e);
+                    }
 
-            // Inject prior phase output context so the completion AI knows what happened
-            if !completion_prompt.is_empty() {
-                let prior_context = self.build_prior_phase_context(execution_id, iterations_run);
-                if !prior_context.is_empty() {
-                    completion_prompt =
-                        format!("{}\n\n---\n\n{}", prior_context, completion_prompt);
+                    let doctor_handle = self.app_state.doctor_handle.lock().await.clone();
+                    let start = std::time::Instant::now();
+                    match execute_prompt_response_mode(
+                        step,
+                        &self.checkpoint_db,
+                        None,
+                        doctor_handle,
+                    )
+                    .await
+                    {
+                        Ok(output) => {
+                            let duration_ms = start.elapsed().as_millis() as u64;
+                            info!(
+                                "COMPLETION-PHASE: Response-mode step '{}' completed successfully ({} bytes)",
+                                step_name,
+                                output.len()
+                            );
+                            // Save completion checkpoint
+                            let mut resp_checkpoint = StepCheckpoint::new(
+                                execution_id,
+                                "unified",
+                                "completion",
+                                Some(0),
+                                step_idx,
+                                "prompt",
+                            )
+                            .with_step_name(step_name);
+                            resp_checkpoint.mark_success(Some(output.clone()), duration_ms as i64);
+                            if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
+                                warn!("Failed to save completion response-mode step completion checkpoint: {}", e);
+                            }
+                            response_step_count += 1;
+                            all_results.push(StepExecutionResult {
+                                step_index: all_results.len(),
+                                step_type: "prompt".to_string(),
+                                step_name: step_name.to_string(),
+                                step_id: step.id.clone(),
+                                success: true,
+                                error: None,
+                                screenshot_path: None,
+                                started_at: None,
+                                ended_at: None,
+                                duration_ms,
+                                config: crate::step_executor::StepExecutionConfig::default(),
+                                verification_details: None,
+                                output_data: Some(serde_json::json!({ "output": output })),
+                            });
+                        }
+                        Err(e) => {
+                            let duration_ms = start.elapsed().as_millis() as u64;
+                            warn!(
+                                "COMPLETION-PHASE: Response-mode step '{}' failed: {}",
+                                step_name, e
+                            );
+                            // Save failure checkpoint
+                            let mut resp_checkpoint = StepCheckpoint::new(
+                                execution_id,
+                                "unified",
+                                "completion",
+                                Some(0),
+                                step_idx,
+                                "prompt",
+                            )
+                            .with_step_name(step_name);
+                            resp_checkpoint.mark_failed(&e, duration_ms as i64);
+                            if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
+                                warn!("Failed to save completion response-mode step failure checkpoint: {}", e);
+                            }
+                            response_step_count += 1;
+                            all_results.push(StepExecutionResult {
+                                step_index: all_results.len(),
+                                step_type: "prompt".to_string(),
+                                step_name: step_name.to_string(),
+                                step_id: step.id.clone(),
+                                success: false,
+                                error: Some(e),
+                                screenshot_path: None,
+                                started_at: None,
+                                ended_at: None,
+                                duration_ms,
+                                config: crate::step_executor::StepExecutionConfig::default(),
+                                verification_details: None,
+                                output_data: None,
+                            });
+                            // Completion failures are non-fatal - don't return early
+                            overall_success = false;
+                        }
+                    }
+                } else {
+                    session_prompt_steps.push(step.clone());
                 }
             }
 
-            if !completion_prompt.is_empty() {
-                // Use the unified AI session executor with sub-step metadata
-                let config = AiSessionConfig::completion(
-                    execution_id,
-                    workflow_name,
-                    &step_name,
-                    iterations_run,
-                )
-                .with_timeout(timeout_seconds)
-                .with_sub_step_metadata(sub_step_metadata);
+            // Run remaining session-mode prompt steps via consolidated AI session
+            if !session_prompt_steps.is_empty() {
+                // Checkpoint the AI step as a single step (after any response-mode steps)
+                let ai_step_idx = automation_steps.len() + response_step_count;
+                let step_name = prompt_builder::consolidate_step_names_with_default(
+                    &session_prompt_steps,
+                    "Completion AI Task",
+                );
 
-                let (result, duration_ms) = timeout_helper::timed_result_async(
-                    self.ai_executor
-                        .execute(&config, &completion_prompt, logger),
-                )
-                .await;
-                let duration_ms = duration_ms as i64;
                 // Use Some(0) instead of None for iteration to ensure SQLite's
                 // UNIQUE constraint works correctly (NULL != NULL in SQLite)
-                let mut ai_completion_checkpoint = StepCheckpoint::new(
+                let mut ai_checkpoint = StepCheckpoint::new(
                     execution_id,
                     "unified",
                     "completion",
@@ -1337,39 +1945,76 @@ impl CompletionExecutor {
                     "ai_session",
                 )
                 .with_step_name(&step_name);
-
-                if result.success {
-                    ai_completion_checkpoint.mark_success(Some(result.output.clone()), duration_ms);
-                } else {
-                    ai_completion_checkpoint.mark_failed("AI session failed", duration_ms);
+                ai_checkpoint.mark_started();
+                if let Err(e) = checkpoint_mgr.save_step(&ai_checkpoint) {
+                    warn!("Failed to save completion AI step checkpoint: {}", e);
                 }
 
-                if let Err(e) = checkpoint_mgr.save_step(&ai_completion_checkpoint) {
-                    warn!(
-                        "Failed to save completion AI step completion checkpoint: {}",
-                        e
+                // Use structured prompts for granular sub-step tracking
+                let (mut completion_prompt, sub_step_metadata) =
+                    prompt_builder::consolidate_prompts_structured(
+                        &session_prompt_steps,
+                        "completion",
                     );
-                }
 
-                // Save the AI output as the task summary (only on success)
-                // The completion AI output should be the summary shown in the recap page
-                if result.success && !result.output.is_empty() {
-                    if let Err(e) = self.checkpoint_db.update_task_summary(
-                        execution_id,
-                        &result.output,
-                        true, // goal_achieved = true since verification passed
-                        None, // remaining_work = None since task is complete
-                    ) {
-                        warn!("Failed to save completion AI output as summary: {}", e);
-                    } else {
-                        info!(
-                            "Saved completion AI output ({} chars) as task summary",
-                            result.output.len()
-                        );
+                // Inject prior phase output context so the completion AI knows what happened
+                if !completion_prompt.is_empty() {
+                    let prior_context =
+                        self.build_prior_phase_context(execution_id, iterations_run);
+                    if !prior_context.is_empty() {
+                        completion_prompt =
+                            format!("{}\n\n---\n\n{}", prior_context, completion_prompt);
                     }
                 }
 
-                overall_success = overall_success && result.success;
+                if !completion_prompt.is_empty() {
+                    // Use the unified AI session executor with sub-step metadata
+                    let config = AiSessionConfig::completion(
+                        execution_id,
+                        workflow_name,
+                        &step_name,
+                        iterations_run,
+                    )
+                    .with_sub_step_metadata(sub_step_metadata);
+
+                    let (result, duration_ms) = timeout_helper::timed_result_async(
+                        self.ai_executor
+                            .execute(&config, &completion_prompt, logger),
+                    )
+                    .await;
+                    let duration_ms = duration_ms as i64;
+                    // Use Some(0) instead of None for iteration to ensure SQLite's
+                    // UNIQUE constraint works correctly (NULL != NULL in SQLite)
+                    let mut ai_completion_checkpoint = StepCheckpoint::new(
+                        execution_id,
+                        "unified",
+                        "completion",
+                        Some(0),
+                        ai_step_idx,
+                        "ai_session",
+                    )
+                    .with_step_name(&step_name);
+
+                    if result.success {
+                        ai_completion_checkpoint
+                            .mark_success(Some(result.output.clone()), duration_ms);
+                    } else {
+                        ai_completion_checkpoint.mark_failed("AI session failed", duration_ms);
+                    }
+
+                    if let Err(e) = checkpoint_mgr.save_step(&ai_completion_checkpoint) {
+                        warn!(
+                            "Failed to save completion AI step completion checkpoint: {}",
+                            e
+                        );
+                    }
+
+                    // Don't save completion AI output as summary here --
+                    // the async summary generator (summary_generator.rs) produces a proper
+                    // aggregated summary across ALL workflow phases after completion.
+
+                    overall_success = overall_success && result.success;
+                }
             }
         }
 
@@ -1400,7 +2045,6 @@ impl CompletionExecutor {
                 &config.prompt_steps,
                 &config.execution_id,
                 &config.workflow_name,
-                config.timeout_seconds,
                 config.iterations_run,
                 logger,
             )
@@ -1646,7 +2290,6 @@ impl Executor for SetupExecutor {
                 &config.prompt_steps,
                 &config.execution_id,
                 &config.workflow_name,
-                config.timeout_seconds,
                 &StepEventLogger::noop(),
             )
             .await;
@@ -1698,7 +2341,6 @@ impl Executor for AgenticExecutor {
         // Build a LoopConfig from AgenticConfig
         let loop_config = LoopConfig {
             max_iterations: config.max_iterations,
-            timeout_seconds: config.timeout_seconds,
             base_prompt: config.base_prompt,
             workflow_name: config.workflow_name,
             workflow_id: config.workflow_id,
@@ -1706,6 +2348,8 @@ impl Executor for AgenticExecutor {
             targeted_error_ids: Vec::new(),
             starting_iteration: 0,
             run_agentic_first: false,
+            artifact_dir: None,
+            is_dev_mode: false,
         };
 
         let outcome = self
@@ -1714,6 +2358,7 @@ impl Executor for AgenticExecutor {
                 config.iteration,
                 &config.failure_context,
                 config.has_agentic_steps,
+                &[], // No step configs available via trait interface
                 &StepEventLogger::noop(),
             )
             .await;
@@ -1738,7 +2383,6 @@ impl Executor for CompletionExecutor {
                 &config.prompt_steps,
                 &config.execution_id,
                 &config.workflow_name,
-                config.timeout_seconds,
                 config.iterations_run,
                 &StepEventLogger::noop(),
             )

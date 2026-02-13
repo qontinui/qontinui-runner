@@ -453,7 +453,13 @@ export function AiSettings({ onLog }: AiSettingsProps) {
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="text-muted-foreground">Loading AI settings...</div>
+        <div
+          data-content-role="status"
+          data-content-label="loading ai settings"
+          className="text-muted-foreground"
+        >
+          Loading AI settings...
+        </div>
       </div>
     );
   }
@@ -661,7 +667,11 @@ export function AiSettings({ onLog }: AiSettingsProps) {
               <label className="text-xs font-medium">API Key</label>
               {hasApiKey ? (
                 <div className="flex items-center gap-2">
-                  <div className="flex-1 px-2.5 py-1.5 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-muted-foreground text-sm">
+                  <div
+                    data-content-role="status"
+                    data-content-label="claude api key configured"
+                    className="flex-1 px-2.5 py-1.5 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-muted-foreground text-sm"
+                  >
                     API key configured securely
                   </div>
                   <button
@@ -927,7 +937,11 @@ export function AiSettings({ onLog }: AiSettingsProps) {
               <label className="text-xs font-medium">API Key</label>
               {hasGeminiApiKey ? (
                 <div className="flex items-center gap-2">
-                  <div className="flex-1 px-2.5 py-1.5 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-muted-foreground text-sm">
+                  <div
+                    data-content-role="status"
+                    data-content-label="gemini api key configured"
+                    className="flex-1 px-2.5 py-1.5 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-muted-foreground text-sm"
+                  >
                     Gemini API key configured securely
                   </div>
                   <button

@@ -278,10 +278,17 @@ export function ImportExportDialog({
                   className={`w-4 h-4 ${getStatusColors("success").icon} flex-shrink-0 mt-0.5`}
                 />
                 <div className="text-sm">
-                  <p className={`font-medium ${getStatusColors("success").text}`}>
+                  <p
+                    data-content-role="status"
+                    className={`font-medium ${getStatusColors("success").text}`}
+                  >
                     Import Complete
                   </p>
-                  <p className="text-muted-foreground mt-1">
+                  <p
+                    data-content-role="description"
+                    data-content-label="import summary"
+                    className="text-muted-foreground mt-1"
+                  >
                     {importSummary.created} created, {importSummary.updated} updated,{" "}
                     {importSummary.skipped} skipped
                     {importSummary.errors > 0 && `, ${importSummary.errors} errors`}
@@ -305,6 +312,8 @@ export function ImportExportDialog({
                           <td className="px-3 py-2 truncate max-w-[200px]">{result.name}</td>
                           <td className="px-3 py-2">
                             <span
+                              data-content-role="badge"
+                              data-content-label="import result status"
                               className={`px-2 py-0.5 rounded text-xs font-medium ${
                                 result.status === "created"
                                   ? `${getStatusColors("success").bg} ${getStatusColors("success").text}`

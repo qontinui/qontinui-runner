@@ -218,11 +218,16 @@ pub async fn step_flow_execution(
         });
     }
 
+    // Extract doctor handle for health monitoring
+    let doctor_handle = app_state.doctor_handle.lock().await.clone();
+
     // Create executor with event emitter
     let app_handle_clone = app_handle.clone();
-    let executor = FlowExecutor::new().with_event_callback(move |event| {
-        emit_flow_event(&app_handle_clone, event);
-    });
+    let executor = FlowExecutor::new()
+        .with_doctor_handle(doctor_handle)
+        .with_event_callback(move |event| {
+            emit_flow_event(&app_handle_clone, event);
+        });
 
     // Execute one step
     let result = executor.step_once(&flow, state).await;
@@ -285,11 +290,16 @@ pub async fn run_flow_execution(
         });
     }
 
+    // Extract doctor handle for health monitoring
+    let doctor_handle = app_state.doctor_handle.lock().await.clone();
+
     // Create executor with event emitter
     let app_handle_clone = app_handle.clone();
-    let executor = FlowExecutor::new().with_event_callback(move |event| {
-        emit_flow_event(&app_handle_clone, event);
-    });
+    let executor = FlowExecutor::new()
+        .with_doctor_handle(doctor_handle)
+        .with_event_callback(move |event| {
+            emit_flow_event(&app_handle_clone, event);
+        });
 
     // Execute the flow
     let result = executor.execute(&flow, &mut state).await;
@@ -814,11 +824,16 @@ pub async fn resume_flow_execution(
         }),
     );
 
+    // Extract doctor handle for health monitoring
+    let doctor_handle = app_state.doctor_handle.lock().await.clone();
+
     // Create executor with event emitter
     let app_handle_clone = app_handle.clone();
-    let executor = FlowExecutor::new().with_event_callback(move |event| {
-        emit_flow_event(&app_handle_clone, event);
-    });
+    let executor = FlowExecutor::new()
+        .with_doctor_handle(doctor_handle)
+        .with_event_callback(move |event| {
+            emit_flow_event(&app_handle_clone, event);
+        });
 
     // Continue execution
     let result = executor.execute(&flow, &mut state).await;
@@ -887,11 +902,16 @@ pub async fn step_into_flow(
     // Temporarily set to running
     state.status = FlowStatus::Running;
 
+    // Extract doctor handle for health monitoring
+    let doctor_handle = app_state.doctor_handle.lock().await.clone();
+
     // Create executor with event emitter
     let app_handle_clone = app_handle.clone();
-    let executor = FlowExecutor::new().with_event_callback(move |event| {
-        emit_flow_event(&app_handle_clone, event);
-    });
+    let executor = FlowExecutor::new()
+        .with_doctor_handle(doctor_handle)
+        .with_event_callback(move |event| {
+            emit_flow_event(&app_handle_clone, event);
+        });
 
     // Execute one step
     let result = executor.step_once(&flow, state).await;

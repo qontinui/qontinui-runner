@@ -35,7 +35,7 @@ import {
   Eye,
   ArrowRight,
 } from "lucide-react";
-import type { CooccurrenceExport, ElementFingerprint } from "../../hooks/useExternalUIBridge";
+import type { CooccurrenceExport, ElementFingerprint } from "../../types/ui-bridge-types";
 import { StateGraphView } from "./StateGraphView";
 import { ExportConfigDialog } from "./ExportConfigDialog";
 import { StateComparisonView } from "./StateComparisonView";

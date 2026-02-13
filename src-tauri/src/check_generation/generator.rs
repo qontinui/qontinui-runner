@@ -10,6 +10,7 @@ use super::types::{
 };
 use crate::ai_provider;
 use crate::ai_router::TaskContext;
+use crate::doctor::DoctorHandle;
 
 /// Tool suggestions per language (used when AI fails or for quick suggestions)
 struct ToolSuggestion {
@@ -122,11 +123,14 @@ const RUST_TOOLS: &[ToolSuggestion] = &[
 ];
 
 /// Generate check suggestions using AI
-pub fn generate_checks(request: &GenerateChecksRequest) -> GenerateChecksResponse {
+pub fn generate_checks(
+    request: &GenerateChecksRequest,
+    doctor_handle: Option<&DoctorHandle>,
+) -> GenerateChecksResponse {
     let preferences = request.user_preferences.clone().unwrap_or_default();
 
     // First try AI generation
-    match generate_with_ai(&request.workspace_scan, &preferences) {
+    match generate_with_ai(&request.workspace_scan, &preferences, doctor_handle) {
         Ok(checks) if !checks.is_empty() => {
             info!("AI generated {} check suggestions", checks.len());
             GenerateChecksResponse {
@@ -150,6 +154,7 @@ pub fn generate_checks(request: &GenerateChecksRequest) -> GenerateChecksRespons
 fn generate_with_ai(
     scan: &WorkspaceScanResult,
     preferences: &UserPreferences,
+    doctor_handle: Option<&DoctorHandle>,
 ) -> Result<Vec<SuggestedCheckWithReason>, String> {
     let prompt = build_ai_prompt(scan, preferences);
 
@@ -164,7 +169,7 @@ fn generate_with_ai(
     };
 
     // Run AI prompt
-    let response = ai_provider::run_prompt_with_routing(&prompt, &context, 120);
+    let response = ai_provider::run_prompt_with_routing(&prompt, &context, doctor_handle);
 
     if !response.success {
         return Err(response

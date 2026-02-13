@@ -429,13 +429,35 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps)
 
       {/* Stats bar */}
       <div className="flex items-center gap-6 text-sm text-muted-foreground">
-        <span>{stats.total} runs</span>
-        <span className={getStatusColors("success").text}>{stats.success} passed</span>
-        <span className={getStatusColors("error").text}>{stats.failed} failed</span>
-        <span className="flex items-center gap-1">
+        <span data-content-role="metric" data-content-label="total runs">
+          {stats.total} runs
+        </span>
+        <span
+          data-content-role="metric"
+          data-content-label="passed runs"
+          className={getStatusColors("success").text}
+        >
+          {stats.success} passed
+        </span>
+        <span
+          data-content-role="metric"
+          data-content-label="failed runs"
+          className={getStatusColors("error").text}
+        >
+          {stats.failed} failed
+        </span>
+        <span
+          data-content-role="metric"
+          data-content-label="GUI run count"
+          className="flex items-center gap-1"
+        >
           <Monitor className="w-3 h-3" /> {stats.guiCount}
         </span>
-        <span className="flex items-center gap-1">
+        <span
+          data-content-role="metric"
+          data-content-label="AI run count"
+          className="flex items-center gap-1"
+        >
           <Bot className="w-3 h-3" /> {stats.aiCount}
         </span>
       </div>

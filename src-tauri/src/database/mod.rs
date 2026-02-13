@@ -5,6 +5,12 @@
 
 #![allow(dead_code)]
 
+pub mod embedding_client;
+pub mod embedding_jobs;
+pub mod embeddings;
+pub mod hybrid_search;
+pub mod query_builder;
+
 use chrono::Utc;
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
@@ -229,6 +235,11 @@ pub struct TaskRun {
     /// NULL for legacy single-bridge tasks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bridge_id: Option<String>,
+
+    /// Structured result data (JSON) — used by meta-workflows to store outputs
+    /// like generated_workflow_id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_data: Option<String>,
 
     pub created_at: String,
     pub updated_at: String,
@@ -1781,6 +1792,18 @@ impl CheckpointDb {
         &self,
     ) -> Result<PooledConnection<SqliteConnectionManager>, crate::error::AppError> {
         self.get_conn()
+    }
+
+    /// Execute a closure with a database connection, returning the closure's result.
+    ///
+    /// This is a convenience method for modules that need to run operations on
+    /// a raw `rusqlite::Connection` reference without managing the pooled connection lifetime.
+    pub fn with_conn<F, T>(&self, f: F) -> Result<T, String>
+    where
+        F: FnOnce(&rusqlite::Connection) -> Result<T, String>,
+    {
+        let conn = self.get_conn_string()?;
+        f(&conn)
     }
 
     /// Get a connection (legacy API returning String error).
@@ -4307,6 +4330,113 @@ impl CheckpointDb {
             info!("Successfully migrated to version 53 (preflight_check_enabled added)");
         }
 
+        // Migration to version 54: Add result_data to task_runs, generated_by_task_run_id to unified_workflows
+        if current_version < 54 {
+            info!("Migrating database to version 54 (result_data, generated_by_task_run_id)");
+            conn.execute_batch(
+                r#"
+                -- Structured result data for task runs (JSON blob for meta-workflow outputs)
+                ALTER TABLE task_runs ADD COLUMN result_data TEXT;
+
+                -- Links generated workflows back to the meta-workflow task run that created them
+                ALTER TABLE unified_workflows ADD COLUMN generated_by_task_run_id TEXT REFERENCES task_runs(id) ON DELETE SET NULL;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (54, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 54: {}", e))?;
+
+            info!(
+                "Successfully migrated to version 54 (result_data, generated_by_task_run_id added)"
+            );
+        }
+
+        // Migration to version 55: Add embedding BLOB columns for hybrid RAG search + feedback table
+        if current_version < 55 {
+            info!("Migrating database to version 55 (embedding columns + workflow_generation_feedback)");
+            conn.execute_batch(
+                r#"
+                -- Embedding BLOB columns for hybrid RAG search (384-dim MiniLM, 1536 bytes each)
+                ALTER TABLE task_runs ADD COLUMN prompt_embedding BLOB;
+                ALTER TABLE task_runs ADD COLUMN summary_embedding BLOB;
+
+                ALTER TABLE task_run_findings ADD COLUMN title_embedding BLOB;
+                ALTER TABLE task_run_findings ADD COLUMN description_embedding BLOB;
+
+                ALTER TABLE task_knowledge ADD COLUMN content_embedding BLOB;
+
+                ALTER TABLE unified_workflows ADD COLUMN description_embedding BLOB;
+
+                ALTER TABLE learning_outcomes ADD COLUMN context_embedding BLOB;
+
+                ALTER TABLE learning_patterns ADD COLUMN description_embedding BLOB;
+
+                ALTER TABLE error_events ADD COLUMN message_embedding BLOB;
+
+                -- Workflow generation feedback table
+                CREATE TABLE IF NOT EXISTS workflow_generation_feedback (
+                    id TEXT PRIMARY KEY,
+                    workflow_id TEXT NOT NULL,
+                    task_run_id TEXT,
+                    feedback_type TEXT NOT NULL,
+                    edited_field TEXT,
+                    old_value TEXT,
+                    new_value TEXT,
+                    delete_reason TEXT,
+                    rating INTEGER,
+                    rating_comment TEXT,
+                    workflow_category TEXT,
+                    workflow_description TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    FOREIGN KEY (workflow_id) REFERENCES unified_workflows(id) ON DELETE CASCADE,
+                    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE SET NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_wgf_workflow_id ON workflow_generation_feedback(workflow_id);
+                CREATE INDEX IF NOT EXISTS idx_wgf_task_run_id ON workflow_generation_feedback(task_run_id);
+                CREATE INDEX IF NOT EXISTS idx_wgf_feedback_type ON workflow_generation_feedback(feedback_type);
+                CREATE INDEX IF NOT EXISTS idx_wgf_created_at ON workflow_generation_feedback(created_at);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (55, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 55: {}", e))?;
+
+            info!("Successfully migrated to version 55 (embedding columns + workflow_generation_feedback)");
+        }
+
+        // Version 56: Add sync_pending column to unified_workflows for offline cache sync
+        if current_version < 56 {
+            info!("Migrating to version 56 (unified_workflows sync_pending)...");
+            conn.execute_batch(
+                r#"
+                ALTER TABLE unified_workflows ADD COLUMN sync_pending INTEGER DEFAULT 0;
+                CREATE INDEX IF NOT EXISTS idx_unified_workflows_sync_pending ON unified_workflows(sync_pending);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (56, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 56: {}", e))?;
+
+            info!("Successfully migrated to version 56 (unified_workflows sync_pending)");
+        }
+
+        // Migration to version 57: Add example_status column to unified_workflows
+        // Tracks whether a workflow is in the example library for RAG-based generation
+        if current_version < 57 {
+            info!("Migrating database to version 57 (add example_status to unified_workflows)");
+            conn.execute_batch(
+                r#"
+                ALTER TABLE unified_workflows ADD COLUMN example_status TEXT DEFAULT 'pending';
+                CREATE INDEX IF NOT EXISTS idx_unified_workflows_example_status ON unified_workflows(example_status);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (57, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 57: {}", e))?;
+
+            info!("Successfully migrated to version 57 (example_status column added)");
+        }
+
         Ok(())
     }
 
@@ -4789,6 +4919,7 @@ impl CheckpointDb {
             root_task_run_id: Some(effective_root.to_string()),
             depth: input.depth,
             bridge_id: input.bridge_id.clone(),
+            result_data: None,
             created_at: now.clone(),
             updated_at: now,
             completed_at: None,
@@ -5014,7 +5145,7 @@ impl CheckpointDb {
                    COALESCE(summary, ai_summary) as summary, ai_summary, goal_achieved, remaining_work,
                    summary_generated_at, transition_history_json, workflow_type,
                    workspace_id, triggered_by,
-                   parent_task_run_id, root_task_run_id, depth, bridge_id,
+                   parent_task_run_id, root_task_run_id, depth, bridge_id, result_data,
                    created_at, updated_at, completed_at
             FROM task_runs
             WHERE id = ?1
@@ -5049,9 +5180,10 @@ impl CheckpointDb {
                     root_task_run_id: row.get(23)?,
                     depth: row.get::<_, Option<i64>>(24)?.unwrap_or(0) as u32,
                     bridge_id: row.get(25)?,
-                    created_at: row.get(26)?,
-                    updated_at: row.get(27)?,
-                    completed_at: row.get(28)?,
+                    result_data: row.get(26)?,
+                    created_at: row.get(27)?,
+                    updated_at: row.get(28)?,
+                    completed_at: row.get(29)?,
                 })
             },
         );
@@ -5091,7 +5223,7 @@ impl CheckpointDb {
                        COALESCE(summary, ai_summary) as summary, ai_summary, goal_achieved, remaining_work,
                        summary_generated_at, transition_history_json, workflow_type,
                        workspace_id, triggered_by,
-                       parent_task_run_id, root_task_run_id, depth, bridge_id,
+                       parent_task_run_id, root_task_run_id, depth, bridge_id, result_data,
                        created_at, updated_at, completed_at
                 FROM task_runs
                 WHERE parent_task_run_id = ?1
@@ -5132,9 +5264,10 @@ impl CheckpointDb {
                     root_task_run_id: row.get(23)?,
                     depth: row.get::<_, Option<i64>>(24)?.unwrap_or(0) as u32,
                     bridge_id: row.get(25)?,
-                    created_at: row.get(26)?,
-                    updated_at: row.get(27)?,
-                    completed_at: row.get(28)?,
+                    result_data: row.get(26)?,
+                    created_at: row.get(27)?,
+                    updated_at: row.get(28)?,
+                    completed_at: row.get(29)?,
                 })
             })
             .map_err(|e| format!("Failed to query child tasks: {}", e))?
@@ -5168,7 +5301,7 @@ impl CheckpointDb {
                        COALESCE(summary, ai_summary) as summary, ai_summary, goal_achieved, remaining_work,
                        summary_generated_at, transition_history_json, workflow_type,
                        workspace_id, triggered_by,
-                       parent_task_run_id, root_task_run_id, depth, bridge_id,
+                       parent_task_run_id, root_task_run_id, depth, bridge_id, result_data,
                        created_at, updated_at, completed_at
                 FROM task_runs
                 WHERE root_task_run_id = ?1 AND id != ?1
@@ -5209,9 +5342,10 @@ impl CheckpointDb {
                     root_task_run_id: row.get(23)?,
                     depth: row.get::<_, Option<i64>>(24)?.unwrap_or(0) as u32,
                     bridge_id: row.get(25)?,
-                    created_at: row.get(26)?,
-                    updated_at: row.get(27)?,
-                    completed_at: row.get(28)?,
+                    result_data: row.get(26)?,
+                    created_at: row.get(27)?,
+                    updated_at: row.get(28)?,
+                    completed_at: row.get(29)?,
                 })
             })
             .map_err(|e| format!("Failed to query task hierarchy: {}", e))?
@@ -5412,6 +5546,43 @@ impl CheckpointDb {
 
         info!("Task run {} status updated to '{}'", id, status);
         Ok(())
+    }
+
+    /// Update the result_data JSON field on a task run.
+    ///
+    /// Used by meta-workflow steps (e.g. save_workflow_artifact) to store
+    /// structured results like generated workflow IDs.
+    pub fn update_task_run_result_data(&self, id: &str, result_data: &str) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        conn.execute(
+            r#"
+            UPDATE task_runs SET
+                result_data = ?1,
+                updated_at = ?2
+            WHERE id = ?3
+            "#,
+            params![result_data, now, id],
+        )
+        .map_err(|e| format!("Failed to update task run result_data: {}", e))?;
+
+        info!("Task run {} result_data updated", id);
+        Ok(())
+    }
+
+    /// Get the result_data JSON from a task run.
+    pub fn get_task_run_result_data(&self, id: &str) -> Result<Option<String>, String> {
+        let conn = self.get_conn()?;
+        conn.query_row(
+            "SELECT result_data FROM task_runs WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("Failed to get result_data: {}", e))?
+        .ok_or_else(|| format!("Task run {} not found", id))
+        .map(|v: Option<String>| v)
     }
 
     /// Mark a task run as failed.
@@ -5660,6 +5831,7 @@ impl CheckpointDb {
                     root_task_run_id: None,   // Not queried for performance
                     depth: 0,                 // Not queried for performance
                     bridge_id: None,          // Not queried for performance
+                    result_data: None,        // Not queried for performance
                     created_at: row.get(17)?,
                     updated_at: row.get(18)?,
                     completed_at: row.get(19)?,
@@ -5724,6 +5896,7 @@ impl CheckpointDb {
                     root_task_run_id: None,   // Not queried for performance
                     depth: 0,                 // Not queried for performance
                     bridge_id: None,          // Not queried for performance
+                    result_data: None,        // Not queried for performance
                     created_at: row.get(17)?,
                     updated_at: row.get(18)?,
                     completed_at: row.get(19)?,
@@ -5866,6 +6039,7 @@ impl CheckpointDb {
                     root_task_run_id: None,   // Not queried for performance
                     depth: 0,                 // Not queried for performance
                     bridge_id: None,          // Not queried for performance
+                    result_data: None,        // Not queried for performance
                     created_at: row.get(18)?,
                     updated_at: row.get(19)?,
                     completed_at: row.get(20)?,
@@ -5962,6 +6136,7 @@ impl CheckpointDb {
                     root_task_run_id: None,
                     depth: 0,
                     bridge_id: None,
+                    result_data: None,
                     created_at: row.get(19)?,
                     updated_at: row.get(20)?,
                     completed_at: row.get(21)?,
@@ -10084,7 +10259,7 @@ impl CheckpointDb {
                        skip_ai_summary, created_at, updated_at, log_source_selection,
                        context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                        log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
-                       preflight_check_enabled
+                       preflight_check_enabled, generated_by_task_run_id
                 FROM unified_workflows
                 ORDER BY updated_at DESC
                 "#,
@@ -10148,6 +10323,7 @@ impl CheckpointDb {
                         .unwrap_or_default(),
                     timeout_seconds: row.get::<_, Option<i64>>(23)?.map(|v| v as u64),
                     preflight_check_enabled: row.get::<_, Option<i32>>(24)?.unwrap_or(1) != 0,
+                    generated_by_task_run_id: row.get(25)?,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -10173,7 +10349,7 @@ impl CheckpointDb {
                    skip_ai_summary, created_at, updated_at, log_source_selection,
                    context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                    log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
-                   preflight_check_enabled
+                   preflight_check_enabled, generated_by_task_run_id
             FROM unified_workflows
             WHERE id = ?1
             "#,
@@ -10234,6 +10410,7 @@ impl CheckpointDb {
                         .unwrap_or_default(),
                     timeout_seconds: row.get::<_, Option<i64>>(23)?.map(|v| v as u64),
                     preflight_check_enabled: row.get::<_, Option<i32>>(24)?.unwrap_or(1) != 0,
+                    generated_by_task_run_id: row.get(25)?,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -10261,7 +10438,7 @@ impl CheckpointDb {
                    skip_ai_summary, created_at, updated_at, log_source_selection,
                    context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                    log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
-                   preflight_check_enabled
+                   preflight_check_enabled, generated_by_task_run_id
             FROM unified_workflows
             WHERE name = ?1
             ORDER BY updated_at DESC
@@ -10324,6 +10501,7 @@ impl CheckpointDb {
                         .unwrap_or_default(),
                     timeout_seconds: row.get::<_, Option<i64>>(23)?.map(|v| v as u64),
                     preflight_check_enabled: row.get::<_, Option<i32>>(24)?.unwrap_or(1) != 0,
+                    generated_by_task_run_id: row.get(25)?,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -10355,14 +10533,30 @@ impl CheckpointDb {
             serde_json::to_string(&request.agentic_steps).unwrap_or_else(|_| "[]".to_string());
         let completion_steps_json =
             serde_json::to_string(&request.completion_steps).unwrap_or_else(|_| "[]".to_string());
-        let log_source_selection_json = serde_json::to_string(&request.log_source_selection)
-            .unwrap_or_else(|_| "\"default\"".to_string());
-        let context_ids_json =
-            serde_json::to_string(&request.context_ids).unwrap_or_else(|_| "[]".to_string());
-        let disabled_context_ids_json = serde_json::to_string(&request.disabled_context_ids)
-            .unwrap_or_else(|_| "[]".to_string());
-        let health_check_urls_json =
-            serde_json::to_string(&request.health_check_urls).unwrap_or_else(|_| "[]".to_string());
+        let log_source_selection_json = request
+            .log_source_selection
+            .as_ref()
+            .map(|ls| serde_json::to_string(ls).unwrap_or_else(|_| "\"default\"".to_string()))
+            .unwrap_or_else(|| "\"default\"".to_string());
+        let context_ids_json = request
+            .context_ids
+            .as_ref()
+            .map(|ids| serde_json::to_string(ids).unwrap_or_else(|_| "[]".to_string()))
+            .unwrap_or_else(|| "[]".to_string());
+        let disabled_context_ids_json = request
+            .disabled_context_ids
+            .as_ref()
+            .map(|ids| serde_json::to_string(ids).unwrap_or_else(|_| "[]".to_string()))
+            .unwrap_or_else(|| "[]".to_string());
+        let health_check_urls_json = request
+            .health_check_urls
+            .as_ref()
+            .map(|urls| serde_json::to_string(urls).unwrap_or_else(|_| "[]".to_string()))
+            .unwrap_or_else(|| "[]".to_string());
+        let auto_include_contexts = request.auto_include_contexts.unwrap_or(true);
+        let log_watch_enabled = request.log_watch_enabled.unwrap_or(true);
+        let health_check_enabled = request.health_check_enabled.unwrap_or(true);
+        let preflight_check_enabled = request.preflight_check_enabled.unwrap_or(true);
 
         conn.execute(
             r#"
@@ -10371,8 +10565,9 @@ impl CheckpointDb {
                 agentic_steps, completion_steps, max_iterations, timeout_seconds, provider, model,
                 skip_ai_summary, created_at, updated_at, log_source_selection,
                 context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
-                log_watch_enabled, health_check_enabled, health_check_urls, preflight_check_enabled
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
+                log_watch_enabled, health_check_enabled, health_check_urls, preflight_check_enabled,
+                generated_by_task_run_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
             "#,
             params![
                 id,
@@ -10394,12 +10589,13 @@ impl CheckpointDb {
                 log_source_selection_json,
                 context_ids_json,
                 disabled_context_ids_json,
-                request.auto_include_contexts,
+                auto_include_contexts,
                 request.prompt_template,
-                request.log_watch_enabled,
-                request.health_check_enabled,
+                log_watch_enabled,
+                health_check_enabled,
                 health_check_urls_json,
-                request.preflight_check_enabled,
+                preflight_check_enabled,
+                request.generated_by_task_run_id,
             ],
         )
         .map_err(|e| format!("Failed to create unified workflow: {}", e))?;
@@ -10426,14 +10622,30 @@ impl CheckpointDb {
             serde_json::to_string(&request.agentic_steps).unwrap_or_else(|_| "[]".to_string());
         let completion_steps_json =
             serde_json::to_string(&request.completion_steps).unwrap_or_else(|_| "[]".to_string());
-        let log_source_selection_json = serde_json::to_string(&request.log_source_selection)
-            .unwrap_or_else(|_| "\"default\"".to_string());
-        let context_ids_json =
-            serde_json::to_string(&request.context_ids).unwrap_or_else(|_| "[]".to_string());
-        let disabled_context_ids_json = serde_json::to_string(&request.disabled_context_ids)
-            .unwrap_or_else(|_| "[]".to_string());
-        let health_check_urls_json =
-            serde_json::to_string(&request.health_check_urls).unwrap_or_else(|_| "[]".to_string());
+        let log_source_selection_json = request
+            .log_source_selection
+            .as_ref()
+            .map(|ls| serde_json::to_string(ls).unwrap_or_else(|_| "\"default\"".to_string()))
+            .unwrap_or_else(|| "\"default\"".to_string());
+        let context_ids_json = request
+            .context_ids
+            .as_ref()
+            .map(|ids| serde_json::to_string(ids).unwrap_or_else(|_| "[]".to_string()))
+            .unwrap_or_else(|| "[]".to_string());
+        let disabled_context_ids_json = request
+            .disabled_context_ids
+            .as_ref()
+            .map(|ids| serde_json::to_string(ids).unwrap_or_else(|_| "[]".to_string()))
+            .unwrap_or_else(|| "[]".to_string());
+        let health_check_urls_json = request
+            .health_check_urls
+            .as_ref()
+            .map(|urls| serde_json::to_string(urls).unwrap_or_else(|_| "[]".to_string()))
+            .unwrap_or_else(|| "[]".to_string());
+        let auto_include_contexts = request.auto_include_contexts.unwrap_or(true);
+        let log_watch_enabled = request.log_watch_enabled.unwrap_or(true);
+        let health_check_enabled = request.health_check_enabled.unwrap_or(true);
+        let preflight_check_enabled = request.preflight_check_enabled.unwrap_or(true);
 
         conn.execute(
             r#"
@@ -10442,8 +10654,9 @@ impl CheckpointDb {
                 agentic_steps, completion_steps, max_iterations, timeout_seconds, provider, model,
                 skip_ai_summary, created_at, updated_at, log_source_selection,
                 context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
-                log_watch_enabled, health_check_enabled, health_check_urls, preflight_check_enabled
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
+                log_watch_enabled, health_check_enabled, health_check_urls, preflight_check_enabled,
+                generated_by_task_run_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
             "#,
             params![
                 id,
@@ -10465,12 +10678,13 @@ impl CheckpointDb {
                 log_source_selection_json,
                 context_ids_json,
                 disabled_context_ids_json,
-                request.auto_include_contexts,
+                auto_include_contexts,
                 request.prompt_template,
-                request.log_watch_enabled,
-                request.health_check_enabled,
+                log_watch_enabled,
+                health_check_enabled,
                 health_check_urls_json,
-                request.preflight_check_enabled,
+                preflight_check_enabled,
+                request.generated_by_task_run_id,
             ],
         )
         .map_err(|e| format!("Failed to create unified workflow: {}", e))?;
@@ -10669,7 +10883,7 @@ impl CheckpointDb {
                    skip_ai_summary, created_at, updated_at, log_source_selection,
                    context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                    log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
-                   preflight_check_enabled
+                   preflight_check_enabled, generated_by_task_run_id
             FROM unified_workflows
             WHERE 1=1
             "#,
@@ -10762,6 +10976,7 @@ impl CheckpointDb {
                         .unwrap_or_default(),
                     timeout_seconds: row.get::<_, Option<i64>>(23)?.map(|v| v as u64),
                     preflight_check_enabled: row.get::<_, Option<i32>>(24)?.unwrap_or(1) != 0,
+                    generated_by_task_run_id: row.get(25)?,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -10796,18 +11011,135 @@ impl CheckpointDb {
             provider: original.provider,
             model: original.model,
             skip_ai_summary: original.skip_ai_summary,
-            log_source_selection: original.log_source_selection,
-            context_ids: original.context_ids,
-            disabled_context_ids: original.disabled_context_ids,
-            auto_include_contexts: original.auto_include_contexts,
+            log_source_selection: Some(original.log_source_selection),
+            context_ids: Some(original.context_ids),
+            disabled_context_ids: Some(original.disabled_context_ids),
+            auto_include_contexts: Some(original.auto_include_contexts),
             prompt_template: original.prompt_template,
-            log_watch_enabled: original.log_watch_enabled,
-            health_check_enabled: original.health_check_enabled,
-            health_check_urls: original.health_check_urls,
-            preflight_check_enabled: original.preflight_check_enabled,
+            log_watch_enabled: Some(original.log_watch_enabled),
+            health_check_enabled: Some(original.health_check_enabled),
+            health_check_urls: Some(original.health_check_urls),
+            preflight_check_enabled: Some(original.preflight_check_enabled),
+            targeted_error_ids: None,
+            generated_by_task_run_id: None, // Don't copy the generator reference
         };
 
         self.create_unified_workflow(&create_request)
+    }
+
+    // ========================================================================
+    // Workflow Sync Helpers
+    // ========================================================================
+
+    /// Get all workflows with sync_pending = 1 (created/modified offline).
+    pub fn get_pending_sync_workflows(
+        &self,
+    ) -> Result<Vec<crate::unified_workflows::UnifiedWorkflow>, String> {
+        let conn = self.get_conn()?;
+
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT id, name, description, category, tags, setup_steps, verification_steps,
+                       agentic_steps, completion_steps, max_iterations, provider, model,
+                       skip_ai_summary, created_at, updated_at, log_source_selection,
+                       context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
+                       log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
+                       preflight_check_enabled, generated_by_task_run_id
+                FROM unified_workflows
+                WHERE sync_pending = 1
+                "#,
+            )
+            .map_err(|e| format!("Failed to prepare pending sync query: {}", e))?;
+
+        let workflows = stmt
+            .query_map([], |row| {
+                Ok(crate::unified_workflows::UnifiedWorkflow {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    description: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    category: row
+                        .get::<_, Option<String>>(3)?
+                        .unwrap_or_else(|| "general".to_string()),
+                    tags: row
+                        .get::<_, Option<String>>(4)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    setup_steps: row
+                        .get::<_, Option<String>>(5)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    verification_steps: row
+                        .get::<_, Option<String>>(6)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    agentic_steps: row
+                        .get::<_, Option<String>>(7)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    completion_steps: row
+                        .get::<_, Option<String>>(8)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    max_iterations: row.get::<_, i64>(9)? as u32,
+                    provider: row.get(10)?,
+                    model: row.get(11)?,
+                    skip_ai_summary: row.get::<_, i32>(12)? != 0,
+                    created_at: row.get(13)?,
+                    updated_at: row.get(14)?,
+                    log_source_selection: row
+                        .get::<_, Option<String>>(15)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    context_ids: row
+                        .get::<_, Option<String>>(16)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    disabled_context_ids: row
+                        .get::<_, Option<String>>(17)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    auto_include_contexts: row.get::<_, Option<i32>>(18)?.unwrap_or(1) != 0,
+                    prompt_template: row.get(19)?,
+                    log_watch_enabled: row.get::<_, Option<i32>>(20)?.unwrap_or(1) != 0,
+                    health_check_enabled: row.get::<_, Option<i32>>(21)?.unwrap_or(1) != 0,
+                    health_check_urls: row
+                        .get::<_, Option<String>>(22)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    timeout_seconds: row.get::<_, Option<i64>>(23)?.map(|v| v as u64),
+                    preflight_check_enabled: row.get::<_, Option<i32>>(24)?.unwrap_or(1) != 0,
+                    generated_by_task_run_id: row.get(25)?,
+                    targeted_error_ids: vec![],
+                })
+            })
+            .map_err(|e| format!("Failed to query pending sync workflows: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(workflows)
+    }
+
+    /// Clear the sync_pending flag for a workflow after successful push to backend.
+    pub fn clear_sync_pending(&self, id: &str) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        conn.execute(
+            "UPDATE unified_workflows SET sync_pending = 0 WHERE id = ?1",
+            params![id],
+        )
+        .map_err(|e| format!("Failed to clear sync_pending: {}", e))?;
+        Ok(())
+    }
+
+    /// Set the sync_pending flag for a workflow (created/modified while offline).
+    pub fn set_sync_pending(&self, id: &str) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        conn.execute(
+            "UPDATE unified_workflows SET sync_pending = 1 WHERE id = ?1",
+            params![id],
+        )
+        .map_err(|e| format!("Failed to set sync_pending: {}", e))?;
+        Ok(())
     }
 
     // ========================================================================

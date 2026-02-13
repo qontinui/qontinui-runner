@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::database::CheckpointDb;
+use crate::doctor::DoctorHandle;
 use crate::step_registry::StepEventLogger;
 use crate::summary_generator::generate_task_summary_async;
 use crate::unified_ai_session::{AiSessionConfig, AiSessionResult, UnifiedAiSessionExecutor};
@@ -26,6 +27,7 @@ pub struct PlanExecutor {
     checkpoint_db: Arc<CheckpointDb>,
     #[allow(dead_code)]
     app_handle: tauri::AppHandle,
+    doctor_handle: Option<DoctorHandle>,
 }
 
 impl PlanExecutor {
@@ -35,6 +37,11 @@ impl PlanExecutor {
         app_handle: tauri::AppHandle,
         pid_tracker: Arc<std::sync::Mutex<Vec<u32>>>,
     ) -> Self {
+        let doctor_handle = app_state
+            .doctor_handle
+            .try_lock()
+            .ok()
+            .and_then(|guard| guard.clone());
         Self {
             ai_executor: UnifiedAiSessionExecutor::new(
                 app_state.clone(),
@@ -43,6 +50,7 @@ impl PlanExecutor {
             ),
             checkpoint_db: app_state.checkpoint_db.clone(),
             app_handle,
+            doctor_handle,
         }
     }
 
@@ -133,8 +141,7 @@ impl PlanExecutor {
                 &config.execution_id,
                 &config.plan_name,
                 (phase_index + 1) as u32,
-            )
-            .with_timeout(config.timeout_seconds);
+            );
 
             // Execute the AI session
             let result: AiSessionResult = self
@@ -203,8 +210,9 @@ impl PlanExecutor {
                 // Generate summary for partial completion
                 let db = self.checkpoint_db.clone();
                 let exec_id = config.execution_id.clone();
+                let doctor_handle = self.doctor_handle.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = generate_task_summary_async(db, exec_id).await {
+                    if let Err(e) = generate_task_summary_async(db, exec_id, doctor_handle).await {
                         warn!("Failed to generate summary for failed plan: {}", e);
                     }
                 });
@@ -264,8 +272,7 @@ impl PlanExecutor {
                     &config.plan_name,
                     format!("Next Steps Sweep {}", iteration + 1),
                     (total_phases + iteration as usize) as u32,
-                )
-                .with_timeout(config.timeout_seconds);
+                );
 
                 let result = self
                     .ai_executor
@@ -332,8 +339,9 @@ impl PlanExecutor {
         // Generate summary
         let db = self.checkpoint_db.clone();
         let exec_id = config.execution_id.clone();
+        let doctor_handle = self.doctor_handle.clone();
         tokio::spawn(async move {
-            if let Err(e) = generate_task_summary_async(db, exec_id).await {
+            if let Err(e) = generate_task_summary_async(db, exec_id, doctor_handle).await {
                 warn!("Failed to generate plan summary: {}", e);
             }
         });

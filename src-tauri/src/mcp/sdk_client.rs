@@ -147,7 +147,7 @@ struct ConnectResponse {
 // =============================================================================
 
 /// Send an HTTP request to the connected SDK app
-async fn sdk_request(
+pub async fn sdk_request(
     state: &Arc<ApiState>,
     method: Method,
     path: &str,
@@ -276,7 +276,7 @@ async fn handle_connect(
 
     let port = req.port.unwrap_or_else(|| {
         url.split(':')
-            .last()
+            .next_back()
             .and_then(|p| p.parse().ok())
             .unwrap_or(0)
     });
@@ -351,41 +351,47 @@ async fn try_health_check(
     client: &reqwest::Client,
     url: &str,
 ) -> Result<(String, serde_json::Value), String> {
-    // Try /ui-bridge/health first (standard SDK path)
-    let ui_bridge_health_url = format!("{}/ui-bridge/health", url);
-    match client.get(&ui_bridge_health_url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            if let Ok(json) = resp.json::<serde_json::Value>().await {
-                return Ok(("/ui-bridge".to_string(), json));
+    // Try paths in order: Next.js API route, standard SDK path, root-level
+    let paths: &[(&str, &str)] = &[
+        ("/api/ui-bridge/health", "/api/ui-bridge"),
+        ("/ui-bridge/health", "/ui-bridge"),
+        ("/health", ""),
+    ];
+
+    let mut errors: Vec<String> = Vec::new();
+
+    for (health_path, base_path) in paths {
+        let health_url = format!("{}{}", url, health_path);
+        match client.get(&health_url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(json) => return Ok((base_path.to_string(), json)),
+                    Err(e) => {
+                        errors.push(format!("{} → invalid JSON: {}", health_path, e));
+                    }
+                }
+            }
+            Ok(resp) => {
+                errors.push(format!("{} → HTTP {}", health_path, resp.status()));
+            }
+            Err(e) => {
+                let reason = if e.is_connect() {
+                    "connection refused".to_string()
+                } else if e.is_timeout() {
+                    "timed out".to_string()
+                } else {
+                    e.to_string()
+                };
+                errors.push(format!("{} → {}", health_path, reason));
             }
         }
-        _ => {}
     }
 
-    // Try /health (app might serve UI Bridge at root)
-    let health_url = format!("{}/health", url);
-    match client.get(&health_url).send().await {
-        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
-            Ok(json) => return Ok(("".to_string(), json)),
-            Err(e) => return Err(format!("Health endpoint returned invalid JSON: {}", e)),
-        },
-        Ok(resp) => {
-            return Err(format!("Health check returned HTTP {}", resp.status()));
-        }
-        Err(e) => {
-            return Err(format!(
-                "Cannot reach app at {}: {}",
-                url,
-                if e.is_connect() {
-                    "Connection refused"
-                } else if e.is_timeout() {
-                    "Timed out"
-                } else {
-                    &e.to_string()
-                }
-            ));
-        }
-    }
+    Err(format!(
+        "No UI Bridge health endpoint found at {}. Tried: {}",
+        url,
+        errors.join(", ")
+    ))
 }
 
 /// POST /ui-bridge/sdk/disconnect — Disconnect from SDK app
@@ -467,7 +473,20 @@ async fn handle_health(State(state): State<Arc<ApiState>>) -> Json<serde_json::V
 /// GET /ui-bridge/sdk/elements — List all elements
 async fn handle_elements(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
     match sdk_request(&state, Method::GET, "/control/elements", None).await {
-        Ok(data) => Json(data),
+        Ok(mut data) => {
+            // Add helpful note if no elements found
+            if let Some(arr) = data.get("data").and_then(|d| d.as_array()) {
+                if arr.is_empty() {
+                    if let Some(obj) = data.as_object_mut() {
+                        obj.insert(
+                            "note".to_string(),
+                            serde_json::json!("No instrumented elements found. Ensure the UI Bridge SDK provider is mounted on the active page and elements are registered."),
+                        );
+                    }
+                }
+            }
+            Json(data)
+        }
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
     }
 }
@@ -519,7 +538,20 @@ async fn handle_discover(
 /// GET /ui-bridge/sdk/components — List components
 async fn handle_components(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
     match sdk_request(&state, Method::GET, "/control/components", None).await {
-        Ok(data) => Json(data),
+        Ok(mut data) => {
+            // Add helpful note if no components found
+            if let Some(arr) = data.get("data").and_then(|d| d.as_array()) {
+                if arr.is_empty() {
+                    if let Some(obj) = data.as_object_mut() {
+                        obj.insert(
+                            "note".to_string(),
+                            serde_json::json!("No registered components found. Ensure the UI Bridge SDK provider is mounted and components are registered with useUIBridge or equivalent."),
+                        );
+                    }
+                }
+            }
+            Json(data)
+        }
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
     }
 }
@@ -580,6 +612,45 @@ async fn handle_ai_snapshot(State(state): State<Arc<ApiState>>) -> Json<serde_js
 /// GET /ui-bridge/sdk/ai/summary — Page summary
 async fn handle_ai_summary(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
     match sdk_request(&state, Method::GET, "/ai/summary", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+// =============================================================================
+// Page Navigation Relay Handlers
+// =============================================================================
+
+/// POST /ui-bridge/sdk/page/refresh — Refresh the page
+async fn handle_page_refresh(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/control/page/refresh", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/page/navigate — Navigate to a URL
+async fn handle_page_navigate(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/control/page/navigate", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/page/back — Go back in history
+async fn handle_page_go_back(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/control/page/back", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/page/forward — Go forward in history
+async fn handle_page_go_forward(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/control/page/forward", None).await {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
     }
@@ -807,6 +878,54 @@ async fn handle_screenshot(
 }
 
 // =============================================================================
+// Cross-App Analysis Proxies
+// =============================================================================
+
+/// GET /ui-bridge/sdk/ai/analyze/data — Extract page data
+async fn handle_ai_analyze_data(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/ai/analyze/data", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/ai/analyze/regions — Segment page regions
+async fn handle_ai_analyze_regions(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/ai/analyze/regions", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/ai/analyze/structured-data — Extract tables/lists
+async fn handle_ai_analyze_structured_data(
+    State(state): State<Arc<ApiState>>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/ai/analyze/structured-data", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/ai/analyze/cross-app-compare — Compare two snapshots
+async fn handle_ai_analyze_cross_app_compare(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(
+        &state,
+        Method::POST,
+        "/ai/analyze/cross-app-compare",
+        Some(body),
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+// =============================================================================
 // Router
 // =============================================================================
 
@@ -842,6 +961,28 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/ui-bridge/sdk/ai/assert", post(handle_ai_assert))
         .route("/ui-bridge/sdk/ai/snapshot", get(handle_ai_snapshot))
         .route("/ui-bridge/sdk/ai/summary", get(handle_ai_summary))
+        // AI analysis endpoints
+        .route(
+            "/ui-bridge/sdk/ai/analyze/data",
+            get(handle_ai_analyze_data),
+        )
+        .route(
+            "/ui-bridge/sdk/ai/analyze/regions",
+            get(handle_ai_analyze_regions),
+        )
+        .route(
+            "/ui-bridge/sdk/ai/analyze/structured-data",
+            get(handle_ai_analyze_structured_data),
+        )
+        .route(
+            "/ui-bridge/sdk/ai/analyze/cross-app-compare",
+            post(handle_ai_analyze_cross_app_compare),
+        )
+        // Page navigation
+        .route("/ui-bridge/sdk/page/refresh", post(handle_page_refresh))
+        .route("/ui-bridge/sdk/page/navigate", post(handle_page_navigate))
+        .route("/ui-bridge/sdk/page/back", post(handle_page_go_back))
+        .route("/ui-bridge/sdk/page/forward", post(handle_page_go_forward))
         // Debug
         .route("/ui-bridge/sdk/debug/metrics", get(handle_debug_metrics))
         .route(

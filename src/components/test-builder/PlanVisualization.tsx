@@ -77,7 +77,13 @@ export function PlanVisualization({
               {/* Step content */}
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2">
-                  <span className="font-medium text-neutral-200">{step.name}</span>
+                  <span
+                    data-content-role="label"
+                    data-content-label="step name"
+                    className="font-medium text-neutral-200"
+                  >
+                    {step.name}
+                  </span>
                   {step.depends_on.length > 0 && (
                     <span className="text-xs text-neutral-500">
                       (needs step {step.depends_on.map((d) => d + 1).join(", ")})
@@ -85,7 +91,13 @@ export function PlanVisualization({
                   )}
                 </div>
 
-                <div className="text-sm text-neutral-400 mt-1">{step.purpose}</div>
+                <div
+                  data-content-role="description"
+                  data-content-label="step purpose"
+                  className="text-sm text-neutral-400 mt-1"
+                >
+                  {step.purpose}
+                </div>
 
                 {/* URL preview */}
                 <div className="mt-2 flex items-center gap-2">
@@ -104,9 +116,21 @@ export function PlanVisualization({
                         className="flex items-center gap-1 px-2 py-0.5 bg-purple-900/30 border border-purple-700/50 rounded text-xs"
                       >
                         <Variable className="w-3 h-3 text-purple-400" />
-                        <span className="text-purple-300">{ext.variable_name}</span>
+                        <span
+                          data-content-role="label"
+                          data-content-label="variable name"
+                          className="text-purple-300"
+                        >
+                          {ext.variable_name}
+                        </span>
                         <span className="text-purple-500">←</span>
-                        <span className="text-purple-400 font-mono">{ext.json_path}</span>
+                        <span
+                          data-content-role="code"
+                          data-content-label="json path"
+                          className="text-purple-400 font-mono"
+                        >
+                          {ext.json_path}
+                        </span>
                       </div>
                     ))}
                   </div>

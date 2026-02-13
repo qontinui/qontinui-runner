@@ -322,7 +322,9 @@ function PhaseSection({
   onIterationToggle: (key: string, expanded: boolean) => void;
   taskRunId: string | null;
 }) {
-  const [expanded, setExpanded] = useState(defaultExpanded || group.isActive);
+  const [expanded, setExpanded] = useState(
+    group.isUpcoming ? false : defaultExpanded || group.isActive,
+  );
   const config = WORKFLOW_STAGE_CONFIG[group.phase];
   const colors = getAccentColors(config.color as Parameters<typeof getAccentColors>[0]);
   const successColors = getStatusColors("success");
@@ -335,32 +337,37 @@ function PhaseSection({
   const hasRunningStep = group.steps.some((step) => step.status === "running");
 
   return (
-    <div className="border-b border-border/50 last:border-b-0">
+    <div className={cn("border-b border-border/50 last:border-b-0", group.isUpcoming && "opacity-50")}>
       {/* Phase header */}
       <button
-        onClick={() => setExpanded(!expanded)}
+        onClick={() => !group.isUpcoming && setExpanded(!expanded)}
         className={cn(
           "w-full flex items-center gap-3 px-4 py-2.5 transition-colors",
-          "hover:bg-muted/30",
+          group.isUpcoming ? "cursor-default" : "hover:bg-muted/30",
           group.isActive && cn(colors.bg, colors.border, "border-l-2"),
         )}
       >
         {/* Expand/collapse icon */}
-        {expanded ? (
-          <ChevronDown className="h-4 w-4 text-muted-foreground" />
-        ) : (
-          <ChevronRight className="h-4 w-4 text-muted-foreground" />
+        {!group.isUpcoming && (
+          expanded ? (
+            <ChevronDown className="h-4 w-4 text-muted-foreground" />
+          ) : (
+            <ChevronRight className="h-4 w-4 text-muted-foreground" />
+          )
         )}
+        {group.isUpcoming && <div className="w-4" />}
 
         {/* Phase badge */}
         <Badge
           className={cn(
             "px-2 py-0.5 text-xs font-medium border",
-            group.isActive
-              ? cn(colors.bg, colors.text, colors.border)
-              : group.isComplete
-                ? "bg-muted/50 text-muted-foreground border-border/50"
-                : "bg-muted/20 text-muted-foreground/50 border-transparent",
+            group.isUpcoming
+              ? "bg-muted/10 text-muted-foreground/30 border-dashed border-border/30"
+              : group.isActive
+                ? cn(colors.bg, colors.text, colors.border)
+                : group.isComplete
+                  ? "bg-muted/50 text-muted-foreground border-border/50"
+                  : "bg-muted/20 text-muted-foreground/50 border-transparent",
           )}
         >
           {config.label}
@@ -369,8 +376,13 @@ function PhaseSection({
         {/* Running indicator - only show if a step is actually running */}
         {hasRunningStep && <Loader2 className={cn("h-3.5 w-3.5 animate-spin", colors.text)} />}
 
+        {/* Upcoming label */}
+        {group.isUpcoming && (
+          <span className="text-xs text-muted-foreground/40 ml-auto">Upcoming</span>
+        )}
+
         {/* Iteration count for phases with iterations */}
-        {group.hasIterations && group.iterationGroups.length > 0 && (
+        {!group.isUpcoming && group.hasIterations && group.iterationGroups.length > 0 && (
           <Badge
             variant="muted"
             className="text-[10px] px-1.5 py-0 h-5 gap-1 text-muted-foreground"
@@ -381,27 +393,27 @@ function PhaseSection({
         )}
 
         {/* Step count (for phases without iterations) */}
-        {!group.hasIterations && (
+        {!group.isUpcoming && !group.hasIterations && (
           <span className="text-xs text-muted-foreground ml-auto">
             {group.stats.completed}/{group.stats.total} steps
           </span>
         )}
 
         {/* Success/fail indicators (for phases without iterations) - different wording for agentic */}
-        {!group.hasIterations && group.stats.successful > 0 && (
+        {!group.isUpcoming && !group.hasIterations && group.stats.successful > 0 && (
           <Badge variant="muted" className={cn("text-[10px]", successColors.text)}>
             {group.stats.successful} {group.phase === "agentic" ? "completed" : "passed"}
           </Badge>
         )}
-        {!group.hasIterations && group.stats.failed > 0 && (
+        {!group.isUpcoming && !group.hasIterations && group.stats.failed > 0 && (
           <Badge variant="muted" className={cn("text-[10px]", errorColors.text)}>
             {group.stats.failed} {group.phase === "agentic" ? "incomplete" : "failed"}
           </Badge>
         )}
       </button>
 
-      {/* Content */}
-      {expanded && (
+      {/* Content - not shown for upcoming phases */}
+      {!group.isUpcoming && expanded && (
         <div className="bg-muted/10">
           {showFlatList ? (
             // Flat list for phases without iterations

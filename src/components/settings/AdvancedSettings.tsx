@@ -143,7 +143,13 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="text-muted-foreground">Loading settings...</div>
+        <div
+          data-content-role="status"
+          data-content-label="loading settings"
+          className="text-muted-foreground"
+        >
+          Loading settings...
+        </div>
       </div>
     );
   }
@@ -295,7 +301,9 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
         {deviceInfoLoading && !deviceInfo ? (
           <div className="flex items-center gap-2 text-muted-foreground">
             <RefreshCw className="w-4 h-4 animate-spin" />
-            <span>Loading device info...</span>
+            <span data-content-role="status" data-content-label="loading device info">
+              Loading device info...
+            </span>
           </div>
         ) : deviceInfo ? (
           <div className="space-y-2">
@@ -357,7 +365,11 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
             </div>
           </div>
         ) : (
-          <div className="text-xs text-muted-foreground italic">
+          <div
+            data-content-role="status"
+            data-content-label="device info unavailable"
+            className="text-xs text-muted-foreground italic"
+          >
             Unable to load device information.
           </div>
         )}

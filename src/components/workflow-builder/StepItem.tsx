@@ -244,7 +244,13 @@ export function StepItem({
       {/* Step Info */}
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">
-          <span className="text-sm font-medium text-zinc-200 truncate">{step.name}</span>
+          <span
+            data-content-role="label"
+            data-content-label="step name"
+            className="text-sm font-medium text-zinc-200 truncate"
+          >
+            {step.name}
+          </span>
           {isSummaryStep && (
             <span className="text-xs px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-400 flex items-center gap-1">
               <Lock className="w-3 h-3" />
@@ -257,7 +263,13 @@ export function StepItem({
             </span>
           )}
         </div>
-        <div className="text-xs text-zinc-500 truncate">{getSubtitle()}</div>
+        <div
+          data-content-role="description"
+          data-content-label="step description"
+          className="text-xs text-zinc-500 truncate"
+        >
+          {getSubtitle()}
+        </div>
       </div>
 
       {/* Action Buttons - hidden in selection mode */}

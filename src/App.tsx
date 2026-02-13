@@ -36,7 +36,6 @@ import {
   TestTube,
   Accessibility,
   Cloud,
-  Puzzle,
 } from "lucide-react";
 
 // Contexts
@@ -53,6 +52,7 @@ import { ContextualTutorial } from "./components/tutorial";
 
 // UI Bridge for AI-driven UI automation
 import { UIBridgeProvider, AutoRegisterProvider } from "ui-bridge";
+import { SdkUIBridgeInspector } from "./components/ui-bridge/SdkUIBridgeInspector";
 
 // Navigation context for tutorials to navigate to pages
 interface NavigationContextValue {
@@ -158,13 +158,14 @@ import { useTaskRuns } from "./hooks/useAiData";
 // Accessibility components
 import { AccessibilityExplorerPanel } from "./components/accessibility";
 // UI Bridge Inspector
-import { ExternalUIBridgeInspector } from "./components/ui-bridge";
 // New dashboard components
 import { LearningDashboard } from "./components/learning-dashboard";
 import { CheckpointBrowser } from "./components/checkpoint-browser";
 import { FlowDesigner } from "./components/flow-designer";
 // Spec Discovery (formerly Live Page Generator)
 import { SpecDiscoveryTab } from "./components/spec-discovery";
+// App Comparison Wizard (two-app snapshot comparison)
+import { AppComparisonWizard } from "./components/discover";
 import type { UnifiedWorkflow } from "./types/unified-workflow";
 // Configure components
 import { ExternalLogsTab as _ExternalLogsTab } from "./components/ExternalLogsTab";
@@ -229,6 +230,7 @@ type MainTabId =
   | "check-builder"
   | "shell-command-builder"
   | "spec-discovery"
+  | "app-comparison"
   | "capture"
   | "config-log-sources"
   | "config-findings"
@@ -299,6 +301,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "check-builder",
   "shell-command-builder",
   "spec-discovery",
+  "app-comparison",
   "capture",
   "config-log-sources",
   "config-findings",
@@ -1224,21 +1227,7 @@ function AppContent() {
         );
 
       case "run-ui-bridge":
-        // UI Bridge Inspector is a standalone tool for inspecting web pages via browser extension
-        // It doesn't require a task run to be selected
-        return (
-          <div className="h-full flex flex-col overflow-hidden">
-            <div className="flex-shrink-0 bg-background border-b border-border px-4 py-3">
-              <div className="flex items-center gap-2">
-                <Puzzle className="w-4 h-4 text-muted-foreground" />
-                <span className="text-sm font-medium">UI Bridge Inspector</span>
-              </div>
-            </div>
-            <div className="flex-1 min-h-0 overflow-hidden p-4">
-              <ExternalUIBridgeInspector />
-            </div>
-          </div>
-        );
+        return <SdkUIBridgeInspector />;
 
       case "discoveries":
         return (
@@ -1450,6 +1439,13 @@ function AppContent() {
               onNavigateToLibrary={() => setActiveTab("library")}
               onApplyWorkflow={handleApplyWorkflow}
             />
+          </div>
+        );
+
+      case "app-comparison":
+        return (
+          <div className="h-full overflow-hidden">
+            <AppComparisonWizard onLog={addLog} />
           </div>
         );
 

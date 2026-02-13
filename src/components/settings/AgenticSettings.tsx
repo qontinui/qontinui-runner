@@ -177,7 +177,13 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="text-muted-foreground">Loading agentic settings...</div>
+        <div
+          data-content-role="status"
+          data-content-label="loading agentic settings"
+          className="text-muted-foreground"
+        >
+          Loading agentic settings...
+        </div>
       </div>
     );
   }

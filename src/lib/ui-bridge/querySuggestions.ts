@@ -5,7 +5,7 @@
  * Prioritizes interactive elements and primary actions for best UX.
  */
 
-import type { ExternalElement } from "../../hooks/useExternalUIBridge";
+import type { ExternalElement } from "../../types/ui-bridge-types";
 
 /**
  * A suggested query for the natural language panel

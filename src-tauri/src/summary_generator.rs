@@ -10,6 +10,7 @@
 use crate::ai_provider;
 use crate::ai_router::TaskContext;
 use crate::database::CheckpointDb;
+use crate::doctor::DoctorHandle;
 use crate::findings::types::{Finding, FindingStatus};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -22,22 +23,28 @@ const MAX_OUTPUT_FOR_SUMMARY: usize = 50000;
 const SUMMARY_PROMPT_TEMPLATE: &str = r#"You are summarizing a completed workflow run. The workflow follows a multi-phase structure:
 
 1. **Setup** - Initial configuration and preparation steps
-2. **Verification/Agentic loop** - Iterative cycles of AI work (agentic) and automated checks (verification)
+2. **Verification/Agentic loop** - Iterative cycles where automated checks run (verification), failures are sent to an AI agent for fixing (agentic), and checks re-run until all pass or max iterations reached
 3. **Completion** - Final wrap-up steps
 
-Your job is to produce a SHORT, COMPREHENSIVE recap of the ENTIRE workflow - not just the last phase. Cover what was done across all phases. The summary should read like a changelog entry or status report.
+Your job is to produce a SHORT, COMPREHENSIVE summary of the workflow's outcome. Focus on the FINAL STATE and the journey to get there.
+
+**Structure your summary as:**
+1. The FINAL OUTCOME (did all checks pass? how many iterations were needed?)
+2. What issues the AI agent fixed across iterations (specific: file names, error types, tools involved)
+3. What happened in the completion phase (if anything)
 
 **Important:**
-- Summarize the full workflow, including setup actions, what the AI agent did, verification results, and completion steps
-- Do NOT include internal markers like `[STEP_COMPLETE:...]`, `[SESSION_START:...]`, `[TASK_COMPLETE]`, or `[FINDING:...]` in your summary text
+- Lead with the final result, not the initial failures
+- Describe the full progression (e.g., "After 4 iterations: iteration 1 had 3 failures, the AI fixed formatting and type errors, and all 15 checks passed by iteration 4")
+- Be specific about what was accomplished (files changed, error types fixed, check groups that passed)
+- Do NOT include internal markers like `[STEP_COMPLETE:...]`, `[SESSION_START:...]`, `[TASK_COMPLETE]`, or `[FINDING:...]`
 - Write in plain prose, no markdown formatting
-- Be specific about what was accomplished (files changed, tests run, repos pushed, etc.)
 - If verification passed on the first iteration with no agentic work needed, say so clearly
 
 Respond in this exact JSON format only, with no other text:
 ```json
 {
-  "summary": "Your 2-5 sentence summary of the entire workflow here...",
+  "summary": "Your 2-5 sentence summary focusing on the final outcome and what was accomplished...",
   "goal_achieved": true,
   "remaining_work": null
 }
@@ -53,7 +60,7 @@ If the goal was not achieved, set goal_achieved to false and provide remaining_w
 {workflow_metadata}{findings_section}
 ## Task Output (Last {output_chars} characters)
 
-The output below contains `[SESSION_START:N]` markers indicating different AI sessions/phases. Earlier sessions are typically setup or agentic work; later sessions are verification and completion. `[USER_MESSAGE]...[/USER_MESSAGE]` blocks indicate messages sent by the user during interactive sessions.
+The output below shows the workflow's progression through iterations. Each iteration has a verification phase (automated checks) followed by an agentic phase (AI fixing issues). The LAST iteration's verification result is the final outcome.
 
 {task_output}
 "#;
@@ -190,6 +197,48 @@ pub(crate) fn format_findings_for_summary(findings: &[Finding]) -> String {
     parts.join("\n")
 }
 
+/// Assemble AI output from task_run_events when output_log is empty.
+///
+/// For unified workflow runs, the AI conversation output is stored in task_run_events
+/// (event_type='ai_output') rather than in the output_log field. This function
+/// reconstructs the output from those events for summary generation.
+fn assemble_output_from_events(db: &CheckpointDb, task_run_id: &str) -> String {
+    let events = db
+        .get_task_run_events(task_run_id, Some("ai_output"), None)
+        .unwrap_or_default();
+
+    if events.is_empty() {
+        return String::new();
+    }
+
+    let mut parts = Vec::new();
+    for event in &events {
+        let phase = event
+            .event_subtype
+            .as_deref()
+            .unwrap_or("unknown");
+        let iteration_label = &event.message;
+
+        // Extract the "output" field from the event's JSON data
+        if let Some(ref data_str) = event.data {
+            if let Ok(data) = serde_json::from_str::<serde_json::Value>(data_str) {
+                if let Some(output) = data.get("output").and_then(|v| v.as_str()) {
+                    let iteration = data.get("iteration").and_then(|v| v.as_u64()).unwrap_or(0);
+                    parts.push(format!(
+                        "[SESSION_START:{} - {} phase]\n{}",
+                        iteration, phase, output
+                    ));
+                } else {
+                    // Fallback: use the message as context
+                    parts.push(format!("[SESSION: {}]", iteration_label));
+                }
+            }
+        }
+    }
+
+    parts.join("\n\n")
+}
+
 /// Build a workflow metadata section for the summary prompt.
 ///
 /// Includes verification phase results and transition history so the summary AI
@@ -207,8 +256,9 @@ fn build_workflow_metadata(
         .unwrap_or_default();
 
     if !verification_results.is_empty() {
+        let last_iteration_idx = verification_results.len() - 1;
         parts.push("\n## Verification Results\n".to_string());
-        for result in &verification_results {
+        for (idx, result) in verification_results.iter().enumerate() {
             let iteration = result
                 .get("iteration")
                 .and_then(|v| v.as_u64())
@@ -236,18 +286,25 @@ fn build_workflow_metadata(
                 iteration, status, passed, failed, total
             ));
 
-            // Include brief step details for failed steps
+            let is_last = idx == last_iteration_idx;
+
             if let Some(step_results) = result.get("step_results").and_then(|v| v.as_array()) {
                 for sr in step_results {
                     let success = sr.get("success").and_then(|v| v.as_bool()).unwrap_or(true);
+                    let name = sr
+                        .get("step_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+
                     if !success {
-                        let name = sr
-                            .get("step_name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
+                        // Always show failed steps with error details
                         let err = sr.get("error").and_then(|v| v.as_str()).unwrap_or("");
                         let truncated = if err.len() > 150 { &err[..150] } else { err };
                         parts.push(format!("  - FAILED: {} - {}", name, truncated));
+                    } else if is_last {
+                        // For the final iteration, also show passed steps (so summary
+                        // can describe the complete outcome, not just failures)
+                        parts.push(format!("  - PASSED: {}", name));
                     }
                 }
             }
@@ -299,6 +356,7 @@ fn build_workflow_metadata(
 pub fn generate_task_summary(
     db: &CheckpointDb,
     task_run_id: &str,
+    doctor_handle: Option<&DoctorHandle>,
 ) -> Result<SummaryResult, String> {
     info!("Generating summary for task run: {}", task_run_id);
 
@@ -306,12 +364,6 @@ pub fn generate_task_summary(
     let task = db
         .get_task_run(task_run_id)?
         .ok_or_else(|| format!("Task run not found: {}", task_run_id))?;
-
-    // Skip if already has a summary
-    if task.summary.is_some() {
-        info!("Task {} already has a summary, skipping", task_run_id);
-        return Err("Task already has a summary".to_string());
-    }
 
     // Determine if this is a failed/stopped task (affects prompt template choice)
     let is_failure = task.status == "failed" || task.status == "stopped";
@@ -326,8 +378,17 @@ pub fn generate_task_summary(
     // Build structured workflow metadata (verification results, transition history)
     let workflow_metadata = build_workflow_metadata(db, task_run_id, &task);
 
-    // Prepare the output for summarization: strip markers first, then truncate
-    let cleaned_output = strip_output_markers(&task.output_log);
+    // Prepare the output for summarization.
+    // For unified workflow runs, output_log is often empty because AI output is stored
+    // in task_run_events instead. Fall back to assembling from events.
+    let raw_output = if task.output_log.trim().is_empty() {
+        info!("output_log is empty, assembling from task_run_events");
+        assemble_output_from_events(db, task_run_id)
+    } else {
+        task.output_log.clone()
+    };
+
+    let cleaned_output = strip_output_markers(&raw_output);
     let truncated_output = if cleaned_output.len() > MAX_OUTPUT_FOR_SUMMARY {
         // Take the last N characters (most recent output is usually most relevant)
         let start = cleaned_output.len() - MAX_OUTPUT_FOR_SUMMARY;
@@ -375,7 +436,7 @@ pub fn generate_task_summary(
     let task_context = TaskContext::from_prompt(&prompt);
 
     // Use the AI provider module to run the prompt with routing
-    let response = ai_provider::run_prompt_with_routing(&prompt, &task_context, 0);
+    let response = ai_provider::run_prompt_with_routing(&prompt, &task_context, doctor_handle);
 
     if !response.success {
         let err = response
@@ -485,10 +546,13 @@ fn extract_json_from_response(response: &str) -> Result<String, String> {
 pub async fn generate_task_summary_async(
     db: Arc<CheckpointDb>,
     task_run_id: String,
+    doctor_handle: Option<DoctorHandle>,
 ) -> Result<SummaryResult, String> {
-    tokio::task::spawn_blocking(move || generate_task_summary(&db, &task_run_id))
-        .await
-        .map_err(|e| format!("Task spawn error: {}", e))?
+    tokio::task::spawn_blocking(move || {
+        generate_task_summary(&db, &task_run_id, doctor_handle.as_ref())
+    })
+    .await
+    .map_err(|e| format!("Task spawn error: {}", e))?
 }
 
 #[cfg(test)]

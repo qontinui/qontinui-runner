@@ -16,6 +16,7 @@ use tracing::{debug, error, info, warn};
 use std::collections::HashMap;
 
 use crate::database::CheckpointDb;
+use crate::doctor::DoctorHandle;
 use crate::error_monitor::{CuratorConfig, DebugContextCurator};
 use crate::execution_context::AiSessionContext;
 use crate::orchestrator::{
@@ -235,8 +236,6 @@ pub struct StageTransition {
 pub struct OrchestratorConfig {
     /// Maximum iterations before stopping
     pub max_iterations: u32,
-    /// Timeout for AI calls (planning, verification)
-    pub ai_timeout_seconds: u64,
     /// Working directory for running commands
     pub working_directory: String,
     /// Whether to enable planning phase
@@ -281,7 +280,6 @@ impl Default for OrchestratorConfig {
     fn default() -> Self {
         Self {
             max_iterations: 10,
-            ai_timeout_seconds: 300,
             working_directory: ".".to_string(),
             enable_planning: true,
             enable_ai_verification: true,
@@ -649,16 +647,20 @@ pub struct Orchestrator {
     session_ctx: Option<AiSessionContext>,
     /// Hook executor for lifecycle events
     hook_executor: HookExecutor,
+    /// Doctor health monitor handle for tracking AI processes.
+    doctor_handle: Option<DoctorHandle>,
 }
 
 impl Orchestrator {
     /// Create a new orchestrator without output capabilities.
-    pub fn new(config: OrchestratorConfig, db: Arc<CheckpointDb>) -> Self {
+    pub fn new(
+        config: OrchestratorConfig,
+        db: Arc<CheckpointDb>,
+        doctor_handle: Option<DoctorHandle>,
+    ) -> Self {
         let knowledge_base = KnowledgeBase::new(Arc::clone(&db));
-        let verifier = VerificationOrchestrator::new(
-            config.working_directory.clone(),
-            config.ai_timeout_seconds,
-        );
+        let verifier =
+            VerificationOrchestrator::new(config.working_directory.clone(), doctor_handle.clone());
 
         Self {
             config,
@@ -668,6 +670,7 @@ impl Orchestrator {
             app_handle: None,
             session_ctx: None,
             hook_executor: HookExecutor::empty(),
+            doctor_handle,
         }
     }
 
@@ -677,12 +680,11 @@ impl Orchestrator {
         db: Arc<CheckpointDb>,
         app_handle: tauri::AppHandle,
         session_ctx: Option<AiSessionContext>,
+        doctor_handle: Option<DoctorHandle>,
     ) -> Self {
         let knowledge_base = KnowledgeBase::new(Arc::clone(&db));
-        let verifier = VerificationOrchestrator::new(
-            config.working_directory.clone(),
-            config.ai_timeout_seconds,
-        );
+        let verifier =
+            VerificationOrchestrator::new(config.working_directory.clone(), doctor_handle.clone());
 
         Self {
             config,
@@ -692,6 +694,7 @@ impl Orchestrator {
             app_handle: Some(app_handle),
             session_ctx,
             hook_executor: HookExecutor::empty(),
+            doctor_handle,
         }
     }
 
@@ -1170,7 +1173,7 @@ impl Orchestrator {
                 task_run_id,
                 goal,
                 &self.config.working_directory,
-                self.config.ai_timeout_seconds,
+                self.doctor_handle.as_ref(),
             )?;
 
             state.plan = Some(plan_result.plan.clone());
@@ -1917,7 +1920,7 @@ impl Orchestrator {
             &state.task_run_id,
             &self.config.working_directory,
             reason,
-            self.config.ai_timeout_seconds,
+            self.doctor_handle.as_ref(),
         )?;
 
         state.plan = Some(plan_result.plan.clone());
@@ -2925,8 +2928,10 @@ pub async fn run_orchestrated_task(
     worker_fn: impl Fn(&str) -> Result<String, String>,
     // Callback to capture screenshot for AI verification
     screenshot_fn: impl Fn() -> Result<Option<String>, String>,
+    // Doctor health monitor handle
+    doctor_handle: Option<DoctorHandle>,
 ) -> Result<TaskCompletionResult, String> {
-    let orchestrator = Orchestrator::new(config.clone(), db);
+    let orchestrator = Orchestrator::new(config.clone(), db, doctor_handle);
     let mut state = orchestrator.initialize_task(task_run_id, goal)?;
 
     loop {

@@ -363,6 +363,8 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
                   </div>
                   {envVarStatus[settings.authEnvVar] !== undefined && (
                     <div
+                      data-content-role="status"
+                      data-content-label="env var status"
                       className={`text-[10px] ${envVarStatus[settings.authEnvVar] ? "text-green-500" : "text-red-500"}`}
                     >
                       {envVarStatus[settings.authEnvVar]
@@ -411,7 +413,11 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
             </div>
           </div>
           <div className="flex items-center gap-3">
-            <span className="text-xs text-muted-foreground">
+            <span
+              data-content-role="metric"
+              data-content-label="variable count"
+              className="text-xs text-muted-foreground"
+            >
               {settings.customVariables.length} variable
               {settings.customVariables.length !== 1 ? "s" : ""}
             </span>
@@ -427,7 +433,11 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
           <div className="px-4 pb-4 space-y-4 border-t border-border/50">
             <div className="pt-4 space-y-3">
               {settings.customVariables.length === 0 ? (
-                <div className="text-center py-6 text-muted-foreground text-sm">
+                <div
+                  data-content-role="status"
+                  data-content-label="no variables"
+                  className="text-center py-6 text-muted-foreground text-sm"
+                >
                   No custom variables defined
                 </div>
               ) : (

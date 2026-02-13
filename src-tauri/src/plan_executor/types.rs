@@ -17,8 +17,6 @@ pub struct PlanConfig {
     pub next_steps_sweep: bool,
     /// Maximum number of sweep iterations before stopping (default 5).
     pub max_next_steps_iterations: u32,
-    /// Optional timeout in seconds for each AI session.
-    pub timeout_seconds: Option<u64>,
     /// Unique execution ID for this plan run.
     pub execution_id: String,
 }

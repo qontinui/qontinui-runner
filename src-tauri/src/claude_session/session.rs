@@ -384,6 +384,14 @@ impl ClaudeSession {
                                         {
                                             warn!("Failed to emit {} event: {}", event_name, e);
                                         }
+                                        // Also broadcast to WebSocket clients
+                                        if let Ok(json) = serde_json::to_value(&finding) {
+                                            crate::event_system::broadcast_ws_notification(
+                                                &app_handle_findings,
+                                                event_name,
+                                                &json,
+                                            );
+                                        }
                                     }));
 
                                 let finding_msg = if is_resolved {
@@ -495,6 +503,12 @@ impl ClaudeSession {
                                         {
                                             warn!("Failed to emit step_progress event: {}", e);
                                         }
+                                        // Also broadcast to WebSocket clients (channel: "step-progress")
+                                        crate::event_system::broadcast_ws_notification(
+                                            &app_handle_progress,
+                                            "step-progress",
+                                            &progress_event,
+                                        );
                                     }));
 
                                 let progress_msg = if let Some(total) = parsed_progress.total {

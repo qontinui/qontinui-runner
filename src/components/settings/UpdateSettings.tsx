@@ -103,10 +103,20 @@ export function UpdateSettings({ onLog }: UpdateSettingsProps) {
 
         <div className="flex items-center justify-between">
           <div className="space-y-1">
-            <div className="text-xl font-bold text-primary">
+            <div
+              data-content-role="metric"
+              data-content-label="current version"
+              className="text-xl font-bold text-primary"
+            >
               v{updateInfo?.current_version || "0.1.0"}
             </div>
-            <div className="text-xs text-muted-foreground">Last checked: {formatLastChecked()}</div>
+            <div
+              data-content-role="body-text"
+              data-content-label="last checked time"
+              className="text-xs text-muted-foreground"
+            >
+              Last checked: {formatLastChecked()}
+            </div>
           </div>
 
           <button
@@ -138,8 +148,18 @@ export function UpdateSettings({ onLog }: UpdateSettingsProps) {
             <div className="flex items-start gap-2 p-3 bg-muted/30 rounded-lg">
               <Info className="w-4 h-4 text-muted-foreground mt-0.5 shrink-0" />
               <div>
-                <div className="text-sm font-medium">Development Mode</div>
-                <div className="text-xs text-muted-foreground">
+                <div
+                  data-content-role="status"
+                  data-content-label="development mode"
+                  className="text-sm font-medium"
+                >
+                  Development Mode
+                </div>
+                <div
+                  data-content-role="description"
+                  data-content-label="development mode info"
+                  className="text-xs text-muted-foreground"
+                >
                   Update checking is disabled in development builds. Build a release version to
                   enable automatic updates.
                 </div>
@@ -150,8 +170,18 @@ export function UpdateSettings({ onLog }: UpdateSettingsProps) {
               <div className="flex items-start gap-2 p-3 bg-primary/10 rounded-lg">
                 <Download className="w-4 h-4 text-primary mt-0.5 shrink-0" />
                 <div className="flex-1">
-                  <div className="text-sm font-medium text-primary">Update Available</div>
-                  <div className="text-xs text-muted-foreground mt-1">
+                  <div
+                    data-content-role="status"
+                    data-content-label="update available"
+                    className="text-sm font-medium text-primary"
+                  >
+                    Update Available
+                  </div>
+                  <div
+                    data-content-role="description"
+                    data-content-label="update version info"
+                    className="text-xs text-muted-foreground mt-1"
+                  >
                     Version <span className="font-semibold">{updateInfo.version}</span> is available
                     for download.
                   </div>
@@ -160,7 +190,13 @@ export function UpdateSettings({ onLog }: UpdateSettingsProps) {
 
               {updateInfo.notes && (
                 <div className="space-y-2">
-                  <div className="text-sm font-medium">Release Notes:</div>
+                  <div
+                    data-content-role="label"
+                    data-content-label="release notes label"
+                    className="text-sm font-medium"
+                  >
+                    Release Notes:
+                  </div>
                   <div className="p-3 bg-muted/50 rounded-lg text-sm text-muted-foreground whitespace-pre-wrap max-h-48 overflow-y-auto">
                     {updateInfo.notes}
                   </div>
@@ -206,10 +242,18 @@ export function UpdateSettings({ onLog }: UpdateSettingsProps) {
                 className={`w-4 h-4 ${getStatusColors("success").icon} mt-0.5 shrink-0`}
               />
               <div>
-                <div className={`text-sm font-medium ${getStatusColors("success").text}`}>
+                <div
+                  data-content-role="status"
+                  data-content-label="up to date"
+                  className={`text-sm font-medium ${getStatusColors("success").text}`}
+                >
                   Up to Date
                 </div>
-                <div className="text-xs text-muted-foreground">
+                <div
+                  data-content-role="description"
+                  data-content-label="up to date info"
+                  className="text-xs text-muted-foreground"
+                >
                   You're running the latest version of Qontinui Runner.
                 </div>
               </div>
@@ -223,8 +267,20 @@ export function UpdateSettings({ onLog }: UpdateSettingsProps) {
         <div className="flex items-start gap-2 p-3 bg-destructive/10 rounded-lg">
           <AlertCircle className="w-4 h-4 text-destructive mt-0.5 shrink-0" />
           <div>
-            <div className="text-sm font-medium text-destructive">Update Error</div>
-            <div className="text-xs text-muted-foreground">{error}</div>
+            <div
+              data-content-role="status"
+              data-content-label="update error"
+              className="text-sm font-medium text-destructive"
+            >
+              Update Error
+            </div>
+            <div
+              data-content-role="body-text"
+              data-content-label="error message"
+              className="text-xs text-muted-foreground"
+            >
+              {error}
+            </div>
           </div>
         </div>
       )}

@@ -77,7 +77,7 @@ impl TreeEventEmitter {
             "node_type": "action",
             "name": action_name,
             "timestamp": timestamp,
-            "status": "pending",
+            "status": "running",
             "metadata": metadata,
         });
 
@@ -106,7 +106,7 @@ impl TreeEventEmitter {
             "node_type": "action",
             "name": action_name,
             "timestamp": end_timestamp,
-            "status": "completed",
+            "status": "success",
             "duration_ms": duration_ms,
             "metadata": result_metadata,
         });

@@ -9,7 +9,7 @@
  * (qontinui.state_machine.fingerprint_types.ElementFingerprint).
  */
 
-import type { ExternalElement, ElementFingerprint } from "../../hooks/useExternalUIBridge";
+import type { ExternalElement, ElementFingerprint } from "../../types/ui-bridge-types";
 
 // =============================================================================
 // Configuration

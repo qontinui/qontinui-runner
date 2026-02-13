@@ -23,7 +23,6 @@ import {
   ChevronDown,
   ChevronUp,
   AlertCircle,
-  Zap,
 } from "lucide-react";
 import type {
   WorkflowPhase,
@@ -55,7 +54,6 @@ import { McpServerToolPicker } from "./McpServerToolPicker";
 import { AiGenerateWorkflowModal } from "./AiGenerateWorkflowModal";
 import { GenerateFromStatesModal } from "./GenerateFromStatesModal";
 import { AddStateStepsModal } from "./AddStateStepsModal";
-import { LiveBrowserPanel } from "./LiveBrowserPanel";
 import { PromptTemplateEditor } from "./PromptTemplateEditor";
 import { ContextManagement } from "./ContextManagement";
 import { PageTutorialMenu } from "../tutorial";
@@ -306,7 +304,13 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
         <div className="p-3 bg-zinc-800/50 rounded-md space-y-3">
           <div className="flex items-center gap-2">
             <Sparkles className="w-4 h-4 text-purple-400" />
-            <span className="text-sm font-medium text-zinc-300">AI Provider Override</span>
+            <span
+              data-content-role="label"
+              data-content-label="AI provider override"
+              className="text-sm font-medium text-zinc-300"
+            >
+              AI Provider Override
+            </span>
             <div className="relative group">
               <Info className="w-3.5 h-3.5 text-zinc-500 hover:text-zinc-300 cursor-help" />
               <div className="absolute left-0 bottom-full mb-2 w-64 p-3 bg-zinc-800 border border-zinc-600 rounded-lg shadow-lg opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 z-50">
@@ -816,9 +820,6 @@ function WorkflowBuilderContent({
 
   // Add state steps modal state
   const [addStateStepsModalOpen, setAddStateStepsModalOpen] = useState(false);
-
-  // Live browser panel state
-  const [liveBrowserPanelOpen, setLiveBrowserPanelOpen] = useState(false);
 
   // Ref for focusing the name input when creating new workflow
   const nameInputRef = useRef<HTMLInputElement | null>(null);
@@ -1864,7 +1865,13 @@ function WorkflowBuilderContent({
         )}
         {(state.error || executionError) && !isExecuting && (
           <div className="px-4 py-2 bg-red-500/20 border-b border-red-500/30 text-red-400 text-sm flex items-center justify-between gap-2">
-            <span className="flex-1">{state.error || executionError}</span>
+            <span
+              data-content-role="status"
+              data-content-label="execution error"
+              className="flex-1"
+            >
+              {state.error || executionError}
+            </span>
             <button
               onClick={() => setExecutionError(null)}
               className="text-red-400 hover:text-red-300 p-1"
@@ -1911,18 +1918,7 @@ function WorkflowBuilderContent({
                   phase="verification"
                   steps={state.workflow.verification_steps}
                   onAddStep={handleAddStep}
-                  headerActions={
-                    <button
-                      onClick={() => setLiveBrowserPanelOpen(true)}
-                      className="flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium
-                                 text-cyan-400 hover:text-cyan-300 hover:bg-green-500/10 transition-colors"
-                      title="Add verification steps from a live browser page"
-                      data-ui-id="workflow-builder-verification-live-btn"
-                    >
-                      <Zap className="w-3.5 h-3.5" />
-                      Live
-                    </button>
-                  }
+                  headerActions={null}
                   renderStep={(step, index, isSelectionMode, isSelectedForDelete, onToggleSelect) =>
                     renderStep(
                       step,
@@ -2109,21 +2105,6 @@ function WorkflowBuilderContent({
               onStepsAdded={(result) => {
                 console.log(
                   "[WorkflowBuilder] Added steps from state:",
-                  result.verificationSteps.length,
-                  "verification,",
-                  result.agenticStep ? "1 agentic" : "0 agentic",
-                );
-              }}
-            />
-
-            {/* Live Browser Panel */}
-            <LiveBrowserPanel
-              isOpen={liveBrowserPanelOpen}
-              onClose={() => setLiveBrowserPanelOpen(false)}
-              addStep={addStep}
-              onStepsAdded={(result) => {
-                console.log(
-                  "[WorkflowBuilder] Added steps from live browser:",
                   result.verificationSteps.length,
                   "verification,",
                   result.agenticStep ? "1 agentic" : "0 agentic",

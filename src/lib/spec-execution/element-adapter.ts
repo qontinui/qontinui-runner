@@ -7,7 +7,7 @@
 
 import type { DiscoveredElement } from "@qontinui/ui-bridge/control";
 import type { RegisteredElement } from "ui-bridge";
-import type { ExternalElement } from "../../hooks/useExternalUIBridge";
+import type { ExternalElement } from "../../types/ui-bridge-types";
 
 /**
  * Convert a RegisteredElement from the runner's UI Bridge registry

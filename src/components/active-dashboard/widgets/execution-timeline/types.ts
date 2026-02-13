@@ -162,6 +162,8 @@ export interface PhaseGroup {
   isActive: boolean;
   /** Whether this phase is complete */
   isComplete: boolean;
+  /** Whether this phase hasn't started yet (defined in workflow but no steps executed) */
+  isUpcoming: boolean;
   /** Phase statistics */
   stats: {
     total: number;

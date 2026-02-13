@@ -383,7 +383,11 @@ export function McpServerToolPicker({
 
         {/* Footer */}
         <div className="flex items-center justify-between px-4 py-3 border-t border-neutral-700 bg-neutral-800/50">
-          <span className="text-sm text-muted-foreground">
+          <span
+            data-content-role="metric"
+            data-content-label="available item count"
+            className="text-sm text-muted-foreground"
+          >
             {mode === "servers"
               ? `${filteredServers.length} server${filteredServers.length !== 1 ? "s" : ""} available`
               : `${filteredTools.length} tool${filteredTools.length !== 1 ? "s" : ""} available`}

@@ -1303,6 +1303,28 @@ pub fn build_iteration_context_with_compression(
         context.push_str(
             "Use these APIs when you need more detail than provided in this context.\n\n",
         );
+
+        // Add UI Bridge vs Playwright guidance
+        context.push_str("### Verification Tool Priority\n\n");
+        context.push_str(
+            "**Prefer UI Bridge over Playwright** when the target app has the UI Bridge SDK integrated.\n\n",
+        );
+        context.push_str(
+            "- **UI Bridge SDK** (`/ui-bridge/sdk/*`): Use for SDK-integrated apps. Provides structured element data, \
+             fingerprinting, and state discovery. Connect via `POST /ui-bridge/sdk/connect`, then query elements \
+             via `GET /ui-bridge/sdk/elements` or `GET /ui-bridge/sdk/snapshot`.\n",
+        );
+        context.push_str(
+            "- **UI Bridge Control** (`/ui-bridge/control/*`): Use for the runner's own UI. \
+             Always available, no connection needed.\n",
+        );
+        context.push_str(
+            "- **Playwright**: Use only for non-SDK web apps, or when you need real browser behavior \
+             (cookies, network interception, navigation). Playwright is a fallback, not the default.\n\n",
+        );
+        context.push_str(
+            "Check `GET /ui-bridge/sdk/status` to see if an SDK app is already connected before resorting to Playwright.\n\n",
+        );
     }
 
     // Add unresolved findings
@@ -1457,6 +1479,66 @@ pub struct TaskKnowledgeExport {
     pub solutions: Vec<StoredTaskKnowledge>,
     pub verification_feedback: Vec<StoredTaskKnowledge>,
     pub latest_verification_results: Vec<StoredVerificationResult>,
+}
+
+// ============================================================================
+// Cross-task knowledge search (hybrid RAG)
+// ============================================================================
+
+/// Search for similar knowledge entries across ALL task runs.
+///
+/// Uses hybrid search: SQL filter by category + vector re-rank by content_embedding.
+/// Enables questions like "Has this root cause been identified before?"
+pub fn search_similar_knowledge(
+    conn: &rusqlite::Connection,
+    query_embedding: &[f32],
+    category: Option<&str>,
+    limit: usize,
+) -> Result<
+    Vec<
+        crate::database::hybrid_search::SearchResult<
+            crate::database::hybrid_search::KnowledgeResult,
+        >,
+    >,
+    String,
+> {
+    let config = crate::database::hybrid_search::HybridSearchConfig {
+        limit,
+        ..Default::default()
+    };
+
+    crate::database::hybrid_search::hybrid_search_knowledge(
+        conn,
+        query_embedding,
+        category,
+        &config,
+    )
+}
+
+/// Format cross-task knowledge results for injection into AI context.
+pub fn format_cross_task_knowledge(
+    results: &[crate::database::hybrid_search::SearchResult<
+        crate::database::hybrid_search::KnowledgeResult,
+    >],
+) -> String {
+    if results.is_empty() {
+        return String::new();
+    }
+
+    let mut output = String::from("## Related Knowledge from Previous Tasks\n\n");
+
+    for (i, result) in results.iter().take(5).enumerate() {
+        output.push_str(&format!(
+            "{}. **[{}]** (similarity: {:.0}%, task: {})\n   {}\n\n",
+            i + 1,
+            result.item.category,
+            result.similarity * 100.0,
+            &result.item.task_run_id[..8.min(result.item.task_run_id.len())],
+            result.item.content,
+        ));
+    }
+
+    output
 }
 
 // ============================================================================

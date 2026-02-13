@@ -17,6 +17,7 @@
 use super::flow::{Flow, FlowState, FlowStatus, FlowStep, ParallelMerge, StepType};
 use crate::ai_provider;
 use crate::ai_router::TaskContext;
+use crate::doctor::DoctorHandle;
 use crate::execution_core::builtin_tools::{execute_builtin_tool, BuiltinToolRegistry};
 use crate::execution_core::unified_tools::{execute_unified_tool, UnifiedToolRegistry};
 use crate::mcp_embedded::EmbeddedMcp;
@@ -186,6 +187,8 @@ pub struct FlowExecutor {
     config: FlowExecutorConfig,
     /// Event callback for emitting flow events.
     event_callback: Option<Arc<dyn Fn(FlowEvent) + Send + Sync>>,
+    /// Doctor health monitor handle for tracking AI processes.
+    doctor_handle: Option<DoctorHandle>,
 }
 
 impl FlowExecutor {
@@ -194,7 +197,14 @@ impl FlowExecutor {
         Self {
             config: FlowExecutorConfig::default(),
             event_callback: None,
+            doctor_handle: None,
         }
+    }
+
+    /// Set the doctor handle for health monitoring.
+    pub fn with_doctor_handle(mut self, doctor_handle: Option<DoctorHandle>) -> Self {
+        self.doctor_handle = doctor_handle;
+        self
     }
 
     /// Set configuration.
@@ -636,13 +646,15 @@ impl FlowExecutor {
         // Build task context for AI routing (helps select appropriate model)
         let task_context = TaskContext::from_prompt(&full_prompt);
 
-        // Get the timeout for this step
-        let timeout_secs = self.config.default_step_timeout_secs;
-
         // Call AI provider in a blocking task (ai_provider is synchronous)
         let prompt_clone = full_prompt.clone();
+        let doctor_handle_clone = self.doctor_handle.clone();
         let ai_result = tokio::task::spawn_blocking(move || {
-            ai_provider::run_prompt_with_routing(&prompt_clone, &task_context, timeout_secs)
+            ai_provider::run_prompt_with_routing(
+                &prompt_clone,
+                &task_context,
+                doctor_handle_clone.as_ref(),
+            )
         })
         .await;
 

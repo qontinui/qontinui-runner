@@ -262,8 +262,14 @@ export function PromptTemplateEditor({
               placeholder="Enter your prompt template..."
             />
             <div className="mt-1 flex items-center justify-between text-xs text-zinc-500">
-              <span>{editorContent.length} characters</span>
-              {hasChanges && <span className="text-amber-400">Unsaved changes</span>}
+              <span data-content-role="metric" data-content-label="template character count">
+                {editorContent.length} characters
+              </span>
+              {hasChanges && (
+                <span data-content-role="status" className="text-amber-400">
+                  Unsaved changes
+                </span>
+              )}
             </div>
           </div>
 

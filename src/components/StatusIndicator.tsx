@@ -15,6 +15,7 @@ import { listen } from "@tauri-apps/api/event";
 import type { BackgroundActivity, ActivityType } from "../hooks/useBackgroundActivities";
 import { getSeverityColors, getAccentColors } from "@/design-system";
 import { ErrorBadge } from "./error-monitor";
+import { DoctorHealthBadge } from "./doctor";
 
 const RUNNER_NAME_STORAGE_KEY = "qontinui-runner-name";
 const SELECTED_PROJECT_STORAGE_KEY = "qontinui-selected-project";
@@ -149,7 +150,10 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
       {/* Beta Badge */}
       {isBeta && (
         <div className="fixed top-4 right-4 z-50">
-          <span className="px-3 py-1 text-xs font-semibold bg-gradient-to-r from-purple-500 to-indigo-500 text-white rounded-full shadow-lg">
+          <span
+            data-content-role="badge"
+            className="px-3 py-1 text-xs font-semibold bg-gradient-to-r from-purple-500 to-indigo-500 text-white rounded-full shadow-lg"
+          >
             BETA
           </span>
         </div>
@@ -162,14 +166,26 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
           <div
             className={`w-2 h-2 rounded-full ${pythonStatus === "running" ? getAccentColors("green").bgSolid : "bg-muted-foreground"}`}
           />
-          <span className="text-sm font-bold text-foreground">Qontinui Runner</span>
+          <span
+            data-content-role="heading"
+            data-content-level="1"
+            className="text-sm font-bold text-foreground"
+          >
+            Qontinui Runner
+          </span>
         </div>
 
         {/* Runner Name */}
         {runnerName && (
           <div className="flex items-center gap-2 pr-3 border-r border-border-default">
             <Tag className="w-4 h-4 text-primary" />
-            <span className="text-sm font-medium text-foreground">{runnerName}</span>
+            <span
+              data-content-role="label"
+              data-content-label="runner name"
+              className="text-sm font-medium text-foreground"
+            >
+              {runnerName}
+            </span>
           </div>
         )}
 
@@ -177,7 +193,13 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
         {projectName && (
           <div className="flex items-center gap-2 pr-3 border-r border-border-default">
             <FolderKanban className={`w-4 h-4 ${getAccentColors("blue").text}`} />
-            <span className="text-sm font-medium text-foreground">{projectName}</span>
+            <span
+              data-content-role="label"
+              data-content-label="project name"
+              className="text-sm font-medium text-foreground"
+            >
+              {projectName}
+            </span>
           </div>
         )}
 
@@ -185,7 +207,11 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
           <div
             className={`w-2 h-2 rounded-full ${configLoaded ? getAccentColors("green").bgSolid : "bg-muted-foreground"}`}
           />
-          <span className="text-sm text-text-muted">
+          <span
+            data-content-role="status"
+            data-content-label="config status"
+            className="text-sm text-text-muted"
+          >
             Config: {configLoaded ? "Loaded" : "Not Loaded"}
           </span>
         </div>
@@ -196,6 +222,9 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
             window.dispatchEvent(new CustomEvent("navigate-to-error-monitor"));
           }}
         />
+
+        {/* Doctor Health Badge - Shows when AI processes appear stuck */}
+        <DoctorHealthBadge />
 
         {/* Active Processes Section - Only shown when there is activity */}
         {(executionActive || backgroundActivities.length > 0) && (
@@ -209,7 +238,11 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
                   title="GUI Automation workflow is running"
                 >
                   <Play className={`w-3.5 h-3.5 animate-pulse ${getAccentColors("blue").text}`} />
-                  <span className={`text-xs font-medium ${getAccentColors("blue").text}`}>
+                  <span
+                    data-content-role="status"
+                    data-content-label="GUI automation active"
+                    className={`text-xs font-medium ${getAccentColors("blue").text}`}
+                  >
                     GUI Automation
                   </span>
                 </div>
@@ -226,9 +259,20 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
                     title={activity.detail || activity.label}
                   >
                     <Icon className={`w-3.5 h-3.5 ${colorClass} animate-pulse`} />
-                    <span className="text-xs font-medium text-foreground">{activity.label}</span>
+                    <span
+                      data-content-role="status"
+                      className="text-xs font-medium text-foreground"
+                    >
+                      {activity.label}
+                    </span>
                     {activity.progress !== undefined && (
-                      <span className="text-xs text-text-muted">{activity.progress}%</span>
+                      <span
+                        data-content-role="metric"
+                        data-content-label={`${activity.label} progress`}
+                        className="text-xs text-text-muted"
+                      >
+                        {activity.progress}%
+                      </span>
                     )}
                   </div>
                 );

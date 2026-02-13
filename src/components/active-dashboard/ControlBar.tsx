@@ -122,6 +122,8 @@ function IterationBadge({
 
   return (
     <div
+      data-content-role="badge"
+      data-content-label={`Iteration ${iteration}/${maxIterations}`}
       className={`flex items-center gap-1.5 px-2 py-1 text-xs font-medium rounded-md ${colors.bg} ${colors.text} ${colors.border} border ${isRunning ? "animate-phase-glow" : ""}`}
       title={`Iteration ${iteration} of ${maxIterations}`}
     >
@@ -209,10 +211,16 @@ function WorkflowStageIndicator({
           return (
             <div key={stage} className="flex items-center">
               <div className={stageClasses} title={config.description}>
-                <span>{config.label}</span>
+                <span data-content-role="label" data-content-label={`${config.label} stage`}>
+                  {config.label}
+                </span>
                 {/* Step count badge */}
                 {showStepCounts && hasSteps && (
-                  <span className="text-[10px] opacity-80 font-mono">
+                  <span
+                    data-content-role="metric"
+                    data-content-label={`${config.label} step progress`}
+                    className="text-[10px] opacity-80 font-mono"
+                  >
                     {stepCounts.completed}/{stepCounts.total}
                   </span>
                 )}
@@ -249,6 +257,8 @@ function PlanPhaseIndicator({
     <div className="flex items-center gap-2">
       {displayIndex != null && totalPhases != null && (
         <div
+          data-content-role="badge"
+          data-content-label={`Plan phase ${displayIndex}/${totalPhases}${phaseName ? `: ${phaseName}` : ""}`}
           className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md ${colors.bg} ${colors.text} ${colors.border} border ${isRunning ? "animate-phase-glow" : ""}`}
           title={`Phase ${displayIndex} of ${totalPhases}${phaseName ? `: ${phaseName}` : ""}`}
         >
@@ -307,7 +317,13 @@ export function ControlBar({
       {/* Left: Task Name */}
       <div className="flex items-center gap-3 min-w-0 flex-1">
         {taskName && (
-          <span className="text-sm text-foreground font-medium truncate">{taskName}</span>
+          <span
+            data-content-role="label"
+            data-content-label="task name"
+            className="text-sm text-foreground font-medium truncate"
+          >
+            {taskName}
+          </span>
         )}
       </div>
 
@@ -336,13 +352,21 @@ export function ControlBar({
         )}
         {/* Show phase badge for non-orchestrated workflows - removed showPhaseBadge requirement */}
         {!isOrchestrated && phase !== "idle" && phaseInfo.label && (
-          <Badge className={`px-3 py-1 text-xs font-medium ${phaseStyle.className}`}>
+          <Badge
+            data-content-role="badge"
+            data-content-label="task phase"
+            className={`px-3 py-1 text-xs font-medium ${phaseStyle.className}`}
+          >
             {phaseInfo.label}
           </Badge>
         )}
         {/* Fallback: Show "Running" badge when task is running but no specific phase detected */}
         {!isOrchestrated && isRunning && phase === "idle" && (
-          <Badge className="px-3 py-1 text-xs font-medium bg-blue-500/10 text-blue-600 border border-blue-500/30">
+          <Badge
+            data-content-role="badge"
+            data-content-label="execution status"
+            className="px-3 py-1 text-xs font-medium bg-blue-500/10 text-blue-600 border border-blue-500/30"
+          >
             RUNNING
           </Badge>
         )}

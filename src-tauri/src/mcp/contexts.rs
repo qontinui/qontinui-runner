@@ -46,6 +46,16 @@ pub struct DuplicateContextRequest {
     pub target_scope: String,
 }
 
+/// Request body for creating a context from a file path
+#[derive(Debug, Deserialize)]
+pub struct CreateContextFromFileRequest {
+    pub file_path: String,
+    pub name: Option<String>,
+    pub category: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -822,6 +832,60 @@ async fn sync_context_to_web(project_id: &str, ctx: &context::Context) -> Result
     Ok(())
 }
 
+/// POST /contexts/{scope}/from-file - Create a context by reading a file
+pub async fn create_context_from_file_handler(
+    axum::extract::Path(scope): axum::extract::Path<String>,
+    Json(req): Json<CreateContextFromFileRequest>,
+) -> Result<Json<ApiResponse<context::ContextWithMetadata>>, (StatusCode, Json<ApiResponse<()>>)> {
+    if scope != "user" && scope != "project" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!(
+                "File import only supported for 'user' or 'project' scope, got: {}",
+                scope
+            ))),
+        ));
+    }
+
+    // Currently only user scope is supported for file import
+    if scope != "user" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(
+                "File import is currently only supported for 'user' scope",
+            )),
+        ));
+    }
+
+    match context::create_context_from_file(&req.file_path, req.name, req.category, req.tags) {
+        Ok(ctx) => {
+            info!(
+                "Created context from file '{}': {}",
+                req.file_path, ctx.name
+            );
+            let library = context::load_user_context_library();
+            Ok(Json(ApiResponse::success(context_to_with_metadata(
+                ctx,
+                context::ContextScope::User,
+                &library,
+            ))))
+        }
+        Err(e) => {
+            error!(
+                "Failed to create context from file '{}': {}",
+                req.file_path, e
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!(
+                    "Failed to create context from file: {}",
+                    e
+                ))),
+            ))
+        }
+    }
+}
+
 /// Create routes for this module.
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::{get, post, put};
@@ -829,6 +893,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/contexts", get(list_all_contexts))
         .route("/contexts/categories", get(list_context_categories))
         .route("/contexts/tags", get(list_context_tags))
+        .route(
+            "/contexts/:scope/from-file",
+            post(create_context_from_file_handler),
+        )
         .route("/contexts/:scope", post(create_context_handler))
         .route(
             "/contexts/:scope/:id",

@@ -18,7 +18,6 @@
 //!     ],
 //!     next_steps_sweep: true,
 //!     max_next_steps_iterations: 5,
-//!     timeout_seconds: None,
 //!     execution_id: "plan-123".to_string(),
 //! };
 //!

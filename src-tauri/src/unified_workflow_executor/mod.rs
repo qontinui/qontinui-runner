@@ -29,7 +29,6 @@
 //!
 //! let config = LoopConfig {
 //!     max_iterations: 5,
-//!     timeout_seconds: None, // No timeout (default) - user can stop manually
 //!     base_prompt: "Fix the issues".to_string(),
 //!     workflow_name: "My Workflow".to_string(),
 //!     workflow_id: "wf-123".to_string(),
@@ -37,6 +36,8 @@
 //!     targeted_error_ids: vec![],
 //!     starting_iteration: 0,
 //!     run_agentic_first: false, // Set to true for error-fix workflows
+//!     artifact_dir: None, // Auto-created if None
+//!     is_dev_mode: false,
 //! };
 //!
 //! let result = controller.run(
@@ -70,6 +71,7 @@ use tracing::{error, info};
 // Core types used by external code
 pub use loop_controller::{
     // Phase-aware versions (preferred for unified workflows)
+    convert_all_json_steps_with_phase,
     convert_json_steps_with_phase,
     extract_prompt_steps_with_phase,
     extract_workflow_id_from_task_id,

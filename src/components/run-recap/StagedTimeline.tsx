@@ -104,9 +104,19 @@ function StepItem({ step, onClick }: StepItemProps) {
       {/* Content */}
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">
-          <span className="font-medium text-sm truncate">{step.name}</span>
+          <span
+            data-content-role="label"
+            data-content-label={step.name}
+            className="font-medium text-sm truncate"
+          >
+            {step.name}
+          </span>
           {step.duration_ms !== undefined && (
-            <span className="text-xs text-muted-foreground">
+            <span
+              data-content-role="metric"
+              data-content-label={`${step.name} duration`}
+              className="text-xs text-muted-foreground"
+            >
               ({formatDuration(step.duration_ms)})
             </span>
           )}
@@ -163,25 +173,37 @@ function StageSection({ stage, onAiStepClick }: StageSectionProps) {
           <div className={`p-1.5 rounded ${colorClasses.bg}`}>
             <Icon className={`w-4 h-4 ${colorClasses.text}`} />
           </div>
-          <span className="font-medium">{stage.display_name}</span>
+          <span role="heading" aria-level={3} className="font-medium">
+            {stage.display_name}
+          </span>
           {getStatusIcon(stage.status)}
           {/* Only show iteration badge for stages that loop (verification/agentic) */}
           {(stage.stage === "verification" || stage.stage === "agentic") &&
             stage.iteration !== undefined && (
               <span
                 data-ui-id={`recap-iteration-${stage.stage}-${stage.iteration}`}
+                data-content-role="badge"
+                data-content-label={`${stage.display_name} iteration`}
                 className="text-xs text-muted-foreground bg-muted px-1.5 py-0.5 rounded"
               >
                 Iteration {stage.iteration}
               </span>
             )}
-          <span className="text-sm text-muted-foreground">
+          <span
+            data-content-role="label"
+            data-content-label={`${stage.display_name} step count`}
+            className="text-sm text-muted-foreground"
+          >
             ({stage.steps.length} {stage.steps.length === 1 ? "step" : "steps"})
           </span>
         </div>
         <div className="flex items-center gap-2">
           {stage.duration_ms !== undefined && (
-            <span className="text-sm text-muted-foreground">
+            <span
+              data-content-role="metric"
+              data-content-label={`${stage.display_name} duration`}
+              className="text-sm text-muted-foreground"
+            >
               {formatDuration(stage.duration_ms)}
             </span>
           )}
@@ -195,19 +217,20 @@ function StageSection({ stage, onAiStepClick }: StageSectionProps) {
       </button>
 
       {expanded && stage.steps.length > 0 && (
-        <div className="border-t border-border p-2 space-y-1">
+        <ul role="list" className="list-none border-t border-border p-2 space-y-1">
           {stage.steps.map((step, i) => (
-            <StepItem
-              key={`${step.name}-${i}`}
-              step={step}
-              onClick={
-                step.step_type === "ai_session" && onAiStepClick
-                  ? () => onAiStepClick(stage.stage, stage.iteration)
-                  : undefined
-              }
-            />
+            <li key={`${step.name}-${i}`}>
+              <StepItem
+                step={step}
+                onClick={
+                  step.step_type === "ai_session" && onAiStepClick
+                    ? () => onAiStepClick(stage.stage, stage.iteration)
+                    : undefined
+                }
+              />
+            </li>
           ))}
-        </div>
+        </ul>
       )}
     </div>
   );
@@ -218,43 +241,9 @@ interface StagedTimelineProps {
   onAiStepClick?: (phase: string, iteration?: number) => void;
 }
 
-// Default stage order and labels
-// Note: verification comes before agentic because the typical flow is:
-// setup -> verification (check initial state) -> agentic (fix issues) -> verification (re-check) -> ...
-const DEFAULT_STAGES: WorkflowStage[] = ["setup", "verification", "agentic", "completion"];
-const STAGE_LABELS: Record<WorkflowStage, string> = {
-  setup: "Setup",
-  agentic: "Agentic",
-  verification: "Verification",
-  completion: "Completion",
-};
-
 export function StagedTimeline({ stages, onAiStepClick }: StagedTimelineProps) {
-  // Build a map of existing stages for quick lookup
-  const stageMap = new Map<string, StageRecap>();
-  stages.forEach((s) => {
-    const key = `${s.stage}-${s.iteration ?? 0}`;
-    stageMap.set(key, s);
-  });
-
-  // Collect all stages - start with actual data from backend
+  // Only show phases that actually ran — the backend already returns only those
   const allStages: StageRecap[] = [...stages];
-
-  // Add placeholder stages for any missing iteration 0 stages
-  // (only if no stages exist for that phase at all)
-  DEFAULT_STAGES.forEach((stageName) => {
-    const hasAnyIterationOfStage = stages.some((s) => s.stage === stageName);
-    if (!hasAnyIterationOfStage) {
-      // Create a placeholder stage only if this phase never ran
-      allStages.push({
-        stage: stageName,
-        display_name: STAGE_LABELS[stageName],
-        status: "pending",
-        steps: [],
-        iteration: 0,
-      });
-    }
-  });
 
   // Sort stages by phase order (matching backend logic in stage_builder.rs).
   // Phase order is the primary sort; timestamps are only used within the same phase+iteration.
@@ -298,7 +287,11 @@ export function StagedTimeline({ stages, onAiStepClick }: StagedTimelineProps) {
   }
 
   return (
-    <div data-ui-id="recap-staged-timeline" className="space-y-3">
+    <section
+      data-ui-id="recap-staged-timeline"
+      aria-label="Workflow timeline"
+      className="space-y-3"
+    >
       {allStages.map((stage, index) => (
         <StageSection
           key={`${stage.stage}-${stage.iteration ?? index}`}
@@ -306,7 +299,7 @@ export function StagedTimeline({ stages, onAiStepClick }: StagedTimelineProps) {
           onAiStepClick={onAiStepClick}
         />
       ))}
-    </div>
+    </section>
   );
 }
 

@@ -401,6 +401,62 @@ pub fn create_user_context(
     Ok(created)
 }
 
+/// Create a user context from a file path.
+///
+/// Reads the file content and creates a context with auto-detected name and category.
+/// Filenames containing "claude" or "gemini" are categorized as "ai-instructions".
+pub fn create_context_from_file(
+    file_path: &str,
+    name: Option<String>,
+    category: Option<String>,
+    tags: Vec<String>,
+) -> Result<Context, String> {
+    let path = std::path::Path::new(file_path);
+
+    // Read file content
+    let content = fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read file '{}': {}", file_path, e))?;
+
+    if content.is_empty() {
+        return Err(format!("File '{}' is empty", file_path));
+    }
+
+    // Derive name from filename if not provided
+    let derived_name = name.unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("imported-context")
+            .to_string()
+    });
+
+    // Auto-detect category from filename
+    let filename_lower = path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let derived_category = category.or_else(|| {
+        if filename_lower.contains("claude") || filename_lower.contains("gemini") {
+            Some("ai-instructions".to_string())
+        } else {
+            None
+        }
+    });
+
+    // Build auto-include with filename-based task mentions
+    let stem_lower = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let auto_include = Some(ContextAutoInclude {
+        task_mentions: Some(vec![stem_lower]),
+        ..Default::default()
+    });
+
+    create_user_context(derived_name, content, derived_category, tags, auto_include)
+}
+
 /// Update an existing user context
 pub fn update_user_context(
     id: &str,

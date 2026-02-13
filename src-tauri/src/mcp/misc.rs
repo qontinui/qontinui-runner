@@ -3342,6 +3342,156 @@ Capture a screenshot from a specified monitor.
 "#,
     );
 
+    // SDK Tools - for interacting with UI Bridge SDK-integrated apps
+    context.push_str(
+        r#"
+## Available SDK Tools (UI Bridge)
+
+The following tools interact with SDK-integrated web apps via the runner's HTTP API.
+Use these to inspect, interact with, and test web applications that have the UI Bridge SDK installed.
+
+**Content Discovery:** These tools discover both **interactive elements** (buttons, inputs, links)
+and **content elements** (headings, paragraphs, labels, metrics, badges, status indicators).
+Content elements have a `contentType` field (e.g., `heading`, `paragraph`, `label`, `metric-value`,
+`badge`, `status-message`, `description-text`, `list-item`, `table-cell`, `code-block`, `nav-text`)
+and may have a `contentRole` from `data-content-role` attributes (e.g., `heading`, `body-text`,
+`label`, `metric`, `badge`, `status`, `description`).
+
+**Content filtering** (supported by element/snapshot tools):
+- `includeContent` (bool) — include content elements (default: true)
+- `contentOnly` (bool) — return only content elements, excluding interactive ones
+- `contentRole` (string) — filter to a specific content role
+
+This lets you read page text, find specific metrics/labels/statuses, and verify content changes without screenshots.
+
+### Connection
+
+#### sdk_connect
+Connect to a UI Bridge SDK app for element inspection and interaction.
+**Usage:**
+```json
+{"tool": "mcp__qontinui__sdk_connect", "url": "http://localhost:3001"}
+```
+
+#### sdk_status
+Check SDK app connection status. Returns whether connected and app details.
+**Usage:**
+```json
+{"tool": "mcp__qontinui__sdk_status"}
+```
+
+### Element Inspection
+
+#### sdk_elements
+List all registered UI elements (interactive and content) in the connected SDK app.
+Returns element IDs, types, labels, state, and contentType/contentRole for content elements.
+Accepts optional `includeContent`, `contentOnly`, and `contentRole` filters.
+**Usage:**
+```json
+{"tool": "mcp__qontinui__sdk_elements"}
+{"tool": "mcp__qontinui__sdk_elements", "contentOnly": true, "contentRole": "metric"}
+```
+
+#### sdk_snapshot
+Get a complete UI snapshot with all elements (interactive + content) and their current state.
+Includes visibility, bounds, text content, available actions, and contentType/contentRole for content elements.
+Accepts optional `includeContent`, `contentOnly`, and `contentRole` filters.
+**Usage:**
+```json
+{"tool": "mcp__qontinui__sdk_snapshot"}
+{"tool": "mcp__qontinui__sdk_snapshot", "contentOnly": true}
+```
+
+### AI-Powered Interaction
+
+#### sdk_ai_search
+Search for elements (interactive or content) by natural language description.
+**Usage:**
+```json
+{"tool": "mcp__qontinui__sdk_ai_search", "text": "Submit button"}
+{"tool": "mcp__qontinui__sdk_ai_search", "text": "total revenue metric"}
+```
+
+#### sdk_ai_execute
+Execute an action by natural language instruction.
+**Usage:**
+```json
+{"tool": "mcp__qontinui__sdk_ai_execute", "instruction": "click the Submit button"}
+```
+
+#### sdk_ai_assert
+Assert element state using natural language.
+**Usage:**
+```json
+{"tool": "mcp__qontinui__sdk_ai_assert", "text": "error message", "state": "hidden"}
+```
+
+#### sdk_page_summary
+Get an AI-friendly summary of the current page, including layout, navigation, and key elements.
+**Usage:**
+```json
+{"tool": "mcp__qontinui__sdk_page_summary"}
+```
+
+### Screenshots
+
+#### sdk_screenshot
+Capture a screenshot of the monitor where the SDK app is running.
+**Usage:**
+```json
+{"tool": "mcp__qontinui__sdk_screenshot"}
+```
+
+### Per-App Analysis
+
+These tools analyze the currently connected SDK app's page structure and data.
+They work on a single app — use them independently or as building blocks.
+
+#### sdk_analyze_data
+Extract labeled data values from the page. Each value is classified by type
+(text, number, currency, date, email, url, phone, percentage, boolean) and
+normalized for comparison.
+**Usage:**
+```json
+{"tool": "mcp__qontinui__sdk_analyze_data"}
+```
+
+#### sdk_analyze_regions
+Segment the page into semantic regions: header, navigation, sidebar,
+main-content, footer, form, table, card, modal, toolbar. Each region
+includes its bounding box and contained element IDs.
+**Usage:**
+```json
+{"tool": "mcp__qontinui__sdk_analyze_regions"}
+```
+
+#### sdk_analyze_structured_data
+Detect and extract tables (with column headers and row data) and lists
+(with field schemas and items) from the page based on spatial layout patterns.
+**Usage:**
+```json
+{"tool": "mcp__qontinui__sdk_analyze_structured_data"}
+```
+
+### Cross-App Comparison
+
+#### sdk_cross_app_compare
+Compare two SDK-integrated apps by connecting to each, capturing semantic
+snapshots (including content elements), and running a full analysis. Returns
+scores (0-1) for data completeness, format alignment, presentation alignment,
+navigation parity, action parity, and an overall score. Also returns a
+prioritized issue list. Content elements enable text-level comparison across apps.
+
+Set `include_components` to true to also fetch and compare registered
+components between the two apps.
+
+**Usage:**
+```json
+{"tool": "mcp__qontinui__sdk_cross_app_compare", "source_url": "http://localhost:1420", "target_url": "http://localhost:3001", "include_components": true}
+```
+"#,
+    );
+
     context
 }
 

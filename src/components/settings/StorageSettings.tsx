@@ -152,13 +152,29 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
 
         <div className="space-y-4">
           <div>
-            <div className="text-xs font-medium mb-2">Storage Usage</div>
+            <div
+              data-content-role="heading"
+              data-content-label="storage usage heading"
+              className="text-xs font-medium mb-2"
+            >
+              Storage Usage
+            </div>
 
             {/* Screenshots */}
             <div className="space-y-2 mb-4">
               <div className="flex items-center justify-between text-sm">
-                <span className="text-muted-foreground">Screenshots</span>
-                <span className="font-medium">
+                <span
+                  data-content-role="label"
+                  data-content-label="screenshots label"
+                  className="text-muted-foreground"
+                >
+                  Screenshots
+                </span>
+                <span
+                  data-content-role="metric"
+                  data-content-label="screenshots usage"
+                  className="font-medium"
+                >
                   {storageUsage.screenshots.toFixed(2)} MB / {storagePaths.max_screenshot_mb} MB (
                   {storageUsage.screenshotCount} files)
                 </span>
@@ -179,8 +195,18 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
             {/* Videos */}
             <div className="space-y-2">
               <div className="flex items-center justify-between text-sm">
-                <span className="text-muted-foreground">Videos</span>
-                <span className="font-medium">
+                <span
+                  data-content-role="label"
+                  data-content-label="videos label"
+                  className="text-muted-foreground"
+                >
+                  Videos
+                </span>
+                <span
+                  data-content-role="metric"
+                  data-content-label="videos usage"
+                  className="font-medium"
+                >
                   {storageUsage.videos.toFixed(2)} MB / {storagePaths.max_video_mb} MB (
                   {storageUsage.videoCount} files)
                 </span>
@@ -201,7 +227,13 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
 
           {/* Storage Paths */}
           <div className="space-y-2">
-            <div className="text-xs font-medium">Storage Locations</div>
+            <div
+              data-content-role="heading"
+              data-content-label="storage locations heading"
+              className="text-xs font-medium"
+            >
+              Storage Locations
+            </div>
             <div className="space-y-2 text-xs">
               <div className="flex items-center justify-between">
                 <span className="text-muted-foreground">Screenshots:</span>
@@ -240,7 +272,13 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
 
           {/* Cleanup Actions */}
           <div className="space-y-2" data-ui-id="settings-storage-cleanup-section">
-            <div className="text-xs font-medium">Storage Cleanup</div>
+            <div
+              data-content-role="heading"
+              data-content-label="storage cleanup heading"
+              className="text-xs font-medium"
+            >
+              Storage Cleanup
+            </div>
             <div className="flex flex-wrap gap-2">
               <button
                 onClick={() => handleDeleteOldSessions("screenshots", 30)}

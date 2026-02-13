@@ -124,9 +124,21 @@ export function AuthConnectionSettings({
               <User className="w-4 h-4 text-primary" />
             </div>
             <div>
-              <div className="text-sm font-medium">{auth.authStatus.user.email}</div>
+              <div
+                data-content-role="label"
+                data-content-label="user email"
+                className="text-sm font-medium"
+              >
+                {auth.authStatus.user.email}
+              </div>
               {auth.authStatus.user.name && (
-                <div className="text-xs text-muted-foreground">{auth.authStatus.user.name}</div>
+                <div
+                  data-content-role="label"
+                  data-content-label="user name"
+                  className="text-xs text-muted-foreground"
+                >
+                  {auth.authStatus.user.name}
+                </div>
               )}
             </div>
           </div>
@@ -257,6 +269,8 @@ export function AuthConnectionSettings({
           <h4 className="font-medium text-sm">Connection Status</h4>
           {connected && (
             <span
+              data-content-role="status"
+              data-content-label="connection connected"
               className={`flex items-center gap-1.5 ${getStatusColors("success").text} text-xs`}
             >
               <span
@@ -270,18 +284,48 @@ export function AuthConnectionSettings({
         {connectionInfo && (
           <div className="space-y-1.5 text-xs p-3 bg-muted/30 rounded-lg">
             <div className="flex justify-between">
-              <span className="text-muted-foreground">Device ID:</span>
-              <span className="font-mono">{connectionInfo.device_id.slice(0, 8)}...</span>
+              <span
+                data-content-role="label"
+                data-content-label="device id label"
+                className="text-muted-foreground"
+              >
+                Device ID:
+              </span>
+              <span
+                data-content-role="body-text"
+                data-content-label="device id value"
+                className="font-mono"
+              >
+                {connectionInfo.device_id.slice(0, 8)}...
+              </span>
             </div>
             <div className="flex justify-between">
-              <span className="text-muted-foreground">WebSocket URL:</span>
-              <span className="font-mono text-[10px]">
+              <span
+                data-content-role="label"
+                data-content-label="websocket url label"
+                className="text-muted-foreground"
+              >
+                WebSocket URL:
+              </span>
+              <span
+                data-content-role="body-text"
+                data-content-label="websocket url value"
+                className="font-mono text-[10px]"
+              >
                 {connectionInfo.websocket_url.slice(0, 40)}...
               </span>
             </div>
             <div className="flex justify-between">
-              <span className="text-muted-foreground">WebSocket:</span>
               <span
+                data-content-role="label"
+                data-content-label="websocket status label"
+                className="text-muted-foreground"
+              >
+                WebSocket:
+              </span>
+              <span
+                data-content-role="status"
+                data-content-label="websocket status"
                 className={
                   connected ? getStatusColors("success").text : getAccentColors("orange").text
                 }

@@ -1,12 +1,11 @@
 /**
  * SpecDiscoveryTab.tsx
  *
- * Connects to live browser pages/apps via UI Bridge to discover specs
+ * Connects to live SDK-integrated apps via UI Bridge to discover specs
  * and generate verification workflows.
  *
  * Key features:
- *   - Real-time connection to browser tabs
- *   - Mobile device support (via ADB)
+ *   - Real-time SDK connection to apps
  *   - Spec discovery from connected pages
  *   - Spec group selection for workflow generation
  *   - Workflow generation, save, and apply
@@ -15,8 +14,6 @@
 
 import { useState, useCallback, useEffect, useMemo } from "react";
 import {
-  Globe,
-  Smartphone,
   RefreshCw,
   Play,
   Zap,
@@ -35,12 +32,16 @@ import {
   MessageSquare,
   ShieldCheck,
   FileCode,
+  Plug,
+  PlugZap,
+  Wifi,
+  WifiOff,
 } from "lucide-react";
-import { useLiveBrowser, type BrowserTab, type MobileDevice } from "@/hooks/useLiveBrowser";
 import { SearchComparisonPanel } from "@/components/ui-bridge/SearchComparisonPanel";
 import { ElementDescriptionPanel } from "@/components/ui-bridge/ElementDescriptionPanel";
 import { NaturalLanguagePanel } from "@/components/ui-bridge/NaturalLanguagePanel";
-import type { ExternalElement, PageContext, CommandResult } from "@/hooks/useExternalUIBridge";
+import { useSdkUIBridge } from "@/hooks/useSdkUIBridge";
+import type { PageContext } from "@/types/ui-bridge-types";
 import { cn } from "@/lib/utils";
 import { buildSpecWorkflow, type SpecConfig, type SpecGroup } from "@/lib/workflow-builder";
 import type { UnifiedWorkflow } from "@/types/unified-workflow";
@@ -51,21 +52,6 @@ const API_BASE = "http://127.0.0.1:9876";
 // =============================================================================
 // Types
 // =============================================================================
-
-interface UIBridgeContext {
-  url?: string;
-  title?: string;
-  elements?: Array<{
-    id: string;
-    tagName: string;
-    type: string;
-    text?: string;
-    label?: string;
-    visible: boolean;
-    enabled: boolean;
-  }>;
-  pageSnapshot?: string;
-}
 
 /** Discovered spec from a connected page */
 interface DiscoveredSpec {
@@ -81,13 +67,6 @@ interface SpecDiscoveryTabProps {
 
 type LeftPanelTab = "search" | "describe" | "nl";
 type RightPanelTab = "definition" | "output";
-
-interface Target {
-  id: string;
-  type: "browser" | "mobile";
-  name: string;
-  connected: boolean;
-}
 
 // Storage key for persisting state
 const STORAGE_KEY = "spec-discovery-state";
@@ -129,9 +108,22 @@ export function SpecDiscoveryTab({
   const [leftPanelTab, setLeftPanelTab] = useState<LeftPanelTab>("search");
   const [rightPanelTab, setRightPanelTab] = useState<RightPanelTab>("definition");
 
-  // Target selection state
-  const [selectedTabId, setSelectedTabId] = useState<number | null>(null);
-  const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(null);
+  // SDK UI Bridge connection
+  const {
+    connectionStatus,
+    connectedApp,
+    elements: sdkElements,
+    selectedElementId,
+    selectedElement,
+    selectElement,
+    highlightElement,
+    executeAction,
+    isLoadingElements,
+    connect: sdkConnect,
+    disconnect: sdkDisconnect,
+    error: sdkError,
+  } = useSdkUIBridge();
+  const [sdkUrlInput, setSdkUrlInput] = useState("");
 
   // Instructions state (with persistence)
   const [instructions, setInstructions] = useState(persistedState.instructions ?? "");
@@ -170,9 +162,6 @@ export function SpecDiscoveryTab({
   });
   const [generationError, setGenerationError] = useState<string | null>(null);
 
-  // UI Bridge context
-  const [_uiBridgeContext, setUiBridgeContext] = useState<UIBridgeContext | null>(null);
-
   // Persist state to localStorage when values change
   useEffect(() => {
     const stateToSave: PersistedState = {
@@ -188,179 +177,54 @@ export function SpecDiscoveryTab({
     }
   }, [instructions, expectedResults, agenticInstructions, discoveredSpecs]);
 
-  // Use the live browser hook
-  const {
-    browserTabs,
-    mobileDevices,
-    isLoadingTargets,
-    connectionStatus,
-    connectedTarget,
-    elements,
-    selectedElementId,
-    error: _connectionError,
-    refreshTargets,
-    connectToTab,
-    connectToMobile,
-    disconnect: _disconnect,
-    refreshElements: _refreshElements,
-    selectElement,
-    highlightElement,
-    executeAction,
-  } = useLiveBrowser();
-
-  // Convert elements to ExternalElement format for UI Bridge panels
-  const externalElements = useMemo(() => elements as unknown as ExternalElement[], [elements]);
-
-  // Get selected element for UI Bridge panels
-  const selectedElement = useMemo(
-    () =>
-      selectedElementId
-        ? (externalElements.find((el) => el.id === selectedElementId) ?? null)
-        : null,
-    [externalElements, selectedElementId],
-  );
-
   // Create page context for ElementDescriptionPanel
   const pageContext = useMemo((): PageContext | null => {
-    if (!connectedTarget || connectionStatus !== "connected") return null;
+    if (!connectedApp || connectionStatus !== "connected") return null;
     return {
-      url: connectedTarget.url || "",
-      title: connectedTarget.name || "",
-      elements: externalElements,
+      url: connectedApp.port ? `http://localhost:${connectedApp.port}` : "",
+      title: connectedApp.appName || "SDK App",
+      elements: sdkElements,
       timestamp: Date.now(),
     };
-  }, [connectedTarget, connectionStatus, externalElements]);
+  }, [connectedApp, connectionStatus, sdkElements]);
 
-  // Wrapper for executeAction that returns CommandResult
-  const handleExecuteActionWithResult = useCallback(
-    async (
-      elementId: string,
-      action: string,
-      params?: Record<string, unknown>,
-    ): Promise<CommandResult> => {
-      try {
-        await executeAction(elementId, action, params);
-        return { success: true };
-      } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : "Action failed",
-        };
-      }
-    },
-    [executeAction],
-  );
+  const isConnected = connectionStatus === "connected";
+  const isConnecting = connectionStatus === "connecting";
 
-  // Wrapper for selectElement that matches expected signature
-  const handleSelectElement = useCallback(
-    (elementId: string | null) => {
-      selectElement(elementId);
-    },
-    [selectElement],
-  );
-
-  // Refresh targets on mount
-  useEffect(() => {
-    refreshTargets();
-  }, [refreshTargets]);
-
-  // Build targets array for rendering
-  const targets: Target[] = [
-    ...browserTabs.map((tab) => ({
-      id: `browser-${tab.id}`,
-      type: "browser" as const,
-      name: tab.title || tab.url,
-      connected: selectedTabId === tab.id && connectionStatus === "connected",
-    })),
-    ...mobileDevices.map((device) => ({
-      id: `mobile-${device.device_id}`,
-      type: "mobile" as const,
-      name: device.model || device.device_id,
-      connected: selectedDeviceId === device.device_id && connectionStatus === "connected",
-    })),
-  ];
-
-  // Handle tab selection
-  const handleSelectTab = useCallback(
-    async (tab: BrowserTab) => {
-      setSelectedTabId(tab.id);
-      setSelectedDeviceId(null);
-      try {
-        await connectToTab(tab.id);
-      } catch (error) {
-        onLog?.("error", `Failed to connect to tab: ${error}`);
-      }
-    },
-    [connectToTab, onLog],
-  );
-
-  // Handle device selection
-  const handleSelectDevice = useCallback(
-    async (device: MobileDevice) => {
-      setSelectedDeviceId(device.device_id);
-      setSelectedTabId(null);
-      try {
-        await connectToMobile(device.device_id);
-      } catch (error) {
-        onLog?.("error", `Failed to connect to device: ${error}`);
-      }
-    },
-    [connectToMobile, onLog],
-  );
-
-  // Handle target click from unified list
-  const handleTargetClick = useCallback(
-    (target: Target) => {
-      if (target.type === "browser") {
-        const tabId = parseInt(target.id.replace("browser-", ""));
-        const tab = browserTabs.find((t) => t.id === tabId);
-        if (tab) handleSelectTab(tab);
-      } else {
-        const deviceId = target.id.replace("mobile-", "");
-        const device = mobileDevices.find((d) => d.device_id === deviceId);
-        if (device) handleSelectDevice(device);
-      }
-    },
-    [browserTabs, mobileDevices, handleSelectTab, handleSelectDevice],
-  );
-
-  // Auto-capture context when connected
-  useEffect(() => {
-    if (connectionStatus === "connected" && elements.length > 0) {
-      setUiBridgeContext({
-        url: connectedTarget?.url,
-        title: connectedTarget?.name,
-        elements: elements.map((el) => ({
-          id: el.id,
-          tagName: el.tagName,
-          type: el.type,
-          text: el.text,
-          label: el.label,
-          visible: el.visible,
-          enabled: el.enabled,
-        })),
-      });
+  // Handle SDK connect
+  const handleSdkConnect = useCallback(async () => {
+    if (!sdkUrlInput.trim()) return;
+    const ok = await sdkConnect(sdkUrlInput.trim());
+    if (ok) {
+      onLog?.("success", `Connected to ${sdkUrlInput.trim()}`);
     }
-  }, [connectionStatus, connectedTarget, elements]);
+  }, [sdkUrlInput, sdkConnect, onLog]);
+
+  // Handle SDK disconnect
+  const handleSdkDisconnect = useCallback(async () => {
+    await sdkDisconnect();
+    setSdkUrlInput("");
+    onLog?.("info", "Disconnected from SDK app");
+  }, [sdkDisconnect, onLog]);
 
   // =============================================================================
   // Spec Discovery Functions
   // =============================================================================
 
-  /** Discover specs from the connected page's SpecStore */
+  /** Discover specs from the connected app's SpecStore via SDK */
   const discoverSpecs = useCallback(async () => {
-    if (connectionStatus !== "connected") {
-      onLog?.("warning", "Not connected to a browser tab");
+    if (!isConnected) {
+      onLog?.("warning", "Not connected to an SDK app");
       return;
     }
 
     setIsDiscoveringSpecs(true);
 
     try {
-      const response = await fetch(`${API_BASE}/extension/command`, {
+      const response = await fetch(`${API_BASE}/ui-bridge/sdk/discover`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "getSpecs", params: {} }),
+        body: JSON.stringify({ action: "getSpecs" }),
       });
 
       if (!response.ok) {
@@ -424,7 +288,7 @@ export function SpecDiscoveryTab({
     } finally {
       setIsDiscoveringSpecs(false);
     }
-  }, [connectionStatus, onLog]);
+  }, [isConnected, onLog]);
 
   /** Generate a UnifiedWorkflow from discovered specs */
   const handleGenerateWorkflow = useCallback(() => {
@@ -455,14 +319,14 @@ export function SpecDiscoveryTab({
       agenticPrompt: agenticInstructions || undefined,
       maxIterations: 3,
       elementSource: "external",
-      pageUrl: connectedTarget?.url,
-      workflowName: `Spec Verification — ${connectedTarget?.name || "Live Page"}`,
+      pageUrl: connectedApp?.port ? `http://localhost:${connectedApp.port}` : undefined,
+      workflowName: `Spec Verification — ${connectedApp?.appName || "SDK App"}`,
     });
 
     setGeneratedWorkflow(workflow);
     setRightPanelTab("output");
     onLog?.("success", `Generated workflow with ${workflow.verification_steps.length} spec steps`);
-  }, [discoveredSpecs, selectedSpecGroupIds, agenticInstructions, connectedTarget, onLog]);
+  }, [discoveredSpecs, selectedSpecGroupIds, agenticInstructions, connectedApp, onLog]);
 
   /** Apply the generated workflow to the runner */
   const handleApplyWorkflow = useCallback(async () => {
@@ -540,51 +404,83 @@ export function SpecDiscoveryTab({
           Left Panel - Exploration
           ========================================= */}
       <div className="flex w-[480px] flex-col border-r border-border bg-surface-raised">
-        {/* Connections Section */}
+        {/* SDK Connection Section */}
         <div className="border-b border-border">
           <div className="flex items-center justify-between px-4 py-3">
-            <h2 className="text-sm font-semibold text-text-primary">Connections</h2>
-            <button
-              onClick={refreshTargets}
-              disabled={isLoadingTargets}
-              className="flex h-7 w-7 items-center justify-center rounded text-text-muted hover:text-text-primary hover:bg-surface-hover transition-colors"
-            >
-              <RefreshCw className={cn("h-4 w-4", isLoadingTargets && "animate-spin")} />
-            </button>
+            <h2 className="text-sm font-semibold text-text-primary">SDK Connection</h2>
+            {isConnected && (
+              <span className="flex items-center gap-1 text-xs text-brand-success">
+                <Wifi className="h-3 w-3" />
+                {connectedApp?.appName || "Connected"}
+              </span>
+            )}
+            {connectionStatus === "error" && (
+              <span className="flex items-center gap-1 text-xs text-error">
+                <WifiOff className="h-3 w-3" />
+                Error
+              </span>
+            )}
           </div>
-          <div className="px-2 pb-2">
-            <div className="mb-2 px-2 text-xs font-medium uppercase tracking-wider text-text-muted">
-              Targets
-            </div>
-            <div className="max-h-[180px] space-y-1 overflow-y-auto scrollbar-dark">
-              {targets.length > 0 ? (
-                targets.map((target) => (
-                  <TargetItem
-                    key={target.id}
-                    target={target}
-                    onClick={() => handleTargetClick(target)}
-                  />
-                ))
-              ) : isLoadingTargets ? (
-                <div className="flex items-center justify-center py-4 text-text-muted text-xs">
-                  <Loader2 className="h-4 w-4 animate-spin mr-2" />
-                  Scanning...
-                </div>
+          <div className="px-4 pb-3 space-y-2">
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                value={sdkUrlInput}
+                onChange={(e) => setSdkUrlInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !isConnected) handleSdkConnect();
+                }}
+                placeholder="http://localhost:3001"
+                disabled={isConnected}
+                className="flex-1 rounded-md border border-border bg-surface-canvas px-3 py-1.5 text-xs text-text-primary placeholder:text-text-muted focus:border-brand-primary/50 focus:outline-none disabled:opacity-60"
+              />
+              {isConnected ? (
+                <button
+                  onClick={handleSdkDisconnect}
+                  className="flex items-center gap-1 rounded-md bg-error/10 px-2.5 py-1.5 text-xs font-medium text-error hover:bg-error/20 transition-colors"
+                >
+                  <PlugZap className="h-3.5 w-3.5" />
+                  Disconnect
+                </button>
               ) : (
-                <div className="text-center py-4 text-text-muted text-xs">
-                  <p>No targets found.</p>
-                  <p className="text-[10px] mt-1">Connect a browser tab or mobile device</p>
-                </div>
+                <button
+                  onClick={handleSdkConnect}
+                  disabled={isConnecting || !sdkUrlInput.trim()}
+                  className="flex items-center gap-1 rounded-md bg-brand-primary px-2.5 py-1.5 text-xs font-medium text-white hover:bg-brand-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                >
+                  {isConnecting ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Plug className="h-3.5 w-3.5" />
+                  )}
+                  {isConnecting ? "..." : "Connect"}
+                </button>
               )}
             </div>
-          </div>
-          <div className="border-t border-border px-4 py-2">
+            {sdkError && (
+              <div className="flex items-center gap-1.5 text-xs text-error">
+                <AlertCircle className="h-3 w-3 flex-shrink-0" />
+                {sdkError}
+              </div>
+            )}
+            {isConnected && (
+              <div className="text-[10px] text-text-muted">
+                {isLoadingElements ? (
+                  <span className="flex items-center gap-1">
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                    Loading elements...
+                  </span>
+                ) : (
+                  `${sdkElements.length} elements discovered`
+                )}
+              </div>
+            )}
             {/* Discover Specs button — shown when connected */}
-            {connectionStatus === "connected" && (
+            {isConnected && (
               <button
                 onClick={discoverSpecs}
                 disabled={isDiscoveringSpecs}
-                className="mt-2 w-full flex items-center justify-center gap-1.5 rounded-md py-1.5 text-xs font-medium bg-surface-hover text-text-primary hover:bg-surface-active disabled:opacity-50 transition-colors"
+                className="w-full flex items-center justify-center gap-1.5 rounded-md py-1.5 text-xs font-medium bg-surface-hover text-text-primary hover:bg-surface-active disabled:opacity-50 transition-colors"
               >
                 {isDiscoveringSpecs ? (
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -647,10 +543,10 @@ export function SpecDiscoveryTab({
           {leftPanelTab === "search" && (
             <div className="h-full p-3">
               <SearchComparisonPanel
-                elements={externalElements}
-                onSelectElement={handleSelectElement}
-                onHighlightElement={highlightElement}
-                disabled={connectionStatus !== "connected"}
+                elements={sdkElements}
+                onSelectElement={(id) => selectElement(id)}
+                onHighlightElement={(id) => highlightElement(id)}
+                disabled={!isConnected}
               />
             </div>
           )}
@@ -658,11 +554,11 @@ export function SpecDiscoveryTab({
           {leftPanelTab === "describe" && (
             <div className="h-full p-3">
               <ElementDescriptionPanel
-                elements={externalElements}
+                elements={sdkElements}
                 selectedElement={selectedElement}
                 pageContext={pageContext}
-                onSelectElement={handleSelectElement}
-                disabled={connectionStatus !== "connected"}
+                onSelectElement={(id) => selectElement(id)}
+                disabled={!isConnected}
               />
             </div>
           )}
@@ -670,12 +566,12 @@ export function SpecDiscoveryTab({
           {leftPanelTab === "nl" && (
             <div className="h-full p-3">
               <NaturalLanguagePanel
-                elements={externalElements}
-                onSelectElement={handleSelectElement}
-                onHighlightElement={highlightElement}
-                onExecuteAction={handleExecuteActionWithResult}
+                elements={sdkElements}
+                onSelectElement={(id) => selectElement(id)}
+                onHighlightElement={(id) => highlightElement(id)}
+                onExecuteAction={executeAction}
                 pageContext={pageContext}
-                disabled={connectionStatus !== "connected"}
+                disabled={!isConnected}
               />
             </div>
           )}
@@ -1044,44 +940,6 @@ export function SpecDiscoveryTab({
 // =============================================================================
 // Sub-Components
 // =============================================================================
-
-interface TargetItemProps {
-  target: Target;
-  onClick: () => void;
-}
-
-function TargetItem({ target, onClick }: TargetItemProps) {
-  return (
-    <button
-      onClick={onClick}
-      className="w-full flex items-center gap-3 rounded-md px-2 py-1.5 transition-colors hover:bg-surface-hover cursor-pointer text-left"
-    >
-      <div className="flex h-7 w-7 items-center justify-center rounded-md bg-surface-hover">
-        {target.type === "browser" ? (
-          <Globe className="h-3.5 w-3.5 text-brand-primary" />
-        ) : (
-          <Smartphone className="h-3.5 w-3.5 text-brand-secondary" />
-        )}
-      </div>
-      <div className="flex-1 min-w-0">
-        <div className="truncate text-sm text-text-primary">{target.name}</div>
-        <div className="flex items-center gap-1.5 text-xs text-text-muted">
-          {target.connected ? (
-            <>
-              <span className="h-1.5 w-1.5 rounded-full bg-brand-success" />
-              <span className="text-brand-success">Connected</span>
-            </>
-          ) : (
-            <>
-              <span className="h-1.5 w-1.5 rounded-full bg-text-muted" />
-              <span>Disconnected</span>
-            </>
-          )}
-        </div>
-      </div>
-    </button>
-  );
-}
 
 /** Phase section for workflow preview */
 interface WorkflowPhaseSectionProps {

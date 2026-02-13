@@ -14,11 +14,16 @@ use tauri::Manager;
 use tracing::{error, info, warn};
 
 use crate::database::CreateTaskRunInput;
-use crate::mcp::extension as extension_handlers;
 use crate::mcp::misc::default_true;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::step_event_builder::categorize_steps;
 use crate::workflow_generation;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GenerateWorkflowAsyncResponse {
+    pub task_run_id: String,
+    pub meta_workflow_id: String,
+}
 
 pub fn refetch_unified_workflow_steps(
     task_id: &str,
@@ -206,6 +211,65 @@ pub fn refetch_unified_workflow_steps(
 }
 
 // ============================================================================
+// Web Backend Sync Helpers
+// ============================================================================
+
+/// Push a workflow to the web backend (best-effort).
+/// On failure, marks the local workflow as sync_pending.
+async fn push_to_backend(
+    db: &crate::database::CheckpointDb,
+    workflow: &crate::unified_workflows::UnifiedWorkflow,
+) {
+    let client = crate::mcp::web_backend_workflows::WebBackendWorkflowClient::new();
+    match client.save_workflow(workflow).await {
+        Ok(_) => {
+            info!("Synced workflow '{}' to web backend", workflow.name);
+            let _ = db.clear_sync_pending(&workflow.id);
+        }
+        Err(e) => {
+            warn!(
+                "Failed to push workflow '{}' to backend (will sync later): {}",
+                workflow.name, e
+            );
+            let _ = db.set_sync_pending(&workflow.id);
+        }
+    }
+}
+
+/// Update a workflow on the web backend (best-effort).
+/// On failure, marks the local workflow as sync_pending.
+async fn update_on_backend(
+    db: &crate::database::CheckpointDb,
+    workflow: &crate::unified_workflows::UnifiedWorkflow,
+) {
+    let client = crate::mcp::web_backend_workflows::WebBackendWorkflowClient::new();
+    match client.update_workflow(&workflow.id, workflow).await {
+        Ok(_) => {
+            info!("Synced workflow update '{}' to web backend", workflow.name);
+            let _ = db.clear_sync_pending(&workflow.id);
+        }
+        Err(e) => {
+            warn!(
+                "Failed to push workflow update '{}' to backend (will sync later): {}",
+                workflow.name, e
+            );
+            let _ = db.set_sync_pending(&workflow.id);
+        }
+    }
+}
+
+/// Delete a workflow from the web backend (best-effort).
+async fn delete_from_backend(id: &str) {
+    let client = crate::mcp::web_backend_workflows::WebBackendWorkflowClient::new();
+    if let Err(e) = client.delete_workflow(id).await {
+        warn!(
+            "Failed to delete workflow '{}' from backend: {}",
+            id, e
+        );
+    }
+}
+
+// ============================================================================
 // Unified Workflows HTTP API Handlers
 // ============================================================================
 
@@ -232,6 +296,7 @@ pub async fn list_unified_workflows(
 }
 
 /// Get a single unified workflow by ID
+/// Checks local cache first, falls back to web backend on cache miss.
 pub async fn get_unified_workflow(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
@@ -239,17 +304,68 @@ pub async fn get_unified_workflow(
     Json<ApiResponse<crate::unified_workflows::UnifiedWorkflow>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
+    // Check local cache first
     match state.app_state.checkpoint_db.get_unified_workflow(&id) {
-        Ok(Some(workflow)) => Ok(Json(ApiResponse::success(workflow))),
-        Ok(None) => Err((
-            StatusCode::NOT_FOUND,
-            Json(api_error(format!("Unified workflow not found: {}", id))),
-        )),
+        Ok(Some(workflow)) => return Ok(Json(ApiResponse::success(workflow))),
+        Ok(None) => {
+            // Cache miss — try web backend
+            info!("Workflow {} not in local cache, trying web backend", id);
+        }
         Err(e) => {
-            error!("Failed to get unified workflow: {}", e);
+            error!("Failed to get unified workflow from cache: {}", e);
+            // Still try backend as fallback
+        }
+    }
+
+    // Try fetching from web backend
+    let client = crate::mcp::web_backend_workflows::WebBackendWorkflowClient::new();
+    match client.fetch_workflow(&id).await {
+        Ok(workflow) => {
+            info!(
+                "Fetched workflow '{}' from web backend, caching locally",
+                workflow.name
+            );
+            // Cache locally for future access
+            let create_req = crate::unified_workflows::CreateUnifiedWorkflowRequest {
+                name: workflow.name.clone(),
+                description: workflow.description.clone(),
+                category: workflow.category.clone(),
+                tags: workflow.tags.clone(),
+                setup_steps: workflow.setup_steps.clone(),
+                verification_steps: workflow.verification_steps.clone(),
+                agentic_steps: workflow.agentic_steps.clone(),
+                completion_steps: workflow.completion_steps.clone(),
+                max_iterations: workflow.max_iterations,
+                timeout_seconds: workflow.timeout_seconds,
+                provider: workflow.provider.clone(),
+                model: workflow.model.clone(),
+                skip_ai_summary: workflow.skip_ai_summary,
+                log_source_selection: Some(workflow.log_source_selection.clone()),
+                context_ids: Some(workflow.context_ids.clone()),
+                disabled_context_ids: Some(workflow.disabled_context_ids.clone()),
+                auto_include_contexts: Some(workflow.auto_include_contexts),
+                prompt_template: workflow.prompt_template.clone(),
+                log_watch_enabled: Some(workflow.log_watch_enabled),
+                health_check_enabled: Some(workflow.health_check_enabled),
+                health_check_urls: Some(workflow.health_check_urls.clone()),
+                preflight_check_enabled: Some(workflow.preflight_check_enabled),
+                targeted_error_ids: None,
+                generated_by_task_run_id: workflow.generated_by_task_run_id.clone(),
+            };
+            if let Err(e) = state
+                .app_state
+                .checkpoint_db
+                .create_unified_workflow_with_id(&workflow.id, &create_req)
+            {
+                warn!("Failed to cache workflow locally: {}", e);
+            }
+            Ok(Json(ApiResponse::success(workflow)))
+        }
+        Err(e) => {
+            warn!("Workflow {} not found on backend either: {}", id, e);
             Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to get unified workflow: {}", e))),
+                StatusCode::NOT_FOUND,
+                Json(api_error(format!("Unified workflow not found: {}", id))),
             ))
         }
     }
@@ -274,6 +390,8 @@ pub async fn create_unified_workflow(
                 "Created unified workflow: {} ({})",
                 created.name, created.id
             );
+            // Push to web backend (best-effort, async)
+            push_to_backend(&state.app_state.checkpoint_db, &created).await;
             Ok(Json(ApiResponse::success(created)))
         }
         Err(e) => {
@@ -299,6 +417,44 @@ pub async fn update_unified_workflow(
     (StatusCode, Json<ApiResponse<()>>),
 > {
     info!("Updating unified workflow: {}", id);
+
+    // Check if this workflow was generated by a task run (for feedback tracking)
+    let existing_for_feedback = state
+        .app_state
+        .checkpoint_db
+        .get_unified_workflow(&id)
+        .ok()
+        .flatten();
+    if let Some(ref existing) = existing_for_feedback {
+        if let Some(ref task_run_id) = existing.generated_by_task_run_id {
+            info!(
+                "Workflow '{}' (generated by task run '{}') is being updated — \
+                 this is a post-generation feedback event indicating the user \
+                 refined the generated workflow",
+                existing.name, task_run_id
+            );
+
+            // Record structured feedback
+            let feedback = crate::workflow_generation::feedback::FeedbackType::Edit {
+                field: "workflow_update".to_string(),
+                old_value: None,
+                new_value: None,
+            };
+            if let Err(e) = state.app_state.checkpoint_db.with_conn(|conn| {
+                crate::workflow_generation::feedback::record_workflow_feedback(
+                    conn,
+                    &id,
+                    Some(task_run_id),
+                    Some(&existing.category),
+                    Some(&existing.description),
+                    &feedback,
+                )
+            }) {
+                warn!("Failed to record edit feedback: {}", e);
+            }
+        }
+    }
+
     match state
         .app_state
         .checkpoint_db
@@ -309,6 +465,8 @@ pub async fn update_unified_workflow(
                 "Updated unified workflow: {} ({})",
                 updated.name, updated.id
             );
+            // Push update to web backend (best-effort, async)
+            update_on_backend(&state.app_state.checkpoint_db, &updated).await;
             Ok(Json(ApiResponse::success(updated)))
         }
         Err(e) if e.contains("not found") => Err((
@@ -334,11 +492,44 @@ pub async fn delete_unified_workflow(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("Deleting unified workflow: {}", id);
+
+    // Check if this workflow was generated by a task run (for feedback tracking)
+    if let Ok(Some(existing)) = state.app_state.checkpoint_db.get_unified_workflow(&id) {
+        if let Some(ref task_run_id) = existing.generated_by_task_run_id {
+            info!(
+                "Workflow '{}' (generated by task run '{}') is being deleted — \
+                 this is a post-generation feedback event indicating the user \
+                 rejected the generated workflow",
+                existing.name, task_run_id
+            );
+
+            // Record structured feedback
+            let feedback =
+                crate::workflow_generation::feedback::FeedbackType::Delete { reason: None };
+            if let Err(e) = state.app_state.checkpoint_db.with_conn(|conn| {
+                crate::workflow_generation::feedback::record_workflow_feedback(
+                    conn,
+                    &id,
+                    Some(task_run_id),
+                    Some(&existing.category),
+                    Some(&existing.description),
+                    &feedback,
+                )
+            }) {
+                warn!("Failed to record delete feedback: {}", e);
+            }
+        }
+    }
+
     match state.app_state.checkpoint_db.delete_unified_workflow(&id) {
-        Ok(true) => Ok(Json(ApiResponse::success(serde_json::json!({
-            "deleted": true,
-            "id": id
-        })))),
+        Ok(true) => {
+            // Delete from web backend (best-effort, async)
+            delete_from_backend(&id).await;
+            Ok(Json(ApiResponse::success(serde_json::json!({
+                "deleted": true,
+                "id": id
+            }))))
+        }
         Ok(false) => Err((
             StatusCode::NOT_FOUND,
             Json(api_error(format!("Unified workflow not found: {}", id))),
@@ -399,6 +590,8 @@ pub async fn duplicate_unified_workflow(
     {
         Ok(duplicated) => {
             info!("Duplicated unified workflow: {} -> {}", id, duplicated.id);
+            // Push duplicate to web backend (best-effort, async)
+            push_to_backend(&state.app_state.checkpoint_db, &duplicated).await;
             Ok(Json(ApiResponse::success(duplicated)))
         }
         Err(e) if e.contains("not found") => Err((
@@ -545,15 +738,17 @@ pub async fn import_unified_workflow(
         provider: workflow.provider.clone(),
         model: workflow.model.clone(),
         skip_ai_summary: workflow.skip_ai_summary,
-        log_source_selection: workflow.log_source_selection.clone(),
-        context_ids: workflow.context_ids.clone(),
-        disabled_context_ids: workflow.disabled_context_ids.clone(),
-        auto_include_contexts: workflow.auto_include_contexts,
+        log_source_selection: Some(workflow.log_source_selection.clone()),
+        context_ids: Some(workflow.context_ids.clone()),
+        disabled_context_ids: Some(workflow.disabled_context_ids.clone()),
+        auto_include_contexts: Some(workflow.auto_include_contexts),
         prompt_template: workflow.prompt_template.clone(),
-        log_watch_enabled: workflow.log_watch_enabled,
-        health_check_enabled: workflow.health_check_enabled,
-        health_check_urls: workflow.health_check_urls.clone(),
-        preflight_check_enabled: workflow.preflight_check_enabled,
+        log_watch_enabled: Some(workflow.log_watch_enabled),
+        health_check_enabled: Some(workflow.health_check_enabled),
+        health_check_urls: Some(workflow.health_check_urls.clone()),
+        preflight_check_enabled: Some(workflow.preflight_check_enabled),
+        targeted_error_ids: None,
+        generated_by_task_run_id: workflow.generated_by_task_run_id.clone(),
     };
 
     // Use the database's create function but with our custom ID
@@ -567,6 +762,8 @@ pub async fn import_unified_workflow(
                 "Imported unified workflow: {} ({}) [overwritten: {}]",
                 created.name, created.id, overwritten
             );
+            // Push imported workflow to web backend (best-effort, async)
+            push_to_backend(&state.app_state.checkpoint_db, &created).await;
             Ok(Json(ApiResponse::success(
                 crate::unified_workflows::ImportWorkflowResult {
                     workflow: created,
@@ -594,7 +791,7 @@ pub async fn import_unified_workflow(
 
 /// Generate a unified workflow from natural language description using AI
 pub async fn generate_unified_workflow_handler(
-    State(_state): State<Arc<ApiState>>,
+    State(state): State<Arc<ApiState>>,
     Json(request): Json<workflow_generation::GenerateWorkflowRequest>,
 ) -> Result<
     Json<ApiResponse<workflow_generation::GenerateWorkflowResponse>>,
@@ -605,20 +802,49 @@ pub async fn generate_unified_workflow_handler(
         &request.description[..request.description.len().min(50)]
     );
 
+    // Clone handles so they can be moved into the blocking closure
+    let doctor_handle = state.doctor_handle.clone();
+    let db = state.app_state.checkpoint_db.clone();
+
     // Run the generation in a blocking task since it uses sync AI provider
-    let result =
-        tokio::task::spawn_blocking(move || workflow_generation::generate_workflow(request))
-            .await
-            .map_err(|e| {
-                error!(
-                    "Failed to spawn blocking task for workflow generation: {}",
-                    e
-                );
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(api_error(format!("Failed to generate workflow: {}", e))),
-                )
-            })?;
+    let result = tokio::task::spawn_blocking(move || {
+        // Get DB connection for RAG examples + filtered schema context
+        let gen_result = db.with_conn(|conn| {
+            Ok(workflow_generation::generate_workflow(
+                request,
+                doctor_handle.as_ref(),
+                Some(conn),
+                None, // Embedding computed lazily if embedding API is available
+            ))
+        });
+        match gen_result {
+            Ok(response) => response,
+            Err(e) => {
+                warn!("DB access failed for workflow generation, falling back to no-DB path: {}", e);
+                // This shouldn't happen, but if it does, the request was already moved
+                // into the closure above, so we can't retry. Return an error response.
+                workflow_generation::GenerateWorkflowResponse {
+                    workflow: None,
+                    validation_errors: vec![],
+                    success: false,
+                    error: Some(format!("Database error during generation: {}", e)),
+                    model_used: None,
+                    verification_iterations: vec![],
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!(
+            "Failed to spawn blocking task for workflow generation: {}",
+            e
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to generate workflow: {}", e))),
+        )
+    })?;
 
     if result.success {
         info!(
@@ -641,6 +867,232 @@ pub async fn generate_unified_workflow_handler(
     }
 }
 
+/// Generate a unified workflow asynchronously using a meta-workflow approach.
+///
+/// Instead of generating synchronously, this endpoint:
+/// 1. Resolves contexts from the request
+/// 2. Builds a meta-workflow (a UnifiedWorkflow that generates another workflow)
+/// 3. Saves the meta-workflow to the database
+/// 4. Creates a task run for the meta-workflow execution
+/// 5. Returns the task_run_id and meta_workflow_id for frontend polling
+pub async fn generate_unified_workflow_async_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<workflow_generation::GenerateWorkflowRequest>,
+) -> Result<Json<ApiResponse<GenerateWorkflowAsyncResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    use crate::workflow_generation::meta_workflow::{
+        build_historical_context, build_meta_workflow_template,
+    };
+
+    info!(
+        "Generating unified workflow async from description: {}...",
+        &request.description[..request.description.len().min(50)]
+    );
+
+    // Resolve contexts (same pattern as generator.rs)
+    let mut resolved_contexts = String::new();
+    if let Some(ref ids) = request.context_ids {
+        if !ids.is_empty() {
+            let resolved = crate::context::resolve_contexts(ids, false, "", &[], &[]);
+            if let Some(formatted) = crate::context::format_contexts_for_prompt(&resolved) {
+                resolved_contexts.push_str(&formatted);
+            }
+        }
+    }
+    if let Some(ref inline) = request.inline_context {
+        if !inline.is_empty() {
+            resolved_contexts.push_str(&format!(
+                "<context name=\"User-Provided Context\">\n{}\n</context>\n\n",
+                inline
+            ));
+        }
+    }
+
+    // Build historical context from database (best-effort, falls back gracefully)
+    let historical_context = state
+        .app_state
+        .checkpoint_db
+        .with_conn(|conn| {
+            Ok(build_historical_context(
+                conn,
+                &request.description,
+                None, // Embedding computed lazily if embedding API is available
+                request.category.as_deref(),
+            ))
+        })
+        .ok()
+        .flatten();
+
+    // Build the meta-workflow
+    let meta_workflow =
+        build_meta_workflow_template(&request, &resolved_contexts, historical_context.as_ref());
+
+    // Save the meta-workflow to database
+    let create_request = crate::unified_workflows::CreateUnifiedWorkflowRequest {
+        name: meta_workflow.name.clone(),
+        description: meta_workflow.description.clone(),
+        category: meta_workflow.category.clone(),
+        tags: meta_workflow.tags.clone(),
+        setup_steps: meta_workflow.setup_steps.clone(),
+        verification_steps: meta_workflow.verification_steps.clone(),
+        agentic_steps: meta_workflow.agentic_steps.clone(),
+        completion_steps: meta_workflow.completion_steps.clone(),
+        max_iterations: meta_workflow.max_iterations,
+        timeout_seconds: meta_workflow.timeout_seconds,
+        provider: meta_workflow.provider.clone(),
+        model: meta_workflow.model.clone(),
+        skip_ai_summary: meta_workflow.skip_ai_summary,
+        log_source_selection: Some(meta_workflow.log_source_selection.clone()),
+        log_watch_enabled: Some(meta_workflow.log_watch_enabled),
+        health_check_enabled: Some(meta_workflow.health_check_enabled),
+        health_check_urls: Some(meta_workflow.health_check_urls.clone()),
+        preflight_check_enabled: Some(meta_workflow.preflight_check_enabled),
+        context_ids: Some(meta_workflow.context_ids.clone()),
+        disabled_context_ids: Some(meta_workflow.disabled_context_ids.clone()),
+        auto_include_contexts: Some(meta_workflow.auto_include_contexts),
+        prompt_template: meta_workflow.prompt_template.clone(),
+        targeted_error_ids: Some(meta_workflow.targeted_error_ids.clone()),
+        generated_by_task_run_id: None, // Will be set after task run creation
+    };
+
+    let saved_workflow = match state
+        .app_state
+        .checkpoint_db
+        .create_unified_workflow(&create_request)
+    {
+        Ok(w) => w,
+        Err(e) => {
+            error!("Failed to save meta-workflow: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to save meta-workflow: {}", e))),
+            ));
+        }
+    };
+
+    // Create a task run for this workflow
+    let task_run_id = uuid::Uuid::new_v4().to_string();
+    let task_run_input = CreateTaskRunInput::new(&task_run_id, &saved_workflow.name)
+        .with_workflow_type("unified")
+        .with_workflow_name(&saved_workflow.name)
+        .with_max_sessions(saved_workflow.max_iterations)
+        .with_auto_continue(true);
+
+    if let Err(e) = state
+        .app_state
+        .checkpoint_db
+        .create_task_run(&task_run_input)
+    {
+        error!("Failed to create task run: {}", e);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to create task run: {}", e))),
+        ));
+    }
+
+    info!(
+        "Created meta-workflow '{}' (id={}) with task run {}",
+        saved_workflow.name, saved_workflow.id, task_run_id
+    );
+
+    // Convert workflow steps for LoopController with explicit phase assignment
+    {
+        use crate::unified_workflow_executor::{
+            convert_json_steps_with_phase, extract_prompt_steps_with_phase, LoopConfig,
+            LoopController,
+        };
+
+        let setup_automation_steps =
+            convert_json_steps_with_phase(&saved_workflow.setup_steps, 0, Some("setup"));
+        let setup_automation_steps = crate::unified_workflows::prepend_preflight_check_step(
+            setup_automation_steps,
+            saved_workflow.preflight_check_enabled,
+        );
+        let setup_prompt_steps =
+            extract_prompt_steps_with_phase(&saved_workflow.setup_steps, Some("setup"));
+        let verification_steps = convert_json_steps_with_phase(
+            &saved_workflow.verification_steps,
+            0,
+            Some("verification"),
+        );
+        let verification_steps = crate::unified_workflows::prepend_health_check_steps(
+            verification_steps,
+            saved_workflow.health_check_enabled,
+            &saved_workflow.health_check_urls,
+        );
+        let verification_steps = crate::unified_workflows::prepend_log_watch_step(
+            verification_steps,
+            saved_workflow.log_watch_enabled,
+        );
+        let agentic_steps =
+            extract_prompt_steps_with_phase(&saved_workflow.agentic_steps, Some("agentic"));
+        let completion_automation_steps =
+            convert_json_steps_with_phase(&saved_workflow.completion_steps, 0, Some("completion"));
+        let completion_prompt_steps =
+            extract_prompt_steps_with_phase(&saved_workflow.completion_steps, Some("completion"));
+
+        // For meta-workflows, run agentic first if there are targeted errors
+        let run_agentic_first = !saved_workflow.targeted_error_ids.is_empty();
+
+        let loop_config = LoopConfig {
+            max_iterations: saved_workflow.max_iterations,
+            base_prompt: String::new(),
+            workflow_name: saved_workflow.name.clone(),
+            workflow_id: saved_workflow.id.clone(),
+            execution_id: task_run_id.clone(),
+            targeted_error_ids: saved_workflow.targeted_error_ids.clone(),
+            starting_iteration: 0,
+            run_agentic_first,
+            artifact_dir: None,
+            is_dev_mode: cfg!(debug_assertions),
+        };
+
+        // Clone state fields for the background task
+        let app_state = state.app_state.clone();
+        let config_storage = state.config_storage.clone();
+        let app_handle = state.app_handle.clone();
+        let pid_tracker = state.current_ai_pids.clone();
+        let checkpoint_db = state.app_state.checkpoint_db.clone();
+        let workflow_name = saved_workflow.name.clone();
+        let execution_id_for_guard = task_run_id.clone();
+
+        // Get session manager for interactive mode
+        let session_manager: Arc<crate::claude_session::SessionManager> = state
+            .app_handle
+            .state::<Arc<crate::claude_session::SessionManager>>()
+            .inner()
+            .clone();
+
+        // Spawn the workflow executor in the background with panic protection
+        crate::unified_workflow_executor::spawn_workflow_with_panic_guard(
+            checkpoint_db,
+            execution_id_for_guard,
+            workflow_name,
+            async move {
+                let mut controller =
+                    LoopController::new(app_state, config_storage, app_handle, pid_tracker)
+                        .with_session_manager(session_manager);
+
+                controller
+                    .run(
+                        loop_config,
+                        setup_automation_steps,
+                        setup_prompt_steps,
+                        verification_steps,
+                        agentic_steps,
+                        completion_automation_steps,
+                        completion_prompt_steps,
+                    )
+                    .await
+            },
+        );
+    }
+
+    Ok(Json(ApiResponse::success(GenerateWorkflowAsyncResponse {
+        task_run_id,
+        meta_workflow_id: saved_workflow.id,
+    })))
+}
+
 // =============================================================================
 // NOTE: run_unified_workflow_with_verification_loop was removed and replaced
 // with the modular unified_workflow_executor module.
@@ -653,9 +1105,6 @@ pub struct RunUnifiedWorkflowRequest {
     /// Monitor index to use (defaults to 0)
     #[serde(default)]
     monitor_index: Option<i32>,
-    /// Timeout in seconds (defaults to 300)
-    #[serde(default)]
-    timeout_seconds: Option<u64>,
     /// Optional task_run_id for resuming an existing execution.
     /// If provided, the workflow will resume from where it left off.
     /// If not provided, the system will check for incomplete task_runs and auto-resume,
@@ -727,9 +1176,6 @@ pub struct ExecutePlanRequest {
     /// Maximum number of sweep iterations (default: 5).
     #[serde(default = "default_max_sweep_iterations")]
     max_next_steps_iterations: u32,
-    /// Optional timeout in seconds for each AI session.
-    #[serde(default)]
-    timeout_seconds: Option<u64>,
 }
 
 /// A single phase in a plan execution request.
@@ -795,7 +1241,6 @@ pub async fn run_unified_workflow(
     }
 
     let monitor_index = request.monitor_index.unwrap_or(0);
-    let _timeout_seconds = request.timeout_seconds.unwrap_or(300);
 
     // Convert JSON steps to ExecutionStepConfig
     // For now, we run phases sequentially: setup -> (verification + agentic) -> completion
@@ -1067,11 +1512,6 @@ pub async fn run_unified_workflow(
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
             spec_stop_on_failure: step.get("stop_on_failure").and_then(|v| v.as_bool()),
-            spec_prefetched_elements: None,
-            // Error resolved fields
-            error_id: None,
-            error_pattern: None,
-            error_source: None,
             // Gate fields
             gate_required_steps: step
                 .get("required_steps")
@@ -1086,6 +1526,7 @@ pub async fn run_unified_workflow(
                 .get("stop_on_failure")
                 .or_else(|| step.get("gateStopOnFailure"))
                 .and_then(|v| v.as_bool()),
+            ..Default::default()
         })
     };
 
@@ -1147,12 +1588,12 @@ pub async fn run_unified_workflow(
         .any(|s| s.step_type == "spec" && s.spec_element_source.as_deref() == Some("external"));
 
     let prefetched_elements = if needs_external_elements {
-        info!("Pre-fetching external elements for spec steps (run endpoint)");
-        match extension_handlers::send_extension_command(
-            state.clone(),
-            "getElements",
-            serde_json::json!({"includeNonInteractive": true}),
-            10,
+        info!("Pre-fetching external elements for spec steps via SDK (run endpoint)");
+        match crate::mcp::sdk_client::sdk_request(
+            &state,
+            reqwest::Method::GET,
+            "/control/elements",
+            None,
         )
         .await
         {
@@ -1162,13 +1603,13 @@ pub async fn run_unified_workflow(
                     .cloned()
                     .unwrap_or(serde_json::json!([]));
                 info!(
-                    "Pre-fetched {} external elements",
+                    "Pre-fetched {} external elements via SDK",
                     elements.as_array().map(|a| a.len()).unwrap_or(0)
                 );
                 Some(elements)
             }
             Err(e) => {
-                warn!("Failed to pre-fetch external elements: {}", e);
+                warn!("Failed to pre-fetch external elements via SDK: {}", e);
                 None
             }
         }
@@ -1188,6 +1629,15 @@ pub async fn run_unified_workflow(
             }
         }
     }
+
+    // Extract verification-phase steps BEFORE categorize_steps consumes all_steps.
+    // This preserves the original step ordering (e.g., prompt checks before gates)
+    // which is critical for gate steps that depend on prompt step results.
+    let ordered_verification_steps: Vec<_> = all_steps
+        .iter()
+        .filter(|s| s.phase.as_deref() == Some("verification"))
+        .cloned()
+        .collect();
 
     // Separate automation steps from AI steps using the robust categorize_steps helper.
     // This replaces the fragile string-based partition logic.
@@ -1326,11 +1776,11 @@ pub async fn run_unified_workflow(
             .filter(|s| s.phase.as_deref() == Some("setup"))
             .cloned()
             .collect();
-        let verification_steps: Vec<_> = automation_steps
-            .iter()
-            .filter(|s| s.phase.as_deref() == Some("verification"))
-            .cloned()
-            .collect();
+        // Use ordered_verification_steps (extracted before categorize_steps) to preserve
+        // the original step ordering from the workflow definition. This is critical because
+        // gate steps must come AFTER the prompt/automation steps they reference.
+        // The previous approach of automation-first-then-prompt broke gate evaluation.
+        let verification_steps = ordered_verification_steps;
 
         // Prepend health check steps if enabled and URLs configured
         // Health checks run BEFORE log_watch to catch server down before scanning logs
@@ -1345,17 +1795,6 @@ pub async fn run_unified_workflow(
             verification_steps,
             workflow.log_watch_enabled,
         );
-
-        // Warn if verification_steps is empty but workflow had verification steps
-        // This can happen if all verification steps were prompt-type (which shouldn't happen)
-        if verification_steps.is_empty() && !workflow.verification_steps.is_empty() {
-            warn!(
-                    "WARNING: workflow.verification_steps has {} items but extracted verification_steps is empty! \
-                     This means all verification steps have step_type='prompt' which is not supported. \
-                     Verification will auto-pass, causing completion to run immediately.",
-                    workflow.verification_steps.len()
-                );
-        }
 
         // Filter prompt_steps by phase - agentic prompts only
         let agentic_steps: Vec<_> = prompt_steps
@@ -1401,16 +1840,11 @@ pub async fn run_unified_workflow(
         let (completion_automation_steps, completion_prompt_steps) =
             categorize_steps(completion_steps, |s| &s.step_type);
 
-        // Run the verification-agentic loop using the new modular architecture
-        // Timeout priority: request override > workflow setting > None (no timeout)
-        let timeout_seconds = request.timeout_seconds.or(workflow.timeout_seconds);
-
         // For error-fix workflows, run agentic first
         let run_agentic_first = !workflow.targeted_error_ids.is_empty();
 
         let loop_config = crate::unified_workflow_executor::LoopConfig {
             max_iterations: workflow.max_iterations,
-            timeout_seconds, // None = no timeout (default)
             base_prompt: combined_prompt,
             workflow_name: workflow.name.clone(),
             workflow_id: workflow.id.clone(),
@@ -1418,6 +1852,8 @@ pub async fn run_unified_workflow(
             targeted_error_ids: workflow.targeted_error_ids.clone(),
             starting_iteration: 0, // Fresh start
             run_agentic_first,
+            artifact_dir: None,
+            is_dev_mode: cfg!(debug_assertions),
         };
 
         let session_manager: Arc<crate::claude_session::SessionManager> = state
@@ -1640,6 +2076,7 @@ pub async fn execute_inline_workflow(
         health_check_enabled: false,
         health_check_urls: vec![],
         preflight_check_enabled: true,
+        generated_by_task_run_id: None,
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
     };
@@ -1752,12 +2189,12 @@ pub async fn execute_inline_workflow(
         .any(|s| s.step_type == "spec" && s.spec_element_source.as_deref() == Some("external"));
 
     let prefetched_elements = if needs_external_elements {
-        info!("Pre-fetching external elements for spec steps");
-        match extension_handlers::send_extension_command(
-            state.clone(),
-            "getElements",
-            serde_json::json!({"includeNonInteractive": true}),
-            10,
+        info!("Pre-fetching external elements for spec steps via SDK");
+        match crate::mcp::sdk_client::sdk_request(
+            &state,
+            reqwest::Method::GET,
+            "/control/elements",
+            None,
         )
         .await
         {
@@ -1767,13 +2204,13 @@ pub async fn execute_inline_workflow(
                     .cloned()
                     .unwrap_or(serde_json::json!([]));
                 info!(
-                    "Pre-fetched {} external elements",
+                    "Pre-fetched {} external elements via SDK",
                     elements.as_array().map(|a| a.len()).unwrap_or(0)
                 );
                 Some(elements)
             }
             Err(e) => {
-                warn!("Failed to pre-fetch external elements: {}", e);
+                warn!("Failed to pre-fetch external elements via SDK: {}", e);
                 None
             }
         }
@@ -1789,6 +2226,15 @@ pub async fn execute_inline_workflow(
             }
         }
     }
+
+    // Extract verification-phase steps BEFORE categorize_steps consumes all_steps.
+    // This preserves the original step ordering (e.g., prompt checks before gates)
+    // which is critical for gate steps that depend on prompt step results.
+    let ordered_verification_steps: Vec<_> = all_steps
+        .iter()
+        .filter(|s| s.phase.as_deref() == Some("verification"))
+        .cloned()
+        .collect();
 
     // Separate steps by type
     let (automation_steps, prompt_steps) = categorize_steps(all_steps, |s| &s.step_type);
@@ -1827,11 +2273,10 @@ pub async fn execute_inline_workflow(
             .filter(|s| s.phase.as_deref() == Some("setup"))
             .cloned()
             .collect();
-        let verification_steps: Vec<_> = automation_steps
-            .iter()
-            .filter(|s| s.phase.as_deref() == Some("verification"))
-            .cloned()
-            .collect();
+        // Use ordered_verification_steps (extracted before categorize_steps) to preserve
+        // the original step ordering from the workflow definition. This is critical because
+        // gate steps must come AFTER the prompt/automation steps they reference.
+        let verification_steps = ordered_verification_steps;
 
         // Prepend log_watch step
         let verification_steps = crate::unified_workflows::prepend_log_watch_step(
@@ -1885,7 +2330,6 @@ pub async fn execute_inline_workflow(
 
         let loop_config = crate::unified_workflow_executor::LoopConfig {
             max_iterations: workflow.max_iterations,
-            timeout_seconds: request.timeout_seconds,
             base_prompt: combined_prompt,
             workflow_name: workflow.name.clone(),
             workflow_id: workflow.id.clone(),
@@ -1893,6 +2337,8 @@ pub async fn execute_inline_workflow(
             targeted_error_ids: workflow.targeted_error_ids.clone(),
             starting_iteration: 0,
             run_agentic_first,
+            artifact_dir: None,
+            is_dev_mode: cfg!(debug_assertions),
         };
 
         let session_manager: Arc<crate::claude_session::SessionManager> = state
@@ -2046,7 +2492,6 @@ pub async fn execute_plan(
             .collect(),
         next_steps_sweep: request.next_steps_sweep,
         max_next_steps_iterations: request.max_next_steps_iterations,
-        timeout_seconds: request.timeout_seconds,
         execution_id: execution_id.clone(),
     };
 
@@ -2542,7 +2987,6 @@ pub async fn run_workflow_sequence(
 
                     let loop_config = crate::unified_workflow_executor::LoopConfig {
                         max_iterations: workflow.max_iterations,
-                        timeout_seconds: workflow.timeout_seconds, // Use workflow setting
                         base_prompt: prompt_content,
                         workflow_name: workflow.name.clone(),
                         workflow_id: workflow.id.clone(),
@@ -2550,6 +2994,8 @@ pub async fn run_workflow_sequence(
                         targeted_error_ids: workflow.targeted_error_ids.clone(),
                         starting_iteration: 0, // Fresh start
                         run_agentic_first,
+                        artifact_dir: None,
+                        is_dev_mode: cfg!(debug_assertions),
                     };
 
                     let result = controller
@@ -2634,6 +3080,26 @@ pub async fn run_workflow_sequence(
                     .checkpoint_db
                     .fail_task_run(&execution_id_clone, &error_msg);
             }
+
+            // Fire-and-forget summary generation for the sequence task
+            let db = state_clone.app_state.checkpoint_db.clone();
+            let exec_id = execution_id_clone.clone();
+            let doctor_handle = state_clone.doctor_handle.clone();
+            tokio::spawn(async move {
+                match crate::summary_generator::generate_task_summary_async(
+                    db,
+                    exec_id.clone(),
+                    doctor_handle,
+                )
+                .await
+                {
+                    Ok(_) => info!("Generated summary for sequence task {}", exec_id),
+                    Err(e) => warn!(
+                        "Failed to generate summary for sequence task {}: {}",
+                        exec_id, e
+                    ),
+                }
+            });
         },
     );
 
@@ -2642,6 +3108,54 @@ pub async fn run_workflow_sequence(
         workflow_count,
         workflow_names: workflow_names_response,
     })))
+}
+
+// ============================================================================
+// Example Status API
+// ============================================================================
+
+#[derive(Deserialize)]
+struct UpdateExampleStatusRequest {
+    status: String,
+}
+
+async fn update_example_status_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Json(request): Json<UpdateExampleStatusRequest>,
+) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
+    use crate::workflow_generation::example_workflows;
+
+    let valid_statuses = ["active", "excluded", "pending"];
+    if !valid_statuses.contains(&request.status.as_str()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!(
+                "Invalid status '{}'. Must be one of: active, excluded, pending",
+                request.status
+            ))),
+        ));
+    }
+
+    state
+        .app_state
+        .checkpoint_db
+        .with_conn(|conn| {
+            match request.status.as_str() {
+                "active" => example_workflows::promote_workflow_to_example(conn, &id),
+                "excluded" => example_workflows::exclude_workflow_from_examples(conn, &id),
+                "pending" => example_workflows::remove_workflow_from_examples(conn, &id),
+                _ => unreachable!(),
+            }
+        })
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to update example status: {}", e))),
+            )
+        })?;
+
+    Ok(Json(ApiResponse::success(())))
 }
 
 // ============================================================================
@@ -2656,7 +3170,30 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/unified-workflows",
             get(list_unified_workflows).post(create_unified_workflow),
         )
+        // Literal paths must come before :id catch-all
         .route("/unified-workflows/search", get(search_unified_workflows))
+        .route("/unified-workflows/import", post(import_unified_workflow))
+        .route(
+            "/unified-workflows/generate",
+            post(generate_unified_workflow_handler),
+        )
+        .route(
+            "/unified-workflows/generate-async",
+            post(generate_unified_workflow_async_handler),
+        )
+        .route(
+            "/unified-workflows/execute-inline",
+            post(execute_inline_workflow),
+        )
+        .route(
+            "/unified-workflows/last-inline",
+            get(get_last_inline_workflow),
+        )
+        .route(
+            "/unified-workflows/run-sequence",
+            post(run_workflow_sequence),
+        )
+        // Parameterized paths after all literal paths
         .route(
             "/unified-workflows/:id",
             get(get_unified_workflow)
@@ -2671,27 +3208,14 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/unified-workflows/:id/export",
             get(export_unified_workflow),
         )
-        .route("/unified-workflows/import", post(import_unified_workflow))
-        .route(
-            "/unified-workflows/generate",
-            post(generate_unified_workflow_handler),
-        )
         .route("/unified-workflows/:id/run", post(run_unified_workflow))
-        .route(
-            "/unified-workflows/execute-inline",
-            post(execute_inline_workflow),
-        )
-        .route("/execute-plan", post(execute_plan))
-        .route(
-            "/unified-workflows/last-inline",
-            get(get_last_inline_workflow),
-        )
         .route(
             "/unified-workflows/:id/stats",
             get(get_unified_workflow_stats),
         )
         .route(
-            "/unified-workflows/run-sequence",
-            post(run_workflow_sequence),
+            "/unified-workflows/:id/example-status",
+            axum::routing::put(update_example_status_handler),
         )
+        .route("/execute-plan", post(execute_plan))
 }

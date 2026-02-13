@@ -25,7 +25,7 @@ import {
   ChevronRight,
   Sparkles,
 } from "lucide-react";
-import type { ExternalElement } from "../../hooks/useExternalUIBridge";
+import type { ExternalElement } from "../../types/ui-bridge-types";
 
 interface SearchComparisonPanelProps {
   elements: ExternalElement[];

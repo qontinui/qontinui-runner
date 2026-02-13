@@ -438,6 +438,79 @@ pub async fn ui_bridge_get_spec_handler(
 }
 
 // ============================================================================
+// Page Navigation Handlers
+// ============================================================================
+
+/// Request for page navigation
+#[derive(Debug, Deserialize)]
+pub struct PageNavigateRequest {
+    url: String,
+}
+
+/// Refresh the page.
+pub async fn ui_bridge_page_refresh_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Page refresh");
+
+    match ui_bridge_request_sync(&state, "page_refresh", serde_json::json!({})).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Navigate to a URL.
+pub async fn ui_bridge_page_navigate_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<PageNavigateRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Page navigate to {}", request.url);
+
+    let payload = serde_json::json!({ "url": request.url });
+
+    match ui_bridge_request_sync(&state, "page_navigate", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Go back in browser history.
+pub async fn ui_bridge_page_go_back_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Page go back");
+
+    match ui_bridge_request_sync(&state, "page_go_back", serde_json::json!({})).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Go forward in browser history.
+pub async fn ui_bridge_page_go_forward_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Page go forward");
+
+    match ui_bridge_request_sync(&state, "page_go_forward", serde_json::json!({})).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+// ============================================================================
 // Exploration Handlers
 // ============================================================================
 
@@ -800,6 +873,22 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/control/spec/:id",
             get(ui_bridge_get_spec_handler),
+        )
+        .route(
+            "/ui-bridge/control/page/refresh",
+            post(ui_bridge_page_refresh_handler),
+        )
+        .route(
+            "/ui-bridge/control/page/navigate",
+            post(ui_bridge_page_navigate_handler),
+        )
+        .route(
+            "/ui-bridge/control/page/back",
+            post(ui_bridge_page_go_back_handler),
+        )
+        .route(
+            "/ui-bridge/control/page/forward",
+            post(ui_bridge_page_go_forward_handler),
         )
         .route("/ui-bridge/explore", post(start_ui_bridge_exploration))
         .route(

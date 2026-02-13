@@ -42,7 +42,7 @@ import {
   History,
   Database,
 } from "lucide-react";
-import type { ExternalElement, CommandResult, PageContext } from "../../hooks/useExternalUIBridge";
+import type { ExternalElement, CommandResult, PageContext } from "../../types/ui-bridge-types";
 import {
   ElementDescriptionService,
   type PersistedElementDescription,

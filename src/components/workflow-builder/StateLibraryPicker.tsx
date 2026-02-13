@@ -242,7 +242,11 @@ export function StateLibraryPicker({ isOpen, onClose, onSelect, phase }: StateLi
 
         {/* Footer */}
         <div className="flex items-center justify-between px-4 py-3 border-t border-neutral-700 bg-neutral-800/50">
-          <span className="text-sm text-muted-foreground">
+          <span
+            data-content-role="metric"
+            data-content-label="available state count"
+            className="text-sm text-muted-foreground"
+          >
             {filteredStates.length} state{filteredStates.length !== 1 ? "s" : ""} available
           </span>
           <div className="flex items-center gap-2">

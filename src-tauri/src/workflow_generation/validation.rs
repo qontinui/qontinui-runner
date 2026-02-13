@@ -45,24 +45,10 @@ pub fn validate_workflow(workflow: &UnifiedWorkflow) -> Vec<ValidationError> {
     validate_steps(&workflow.agentic_steps, "agentic", &mut errors);
     validate_steps(&workflow.completion_steps, "completion", &mut errors);
 
-    // Validate agentic steps - only prompts allowed
-    for (i, step) in workflow.agentic_steps.iter().enumerate() {
-        if let Some(step_type) = step.get("type").and_then(|v| v.as_str()) {
-            if step_type != "prompt" {
-                errors.push(ValidationError {
-                    field: format!("agentic_steps[{}]", i),
-                    message: format!(
-                        "Agentic phase can only contain 'prompt' steps, found '{}'",
-                        step_type
-                    ),
-                });
-            }
-        }
-    }
-
-    // Validate phase constraints for all steps
+    // Validate phase constraints for all steps (including agentic = prompt-only)
     validate_phase_constraints(&workflow.setup_steps, "setup", &mut errors);
     validate_phase_constraints(&workflow.verification_steps, "verification", &mut errors);
+    validate_phase_constraints(&workflow.agentic_steps, "agentic", &mut errors);
     validate_phase_constraints(&workflow.completion_steps, "completion", &mut errors);
 
     // Validate timestamps
@@ -135,9 +121,13 @@ fn validate_steps(steps: &[Value], expected_phase: &str, errors: &mut Vec<Valida
     }
 }
 
-fn validate_phase_constraints(steps: &[Value], phase: &str, errors: &mut Vec<ValidationError>) {
-    let allowed_types: Vec<&str> = match phase {
-        "setup" => vec![
+/// Returns the step types allowed in a given phase.
+///
+/// This is the single source of truth for phase constraints, used by both
+/// validation and the metadata registry.
+pub fn allowed_types_for_phase(phase: &str) -> &'static [&'static str] {
+    match phase {
+        "setup" => &[
             "script",
             "state",
             "workflow_ref",
@@ -146,12 +136,14 @@ fn validate_phase_constraints(steps: &[Value], phase: &str, errors: &mut Vec<Val
             "mcp_call",
             "prompt",
             "shell_command",
+            "check_group",
+            "macro",
             "awas_discover",
             "awas_execute",
             "awas_check_support",
             "awas_list_actions",
         ],
-        "verification" => vec![
+        "verification" => &[
             "test",
             "check",
             "screenshot",
@@ -161,19 +153,30 @@ fn validate_phase_constraints(steps: &[Value], phase: &str, errors: &mut Vec<Val
             "api_request",
             "mcp_call",
             "prompt",
+            "spec",
+            "gate",
+            "check_group",
+            "macro",
             "awas_execute",
             "awas_list_actions",
             "awas_extract_elements",
         ],
-        "completion" => vec![
+        "completion" => &[
             "prompt",
             "script",
             "api_request",
             "mcp_call",
             "shell_command",
+            "check_group",
+            "macro",
         ],
-        _ => vec![],
-    };
+        "agentic" => &["prompt"],
+        _ => &[],
+    }
+}
+
+fn validate_phase_constraints(steps: &[Value], phase: &str, errors: &mut Vec<ValidationError>) {
+    let allowed_types = allowed_types_for_phase(phase);
 
     for (i, step) in steps.iter().enumerate() {
         if let Some(step_type) = step.get("type").and_then(|v| v.as_str()) {
@@ -267,6 +270,7 @@ mod tests {
             health_check_enabled: true,
             health_check_urls: vec![],
             preflight_check_enabled: true,
+            generated_by_task_run_id: None,
             targeted_error_ids: vec![],
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),

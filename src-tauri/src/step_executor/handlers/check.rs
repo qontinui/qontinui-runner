@@ -53,6 +53,11 @@ impl StepHandler for CheckHandler {
             return Self::execute_http_status_check(step, step_name, timeout_secs, context).await;
         }
 
+        // Handle ai_review check type - AI-based semantic review
+        if check_type == "ai_review" {
+            return Self::execute_ai_review_check(step, step_name, timeout_secs, context).await;
+        }
+
         // Detect project type from working directory
         let detected_language = Self::detect_language(working_directory.as_deref().unwrap_or("."));
 
@@ -591,6 +596,215 @@ impl CheckHandler {
                 metadata,
             )
             .await;
+    }
+
+    /// Execute AI review check — uses AI to semantically review a file
+    async fn execute_ai_review_check(
+        step: &ExecutionStepConfig,
+        step_name: &str,
+        _timeout_secs: Option<u64>,
+        context: &HandlerContext,
+    ) -> StepHandlerResult {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static AI_REVIEW_SEQUENCE: AtomicU32 = AtomicU32::new(1);
+        let seq_num = AI_REVIEW_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+        let action_id = format!("ai-review-{}", seq_num);
+        let action_name = format!("AI REVIEW: {}", step_name);
+
+        // Read the input file
+        let input_path = match &step.ai_review_input_path {
+            Some(p) => p.clone(),
+            None => {
+                return StepHandlerResult::failure(
+                    "ai_review_input_path is required for ai_review check",
+                );
+            }
+        };
+
+        let input_content = match std::fs::read_to_string(&input_path) {
+            Ok(content) => content,
+            Err(e) => {
+                return StepHandlerResult::failure(format!(
+                    "Failed to read input file '{}': {}",
+                    input_path, e
+                ));
+            }
+        };
+
+        // Optionally run deterministic workflow validation first
+        if step.ai_review_validate_as_workflow.unwrap_or(false) {
+            match serde_json::from_str::<crate::unified_workflows::UnifiedWorkflow>(&input_content)
+            {
+                Ok(workflow) => {
+                    let errors =
+                        crate::workflow_generation::validation::validate_workflow(&workflow);
+                    if !errors.is_empty() {
+                        let issues: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+                        return StepHandlerResult::failure_with_data(
+                            format!("Structural validation failed: {} issues", issues.len()),
+                            json!({
+                                "passed": false,
+                                "issues": issues,
+                                "validation_type": "structural"
+                            }),
+                        );
+                    }
+                }
+                Err(e) => {
+                    return StepHandlerResult::failure_with_data(
+                        format!("Input is not valid workflow JSON: {}", e),
+                        json!({
+                            "passed": false,
+                            "issues": [format!("JSON parse error: {}", e)],
+                            "validation_type": "structural"
+                        }),
+                    );
+                }
+            }
+        }
+
+        // Build the AI review prompt
+        let review_prompt = step
+            .ai_review_prompt
+            .as_deref()
+            .unwrap_or("Review the following content for correctness, completeness, and quality.");
+
+        let full_prompt = format!(
+            "{}\n\n## Input to Review\n\n{}\n\n## Output Format\nReturn ONLY a JSON object (no markdown fencing): {{\"passed\": bool, \"issues\": [\"issue description\", ...]}}",
+            review_prompt, input_content
+        );
+
+        let metadata = json!({
+            "check_type": "ai_review",
+            "input_path": &input_path,
+            "validate_as_workflow": step.ai_review_validate_as_workflow.unwrap_or(false),
+        });
+
+        let (timestamp, sequence) =
+            Self::emit_started(context, &action_id, &action_name, metadata).await;
+
+        let start = std::time::Instant::now();
+
+        // Run AI in spawn_blocking (run_prompt_with_routing is sync)
+        let task_context = crate::ai_router::TaskContext::from_prompt(&full_prompt);
+        let prompt_clone = full_prompt.clone();
+        let doctor_handle = context.app_state.doctor_handle.lock().await.clone();
+        let ai_result = tokio::task::spawn_blocking(move || {
+            crate::ai_provider::run_prompt_with_routing(
+                &prompt_clone,
+                &task_context,
+                doctor_handle.as_ref(),
+            )
+        })
+        .await;
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        let result = match ai_result {
+            Ok(response) => {
+                if !response.success {
+                    let err = response
+                        .error
+                        .unwrap_or_else(|| "AI review failed".to_string());
+                    (false, err, None)
+                } else {
+                    // Try to parse JSON response
+                    let output = response.output;
+                    // Strip markdown code fences if present
+                    let json_str = output
+                        .trim()
+                        .strip_prefix("```json")
+                        .or_else(|| output.trim().strip_prefix("```"))
+                        .unwrap_or(output.trim())
+                        .strip_suffix("```")
+                        .unwrap_or(output.trim())
+                        .trim();
+
+                    match serde_json::from_str::<serde_json::Value>(json_str) {
+                        Ok(parsed) => {
+                            let passed = parsed
+                                .get("passed")
+                                .and_then(|p| p.as_bool())
+                                .unwrap_or(false);
+                            let issues: Vec<String> = parsed
+                                .get("issues")
+                                .and_then(|i| i.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+
+                            if passed {
+                                (
+                                    true,
+                                    String::new(),
+                                    Some(json!({ "passed": true, "issues": issues })),
+                                )
+                            } else {
+                                let issue_summary = issues.join("; ");
+                                (
+                                    false,
+                                    format!("AI review failed: {}", issue_summary),
+                                    Some(json!({ "passed": false, "issues": issues })),
+                                )
+                            }
+                        }
+                        Err(_) => {
+                            // If we can't parse as JSON, treat non-empty output as issues
+                            (
+                                false,
+                                format!("AI review returned non-JSON response: {}", json_str),
+                                Some(
+                                    json!({ "passed": false, "issues": [json_str], "raw_output": true }),
+                                ),
+                            )
+                        }
+                    }
+                }
+            }
+            Err(e) => (false, format!("Failed to run AI review: {}", e), None),
+        };
+
+        let (success, error_msg, output_data) = result;
+
+        let result_metadata = json!({
+            "check_type": "ai_review",
+            "input_path": &input_path,
+            "duration_ms": duration_ms,
+        });
+
+        if success {
+            Self::emit_completed(
+                context,
+                &action_id,
+                &action_name,
+                timestamp,
+                sequence,
+                result_metadata,
+            )
+            .await;
+            match output_data {
+                Some(data) => StepHandlerResult::success_with_data(data),
+                None => StepHandlerResult::success(),
+            }
+        } else {
+            Self::emit_failed(
+                context,
+                &action_id,
+                &action_name,
+                timestamp,
+                sequence,
+                &error_msg,
+                Some(result_metadata),
+            )
+            .await;
+            match output_data {
+                Some(data) => StepHandlerResult::failure_with_data(error_msg, data),
+                None => StepHandlerResult::failure(error_msg),
+            }
+        }
     }
 
     /// Execute HTTP status check

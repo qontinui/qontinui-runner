@@ -436,15 +436,31 @@ export function AiGenerateWorkflowModal({
               <div className="p-3 bg-green-500/10 border border-green-500/30 rounded-md">
                 <div className="flex items-center gap-2 mb-2">
                   <Check className="w-4 h-4 text-green-500" />
-                  <span className="font-medium text-green-400">{generatedWorkflow.name}</span>
+                  <span
+                    data-content-role="label"
+                    data-content-label="generated workflow name"
+                    className="font-medium text-green-400"
+                  >
+                    {generatedWorkflow.name}
+                  </span>
                 </div>
                 <p className="text-sm text-muted-foreground">{generatedWorkflow.description}</p>
                 <div className="flex items-center gap-4 mt-2 text-xs text-muted-foreground">
-                  <span>{getStepCount(generatedWorkflow)} steps</span>
-                  <span>Setup: {generatedWorkflow.setup_steps?.length || 0}</span>
-                  <span>Verification: {generatedWorkflow.verification_steps?.length || 0}</span>
-                  <span>Agentic: {generatedWorkflow.agentic_steps?.length || 0}</span>
-                  <span>Completion: {generatedWorkflow.completion_steps?.length || 0}</span>
+                  <span data-content-role="metric" data-content-label="total step count">
+                    {getStepCount(generatedWorkflow)} steps
+                  </span>
+                  <span data-content-role="metric" data-content-label="setup step count">
+                    Setup: {generatedWorkflow.setup_steps?.length || 0}
+                  </span>
+                  <span data-content-role="metric" data-content-label="verification step count">
+                    Verification: {generatedWorkflow.verification_steps?.length || 0}
+                  </span>
+                  <span data-content-role="metric" data-content-label="agentic step count">
+                    Agentic: {generatedWorkflow.agentic_steps?.length || 0}
+                  </span>
+                  <span data-content-role="metric" data-content-label="completion step count">
+                    Completion: {generatedWorkflow.completion_steps?.length || 0}
+                  </span>
                 </div>
               </div>
 
@@ -453,7 +469,12 @@ export function AiGenerateWorkflowModal({
                 <div className="p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-md">
                   <div className="flex items-center gap-2 mb-2">
                     <AlertCircle className="w-4 h-4 text-yellow-500" />
-                    <span className="text-sm font-medium text-yellow-400">Validation Warnings</span>
+                    <span
+                      data-content-role="heading"
+                      className="text-sm font-medium text-yellow-400"
+                    >
+                      Validation Warnings
+                    </span>
                   </div>
                   <ul className="text-xs text-yellow-400/80 space-y-1 ml-6 list-disc">
                     {validationErrors.map((err, i) => (
@@ -466,7 +487,10 @@ export function AiGenerateWorkflowModal({
               {/* JSON Preview */}
               {showPreview && (
                 <div className="border border-border rounded-md overflow-hidden">
-                  <div className="px-3 py-2 bg-muted text-xs font-medium text-muted-foreground">
+                  <div
+                    data-content-role="heading"
+                    className="px-3 py-2 bg-muted text-xs font-medium text-muted-foreground"
+                  >
                     JSON Preview
                   </div>
                   <pre className="p-3 text-xs overflow-x-auto max-h-60 bg-background/50 text-foreground/80">

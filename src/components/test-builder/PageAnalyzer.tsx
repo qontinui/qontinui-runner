@@ -44,7 +44,8 @@ import type {
 import { createAnalysisFromStepOutput } from "./types";
 import type { SavedApiRequest } from "../../types";
 import { stepOutputRegistry } from "../../lib/step-output-handlers";
-import { useLiveBrowser, type DiscoveredElement } from "../../hooks/useLiveBrowser";
+import { useSdkUIBridge } from "../../hooks/useSdkUIBridge";
+import type { ExternalElement } from "../../types/ui-bridge-types";
 
 // Script info from the Scripts library API
 interface PlaywrightScript {
@@ -102,8 +103,9 @@ export function PageAnalyzer({ onAnalysisComplete, initialAnalyses }: PageAnalyz
   const [selectedStepOutputIds, setSelectedStepOutputIds] = useState<string[]>([]);
   const [loadingStepOutputs, setLoadingStepOutputs] = useState(false);
 
-  // Live browser (for live capture mode)
-  const liveBrowser = useLiveBrowser();
+  // SDK UI Bridge connection (replaces removed Chrome extension)
+  const sdk = useSdkUIBridge();
+  const [sdkUrlInput, setSdkUrlInput] = useState("");
 
   // Load Playwright scripts when mode changes
   useEffect(() => {
@@ -339,50 +341,51 @@ export function PageAnalyzer({ onAnalysisComplete, initialAnalyses }: PageAnalyz
     setAddMode(null);
   }, [selectedStepOutputIds, recentStepOutputs]);
 
-  // Capture elements from live browser and create analysis
+  // Capture elements from SDK-connected app and create analysis
   const captureLiveBrowserAnalysis = useCallback(() => {
-    if (liveBrowser.elements.length === 0) {
-      setError("No elements discovered. Connect to a browser tab and refresh elements.");
+    if (sdk.elements.length === 0) {
+      setError("No elements discovered. Connect to an SDK app and refresh elements.");
       return;
     }
 
-    const liveBrowserElements: LiveBrowserElement[] = liveBrowser.elements.map(
-      (el: DiscoveredElement) => ({
-        id: el.id,
-        tagName: el.tagName,
-        type: el.type,
-        text: el.text,
-        label: el.label,
-        value: el.value,
-        checked: el.checked,
-        visible: el.visible,
-        enabled: el.enabled,
-        bounds: {
-          x: el.bounds.x,
-          y: el.bounds.y,
-          width: el.bounds.width,
-          height: el.bounds.height,
-        },
-      }),
-    );
+    const liveBrowserElements: LiveBrowserElement[] = sdk.elements.map((el: ExternalElement) => ({
+      id: el.id,
+      tagName: el.tagName,
+      type: el.type,
+      text: el.text,
+      label: el.label,
+      value: el.value,
+      checked: el.checked,
+      visible: el.visible,
+      enabled: el.enabled,
+      bounds: {
+        x: el.bounds.x,
+        y: el.bounds.y,
+        width: el.bounds.width,
+        height: el.bounds.height,
+      },
+    }));
+
+    const appUrl = sdk.connectedApp?.port ? `http://localhost:${sdk.connectedApp.port}` : "";
+    const appName = sdk.connectedApp?.appName || "SDK App";
 
     const analysisData: LiveBrowserAnalysis = {
       elements: liveBrowserElements,
-      url: liveBrowser.connectedTarget?.url ?? "",
-      title: liveBrowser.connectedTarget?.name ?? "Browser Tab",
+      url: appUrl,
+      title: appName,
       captured_at: new Date().toISOString(),
     };
 
     const newAnalysis: CollectedAnalysis = {
       type: "live_browser",
       id: generateId(),
-      name: liveBrowser.connectedTarget?.name ?? "Live Capture",
+      name: appName,
       data: analysisData,
     };
 
     setAnalyses((prev) => [...prev, newAnalysis]);
     setAddMode(null);
-  }, [liveBrowser.elements, liveBrowser.connectedTarget]);
+  }, [sdk.elements, sdk.connectedApp]);
 
   // Toggle step output selection
   const toggleStepOutputSelection = useCallback((id: string) => {
@@ -473,9 +476,15 @@ export function PageAnalyzer({ onAnalysisComplete, initialAnalyses }: PageAnalyz
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-2">
           <Camera className="w-5 h-5 text-blue-400" />
-          <h3 className="text-sm font-medium text-neutral-200">Collected Analyses</h3>
+          <h3 data-content-role="heading" className="text-sm font-medium text-neutral-200">
+            Collected Analyses
+          </h3>
           {analyses.length > 0 && (
-            <span className="px-1.5 py-0.5 text-xs bg-blue-500/20 text-blue-400 rounded">
+            <span
+              data-content-role="metric"
+              data-content-label="analysis count"
+              className="px-1.5 py-0.5 text-xs bg-blue-500/20 text-blue-400 rounded"
+            >
               {analyses.length}
             </span>
           )}
@@ -536,7 +545,6 @@ export function PageAnalyzer({ onAnalysisComplete, initialAnalyses }: PageAnalyz
                   onClick={() => {
                     setAddMode("live_browser");
                     setShowAddMenu(false);
-                    liveBrowser.refreshTargets();
                   }}
                   className="w-full flex items-center gap-2 px-3 py-2 text-sm text-neutral-300 hover:bg-neutral-700 rounded"
                   data-ui-id="test-builder-add-live-capture-btn"
@@ -701,7 +709,11 @@ export function PageAnalyzer({ onAnalysisComplete, initialAnalyses }: PageAnalyz
                               <span className="text-sm text-neutral-200 truncate">
                                 {output.step_name}
                               </span>
-                              <span className="text-xs px-1.5 py-0.5 bg-neutral-700 text-neutral-400 rounded">
+                              <span
+                                data-content-role="badge"
+                                data-content-label="step type"
+                                className="text-xs px-1.5 py-0.5 bg-neutral-700 text-neutral-400 rounded"
+                              >
                                 {output.step_type}
                               </span>
                             </div>
@@ -716,7 +728,11 @@ export function PageAnalyzer({ onAnalysisComplete, initialAnalyses }: PageAnalyz
                   )}
 
                   {selectedStepOutputIds.length > 0 && (
-                    <div className="text-xs text-orange-400">
+                    <div
+                      data-content-role="metric"
+                      data-content-label="selected outputs count"
+                      className="text-xs text-orange-400"
+                    >
                       {selectedStepOutputIds.length} output(s) selected
                     </div>
                   )}
@@ -753,64 +769,68 @@ export function PageAnalyzer({ onAnalysisComplete, initialAnalyses }: PageAnalyz
             </div>
           )}
 
-          {/* Live Browser Options */}
+          {/* Live Browser (SDK) Options */}
           {addMode === "live_browser" && (
             <div className="space-y-3">
-              {/* Browser tabs */}
-              {liveBrowser.isLoadingTargets ? (
-                <div className="flex items-center gap-2 text-sm text-neutral-500">
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                  Loading tabs...
-                </div>
-              ) : liveBrowser.connectionStatus === "connected" && liveBrowser.connectedTarget ? (
+              {sdk.connectionStatus === "connected" && sdk.connectedApp ? (
                 <div className="space-y-2">
                   <div className="flex items-center gap-2 p-2 bg-cyan-500/10 border border-cyan-500/30 rounded">
                     <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
                     <span className="text-sm text-cyan-400 truncate flex-1">
-                      {liveBrowser.connectedTarget.name}
+                      {sdk.connectedApp.appName || "SDK App"}
                     </span>
                     <button
-                      onClick={liveBrowser.disconnect}
+                      onClick={() => {
+                        sdk.disconnect();
+                        setSdkUrlInput("");
+                      }}
                       className="text-xs text-neutral-400 hover:text-neutral-200"
                     >
                       Disconnect
                     </button>
                   </div>
                   <div className="text-xs text-neutral-400">
-                    {liveBrowser.elements.length} elements discovered
-                    {liveBrowser.isLoadingElements && (
+                    {sdk.elements.length} elements discovered
+                    {sdk.isLoadingElements && (
                       <Loader2 className="w-3 h-3 animate-spin inline ml-1" />
                     )}
                   </div>
                 </div>
-              ) : liveBrowser.browserTabs.length === 0 ? (
-                <p className="text-sm text-neutral-400">No browser tabs found.</p>
               ) : (
-                <div className="max-h-48 overflow-y-auto space-y-1">
-                  {liveBrowser.browserTabs.map((tab) => (
-                    <div
-                      key={tab.id}
-                      className="flex items-center gap-2 p-2 bg-neutral-900 border border-neutral-700 rounded hover:border-neutral-600"
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      value={sdkUrlInput}
+                      onChange={(e) => setSdkUrlInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && sdk.connectionStatus !== "connected") {
+                          sdk.connect(sdkUrlInput.trim());
+                        }
+                      }}
+                      placeholder="http://localhost:3001"
+                      disabled={sdk.connectionStatus === "connecting"}
+                      className="flex-1 px-3 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-sm text-neutral-200 placeholder:text-neutral-500 focus:outline-none focus:border-cyan-500 disabled:opacity-60"
+                    />
+                    <button
+                      onClick={() => sdk.connect(sdkUrlInput.trim())}
+                      disabled={sdk.connectionStatus === "connecting" || !sdkUrlInput.trim()}
+                      className="flex items-center gap-1 px-3 py-1.5 text-xs bg-cyan-600 hover:bg-cyan-500 text-white rounded transition-colors disabled:opacity-50"
                     >
-                      <Globe className="w-3.5 h-3.5 text-neutral-500 flex-shrink-0" />
-                      <div className="flex-1 min-w-0">
-                        <p className="text-xs text-neutral-200 truncate">{tab.title}</p>
-                        <p className="text-[10px] text-neutral-500 truncate">{tab.url}</p>
-                      </div>
-                      <button
-                        onClick={() => liveBrowser.connectToTab(tab.id)}
-                        disabled={liveBrowser.connectionStatus === "connecting"}
-                        className="flex items-center gap-1 px-2 py-1 text-xs bg-cyan-600 hover:bg-cyan-500 text-white rounded transition-colors disabled:opacity-50"
-                      >
-                        {liveBrowser.connectionStatus === "connecting" ? (
-                          <Loader2 className="w-3 h-3 animate-spin" />
-                        ) : (
-                          <Play className="w-3 h-3" />
-                        )}
-                        Connect
-                      </button>
-                    </div>
-                  ))}
+                      {sdk.connectionStatus === "connecting" ? (
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                      ) : (
+                        <Play className="w-3 h-3" />
+                      )}
+                      {sdk.connectionStatus === "connecting" ? "..." : "Connect"}
+                    </button>
+                  </div>
+                  {sdk.error && <p className="text-xs text-red-400">{sdk.error}</p>}
+                  {sdk.connectionStatus === "disconnected" && (
+                    <p className="text-xs text-neutral-500">
+                      Enter the URL of an SDK-integrated app to connect.
+                    </p>
+                  )}
                 </div>
               )}
             </div>
@@ -839,8 +859,7 @@ export function PageAnalyzer({ onAnalysisComplete, initialAnalyses }: PageAnalyz
               isAnalyzing ||
               (addMode === "playwright" && !selectedScriptId) ||
               (addMode === "live_browser" &&
-                (liveBrowser.connectionStatus !== "connected" ||
-                  liveBrowser.elements.length === 0)) ||
+                (sdk.connectionStatus !== "connected" || sdk.elements.length === 0)) ||
               (addMode === "step_output" &&
                 stepOutputMode === "recent" &&
                 selectedStepOutputIds.length === 0) ||
@@ -857,7 +876,7 @@ export function PageAnalyzer({ onAnalysisComplete, initialAnalyses }: PageAnalyz
             ) : addMode === "live_browser" ? (
               <>
                 <Zap className="w-4 h-4" />
-                Capture Elements ({liveBrowser.elements.length})
+                Capture Elements ({sdk.elements.length})
               </>
             ) : addMode === "step_output" && stepOutputMode === "recent" ? (
               <>
@@ -903,12 +922,26 @@ export function PageAnalyzer({ onAnalysisComplete, initialAnalyses }: PageAnalyz
             <div key={analysis.id}>
               <div className="grid grid-cols-[auto_1fr_auto_auto] gap-4 px-4 py-3 items-center hover:bg-neutral-800/50">
                 <span
+                  data-content-role="badge"
+                  data-content-label="analysis type"
                   className={`px-2 py-0.5 text-xs font-medium rounded ${getTypeBadge(analysis.type)}`}
                 >
                   {getTypeLabel(analysis)}
                 </span>
-                <span className="text-sm text-neutral-200 truncate">{analysis.name}</span>
-                <span className="text-xs text-neutral-400">{getItemCount(analysis)}</span>
+                <span
+                  data-content-role="label"
+                  data-content-label="analysis name"
+                  className="text-sm text-neutral-200 truncate"
+                >
+                  {analysis.name}
+                </span>
+                <span
+                  data-content-role="metric"
+                  data-content-label="analysis item count"
+                  className="text-xs text-neutral-400"
+                >
+                  {getItemCount(analysis)}
+                </span>
                 <div className="flex items-center gap-1">
                   <button
                     onClick={() => setExpandedId(expandedId === analysis.id ? null : analysis.id)}
@@ -1148,7 +1181,11 @@ export function PageAnalyzer({ onAnalysisComplete, initialAnalyses }: PageAnalyz
         <div className="mt-4 p-3 bg-neutral-800/50 border border-neutral-700 rounded-lg">
           <div className="flex items-center gap-2 text-sm">
             <Check className="w-4 h-4 text-green-400" />
-            <span className="text-neutral-200">
+            <span
+              data-content-role="status"
+              data-content-label="analyses ready status"
+              className="text-neutral-200"
+            >
               {analyses.length} {analyses.length === 1 ? "analysis" : "analyses"} ready for AI test
               generation
             </span>

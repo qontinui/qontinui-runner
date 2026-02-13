@@ -18,7 +18,7 @@
  *   iOS:          https://developer.apple.com/documentation/uikit/uiaccessibility
  */
 
-import type { ExternalElement } from "../../hooks/useExternalUIBridge";
+import type { ExternalElement } from "../../types/ui-bridge-types";
 
 // =============================================================================
 // Shared helpers

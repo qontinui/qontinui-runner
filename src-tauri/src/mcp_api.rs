@@ -73,7 +73,7 @@ use crate::mcp::awas::{
 };
 
 use crate::mcp::shared::get_workspace_paths_internal;
-use crate::mcp::types::{ApiResponse, ApiState, ExtensionState};
+use crate::mcp::types::{ApiResponse, ApiState};
 
 /// Health check endpoint
 async fn health() -> Json<ApiResponse<String>> {
@@ -128,14 +128,7 @@ pub fn create_router(
             crate::mcp::sdk_client::SdkConnectionManager::new(),
         )),
         ui_bridge_pending: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        extension: ExtensionState {
-            ws_sender: Arc::new(tokio::sync::Mutex::new(None)),
-            pending_requests: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-            connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            last_pong: Arc::new(std::sync::atomic::AtomicI64::new(0)),
-            connected_since: Arc::new(std::sync::atomic::AtomicI64::new(0)),
-            reconnect_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        },
+        doctor_handle: None, // Doctor handle accessed via app_state.doctor_handle when needed
     });
 
     // Set up UI Bridge response listener
@@ -258,10 +251,29 @@ pub fn create_router(
         }
     });
 
+    // Sync workflows from web backend on startup (background task)
+    {
+        let db = api_state.app_state.checkpoint_db.clone();
+        tokio::spawn(async move {
+            // Wait for server to start and auth to be available
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+            match crate::mcp::web_backend_workflows::sync_workflows_from_backend(&db).await {
+                Ok(count) => {
+                    if count > 0 {
+                        info!("Synced {} workflows from web backend", count);
+                    }
+                }
+                Err(e) => {
+                    warn!("Workflow sync from backend skipped: {}", e);
+                }
+            }
+        });
+    }
+
     // CORS: Permissive (allow any origin) is intentional.
     // This localhost-only API (port 9876) must be accessible from:
     //   - The Tauri webview (tauri://localhost origin)
-    //   - Chrome extension (chrome-extension:// origin)
     //   - External MCP clients (Claude Desktop, Cursor, etc.)
     //   - WSL environments
     // Adding origin restrictions would break MCP client compatibility.
@@ -291,7 +303,6 @@ pub fn create_router(
         .merge(crate::mcp::contexts::routes())
         .merge(crate::mcp::dom_capture::routes())
         .merge(crate::mcp::error_monitor::routes())
-        .merge(crate::mcp::extension::routes())
         .merge(crate::mcp::extraction::routes())
         .merge(crate::mcp::findings_api::routes())
         .merge(crate::mcp::hooks::routes())
@@ -304,6 +315,7 @@ pub fn create_router(
         .merge(crate::mcp::monitors::routes())
         .merge(crate::mcp::playwright::routes())
         .merge(crate::mcp::prompts::routes())
+        .merge(crate::mcp::query_tool::routes())
         .merge(crate::mcp::rag::routes())
         .merge(crate::mcp::recordings::routes())
         .merge(crate::mcp::saved_api_requests::routes())
@@ -312,6 +324,7 @@ pub fn create_router(
         .merge(crate::mcp::settings::routes())
         .merge(crate::mcp::shell_commands::routes())
         .merge(crate::mcp::state_explorer::routes())
+        .merge(crate::mcp::step_type_metadata_api::routes())
         .merge(crate::mcp::task_runs::routes())
         .merge(crate::mcp::testing::routes())
         .merge(crate::mcp::ui_bridge::routes())

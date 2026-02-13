@@ -25,7 +25,7 @@ import { listen, emit, type UnlistenFn } from "@tauri-apps/api/event";
 import { useUIBridge } from "ui-bridge";
 import type { SpecGroup, SpecGroupResult, SpecExecutionOptions } from "@qontinui/ui-bridge/specs";
 import { executeSpecGroup, externalToDiscovered } from "../lib/spec-execution";
-import type { ExternalElement } from "./useExternalUIBridge";
+import type { ExternalElement } from "../types/ui-bridge-types";
 
 /**
  * Payload for spec execution requests from Rust

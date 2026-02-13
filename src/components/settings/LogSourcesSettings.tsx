@@ -321,7 +321,13 @@ export function LogSourcesSettings({ onLog }: LogSourcesSettingsProps) {
             <ChevronRight className="w-4 h-4" />
           )}
           <Sparkles className="w-4 h-4 text-primary" />
-          <span className="font-medium text-sm">AI Source Selection</span>
+          <span
+            data-content-role="heading"
+            data-content-label="ai source selection"
+            className="font-medium text-sm"
+          >
+            AI Source Selection
+          </span>
         </button>
 
         {expandedSections.aiSettings && (
@@ -387,7 +393,13 @@ export function LogSourcesSettings({ onLog }: LogSourcesSettingsProps) {
             ) : (
               <ChevronRight className="w-4 h-4" />
             )}
-            <span className="font-medium text-sm">Log Sources ({settings.sources.length})</span>
+            <span
+              data-content-role="heading"
+              data-content-label="log sources count"
+              className="font-medium text-sm"
+            >
+              Log Sources ({settings.sources.length})
+            </span>
           </button>
           <button
             onClick={() => setShowAddSource(true)}
@@ -434,7 +446,13 @@ export function LogSourcesSettings({ onLog }: LogSourcesSettingsProps) {
             ) : (
               <ChevronRight className="w-4 h-4" />
             )}
-            <span className="font-medium text-sm">Profiles ({settings.profiles.length})</span>
+            <span
+              data-content-role="heading"
+              data-content-label="profiles count"
+              className="font-medium text-sm"
+            >
+              Profiles ({settings.profiles.length})
+            </span>
           </button>
           <button
             onClick={() => setShowAddProfile(true)}
@@ -542,10 +560,26 @@ function SourceRow({
         style={{ backgroundColor: source.color || getCategoryColor(source.category) }}
       />
       <div className="flex-1 min-w-0">
-        <div className="text-sm font-medium truncate">{source.name}</div>
-        <div className="text-xs text-muted-foreground truncate">{source.path}</div>
+        <div
+          data-content-role="label"
+          data-content-label="source name"
+          className="text-sm font-medium truncate"
+        >
+          {source.name}
+        </div>
+        <div
+          data-content-role="body-text"
+          data-content-label="source path"
+          className="text-xs text-muted-foreground truncate"
+        >
+          {source.path}
+        </div>
       </div>
-      <span className="px-1.5 py-0.5 text-[10px] bg-muted rounded capitalize">
+      <span
+        data-content-role="badge"
+        data-content-label="source category"
+        className="px-1.5 py-0.5 text-[10px] bg-muted rounded capitalize"
+      >
         {source.category}
       </span>
       <div className="flex items-center gap-1">
@@ -591,14 +625,28 @@ function ProfileRow({
     <div className="flex items-center gap-3 p-2 rounded-md bg-muted/30">
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">
-          <span className="text-sm font-medium">{profile.name}</span>
+          <span
+            data-content-role="label"
+            data-content-label="profile name"
+            className="text-sm font-medium"
+          >
+            {profile.name}
+          </span>
           {isDefault && (
-            <span className="px-1.5 py-0.5 text-[10px] bg-primary/20 text-primary rounded">
+            <span
+              data-content-role="badge"
+              data-content-label="default profile badge"
+              className="px-1.5 py-0.5 text-[10px] bg-primary/20 text-primary rounded"
+            >
               Default
             </span>
           )}
         </div>
-        <div className="text-xs text-muted-foreground">
+        <div
+          data-content-role="metric"
+          data-content-label="enabled sources count"
+          className="text-xs text-muted-foreground"
+        >
           {enabledCount}/{sourceCount} sources enabled
         </div>
       </div>

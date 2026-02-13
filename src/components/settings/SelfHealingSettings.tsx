@@ -200,7 +200,13 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="text-muted-foreground">Loading self-healing settings...</div>
+        <div
+          data-content-role="status"
+          data-content-label="loading self-healing settings"
+          className="text-muted-foreground"
+        >
+          Loading self-healing settings...
+        </div>
       </div>
     );
   }
@@ -418,7 +424,11 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
               {/* Local Ollama Settings */}
               {settings.llm_mode === "local_ollama" && (
                 <div className="space-y-4 p-3 bg-muted/30 rounded-lg">
-                  <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+                  <div
+                    data-content-role="heading"
+                    data-content-label="ollama config heading"
+                    className="flex items-center gap-2 text-xs font-medium text-muted-foreground"
+                  >
                     <Server className="w-4 h-4" />
                     Local Ollama Configuration
                   </div>
@@ -447,7 +457,11 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
               {/* Remote API Settings */}
               {settings.llm_mode === "remote_api" && (
                 <div className="space-y-4 p-3 bg-muted/30 rounded-lg">
-                  <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+                  <div
+                    data-content-role="heading"
+                    data-content-label="remote api config heading"
+                    className="flex items-center gap-2 text-xs font-medium text-muted-foreground"
+                  >
                     <Cloud className="w-4 h-4" />
                     Remote API Configuration
                   </div>
@@ -480,7 +494,11 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
                     </label>
                     {hasApiKey ? (
                       <div className="flex items-center gap-2">
-                        <div className="flex-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md text-muted-foreground">
+                        <div
+                          data-content-role="status"
+                          data-content-label="api key configured"
+                          className="flex-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md text-muted-foreground"
+                        >
                           API key configured
                         </div>
                         <button

@@ -5,7 +5,7 @@
  * Part of P1.3 implementation for Element Description Panel improvements.
  */
 
-import type { ExternalElement } from "../../hooks/useExternalUIBridge";
+import type { ExternalElement } from "../../types/ui-bridge-types";
 
 /**
  * Result of a selector generation with metadata

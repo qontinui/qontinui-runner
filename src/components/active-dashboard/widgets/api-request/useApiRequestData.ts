@@ -13,32 +13,25 @@ const API_BASE = "http://localhost:9876";
 const POLL_INTERVAL_MS = 2000;
 
 /**
- * Response from the step executions API.
+ * Response from the /current-execution/steps API.
  */
-interface StepExecutionResponse {
+interface CurrentExecutionStepsResponse {
   success: boolean;
-  data?: {
-    executions: Array<{
-      id: string;
-      step_type: string;
-      step_name: string;
-      status: string;
-      start_time?: number;
-      end_time?: number;
-      duration_ms?: number;
-      error?: string;
-      output?: string;
-      // API request specific
-      method?: string;
-      url?: string;
-      request_headers?: Record<string, string>;
-      request_body?: string;
-      status_code?: number;
-      response_headers?: Record<string, string>;
-      response_body?: string;
-      content_type?: string;
-    }>;
-  };
+  task_run_id: string | null;
+  executions: Array<{
+    id: string;
+    step_type: string;
+    step_name: string;
+    status: string;
+    start_time?: number;
+    end_time?: number;
+    duration_ms?: number;
+    error?: string;
+    output?: string;
+    stdout?: string;
+    command?: string;
+  }>;
+  count: number;
 }
 
 /**
@@ -51,31 +44,38 @@ export function useApiRequestData(): ApiRequestData {
   const [startTime, setStartTime] = useState<number | null>(null);
   const [elapsedTime, setElapsedTime] = useState(0);
 
-  // Fetch API request executions
+  // Fetch API request executions from /current-execution/steps
   const fetchRequests = useCallback(async () => {
     try {
-      const response = await fetch(`${API_BASE}/step-executions?type=api_request`);
+      const response = await fetch(`${API_BASE}/current-execution/steps?step_type=api_request`);
       if (response.ok) {
-        const data: StepExecutionResponse = await response.json();
-        if (data.success && data.data?.executions) {
-          const apiRequests: ApiRequestExecution[] = data.data.executions.map((exec) => ({
-            id: exec.id,
-            name: exec.step_name || `${exec.method} ${exec.url}` || "API Request",
-            status: exec.status as ApiRequestExecution["status"],
-            startTime: exec.start_time,
-            endTime: exec.end_time,
-            durationMs: exec.duration_ms,
-            error: exec.error,
-            output: exec.response_body || exec.output,
-            method: exec.method || "GET",
-            url: exec.url || "",
-            requestHeaders: exec.request_headers,
-            requestBody: exec.request_body,
-            statusCode: exec.status_code,
-            responseHeaders: exec.response_headers,
-            responseBody: exec.response_body,
-            contentType: exec.content_type,
-          }));
+        const data: CurrentExecutionStepsResponse = await response.json();
+        if (data.success && data.executions) {
+          const apiRequests: ApiRequestExecution[] = data.executions.map((exec) => {
+            // Try to parse method/url from step_name (often formatted as "METHOD URL")
+            const nameMatch = exec.step_name?.match(/^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(.+)/i);
+            const method = nameMatch?.[1]?.toUpperCase() || "GET";
+            const url = nameMatch?.[2] || "";
+
+            return {
+              id: exec.id,
+              name: exec.step_name || "API Request",
+              status: exec.status as ApiRequestExecution["status"],
+              startTime: exec.start_time,
+              endTime: exec.end_time,
+              durationMs: exec.duration_ms,
+              error: exec.error,
+              output: exec.stdout || exec.output,
+              method,
+              url,
+              requestHeaders: undefined,
+              requestBody: undefined,
+              statusCode: undefined,
+              responseHeaders: undefined,
+              responseBody: exec.output,
+              contentType: undefined,
+            };
+          });
           setRequests(apiRequests);
 
           // Set start time from first request

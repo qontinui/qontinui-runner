@@ -5,7 +5,7 @@
  * Used by the ElementDescriptionPanel to show path breadcrumbs, parent info, and siblings.
  */
 
-import type { ExternalElement } from "../../hooks/useExternalUIBridge";
+import type { ExternalElement } from "../../types/ui-bridge-types";
 
 /**
  * A path segment representing one element in the DOM path

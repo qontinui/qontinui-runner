@@ -11,6 +11,7 @@ use tauri::Emitter;
 use tracing::{debug, info, warn};
 
 use crate::database::CheckpointDb;
+use crate::doctor::DoctorHandle;
 use crate::findings::storage as finding_storage;
 use crate::findings::{Finding, FindingParser, ParsedFinding};
 use crate::mcp::shared::{emit_ai_output, AiSessionContext, FindingContext, ProgressContext};
@@ -93,11 +94,11 @@ fn run_claude_session_inline(
     prompt: &str,
     session_id: &str,
     app_handle: &tauri::AppHandle,
-    timeout_seconds: Option<u64>,
     session_ctx: Option<AiSessionContext>,
     finding_ctx: Option<FindingContext>,
     progress_ctx: Option<ProgressContext>,
     pid_tracker: Option<Arc<std::sync::Mutex<Vec<u32>>>>,
+    doctor_handle: Option<&DoctorHandle>,
 ) -> Result<(bool, String), String> {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -105,14 +106,7 @@ fn run_claude_session_inline(
     use std::thread;
     use std::time::{Duration, Instant};
 
-    let timeout_msg = match timeout_seconds {
-        Some(t) => format!("timeout: {}s", t),
-        None => "no timeout".to_string(),
-    };
-    info!(
-        "Running Claude session inline: {} ({})",
-        session_id, timeout_msg
-    );
+    info!("Running Claude session inline: {}", session_id);
 
     // Write prompt to temp file
     let temp_dir = std::env::temp_dir();
@@ -169,6 +163,27 @@ fn run_claude_session_inline(
         }
     }
 
+    // Track activity for timeout (created early so Doctor registration can use it)
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let last_activity = Arc::new(AtomicU64::new(now_secs));
+    let last_activity_stdout = last_activity.clone();
+
+    // Register with Doctor health monitoring
+    if let Some(handle) = doctor_handle {
+        let reg = crate::doctor::ProcessRegistration {
+            pid: child_pid,
+            process_type: crate::doctor::ProcessType::SessionStreaming,
+            label: format!("Claude session: {}", session_id),
+            last_activity: Some(last_activity.clone()),
+        };
+        if let Err(e) = handle.register_blocking(reg) {
+            warn!("Failed to register session with Doctor: {}", e);
+        }
+    }
+
     // Helper to remove PID from tracker when we're done
     let remove_pid = |tracker: &Option<Arc<std::sync::Mutex<Vec<u32>>>>| {
         if let Some(ref t) = tracker {
@@ -176,6 +191,10 @@ fn run_claude_session_inline(
                 pids.retain(|&p| p != child_pid);
                 info!("Unregistered AI process PID {}", child_pid);
             }
+        }
+        // Also unregister from Doctor
+        if let Some(handle) = doctor_handle {
+            let _ = handle.unregister_blocking(child_pid);
         }
     };
 
@@ -185,14 +204,6 @@ fn run_claude_session_inline(
             .write_all(&prompt_content)
             .map_err(|e| format!("Failed to write to Claude stdin: {}", e))?;
     }
-
-    // Track activity for timeout
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let last_activity = Arc::new(AtomicU64::new(now_secs));
-    let last_activity_stdout = last_activity.clone();
 
     let has_output = Arc::new(AtomicBool::new(false));
     let has_output_heartbeat = has_output.clone();
@@ -437,6 +448,14 @@ fn run_claude_session_inline(
                                 if let Err(e) = app_handle_findings.emit(event_name, &finding) {
                                     warn!("Failed to emit {} event: {}", event_name, e);
                                 }
+                                // Also broadcast to WebSocket clients
+                                if let Ok(json) = serde_json::to_value(&finding) {
+                                    crate::event_system::broadcast_ws_notification(
+                                        &app_handle_findings,
+                                        event_name,
+                                        &json,
+                                    );
+                                }
                             }));
 
                             // Also emit as AI output for visibility in the session log
@@ -557,6 +576,12 @@ fn run_claude_session_inline(
                                 {
                                     warn!("Failed to emit step_progress event: {}", e);
                                 }
+                                // Also broadcast to WebSocket clients (channel: "step-progress")
+                                crate::event_system::broadcast_ws_notification(
+                                    &app_handle_progress,
+                                    "step-progress",
+                                    &progress_event,
+                                );
                             }));
 
                             // Emit special event for STEP_COMPLETE markers (sub-step granular checkpointing)
@@ -645,65 +670,18 @@ fn run_claude_session_inline(
         output
     });
 
-    // Wait for process with optional inactivity timeout
-    // Use a safety fallback of 600s (10 min) when no timeout is configured,
-    // to prevent hanging indefinitely if the process doesn't exit cleanly.
-    let effective_timeout = timeout_seconds.unwrap_or(600);
-    let status = loop {
-        {
-            let now_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let last_activity_secs = last_activity.load(Ordering::Relaxed);
-            let inactive_secs = now_secs.saturating_sub(last_activity_secs);
-
-            if inactive_secs > effective_timeout {
-                warn!(
-                    "Session {} timed out after {}s of inactivity (configured: {:?}, effective: {}s)",
-                    session_id, inactive_secs, timeout_seconds, effective_timeout
-                );
-                let _ = child.kill();
-                thread::sleep(Duration::from_millis(500));
-                // Break with the exit status so the normal cleanup path runs
-                // and collects whatever output was accumulated before the timeout.
-                match child.try_wait() {
-                    Ok(Some(status)) => break status,
-                    _ => {
-                        // Process didn't exit cleanly after kill — use normal cleanup
-                        // to recover accumulated output from the shared buffer
-                        let _ = stop_tx.send(());
-                        let _ = heartbeat_handle.join();
-                        let _ = std::fs::remove_file(&prompt_file);
-                        // Recover output from shared buffer
-                        let buffered = shared_output_buf
-                            .lock()
-                            .map(|s| s.clone())
-                            .unwrap_or_default();
-                        remove_pid(&pid_tracker);
-                        if buffered.is_empty() {
-                            return Err(format!(
-                                "Session timed out after {}s of inactivity (no output captured)",
-                                inactive_secs
-                            ));
-                        }
-                        // Return the buffered output as a failed session (not an Err)
-                        // so the caller gets the output text
-                        return Ok((false, buffered));
-                    }
-                }
-            }
-        }
-
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => thread::sleep(Duration::from_millis(100)),
-            Err(e) => {
-                let _ = stop_tx.send(());
-                let _ = heartbeat_handle.join();
-                let _ = std::fs::remove_file(&prompt_file);
-                return Err(format!("Failed to wait for Claude: {}", e));
-            }
+    // Wait for process to complete.
+    // Health monitoring is handled by the Doctor service, which observes
+    // process health (CPU, memory, activity) and emits events when stuck.
+    // The Doctor never kills processes — it only notifies the frontend.
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(e) => {
+            let _ = stop_tx.send(());
+            let _ = heartbeat_handle.join();
+            let _ = std::fs::remove_file(&prompt_file);
+            remove_pid(&pid_tracker);
+            return Err(format!("Failed to wait for Claude: {}", e));
         }
     };
 
@@ -826,12 +804,12 @@ pub fn run_claude_session_with_retry(
     prompt: &str,
     session_id: &str,
     app_handle: &tauri::AppHandle,
-    timeout_seconds: Option<u64>,
     session_ctx: Option<AiSessionContext>,
     finding_ctx: Option<FindingContext>,
     progress_ctx: Option<ProgressContext>,
     pid_tracker: Option<Arc<std::sync::Mutex<Vec<u32>>>>,
     retry_config: Option<&RetryConfig>,
+    doctor_handle: Option<&DoctorHandle>,
 ) -> Result<(bool, String, Option<RetryState>), String> {
     use std::thread;
     use std::time::Duration;
@@ -845,11 +823,11 @@ pub fn run_claude_session_with_retry(
                 prompt,
                 session_id,
                 app_handle,
-                timeout_seconds,
                 session_ctx,
                 finding_ctx,
                 progress_ctx,
                 pid_tracker,
+                doctor_handle,
             )?;
             return Ok((result.0, result.1, None));
         }
@@ -882,11 +860,11 @@ pub fn run_claude_session_with_retry(
             &current_prompt,
             session_id,
             app_handle,
-            timeout_seconds,
             ctx_clone,
             finding_ctx_clone,
             progress_ctx_clone,
             pid_tracker_clone,
+            doctor_handle,
         );
 
         match result {
@@ -964,13 +942,13 @@ pub fn run_claude_session_interactive(
     prompt: &str,
     session_id: &str,
     app_handle: &tauri::AppHandle,
-    timeout_seconds: Option<u64>,
     session_ctx: Option<AiSessionContext>,
     finding_ctx: Option<FindingContext>,
     progress_ctx: Option<ProgressContext>,
     pid_tracker: Option<Arc<std::sync::Mutex<Vec<u32>>>>,
     session_manager: &Arc<crate::claude_session::SessionManager>,
     task_run_id: &str,
+    doctor_handle: Option<&DoctorHandle>,
 ) -> Result<(bool, String), String> {
     use crate::claude_session::ClaudeSession;
     use crate::commands::ai_chat::emit_session_state;
@@ -992,6 +970,19 @@ pub fn run_claude_session_interactive(
         pid_tracker,
     )?;
 
+    // Register with Doctor health monitoring
+    if let Some(handle) = doctor_handle {
+        let reg = crate::doctor::ProcessRegistration {
+            pid: session.pid(),
+            process_type: crate::doctor::ProcessType::SessionStreaming,
+            label: format!("Claude interactive session: {}", session_id),
+            last_activity: None,
+        };
+        if let Err(e) = handle.register_blocking(reg) {
+            warn!("Failed to register interactive session with Doctor: {}", e);
+        }
+    }
+
     let session = Arc::new(session);
 
     // Register with session manager so frontend can interact
@@ -1007,8 +998,7 @@ pub fn run_claude_session_interactive(
     emit_session_state(app_handle, task_run_id, session_id, session.state());
 
     // Wait for the session to complete (blocks until CLI exits)
-    let timeout = timeout_seconds.map(std::time::Duration::from_secs);
-    let (success, output) = session.wait_for_completion(timeout)?;
+    let (success, output) = session.wait_for_completion(None)?;
 
     // If session didn't reach Closed (e.g. timeout), close it explicitly
     if session.state() != crate::claude_session::SessionState::Closed {
@@ -1031,6 +1021,11 @@ pub fn run_claude_session_interactive(
     // Unregister from session manager
     session_manager.remove(task_run_id);
 
+    // Unregister from Doctor health monitoring
+    if let Some(handle) = doctor_handle {
+        let _ = handle.unregister_blocking(session.pid());
+    }
+
     info!(
         "Interactive session {} completed (success={}, output={} chars)",
         session_id,
@@ -1051,7 +1046,6 @@ pub fn run_claude_session_interactive_with_retry(
     prompt: &str,
     session_id: &str,
     app_handle: &tauri::AppHandle,
-    timeout_seconds: Option<u64>,
     session_ctx: Option<AiSessionContext>,
     finding_ctx: Option<FindingContext>,
     progress_ctx: Option<ProgressContext>,
@@ -1059,6 +1053,7 @@ pub fn run_claude_session_interactive_with_retry(
     retry_config: Option<&RetryConfig>,
     session_manager: &Arc<crate::claude_session::SessionManager>,
     task_run_id: &str,
+    doctor_handle: Option<&DoctorHandle>,
 ) -> Result<(bool, String, Option<RetryState>), String> {
     use std::thread;
     use std::time::Duration;
@@ -1072,13 +1067,13 @@ pub fn run_claude_session_interactive_with_retry(
                 prompt,
                 session_id,
                 app_handle,
-                timeout_seconds,
                 session_ctx,
                 finding_ctx,
                 progress_ctx,
                 pid_tracker,
                 session_manager,
                 task_run_id,
+                doctor_handle,
             )?;
             return Ok((result.0, result.1, None));
         }
@@ -1107,13 +1102,13 @@ pub fn run_claude_session_interactive_with_retry(
             &current_prompt,
             session_id,
             app_handle,
-            timeout_seconds,
             ctx_clone,
             finding_ctx_clone,
             progress_ctx_clone,
             pid_tracker_clone,
             session_manager,
             task_run_id,
+            doctor_handle,
         );
 
         match result {

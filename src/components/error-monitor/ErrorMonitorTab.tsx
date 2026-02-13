@@ -65,7 +65,11 @@ function SeverityBadge({ severity, count }: { severity: ErrorSeverity; count: nu
   };
 
   return (
-    <span className={cn("px-2 py-0.5 rounded-md text-xs font-medium border", colors[severity])}>
+    <span
+      data-content-role="badge"
+      data-content-label={`${severity} error count`}
+      className={cn("px-2 py-0.5 rounded-md text-xs font-medium border", colors[severity])}
+    >
       {count} {severity}
     </span>
   );
@@ -100,7 +104,11 @@ function StatusBadge({ status }: { status: ErrorStatus }) {
   const config = statusConfig[status] || { label: status, className: "" };
 
   return (
-    <span className={cn("px-2 py-0.5 rounded-md text-xs font-medium", config.className)}>
+    <span
+      data-content-role="badge"
+      data-content-label="error status"
+      className={cn("px-2 py-0.5 rounded-md text-xs font-medium", config.className)}
+    >
       {config.label}
     </span>
   );
@@ -138,7 +146,11 @@ function ErrorItem({
         {/* Content */}
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-1">
-            <span className="text-sm font-medium truncate">
+            <span
+              data-content-role="label"
+              data-content-label="error type"
+              className="text-sm font-medium truncate"
+            >
               {error.errorType || "Unknown Error"}
             </span>
             <StatusBadge status={error.status} />
@@ -360,7 +372,11 @@ export function ErrorMonitorTab() {
             <Bug className="w-5 h-5 text-primary" />
             <h2 className="text-lg font-semibold">Error Monitor</h2>
             {summary && summary.unresolvedCount > 0 && (
-              <span className="px-2 py-0.5 text-xs bg-red-500/20 text-red-500 rounded-full">
+              <span
+                data-content-role="badge"
+                data-content-label="unresolved error count"
+                className="px-2 py-0.5 text-xs bg-red-500/20 text-red-500 rounded-full"
+              >
                 {summary.unresolvedCount} unresolved
               </span>
             )}
@@ -526,7 +542,11 @@ export function ErrorMonitorTab() {
 
       {/* Footer */}
       <div className="px-4 py-2 border-t border-border bg-muted/30 flex items-center justify-between">
-        <span className="text-xs text-muted-foreground">
+        <span
+          data-content-role="metric"
+          data-content-label="error count"
+          className="text-xs text-muted-foreground"
+        >
           {filteredErrors.length} error{filteredErrors.length !== 1 ? "s" : ""}
           {hasActiveFilters && ` (filtered from ${errors.length})`}
         </span>

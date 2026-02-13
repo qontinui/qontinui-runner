@@ -6,6 +6,7 @@
 use super::types::*;
 use crate::ai_provider::run_prompt_sync;
 use crate::api_request::types::VariableExtraction;
+use crate::doctor::DoctorHandle;
 use crate::saved_api_requests::SavedApiRequest;
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
@@ -147,6 +148,7 @@ struct AiVerificationSuggestion {
 pub fn create_orchestration_plan(
     request: &TestOrchestrationRequest,
     saved_requests: &[SavedApiRequest],
+    doctor_handle: Option<&DoctorHandle>,
 ) -> Result<TestOrchestrationPlan> {
     info!(
         "Creating orchestration plan for {} requests: {:?}",
@@ -175,7 +177,7 @@ pub fn create_orchestration_plan(
         "Sending orchestration planning prompt ({} chars)",
         prompt.len()
     );
-    let ai_response = run_prompt_sync(&prompt, 120);
+    let ai_response = run_prompt_sync(&prompt, doctor_handle);
 
     info!(
         "AI response: success={}, output_len={}, error={:?}",
@@ -555,7 +557,10 @@ fn repair_truncated_json(json: &str) -> String {
 }
 
 /// Generate verification test code from orchestration execution results
-pub fn generate_test_from_execution(request: &GenerateTestRequest) -> Result<GeneratedTest> {
+pub fn generate_test_from_execution(
+    request: &GenerateTestRequest,
+    doctor_handle: Option<&DoctorHandle>,
+) -> Result<GeneratedTest> {
     info!(
         "Generating {} test from orchestration execution",
         request.test_type
@@ -563,7 +568,7 @@ pub fn generate_test_from_execution(request: &GenerateTestRequest) -> Result<Gen
 
     let prompt = build_test_generation_prompt(request);
 
-    let ai_response = run_prompt_sync(&prompt, 120);
+    let ai_response = run_prompt_sync(&prompt, doctor_handle);
 
     if !ai_response.success {
         return Err(anyhow!(

@@ -180,7 +180,11 @@ export function ActiveRunsBar({ onNewRun, onRunCreated }: ActiveRunsBarProps) {
       {/* Icon and label */}
       <div className="flex items-center gap-2 text-muted-foreground">
         <Layers className="h-4 w-4" />
-        <span className="text-xs font-medium">
+        <span
+          data-content-role="label"
+          data-content-label="active run count"
+          className="text-xs font-medium"
+        >
           {activeRuns.length} active run{activeRuns.length !== 1 ? "s" : ""}
         </span>
       </div>
@@ -192,7 +196,11 @@ export function ActiveRunsBar({ onNewRun, onRunCreated }: ActiveRunsBarProps) {
       <div className="flex items-center gap-2 overflow-x-auto flex-1 py-1">
         {/* Selected run indicator (brief) */}
         {selectedRunId && (
-          <div className="flex items-center gap-1.5 px-2 py-1 rounded bg-primary/10 text-primary text-xs">
+          <div
+            data-content-role="label"
+            data-content-label="primary run"
+            className="flex items-center gap-1.5 px-2 py-1 rounded bg-primary/10 text-primary text-xs"
+          >
             <span className="font-medium">Primary:</span>
             <span className="truncate max-w-[100px]">
               {activeRuns.find((r) => r.runId === selectedRunId)?.taskName || "Current"}
@@ -228,7 +236,13 @@ export function ActiveRunsBar({ onNewRun, onRunCreated }: ActiveRunsBarProps) {
               title={`${bridgeCounts.gui} GUI bridge${bridgeCounts.gui !== 1 ? "s" : ""}`}
             >
               <Monitor className="h-3 w-3" />
-              <span className="font-medium">{bridgeCounts.gui}</span>
+              <span
+                data-content-role="metric"
+                data-content-label="GUI bridge count"
+                className="font-medium"
+              >
+                {bridgeCounts.gui}
+              </span>
             </div>
           )}
           {bridgeCounts.headless > 0 && (
@@ -237,7 +251,13 @@ export function ActiveRunsBar({ onNewRun, onRunCreated }: ActiveRunsBarProps) {
               title={`${bridgeCounts.headless} Headless bridge${bridgeCounts.headless !== 1 ? "s" : ""}`}
             >
               <Cloud className="h-3 w-3" />
-              <span className="font-medium">{bridgeCounts.headless}</span>
+              <span
+                data-content-role="metric"
+                data-content-label="headless bridge count"
+                className="font-medium"
+              >
+                {bridgeCounts.headless}
+              </span>
             </div>
           )}
         </div>
@@ -260,7 +280,13 @@ export function ActiveRunsBar({ onNewRun, onRunCreated }: ActiveRunsBarProps) {
           } ${getAccentColors("amber").text}`}
           title="A run currently has exclusive GUI control"
         >
-          <span className="font-medium relative z-10">GUI Lock</span>
+          <span
+            data-content-role="status"
+            data-content-label="GUI lock status"
+            className="font-medium relative z-10"
+          >
+            GUI Lock
+          </span>
           <div className="absolute inset-0 bg-amber-500/20 rounded animate-pulse" />
         </div>
       )}

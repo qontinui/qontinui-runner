@@ -7,7 +7,6 @@
 // see the fields as "used" but they are accessed at runtime during serialization.
 #![allow(dead_code)]
 
-use axum::extract::ws::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,29 +15,10 @@ use crate::action_service::UnifiedActionService;
 use crate::commands::rag::RAGState;
 use crate::commands::AppState;
 use crate::config_storage::ConfigStorage;
+use crate::doctor::DoctorHandle;
 
 /// Default port for the MCP API server
 pub const MCP_API_PORT: u16 = 9876;
-
-/// Chrome extension connection state (WebSocket, pending requests, health tracking).
-pub struct ExtensionState {
-    /// Channel sender for outgoing WebSocket messages.
-    /// The WebSocket handler task exclusively owns the SplitSink and reads from this channel.
-    /// All other tasks (HTTP handlers, ping/pong) push messages through this channel,
-    /// eliminating lock contention that previously caused keepalive failures.
-    pub ws_sender: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Message>>>>,
-    /// Pending command requests (requestId -> oneshot sender for response)
-    pub pending_requests:
-        Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>>>,
-    /// Connection status
-    pub connected: Arc<std::sync::atomic::AtomicBool>,
-    /// Timestamp of last pong received (epoch millis)
-    pub last_pong: Arc<std::sync::atomic::AtomicI64>,
-    /// Timestamp when connected (epoch millis, 0 if not connected)
-    pub connected_since: Arc<std::sync::atomic::AtomicI64>,
-    /// Number of reconnections since runner start
-    pub reconnect_count: Arc<std::sync::atomic::AtomicU64>,
-}
 
 /// Shared state for the API server (authoritative definition)
 pub struct ApiState {
@@ -56,12 +36,12 @@ pub struct ApiState {
     /// Pending UI Bridge requests waiting for frontend response
     pub ui_bridge_pending:
         Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>>>,
-    /// Chrome extension connection state
-    pub extension: ExtensionState,
     /// Web extraction state tracking
     pub extraction_state: Arc<crate::mcp::extraction::ExtractionState>,
     /// SDK app connections manager (supports multiple simultaneous connections)
     pub sdk_connection: Arc<tokio::sync::Mutex<crate::mcp::sdk_client::SdkConnectionManager>>,
+    /// Doctor health monitoring handle for AI process health tracking.
+    pub doctor_handle: Option<DoctorHandle>,
 }
 
 /// Response for API endpoints

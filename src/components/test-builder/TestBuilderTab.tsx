@@ -226,7 +226,11 @@ function TestBuilderContent({ onLog }: TestBuilderTabProps) {
               <ScanSearch className="w-4 h-4" />
               Page Analysis
               {analysisData && (
-                <span className="ml-1 px-1.5 py-0.5 text-xs bg-green-500/20 text-green-400 rounded">
+                <span
+                  data-content-role="badge"
+                  data-content-label="analysis count"
+                  className="ml-1 px-1.5 py-0.5 text-xs bg-green-500/20 text-green-400 rounded"
+                >
                   {analysisData.type === "multi"
                     ? `${analysisData.data.requests.filter((r) => r.status === "complete").length} req`
                     : analysisData.type === "collected"
@@ -262,7 +266,9 @@ function TestBuilderContent({ onLog }: TestBuilderTabProps) {
             {/* Test type selector - only show when no test is selected */}
             {!selectedTest && activeTab === "ai" && (
               <div className="ml-auto mr-4 flex items-center gap-2">
-                <span className="text-xs text-neutral-500">Test Type:</span>
+                <span data-content-role="label" className="text-xs text-neutral-500">
+                  Test Type:
+                </span>
                 <select
                   value={selectedTestType}
                   onChange={(e) => setSelectedTestType(e.target.value as TestType)}
@@ -277,7 +283,11 @@ function TestBuilderContent({ onLog }: TestBuilderTabProps) {
               </div>
             )}
             {analysisData && activeTab === "ai" && (
-              <span className="ml-auto mr-4 text-xs text-neutral-500">
+              <span
+                data-content-role="status"
+                data-content-label="analysis summary"
+                className="ml-auto mr-4 text-xs text-neutral-500"
+              >
                 {analysisData.type === "multi"
                   ? `${analysisData.data.requests.filter((r) => r.status === "complete").length} API responses`
                   : analysisData.type === "collected"

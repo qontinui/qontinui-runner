@@ -88,7 +88,9 @@ mod types;
 
 // Public API exports for external consumers (e.g., tests, downstream crates)
 #[allow(unused_imports)]
-pub use broadcaster::{shared_broadcaster, EventBroadcaster, SharedEventBroadcaster};
+pub use broadcaster::{
+    broadcast_ws_notification, shared_broadcaster, EventBroadcaster, SharedEventBroadcaster,
+};
 pub use emitter::EventEmitter;
 #[allow(unused_imports)]
 pub use types::AppEvent;

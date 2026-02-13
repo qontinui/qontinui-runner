@@ -49,7 +49,7 @@ import {
   ElementDescriptionService,
   type PersistedElementDescription,
 } from "../../services/element-description-service";
-import type { ExternalElement, PageContext } from "../../hooks/useExternalUIBridge";
+import type { ExternalElement, PageContext } from "../../types/ui-bridge-types";
 import {
   buildDOMContext,
   getLandmarkDisplayName,

@@ -13,8 +13,9 @@
 
 use crate::ai_router::{TaskContext, TaskRouter};
 use crate::config_facade::ai_keychain;
+use crate::doctor::{DoctorHandle, ProcessRegistration, ProcessType};
 use crate::settings::{self, AiProvider, CliExecutionMode};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use tracing::{debug, error, info, warn};
 
 /// Result of running an AI prompt
@@ -83,56 +84,105 @@ impl AiResponse {
     }
 }
 
+/// Spawn a command and register it with the Doctor health monitor.
+///
+/// If a `DoctorHandle` is provided, the process is registered before waiting
+/// for output and unregistered afterwards. If no handle is provided, falls
+/// back to the standard `.output()` call.
+fn spawn_and_wait_with_doctor(
+    cmd: &mut Command,
+    label: &str,
+    doctor_handle: Option<&DoctorHandle>,
+) -> std::io::Result<std::process::Output> {
+    match doctor_handle {
+        Some(handle) => {
+            // Must pipe stdout/stderr so wait_with_output() can capture them.
+            // Without this, spawn() inherits parent's stdio and wait_with_output()
+            // returns empty buffers.
+            let child = cmd
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            let pid = child.id();
+
+            // Register with Doctor
+            let reg = ProcessRegistration {
+                pid,
+                process_type: ProcessType::ResponseOneShot,
+                label: label.to_string(),
+                last_activity: None,
+            };
+            if let Err(e) = handle.register_blocking(reg) {
+                warn!("Failed to register process with Doctor: {}", e);
+            }
+
+            let output = child.wait_with_output()?;
+
+            // Unregister (Doctor will auto-unregister dead processes, but explicit is cleaner)
+            if let Err(e) = handle.unregister_blocking(pid) {
+                debug!("Failed to unregister process with Doctor: {}", e);
+            }
+
+            Ok(output)
+        }
+        None => cmd.output(),
+    }
+}
+
 /// Run an AI prompt synchronously and return the response.
 ///
 /// This function selects the appropriate provider based on settings and
-/// executes the prompt, waiting for the response.
+/// executes the prompt, waiting for the response. The process runs until
+/// completion — health monitoring is handled by the Doctor service.
 ///
 /// # Arguments
 /// * `prompt` - The prompt to send to the AI
-/// * `timeout_seconds` - Maximum time to wait for response (0 = use default from settings)
+/// * `doctor_handle` - Optional Doctor health monitor handle for process registration
 ///
 /// # Returns
 /// `AiResponse` with success status, output, and any error message
-pub fn run_prompt_sync(prompt: &str, timeout_seconds: u64) -> AiResponse {
+pub fn run_prompt_sync(prompt: &str, doctor_handle: Option<&DoctorHandle>) -> AiResponse {
     let ai_settings = settings::get_ai_settings();
-    let timeout = if timeout_seconds > 0 {
-        timeout_seconds
-    } else {
-        ai_settings.claude_cli.timeout_seconds
-    };
 
     info!(
-        "Running AI prompt via {:?} (timeout: {}s, prompt length: {} chars)",
+        "Running AI prompt via {:?} (prompt length: {} chars)",
         ai_settings.provider,
-        timeout,
         prompt.len()
     );
 
     match ai_settings.provider {
-        AiProvider::ClaudeCli => run_claude_cli(prompt, &ai_settings.claude_cli, timeout, None),
-        AiProvider::ClaudeApi => run_claude_api(prompt, &ai_settings.claude_api, timeout, None),
-        AiProvider::GeminiCli => run_gemini_cli(prompt, &ai_settings.gemini_cli, timeout, None),
-        AiProvider::GeminiApi => run_gemini_api(prompt, &ai_settings.gemini_api, timeout, None),
+        AiProvider::ClaudeCli => {
+            run_claude_cli(prompt, &ai_settings.claude_cli, None, doctor_handle)
+        }
+        AiProvider::ClaudeApi => {
+            run_claude_api(prompt, &ai_settings.claude_api, None, doctor_handle)
+        }
+        AiProvider::GeminiCli => {
+            run_gemini_cli(prompt, &ai_settings.gemini_cli, None, doctor_handle)
+        }
+        AiProvider::GeminiApi => {
+            run_gemini_api(prompt, &ai_settings.gemini_api, None, doctor_handle)
+        }
     }
 }
 
 /// Run an AI prompt with intelligent routing based on task complexity.
 ///
 /// This function assesses the complexity of the task based on the provided context
-/// and routes it to an appropriate model (simple tasks → cheaper models, complex → powerful models).
+/// and routes it to an appropriate model (simple tasks -> cheaper models, complex -> powerful models).
+/// The process runs until completion — health monitoring is handled by the Doctor service.
 ///
 /// # Arguments
 /// * `prompt` - The prompt to send to the AI
 /// * `context` - Task context for complexity assessment (files, verification criteria, etc.)
-/// * `timeout_seconds` - Maximum time to wait for response (0 = use default from settings)
+/// * `doctor_handle` - Optional Doctor health monitor handle for process registration
 ///
 /// # Returns
 /// `AiResponse` with success status, output, and any error message
 pub fn run_prompt_with_routing(
     prompt: &str,
     context: &TaskContext,
-    timeout_seconds: u64,
+    doctor_handle: Option<&DoctorHandle>,
 ) -> AiResponse {
     let ai_settings = settings::get_ai_settings();
     let routing_config = &ai_settings.routing;
@@ -157,16 +207,9 @@ pub fn run_prompt_with_routing(
         None
     };
 
-    let timeout = if timeout_seconds > 0 {
-        timeout_seconds
-    } else {
-        ai_settings.claude_cli.timeout_seconds
-    };
-
     info!(
-        "Running AI prompt via {:?} (timeout: {}s, prompt length: {} chars, routed: {})",
+        "Running AI prompt via {:?} (prompt length: {} chars, routed: {})",
         ai_settings.provider,
-        timeout,
         prompt.len(),
         model_override.is_some()
     );
@@ -175,59 +218,61 @@ pub fn run_prompt_with_routing(
         AiProvider::ClaudeCli => run_claude_cli(
             prompt,
             &ai_settings.claude_cli,
-            timeout,
             model_override.as_deref(),
+            doctor_handle,
         ),
         AiProvider::ClaudeApi => run_claude_api(
             prompt,
             &ai_settings.claude_api,
-            timeout,
             model_override.as_deref(),
+            doctor_handle,
         ),
         AiProvider::GeminiCli => {
             // Gemini routing only works within Gemini models, warn if trying to route to Claude model
             if let Some(ref model) = model_override {
                 if model.starts_with("claude") {
                     warn!("Cannot route to Claude model when using Gemini provider, using default Gemini model");
-                    run_gemini_cli(prompt, &ai_settings.gemini_cli, timeout, None)
+                    run_gemini_cli(prompt, &ai_settings.gemini_cli, None, doctor_handle)
                 } else {
                     run_gemini_cli(
                         prompt,
                         &ai_settings.gemini_cli,
-                        timeout,
                         model_override.as_deref(),
+                        doctor_handle,
                     )
                 }
             } else {
-                run_gemini_cli(prompt, &ai_settings.gemini_cli, timeout, None)
+                run_gemini_cli(prompt, &ai_settings.gemini_cli, None, doctor_handle)
             }
         }
         AiProvider::GeminiApi => {
             if let Some(ref model) = model_override {
                 if model.starts_with("claude") {
                     warn!("Cannot route to Claude model when using Gemini provider, using default Gemini model");
-                    run_gemini_api(prompt, &ai_settings.gemini_api, timeout, None)
+                    run_gemini_api(prompt, &ai_settings.gemini_api, None, doctor_handle)
                 } else {
                     run_gemini_api(
                         prompt,
                         &ai_settings.gemini_api,
-                        timeout,
                         model_override.as_deref(),
+                        doctor_handle,
                     )
                 }
             } else {
-                run_gemini_api(prompt, &ai_settings.gemini_api, timeout, None)
+                run_gemini_api(prompt, &ai_settings.gemini_api, None, doctor_handle)
             }
         }
     }
 }
 
-/// Run a prompt via Claude CLI
+/// Run a prompt via Claude CLI.
+///
+/// The process runs until completion — health monitoring is handled by the Doctor service.
 fn run_claude_cli(
     prompt: &str,
     settings: &settings::ClaudeCliSettings,
-    _timeout_seconds: u64,
     model_override: Option<&str>,
+    doctor_handle: Option<&DoctorHandle>,
 ) -> AiResponse {
     let system = std::env::consts::OS;
 
@@ -251,9 +296,12 @@ fn run_claude_cli(
         effective_mode, claude_program, config_dir, model_override, prompt.len()
     );
 
-    // For long prompts, use stdin piping instead of command-line argument
-    // This avoids Windows' command line length limitations (8191 chars)
-    let use_stdin = prompt.len() > 8000;
+    // On Windows, always use stdin piping (file-based approach) because
+    // cmd.exe /c interprets special characters (", %, ^, &, |, >, <) in
+    // command-line arguments, which corrupts JSON content in prompts.
+    // On other platforms, only use stdin for long prompts.
+    let use_stdin =
+        matches!(effective_mode, CliExecutionMode::WindowsNative) || prompt.len() > 8000;
 
     if use_stdin {
         // Use file-based approach for long prompts (avoids Windows cmd length limits)
@@ -263,6 +311,7 @@ fn run_claude_cli(
             effective_mode,
             config_dir,
             model_override,
+            doctor_handle,
         )
     } else {
         // Use command-line argument for short prompts
@@ -272,20 +321,23 @@ fn run_claude_cli(
             effective_mode,
             config_dir,
             model_override,
+            doctor_handle,
         )
     }
 }
 
-/// Run Claude CLI with prompt in a temp file (for long prompts)
+/// Run Claude CLI with prompt in a temp file (for long prompts).
 ///
 /// Writes the prompt to a temp file and uses PowerShell to read it and pipe to Claude.
 /// This avoids Windows command line length limitations.
+/// The process runs until completion — health monitoring is handled by the Doctor service.
 fn run_claude_cli_with_file(
     prompt: &str,
     claude_program: &str,
     effective_mode: CliExecutionMode,
     config_dir: Option<&str>,
     model_override: Option<&str>,
+    doctor_handle: Option<&DoctorHandle>,
 ) -> AiResponse {
     // Write prompt to a temp file
     let temp_dir = std::env::temp_dir();
@@ -319,15 +371,17 @@ fn run_claude_cli_with_file(
                     prompt_path, claude_program, model_flag
                 )
             };
-            Command::new("powershell.exe")
-                .args([
+            spawn_and_wait_with_doctor(
+                Command::new("powershell.exe").args([
                     "-NoProfile",
                     "-ExecutionPolicy",
                     "Bypass",
                     "-Command",
                     &ps_command,
-                ])
-                .output()
+                ]),
+                "Claude CLI response (file)",
+                doctor_handle,
+            )
         }
         CliExecutionMode::Wsl => {
             // For WSL, use cat to read file and pipe
@@ -349,9 +403,11 @@ fn run_claude_cli_with_file(
                     model_flag
                 )
             };
-            Command::new("wsl")
-                .args(["bash", "-c", &wsl_prompt])
-                .output()
+            spawn_and_wait_with_doctor(
+                Command::new("wsl").args(["bash", "-c", &wsl_prompt]),
+                "Claude CLI response (WSL file)",
+                doctor_handle,
+            )
         }
         CliExecutionMode::Native => {
             // On Unix, use cat to read and pipe
@@ -366,7 +422,11 @@ fn run_claude_cli_with_file(
                     prompt_path, claude_program, model_flag
                 )
             };
-            Command::new("sh").args(["-c", &native_cmd]).output()
+            spawn_and_wait_with_doctor(
+                Command::new("sh").args(["-c", &native_cmd]),
+                "Claude CLI response (native file)",
+                doctor_handle,
+            )
         }
     };
 
@@ -386,13 +446,16 @@ fn run_claude_cli_with_file(
     }
 }
 
-/// Run Claude CLI with prompt as command-line argument (for short prompts)
+/// Run Claude CLI with prompt as command-line argument (for short prompts).
+///
+/// The process runs until completion — health monitoring is handled by the Doctor service.
 fn run_claude_cli_with_arg(
     prompt: &str,
     claude_program: &str,
     effective_mode: CliExecutionMode,
     config_dir: Option<&str>,
     model_override: Option<&str>,
+    doctor_handle: Option<&DoctorHandle>,
 ) -> AiResponse {
     let output_result = match effective_mode {
         CliExecutionMode::WindowsNative | CliExecutionMode::Auto => {
@@ -406,7 +469,7 @@ fn run_claude_cli_with_arg(
             if let Some(dir) = config_dir {
                 cmd.env("CLAUDE_CONFIG_DIR", dir);
             }
-            cmd.output()
+            spawn_and_wait_with_doctor(&mut cmd, "Claude CLI response (arg)", doctor_handle)
         }
         CliExecutionMode::Wsl => {
             let mut cmd = Command::new("wsl");
@@ -419,7 +482,7 @@ fn run_claude_cli_with_arg(
             if let Some(dir) = config_dir {
                 cmd.env("CLAUDE_CONFIG_DIR", dir);
             }
-            cmd.output()
+            spawn_and_wait_with_doctor(&mut cmd, "Claude CLI response (WSL arg)", doctor_handle)
         }
         CliExecutionMode::Native => {
             let mut cmd = Command::new(claude_program);
@@ -432,7 +495,7 @@ fn run_claude_cli_with_arg(
             if let Some(dir) = config_dir {
                 cmd.env("CLAUDE_CONFIG_DIR", dir);
             }
-            cmd.output()
+            spawn_and_wait_with_doctor(&mut cmd, "Claude CLI response (native arg)", doctor_handle)
         }
     };
 
@@ -459,9 +522,23 @@ fn process_cli_output(output: std::process::Output) -> AiResponse {
 
     if output.status.success() {
         debug!("Claude CLI response length: {} chars", stdout.len());
-        AiResponse::success(stdout)
+        if stdout.trim().is_empty() && !stderr.trim().is_empty() {
+            // CLI exited 0 but produced no stdout — stderr likely has the real error
+            warn!(
+                "Claude CLI exited successfully but stdout is empty. stderr ({} chars): {}",
+                stderr.len(),
+                if stderr.len() > 1000 { &stderr[..1000] } else { &stderr }
+            );
+            // Return as error since empty output is not useful
+            AiResponse::error(format!(
+                "Claude CLI produced no output. stderr: {}",
+                if stderr.len() > 500 { &stderr[..500] } else { &stderr }
+            ))
+        } else {
+            AiResponse::success(stdout)
+        }
     } else {
-        error!("Claude CLI failed: {}", stderr);
+        error!("Claude CLI failed (exit code {:?}): {}", output.status.code(), stderr);
         AiResponse::error_with_output(stdout, format!("Claude CLI failed: {}", stderr))
     }
 }
@@ -480,8 +557,8 @@ fn process_cli_output(output: std::process::Output) -> AiResponse {
 fn run_claude_api(
     prompt: &str,
     settings: &settings::ClaudeApiSettings,
-    _timeout_seconds: u64,
     model_override: Option<&str>,
+    _doctor_handle: Option<&DoctorHandle>,
 ) -> AiResponse {
     let model = model_override.unwrap_or(&settings.model);
     info!(
@@ -501,7 +578,8 @@ fn run_claude_api(
         Err(e) => return AiResponse::error(format!("Failed to retrieve API key: {}", e)),
     };
 
-    // Use blocking reqwest client for synchronous HTTP request
+    // Use blocking reqwest client for synchronous HTTP request.
+    // No timeout — the Doctor service monitors process health externally.
     let client = match reqwest::blocking::Client::builder().build() {
         Ok(c) => c,
         Err(e) => return AiResponse::error(format!("Failed to create HTTP client: {}", e)),
@@ -565,12 +643,14 @@ fn run_claude_api(
     }
 }
 
-/// Run a prompt via Gemini CLI
+/// Run a prompt via Gemini CLI.
+///
+/// The process runs until completion — health monitoring is handled by the Doctor service.
 fn run_gemini_cli(
     prompt: &str,
     settings: &settings::GeminiCliSettings,
-    _timeout_seconds: u64,
     model_override: Option<&str>,
+    doctor_handle: Option<&DoctorHandle>,
 ) -> AiResponse {
     let system = std::env::consts::OS;
 
@@ -600,16 +680,29 @@ fn run_gemini_cli(
     let output_result = match effective_mode {
         CliExecutionMode::WindowsNative | CliExecutionMode::Auto => {
             // On Windows, use cmd.exe /c to handle .cmd files from npm install
-            Command::new("cmd.exe")
-                .args(["/c", gemini_program, "--model", model, "-p", prompt])
-                .output()
+            spawn_and_wait_with_doctor(
+                Command::new("cmd.exe").args([
+                    "/c",
+                    gemini_program,
+                    "--model",
+                    model,
+                    "-p",
+                    prompt,
+                ]),
+                "Gemini CLI response",
+                doctor_handle,
+            )
         }
-        CliExecutionMode::Wsl => Command::new("wsl")
-            .args([gemini_program, "--model", model, "-p", prompt])
-            .output(),
-        CliExecutionMode::Native => Command::new(gemini_program)
-            .args(["--model", model, "-p", prompt])
-            .output(),
+        CliExecutionMode::Wsl => spawn_and_wait_with_doctor(
+            Command::new("wsl").args([gemini_program, "--model", model, "-p", prompt]),
+            "Gemini CLI response (WSL)",
+            doctor_handle,
+        ),
+        CliExecutionMode::Native => spawn_and_wait_with_doctor(
+            Command::new(gemini_program).args(["--model", model, "-p", prompt]),
+            "Gemini CLI response (native)",
+            doctor_handle,
+        ),
     };
 
     match output_result {
@@ -652,8 +745,8 @@ fn run_gemini_cli(
 fn run_gemini_api(
     prompt: &str,
     settings: &settings::GeminiApiSettings,
-    _timeout_seconds: u64,
     model_override: Option<&str>,
+    _doctor_handle: Option<&DoctorHandle>,
 ) -> AiResponse {
     let model = model_override.unwrap_or(&settings.model);
     info!(
@@ -674,7 +767,8 @@ fn run_gemini_api(
         Err(e) => return AiResponse::error(format!("Failed to retrieve API key: {}", e)),
     };
 
-    // Use blocking reqwest client for synchronous HTTP request
+    // Use blocking reqwest client for synchronous HTTP request.
+    // No timeout — the Doctor service monitors process health externally.
     let client = match reqwest::blocking::Client::builder().build() {
         Ok(c) => c,
         Err(e) => return AiResponse::error(format!("Failed to create HTTP client: {}", e)),
