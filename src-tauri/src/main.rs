@@ -489,6 +489,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::findings::resolve_finding,
             commands::findings::provide_finding_response,
             commands::findings::get_findings_summary,
+            commands::findings::list_task_knowledge_cmd,
             // State Explorer commands
             commands::state_explorer::start_exploration,
             commands::state_explorer::get_exploration_strategies,
@@ -554,6 +555,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::ai_data::get_task_run_api_requests_from_db,
             commands::ai_data::get_task_run_awas_steps_from_db,
             commands::ai_data::get_task_run_verification_results_from_db,
+            commands::ai_data::get_task_run_context,
             // Recap commands (Session overview)
             commands::recap::get_task_run_recap,
             // Task Sync commands (sync to qontinui-web)

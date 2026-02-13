@@ -297,6 +297,19 @@ pub struct AITaskFindingSyncResponse {
     pub status: String,
 }
 
+/// Request to create a verification result
+#[derive(Debug, Serialize)]
+pub struct VerificationResultCreateRequest {
+    pub iteration: u32,
+    pub result: serde_json::Value,
+}
+
+/// Request to batch upsert verification results
+#[derive(Debug, Serialize)]
+pub struct VerificationResultsBatchRequest {
+    pub results: Vec<VerificationResultCreateRequest>,
+}
+
 // ============================================================================
 // Conversion helpers
 // ============================================================================
@@ -632,6 +645,63 @@ impl AITaskSyncService {
         Ok(result)
     }
 
+    /// Sync a verification phase result to the backend.
+    pub async fn sync_verification_result(
+        &self,
+        task_id: &str,
+        iteration: u32,
+        result_json: &serde_json::Value,
+    ) -> Result<(), String> {
+        info!(
+            "Syncing verification result for task {}, iteration {}",
+            task_id, iteration
+        );
+
+        let access_token = self.check_auth()?;
+
+        let request = VerificationResultsBatchRequest {
+            results: vec![VerificationResultCreateRequest {
+                iteration,
+                result: result_json.clone(),
+            }],
+        };
+
+        let response = self
+            .client
+            .post(format!(
+                "{}/api/v1/task-runs/{}/verification-results",
+                get_api_base_url(),
+                task_id
+            ))
+            .bearer_auth(&access_token)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| {
+                error!("Failed to sync verification result: {}", e);
+                format!("Network error: {}", e)
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            error!(
+                "Sync verification result failed with status {}: {}",
+                status, error_text
+            );
+            return Err(format!("Failed to sync verification result: {}", error_text));
+        }
+
+        info!(
+            "Verification result synced successfully for iteration {}",
+            iteration
+        );
+        Ok(())
+    }
+
     /// Sync task completion to the backend.
     pub async fn sync_task_completed(&self, task: &TaskRun) -> Result<AITaskResponse, String> {
         info!("Syncing task completion: {}", task.id);
@@ -695,7 +765,7 @@ impl AITaskSyncService {
         Ok(result)
     }
 
-    /// Full sync: sync a task with all its findings.
+    /// Full sync: sync a task with all its findings and verification results.
     ///
     /// This is useful for syncing a completed task that was created while offline.
     pub async fn full_sync_task(
@@ -720,7 +790,25 @@ impl AITaskSyncService {
             self.sync_findings(task_id, &findings).await?;
         }
 
-        // 3. If task is complete, sync completion status
+        // 3. Sync all verification results
+        let verification_results = db.get_all_verification_phase_results(task_id);
+        if let Ok(results) = verification_results {
+            for result in &results {
+                if let Some(iteration) = result.get("iteration").and_then(|v| v.as_u64()) {
+                    if let Err(e) = self
+                        .sync_verification_result(task_id, iteration as u32, result)
+                        .await
+                    {
+                        warn!(
+                            "Failed to sync verification result iter {} for task {}: {}",
+                            iteration, task_id, e
+                        );
+                    }
+                }
+            }
+        }
+
+        // 4. If task is complete, sync completion status
         if task.status != "running" {
             self.sync_task_completed(&task).await?;
         }

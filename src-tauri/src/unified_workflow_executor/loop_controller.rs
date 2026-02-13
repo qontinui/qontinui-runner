@@ -1030,6 +1030,19 @@ impl LoopController {
                     iteration,
                     &result_json,
                 );
+
+                // Sync to web backend (best-effort, non-blocking)
+                let parent_id_clone = parent_id.clone();
+                let result_json_clone = result_json.clone();
+                tokio::spawn(async move {
+                    let sync_service = crate::commands::task_sync::AITaskSyncService::new();
+                    if let Err(e) = sync_service
+                        .sync_verification_result(&parent_id_clone, iteration, &result_json_clone)
+                        .await
+                    {
+                        warn!("Failed to sync verification result to backend: {}", e);
+                    }
+                });
             }
 
             // Persist workflow state: VerificationComplete
@@ -1276,6 +1289,18 @@ impl LoopController {
             let broadcaster = EventBroadcaster::new(self.app_handle.clone());
             broadcaster.task_run_update(execution_id, "completed", None, None);
 
+            // Sync completion to web backend (best-effort, non-blocking)
+            let db = self.checkpoint_db.clone();
+            let eid = execution_id.to_string();
+            tokio::spawn(async move {
+                let sync_service = crate::commands::task_sync::AITaskSyncService::new();
+                if let Ok(Some(task)) = db.get_task_run(&eid) {
+                    if let Err(e) = sync_service.sync_task_completed(&task).await {
+                        warn!("Failed to sync task completion to backend: {}", e);
+                    }
+                }
+            });
+
             // Fire-and-forget: try to promote workflow to example library
             if let Some(wf_id) = workflow_id {
                 let db = self.checkpoint_db.clone();
@@ -1303,6 +1328,18 @@ impl LoopController {
                 None,
                 Some(serde_json::json!({ "reason": reason })),
             );
+
+            // Sync failure to web backend (best-effort, non-blocking)
+            let db = self.checkpoint_db.clone();
+            let eid = execution_id.to_string();
+            tokio::spawn(async move {
+                let sync_service = crate::commands::task_sync::AITaskSyncService::new();
+                if let Ok(Some(task)) = db.get_task_run(&eid) {
+                    if let Err(e) = sync_service.sync_task_completed(&task).await {
+                        warn!("Failed to sync task failure to backend: {}", e);
+                    }
+                }
+            });
         }
     }
 

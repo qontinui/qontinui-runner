@@ -18,7 +18,7 @@
 -- Version 20 adds task_run_events, task_run_screenshots, task_run_playwright_results (hybrid logging).
 -- Version 21 adds completion_steps and skip_ai_summary to unified_workflows.
 -- Version 22 adds hybrid logging tables via migration (already in schema as of v20).
--- Version 23 adds task_knowledge_summaries (compression) and retry_state_json to task_runs.
+-- Version 23 adds task_knowledge_summaries (compression).
 -- Version 24 adds task_run_api_requests table for API request log migration.
 -- Version 25 adds runtime_context_json to task_runs (execution context propagation) and task_hooks table (lifecycle hooks).
 -- Version 26 adds task_run_awas_steps table (AWAS step execution results).
@@ -218,9 +218,6 @@ CREATE TABLE IF NOT EXISTS task_runs (
     goal_achieved BOOLEAN,  -- Whether the stated goal was achieved
     remaining_work TEXT,  -- What remains to be done if goal was not achieved
     summary_generated_at TEXT,  -- Timestamp when the summary was generated
-
-    -- Retry state (for retry with feedback injection)
-    retry_state_json TEXT,  -- JSON: {attempt, last_error, error_history[], delay_history[]}
 
     -- Runtime context (for execution context propagation)
     runtime_context_json TEXT,  -- JSON: {variables, step_outputs, iteration}

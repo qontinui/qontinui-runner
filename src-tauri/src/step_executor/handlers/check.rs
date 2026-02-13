@@ -710,15 +710,17 @@ impl CheckHandler {
                 } else {
                     // Try to parse JSON response
                     let output = response.output;
-                    // Strip markdown code fences if present
-                    let json_str = output
-                        .trim()
-                        .strip_prefix("```json")
-                        .or_else(|| output.trim().strip_prefix("```"))
-                        .unwrap_or(output.trim())
-                        .strip_suffix("```")
-                        .unwrap_or(output.trim())
-                        .trim();
+                    // Extract JSON object from response — the AI may prefix
+                    // analysis text before the JSON, so find the first { and last }
+                    let json_str = if let Some(start) = output.find('{') {
+                        if let Some(end) = output.rfind('}') {
+                            &output[start..=end]
+                        } else {
+                            output.trim()
+                        }
+                    } else {
+                        output.trim()
+                    };
 
                     match serde_json::from_str::<serde_json::Value>(json_str) {
                         Ok(parsed) => {

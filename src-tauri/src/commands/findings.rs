@@ -8,6 +8,7 @@ use tauri::State;
 use tracing::info;
 
 use crate::commands::AppState;
+use crate::database::StoredTaskKnowledge;
 use crate::findings::{Finding, FindingStatus, FindingSummary};
 
 /// Get all findings for a task run.
@@ -111,4 +112,16 @@ pub async fn get_findings_summary(
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<FindingSummary, String> {
     app_state.checkpoint_db.get_finding_summary(&task_run_id)
+}
+
+/// List knowledge entries for a task run with optional category filter.
+#[tauri::command]
+pub async fn list_task_knowledge_cmd(
+    task_run_id: String,
+    category: Option<String>,
+    app_state: State<'_, Arc<AppState>>,
+) -> Result<Vec<StoredTaskKnowledge>, String> {
+    app_state
+        .checkpoint_db
+        .list_task_knowledge(&task_run_id, category.as_deref(), false)
 }

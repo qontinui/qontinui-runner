@@ -21,11 +21,35 @@ import {
   Clock,
   ChevronDown,
   ChevronRight,
+  Loader2,
+  Eye,
+  Lightbulb,
+  Search,
+  Target,
+  Wrench,
+  Info,
 } from "lucide-react";
 import type { Finding, FindingSeverity } from "@/types/findings";
 
 interface KnowledgeTabProps {
   taskRunId: string;
+}
+
+interface KnowledgeEntry {
+  id: string;
+  task_run_id: string;
+  category: string;
+  agent_type: string;
+  iteration: number;
+  content: string;
+  evidence?: string;
+  confidence: string;
+  related_files: string[];
+  related_criterion_id?: string;
+  is_resolved: boolean;
+  resolution_notes?: string;
+  resolved_at?: string;
+  created_at: string;
 }
 
 // Category icons mapping
@@ -40,6 +64,22 @@ const CATEGORY_ICONS: Record<string, typeof Bug> = {
   test_issue: FlaskConical,
 };
 
+// Knowledge category icons and colors
+const KNOWLEDGE_CATEGORY_CONFIG: Record<string, { icon: typeof Bug; color: string; label: string }> = {
+  finding: { icon: Search, color: "text-amber-500", label: "Finding" },
+  root_cause: { icon: Target, color: "text-red-400", label: "Root Cause" },
+  observation: { icon: Eye, color: "text-blue-400", label: "Observation" },
+  hypothesis: { icon: Lightbulb, color: "text-purple-400", label: "Hypothesis" },
+  solution: { icon: Wrench, color: "text-green-400", label: "Solution" },
+  context: { icon: Info, color: "text-gray-400", label: "Context" },
+};
+
+const CONFIDENCE_COLORS: Record<string, string> = {
+  high: "bg-green-500/10 text-green-400",
+  medium: "bg-amber-500/10 text-amber-400",
+  low: "bg-red-500/10 text-red-400",
+};
+
 // Severity colors
 const SEVERITY_COLORS: Record<FindingSeverity, { bg: string; text: string; border: string }> = {
   critical: { bg: "bg-red-500/10", text: "text-red-500", border: "border-red-500/30" },
@@ -49,20 +89,14 @@ const SEVERITY_COLORS: Record<FindingSeverity, { bg: string; text: string; borde
   info: { bg: "bg-gray-500/10", text: "text-gray-400", border: "border-gray-500/30" },
 };
 
-interface _KnowledgeEntry {
-  id: string;
-  category: string;
-  content: string;
-  iteration: number;
-  timestamp: number;
-  agent?: string;
-}
-
 export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
   const [findings, setFindings] = useState<Finding[]>([]);
+  const [knowledgeEntries, setKnowledgeEntries] = useState<KnowledgeEntry[]>([]);
+  const [knowledgeLoading, setKnowledgeLoading] = useState(true);
   const [categoryFilter, setCategoryFilter] = useState<string>("all");
   const [agentFilter, setAgentFilter] = useState<string>("all");
   const [expandedFindings, setExpandedFindings] = useState<Set<string>>(new Set());
+  const [expandedKnowledge, setExpandedKnowledge] = useState<Set<string>>(new Set());
 
   // Fetch findings for this specific task run using Tauri command
   useEffect(() => {
@@ -85,6 +119,42 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
     const interval = setInterval(fetchFindings, 10000);
     return () => clearInterval(interval);
   }, [taskRunId]);
+
+  // Fetch knowledge entries
+  useEffect(() => {
+    const fetchKnowledge = async () => {
+      if (!taskRunId) return;
+
+      try {
+        const entries = await invoke<KnowledgeEntry[]>("list_task_knowledge_cmd", {
+          taskRunId,
+          category: null,
+        });
+        setKnowledgeEntries(entries || []);
+      } catch (error) {
+        console.error("Failed to fetch knowledge entries:", error);
+        setKnowledgeEntries([]);
+      } finally {
+        setKnowledgeLoading(false);
+      }
+    };
+
+    fetchKnowledge();
+    const interval = setInterval(fetchKnowledge, 10000);
+    return () => clearInterval(interval);
+  }, [taskRunId]);
+
+  const toggleKnowledge = (id: string) => {
+    setExpandedKnowledge((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
 
   const toggleFinding = (id: string) => {
     setExpandedFindings((prev) => {
@@ -109,9 +179,33 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
     {} as Record<string, Finding[]>,
   );
 
-  // Categories for filter
+  // Categories for filter (from knowledge entries)
+  const knowledgeCategories = ["all", ...new Set(knowledgeEntries.map((e) => e.category))];
+  const knowledgeAgents = ["all", ...new Set(knowledgeEntries.map((e) => e.agent_type))];
+
+  // Filter knowledge entries
+  const filteredKnowledge = knowledgeEntries.filter((entry) => {
+    if (categoryFilter !== "all" && entry.category !== categoryFilter) return false;
+    if (agentFilter !== "all" && entry.agent_type !== agentFilter) return false;
+    return true;
+  });
+
+  // Group by iteration
+  const knowledgeByIteration = filteredKnowledge.reduce(
+    (acc, entry) => {
+      const iter = entry.iteration || 0;
+      if (!acc[iter]) acc[iter] = [];
+      acc[iter].push(entry);
+      return acc;
+    },
+    {} as Record<number, KnowledgeEntry[]>,
+  );
+  const iterations = Object.keys(knowledgeByIteration)
+    .map(Number)
+    .sort((a, b) => a - b);
+
+  // Finding categories for the findings panel
   const categories = ["all", ...new Set(findings.map((f) => f.categoryId))];
-  const agents = ["all", "planning", "worker", "verification", "system"];
 
   return (
     <div className="space-y-4">
@@ -219,9 +313,9 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
                 onChange={(e) => setCategoryFilter(e.target.value)}
                 className="text-xs bg-muted border-none rounded px-2 py-1"
               >
-                {categories.map((cat) => (
+                {knowledgeCategories.map((cat) => (
                   <option key={cat} value={cat}>
-                    {cat === "all" ? "All Categories" : cat}
+                    {cat === "all" ? "All Categories" : KNOWLEDGE_CATEGORY_CONFIG[cat]?.label || cat}
                   </option>
                 ))}
               </select>
@@ -233,7 +327,7 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
                 onChange={(e) => setAgentFilter(e.target.value)}
                 className="text-xs bg-muted border-none rounded px-2 py-1"
               >
-                {agents.map((agent) => (
+                {knowledgeAgents.map((agent) => (
                   <option key={agent} value={agent}>
                     {agent === "all" ? "All Agents" : agent}
                   </option>
@@ -243,15 +337,114 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
           </div>
         </div>
 
-        {/* Knowledge entries would be displayed here */}
-        <div className="space-y-2">
-          <p
-            data-ui-id="recap-knowledge-entry-placeholder"
-            className="text-sm text-muted-foreground text-center py-4"
-          >
-            No knowledge entries recorded for this run.
-          </p>
-        </div>
+        {knowledgeLoading ? (
+          <div className="p-4 flex items-center justify-center gap-2 text-muted-foreground">
+            <Loader2 className="w-4 h-4 animate-spin" />
+            <span className="text-sm">Loading knowledge entries...</span>
+          </div>
+        ) : filteredKnowledge.length > 0 ? (
+          <div className="space-y-3">
+            {iterations.map((iteration) => {
+              const entries = knowledgeByIteration[iteration];
+              return (
+                <div key={iteration}>
+                  <div className="text-xs font-medium text-muted-foreground px-1 mb-1.5">
+                    Iteration {iteration}
+                  </div>
+                  <div className="space-y-1.5">
+                    {entries.map((entry) => {
+                      const config = KNOWLEDGE_CATEGORY_CONFIG[entry.category] || {
+                        icon: Info,
+                        color: "text-gray-400",
+                        label: entry.category,
+                      };
+                      const Icon = config.icon;
+                      const isExpanded = expandedKnowledge.has(entry.id);
+
+                      return (
+                        <div
+                          key={entry.id}
+                          data-ui-id={`recap-knowledge-entry-${entry.id}`}
+                          className="rounded-lg border border-border bg-muted/20"
+                        >
+                          <button
+                            onClick={() => toggleKnowledge(entry.id)}
+                            className="w-full px-3 py-2 flex items-center gap-2 text-left hover:bg-muted/40 transition-colors rounded-lg"
+                          >
+                            <Icon className={`w-4 h-4 flex-shrink-0 ${config.color}`} />
+                            <span className={`text-xs px-1.5 py-0.5 rounded ${CONFIDENCE_COLORS[entry.confidence] || "bg-gray-500/10 text-gray-400"}`}>
+                              {entry.confidence}
+                            </span>
+                            <span className="text-xs text-muted-foreground">{entry.agent_type}</span>
+                            <span className="flex-1 text-sm truncate">{entry.content}</span>
+                            {entry.is_resolved && (
+                              <CheckCircle className="w-3.5 h-3.5 text-green-400 flex-shrink-0" />
+                            )}
+                            {isExpanded ? (
+                              <ChevronDown className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                            ) : (
+                              <ChevronRight className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                            )}
+                          </button>
+
+                          {isExpanded && (
+                            <div className="px-3 pb-3 space-y-2 border-t border-border/50 mt-1 pt-2">
+                              <p className="text-sm text-foreground/80">{entry.content}</p>
+
+                              {entry.evidence && (
+                                <div>
+                                  <span className="text-xs font-medium text-muted-foreground">Evidence:</span>
+                                  <p className="text-sm text-foreground/70 mt-0.5">{entry.evidence}</p>
+                                </div>
+                              )}
+
+                              {entry.related_files.length > 0 && (
+                                <div>
+                                  <span className="text-xs font-medium text-muted-foreground">Related files:</span>
+                                  <div className="flex flex-wrap gap-1 mt-0.5">
+                                    {entry.related_files.map((file, i) => (
+                                      <span key={i} className="text-xs font-mono bg-muted px-1.5 py-0.5 rounded">
+                                        {file}
+                                      </span>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
+
+                              {entry.is_resolved && entry.resolution_notes && (
+                                <div>
+                                  <span className="text-xs font-medium text-green-400">Resolution:</span>
+                                  <p className="text-sm text-green-400/80 mt-0.5">{entry.resolution_notes}</p>
+                                </div>
+                              )}
+
+                              <div className="flex items-center gap-3 text-xs text-muted-foreground">
+                                <span>{config.label}</span>
+                                <span>{entry.agent_type}</span>
+                                {entry.created_at && (
+                                  <span>{new Date(entry.created_at).toLocaleString()}</span>
+                                )}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="space-y-2">
+            <p
+              data-ui-id="recap-knowledge-entry-placeholder"
+              className="text-sm text-muted-foreground text-center py-4"
+            >
+              No knowledge entries recorded for this run.
+            </p>
+          </div>
+        )}
       </div>
     </div>
   );

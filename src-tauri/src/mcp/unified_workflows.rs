@@ -994,6 +994,20 @@ pub async fn generate_unified_workflow_async_handler(
         saved_workflow.name, saved_workflow.id, task_run_id
     );
 
+    // Sync task run creation to web backend (best-effort, non-blocking)
+    {
+        let db = state.app_state.checkpoint_db.clone();
+        let tid = task_run_id.clone();
+        tokio::spawn(async move {
+            let sync_service = crate::commands::task_sync::AITaskSyncService::new();
+            if let Ok(Some(task)) = db.get_task_run(&tid) {
+                if let Err(e) = sync_service.sync_task_created(&task, None).await {
+                    warn!("Failed to sync task creation to backend: {}", e);
+                }
+            }
+        });
+    }
+
     // Convert workflow steps for LoopController with explicit phase assignment
     {
         use crate::unified_workflow_executor::{

@@ -1456,3 +1456,114 @@ pub async fn get_task_run_verification_results_from_db(
         Err(e) => Ok(AiDataResponse::err(e)),
     }
 }
+
+/// Response type for runtime context query.
+#[derive(Debug, Serialize)]
+pub struct RuntimeContextResult {
+    pub task_run_id: String,
+    pub variables: Vec<RuntimeContextVariable>,
+}
+
+/// A single context variable for display.
+#[derive(Debug, Serialize)]
+pub struct RuntimeContextVariable {
+    pub name: String,
+    pub value: String,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_step: Option<String>,
+}
+
+/// Get runtime context variables for a task run.
+///
+/// Reads the `runtime_context_json` column from `task_runs` and transforms
+/// the stored variables into a flat list for the Context Tab.
+#[tauri::command]
+pub async fn get_task_run_context(
+    state: State<'_, Arc<AppState>>,
+    task_run_id: String,
+) -> Result<AiDataResponse<RuntimeContextResult>, String> {
+    let context_json = state
+        .checkpoint_db
+        .get_task_run_runtime_context(&task_run_id)?;
+
+    let mut variables = Vec::new();
+
+    if let Some(json_str) = context_json {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json_str) {
+            // Extract variables from the persisted context
+            if let Some(vars) = parsed.get("variables").and_then(|v| v.as_object()) {
+                for (name, entry) in vars {
+                    let (value, source) = if let Some(obj) = entry.as_object() {
+                        let val = obj
+                            .get("value")
+                            .map(|v| match v {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            })
+                            .unwrap_or_default();
+                        let src = obj
+                            .get("source")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        (val, src)
+                    } else {
+                        // Legacy format: plain value
+                        let val = match entry {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        (val, "unknown".to_string())
+                    };
+
+                    variables.push(RuntimeContextVariable {
+                        name: name.clone(),
+                        value,
+                        source,
+                        source_step: None,
+                    });
+                }
+            }
+
+            // Extract replay lineage info as a system variable if present
+            if let Some(lineage) = parsed.get("replay_lineage") {
+                variables.push(RuntimeContextVariable {
+                    name: "replay_lineage".to_string(),
+                    value: serde_json::to_string(lineage).unwrap_or_default(),
+                    source: "system".to_string(),
+                    source_step: None,
+                });
+            }
+            if let Some(checkpoint_id) = parsed.get("source_checkpoint_id") {
+                variables.push(RuntimeContextVariable {
+                    name: "source_checkpoint_id".to_string(),
+                    value: checkpoint_id
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    source: "system".to_string(),
+                    source_step: None,
+                });
+            }
+        }
+    }
+
+    // Sort variables: system first, then step, then by name
+    variables.sort_by(|a, b| {
+        let source_order = |s: &str| match s {
+            "system" => 0,
+            "user" => 1,
+            "step" => 2,
+            _ => 3,
+        };
+        source_order(&a.source)
+            .cmp(&source_order(&b.source))
+            .then(a.name.cmp(&b.name))
+    });
+
+    Ok(AiDataResponse::ok(RuntimeContextResult {
+        task_run_id,
+        variables,
+    }))
+}

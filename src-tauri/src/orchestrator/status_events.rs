@@ -3,7 +3,6 @@
 //! Provides event emission for the agentic features to enable real-time
 //! visibility in the frontend. Emits events for:
 //! - Task routing decisions
-//! - Retry attempts and status
 //! - Memory compression operations
 //! - Lifecycle hook executions
 
@@ -15,7 +14,6 @@ use tracing::{debug, info};
 
 use super::compression::{CompressionResult, TokenCount};
 use super::hooks::{HookResult, HookTrigger};
-use super::retry::{RetryAttempt, RetryState};
 use crate::ai_router::{ComplexityAssessment, TaskComplexity};
 
 // ============================================================================
@@ -59,47 +57,6 @@ pub struct RoutingDecisionEvent {
     #[serde(flatten)]
     pub base: EventBase,
     pub decision: RoutingDecisionPayload,
-}
-
-/// Retry attempt event payload
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RetryAttemptPayload {
-    /// Attempt number (1-indexed)
-    pub attempt_number: u32,
-    /// Error that triggered this retry
-    pub error: String,
-    /// Timestamp of the attempt
-    pub attempt_timestamp: String,
-    /// Delay before this retry (ms)
-    pub delay_ms: u64,
-    /// Whether feedback was injected
-    pub feedback_injected: bool,
-}
-
-/// Retry state payload
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RetryStatePayload {
-    /// Current attempt number
-    pub attempt: u32,
-    /// Last error
-    pub last_error: Option<String>,
-    /// Last attempt timestamp
-    pub last_attempt_at: Option<String>,
-    /// Total delay accumulated (ms)
-    pub total_delay_ms: u64,
-    /// Error history
-    pub error_history: Vec<RetryAttemptPayload>,
-}
-
-/// Retry attempt event
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RetryAttemptEvent {
-    #[serde(flatten)]
-    pub base: EventBase,
-    pub attempt: RetryAttemptPayload,
-    pub state: RetryStatePayload,
-    pub exhausted: bool,
-    pub next_retry_delay_ms: Option<u64>,
 }
 
 /// Token count payload
@@ -244,55 +201,6 @@ impl StatusEventEmitter {
 
         if let Err(e) = app_handle.emit(Self::EVENT_CHANNEL, &event) {
             debug!("Failed to emit routing decision event: {}", e);
-        }
-    }
-
-    /// Emit a retry attempt event
-    pub fn emit_retry_attempt(
-        app_handle: &tauri::AppHandle,
-        task_run_id: &str,
-        attempt: &RetryAttempt,
-        state: &RetryState,
-        exhausted: bool,
-        next_delay_ms: Option<u64>,
-    ) {
-        let event = RetryAttemptEvent {
-            base: Self::create_base("retry_attempt", task_run_id),
-            attempt: RetryAttemptPayload {
-                attempt_number: attempt.attempt_number,
-                error: truncate_string(&attempt.error, 500),
-                attempt_timestamp: attempt.timestamp.clone(),
-                delay_ms: attempt.delay_ms,
-                feedback_injected: attempt.feedback_injected,
-            },
-            state: RetryStatePayload {
-                attempt: state.attempt,
-                last_error: state.last_error.clone().map(|e| truncate_string(&e, 200)),
-                last_attempt_at: state.last_attempt_at.clone(),
-                total_delay_ms: state.total_delay_ms,
-                error_history: state
-                    .error_history
-                    .iter()
-                    .map(|a| RetryAttemptPayload {
-                        attempt_number: a.attempt_number,
-                        error: truncate_string(&a.error, 200),
-                        attempt_timestamp: a.timestamp.clone(),
-                        delay_ms: a.delay_ms,
-                        feedback_injected: a.feedback_injected,
-                    })
-                    .collect(),
-            },
-            exhausted,
-            next_retry_delay_ms: next_delay_ms,
-        };
-
-        info!(
-            "Emitting retry attempt: attempt {} of history, exhausted={}",
-            attempt.attempt_number, exhausted
-        );
-
-        if let Err(e) = app_handle.emit(Self::EVENT_CHANNEL, &event) {
-            debug!("Failed to emit retry attempt event: {}", e);
         }
     }
 

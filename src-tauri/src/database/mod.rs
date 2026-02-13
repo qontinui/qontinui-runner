@@ -2977,7 +2977,7 @@ impl CheckpointDb {
             info!("Successfully migrated to version 22 (hybrid logging tables: task_run_events, task_run_screenshots, task_run_playwright_results)");
         }
 
-        // Migration 23: Add task_knowledge_summaries and retry_state_json
+        // Migration 23: Add task_knowledge_summaries
         if current_version < 23 {
             conn.execute_batch(
                 r#"
@@ -3003,12 +3003,7 @@ impl CheckpointDb {
             )
             .map_err(|e| format!("Failed to migrate to version 23: {}", e))?;
 
-            // Add retry_state_json column (ALTER TABLE must be separate)
-            let _ = conn.execute("ALTER TABLE task_runs ADD COLUMN retry_state_json TEXT", []);
-
-            info!(
-                "Successfully migrated to version 23 (task_knowledge_summaries, retry_state_json)"
-            );
+            info!("Successfully migrated to version 23 (task_knowledge_summaries)");
         }
 
         // Migration 24: Add task_run_api_requests table

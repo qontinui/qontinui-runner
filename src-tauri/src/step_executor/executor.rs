@@ -1597,6 +1597,50 @@ impl StepExecutor {
         result
     }
 
+    /// Persist runtime context (variables) to the database so the Context Tab can display them.
+    ///
+    /// Merges variables from both RuntimeContext and SharedVariableStore into a single JSON blob
+    /// stored in `task_runs.runtime_context_json`.
+    fn persist_runtime_context(&self, execution_id: &str) {
+        let shared_vars = self.shared_variables.get_all();
+        let ctx_vars = &self.runtime_context.variables;
+
+        // Skip if there are no variables to persist
+        if shared_vars.is_empty() && ctx_vars.is_empty() {
+            return;
+        }
+
+        // Build a combined context: merge RuntimeContext variables and SharedVariableStore
+        let mut variables = serde_json::Map::new();
+        for (name, value) in ctx_vars {
+            variables.insert(
+                name.clone(),
+                json!({ "value": value, "source": "system" }),
+            );
+        }
+        for (name, value) in &shared_vars {
+            variables.insert(
+                name.clone(),
+                json!({ "value": value, "source": "step" }),
+            );
+        }
+
+        let context_json = json!({
+            "variables": variables,
+            "iteration": self.runtime_context.iteration,
+        });
+
+        // Remap to parent ID for workflow sequence children
+        let task_run_id = get_parent_task_id(execution_id);
+
+        if let Err(e) = self.app_state.checkpoint_db.update_task_run_runtime_context(
+            &task_run_id,
+            &context_json.to_string(),
+        ) {
+            warn!("Failed to persist runtime context: {}", e);
+        }
+    }
+
     /// Log a step execution event to the database
     ///
     /// This logs step start, complete, and error events to the task_run_events table.
@@ -2149,6 +2193,10 @@ impl StepExecutor {
         } else {
             None
         };
+
+        // Persist runtime context (variables + shared variables) to the database
+        // so the Context Tab can display them after completion.
+        self.persist_runtime_context(execution_id);
 
         ExecutionResult {
             success: failed_steps == 0,
