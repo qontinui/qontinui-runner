@@ -3658,25 +3658,28 @@ class QontinuiExecutor:
         """
         Handle execute_workflow command from web app.
 
-        This command receives a full workflow configuration from the web app,
-        writes it to a temporary file, loads it, and starts execution.
+        Receives a full unified workflow definition from the web app and
+        forwards it to the local Rust MCP API's execute-inline endpoint.
+        This approach works for remote runners that don't have the workflow
+        in their local SQLite DB.
+
+        The execute-inline endpoint blocks until execution finishes, so we
+        run it in a background thread and return immediately.
 
         Args:
             params: Dictionary containing:
                 - execution_id: Unique ID for tracking this execution
-                - workflow: Full workflow configuration (as exported from web app)
+                - workflow: Full unified workflow configuration
                 - variables: Optional variables to pass to workflow
 
         Returns:
             Dictionary with success status and execution details
         """
-        import os
         import sys
-        import tempfile
+        import threading
 
         execution_id = params.get("execution_id")
         workflow = params.get("workflow")
-        variables = params.get("variables", {})
 
         print(
             f"[info    ] EXECUTOR: _handle_execute_workflow called with execution_id={execution_id}",
@@ -3690,135 +3693,76 @@ class QontinuiExecutor:
         if not execution_id:
             return {"success": False, "error": "No execution_id provided"}
 
-        try:
-            # Stop any existing execution
-            if self.is_running:
+        def _run_workflow_background():
+            import requests
+
+            try:
                 self.event_manager.emit_log(
-                    "info", "Stopping current execution before starting new workflow"
+                    "info",
+                    f"Starting remote workflow execution via execute-inline: {workflow.get('name', 'Unknown')}",
                 )
-                self.stop_execution()
 
-            # Write workflow to temporary file
-            # The workflow from the web app is the full export format, which includes
-            # the configuration structure that load_configuration expects
-            temp_dir = tempfile.gettempdir()
-            temp_file = os.path.join(temp_dir, f"qontinui_remote_{execution_id}.json")
-
-            # If workflow is the export format, it may be the full config
-            # If it's just the workflow, wrap it in the expected format
-            if "workflows" not in workflow and "stateMachine" not in workflow:
-                # Workflow is probably just a single workflow, wrap it
-                config_data = {
-                    "version": workflow.get("version", "1.0.0"),
-                    "workflows": [workflow] if isinstance(workflow, dict) else workflow,
-                    "images": [],
-                    "settings": {},
-                }
-            else:
-                # It's already in the full config format
-                config_data = workflow
-
-            with open(temp_file, "w", encoding="utf-8") as f:
-                json.dump(config_data, f, indent=2)
-
-            self.event_manager.emit_log("info", f"Workflow configuration written to {temp_file}")
-
-            # Load the configuration
-            load_success = self.load_configuration(temp_file)
-            if not load_success:
-                # Clean up temp file
-                with contextlib.suppress(Exception):
-                    os.unlink(temp_file)
-                return {"success": False, "error": "Failed to load workflow configuration"}
-
-            # Apply any variables if provided
-            if variables:
-                self.event_manager.emit_log("info", f"Applying variables: {list(variables.keys())}")
-
-                # Apply variables to the action executor's variable context
-                if self.executor_core and self.executor_core.action_executor:
-                    try:
-                        if hasattr(self.executor_core.action_executor, "variable_context"):
-                            for key, value in variables.items():
-                                # Set variables with 'global' scope so they're available throughout execution
-                                self.executor_core.action_executor.variable_context.set(
-                                    key, value, "global"
-                                )
-                                self.event_manager.emit_log(
-                                    "debug",
-                                    f"Set variable '{key}' = {value} (type: {type(value).__name__})",
-                                )
-                            self.event_manager.emit_log(
-                                "info",
-                                f"Successfully applied {len(variables)} variables to execution context",
-                            )
-                        else:
-                            self.event_manager.emit_log(
-                                "warning", "Action executor does not have variable_context"
-                            )
-                    except Exception as e:
-                        self.event_manager.emit_log("error", f"Failed to apply variables: {e}")
-                        self.event_manager.emit_log(
-                            "debug", f"Traceback: {traceback.format_exc()}"
-                        )  # noqa: F823
-                else:
-                    self.event_manager.emit_log(
-                        "warning",
-                        "Cannot apply variables: executor_core or action_executor not initialized",
-                    )
-
-            # Get the workflow ID to execute (first workflow if not specified)
-            workflow_id = None
-            if self.config and "workflows" in self.config:
-                workflows = self.config.get("workflows", [])
-                if workflows:
-                    workflow_id = workflows[0].get("id")
-
-            if not workflow_id:
-                return {"success": False, "error": "No workflow found in configuration"}
-
-            # Start execution
-            self.event_manager.emit_log(
-                "info", f"Starting remote workflow execution: {workflow_id}"
-            )
-            start_success = self.start_execution(workflow_id)
-
-            if start_success:
-                # Send execution started event through WebSocket
+                # Notify via WebSocket that execution has started
                 if self.websocket_handler and self.websocket_handler.is_connected:
                     execution_event = {
                         "type": "execution_started",
                         "data": {
                             "execution_id": execution_id,
-                            "workflow_id": workflow_id,
                             "workflow_name": workflow.get("name", "Unknown"),
                         },
                     }
                     self.websocket_handler.send_message(json.dumps(execution_event))
 
-                return {
-                    "success": True,
-                    "execution_id": execution_id,
-                    "workflow_id": workflow_id,
-                    "message": "Workflow execution started",
-                }
-            else:
-                return {"success": False, "error": "Failed to start workflow execution"}
+                # Forward to the local Rust MCP API's execute-inline endpoint
+                resp = requests.post(
+                    "http://localhost:9876/unified-workflows/execute-inline",
+                    json={
+                        "name": workflow.get("name", "Remote Workflow"),
+                        "description": workflow.get("description", ""),
+                        "setup_steps": workflow.get("setup_steps", []),
+                        "verification_steps": workflow.get("verification_steps", []),
+                        "agentic_steps": workflow.get("agentic_steps", []),
+                        "completion_steps": workflow.get("completion_steps", []),
+                        "max_iterations": workflow.get("max_iterations", 10),
+                        "timeout_seconds": workflow.get("timeout_seconds"),
+                        "settings": workflow.get("settings"),
+                    },
+                    timeout=3600,
+                )
 
-        except Exception as e:
-            print(
-                f"[error   ] EXECUTOR: Failed to execute workflow: {e}",
-                file=sys.stderr,
-                flush=True,
-            )
+                if resp.ok:
+                    self.event_manager.emit_log(
+                        "info",
+                        f"Remote workflow execution completed: {execution_id}",
+                    )
+                else:
+                    self.event_manager.emit_log(
+                        "error",
+                        f"Remote workflow execution failed ({resp.status_code}): {resp.text[:500]}",
+                    )
 
-            print(
-                f"[error   ] EXECUTOR: Traceback: {traceback.format_exc()}",
-                file=sys.stderr,
-                flush=True,
-            )
-            self.event_manager.emit_log("error", f"Failed to execute workflow: {e}")
-            return {"success": False, "error": str(e)}
+                # Notify via WebSocket that execution has finished
+                if self.websocket_handler and self.websocket_handler.is_connected:
+                    completion_event = {
+                        "type": "execution_completed",
+                        "data": {
+                            "execution_id": execution_id,
+                            "success": resp.ok,
+                        },
+                    }
+                    self.websocket_handler.send_message(json.dumps(completion_event))
+
+            except Exception as e:
+                self.event_manager.emit_log("error", f"Remote workflow execution failed: {e}")
+
+        threading.Thread(target=_run_workflow_background, daemon=True).start()
+
+        return {
+            "success": True,
+            "execution_id": execution_id,
+            "status": "started",
+            "message": "Workflow execution started",
+        }
 
     def _handle_detect_current_states(self, params: dict[str, Any]) -> dict[str, Any]:
         """Handle detect_current_states command for AI Verification Agent.
