@@ -108,16 +108,25 @@ const HEALTH_PATHS: &[(&str, &str)] = &[
     ("/ui-bridge/health", "/ui-bridge"),
     ("/health", ""),
 ];
-const SCAN_TIMEOUT_MS: u64 = 500;
+const SCAN_TIMEOUT_MS: u64 = 1500;
 
 // ============================================================================
 // Scanner Implementation
 // ============================================================================
 
+/// Build a shared HTTP client for scanning (avoids creating one per port check)
+fn build_scan_client() -> Option<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_millis(SCAN_TIMEOUT_MS))
+        .pool_max_idle_per_host(2)
+        .build()
+        .ok()
+}
+
 /// Check a single port for UI Bridge health endpoint
-async fn check_port(port: u16) -> Option<DiscoveredApp> {
+async fn check_port(client: &reqwest::Client, port: u16) -> Option<DiscoveredApp> {
     for (health_path, base_path) in HEALTH_PATHS {
-        match check_health(port, health_path, base_path).await {
+        match check_health(client, port, health_path, base_path).await {
             Some(app) => return Some(app),
             None => continue,
         }
@@ -126,16 +135,16 @@ async fn check_port(port: u16) -> Option<DiscoveredApp> {
 }
 
 /// Check a specific health endpoint on a port
-async fn check_health(port: u16, path: &str, base_path: &str) -> Option<DiscoveredApp> {
+async fn check_health(
+    client: &reqwest::Client,
+    port: u16,
+    path: &str,
+    base_path: &str,
+) -> Option<DiscoveredApp> {
     let url = format!("http://localhost:{}{}", port, path);
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(SCAN_TIMEOUT_MS))
-        .build()
-        .ok()?;
-
     let response = match timeout(
-        Duration::from_millis(SCAN_TIMEOUT_MS + 100),
+        Duration::from_millis(SCAN_TIMEOUT_MS + 200),
         client.get(&url).send(),
     )
     .await
@@ -202,11 +211,19 @@ async fn check_health(port: u16, path: &str, base_path: &str) -> Option<Discover
     })
 }
 
-/// Scan a list of ports in parallel
+/// Scan a list of ports in parallel using a shared HTTP client
 async fn scan_ports(ports: &[u16]) -> Vec<DiscoveredApp> {
+    let client = match build_scan_client() {
+        Some(c) => Arc::new(c),
+        None => return Vec::new(),
+    };
+
     let handles: Vec<_> = ports
         .iter()
-        .map(|&port| tokio::spawn(async move { check_port(port).await }))
+        .map(|&port| {
+            let client = client.clone();
+            tokio::spawn(async move { check_port(&client, port).await })
+        })
         .collect();
 
     let mut apps = Vec::new();
@@ -334,6 +351,7 @@ async fn list_adb_devices() -> Vec<MobileDevice> {
 /// Check if a mobile device has UI Bridge by port forwarding
 async fn check_device_ui_bridge(device_id: &str) -> Option<DiscoveredApp> {
     let adb_path = find_adb()?;
+    let client = build_scan_client()?;
 
     // Forward a local port to the device's UI Bridge port
     // Use tcp:0 to let the OS pick a free local port
@@ -357,7 +375,7 @@ async fn check_device_ui_bridge(device_id: &str) -> Option<DiscoveredApp> {
     );
 
     // Check the forwarded port
-    let result = check_port(local_port).await;
+    let result = check_port(&client, local_port).await;
 
     // Remove the port forward
     let _ = tokio::process::Command::new(&adb_path)

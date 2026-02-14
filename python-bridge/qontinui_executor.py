@@ -82,29 +82,63 @@ from event_manager import EventManager, EventType  # noqa: E402
 from event_translator import EventTranslator  # noqa: E402
 from execution_tree import ExecutionNode, ExecutionTree  # noqa: E402
 from executor_core import ExecutorCore  # noqa: E402
-from gui_automation import GUIAutomation  # noqa: E402
-from services.accessibility_capture_service import AccessibilityCaptureService  # noqa: E402
-from services.ai_builder_generator import AiBuilderGeneratorService  # noqa: E402
-from services.ai_shell_command_generator import AiShellCommandGeneratorService  # noqa: E402
-from services.ai_test_generator import AiTestGeneratorService  # noqa: E402
-from services.input_monitor_service import InputMonitorService  # noqa: E402
-from services.integration_testing_service import IntegrationTestingService  # noqa: E402
-from services.model_manager import get_model_manager  # noqa: E402
-from services.pattern_matching_service import get_pattern_matching_service  # noqa: E402
-from services.playwright_collector_service import PlaywrightCollectorService  # noqa: E402
-from services.screenshot_service import ScreenshotService  # noqa: E402
-from services.test_analysis_service import TestAnalysisService  # noqa: E402
-from services.ui_bridge_explorer_service import UIBridgeExplorerService  # noqa: E402
-from services.uitars_extraction_service import (  # noqa: E402
-    UITarsExtractionService,
-    get_uitars_extraction_service,
-)
-from services.unified_data_collector import UnifiedDataCollector  # noqa: E402
-from services.vision_extraction_service import VisionExtractionService  # noqa: E402
-from services.web_extraction_service import WebExtractionService  # noqa: E402
-from test_results_handler import TestResultsHandler  # noqa: E402
 from training_export import TrainingExportCoordinator  # noqa: E402
 from websocket_handler import WebSocketHandler  # noqa: E402
+
+# TestResultsHandler module may not exist; import gracefully
+try:
+    from test_results_handler import TestResultsHandler  # noqa: E402
+except ImportError:
+    TestResultsHandler = None  # type: ignore[assignment, misc]
+
+# UI Bridge explorer - lightweight, doesn't need ML stack
+from services.ui_bridge_explorer_service import UIBridgeExplorerService  # noqa: E402
+
+# Services that may require heavy ML dependencies (torch, easyocr, etc.)
+# Import them gracefully so the executor can start without the full ML stack.
+_ML_SERVICES_AVAILABLE = True
+try:
+    from gui_automation import GUIAutomation  # noqa: E402
+    from services.accessibility_capture_service import AccessibilityCaptureService  # noqa: E402
+    from services.ai_builder_generator import AiBuilderGeneratorService  # noqa: E402
+    from services.ai_shell_command_generator import AiShellCommandGeneratorService  # noqa: E402
+    from services.ai_test_generator import AiTestGeneratorService  # noqa: E402
+    from services.input_monitor_service import InputMonitorService  # noqa: E402
+    from services.integration_testing_service import IntegrationTestingService  # noqa: E402
+    from services.model_manager import get_model_manager  # noqa: E402
+    from services.pattern_matching_service import get_pattern_matching_service  # noqa: E402
+    from services.playwright_collector_service import PlaywrightCollectorService  # noqa: E402
+    from services.screenshot_service import ScreenshotService  # noqa: E402
+    from services.test_analysis_service import TestAnalysisService  # noqa: E402
+    from services.uitars_extraction_service import (  # noqa: E402
+        UITarsExtractionService,
+        get_uitars_extraction_service,
+    )
+    from services.unified_data_collector import UnifiedDataCollector  # noqa: E402
+    from services.vision_extraction_service import VisionExtractionService  # noqa: E402
+    from services.web_extraction_service import WebExtractionService  # noqa: E402
+except ImportError as _ml_import_err:
+    _ML_SERVICES_AVAILABLE = False
+    _ml_import_error_msg = f"{type(_ml_import_err).__name__}: {_ml_import_err}"
+    logger.warning(f"ML services not available (non-fatal): {_ml_import_error_msg}")
+    # Provide None placeholders for unavailable services
+    GUIAutomation = None  # type: ignore[assignment, misc]
+    AccessibilityCaptureService = None  # type: ignore[assignment, misc]
+    AiBuilderGeneratorService = None  # type: ignore[assignment, misc]
+    AiShellCommandGeneratorService = None  # type: ignore[assignment, misc]
+    AiTestGeneratorService = None  # type: ignore[assignment, misc]
+    InputMonitorService = None  # type: ignore[assignment, misc]
+    IntegrationTestingService = None  # type: ignore[assignment, misc]
+    get_model_manager = None  # type: ignore[assignment, misc]
+    get_pattern_matching_service = None  # type: ignore[assignment, misc]
+    PlaywrightCollectorService = None  # type: ignore[assignment, misc]
+    ScreenshotService = None  # type: ignore[assignment, misc]
+    TestAnalysisService = None  # type: ignore[assignment, misc]
+    UITarsExtractionService = None  # type: ignore[assignment, misc]
+    get_uitars_extraction_service = None  # type: ignore[assignment, misc]
+    UnifiedDataCollector = None  # type: ignore[assignment, misc]
+    VisionExtractionService = None  # type: ignore[assignment, misc]
+    WebExtractionService = None  # type: ignore[assignment, misc]
 
 # Check if qontinui library is available
 try:
@@ -178,7 +212,10 @@ class QontinuiExecutor:
         )
 
         # Initialize TestResultsHandler for QA dashboard submission
-        self.test_results_handler = TestResultsHandler(emit_log_fn=self.event_manager.emit_log)
+        if TestResultsHandler is not None:
+            self.test_results_handler = TestResultsHandler(emit_log_fn=self.event_manager.emit_log)
+        else:
+            self.test_results_handler = None
 
         # Initialize CaptureManager
         self.capture_manager = CaptureManager(

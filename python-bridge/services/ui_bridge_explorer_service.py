@@ -551,10 +551,12 @@ class UIBridgeExplorerService:
             ],
             "render_logs": [
                 {
-                    "id": log.id,
-                    "timestamp": log.timestamp.isoformat(),
-                    "url": log.url,
-                    "elements_count": len(log.elements),
+                    "id": log.get("id", ""),
+                    "type": log.get("type", "dom_snapshot"),
+                    "timestamp": log.get("timestamp", ""),
+                    "url": log.get("snapshot", {}).get("url", ""),
+                    "elements_count": log.get("elements_count", 0),
+                    "snapshot": log.get("snapshot", {}),
                 }
                 for log in result.render_logs
             ],
