@@ -8,7 +8,6 @@
  */
 
 import { useState, useCallback, useEffect } from "react";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   Terminal,
   GitBranch,
@@ -301,14 +300,16 @@ function CommandLibraryPanel({ onOpenAiGenerator }: { onOpenAiGenerator: () => v
             <Sparkles className="w-3.5 h-3.5" />
             <span>AI</span>
           </button>
-          <button
-            onClick={() => openUrl("http://localhost:3001/build/shell-commands")}
-            className="flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg hover:bg-muted transition-colors text-indigo-400 hover:text-indigo-300 text-xs"
+          <a
+            href="http://localhost:3001/build/shell-commands"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg hover:bg-muted transition-colors text-indigo-400 hover:text-indigo-300 text-xs no-underline"
             title="Edit in Web (opens browser)"
           >
             <ExternalLink className="w-3.5 h-3.5" />
             <span>Web</span>
-          </button>
+          </a>
           <button
             onClick={() => setIsSelectionMode(!isSelectionMode)}
             className={`flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg transition-colors text-xs ${

@@ -7,7 +7,6 @@
 
 import { useRef } from "react";
 import { Sparkles, Plus, Upload, Download, Trash2, GitBranch, Layers, ExternalLink } from "lucide-react";
-import { openUrl } from "@tauri-apps/plugin-opener";
 
 export interface BuilderToolbarAction {
   /** Unique key for the action */
@@ -18,6 +17,8 @@ export interface BuilderToolbarAction {
   label: string;
   /** Click handler */
   onClick?: () => void;
+  /** External URL — renders as <a> tag instead of button */
+  href?: string;
   /** Whether the action is disabled */
   disabled?: boolean;
   /** Whether the action is currently active (e.g., selection mode) */
@@ -73,6 +74,25 @@ function ActionButton({ action }: { action: BuilderToolbarAction }) {
           {showLabel && <span>{action.label}</span>}
         </button>
       </>
+    );
+  }
+
+  // External link action — renders as <a> tag (works in Tauri webview)
+  if (action.href) {
+    return (
+      <a
+        href={action.href}
+        target="_blank"
+        rel="noopener noreferrer"
+        className={`flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg
+          transition-colors text-xs no-underline
+          ${action.className || "flex-1 hover:bg-neutral-800 text-neutral-400 hover:text-neutral-200"}
+          ${!showLabel ? "p-1.5 flex-none" : "flex-1"}`}
+        title={action.title || action.label}
+      >
+        <Icon className="w-3.5 h-3.5" />
+        {showLabel && <span>{action.label}</span>}
+      </a>
     );
   }
 
@@ -228,12 +248,12 @@ export const toolbarActions = {
     title: active ? "Cancel selection" : "Select items to delete",
   }),
 
-  /** Edit in Web action — opens the corresponding web builder page */
+  /** Edit in Web action — opens the corresponding web builder page in system browser */
   editInWeb: (webPath: string): BuilderToolbarAction => ({
     key: "edit-in-web",
     icon: ExternalLink,
     label: "Web",
-    onClick: () => openUrl(`http://localhost:3001${webPath}`),
+    href: `http://localhost:3001${webPath}`,
     className: "text-indigo-400 hover:text-indigo-300 hover:bg-neutral-800",
     title: "Edit in Web (opens browser)",
   }),

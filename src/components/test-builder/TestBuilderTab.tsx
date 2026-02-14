@@ -10,7 +10,6 @@
  */
 
 import { useState, useEffect, useCallback } from "react";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import { Sparkles, Code, ScanSearch, Zap, FileJson, ExternalLink } from "lucide-react";
 import { TestBuilderProvider, useTestBuilder } from "./TestBuilderContext";
 import { TestLibraryPanel } from "./TestLibraryPanel";
@@ -265,15 +264,17 @@ function TestBuilderContent({ onLog }: TestBuilderTabProps) {
               Spec Workflow
             </button>
             {/* Edit in Web button */}
-            <button
-              onClick={() => openUrl("http://localhost:3001/build/tests")}
-              className="flex items-center gap-1.5 px-3 py-2.5 text-sm font-medium transition-colors text-indigo-400 hover:text-indigo-300 hover:bg-neutral-700/30"
+            <a
+              href="http://localhost:3001/build/tests"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center gap-1.5 px-3 py-2.5 text-sm font-medium transition-colors text-indigo-400 hover:text-indigo-300 hover:bg-neutral-700/30 no-underline"
               title="Edit in Web (opens browser)"
               data-ui-id="test-builder-edit-in-web-btn"
             >
               <ExternalLink className="w-4 h-4" />
               Web
-            </button>
+            </a>
             {/* Test type selector - only show when no test is selected */}
             {!selectedTest && activeTab === "ai" && (
               <div className="ml-auto mr-4 flex items-center gap-2">

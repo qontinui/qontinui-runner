@@ -6,7 +6,6 @@
  */
 
 import { ReactNode } from "react";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import { LucideIcon, Activity, ExternalLink } from "lucide-react";
 import { RunSelector } from "../run-selection/RunSelector";
 import { useRunSelectionOptional } from "../../contexts/RunSelectionContext";
@@ -94,18 +93,16 @@ export function RunPageLayout({ children, title, icon: Icon, badgeCount }: RunPa
               </span>
             )}
             {selectedRun && (
-              <button
-                onClick={() =>
-                  openUrl(
-                    `http://localhost:3001/runs/${selectedRun.id}?tab=${webTab}`
-                  )
-                }
-                className="flex items-center gap-1 px-2 py-0.5 text-xs text-muted-foreground hover:text-foreground rounded hover:bg-muted transition-colors"
+              <a
+                href={`http://localhost:3001/runs/${selectedRun.id}?tab=${webTab}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-1 px-2 py-0.5 text-xs text-muted-foreground hover:text-foreground rounded hover:bg-muted transition-colors no-underline"
                 title="View in Web (opens browser)"
               >
                 <ExternalLink className="w-3 h-3" />
                 <span>Open in Web</span>
-              </button>
+              </a>
             )}
           </div>
 
