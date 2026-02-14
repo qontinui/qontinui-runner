@@ -2045,7 +2045,6 @@ class QontinuiExecutor:
 
                 # Get options
                 min_area = params.get("min_area", 100)
-                params.get("model")
 
                 # Create vectorizer (will try to use SAM3)
                 vectorizer = SegmentVectorizer()
@@ -4297,7 +4296,7 @@ class QontinuiExecutor:
             self.event_manager.emit_log("error", f"Failed to start interaction recording: {e}")
             import traceback
 
-            traceback.print_exc()
+            traceback.print_exc(file=sys.stderr)
             return {"success": False, "error": str(e)}
 
     def _handle_stop_interaction_recording(self) -> dict[str, Any]:
@@ -4366,7 +4365,7 @@ class QontinuiExecutor:
             self.event_manager.emit_log("error", f"Failed to stop interaction recording: {e}")
             import traceback
 
-            traceback.print_exc()
+            traceback.print_exc(file=sys.stderr)
             # Reset state even on error
             self._interaction_recording_active = False
             return {"success": False, "error": str(e)}
@@ -4489,7 +4488,7 @@ class QontinuiExecutor:
             self.event_manager.emit_log("error", f"Failed to start click capture: {e}")
             import traceback
 
-            traceback.print_exc()
+            traceback.print_exc(file=sys.stderr)
             return {"success": False, "error": str(e)}
 
     def _handle_stop_click_capture(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -4584,7 +4583,7 @@ class QontinuiExecutor:
             self.event_manager.emit_log("error", f"Failed to stop click capture: {e}")
             import traceback
 
-            traceback.print_exc()
+            traceback.print_exc(file=sys.stderr)
             # Reset state even on error
             self._click_capture_active = False
             return {"success": False, "error": str(e)}
@@ -4763,7 +4762,7 @@ class QontinuiExecutor:
             self.event_manager.emit_log("error", f"Failed to process click capture: {e}")
             import traceback
 
-            traceback.print_exc()
+            traceback.print_exc(file=sys.stderr)
             return {"success": False, "error": str(e)}
 
     def _capture_screenshot_for_processing(self):
@@ -4979,7 +4978,7 @@ class QontinuiExecutor:
             self.event_manager.emit_log("error", f"Failed to generate state machine: {e}")
             import traceback
 
-            traceback.print_exc()
+            traceback.print_exc(file=sys.stderr)
             return {"success": False, "error": str(e)}
 
     # =========================================================================
