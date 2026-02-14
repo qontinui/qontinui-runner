@@ -1723,7 +1723,7 @@ mod tests {
     #[tokio::test]
     async fn test_simple_flow_execution() {
         let flow = Flow::new("test")
-            .add_step(FlowStep::agent("start", "tester", "Test prompt").then("end"))
+            .add_step(FlowStep::tool("start", "timestamp").then("end"))
             .add_step(FlowStep::end("end"));
 
         let mut state = FlowState::new(&flow);
@@ -1760,8 +1760,8 @@ mod tests {
     #[tokio::test]
     async fn test_step_by_step_execution() {
         let flow = Flow::new("step_test")
-            .add_step(FlowStep::agent("step1", "role", "prompt").then("step2"))
-            .add_step(FlowStep::agent("step2", "role", "prompt").then("end"))
+            .add_step(FlowStep::tool("step1", "timestamp").then("step2"))
+            .add_step(FlowStep::tool("step2", "timestamp").then("end"))
             .add_step(FlowStep::end("end"));
 
         let mut state = FlowState::new(&flow);

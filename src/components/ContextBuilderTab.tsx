@@ -373,6 +373,7 @@ export function ContextBuilderTab({
             className="mb-3"
             actions={[
               toolbarActions.ai(() => setShowAiGenerator(true)),
+              toolbarActions.editInWeb("/build/contexts"),
               toolbarActions.new(startCreate, "New"),
               toolbarActions.delete(() => setIsSelectionMode(!isSelectionMode), isSelectionMode),
             ]}

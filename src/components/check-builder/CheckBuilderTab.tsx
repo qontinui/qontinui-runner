@@ -35,6 +35,7 @@ import {
   FolderOpen,
   Check as CheckIcon,
   X,
+  ExternalLink,
 } from "lucide-react";
 import { BatchDeleteDialog } from "../ui/BatchDeleteDialog";
 import { CheckBuilderProvider, useCheckBuilder } from "./CheckBuilderContext";
@@ -298,6 +299,14 @@ function CheckLibraryPanel({ onOpenAiModal }: CheckLibraryPanelProps) {
               <span>AI</span>
             </button>
           )}
+          <button
+            onClick={() => window.open("http://localhost:3001/build/checks", "_blank")}
+            className="flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg hover:bg-muted transition-colors text-indigo-400 hover:text-indigo-300 text-xs"
+            title="Edit in Web (opens browser)"
+          >
+            <ExternalLink className="w-3.5 h-3.5" />
+            <span>Web</span>
+          </button>
           <button
             onClick={() => setIsSelectionMode(!isSelectionMode)}
             className={`flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg transition-colors text-xs ${

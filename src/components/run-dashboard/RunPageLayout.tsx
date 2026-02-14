@@ -6,10 +6,22 @@
  */
 
 import { ReactNode } from "react";
-import { LucideIcon, Activity } from "lucide-react";
+import { LucideIcon, Activity, ExternalLink } from "lucide-react";
 import { RunSelector } from "../run-selection/RunSelector";
 import { useRunSelectionOptional } from "../../contexts/RunSelectionContext";
 import { getStatusColors } from "@/design-system";
+
+/** Maps runner page titles to web run-detail tab names */
+const TAB_MAPPING: Record<string, string> = {
+  "Recap": "summary",
+  "Actions": "summary",
+  "Image Recognition": "summary",
+  "Findings": "findings",
+  "Test Results": "tests",
+  "AI Output": "ai-conversation",
+  "AI Data": "data-logs",
+  "Statistics": "summary",
+};
 
 interface RunPageLayoutProps {
   /** Child content to render */
@@ -63,6 +75,8 @@ export function RunPageLayout({ children, title, icon: Icon, badgeCount }: RunPa
     );
   }
 
+  const webTab = TAB_MAPPING[title] || "summary";
+
   return (
     <div className="h-full flex flex-col overflow-hidden">
       {/* Header with RunSelector */}
@@ -76,6 +90,21 @@ export function RunPageLayout({ children, title, icon: Icon, badgeCount }: RunPa
               <span className="px-1.5 py-0.5 text-xs rounded-full bg-muted text-muted-foreground">
                 {badgeCount}
               </span>
+            )}
+            {selectedRun && (
+              <button
+                onClick={() =>
+                  window.open(
+                    `http://localhost:3001/runs/${selectedRun.id}?tab=${webTab}`,
+                    "_blank"
+                  )
+                }
+                className="flex items-center gap-1 px-2 py-0.5 text-xs text-muted-foreground hover:text-foreground rounded hover:bg-muted transition-colors"
+                title="View in Web (opens browser)"
+              >
+                <ExternalLink className="w-3 h-3" />
+                <span>Open in Web</span>
+              </button>
             )}
           </div>
 

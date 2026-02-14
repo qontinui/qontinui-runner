@@ -1636,6 +1636,7 @@ function WorkflowBuilderContent({
               toolbarActions.addFromState(() => setAddStateStepsModalOpen(true)),
               toolbarActions.new(handleNewWorkflow, "New"),
               toolbarActions.import(handleImportWorkflow, ".json", workflowsLoading),
+              toolbarActions.editInWeb("/build/workflows"),
               toolbarActions.delete(
                 () => setIsWorkflowSelectionMode(!isWorkflowSelectionMode),
                 isWorkflowSelectionMode,

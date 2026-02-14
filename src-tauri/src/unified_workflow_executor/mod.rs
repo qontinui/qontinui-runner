@@ -65,8 +65,9 @@ mod types;
 
 // Panic handling imports
 use futures_util::FutureExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 // Core types used by external code
 pub use loop_controller::{
@@ -105,14 +106,68 @@ pub use phase_configs::{
 pub use resume::{ResumeManager, ResumePoint};
 
 // =============================================================================
+// Drop Guard for Workflow Task Safety
+// =============================================================================
+
+/// A guard that ensures a workflow task is marked as failed if the tokio task
+/// is dropped without completing normally.
+///
+/// `catch_unwind` catches panics, but it does NOT catch tokio task cancellations
+/// (e.g., `JoinHandle::abort()`, runtime shutdown). When a task is cancelled,
+/// the future is simply dropped — no panic occurs, and `catch_unwind` never
+/// runs its Ok/Err arms. This leaves the workflow in a zombie state: the DB
+/// still says "running" but no executor is alive.
+///
+/// This guard uses `Drop` to detect that scenario. If the task exits without
+/// the `completed` flag being set, the guard marks the workflow as failed.
+struct WorkflowDropGuard {
+    checkpoint_db: Arc<crate::database::CheckpointDb>,
+    execution_id: String,
+    workflow_name: String,
+    completed: Arc<AtomicBool>,
+}
+
+impl Drop for WorkflowDropGuard {
+    fn drop(&mut self) {
+        if !self.completed.load(Ordering::SeqCst) {
+            error!(
+                "Workflow task '{}' (id: {}) was dropped without completing — \
+                 marking as failed to prevent zombie state",
+                self.workflow_name, self.execution_id
+            );
+            let error_message =
+                "Workflow task was unexpectedly terminated (possible task cancellation or runtime shutdown)";
+            if let Err(e) =
+                self.checkpoint_db
+                    .fail_task_run(&self.execution_id, error_message)
+            {
+                error!(
+                    "Failed to mark dropped workflow {} as failed: {}",
+                    self.execution_id, e
+                );
+            } else {
+                warn!(
+                    "Marked dropped workflow '{}' as failed — Continue button should now be available",
+                    self.workflow_name
+                );
+            }
+        }
+    }
+}
+
+// =============================================================================
 // Panic-Safe Workflow Execution
 // =============================================================================
 
-/// Spawns a workflow execution with proper panic handling.
+/// Spawns a workflow execution with proper panic and cancellation handling.
 ///
-/// This function wraps the workflow execution in a panic-catching layer.
-/// If the workflow panics for any reason, the task is marked as failed
-/// so the user can see the error and use the Continue button.
+/// This function wraps the workflow execution in two safety layers:
+/// 1. **Panic guard**: `catch_unwind` catches panics and marks the task as failed.
+/// 2. **Drop guard**: A `WorkflowDropGuard` catches task cancellations (abort,
+///    runtime shutdown) that bypass `catch_unwind`, and marks the task as failed.
+///
+/// Together, these ensure a workflow never becomes a zombie — regardless of how
+/// the task exits, the DB state is always cleaned up.
 ///
 /// # Arguments
 /// * `checkpoint_db` - Database for marking the task as failed on panic
@@ -139,9 +194,28 @@ pub fn spawn_workflow_with_panic_guard<F>(
 ) where
     F: std::future::Future<Output = loop_controller::WorkflowResult> + Send + 'static,
 {
+    let db_for_guard = checkpoint_db.clone();
+    let id_for_guard = execution_id.clone();
+    let name_for_guard = workflow_name.clone();
+
     tokio::spawn(async move {
+        // The drop guard ensures cleanup even if this task is cancelled/aborted.
+        // It MUST be created inside the spawned task so its Drop runs when the
+        // task is dropped.
+        let completed = Arc::new(AtomicBool::new(false));
+        let _guard = WorkflowDropGuard {
+            checkpoint_db: db_for_guard,
+            execution_id: id_for_guard,
+            workflow_name: name_for_guard,
+            completed: completed.clone(),
+        };
+
         // Wrap the future in AssertUnwindSafe and catch panics
         let result = std::panic::AssertUnwindSafe(fut).catch_unwind().await;
+
+        // If we reach here, the task was NOT cancelled — mark the guard as completed
+        // so its Drop doesn't fire the failsafe.
+        completed.store(true, Ordering::SeqCst);
 
         match result {
             Ok(workflow_result) => {
@@ -183,7 +257,7 @@ pub fn spawn_workflow_with_panic_guard<F>(
     });
 }
 
-/// Spawns a workflow sequence execution with proper panic handling.
+/// Spawns a workflow sequence execution with proper panic and cancellation handling.
 ///
 /// Similar to `spawn_workflow_with_panic_guard` but for workflow sequences
 /// that don't return a WorkflowResult directly.
@@ -201,9 +275,23 @@ pub fn spawn_sequence_with_panic_guard<F>(
 ) where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
+    let db_for_guard = checkpoint_db.clone();
+    let id_for_guard = execution_id.clone();
+    let name_for_guard = sequence_name.clone();
+
     tokio::spawn(async move {
+        let completed = Arc::new(AtomicBool::new(false));
+        let _guard = WorkflowDropGuard {
+            checkpoint_db: db_for_guard,
+            execution_id: id_for_guard,
+            workflow_name: name_for_guard,
+            completed: completed.clone(),
+        };
+
         // Wrap the future in AssertUnwindSafe and catch panics
         let result = std::panic::AssertUnwindSafe(fut).catch_unwind().await;
+
+        completed.store(true, Ordering::SeqCst);
 
         match result {
             Ok(()) => {

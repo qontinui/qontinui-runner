@@ -306,6 +306,7 @@ export function ScriptletBuilderTab({
             className="mb-3"
             actions={[
               toolbarActions.aiPlaceholder(),
+              toolbarActions.editInWeb("/build/scriptlets"),
               toolbarActions.delete(() => setIsSelectionMode(!isSelectionMode), isSelectionMode),
               toolbarActions.new(startCreate, "New"),
             ]}

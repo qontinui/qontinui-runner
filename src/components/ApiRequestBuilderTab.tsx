@@ -433,6 +433,7 @@ export function ApiRequestBuilderTab({
             className="mb-3"
             actions={[
               toolbarActions.ai(() => setShowAiGenerator(true)),
+              toolbarActions.editInWeb("/build/api-requests"),
               toolbarActions.new(startCreate, "New"),
               toolbarActions.delete(() => setIsSelectionMode(!isSelectionMode), isSelectionMode),
             ]}

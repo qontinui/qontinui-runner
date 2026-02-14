@@ -10,7 +10,7 @@
  */
 
 import { useState, useEffect, useCallback } from "react";
-import { Sparkles, Code, ScanSearch, Zap, FileJson } from "lucide-react";
+import { Sparkles, Code, ScanSearch, Zap, FileJson, ExternalLink } from "lucide-react";
 import { TestBuilderProvider, useTestBuilder } from "./TestBuilderContext";
 import { TestLibraryPanel } from "./TestLibraryPanel";
 import { TestEditorPanel, getCodeFromTest } from "./TestEditorPanel";
@@ -262,6 +262,16 @@ function TestBuilderContent({ onLog }: TestBuilderTabProps) {
             >
               <FileJson className="w-4 h-4" />
               Spec Workflow
+            </button>
+            {/* Edit in Web button */}
+            <button
+              onClick={() => window.open("http://localhost:3001/build/tests", "_blank")}
+              className="flex items-center gap-1.5 px-3 py-2.5 text-sm font-medium transition-colors text-indigo-400 hover:text-indigo-300 hover:bg-neutral-700/30"
+              title="Edit in Web (opens browser)"
+              data-ui-id="test-builder-edit-in-web-btn"
+            >
+              <ExternalLink className="w-4 h-4" />
+              Web
             </button>
             {/* Test type selector - only show when no test is selected */}
             {!selectedTest && activeTab === "ai" && (

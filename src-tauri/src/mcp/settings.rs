@@ -13,6 +13,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tauri::Emitter;
 use tracing::{error, info};
 
 use crate::commands::backup::{ComprehensiveExport, ComprehensiveImportResult};
@@ -53,6 +54,12 @@ pub struct SaveApiKeyRequest {
 pub struct StorageCleanupRequest {
     pub storage_type: String,
     pub older_than_days: u32,
+}
+
+/// App mode payload (simple / advanced).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppModePayload {
+    pub mode: String,
 }
 
 /// Device info response.
@@ -122,6 +129,66 @@ async fn save_general_settings(
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(api_error(format!("Failed to save settings: {}", e))),
+            ))
+        }
+    }
+}
+
+// ============================================================================
+// App Mode
+// ============================================================================
+
+/// GET /settings/app-mode
+async fn get_app_mode(
+) -> Result<Json<ApiResponse<AppModePayload>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let result = tokio::task::spawn_blocking(|| {
+        let s = settings::load_settings();
+        AppModePayload { mode: s.app_mode }
+    })
+    .await
+    .map_err(|e| {
+        error!("Failed to get app mode: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Task failed: {}", e))),
+        )
+    })?;
+
+    Ok(Json(ApiResponse::success(result)))
+}
+
+/// PUT /settings/app-mode
+async fn save_app_mode(
+    State(api_state): State<Arc<ApiState>>,
+    Json(payload): Json<AppModePayload>,
+) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let mode = payload.mode.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut s = settings::load_settings();
+        s.app_mode = payload.mode;
+        settings::save_settings(&s)
+    })
+    .await
+    .map_err(|e| {
+        error!("Failed to save app mode: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Task failed: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(()) => {
+            info!("App mode saved via HTTP: {}", mode);
+            // Emit Tauri event so runner frontend updates immediately
+            let _ = api_state.app_handle.emit("app-mode-changed", &mode);
+            Ok(Json(ApiResponse::success(())))
+        }
+        Err(e) => {
+            error!("Failed to save app mode: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to save app mode: {}", e))),
             ))
         }
     }
@@ -921,6 +988,11 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route(
             "/settings/general",
             get(get_general_settings).put(save_general_settings),
+        )
+        // App mode
+        .route(
+            "/settings/app-mode",
+            get(get_app_mode).put(save_app_mode),
         )
         // AI settings
         .route("/settings/ai", get(get_ai_settings).put(save_ai_settings))

@@ -91,7 +91,19 @@ export function useDashboardState(): DashboardState {
       const response = await fetch(`${API_BASE}/task-runs/running`);
       if (response.ok) {
         const tasks = await response.json();
-        setRunningTasks(Array.isArray(tasks) ? tasks : []);
+        const taskList = Array.isArray(tasks) ? tasks : [];
+        setRunningTasks(taskList);
+
+        // Use the running task's created_at as the start time (most accurate source)
+        if (taskList.length > 0 && taskList[0].created_at) {
+          const taskStart = new Date(taskList[0].created_at).getTime() / 1000;
+          if (!isNaN(taskStart)) {
+            setStartTime(taskStart);
+          }
+        } else {
+          // No running tasks — reset start time so elapsed shows 0
+          setStartTime(null);
+        }
       }
     } catch {
       // Silently ignore - API may not be available
@@ -105,9 +117,6 @@ export function useDashboardState(): DashboardState {
       if (response.ok) {
         const data = await response.json();
         setActionLogData(data);
-        if (data.workflow_start_time) {
-          setStartTime(data.workflow_start_time);
-        }
       }
     } catch {
       // Silently ignore

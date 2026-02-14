@@ -32,7 +32,7 @@ use tracing::{debug, info, instrument, warn};
 use crate::ai_provider::run_prompt_with_routing;
 use crate::ai_router::TaskContext;
 use crate::config_storage::ConfigStorage;
-use crate::database::CheckpointDb;
+use crate::database::{CheckpointDb, CreateTaskRunEventInput};
 use crate::doctor::DoctorHandle;
 use crate::executor::{
     prompt_builder, timeout_helper, ExecutionOutcome, Executor, ExecutorContext, ExecutorError,
@@ -55,7 +55,7 @@ use super::phase_configs::{
     AgenticConfig, CompletionConfig, CompletionResult, SetupConfig, SetupResult,
     VerificationConfig, VerificationResult,
 };
-use super::types::{AgenticOutcome, LoopConfig};
+use super::types::{get_parent_task_id, AgenticOutcome, LoopConfig};
 
 // =============================================================================
 // Execution Timing Context
@@ -1311,6 +1311,38 @@ impl AgenticExecutor {
                 iteration
             );
 
+            // Emit start event for Active Dashboard
+            let parent_id = get_parent_task_id(&config.execution_id);
+            let resp_action_id = format!("agentic-response-{}-0", parent_id);
+            let resp_start_event = CreateTaskRunEventInput {
+                task_run_id: parent_id.clone(),
+                event_type: "step_execution".to_string(),
+                event_subtype: Some("start".to_string()),
+                message: format!(
+                    "Starting agentic response-mode prompt (iteration {})",
+                    iteration
+                ),
+                data: Some(
+                    serde_json::to_string(&serde_json::json!({
+                        "step_index": 0,
+                        "step_type": "prompt",
+                        "step_name": "Agentic Response Prompt",
+                        "phase": "agentic",
+                        "iteration": iteration,
+                    }))
+                    .unwrap_or_default(),
+                ),
+                workflow_name: None,
+                state_name: None,
+                action_id: Some(resp_action_id.clone()),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                duration_ms: None,
+            };
+            if let Err(e) = self.checkpoint_db.create_task_run_event(&resp_start_event) {
+                warn!("Failed to emit agentic response-mode start event: {}", e);
+            }
+            let resp_mode_start = std::time::Instant::now();
+
             // Build a temporary step with failure context appended to the prompt
             for step in agentic_steps {
                 if step.prompt_mode.as_deref() != Some("response") {
@@ -1380,6 +1412,36 @@ impl AgenticExecutor {
                         if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
                             warn!("Failed to save agentic response-mode step completion checkpoint: {}", e);
                         }
+                        // Emit completion event for Active Dashboard
+                        let resp_duration = resp_mode_start.elapsed().as_millis() as i64;
+                        let complete_event = CreateTaskRunEventInput {
+                            task_run_id: parent_id.clone(),
+                            event_type: "step_execution".to_string(),
+                            event_subtype: Some("complete".to_string()),
+                            message: format!(
+                                "Agentic response-mode completed (iteration {}, {}ms)",
+                                iteration, resp_duration
+                            ),
+                            data: Some(
+                                serde_json::to_string(&serde_json::json!({
+                                    "step_index": 0,
+                                    "step_type": "prompt",
+                                    "step_name": "Agentic Response Prompt",
+                                    "phase": "agentic",
+                                    "iteration": iteration,
+                                    "success": true,
+                                }))
+                                .unwrap_or_default(),
+                            ),
+                            workflow_name: None,
+                            state_name: None,
+                            action_id: Some(resp_action_id.clone()),
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                            duration_ms: Some(resp_duration),
+                        };
+                        if let Err(e) = self.checkpoint_db.create_task_run_event(&complete_event) {
+                            warn!("Failed to emit agentic response-mode completion event: {}", e);
+                        }
                         return AgenticOutcome::Success { output };
                     }
                     Err(e) => {
@@ -1399,8 +1461,38 @@ impl AgenticExecutor {
                         )
                         .with_step_name(step_name);
                         resp_checkpoint.mark_failed(&e, duration_ms as i64);
-                        if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
-                            warn!("Failed to save agentic response-mode step failure checkpoint: {}", e);
+                        if let Err(e2) = checkpoint_mgr.save_step(&resp_checkpoint) {
+                            warn!("Failed to save agentic response-mode step failure checkpoint: {}", e2);
+                        }
+                        // Emit error event for Active Dashboard
+                        let resp_duration = resp_mode_start.elapsed().as_millis() as i64;
+                        let error_event = CreateTaskRunEventInput {
+                            task_run_id: parent_id.clone(),
+                            event_type: "step_execution".to_string(),
+                            event_subtype: Some("error".to_string()),
+                            message: format!(
+                                "Agentic response-mode failed (iteration {}): {}",
+                                iteration, e
+                            ),
+                            data: Some(
+                                serde_json::to_string(&serde_json::json!({
+                                    "step_index": 0,
+                                    "step_type": "prompt",
+                                    "step_name": "Agentic Response Prompt",
+                                    "phase": "agentic",
+                                    "iteration": iteration,
+                                    "success": false,
+                                }))
+                                .unwrap_or_default(),
+                            ),
+                            workflow_name: None,
+                            state_name: None,
+                            action_id: Some(resp_action_id.clone()),
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                            duration_ms: Some(resp_duration),
+                        };
+                        if let Err(e2) = self.checkpoint_db.create_task_run_event(&error_event) {
+                            warn!("Failed to emit agentic response-mode error event: {}", e2);
                         }
                         return AgenticOutcome::Error { error: e };
                     }
@@ -1432,6 +1524,33 @@ impl AgenticExecutor {
         if let Err(e) = checkpoint_mgr.save_step(&checkpoint) {
             warn!("Failed to save agentic step checkpoint: {}", e);
         }
+
+        // Emit step event so the Active Dashboard timeline shows the agentic phase
+        let parent_id = get_parent_task_id(&config.execution_id);
+        let action_id = format!("agentic-ai_session-{}-0", parent_id);
+        let start_event = CreateTaskRunEventInput {
+            task_run_id: parent_id.clone(),
+            event_type: "step_execution".to_string(),
+            event_subtype: Some("start".to_string()),
+            message: format!("Starting agentic AI session (iteration {})", iteration),
+            data: Some(serde_json::to_string(&serde_json::json!({
+                "step_index": 0,
+                "step_type": "ai_session",
+                "step_name": "AI Fixing Issues",
+                "phase": "agentic",
+                "iteration": iteration,
+            })).unwrap_or_default()),
+            workflow_name: None,
+            state_name: None,
+            action_id: Some(action_id.clone()),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            duration_ms: None,
+        };
+        if let Err(e) = self.checkpoint_db.create_task_run_event(&start_event) {
+            warn!("Failed to emit agentic start event: {}", e);
+        }
+
+        let agentic_start = std::time::Instant::now();
 
         // Build enhanced prompt with failure context and progress marker
         // Note: The UnifiedAiSessionExecutor will handle:
@@ -1557,6 +1676,58 @@ impl AgenticExecutor {
 
         if let Err(e) = checkpoint_mgr.save_step(&completion_checkpoint) {
             warn!("Failed to save agentic step completion checkpoint: {}", e);
+        }
+
+        // Emit completion event so the Active Dashboard timeline shows agentic phase result
+        let agentic_duration_ms = agentic_start.elapsed().as_millis() as i64;
+        let (event_subtype, event_message) = match &outcome {
+            AgenticOutcome::Success { .. } => (
+                "complete",
+                format!(
+                    "Agentic AI session completed successfully (iteration {}, {}ms)",
+                    iteration, agentic_duration_ms
+                ),
+            ),
+            AgenticOutcome::Failed { error, .. } => (
+                "error",
+                format!(
+                    "Agentic AI session failed (iteration {}): {}",
+                    iteration, error
+                ),
+            ),
+            AgenticOutcome::Error { error } => (
+                "error",
+                format!(
+                    "Agentic AI session error (iteration {}): {}",
+                    iteration, error
+                ),
+            ),
+            AgenticOutcome::Skipped => ("complete", "Agentic phase skipped".to_string()),
+        };
+        let completion_event = CreateTaskRunEventInput {
+            task_run_id: parent_id.clone(),
+            event_type: "step_execution".to_string(),
+            event_subtype: Some(event_subtype.to_string()),
+            message: event_message,
+            data: Some(
+                serde_json::to_string(&serde_json::json!({
+                    "step_index": 0,
+                    "step_type": "ai_session",
+                    "step_name": "AI Fixing Issues",
+                    "phase": "agentic",
+                    "iteration": iteration,
+                    "success": matches!(&outcome, AgenticOutcome::Success { .. }),
+                }))
+                .unwrap_or_default(),
+            ),
+            workflow_name: None,
+            state_name: None,
+            action_id: Some(action_id),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            duration_ms: Some(agentic_duration_ms),
+        };
+        if let Err(e) = self.checkpoint_db.create_task_run_event(&completion_event) {
+            warn!("Failed to emit agentic completion event: {}", e);
         }
 
         outcome

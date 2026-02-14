@@ -105,7 +105,8 @@ import {
   deserializeState,
 } from "qontinui-navigation";
 
-// ModeSwitcher removed for initial release — locked to developer mode
+import { listen } from "@tauri-apps/api/event";
+import ModeSwitcher from "./ModeSwitcher";
 
 // ============================================================================
 // Icon Mapping
@@ -237,14 +238,13 @@ function buildNavigationGroups(mode: AppMode): ResolvedNavigationGroup[] {
 }
 
 /**
- * Check if a navigation item ID requires developer mode.
- * Returns true if the item is only available in developer mode.
+ * Check if a navigation item ID requires advanced mode.
+ * Returns true if the item is only available in advanced mode.
  */
-function _requiresDeveloperMode(itemId: string): boolean {
+function _requiresAdvancedMode(itemId: string): boolean {
   const item = findItemById(itemId);
   if (!item) return false;
-  // If item has modes defined and doesn't include "automation", it requires developer mode
-  if (item.modes && item.modes.length > 0 && !item.modes.includes("automation")) {
+  if (item.modes && item.modes.length > 0 && !item.modes.includes("simple")) {
     return true;
   }
   return false;
@@ -687,13 +687,16 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
       if (stored) {
         const parsed = deserializeState(stored);
         if (parsed) {
+          let appMode = parsed.appMode ?? "advanced";
+          if (appMode === ("automation" as string)) appMode = "simple";
+          if (appMode === ("developer" as string)) appMode = "advanced";
           return {
             activeItemId: activeTab,
             expandedGroups: parsed.expandedGroups ?? new Set(["run", "system"]),
             expandedItems: parsed.expandedItems ?? new Set(),
             secondarySidebar: { isOpen: false, parentId: null, items: [] },
             isCollapsed: collapsed,
-            appMode: parsed.appMode ?? "developer",
+            appMode,
           };
         }
       }
@@ -703,7 +706,7 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
     return createInitialState({
       activeItemId: activeTab,
       isCollapsed: collapsed,
-      appMode: "developer",
+      appMode: "advanced",
     });
   });
 
@@ -713,8 +716,29 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
   // Build navigation groups based on current mode
   const navigationGroups = useMemo(() => buildNavigationGroups(appMode), [appMode]);
 
-  // Mode is locked to "developer" for initial release.
-  // handleModeChange and auto-switch useEffect removed.
+  const handleModeChange = useCallback(() => {
+    const newMode: AppMode = appMode === "simple" ? "advanced" : "simple";
+    dispatch(navigationActions.setAppMode(newMode));
+    localStorage.setItem(STORAGE_KEYS.appMode, newMode);
+    // Persist to settings file so web can sync
+    fetch("http://localhost:9876/settings/app-mode", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: newMode }),
+    }).catch(() => {}); // fire-and-forget
+  }, [appMode]);
+
+  // Listen for mode changes from other apps (e.g. web pushing via runner API)
+  useEffect(() => {
+    const unlisten = listen<string>("app-mode-changed", (event) => {
+      const newMode = event.payload as AppMode;
+      if (newMode !== appMode) {
+        dispatch(navigationActions.setAppMode(newMode));
+        localStorage.setItem(STORAGE_KEYS.appMode, newMode);
+      }
+    });
+    return () => { unlisten.then(fn => fn()); };
+  }, [appMode]);
 
   // Flyout state
   const [openFlyout, setOpenFlyout] = useState<{
@@ -879,8 +903,6 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
         style={{ width: collapsed ? SIDEBAR_WIDTH_COLLAPSED : SIDEBAR_WIDTH_EXPANDED }}
         aria-label="Main navigation"
       >
-        {/* Mode Switcher removed — locked to developer mode for initial release */}
-
         {/* Navigation Groups */}
         <div className="flex-1 overflow-y-auto py-2 px-2 space-y-4">
           {navigationGroups.map((group) => (
@@ -898,6 +920,37 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
               appMode={appMode}
             />
           ))}
+        </div>
+
+        {/* Mode Toggle Button */}
+        <div className="border-t border-border/50 p-2">
+          <Tooltip
+            content={appMode === "simple" ? "Show All Pages" : "Show Fewer Pages"}
+            disabled={!collapsed}
+          >
+            <button
+              onClick={handleModeChange}
+              data-ui-id="sidebar-mode-toggle-btn"
+              className={`
+                w-full flex items-center gap-3 px-3 py-2 rounded-md text-sm
+                text-muted-foreground hover:text-foreground hover:bg-muted/30
+                transition-colors outline-none
+                focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2
+                focus-visible:ring-offset-background
+                ${collapsed ? "justify-center px-0" : ""}
+              `}
+              aria-label={appMode === "simple" ? "Show All Pages" : "Show Fewer Pages"}
+            >
+              {collapsed ? (
+                <Layers className="w-4 h-4" />
+              ) : (
+                <>
+                  <Layers className="w-4 h-4" />
+                  <span>{appMode === "simple" ? "Show All Pages" : "Show Fewer Pages"}</span>
+                </>
+              )}
+            </button>
+          </Tooltip>
         </div>
 
         {/* Collapse Toggle Button */}

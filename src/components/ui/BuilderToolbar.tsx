@@ -6,7 +6,7 @@
  */
 
 import { useRef } from "react";
-import { Sparkles, Plus, Upload, Download, Trash2, GitBranch, Layers } from "lucide-react";
+import { Sparkles, Plus, Upload, Download, Trash2, GitBranch, Layers, ExternalLink } from "lucide-react";
 
 export interface BuilderToolbarAction {
   /** Unique key for the action */
@@ -225,6 +225,16 @@ export const toolbarActions = {
     showLabel: false,
     className: active ? "" : "hover:bg-neutral-800 text-neutral-400 hover:text-red-400",
     title: active ? "Cancel selection" : "Select items to delete",
+  }),
+
+  /** Edit in Web action — opens the corresponding web builder page */
+  editInWeb: (webPath: string): BuilderToolbarAction => ({
+    key: "edit-in-web",
+    icon: ExternalLink,
+    label: "Web",
+    onClick: () => window.open(`http://localhost:3001${webPath}`, "_blank"),
+    className: "text-indigo-400 hover:text-indigo-300 hover:bg-neutral-800",
+    title: "Edit in Web (opens browser)",
   }),
 };
 

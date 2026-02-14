@@ -348,6 +348,7 @@ export function TaskBuilderTab({ onLog, editTaskId, _onNavigateToLibrary }: Task
             className="mb-3"
             actions={[
               toolbarActions.ai(() => setShowAiGenerator(true)),
+              toolbarActions.editInWeb("/build/workflows"),
               toolbarActions.new(startCreate, "New"),
               toolbarActions.delete(() => setIsSelectionMode(!isSelectionMode), isSelectionMode),
             ]}

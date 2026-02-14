@@ -1,7 +1,7 @@
 /**
  * ModeSwitcher.tsx
  *
- * A segmented control for switching between Automation and Developer modes.
+ * A segmented control for switching between Simple and Advanced modes.
  * Persists the selection to localStorage and updates the navigation state.
  */
 
@@ -32,18 +32,18 @@ interface ModeConfig {
 
 const MODES: ModeConfig[] = [
   {
-    id: "automation",
-    label: "Auto",
-    shortLabel: "Auto",
+    id: "simple",
+    label: "Simple",
+    shortLabel: "Simple",
     icon: Wrench,
-    description: "Execute pre-built workflows",
+    description: "Essential navigation for running workflows",
   },
   {
-    id: "developer",
-    label: "Dev",
-    shortLabel: "Dev",
+    id: "advanced",
+    label: "Advanced",
+    shortLabel: "Adv",
     icon: Code,
-    description: "Build and debug workflows",
+    description: "Full navigation with builders and configuration",
   },
 ];
 

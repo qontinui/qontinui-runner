@@ -2047,6 +2047,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
             className="mb-3"
             actions={[
               toolbarActions.aiPlaceholder(),
+              toolbarActions.editInWeb("/build/scripts"),
               toolbarActions.delete(() => setIsSelectionMode(!isSelectionMode), isSelectionMode),
               toolbarActions.new(startCreate, "New"),
             ]}

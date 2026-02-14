@@ -27,7 +27,7 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
   const [appSettings, setAppSettings] = useState<AppSettings>({
     auto_load_last_config: false,
   });
-  const [defaultProfile, setDefaultProfile] = useState<AppMode>("developer");
+  const [defaultProfile, setDefaultProfile] = useState<AppMode>("advanced");
   const [includeSummaryStep, setIncludeSummaryStep] = useState<boolean>(true);
 
   useEffect(() => {
@@ -39,7 +39,13 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
   const loadDefaultProfile = () => {
     try {
       const stored = localStorage.getItem(STORAGE_KEYS.appMode);
-      if (stored === "automation" || stored === "developer") {
+      if (stored === "automation") {
+        setDefaultProfile("simple");
+        localStorage.setItem(STORAGE_KEYS.appMode, "simple");
+      } else if (stored === "developer") {
+        setDefaultProfile("advanced");
+        localStorage.setItem(STORAGE_KEYS.appMode, "advanced");
+      } else if (stored === "simple" || stored === "advanced") {
         setDefaultProfile(stored);
       }
     } catch (err) {
@@ -65,7 +71,7 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
 
     onLog(
       "success",
-      `Default profile set to ${profile === "automation" ? "Automation" : "Developer"}`,
+      `Menu mode set to ${profile === "simple" ? "Simple" : "Advanced"}`,
     );
   };
 
@@ -242,7 +248,7 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
         className="space-y-4 rounded-lg bg-card/50 p-4"
         data-ui-id="settings-general-default-profile-section"
       >
-        <h4 className="font-medium text-sm">Default Profile</h4>
+        <h4 className="font-medium text-sm">Menu Mode</h4>
 
         <div className="space-y-2">
           <div className="p-3 rounded-lg bg-muted/30">
@@ -250,44 +256,44 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
               <div className="space-y-1">
                 <div
                   data-content-role="label"
-                  data-content-label="startup profile"
+                  data-content-label="menu mode"
                   className="text-sm font-medium"
                 >
-                  Startup Profile
+                  Menu Mode
                 </div>
                 <div
                   data-content-role="description"
-                  data-content-label="startup profile description"
+                  data-content-label="menu mode description"
                   className="text-xs text-muted-foreground"
                 >
-                  Choose which profile to use when the application starts
+                  Choose how many navigation items to show in the sidebar
                 </div>
               </div>
 
               <div className="flex gap-2">
                 <button
-                  onClick={() => handleProfileChange("automation")}
+                  onClick={() => handleProfileChange("simple")}
                   className={`flex-1 flex items-center justify-center gap-2 py-2 px-3 rounded-lg text-sm font-medium transition-all ${
-                    defaultProfile === "automation"
+                    defaultProfile === "simple"
                       ? "bg-primary text-primary-foreground"
                       : "bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground"
                   }`}
-                  data-ui-id="settings-general-profile-automation-btn"
+                  data-ui-id="settings-general-profile-simple-btn"
                 >
                   <Wrench className="w-4 h-4" />
-                  Automation
+                  Simple
                 </button>
                 <button
-                  onClick={() => handleProfileChange("developer")}
+                  onClick={() => handleProfileChange("advanced")}
                   className={`flex-1 flex items-center justify-center gap-2 py-2 px-3 rounded-lg text-sm font-medium transition-all ${
-                    defaultProfile === "developer"
+                    defaultProfile === "advanced"
                       ? "bg-primary text-primary-foreground"
                       : "bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground"
                   }`}
-                  data-ui-id="settings-general-profile-developer-btn"
+                  data-ui-id="settings-general-profile-advanced-btn"
                 >
                   <Code className="w-4 h-4" />
-                  Developer
+                  Advanced
                 </button>
               </div>
             </div>
@@ -297,12 +303,12 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
         <div className="p-3 bg-primary/5 rounded-lg">
           <div className="text-xs text-muted-foreground space-y-2">
             <div>
-              <strong className="text-foreground">Automation:</strong> Simplified UI for executing
-              pre-built workflows. Shows only execution and monitoring features.
+              <strong className="text-foreground">Simple:</strong> Essential navigation — Run,
+              Observe, Workflows, Settings.
             </div>
             <div>
-              <strong className="text-foreground">Developer:</strong> Full UI with workflow
-              builders, debugging tools, and AI configuration options.
+              <strong className="text-foreground">Advanced:</strong> Full navigation with builders,
+              configuration, and debugging tools.
             </div>
           </div>
         </div>

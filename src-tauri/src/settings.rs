@@ -735,6 +735,9 @@ pub struct Settings {
     /// Can be overridden per-workflow. Checks disk space, Node.js, Python, Rust, Git availability.
     #[serde(default = "default_preflight_check_enabled")]
     pub preflight_check_enabled: bool,
+    /// App mode: "simple" or "advanced" — synced across runner and web apps
+    #[serde(default = "default_app_mode")]
+    pub app_mode: String,
 }
 
 fn default_auto_load_last_config() -> bool {
@@ -751,6 +754,10 @@ fn default_auto_continue_ai_workflow() -> bool {
 
 fn default_include_summary_step() -> bool {
     true
+}
+
+fn default_app_mode() -> String {
+    "advanced".to_string()
 }
 
 /// Get the settings file path in the app data directory

@@ -1672,11 +1672,13 @@ impl StepExecutor {
         let action_id = format!("{}-{}-{}-{}", phase, step.step_type, parent_id, step_index);
 
         // Build data JSON with step details (include original task_run_id for context)
+        let iteration = self.runtime_context.iteration;
         let data = json!({
             "step_index": step_index,
             "step_type": step.step_type,
             "step_name": step_name,
             "phase": step.phase,
+            "iteration": iteration,
             "original_task_run_id": task_run_id,  // Keep original ID for debugging
             "command": step.shell_command.as_ref().or(step.check_command.as_ref()),
             "working_directory": step.shell_command_working_directory.as_ref().or(step.check_working_directory.as_ref()),

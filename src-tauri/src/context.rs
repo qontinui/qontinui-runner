@@ -1699,9 +1699,9 @@ client = UIBridgeClient(
 
 # Common connection targets:
 # - Local runner:        http://localhost:9876
-# - Android emulator:    http://10.0.2.2:9876
-# - iOS simulator:       http://localhost:9876
-# - Physical device:     http://<device-ip>:9876
+# - Android emulator:    http://10.0.2.2:8087
+# - iOS simulator:       http://localhost:8087
+# - Physical device:     http://<device-ip>:8087
 # - Web app (dev):       http://localhost:3001 (check app's configured port)
 ```
 
@@ -1913,13 +1913,13 @@ This context documents the UI Bridge elements available in the qontinui-mobile R
 from ui_bridge import UIBridgeClient
 
 # Android emulator (special IP for host access)
-client = UIBridgeClient("http://10.0.2.2:9876")
+client = UIBridgeClient("http://10.0.2.2:8087")
 
 # iOS simulator
-client = UIBridgeClient("http://localhost:9876")
+client = UIBridgeClient("http://localhost:8087")
 
 # Physical device (use device's IP on your network)
-client = UIBridgeClient("http://192.168.1.100:9876")
+client = UIBridgeClient("http://192.168.1.100:8087")
 ```
 
 **Note:** The server only runs in development mode (`__DEV__`).
