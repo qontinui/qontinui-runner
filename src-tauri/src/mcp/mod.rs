@@ -40,6 +40,7 @@ pub mod prompts;
 pub mod query_tool;
 pub mod rag;
 pub mod recordings;
+pub mod reflection_api;
 pub mod saved_api_requests;
 pub mod scriptlets;
 pub mod sdk_client;

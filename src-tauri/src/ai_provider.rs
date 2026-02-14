@@ -94,6 +94,10 @@ fn spawn_and_wait_with_doctor(
     label: &str,
     doctor_handle: Option<&DoctorHandle>,
 ) -> std::io::Result<std::process::Output> {
+    // Remove CLAUDECODE env var so nested Claude CLI sessions don't refuse to start.
+    // The runner legitimately needs to spawn Claude CLI as a subprocess, not as a nested session.
+    cmd.env_remove("CLAUDECODE");
+
     match doctor_handle {
         Some(handle) => {
             // Must pipe stdout/stderr so wait_with_output() can capture them.

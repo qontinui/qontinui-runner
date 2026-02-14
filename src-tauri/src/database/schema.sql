@@ -1,5 +1,5 @@
 -- SQLite Schema for qontinui-runner
--- Version: 55
+-- Version: 58
 --
 -- This schema provides persistent storage for task runs, settings,
 -- prompts, and scheduler state.
@@ -36,6 +36,7 @@
 -- Version 45 adds bridge_id to task_runs for multi-bridge support.
 -- Version 53 adds preflight_check_enabled to unified_workflows for automatic pre-flight environment checks.
 -- Version 55 adds embedding BLOB columns for hybrid RAG search and workflow_generation_feedback table.
+-- Version 58 adds reflection workflow system (reflection_fixes table, is_reflection/reflection_source_task_run_id on task_runs, reflection_fix_id on findings/knowledge).
 
 -- Schema version tracking
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -247,6 +248,10 @@ CREATE TABLE IF NOT EXISTS task_runs (
     prompt_embedding BLOB,   -- Embedding of the task prompt/description
     summary_embedding BLOB,  -- Embedding of the AI-generated summary
 
+    -- Reflection (v58)
+    is_reflection INTEGER DEFAULT 0,            -- Whether this is a reflection analysis run
+    reflection_source_task_run_id TEXT,          -- Source task run being analyzed by this reflection
+
     -- Timestamps
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -318,6 +323,9 @@ CREATE TABLE IF NOT EXISTS task_run_findings (
     -- Embedding vectors for hybrid RAG search (384-dim MiniLM as f32 BLOB)
     title_embedding BLOB,        -- Embedding of the finding title
     description_embedding BLOB,  -- Embedding of the finding description
+
+    -- Reflection linkage (v58)
+    reflection_fix_id TEXT,      -- FK to reflection_fixes if this finding was addressed by a reflection
 
     -- Timestamps
     detected_at TEXT NOT NULL,
@@ -618,6 +626,9 @@ CREATE TABLE IF NOT EXISTS task_knowledge (
     -- Embedding vector for hybrid RAG search (384-dim MiniLM as f32 BLOB)
     content_embedding BLOB,  -- Embedding of the knowledge content
 
+    -- Reflection linkage (v58)
+    reflection_fix_id TEXT,  -- FK to reflection_fixes if this knowledge was created by a reflection
+
     created_at TEXT NOT NULL,
 
     FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
@@ -810,14 +821,24 @@ CREATE TABLE IF NOT EXISTS unified_workflows (
     setup_steps TEXT DEFAULT '[]',         -- JSON array of SetupStep
     verification_steps TEXT DEFAULT '[]',   -- JSON array of VerificationStep
     agentic_steps TEXT DEFAULT '[]',        -- JSON array of AgenticStep
+    completion_steps TEXT DEFAULT '[]',     -- JSON array of CompletionStep
 
     -- Agentic configuration
     max_iterations INTEGER DEFAULT 10,
     provider TEXT,  -- 'claude_cli', 'gemini_api', etc.
     model TEXT,     -- Model identifier
+    skip_ai_summary BOOLEAN NOT NULL DEFAULT 0,  -- Skip AI summary generation
+    timeout_seconds INTEGER DEFAULT NULL,  -- Optional timeout for AI sessions
+    prompt_template TEXT DEFAULT NULL,  -- Custom prompt template
 
-    -- Log watch configuration
+    -- Context configuration
+    context_ids TEXT DEFAULT '[]',  -- JSON array of context IDs to include
+    disabled_context_ids TEXT DEFAULT '[]',  -- JSON array of disabled context IDs
+    auto_include_contexts INTEGER DEFAULT 1,  -- Auto-include relevant contexts
+
+    -- Log configuration
     log_watch_enabled INTEGER DEFAULT 1,  -- 1 = enabled (default), 0 = disabled
+    log_source_selection TEXT DEFAULT '"default"',  -- Log source selection config
 
     -- Health check configuration
     health_check_enabled INTEGER DEFAULT 1,  -- 1 = enabled (default), 0 = disabled
@@ -838,6 +859,9 @@ CREATE TABLE IF NOT EXISTS unified_workflows (
     -- 'excluded' = user opted out, never auto-added
     example_status TEXT DEFAULT 'pending',
 
+    -- Sync status
+    sync_pending INTEGER DEFAULT 0,  -- Whether workflow needs to be synced to backend
+
     -- Timestamps
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -849,6 +873,7 @@ CREATE INDEX IF NOT EXISTS idx_unified_workflows_category ON unified_workflows(c
 CREATE INDEX IF NOT EXISTS idx_unified_workflows_updated_at ON unified_workflows(updated_at);
 CREATE INDEX IF NOT EXISTS idx_unified_workflows_name ON unified_workflows(name);
 CREATE INDEX IF NOT EXISTS idx_unified_workflows_example_status ON unified_workflows(example_status);
+CREATE INDEX IF NOT EXISTS idx_unified_workflows_sync_pending ON unified_workflows(sync_pending);
 
 -- =============================================================================
 -- Task Run Event Logs (Phase 10: Hybrid Event Logging)
@@ -2054,7 +2079,39 @@ CREATE INDEX IF NOT EXISTS idx_spans_name ON execution_spans(name);
 CREATE INDEX IF NOT EXISTS idx_spans_start ON execution_spans(start_ts);
 CREATE INDEX IF NOT EXISTS idx_spans_duration ON execution_spans(duration_ms);
 
+-- Reflection Fixes (v58)
+-- Tracks fixes applied by reflection workflows and their effectiveness
+CREATE TABLE IF NOT EXISTS reflection_fixes (
+    id TEXT PRIMARY KEY,
+    source_task_run_id TEXT NOT NULL,         -- The run being analyzed
+    reflection_task_run_id TEXT NOT NULL,      -- The reflection run that created this fix
+    source_finding_id TEXT,                    -- FK to task_run_findings (if fix addresses a specific finding)
+    source_knowledge_id TEXT,                  -- FK to task_knowledge (if fix addresses a specific knowledge entry)
+    fix_type TEXT NOT NULL,                    -- knowledge_base_update, workflow_step_rewrite, selector_fix, tool_config_update, context_addition, instruction_clarification
+    fix_description TEXT NOT NULL,
+    file_changed TEXT,
+    old_value TEXT,
+    new_value TEXT,
+    confidence TEXT NOT NULL DEFAULT 'medium', -- high, medium, low
+    status TEXT NOT NULL DEFAULT 'applied',    -- applied, reverted, superseded
+    effectiveness TEXT,                        -- NULL -> effective, ineffective, caused_regression, inconclusive
+    effectiveness_evidence TEXT,
+    applied_at TEXT NOT NULL,
+    evaluated_at TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (source_task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY (reflection_task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY (source_finding_id) REFERENCES task_run_findings(id) ON DELETE SET NULL,
+    FOREIGN KEY (source_knowledge_id) REFERENCES task_knowledge(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_reflection_fixes_source ON reflection_fixes(source_task_run_id);
+CREATE INDEX IF NOT EXISTS idx_reflection_fixes_reflection ON reflection_fixes(reflection_task_run_id);
+CREATE INDEX IF NOT EXISTS idx_reflection_fixes_status ON reflection_fixes(status);
+CREATE INDEX IF NOT EXISTS idx_reflection_fixes_effectiveness ON reflection_fixes(effectiveness);
+CREATE INDEX IF NOT EXISTS idx_reflection_fixes_applied_at ON reflection_fixes(applied_at);
+
 -- Initialize singleton tables
 INSERT OR IGNORE INTO gui_lock (id, holder_session_id, acquired_at) VALUES (1, NULL, NULL);
 INSERT OR IGNORE INTO scheduler_settings (id) VALUES (1);
-INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (55, datetime('now'));
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (58, datetime('now'));

@@ -241,6 +241,17 @@ pub struct TaskRun {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_data: Option<String>,
 
+    // ========================================================================
+    // Reflection Fields
+    // ========================================================================
+    /// Whether this task run is a reflection analysis run.
+    #[serde(default)]
+    pub is_reflection: bool,
+
+    /// The source task run ID that this reflection analyzes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reflection_source_task_run_id: Option<String>,
+
     pub created_at: String,
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -285,6 +296,8 @@ pub struct CreateTaskRunInput {
     pub workspace_id: Option<String>,
     pub triggered_by: Option<String>,
     pub bridge_id: Option<String>,
+    pub is_reflection: bool,
+    pub reflection_source_task_run_id: Option<String>,
 }
 
 impl CreateTaskRunInput {
@@ -308,6 +321,8 @@ impl CreateTaskRunInput {
             workspace_id: None,
             triggered_by: None,
             bridge_id: None,
+            is_reflection: false,
+            reflection_source_task_run_id: None,
         }
     }
 
@@ -398,6 +413,18 @@ impl CreateTaskRunInput {
     /// Set the bridge ID for multi-bridge scenarios.
     pub fn with_bridge_id(mut self, bridge_id: impl Into<String>) -> Self {
         self.bridge_id = Some(bridge_id.into());
+        self
+    }
+
+    /// Mark this task run as a reflection run.
+    pub fn with_is_reflection(mut self, is_reflection: bool) -> Self {
+        self.is_reflection = is_reflection;
+        self
+    }
+
+    /// Set the source task run ID that this reflection analyzes.
+    pub fn with_reflection_source_task_run_id(mut self, source_id: impl Into<String>) -> Self {
+        self.reflection_source_task_run_id = Some(source_id.into());
         self
     }
 }
@@ -4449,6 +4476,57 @@ impl CheckpointDb {
             info!("Successfully migrated to version 57 (example_status column added)");
         }
 
+        // Migration to version 58: Reflection workflow system
+        // Adds reflection_fixes table, is_reflection/reflection_source_task_run_id on task_runs,
+        // and reflection_fix_id on task_run_findings and task_knowledge.
+        if current_version < 58 {
+            info!("Migrating database to version 58 (reflection workflow system)");
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS reflection_fixes (
+                    id TEXT PRIMARY KEY,
+                    source_task_run_id TEXT NOT NULL,
+                    reflection_task_run_id TEXT NOT NULL,
+                    source_finding_id TEXT,
+                    source_knowledge_id TEXT,
+                    fix_type TEXT NOT NULL,
+                    fix_description TEXT NOT NULL,
+                    file_changed TEXT,
+                    old_value TEXT,
+                    new_value TEXT,
+                    confidence TEXT NOT NULL DEFAULT 'medium',
+                    status TEXT NOT NULL DEFAULT 'applied',
+                    effectiveness TEXT,
+                    effectiveness_evidence TEXT,
+                    applied_at TEXT NOT NULL,
+                    evaluated_at TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (source_task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
+                    FOREIGN KEY (reflection_task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
+                    FOREIGN KEY (source_finding_id) REFERENCES task_run_findings(id) ON DELETE SET NULL,
+                    FOREIGN KEY (source_knowledge_id) REFERENCES task_knowledge(id) ON DELETE SET NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_reflection_fixes_source ON reflection_fixes(source_task_run_id);
+                CREATE INDEX IF NOT EXISTS idx_reflection_fixes_reflection ON reflection_fixes(reflection_task_run_id);
+                CREATE INDEX IF NOT EXISTS idx_reflection_fixes_status ON reflection_fixes(status);
+                CREATE INDEX IF NOT EXISTS idx_reflection_fixes_effectiveness ON reflection_fixes(effectiveness);
+                CREATE INDEX IF NOT EXISTS idx_reflection_fixes_applied_at ON reflection_fixes(applied_at);
+
+                ALTER TABLE task_runs ADD COLUMN is_reflection INTEGER DEFAULT 0;
+                ALTER TABLE task_runs ADD COLUMN reflection_source_task_run_id TEXT;
+
+                ALTER TABLE task_run_findings ADD COLUMN reflection_fix_id TEXT;
+                ALTER TABLE task_knowledge ADD COLUMN reflection_fix_id TEXT;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (58, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 58: {}", e))?;
+
+            info!("Successfully migrated to version 58 (reflection workflow system)");
+        }
+
         Ok(())
     }
 
@@ -4877,8 +4955,9 @@ impl CheckpointDb {
                                    config_id, workflow_name, workflow_type,
                                    parent_task_run_id, root_task_run_id, depth,
                                    workspace_id, triggered_by, bridge_id,
+                                   is_reflection, reflection_source_task_run_id,
                                    created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, 'running', 0, ?5, '', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?18)
+            VALUES (?1, ?2, ?3, ?4, 'running', 0, ?5, '', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?20)
             "#,
             params![
                 input.id,
@@ -4898,6 +4977,8 @@ impl CheckpointDb {
                 input.workspace_id,
                 input.triggered_by,
                 input.bridge_id,
+                input.is_reflection as i32,
+                input.reflection_source_task_run_id,
                 now
             ],
         )
@@ -4932,6 +5013,8 @@ impl CheckpointDb {
             depth: input.depth,
             bridge_id: input.bridge_id.clone(),
             result_data: None,
+            is_reflection: input.is_reflection,
+            reflection_source_task_run_id: input.reflection_source_task_run_id.clone(),
             created_at: now.clone(),
             updated_at: now,
             completed_at: None,
@@ -5158,6 +5241,7 @@ impl CheckpointDb {
                    summary_generated_at, transition_history_json, workflow_type,
                    workspace_id, triggered_by,
                    parent_task_run_id, root_task_run_id, depth, bridge_id, result_data,
+                   COALESCE(is_reflection, 0) as is_reflection, reflection_source_task_run_id,
                    created_at, updated_at, completed_at
             FROM task_runs
             WHERE id = ?1
@@ -5193,9 +5277,11 @@ impl CheckpointDb {
                     depth: row.get::<_, Option<i64>>(24)?.unwrap_or(0) as u32,
                     bridge_id: row.get(25)?,
                     result_data: row.get(26)?,
-                    created_at: row.get(27)?,
-                    updated_at: row.get(28)?,
-                    completed_at: row.get(29)?,
+                    is_reflection: row.get::<_, i32>(27)? != 0,
+                    reflection_source_task_run_id: row.get(28)?,
+                    created_at: row.get(29)?,
+                    updated_at: row.get(30)?,
+                    completed_at: row.get(31)?,
                 })
             },
         );
@@ -5236,6 +5322,7 @@ impl CheckpointDb {
                        summary_generated_at, transition_history_json, workflow_type,
                        workspace_id, triggered_by,
                        parent_task_run_id, root_task_run_id, depth, bridge_id, result_data,
+                       COALESCE(is_reflection, 0) as is_reflection, reflection_source_task_run_id,
                        created_at, updated_at, completed_at
                 FROM task_runs
                 WHERE parent_task_run_id = ?1
@@ -5277,9 +5364,11 @@ impl CheckpointDb {
                     depth: row.get::<_, Option<i64>>(24)?.unwrap_or(0) as u32,
                     bridge_id: row.get(25)?,
                     result_data: row.get(26)?,
-                    created_at: row.get(27)?,
-                    updated_at: row.get(28)?,
-                    completed_at: row.get(29)?,
+                    is_reflection: row.get::<_, i32>(27)? != 0,
+                    reflection_source_task_run_id: row.get(28)?,
+                    created_at: row.get(29)?,
+                    updated_at: row.get(30)?,
+                    completed_at: row.get(31)?,
                 })
             })
             .map_err(|e| format!("Failed to query child tasks: {}", e))?
@@ -5314,6 +5403,7 @@ impl CheckpointDb {
                        summary_generated_at, transition_history_json, workflow_type,
                        workspace_id, triggered_by,
                        parent_task_run_id, root_task_run_id, depth, bridge_id, result_data,
+                       COALESCE(is_reflection, 0) as is_reflection, reflection_source_task_run_id,
                        created_at, updated_at, completed_at
                 FROM task_runs
                 WHERE root_task_run_id = ?1 AND id != ?1
@@ -5355,9 +5445,11 @@ impl CheckpointDb {
                     depth: row.get::<_, Option<i64>>(24)?.unwrap_or(0) as u32,
                     bridge_id: row.get(25)?,
                     result_data: row.get(26)?,
-                    created_at: row.get(27)?,
-                    updated_at: row.get(28)?,
-                    completed_at: row.get(29)?,
+                    is_reflection: row.get::<_, i32>(27)? != 0,
+                    reflection_source_task_run_id: row.get(28)?,
+                    created_at: row.get(29)?,
+                    updated_at: row.get(30)?,
+                    completed_at: row.get(31)?,
                 })
             })
             .map_err(|e| format!("Failed to query task hierarchy: {}", e))?
@@ -5844,6 +5936,8 @@ impl CheckpointDb {
                     depth: 0,                 // Not queried for performance
                     bridge_id: None,          // Not queried for performance
                     result_data: None,        // Not queried for performance
+                    is_reflection: false,     // Not queried for performance
+                    reflection_source_task_run_id: None, // Not queried for performance
                     created_at: row.get(17)?,
                     updated_at: row.get(18)?,
                     completed_at: row.get(19)?,
@@ -5909,6 +6003,8 @@ impl CheckpointDb {
                     depth: 0,                 // Not queried for performance
                     bridge_id: None,          // Not queried for performance
                     result_data: None,        // Not queried for performance
+                    is_reflection: false,     // Not queried for performance
+                    reflection_source_task_run_id: None, // Not queried for performance
                     created_at: row.get(17)?,
                     updated_at: row.get(18)?,
                     completed_at: row.get(19)?,
@@ -6052,6 +6148,8 @@ impl CheckpointDb {
                     depth: 0,                 // Not queried for performance
                     bridge_id: None,          // Not queried for performance
                     result_data: None,        // Not queried for performance
+                    is_reflection: false,     // Not queried for performance
+                    reflection_source_task_run_id: None, // Not queried for performance
                     created_at: row.get(18)?,
                     updated_at: row.get(19)?,
                     completed_at: row.get(20)?,
@@ -6149,6 +6247,8 @@ impl CheckpointDb {
                     depth: 0,
                     bridge_id: None,
                     result_data: None,
+                    is_reflection: false,     // Not queried for performance
+                    reflection_source_task_run_id: None, // Not queried for performance
                     created_at: row.get(19)?,
                     updated_at: row.get(20)?,
                     completed_at: row.get(21)?,

@@ -60,6 +60,14 @@ pub enum KnowledgeCategory {
     /// Environment or infrastructure issue (PATH, disk space, tools not installed, etc.)
     /// These require user intervention and should NOT trigger automatic retries.
     Environment,
+    /// Tool/API failure (UI Bridge errors, MCP failures, command timeouts)
+    ToolFailure,
+    /// AI couldn't find needed information during execution
+    ContextGap,
+    /// AI misinterpreted a workflow step or instruction
+    InstructionAmbiguity,
+    /// Same issue observed across multiple runs or iterations
+    RecurringPattern,
 }
 
 impl KnowledgeCategory {
@@ -74,6 +82,10 @@ impl KnowledgeCategory {
             Self::VerificationFeedback => "verification_feedback",
             Self::CriterionOverride => "criterion_override",
             Self::Environment => "environment",
+            Self::ToolFailure => "tool_failure",
+            Self::ContextGap => "context_gap",
+            Self::InstructionAmbiguity => "instruction_ambiguity",
+            Self::RecurringPattern => "recurring_pattern",
         }
     }
 
@@ -88,6 +100,10 @@ impl KnowledgeCategory {
             "verification_feedback" | "feedback" => Some(Self::VerificationFeedback),
             "criterion_override" | "override" => Some(Self::CriterionOverride),
             "environment" | "infrastructure" | "env" => Some(Self::Environment),
+            "tool_failure" | "tool-failure" => Some(Self::ToolFailure),
+            "context_gap" | "context-gap" => Some(Self::ContextGap),
+            "instruction_ambiguity" | "instruction-ambiguity" => Some(Self::InstructionAmbiguity),
+            "recurring_pattern" | "recurring-pattern" | "pattern" => Some(Self::RecurringPattern),
             _ => None,
         }
     }
@@ -106,6 +122,7 @@ pub enum AgentType {
     Worker,
     Verification,
     System,
+    Reflection,
 }
 
 impl AgentType {
@@ -115,6 +132,7 @@ impl AgentType {
             Self::Worker => "worker",
             Self::Verification => "verification",
             Self::System => "system",
+            Self::Reflection => "reflection",
         }
     }
 }

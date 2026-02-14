@@ -28,6 +28,7 @@ import {
   Target,
   Wrench,
   Info,
+  RotateCcw,
 } from "lucide-react";
 import type { Finding, FindingSeverity } from "@/types/findings";
 
@@ -65,7 +66,10 @@ const CATEGORY_ICONS: Record<string, typeof Bug> = {
 };
 
 // Knowledge category icons and colors
-const KNOWLEDGE_CATEGORY_CONFIG: Record<string, { icon: typeof Bug; color: string; label: string }> = {
+const KNOWLEDGE_CATEGORY_CONFIG: Record<
+  string,
+  { icon: typeof Bug; color: string; label: string }
+> = {
   finding: { icon: Search, color: "text-amber-500", label: "Finding" },
   root_cause: { icon: Target, color: "text-red-400", label: "Root Cause" },
   observation: { icon: Eye, color: "text-blue-400", label: "Observation" },
@@ -89,6 +93,39 @@ const SEVERITY_COLORS: Record<FindingSeverity, { bg: string; text: string; borde
   info: { bg: "bg-gray-500/10", text: "text-gray-400", border: "border-gray-500/30" },
 };
 
+interface ReflectionFix {
+  id: string;
+  source_task_run_id: string;
+  reflection_task_run_id: string;
+  fix_type: string;
+  fix_description: string;
+  file_changed?: string;
+  old_value?: string;
+  new_value?: string;
+  confidence: string;
+  status: string;
+  effectiveness?: string;
+  effectiveness_evidence?: string;
+  applied_at: string;
+  created_at: string;
+}
+
+const FIX_TYPE_COLORS: Record<string, { bg: string; text: string }> = {
+  knowledge_base_update: { bg: "bg-blue-500/10", text: "text-blue-400" },
+  workflow_step_rewrite: { bg: "bg-purple-500/10", text: "text-purple-400" },
+  selector_fix: { bg: "bg-amber-500/10", text: "text-amber-400" },
+  tool_config_update: { bg: "bg-green-500/10", text: "text-green-400" },
+  context_addition: { bg: "bg-cyan-500/10", text: "text-cyan-400" },
+  instruction_clarification: { bg: "bg-rose-500/10", text: "text-rose-400" },
+};
+
+const EFFECTIVENESS_COLORS: Record<string, { bg: string; text: string }> = {
+  effective: { bg: "bg-green-500/10", text: "text-green-400" },
+  ineffective: { bg: "bg-red-500/10", text: "text-red-400" },
+  caused_regression: { bg: "bg-red-500/10", text: "text-red-400" },
+  inconclusive: { bg: "bg-gray-500/10", text: "text-gray-400" },
+};
+
 export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
   const [findings, setFindings] = useState<Finding[]>([]);
   const [knowledgeEntries, setKnowledgeEntries] = useState<KnowledgeEntry[]>([]);
@@ -97,6 +134,10 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
   const [agentFilter, setAgentFilter] = useState<string>("all");
   const [expandedFindings, setExpandedFindings] = useState<Set<string>>(new Set());
   const [expandedKnowledge, setExpandedKnowledge] = useState<Set<string>>(new Set());
+  const [reflectionFixes, setReflectionFixes] = useState<ReflectionFix[]>([]);
+  const [reflectionLoading, setReflectionLoading] = useState(true);
+  const [expandedFixes, setExpandedFixes] = useState<Set<string>>(new Set());
+  const [triggeringReflection, setTriggeringReflection] = useState(false);
 
   // Fetch findings for this specific task run using Tauri command
   useEffect(() => {
@@ -143,6 +184,65 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
     const interval = setInterval(fetchKnowledge, 10000);
     return () => clearInterval(interval);
   }, [taskRunId]);
+
+  // Fetch reflection fixes
+  useEffect(() => {
+    const fetchReflectionFixes = async () => {
+      if (!taskRunId) return;
+
+      try {
+        const response = await fetch(
+          `http://localhost:9876/task-runs/${taskRunId}/reflection-fixes`,
+        );
+        if (response.ok) {
+          const result = await response.json();
+          if (result.success && result.data) {
+            setReflectionFixes(result.data);
+          }
+        }
+      } catch (error) {
+        console.error("Failed to fetch reflection fixes:", error);
+        setReflectionFixes([]);
+      } finally {
+        setReflectionLoading(false);
+      }
+    };
+
+    fetchReflectionFixes();
+    const interval = setInterval(fetchReflectionFixes, 10000);
+    return () => clearInterval(interval);
+  }, [taskRunId]);
+
+  const triggerReflection = async () => {
+    setTriggeringReflection(true);
+    try {
+      const response = await fetch(`http://localhost:9876/reflection/trigger/${taskRunId}`, {
+        method: "POST",
+      });
+      if (response.ok) {
+        const result = await response.json();
+        if (result.success) {
+          console.log("Reflection triggered successfully");
+        }
+      }
+    } catch (error) {
+      console.error("Failed to trigger reflection:", error);
+    } finally {
+      setTriggeringReflection(false);
+    }
+  };
+
+  const toggleFix = (id: string) => {
+    setExpandedFixes((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
 
   const toggleKnowledge = (id: string) => {
     setExpandedKnowledge((prev) => {
@@ -296,6 +396,166 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
         )}
       </div>
 
+      {/* Reflection Fixes Panel */}
+      {(reflectionFixes.length > 0 || !reflectionLoading) && (
+        <div data-ui-id="recap-reflection-fixes-panel" className="card p-4">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="font-medium flex items-center gap-2">
+              <RotateCcw className="w-5 h-5 text-purple-400" />
+              <Wrench className="w-4 h-4 text-purple-400 -ml-1" />
+              Reflection Fixes ({reflectionFixes.length})
+            </h3>
+            <button
+              onClick={triggerReflection}
+              disabled={triggeringReflection}
+              className="px-3 py-1.5 text-xs font-medium bg-purple-500/10 text-purple-400 hover:bg-purple-500/20 rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5"
+              data-ui-id="recap-trigger-reflection-btn"
+            >
+              {triggeringReflection ? (
+                <>
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  Triggering...
+                </>
+              ) : (
+                <>
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  Trigger Reflection
+                </>
+              )}
+            </button>
+          </div>
+
+          {reflectionLoading ? (
+            <div className="p-4 flex items-center justify-center gap-2 text-muted-foreground">
+              <Loader2 className="w-4 h-4 animate-spin" />
+              <span className="text-sm">Loading reflection fixes...</span>
+            </div>
+          ) : reflectionFixes.length > 0 ? (
+            <div className="space-y-2">
+              {reflectionFixes.map((fix) => {
+                const typeColors = FIX_TYPE_COLORS[fix.fix_type] || {
+                  bg: "bg-gray-500/10",
+                  text: "text-gray-400",
+                };
+                const confColors =
+                  CONFIDENCE_COLORS[fix.confidence] || "bg-gray-500/10 text-gray-400";
+                const effectColors = fix.effectiveness
+                  ? EFFECTIVENESS_COLORS[fix.effectiveness] || {
+                      bg: "bg-gray-500/10",
+                      text: "text-gray-400",
+                    }
+                  : null;
+                const isExpanded = expandedFixes.has(fix.id);
+
+                return (
+                  <div
+                    key={fix.id}
+                    data-ui-id={`recap-reflection-fix-${fix.id}`}
+                    className="rounded-lg border border-border bg-muted/20"
+                  >
+                    <button
+                      onClick={() => toggleFix(fix.id)}
+                      className="w-full px-3 py-2 flex items-center gap-2 text-left hover:bg-muted/40 transition-colors rounded-lg"
+                    >
+                      <Wrench className={`w-4 h-4 flex-shrink-0 ${typeColors.text}`} />
+                      <span
+                        className={`text-xs px-1.5 py-0.5 rounded ${typeColors.bg} ${typeColors.text}`}
+                      >
+                        {fix.fix_type.replace(/_/g, " ")}
+                      </span>
+                      <span className={`text-xs px-1.5 py-0.5 rounded ${confColors}`}>
+                        {fix.confidence}
+                      </span>
+                      {effectColors && (
+                        <span
+                          className={`text-xs px-1.5 py-0.5 rounded ${effectColors.bg} ${effectColors.text}`}
+                        >
+                          {fix.effectiveness}
+                        </span>
+                      )}
+                      <span className="flex-1 text-sm truncate">{fix.fix_description}</span>
+                      {isExpanded ? (
+                        <ChevronDown className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                      ) : (
+                        <ChevronRight className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                      )}
+                    </button>
+
+                    {isExpanded && (
+                      <div className="px-3 pb-3 space-y-2 border-t border-border/50 mt-1 pt-2">
+                        <p className="text-sm text-foreground/80">{fix.fix_description}</p>
+
+                        {fix.file_changed && (
+                          <div>
+                            <span className="text-xs font-medium text-muted-foreground">
+                              File changed:
+                            </span>
+                            <span className="text-xs font-mono bg-muted px-1.5 py-0.5 rounded ml-1">
+                              {fix.file_changed}
+                            </span>
+                          </div>
+                        )}
+
+                        {(fix.old_value || fix.new_value) && (
+                          <div className="space-y-1.5">
+                            {fix.old_value && (
+                              <div>
+                                <span className="text-xs font-medium text-red-400">Old value:</span>
+                                <pre className="text-xs bg-red-500/5 text-red-300 rounded p-2 mt-0.5 overflow-x-auto whitespace-pre-wrap">
+                                  {fix.old_value}
+                                </pre>
+                              </div>
+                            )}
+                            {fix.new_value && (
+                              <div>
+                                <span className="text-xs font-medium text-green-400">
+                                  New value:
+                                </span>
+                                <pre className="text-xs bg-green-500/5 text-green-300 rounded p-2 mt-0.5 overflow-x-auto whitespace-pre-wrap">
+                                  {fix.new_value}
+                                </pre>
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        {fix.effectiveness_evidence && (
+                          <div>
+                            <span className="text-xs font-medium text-muted-foreground">
+                              Effectiveness evidence:
+                            </span>
+                            <p className="text-sm text-foreground/70 mt-0.5">
+                              {fix.effectiveness_evidence}
+                            </p>
+                          </div>
+                        )}
+
+                        <div className="flex items-center gap-3 text-xs text-muted-foreground">
+                          <span>Status: {fix.status}</span>
+                          {fix.applied_at && (
+                            <span>Applied: {new Date(fix.applied_at).toLocaleString()}</span>
+                          )}
+                          {fix.created_at && (
+                            <span>Created: {new Date(fix.created_at).toLocaleString()}</span>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="px-3 py-4 text-center">
+              <p className="text-sm text-muted-foreground">
+                No reflection fixes applied for this run. Use the button above to trigger a
+                reflection analysis.
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Knowledge Timeline */}
       <div data-ui-id="recap-knowledge-timeline" className="card p-4">
         <div className="flex items-center justify-between mb-4">
@@ -315,7 +575,9 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
               >
                 {knowledgeCategories.map((cat) => (
                   <option key={cat} value={cat}>
-                    {cat === "all" ? "All Categories" : KNOWLEDGE_CATEGORY_CONFIG[cat]?.label || cat}
+                    {cat === "all"
+                      ? "All Categories"
+                      : KNOWLEDGE_CATEGORY_CONFIG[cat]?.label || cat}
                   </option>
                 ))}
               </select>
@@ -372,10 +634,14 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
                             className="w-full px-3 py-2 flex items-center gap-2 text-left hover:bg-muted/40 transition-colors rounded-lg"
                           >
                             <Icon className={`w-4 h-4 flex-shrink-0 ${config.color}`} />
-                            <span className={`text-xs px-1.5 py-0.5 rounded ${CONFIDENCE_COLORS[entry.confidence] || "bg-gray-500/10 text-gray-400"}`}>
+                            <span
+                              className={`text-xs px-1.5 py-0.5 rounded ${CONFIDENCE_COLORS[entry.confidence] || "bg-gray-500/10 text-gray-400"}`}
+                            >
                               {entry.confidence}
                             </span>
-                            <span className="text-xs text-muted-foreground">{entry.agent_type}</span>
+                            <span className="text-xs text-muted-foreground">
+                              {entry.agent_type}
+                            </span>
                             <span className="flex-1 text-sm truncate">{entry.content}</span>
                             {entry.is_resolved && (
                               <CheckCircle className="w-3.5 h-3.5 text-green-400 flex-shrink-0" />
@@ -393,17 +659,26 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
 
                               {entry.evidence && (
                                 <div>
-                                  <span className="text-xs font-medium text-muted-foreground">Evidence:</span>
-                                  <p className="text-sm text-foreground/70 mt-0.5">{entry.evidence}</p>
+                                  <span className="text-xs font-medium text-muted-foreground">
+                                    Evidence:
+                                  </span>
+                                  <p className="text-sm text-foreground/70 mt-0.5">
+                                    {entry.evidence}
+                                  </p>
                                 </div>
                               )}
 
                               {entry.related_files.length > 0 && (
                                 <div>
-                                  <span className="text-xs font-medium text-muted-foreground">Related files:</span>
+                                  <span className="text-xs font-medium text-muted-foreground">
+                                    Related files:
+                                  </span>
                                   <div className="flex flex-wrap gap-1 mt-0.5">
                                     {entry.related_files.map((file, i) => (
-                                      <span key={i} className="text-xs font-mono bg-muted px-1.5 py-0.5 rounded">
+                                      <span
+                                        key={i}
+                                        className="text-xs font-mono bg-muted px-1.5 py-0.5 rounded"
+                                      >
                                         {file}
                                       </span>
                                     ))}
@@ -413,8 +688,12 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
 
                               {entry.is_resolved && entry.resolution_notes && (
                                 <div>
-                                  <span className="text-xs font-medium text-green-400">Resolution:</span>
-                                  <p className="text-sm text-green-400/80 mt-0.5">{entry.resolution_notes}</p>
+                                  <span className="text-xs font-medium text-green-400">
+                                    Resolution:
+                                  </span>
+                                  <p className="text-sm text-green-400/80 mt-0.5">
+                                    {entry.resolution_notes}
+                                  </p>
                                 </div>
                               )}
 

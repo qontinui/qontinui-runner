@@ -11,6 +11,7 @@ import {
   ChevronDown,
   ChevronRight,
   Info,
+  RotateCcw,
 } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import { getAccentColors } from "@/design-system";
@@ -78,6 +79,10 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Reflection settings (separate from Tauri-managed settings)
+  const [reflectionEnabled, setReflectionEnabled] = useState(false);
+  const [reflectionExpanded, setReflectionExpanded] = useState(true);
+
   // Section expansion state
   const [compressionExpanded, setCompressionExpanded] = useState(true);
   const [retryExpanded, setRetryExpanded] = useState(true);
@@ -85,6 +90,7 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
 
   useEffect(() => {
     loadSettings();
+    loadReflectionSettings();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -172,6 +178,48 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
   const resetToDefaults = () => {
     setSettings(DEFAULT_SETTINGS);
     onLog("info", "Settings reset to defaults (save to apply)");
+  };
+
+  const loadReflectionSettings = async () => {
+    try {
+      const response = await fetch("http://localhost:9876/reflection/settings");
+      if (response.ok) {
+        const result = await response.json();
+        if (result.success && result.data) {
+          setReflectionEnabled(result.data.reflection_enabled ?? false);
+        }
+      }
+    } catch (err) {
+      console.error("Failed to load reflection settings:", err);
+      onLog("debug", `Failed to load reflection settings: ${err}`);
+    }
+  };
+
+  const toggleReflection = async (enabled: boolean) => {
+    setReflectionEnabled(enabled);
+    try {
+      const response = await fetch("http://localhost:9876/reflection/settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reflection_enabled: enabled }),
+      });
+      if (response.ok) {
+        const result = await response.json();
+        if (result.success) {
+          onLog("success", `Post-run reflection ${enabled ? "enabled" : "disabled"}`);
+        } else {
+          setReflectionEnabled(!enabled);
+          onLog("error", "Failed to save reflection setting");
+        }
+      } else {
+        setReflectionEnabled(!enabled);
+        onLog("error", "Failed to save reflection setting");
+      }
+    } catch (err) {
+      setReflectionEnabled(!enabled);
+      console.error("Failed to save reflection setting:", err);
+      onLog("error", `Failed to save reflection setting: ${err}`);
+    }
   };
 
   if (loading) {
@@ -752,6 +800,59 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
                 Task routing optimizes cost and latency by using faster/cheaper models for simple
                 tasks. Complexity is assessed based on file count, prompt length, and keywords.
               </p>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Post-Run Reflection Section */}
+      <div
+        className="rounded-lg bg-card/50 overflow-hidden"
+        data-ui-id="settings-agentic-reflection-section"
+      >
+        <button
+          onClick={() => setReflectionExpanded(!reflectionExpanded)}
+          className="w-full p-4 flex items-center justify-between hover:bg-muted/30 transition-colors"
+        >
+          <div className="flex items-center gap-3">
+            <RotateCcw className="w-5 h-5 text-primary" />
+            <div className="text-left">
+              <h4 className="font-medium text-sm">Post-Run Reflection</h4>
+              <p className="text-xs text-muted-foreground">
+                Automatically analyze completed workflows to identify systemic issues and apply
+                fixes
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <ToggleSwitch
+              checked={reflectionEnabled}
+              onChange={(enabled) => toggleReflection(enabled)}
+              onClick={(e) => e.stopPropagation()}
+            />
+            {reflectionExpanded ? (
+              <ChevronDown className="w-4 h-4 text-muted-foreground" />
+            ) : (
+              <ChevronRight className="w-4 h-4 text-muted-foreground" />
+            )}
+          </div>
+        </button>
+
+        {reflectionExpanded && (
+          <div className="px-4 pb-4 space-y-4 border-t border-border/50">
+            <div className={`mt-4 p-3 ${getAccentColors("cyan").bg} rounded-lg flex gap-2`}>
+              <Info className={`w-4 h-4 ${getAccentColors("cyan").text} shrink-0 mt-0.5`} />
+              <div className={`text-xs ${getAccentColors("cyan").text} space-y-1.5`}>
+                <p>
+                  When enabled, the system automatically reviews completed workflow runs to detect
+                  recurring failures, inefficient patterns, and systemic issues.
+                </p>
+                <p>
+                  Reflection can apply fixes such as knowledge base updates, workflow step rewrites,
+                  selector corrections, and instruction clarifications — improving future runs
+                  without manual intervention.
+                </p>
+              </div>
             </div>
           </div>
         )}

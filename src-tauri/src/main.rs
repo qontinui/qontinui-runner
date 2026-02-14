@@ -54,6 +54,7 @@ mod playwright;
 mod prompts;
 mod rag;
 mod recording;
+mod reflection;
 mod runtime_env;
 mod safe_lock;
 mod saved_api_requests;

@@ -20,6 +20,7 @@ use crate::config_storage::ConfigStorage;
 use crate::doctor::DoctorHandle;
 use crate::event_system::EventBroadcaster;
 use crate::orchestrator::integration::StageTransition;
+use crate::orchestrator::knowledge::{AgentType, KnowledgeBase, parse_findings_from_output};
 use crate::step_executor::ExecutionStepConfig;
 use crate::step_registry::StepEventLogger;
 use crate::summary_generator::generate_task_summary_async;
@@ -44,7 +45,11 @@ pub struct LoopController {
     agentic_executor: AgenticExecutor,
     completion_executor: CompletionExecutor,
     checkpoint_db: Arc<crate::database::CheckpointDb>,
+    knowledge_base: KnowledgeBase,
+    app_state: Arc<AppState>,
+    config_storage: Arc<tokio::sync::Mutex<ConfigStorage>>,
     app_handle: tauri::AppHandle,
+    pid_tracker: Arc<std::sync::Mutex<Vec<u32>>>,
     doctor_handle: Option<DoctorHandle>,
 }
 
@@ -79,12 +84,16 @@ impl LoopController {
             ),
             completion_executor: CompletionExecutor::new(
                 app_state.clone(),
-                config_storage,
+                config_storage.clone(),
                 app_handle.clone(),
-                pid_tracker,
+                pid_tracker.clone(),
             ),
             checkpoint_db: app_state.checkpoint_db.clone(),
+            knowledge_base: KnowledgeBase::new(app_state.checkpoint_db.clone()),
+            app_state,
+            config_storage,
             app_handle,
+            pid_tracker,
             doctor_handle,
         }
     }
@@ -830,6 +839,39 @@ impl LoopController {
             });
         }
 
+        // Trigger reflection workflow (dev mode only, non-reflection runs only)
+        if config.is_dev_mode {
+            let deps = crate::reflection::trigger::ReflectionDeps {
+                app_state: self.app_state.clone(),
+                config_storage: self.config_storage.clone(),
+                app_handle: self.app_handle.clone(),
+                pid_tracker: self.pid_tracker.clone(),
+            };
+            let source_task_run_id = config.execution_id.clone();
+            tokio::spawn(async move {
+                // Delay to allow summary generation to finish
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                // launch_reflection is sync — it spawns the workflow internally
+                match crate::reflection::trigger::launch_reflection(
+                    deps,
+                    source_task_run_id.clone(),
+                ) {
+                    Ok(id) if id == "skipped" => {
+                        debug!("Reflection skipped for {}", source_task_run_id);
+                    }
+                    Ok(id) => {
+                        info!(
+                            "Launched reflection {} for completed run {}",
+                            id, source_task_run_id
+                        );
+                    }
+                    Err(e) => {
+                        warn!("Failed to launch reflection for {}: {}", source_task_run_id, e);
+                    }
+                }
+            });
+        }
+
         WorkflowResult {
             success: loop_result.verification_passed,
             verification_passed: loop_result.verification_passed,
@@ -1124,6 +1166,35 @@ impl LoopController {
 
             let failure_context = verification_result.build_failure_context();
 
+            // Record verification feedback as knowledge for cross-iteration context
+            {
+                let failed_criteria: Vec<String> = verification_result
+                    .step_results
+                    .iter()
+                    .filter(|sr| !sr.success)
+                    .map(|sr| sr.step_name.clone())
+                    .collect();
+
+                let parent_id = get_parent_task_id(&config.execution_id);
+                if let Err(e) = self.knowledge_base.record_verification_feedback(
+                    &parent_id,
+                    iteration,
+                    &failure_context,
+                    &failed_criteria,
+                ) {
+                    warn!(
+                        "Failed to record verification feedback as knowledge (iteration {}): {}",
+                        iteration, e
+                    );
+                } else {
+                    debug!(
+                        "Recorded verification feedback knowledge: {} failed criteria (iteration {})",
+                        failed_criteria.len(),
+                        iteration
+                    );
+                }
+            }
+
             // Detect regressions from previous iteration (iteration 2+)
             let failure_context = if iteration > 1 {
                 match detect_regression(
@@ -1197,6 +1268,67 @@ impl LoopController {
                     true,  // increment session count
                     false, // Don't check for completion marker - verification is the authority
                 );
+            }
+
+            // Record findings from AI output as knowledge entries
+            if let Some(output) = agentic_outcome.output() {
+                let findings = parse_findings_from_output(output);
+                if !findings.is_empty() {
+                    let parent_id = get_parent_task_id(&config.execution_id);
+                    info!(
+                        "Parsed {} finding(s) from agentic output (iteration {})",
+                        findings.len(),
+                        iteration
+                    );
+                    for finding in &findings {
+                        if let Err(e) = self.knowledge_base.record_finding(
+                            &parent_id,
+                            finding,
+                            iteration,
+                        ) {
+                            warn!(
+                                "Failed to record finding as knowledge: {}",
+                                e
+                            );
+                        }
+                    }
+                }
+
+                // Record agentic outcome as an observation
+                let parent_id = get_parent_task_id(&config.execution_id);
+                let observation = match &agentic_outcome {
+                    AgenticOutcome::Success { .. } => {
+                        format!(
+                            "Iteration {}: Agentic phase completed successfully ({} chars of output)",
+                            iteration,
+                            output.len()
+                        )
+                    }
+                    AgenticOutcome::Failed { error, .. } => {
+                        format!(
+                            "Iteration {}: Agentic phase failed: {}",
+                            iteration, error
+                        )
+                    }
+                    AgenticOutcome::Error { error } => {
+                        format!(
+                            "Iteration {}: Agentic phase error: {}",
+                            iteration, error
+                        )
+                    }
+                    AgenticOutcome::Skipped => String::new(),
+                };
+                if !observation.is_empty() {
+                    if let Err(e) = self.knowledge_base.record_observation(
+                        &parent_id,
+                        AgentType::Worker,
+                        iteration,
+                        &observation,
+                        &[],
+                    ) {
+                        warn!("Failed to record agentic observation: {}", e);
+                    }
+                }
             }
 
             let iter_result = IterationResult {

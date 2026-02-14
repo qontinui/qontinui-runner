@@ -363,8 +363,9 @@ fn store_parsed_findings(db: &CheckpointDb, task_run_id: &str, findings: &[Parse
 
 /// Build context from previous iterations for the AI to reference.
 ///
-/// Includes findings from the findings database and previous verification
-/// results so the AI can understand what was tried and what happened.
+/// Includes findings from the findings database, previous verification
+/// results, and accumulated knowledge entries so the AI can understand
+/// what was tried, what was learned, and what happened.
 fn build_unified_iteration_context(
     checkpoint_db: &CheckpointDb,
     execution_id: &str,
@@ -372,7 +373,7 @@ fn build_unified_iteration_context(
 ) -> Option<String> {
     let mut sections = Vec::new();
 
-    // 1. Collect findings from the findings database
+    // 1. Collect findings from the findings database (task_run_findings table)
     if let Ok(findings) = checkpoint_db.get_findings_for_task(execution_id) {
         if !findings.is_empty() {
             let mut findings_lines = vec!["### Findings from Previous Iterations".to_string()];
@@ -444,6 +445,73 @@ fn build_unified_iteration_context(
         sections.push(verification_lines.join("\n"));
     }
 
+    // 3. Collect accumulated knowledge entries (task_knowledge table)
+    if let Ok(all_knowledge) = checkpoint_db.list_task_knowledge(execution_id, None, false) {
+        if !all_knowledge.is_empty() {
+            // Group by category for readability
+            let unresolved: Vec<_> = all_knowledge
+                .iter()
+                .filter(|k| !k.is_resolved && k.category != "verification_feedback" && k.category != "observation")
+                .collect();
+
+            let solutions: Vec<_> = all_knowledge
+                .iter()
+                .filter(|k| k.category == "solution")
+                .collect();
+
+            let observations: Vec<_> = all_knowledge
+                .iter()
+                .filter(|k| k.category == "observation")
+                .collect();
+
+            // Show unresolved findings/root causes
+            if !unresolved.is_empty() {
+                let mut lines = vec!["### Accumulated Knowledge (Unresolved)".to_string()];
+                for entry in unresolved.iter().take(10) {
+                    lines.push(format!(
+                        "- **[{}]** (iter {}, {}): {}",
+                        entry.category.to_uppercase(),
+                        entry.iteration,
+                        entry.confidence,
+                        truncate_str(&entry.content, 300),
+                    ));
+                    if let Some(ref evidence) = entry.evidence {
+                        lines.push(format!("  Evidence: {}", truncate_str(evidence, 150)));
+                    }
+                }
+                sections.push(lines.join("\n"));
+            }
+
+            // Show previous solutions attempted
+            if !solutions.is_empty() {
+                let mut lines = vec!["### Previous Solution Attempts".to_string()];
+                for entry in solutions.iter().take(5) {
+                    let status = if entry.is_resolved { "resolved" } else { "unresolved" };
+                    lines.push(format!(
+                        "- [iter {}, {}] {}",
+                        entry.iteration,
+                        status,
+                        truncate_str(&entry.content, 300),
+                    ));
+                }
+                sections.push(lines.join("\n"));
+            }
+
+            // Show recent observations (last 3)
+            if !observations.is_empty() {
+                let mut lines = vec!["### Recent Observations".to_string()];
+                for entry in observations.iter().rev().take(3) {
+                    lines.push(format!(
+                        "- (iter {}) {}",
+                        entry.iteration,
+                        truncate_str(&entry.content, 200),
+                    ));
+                }
+                sections.push(lines.join("\n"));
+            }
+        }
+    }
+
     if sections.is_empty() {
         return None;
     }
@@ -452,6 +520,15 @@ fn build_unified_iteration_context(
         "---\n\n## Previous Iteration Context\n\n{}",
         sections.join("\n\n")
     ))
+}
+
+/// Truncate a string to max_len characters, appending "..." if truncated.
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() > max_len {
+        format!("{}...", &s[..max_len])
+    } else {
+        s.to_string()
+    }
 }
 
 // =============================================================================
