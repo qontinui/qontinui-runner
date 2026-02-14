@@ -67,9 +67,9 @@ class WebExtractionService:
 
     def __init__(
         self,
-        event_manager=None,
-        websocket_handler=None,
-    ):
+        event_manager: Any = None,
+        websocket_handler: Any = None,
+    ) -> None:
         """
         Initialize the web extraction service.
 
@@ -85,10 +85,10 @@ class WebExtractionService:
         self.extractions_dir.mkdir(parents=True, exist_ok=True)
 
         # Current extraction state
-        self._orchestrator = None
+        self._orchestrator: Any = None
         self._current_extraction_id: str | None = None
         self._is_running = False
-        self._current_task: asyncio.Task | None = (
+        self._current_task: asyncio.Task[Any] | None = (
             None  # Track current extraction task for cancellation
         )
 
@@ -99,7 +99,9 @@ class WebExtractionService:
 
         # Store extraction results
         self._extraction_results: dict[str, Any] = {}  # extraction_id -> ExtractionResult
-        self._composite_results: dict[str, dict] = {}  # composite_id -> composite structure
+        self._composite_results: dict[str, dict[str, Any]] = (
+            {}
+        )  # composite_id -> composite structure
 
         # Vision extraction (lazy initialized)
         self._vision_extractor: UnifiedVisionExtractor | None = None

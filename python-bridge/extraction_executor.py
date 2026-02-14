@@ -22,6 +22,7 @@ This separation enables concurrent execution because:
 3. Both can run simultaneously without contention
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -98,7 +99,7 @@ class ExtractionExecutor:
     - Emit events to notify Rust of extraction progress/completion
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize extraction executor and required modules."""
         # Initialize EventManager for emitting events
         self.event_manager = EventManager()
@@ -113,17 +114,14 @@ class ExtractionExecutor:
         self._vision_extraction_service: VisionExtractionService | None = None
 
         # Async event loop for extraction (created on demand)
-        self._async_loop = None
-        self._async_thread = None
+        self._async_loop: asyncio.AbstractEventLoop | None = None
+        self._async_thread: threading.Thread | None = None
 
         logger.info("Extraction executor initialized")
 
-    def _handle_websocket_command(self, command: dict) -> dict[str, Any]:
+    def _handle_websocket_command(self, command: dict[str, Any]) -> None:
         """Handle commands received via WebSocket."""
-        return {
-            "success": False,
-            "error": "WebSocket commands not supported in extraction executor",
-        }
+        logger.warning("WebSocket commands not supported in extraction executor")
 
     def _get_web_extraction_service(self) -> WebExtractionService:
         """Get or create the web extraction service."""
@@ -416,7 +414,7 @@ class ExtractionExecutor:
             self.websocket_handler.configure(
                 enabled=enabled,
                 api_url=api_url,
-                jwt_token=jwt_token,
+                token=jwt_token,
                 project_id=project_id,
                 runner_name=runner_name,
             )

@@ -80,7 +80,6 @@ pub fn dispatch_line(
     let msg = match decode_message(line) {
         Ok(m) => m,
         Err(e) => {
-            // Use debug level so parse failures are visible in development logs
             debug!("Skipping non-parseable line: {}", e);
             return None;
         }
@@ -142,11 +141,10 @@ pub fn dispatch_line(
     }
 
     // Extract text from the message
-    let text = msg.extract_text()?;
-
-    if text.is_empty() {
-        return None;
-    }
+    let text = match msg.extract_text() {
+        Some(t) if !t.is_empty() => t,
+        _ => return None,
+    };
 
     // Emit AI output event
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

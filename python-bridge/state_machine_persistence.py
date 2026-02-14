@@ -155,11 +155,11 @@ class StateMachinePersistence:
             if transitions:
                 persistence.save_transitions(transitions)
 
-            logger.info(
-                f"Persisted config: {len(states)} states, {len(transitions)} transitions"
-            )
+            logger.info(f"Persisted config: {len(states)} states, {len(transitions)} transitions")
         except ImportError:
-            logger.warning("qontinui library not available; config JSON saved but states/transitions skipped")
+            logger.warning(
+                "qontinui library not available; config JSON saved but states/transitions skipped"
+            )
         except Exception as e:
             logger.warning(f"Failed to persist states/transitions: {e}")
 
@@ -172,7 +172,8 @@ class StateMachinePersistence:
             if row is None:
                 return None
             try:
-                return json.loads(row["config_json"])
+                result: dict[Any, Any] = json.loads(row["config_json"])
+                return result
             except (json.JSONDecodeError, TypeError):
                 return None
 
@@ -271,4 +272,4 @@ class StateMachinePersistence:
             cursor = conn.cursor()
             cursor.execute("SELECT COUNT(*) FROM config_snapshots")
             count = cursor.fetchone()[0]
-            return count > 0
+            return bool(count > 0)

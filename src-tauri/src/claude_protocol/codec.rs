@@ -377,6 +377,18 @@ mod tests {
         assert!(text.contains("[STEP_COMPLETE:setup-0]"));
     }
 
+    /// Test with EXACT format from Claude CLI v2.1.42 (stream-json mode).
+    /// This is the actual format seen in production.
+    #[test]
+    fn test_decode_real_cli_v2_format() {
+        // Real assistant message from CLI v2.1.42
+        let line = r#"{"type":"assistant","message":{"model":"claude-opus-4-6","id":"msg_01QmCp8RoHt6ssT4wgyZcWag","type":"message","role":"assistant","content":[{"type":"text","text":"Hi! How can I help you today?"}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":3,"cache_creation_input_tokens":6615,"cache_read_input_tokens":17997,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":6615},"output_tokens":1,"service_tier":"standard","inference_geo":"not_available"},"context_management":null},"parent_tool_use_id":null,"session_id":"082b31f3-3f7a-43cd-adc8-9a3d9d089083","uuid":"504e9b6d-1b06-4d99-841e-88a70fff4da9"}"#;
+        let msg = decode_message(line).unwrap();
+        assert!(matches!(msg, ClaudeOutputMessage::Assistant(_)));
+        let text = msg.extract_text().unwrap();
+        assert_eq!(text, "Hi! How can I help you today?");
+    }
+
     /// Verify whitespace handling in NDJSON lines.
     #[test]
     fn test_whitespace_handling() {
@@ -384,5 +396,16 @@ mod tests {
         let line = r#"  {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"trimmed"}]},"session_id":"default"}  "#;
         let msg = decode_message(line).unwrap();
         assert_eq!(msg.extract_text().unwrap(), "trimmed");
+    }
+
+    /// Verify user echo messages (tool results) are parsed without error.
+    /// Claude CLI in interactive mode echoes back user/tool_result messages.
+    #[test]
+    fn test_decode_user_echo_message() {
+        let line = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01ABC","type":"tool_result","content":"File written successfully"}]}}"#;
+        let msg = decode_message(line).unwrap();
+        assert!(matches!(msg, ClaudeOutputMessage::User(_)));
+        // User messages don't have extractable text
+        assert!(msg.extract_text().is_none());
     }
 }

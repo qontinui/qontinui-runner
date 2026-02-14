@@ -47,7 +47,7 @@ class TrainingExportCoordinator:
     - Manage export lifecycle
     """
 
-    def __init__(self, emit_log_fn):
+    def __init__(self, emit_log_fn: Any) -> None:
         """
         Initialize training export coordinator.
 

@@ -28,7 +28,7 @@ class VisionExtractionService:
     - OCR text detection (EasyOCR or pytesseract)
     """
 
-    def __init__(self, event_manager=None):
+    def __init__(self, event_manager: Any = None) -> None:
         """
         Initialize the vision extraction service.
 
@@ -36,8 +36,8 @@ class VisionExtractionService:
             event_manager: EventManager for emitting events to Rust bridge.
         """
         self.event_manager = event_manager
-        self._ocr_engine = None  # Lazy loaded
-        self._sam_model = None  # Lazy loaded
+        self._ocr_engine: Any = None  # Lazy loaded
+        self._sam_model: Any = None  # Lazy loaded
         self._is_running = False
         self._current_extraction_id: str | None = None
 

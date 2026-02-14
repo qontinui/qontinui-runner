@@ -33,7 +33,7 @@ class TestAnalysisService:
     - Vision: Uses computer vision (OCR, edge, SAM3) for visual element detection
     """
 
-    def __init__(self, event_manager=None, vision_service=None):
+    def __init__(self, event_manager: Any = None, vision_service: Any = None) -> None:
         """
         Initialize the test analysis service.
 

@@ -180,9 +180,7 @@ class UIBridgeHTTPClient:
         The runtime handles pathfinding and multi-step navigation.
         This method is here only for protocol completeness.
         """
-        raise NotImplementedError(
-            "navigate_to should be called on UIBridgeRuntime, not the client"
-        )
+        raise NotImplementedError("navigate_to should be called on UIBridgeRuntime, not the client")
 
 
 class ResolvingUIBridgeClient:

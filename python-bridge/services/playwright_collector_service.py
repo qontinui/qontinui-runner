@@ -58,7 +58,7 @@ class PlaywrightCollectorService:
     and storing results for retrieval.
     """
 
-    def __init__(self, event_manager=None):
+    def __init__(self, event_manager: Any = None) -> None:
         """
         Initialize the Playwright collector service.
 
@@ -68,7 +68,7 @@ class PlaywrightCollectorService:
         self.event_manager = event_manager
         self._jobs: dict[str, PlaywrightJob] = {}
         self._current_job_id: str | None = None
-        self._current_task: asyncio.Task | None = None
+        self._current_task: asyncio.Task[Any] | None = None
         self._async_loop: asyncio.AbstractEventLoop | None = None
 
     def _get_or_create_async_loop(self) -> asyncio.AbstractEventLoop:

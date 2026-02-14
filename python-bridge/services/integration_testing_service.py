@@ -186,7 +186,7 @@ class IntegrationTestingService:
     - Test result reporting
     """
 
-    def __init__(self, emit_log_fn=None, emit_event_fn=None):
+    def __init__(self, emit_log_fn: Any = None, emit_event_fn: Any = None) -> None:
         """
         Initialize the integration testing service.
 

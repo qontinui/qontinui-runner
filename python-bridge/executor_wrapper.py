@@ -37,10 +37,10 @@ class EventType(Enum):
 class ExecutorWrapper:
     """Wraps JSONRunner with event emission capabilities."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.runner: JSONRunner | None = None
         self.config: QontinuiConfig | None = None
-        self.current_state = None
+        self.current_state: Any = None
         self.is_running = False
         self._emit_event(EventType.READY, {"message": "Executor initialized"})
 

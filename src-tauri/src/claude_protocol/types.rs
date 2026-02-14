@@ -18,6 +18,9 @@ pub enum ClaudeOutputMessage {
     System(SystemMessage),
     #[serde(rename = "assistant")]
     Assistant(AssistantMessage),
+    /// User/tool_result messages echoed back by CLI in interactive mode.
+    #[serde(rename = "user")]
+    User(UserEchoMessage),
     #[serde(rename = "content_block_start")]
     ContentBlockStart(ContentBlockStartMessage),
     #[serde(rename = "content_block_delta")]
@@ -42,6 +45,16 @@ pub struct SystemMessage {
     #[serde(default)]
     pub model: Option<String>,
     /// Catch-all for unknown fields
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// User message echoed back by CLI in interactive mode (tool results, etc.).
+/// We don't need to extract text from these - they're informational only.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserEchoMessage {
+    #[serde(default)]
+    pub message: Option<serde_json::Value>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }

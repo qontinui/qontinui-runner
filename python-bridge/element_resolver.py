@@ -160,11 +160,7 @@ class ElementResolver:
             if elem.id in claimed:
                 continue
             elem_zone = self._compute_position_zone(elem.bounds)
-            if (
-                elem.role == role
-                and elem_zone == position_zone
-                and elem.tag_name == tag_name
-            ):
+            if elem.role == role and elem_zone == position_zone and elem.tag_name == tag_name:
                 return elem.id
 
         return None

@@ -145,7 +145,7 @@ class ExecutionTree:
     are added, eliminating timing issues.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize an empty execution tree."""
         self.root: ExecutionNode | None = None
         self.current: ExecutionNode | None = None

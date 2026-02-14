@@ -193,9 +193,9 @@ class QontinuiExecutor:
     - Provide workflow execution interface
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize executor and all modules."""
-        self.config = None
+        self.config: Any = None
         self.is_running = False
         self._is_paused = False
         self._pause_event = threading.Event()
@@ -234,11 +234,11 @@ class QontinuiExecutor:
         self.execution_tree = ExecutionTree()
 
         # Unified data collector (initialized after config load)
-        self.unified_data_collector = None
-        self.screenshot_service = None
+        self.unified_data_collector: Any = None
+        self.screenshot_service: Any = None
 
         # InputMonitorService for validation capture (initialized on demand)
-        self.input_monitor_service = None
+        self.input_monitor_service: Any = None
         # Flag to enable input capture during workflow execution
         self.capture_input_for_validation = False
         self._input_capture_session_id: str | None = None
@@ -258,34 +258,34 @@ class QontinuiExecutor:
         self._click_capture_application_hint: str | None = None
 
         # GUIAutomation (initialized after config load)
-        self.gui_automation = None
+        self.gui_automation: Any = None
 
         # Web extraction service (lazy-loaded when needed)
-        self._web_extraction_service = None
+        self._web_extraction_service: Any = None
 
         # Vision extraction service (lazy-loaded when needed)
-        self._vision_extraction_service = None
+        self._vision_extraction_service: Any = None
 
         # Playwright collector service (lazy-loaded when needed)
-        self._playwright_collector_service = None
+        self._playwright_collector_service: Any = None
 
         # Test analysis service for AI-powered test generation (lazy-loaded when needed)
-        self._test_analysis_service = None
+        self._test_analysis_service: Any = None
 
         # AI test generator service (lazy-loaded when needed)
-        self._ai_test_generator_service = None
+        self._ai_test_generator_service: Any = None
 
         # AI shell command generator service (lazy-loaded when needed)
-        self._ai_shell_command_generator_service = None
+        self._ai_shell_command_generator_service: Any = None
 
         # AI builder generator service (lazy-loaded when needed)
-        self._ai_builder_generator_service = None
+        self._ai_builder_generator_service: Any = None
 
         # Integration testing service (lazy-loaded when needed)
-        self._integration_testing_service = None
+        self._integration_testing_service: Any = None
 
         # Accessibility capture service (lazy-loaded when needed)
-        self._accessibility_capture_service = None
+        self._accessibility_capture_service: Any = None
 
         # UI-TARS extraction service (lazy-loaded when needed)
         self._uitars_extraction_service: UITarsExtractionService | None = None
@@ -294,7 +294,7 @@ class QontinuiExecutor:
         self._ui_bridge_explorer_service: UIBridgeExplorerService | None = None
 
         # UI Bridge Runtime state machine (loaded via load_state_machine command)
-        self._ui_bridge_runtime = None
+        self._ui_bridge_runtime: Any = None
 
         # State machine persistence (lazy-initialized)
         self._sm_persistence: Any = None
@@ -302,8 +302,8 @@ class QontinuiExecutor:
 
         # Dedicated event loop for async operations (avoids conflicts with WebSocket thread's loop)
         # Runs in a background thread to allow run_coroutine_threadsafe()
-        self._async_loop = None
-        self._async_thread = None
+        self._async_loop: Any = None
+        self._async_thread: threading.Thread | None = None
 
         # EventTranslator for library callbacks (initialized if library available)
         if QONTINUI_AVAILABLE:
@@ -325,10 +325,8 @@ class QontinuiExecutor:
         logger.info(f"QontinuiExecutor initialized (library_available={QONTINUI_AVAILABLE})")
 
         # Auto-reload persisted state machine (non-fatal if it fails)
-        try:
+        with contextlib.suppress(Exception):
             self._try_reload_state_machine()
-        except Exception:
-            pass
 
     def _get_sm_persistence(self) -> Any:
         """Lazy-initialize StateMachinePersistence."""
@@ -879,8 +877,9 @@ class QontinuiExecutor:
         # Start WebSocket session if enabled or if it was configured (for auto-reconnect)
         # Call start_session even if currently disconnected - it will attempt to reconnect
         ws_is_enabled = self.websocket_handler.is_enabled()
-        ws_config_exists = self.websocket_handler.ws_config is not None
-        ws_config_enabled = self.websocket_handler.ws_config.enabled if ws_config_exists else False
+        ws_config = self.websocket_handler.ws_config
+        ws_config_exists = ws_config is not None
+        ws_config_enabled = ws_config.enabled if ws_config is not None else False
         self.event_manager.emit_log(
             "debug",
             f"[WS_SESSION_CHECK] is_enabled={ws_is_enabled}, ws_config_exists={ws_config_exists}, ws_config.enabled={ws_config_enabled}, ws_enabled={self.websocket_handler.ws_enabled}",
@@ -5162,7 +5161,7 @@ class QontinuiExecutor:
         try:
             transitions = self._ui_bridge_runtime.get_available_transitions()
             # Convert transition objects to dicts for JSON serialization
-            transition_list = []
+            transition_list: list[Any] = []
             for t in transitions:
                 if hasattr(t, "__dict__"):
                     transition_list.append(
