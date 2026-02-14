@@ -363,9 +363,13 @@ fn store_parsed_findings(db: &CheckpointDb, task_run_id: &str, findings: &[Parse
 
 /// Build context from previous iterations for the AI to reference.
 ///
-/// Includes findings from the findings database, previous verification
-/// results, and accumulated knowledge entries so the AI can understand
-/// what was tried, what was learned, and what happened.
+/// Includes:
+/// - Latest verification feedback from knowledge base
+/// - Findings from the findings database
+/// - Previous verification results (pass/fail history)
+/// - Accumulated knowledge entries (unresolved issues, solutions, observations)
+/// - Available data APIs for deeper investigation
+/// - Tool priority guidance (UI Bridge vs Playwright)
 fn build_unified_iteration_context(
     checkpoint_db: &CheckpointDb,
     execution_id: &str,
@@ -373,7 +377,19 @@ fn build_unified_iteration_context(
 ) -> Option<String> {
     let mut sections = Vec::new();
 
-    // 1. Collect findings from the findings database (task_run_findings table)
+    // 1. Latest verification feedback from knowledge base (most actionable — show first)
+    if let Ok(feedback) =
+        checkpoint_db.list_task_knowledge(execution_id, Some("verification_feedback"), false)
+    {
+        if let Some(latest) = feedback.last() {
+            let mut lines = vec!["### Last Verification Feedback".to_string()];
+            lines.push(String::new());
+            lines.push(latest.content.clone());
+            sections.push(lines.join("\n"));
+        }
+    }
+
+    // 2. Collect findings from the findings database (task_run_findings table)
     if let Ok(findings) = checkpoint_db.get_findings_for_task(execution_id) {
         if !findings.is_empty() {
             let mut findings_lines = vec!["### Findings from Previous Iterations".to_string()];
@@ -385,12 +401,7 @@ fn build_unified_iteration_context(
                     category_str, status_str, finding.title
                 ));
                 if !finding.description.is_empty() {
-                    // Truncate long descriptions
-                    let desc = if finding.description.len() > 200 {
-                        format!("{}...", &finding.description[..200])
-                    } else {
-                        finding.description.clone()
-                    };
+                    let desc = truncate_str(&finding.description, 200);
                     findings_lines.push(format!("  {}", desc));
                 }
             }
@@ -398,7 +409,7 @@ fn build_unified_iteration_context(
         }
     }
 
-    // 2. Collect previous verification results
+    // 3. Collect previous verification results (pass/fail history per iteration)
     let mut verification_lines = vec!["### Previous Verification Results".to_string()];
     let mut has_prev_results = false;
     for iter in 1..current_iteration {
@@ -445,13 +456,16 @@ fn build_unified_iteration_context(
         sections.push(verification_lines.join("\n"));
     }
 
-    // 3. Collect accumulated knowledge entries (task_knowledge table)
+    // 4. Collect accumulated knowledge entries (task_knowledge table)
     if let Ok(all_knowledge) = checkpoint_db.list_task_knowledge(execution_id, None, false) {
         if !all_knowledge.is_empty() {
-            // Group by category for readability
             let unresolved: Vec<_> = all_knowledge
                 .iter()
-                .filter(|k| !k.is_resolved && k.category != "verification_feedback" && k.category != "observation")
+                .filter(|k| {
+                    !k.is_resolved
+                        && k.category != "verification_feedback"
+                        && k.category != "observation"
+                })
                 .collect();
 
             let solutions: Vec<_> = all_knowledge
@@ -489,8 +503,7 @@ fn build_unified_iteration_context(
                     let status = if entry.is_resolved { "resolved" } else { "unresolved" };
                     lines.push(format!(
                         "- [iter {}, {}] {}",
-                        entry.iteration,
-                        status,
+                        entry.iteration, status,
                         truncate_str(&entry.content, 300),
                     ));
                 }
@@ -512,12 +525,88 @@ fn build_unified_iteration_context(
         }
     }
 
+    // 5. Available data APIs (so AI can drill deeper when needed)
+    {
+        let mut api_lines = vec!["### Available Data APIs".to_string()];
+        api_lines.push(String::new());
+        api_lines.push(
+            "The runner database contains detailed execution data. Access via HTTP:".to_string(),
+        );
+        api_lines.push(String::new());
+        api_lines.push("**Verification & Testing:**".to_string());
+        api_lines.push(format!(
+            "- `curl http://localhost:9876/task-runs/{}/verification-results` - Full test results",
+            execution_id
+        ));
+        api_lines.push(format!(
+            "- `curl http://localhost:9876/task-runs/{}/verification-results?failed_only=true` - Only failed checks",
+            execution_id
+        ));
+        api_lines.push(format!(
+            "- `curl http://localhost:9876/task-runs/{}/playwright-results` - Playwright test results",
+            execution_id
+        ));
+        api_lines.push(String::new());
+        api_lines.push("**Knowledge & Findings:**".to_string());
+        api_lines.push(format!(
+            "- `curl http://localhost:9876/task-runs/{}/knowledge` - All findings, observations, solutions",
+            execution_id
+        ));
+        api_lines.push(format!(
+            "- `curl http://localhost:9876/task-runs/{}/knowledge?unresolved_only=true` - Unresolved issues",
+            execution_id
+        ));
+        api_lines.push(String::new());
+        api_lines.push("**Execution History:**".to_string());
+        api_lines.push(format!(
+            "- `curl http://localhost:9876/task-runs/{}/events` - All execution events",
+            execution_id
+        ));
+        api_lines.push(format!(
+            "- `curl http://localhost:9876/task-runs/{}/checkpoints` - Step completion checkpoints",
+            execution_id
+        ));
+        api_lines.push(format!(
+            "- `curl http://localhost:9876/task-runs/{}/mcp-calls` - MCP tool calls",
+            execution_id
+        ));
+        api_lines.push(String::new());
+        api_lines.push(
+            "Use these APIs when you need more detail than provided in this context.".to_string(),
+        );
+        sections.push(api_lines.join("\n"));
+    }
+
+    // 6. Tool priority guidance
+    {
+        let mut tool_lines = vec!["### Verification Tool Priority".to_string()];
+        tool_lines.push(String::new());
+        tool_lines.push(
+            "**Prefer UI Bridge over Playwright** when the target app has the UI Bridge SDK integrated.".to_string(),
+        );
+        tool_lines.push(String::new());
+        tool_lines.push(
+            "- **UI Bridge SDK** (`/ui-bridge/sdk/*`): For SDK-integrated apps. Connect via `POST /ui-bridge/sdk/connect`, then query via `GET /ui-bridge/sdk/elements` or `GET /ui-bridge/sdk/snapshot`.".to_string(),
+        );
+        tool_lines.push(
+            "- **UI Bridge Control** (`/ui-bridge/control/*`): For the runner's own UI. Always available.".to_string(),
+        );
+        tool_lines.push(
+            "- **Playwright**: Only for non-SDK web apps or when you need real browser behavior. Fallback, not default.".to_string(),
+        );
+        tool_lines.push(String::new());
+        tool_lines.push(
+            "Check `GET /ui-bridge/sdk/status` to see if an SDK app is already connected.".to_string(),
+        );
+        sections.push(tool_lines.join("\n"));
+    }
+
     if sections.is_empty() {
         return None;
     }
 
     Some(format!(
-        "---\n\n## Previous Iteration Context\n\n{}",
+        "---\n\n## Previous Iteration Context\n\n{}\n\n---\n\nUse this context to avoid repeating mistakes and build on previous progress.",
         sections.join("\n\n")
     ))
 }

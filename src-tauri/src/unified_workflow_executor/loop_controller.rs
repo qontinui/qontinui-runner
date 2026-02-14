@@ -1100,6 +1100,37 @@ impl LoopController {
             if verification_result.all_passed {
                 info!("*** VERIFICATION PASSED on iteration {} ***", iteration);
 
+                // Resolve all unresolved knowledge entries — the issues they describe
+                // have been addressed since verification now passes.
+                {
+                    let parent_id = get_parent_task_id(&config.execution_id);
+                    match self.knowledge_base.get_all_knowledge(&parent_id) {
+                        Ok(entries) => {
+                            let unresolved: Vec<_> = entries
+                                .iter()
+                                .filter(|k| !k.is_resolved)
+                                .collect();
+                            if !unresolved.is_empty() {
+                                info!(
+                                    "Resolving {} unresolved knowledge entries after verification pass",
+                                    unresolved.len()
+                                );
+                                for entry in &unresolved {
+                                    if let Err(e) = self.knowledge_base.resolve_finding(
+                                        &entry.id,
+                                        Some("Resolved: verification passed"),
+                                    ) {
+                                        warn!("Failed to resolve knowledge entry {}: {}", entry.id, e);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to fetch knowledge entries for resolution: {}", e);
+                        }
+                    }
+                }
+
                 let iter_result = IterationResult {
                     iteration,
                     verification_passed: true,
