@@ -256,6 +256,13 @@ class QontinuiExecutor:
         # UI Bridge explorer service (lazy-loaded when needed)
         self._ui_bridge_explorer_service: UIBridgeExplorerService | None = None
 
+        # UI Bridge Runtime state machine (loaded via load_state_machine command)
+        self._ui_bridge_runtime = None
+
+        # State machine persistence (lazy-initialized)
+        self._sm_persistence: Any = None
+        self._element_resolver: Any = None
+
         # Dedicated event loop for async operations (avoids conflicts with WebSocket thread's loop)
         # Runs in a background thread to allow run_coroutine_threadsafe()
         self._async_loop = None
@@ -279,6 +286,44 @@ class QontinuiExecutor:
             logger.debug("[INIT] EventTranslator initialized and callbacks registered")
 
         logger.info(f"QontinuiExecutor initialized (library_available={QONTINUI_AVAILABLE})")
+
+        # Auto-reload persisted state machine (non-fatal if it fails)
+        try:
+            self._try_reload_state_machine()
+        except Exception:
+            pass
+
+    def _get_sm_persistence(self) -> Any:
+        """Lazy-initialize StateMachinePersistence."""
+        if self._sm_persistence is None:
+            from state_machine_persistence import StateMachinePersistence, get_app_data_dir
+
+            db_path = get_app_data_dir() / "state_machine.db"
+            self._sm_persistence = StateMachinePersistence(db_path)
+        return self._sm_persistence
+
+    def _try_reload_state_machine(self) -> None:
+        """Attempt to reload a persisted state machine on startup."""
+        persistence = self._get_sm_persistence()
+        if not persistence.has_data():
+            return
+        config_data = persistence.load_config()
+        if not config_data:
+            return
+
+        from element_resolver import ElementResolver
+        from ui_bridge_http_client import ResolvingUIBridgeClient, UIBridgeHTTPClient
+
+        from qontinui.state_machine.ui_bridge_runtime import UIBridgeRuntime
+
+        inner_client = UIBridgeHTTPClient("http://localhost:9876")
+        resolver = ElementResolver(persistence)
+        client = ResolvingUIBridgeClient(inner_client, resolver)
+
+        runtime = UIBridgeRuntime.from_dict(config_data, client)
+        self._ui_bridge_runtime = runtime
+        self._element_resolver = resolver
+        self.event_manager.emit_log("info", "Auto-reloaded persisted state machine")
 
     def _emit_event_wrapper(self, event_type: str, data: dict[str, Any]):
         """
@@ -1727,6 +1772,22 @@ class QontinuiExecutor:
 
         elif cmd_type == "generate_state_machine":
             return self._handle_generate_state_machine(params)
+
+        # UI Bridge State Machine commands
+        elif cmd_type == "load_state_machine":
+            return self._handle_load_state_machine(params)
+        elif cmd_type == "get_state_machine_status":
+            return self._handle_get_state_machine_status()
+        elif cmd_type == "sm_execute_transition":
+            return self._handle_sm_execute_transition(params)
+        elif cmd_type == "sm_navigate_to_states":
+            return self._handle_sm_navigate_to_states(params)
+        elif cmd_type == "sm_get_active_states":
+            return self._handle_sm_get_active_states()
+        elif cmd_type == "sm_get_available_transitions":
+            return self._handle_sm_get_available_transitions()
+        elif cmd_type == "clear_state_machine":
+            return self._handle_clear_state_machine()
 
         else:
             return {"success": False, "error": f"Unknown command: {cmd_type}"}
@@ -4920,6 +4981,193 @@ class QontinuiExecutor:
 
             traceback.print_exc()
             return {"success": False, "error": str(e)}
+
+    # =========================================================================
+    # UI Bridge State Machine handlers
+    # =========================================================================
+
+    def _handle_load_state_machine(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Load a UI Bridge state machine configuration.
+
+        Creates a UIBridgeRuntime from the exported config and stores it
+        in memory for subsequent operations. Persists to SQLite for
+        auto-reload on restart.
+
+        Args:
+            params: Must contain "config" key with the exported state machine JSON.
+        """
+        config_data = params.get("config")
+        if not config_data:
+            return {"success": False, "error": "config is required"}
+
+        try:
+            from element_resolver import ElementResolver
+            from ui_bridge_http_client import ResolvingUIBridgeClient, UIBridgeHTTPClient
+
+            from qontinui.state_machine.ui_bridge_runtime import UIBridgeRuntime
+
+            persistence = self._get_sm_persistence()
+
+            # Create HTTP client with resolving wrapper
+            inner_client = UIBridgeHTTPClient("http://localhost:9876")
+            resolver = ElementResolver(persistence)
+            client = ResolvingUIBridgeClient(inner_client, resolver)
+
+            runtime = UIBridgeRuntime.from_dict(config_data, client)
+            self._ui_bridge_runtime = runtime
+            self._element_resolver = resolver
+
+            # Persist config for auto-reload on restart
+            persistence.save_config(config_data)
+
+            # Capture element snapshots for cross-session ID mapping
+            try:
+                elements = inner_client.find().elements
+                resolver.capture_snapshots(elements)
+            except Exception:
+                pass  # UI Bridge may not be connected yet
+
+            stats = runtime.get_statistics()
+            self.event_manager.emit_log(
+                "info",
+                f"State machine loaded: {stats['states']['registered']} states, "
+                f"{stats['transitions']['registered']} transitions",
+            )
+            return {"success": True, "statistics": stats}
+
+        except ImportError as e:
+            return {"success": False, "error": f"Required library not available: {e}"}
+        except Exception as e:
+            self.event_manager.emit_log("error", f"Failed to load state machine: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_get_state_machine_status(self) -> dict[str, Any]:
+        """Get the status of the loaded state machine."""
+        if self._ui_bridge_runtime is None:
+            return {
+                "success": True,
+                "loaded": False,
+                "message": "No state machine loaded",
+            }
+
+        try:
+            stats = self._ui_bridge_runtime.get_statistics()
+            return {
+                "success": True,
+                "loaded": True,
+                "statistics": stats,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _handle_sm_execute_transition(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Execute a specific transition by ID."""
+        if self._ui_bridge_runtime is None:
+            return {"success": False, "error": "No state machine loaded"}
+
+        transition_id = params.get("transition_id")
+        if not transition_id:
+            return {"success": False, "error": "transition_id is required"}
+
+        try:
+            result = self._ui_bridge_runtime.execute_transition(transition_id)
+            return {
+                "success": True,
+                "transition_id": transition_id,
+                "result": result if isinstance(result, dict) else {"completed": True},
+            }
+        except Exception as e:
+            self.event_manager.emit_log(
+                "error", f"Failed to execute transition {transition_id}: {e}"
+            )
+            return {"success": False, "error": str(e)}
+
+    def _handle_sm_navigate_to_states(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Navigate to target states using pathfinding."""
+        if self._ui_bridge_runtime is None:
+            return {"success": False, "error": "No state machine loaded"}
+
+        target_states = params.get("target_states")
+        if not target_states:
+            return {"success": False, "error": "target_states is required"}
+
+        try:
+            result = self._ui_bridge_runtime.navigate_to(target_states)
+            return {
+                "success": True,
+                "target_states": target_states,
+                "result": result if isinstance(result, dict) else {"completed": True},
+            }
+        except Exception as e:
+            self.event_manager.emit_log(
+                "error", f"Failed to navigate to states {target_states}: {e}"
+            )
+            return {"success": False, "error": str(e)}
+
+    def _handle_sm_get_active_states(self) -> dict[str, Any]:
+        """Get currently active states from the runtime."""
+        if self._ui_bridge_runtime is None:
+            return {"success": False, "error": "No state machine loaded"}
+
+        try:
+            active_states = self._ui_bridge_runtime.get_active_states()
+            return {
+                "success": True,
+                "active_states": active_states,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _handle_sm_get_available_transitions(self) -> dict[str, Any]:
+        """Get transitions available from the current state."""
+        if self._ui_bridge_runtime is None:
+            return {"success": False, "error": "No state machine loaded"}
+
+        try:
+            transitions = self._ui_bridge_runtime.get_available_transitions()
+            # Convert transition objects to dicts for JSON serialization
+            transition_list = []
+            for t in transitions:
+                if hasattr(t, "__dict__"):
+                    transition_list.append(
+                        {
+                            "id": getattr(t, "id", None),
+                            "name": getattr(t, "name", None),
+                            "from_states": getattr(t, "from_states", []),
+                            "activate_states": getattr(t, "activate_states", []),
+                            "exit_states": getattr(t, "exit_states", []),
+                        }
+                    )
+                elif isinstance(t, dict):
+                    transition_list.append(t)
+                else:
+                    transition_list.append(str(t))
+
+            return {
+                "success": True,
+                "transitions": transition_list,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _handle_clear_state_machine(self) -> dict[str, Any]:
+        """Clear the loaded state machine and persisted data."""
+        was_loaded = self._ui_bridge_runtime is not None
+        self._ui_bridge_runtime = None
+        self._element_resolver = None
+
+        # Clear persisted data
+        try:
+            persistence = self._get_sm_persistence()
+            persistence.clear()
+        except Exception:
+            pass
+
+        self.event_manager.emit_log(
+            "info",
+            "State machine cleared" if was_loaded else "No state machine was loaded",
+        )
+        return {"success": True, "was_loaded": was_loaded}
 
     def __del__(self):
         """Clean up resources on exit."""

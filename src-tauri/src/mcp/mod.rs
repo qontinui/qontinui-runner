@@ -48,6 +48,7 @@ pub mod settings;
 pub mod shared;
 pub mod shell_commands;
 pub mod state_explorer;
+pub mod state_machine;
 pub mod step_type_metadata_api;
 pub mod task_runs;
 pub mod testing;
