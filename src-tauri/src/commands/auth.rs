@@ -751,8 +751,14 @@ pub async fn get_access_token_for_websocket() -> Result<String, String> {
 /// - Not authenticated
 /// - Device ID retrieval fails
 /// - Backend API call fails
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HeartbeatResponse {
+    pub message: String,
+    pub has_active_connection: bool,
+}
+
 #[tauri::command]
-pub async fn send_device_heartbeat(project_id: Option<String>) -> Result<(), String> {
+pub async fn send_device_heartbeat(project_id: Option<String>) -> Result<HeartbeatResponse, String> {
     info!(
         "[HEARTBEAT] Starting device heartbeat (project_id: {:?})",
         project_id
@@ -869,6 +875,14 @@ pub async fn send_device_heartbeat(project_id: Option<String>) -> Result<(), Str
         return Err(format!("Heartbeat failed: {}", error_text));
     }
 
-    info!("[HEARTBEAT] Heartbeat sent successfully");
-    Ok(())
+    let heartbeat_response: HeartbeatResponse = response.json().await.map_err(|e| {
+        error!("[HEARTBEAT] Failed to parse response: {}", e);
+        format!("Failed to parse heartbeat response: {}", e)
+    })?;
+
+    info!(
+        "[HEARTBEAT] Heartbeat sent successfully (has_active_connection: {})",
+        heartbeat_response.has_active_connection
+    );
+    Ok(heartbeat_response)
 }
