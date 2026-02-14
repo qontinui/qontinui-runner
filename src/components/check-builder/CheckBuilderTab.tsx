@@ -10,6 +10,7 @@
  */
 
 import { useState, useCallback, useEffect } from "react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   Shield,
   Sparkles,
@@ -300,7 +301,7 @@ function CheckLibraryPanel({ onOpenAiModal }: CheckLibraryPanelProps) {
             </button>
           )}
           <button
-            onClick={() => window.open("http://localhost:3001/build/checks", "_blank")}
+            onClick={() => openUrl("http://localhost:3001/build/checks")}
             className="flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg hover:bg-muted transition-colors text-indigo-400 hover:text-indigo-300 text-xs"
             title="Edit in Web (opens browser)"
           >

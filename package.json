@@ -60,6 +60,7 @@
     "@tauri-apps/api": "^2.9",
     "@tauri-apps/plugin-dialog": "^2.6.0",
     "@tauri-apps/plugin-fs": "^2.4.5",
+    "@tauri-apps/plugin-opener": "^2.5.3",
     "@types/diff": "^7.0.2",
     "@types/react": "^19.1.12",
     "@types/react-dom": "^19.1.9",

@@ -6,6 +6,7 @@
  */
 
 import { ReactNode } from "react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { LucideIcon, Activity, ExternalLink } from "lucide-react";
 import { RunSelector } from "../run-selection/RunSelector";
 import { useRunSelectionOptional } from "../../contexts/RunSelectionContext";
@@ -17,9 +18,10 @@ const TAB_MAPPING: Record<string, string> = {
   "Actions": "summary",
   "Image Recognition": "summary",
   "Findings": "findings",
+  "State Explorer": "summary",
   "Test Results": "tests",
   "AI Output": "ai-conversation",
-  "AI Data": "data-logs",
+  "AI Data Viewer": "data-logs",
   "Statistics": "summary",
 };
 
@@ -94,9 +96,8 @@ export function RunPageLayout({ children, title, icon: Icon, badgeCount }: RunPa
             {selectedRun && (
               <button
                 onClick={() =>
-                  window.open(
-                    `http://localhost:3001/runs/${selectedRun.id}?tab=${webTab}`,
-                    "_blank"
+                  openUrl(
+                    `http://localhost:3001/runs/${selectedRun.id}?tab=${webTab}`
                   )
                 }
                 className="flex items-center gap-1 px-2 py-0.5 text-xs text-muted-foreground hover:text-foreground rounded hover:bg-muted transition-colors"

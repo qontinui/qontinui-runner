@@ -10,6 +10,7 @@
  */
 
 import { useState, useEffect, useCallback } from "react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { Sparkles, Code, ScanSearch, Zap, FileJson, ExternalLink } from "lucide-react";
 import { TestBuilderProvider, useTestBuilder } from "./TestBuilderContext";
 import { TestLibraryPanel } from "./TestLibraryPanel";
@@ -265,7 +266,7 @@ function TestBuilderContent({ onLog }: TestBuilderTabProps) {
             </button>
             {/* Edit in Web button */}
             <button
-              onClick={() => window.open("http://localhost:3001/build/tests", "_blank")}
+              onClick={() => openUrl("http://localhost:3001/build/tests")}
               className="flex items-center gap-1.5 px-3 py-2.5 text-sm font-medium transition-colors text-indigo-400 hover:text-indigo-300 hover:bg-neutral-700/30"
               title="Edit in Web (opens browser)"
               data-ui-id="test-builder-edit-in-web-btn"

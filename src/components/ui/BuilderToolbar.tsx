@@ -7,6 +7,7 @@
 
 import { useRef } from "react";
 import { Sparkles, Plus, Upload, Download, Trash2, GitBranch, Layers, ExternalLink } from "lucide-react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 
 export interface BuilderToolbarAction {
   /** Unique key for the action */
@@ -232,7 +233,7 @@ export const toolbarActions = {
     key: "edit-in-web",
     icon: ExternalLink,
     label: "Web",
-    onClick: () => window.open(`http://localhost:3001${webPath}`, "_blank"),
+    onClick: () => openUrl(`http://localhost:3001${webPath}`),
     className: "text-indigo-400 hover:text-indigo-300 hover:bg-neutral-800",
     title: "Edit in Web (opens browser)",
   }),
