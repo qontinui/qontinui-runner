@@ -4051,7 +4051,7 @@ impl StepExecutor {
                             })
                             .and_then(|v| v.as_array())
                             .cloned();
-                        if errors.as_ref().map_or(false, |e| !e.is_empty()) {
+                        if errors.as_ref().is_some_and(|e| !e.is_empty()) {
                             details.console_errors = errors;
                         }
                     }
