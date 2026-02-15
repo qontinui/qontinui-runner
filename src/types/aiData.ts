@@ -87,6 +87,10 @@ export interface TaskRun {
   verification_passed?: boolean | null;
   /** Loop execution result with per-iteration breakdown */
   loop_result?: LoopResult | null;
+  /** Whether this task run is a reflection analysis run */
+  is_reflection?: boolean;
+  /** The source task run ID that this reflection analyzes */
+  reflection_source_task_run_id?: string | null;
 }
 
 // =============================================================================

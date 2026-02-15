@@ -14,8 +14,13 @@ use crate::database::CheckpointDb;
 use crate::doctor::DoctorHandle;
 use crate::findings::storage as finding_storage;
 use crate::findings::{Finding, FindingParser, ParsedFinding};
-use crate::mcp::shared::{emit_ai_output, AiSessionContext, FindingContext, ProgressContext};
+use crate::mcp::shared::{
+    emit_ai_output, AiSessionContext, FindingContext, ProgressContext, ReflectionFixContext,
+};
 use crate::orchestrator::{RetryConfig, RetryService, RetryState};
+use crate::reflection::parser::{ParsedReflectionFix, ReflectionFixParser};
+use crate::reflection::storage as reflection_storage;
+use crate::reflection::types::CreateReflectionFixInput;
 use crate::workflow_state::{ParsedProgress, ProgressParser};
 
 #[cfg(target_os = "windows")]
@@ -111,6 +116,7 @@ fn run_claude_session_inline(
     progress_ctx: Option<ProgressContext>,
     pid_tracker: Option<Arc<std::sync::Mutex<Vec<u32>>>>,
     doctor_handle: Option<&DoctorHandle>,
+    reflection_fix_ctx: Option<ReflectionFixContext>,
 ) -> Result<(bool, String), String> {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -157,7 +163,8 @@ fn run_claude_session_inline(
             "bypassPermissions",
         ])
         .current_dir(working_dir)
-        // Prevent "cannot be launched inside another Claude Code session" error
+        // Remove CLAUDECODE env var to prevent "nested session" detection.
+        // The runner spawns Claude CLI as an automation tool, not as a nested session.
         .env_remove("CLAUDECODE")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -242,7 +249,7 @@ fn run_claude_session_inline(
             }
 
             let elapsed_secs = start_time.elapsed().as_secs();
-            if elapsed_secs > 0 && elapsed_secs % 30 == 0 && elapsed_secs != last_update {
+            if elapsed_secs > 0 && elapsed_secs.is_multiple_of(30) && elapsed_secs != last_update {
                 last_update = elapsed_secs;
                 let mins = elapsed_secs / 60;
                 let secs = elapsed_secs % 60;
@@ -276,6 +283,9 @@ fn run_claude_session_inline(
     // Channel for parsed progress markers (sent from stdout thread to progress processor thread)
     let (progress_tx, progress_rx) = mpsc::channel::<ParsedProgress>();
 
+    // Channel for parsed reflection fixes (sent from stdout thread to reflection fix processor thread)
+    let (reflection_fix_tx, reflection_fix_rx) = mpsc::channel::<ParsedReflectionFix>();
+
     // Stdout reader thread
     let stdout = child.stdout.take();
     let app_handle_stdout = app_handle.clone();
@@ -283,6 +293,7 @@ fn run_claude_session_inline(
     let session_ctx_stdout = session_ctx.clone();
     let finding_ctx_for_stdout = finding_ctx.clone();
     let progress_ctx_for_stdout = progress_ctx.clone();
+    let reflection_fix_ctx_for_stdout = reflection_fix_ctx.clone();
 
     // On Windows, save the raw pipe handle before moving stdout into the reader thread.
     // After the Claude process exits, child processes may still hold inherited copies of
@@ -308,6 +319,13 @@ fn run_claude_session_inline(
         // Create progress parser if we have a progress context
         let mut progress_parser = if progress_ctx_for_stdout.is_some() {
             Some(ProgressParser::new())
+        } else {
+            None
+        };
+
+        // Create reflection fix parser if we have a reflection fix context
+        let mut reflection_fix_parser = if reflection_fix_ctx_for_stdout.is_some() {
+            Some(ReflectionFixParser::new())
         } else {
             None
         };
@@ -365,6 +383,13 @@ fn run_claude_session_inline(
                                     let _ = progress_tx.send(parsed_progress);
                                 }
                             }
+
+                            // Parse for reflection fix markers
+                            if let Some(ref mut parser) = reflection_fix_parser {
+                                if let Some(parsed_fix) = parser.process_line(&complete_line) {
+                                    let _ = reflection_fix_tx.send(parsed_fix);
+                                }
+                            }
                         }
 
                         all_text.push_str(&text);
@@ -389,6 +414,11 @@ fn run_claude_session_inline(
             if let Some(ref mut parser) = progress_parser {
                 if let Some(parsed_progress) = parser.parse_line(&line_buffer) {
                     let _ = progress_tx.send(parsed_progress);
+                }
+            }
+            if let Some(ref mut parser) = reflection_fix_parser {
+                if let Some(parsed_fix) = parser.process_line(&line_buffer) {
+                    let _ = reflection_fix_tx.send(parsed_fix);
                 }
             }
         }
@@ -674,6 +704,97 @@ fn run_claude_session_inline(
         progress_count
     });
 
+    // Reflection fix processor thread - stores reflection fixes in DB and emits events
+    let app_handle_reflection = app_handle.clone();
+    let reflection_fix_ctx_for_processor = reflection_fix_ctx.clone();
+    let session_ctx_for_reflection = session_ctx.clone();
+
+    let reflection_fix_processor_handle = thread::spawn(move || {
+        let mut fix_count: u32 = 0;
+
+        if let Some(ctx) = reflection_fix_ctx_for_processor {
+            let db = match CheckpointDb::new() {
+                Ok(db) => Some(db),
+                Err(e) => {
+                    warn!(
+                        "Failed to open database for reflection fix storage: {}",
+                        e
+                    );
+                    None
+                }
+            };
+
+            while let Ok(parsed_fix) = reflection_fix_rx.recv() {
+                info!(
+                    "Detected reflection fix: {} (type: {}, confidence: {})",
+                    parsed_fix.description, parsed_fix.fix_type, parsed_fix.confidence
+                );
+
+                if let Some(ref db) = db {
+                    let conn = match db.connection() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            warn!("Failed to get database connection: {}", e);
+                            continue;
+                        }
+                    };
+
+                    let input = CreateReflectionFixInput {
+                        source_task_run_id: ctx.source_task_run_id.clone(),
+                        reflection_task_run_id: ctx.reflection_task_run_id.clone(),
+                        source_finding_id: parsed_fix.source_finding_id,
+                        source_knowledge_id: None,
+                        fix_type: parsed_fix.fix_type.clone(),
+                        fix_description: parsed_fix.description.clone(),
+                        file_changed: parsed_fix.file_changed,
+                        old_value: parsed_fix.old_value,
+                        new_value: parsed_fix.new_value,
+                        confidence: parsed_fix.confidence.clone(),
+                    };
+
+                    match reflection_storage::insert_fix(&conn, &input) {
+                        Ok(fix) => {
+                            fix_count += 1;
+                            let msg = format!(
+                                "Reflection fix recorded: [{}:{}] {}",
+                                fix.fix_type, fix.confidence, fix.fix_description
+                            );
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                emit_ai_output(
+                                    &app_handle_reflection,
+                                    &msg,
+                                    "reflection_fix",
+                                    None,
+                                    session_ctx_for_reflection.as_ref(),
+                                );
+                            }));
+
+                            // Emit event to frontend
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                if let Err(e) =
+                                    app_handle_reflection.emit("reflection_fix_recorded", &fix)
+                                {
+                                    warn!(
+                                        "Failed to emit reflection_fix_recorded event: {}",
+                                        e
+                                    );
+                                }
+                            }));
+                        }
+                        Err(e) => {
+                            warn!("Failed to store reflection fix: {}", e);
+                        }
+                    }
+                }
+            }
+        } else {
+            // No reflection fix context - just drain the channel to avoid blocking
+            while reflection_fix_rx.recv().is_ok() {}
+        }
+
+        fix_count
+    });
+
     // Stderr reader thread
     let stderr = child.stderr.take();
     let stderr_handle = thread::spawn(move || {
@@ -751,6 +872,8 @@ fn run_claude_session_inline(
     let detected_findings = finding_processor_handle.join().unwrap_or_default();
     // Wait for the progress processor thread to complete
     let progress_count = progress_processor_handle.join().unwrap_or_default();
+    // Wait for the reflection fix processor thread to complete
+    let reflection_fix_count = reflection_fix_processor_handle.join().unwrap_or_default();
     let _ = std::fs::remove_file(&prompt_file);
 
     // Log summary of detected findings
@@ -770,6 +893,14 @@ fn run_claude_session_inline(
         );
     }
 
+    // Log summary of reflection fixes
+    if reflection_fix_count > 0 {
+        info!(
+            "Session {} recorded {} reflection fixes",
+            session_id, reflection_fix_count
+        );
+    }
+
     // Emit stderr if any
     if !stderr_output.is_empty() {
         for line in stderr_output.lines() {
@@ -786,13 +917,15 @@ fn run_claude_session_inline(
     }
 
     let success = status.success();
+
     info!(
-        "Session {} completed: success={}, output_len={}, findings={}, progress_markers={}",
+        "Session {} completed: success={}, output_len={}, findings={}, progress_markers={}, reflection_fixes={}",
         session_id,
         success,
         all_output.len(),
         detected_findings.len(),
-        progress_count
+        progress_count,
+        reflection_fix_count
     );
 
     // Remove PID from tracker now that session is complete
@@ -824,6 +957,7 @@ pub fn run_claude_session_with_retry(
     pid_tracker: Option<Arc<std::sync::Mutex<Vec<u32>>>>,
     retry_config: Option<&RetryConfig>,
     doctor_handle: Option<&DoctorHandle>,
+    reflection_fix_ctx: Option<ReflectionFixContext>,
 ) -> Result<(bool, String, Option<RetryState>), String> {
     use std::thread;
     use std::time::Duration;
@@ -842,6 +976,7 @@ pub fn run_claude_session_with_retry(
                 progress_ctx,
                 pid_tracker,
                 doctor_handle,
+                reflection_fix_ctx,
             )?;
             return Ok((result.0, result.1, None));
         }
@@ -857,6 +992,7 @@ pub fn run_claude_session_with_retry(
         let finding_ctx_clone = finding_ctx.clone();
         let progress_ctx_clone = progress_ctx.clone();
         let pid_tracker_clone = pid_tracker.clone();
+        let reflection_fix_ctx_clone = reflection_fix_ctx.clone();
 
         // Update retry information on the context if this is a retry attempt
         if retry_state.attempt > 0 {
@@ -879,6 +1015,7 @@ pub fn run_claude_session_with_retry(
             progress_ctx_clone,
             pid_tracker_clone,
             doctor_handle,
+            reflection_fix_ctx_clone,
         );
 
         match result {
@@ -963,6 +1100,7 @@ pub fn run_claude_session_interactive(
     session_manager: &Arc<crate::claude_session::SessionManager>,
     task_run_id: &str,
     doctor_handle: Option<&DoctorHandle>,
+    _reflection_fix_ctx: Option<ReflectionFixContext>,
 ) -> Result<(bool, String), String> {
     use crate::claude_session::ClaudeSession;
     use crate::commands::ai_chat::emit_session_state;
@@ -1068,6 +1206,7 @@ pub fn run_claude_session_interactive_with_retry(
     session_manager: &Arc<crate::claude_session::SessionManager>,
     task_run_id: &str,
     doctor_handle: Option<&DoctorHandle>,
+    reflection_fix_ctx: Option<ReflectionFixContext>,
 ) -> Result<(bool, String, Option<RetryState>), String> {
     use std::thread;
     use std::time::Duration;
@@ -1088,6 +1227,7 @@ pub fn run_claude_session_interactive_with_retry(
                 session_manager,
                 task_run_id,
                 doctor_handle,
+                reflection_fix_ctx,
             )?;
             return Ok((result.0, result.1, None));
         }
@@ -1102,6 +1242,7 @@ pub fn run_claude_session_interactive_with_retry(
         let finding_ctx_clone = finding_ctx.clone();
         let progress_ctx_clone = progress_ctx.clone();
         let pid_tracker_clone = pid_tracker.clone();
+        let reflection_fix_ctx_clone = reflection_fix_ctx.clone();
 
         // Update retry information on the context if this is a retry attempt
         if retry_state.attempt > 0 {
@@ -1123,6 +1264,7 @@ pub fn run_claude_session_interactive_with_retry(
             session_manager,
             task_run_id,
             doctor_handle,
+            reflection_fix_ctx_clone,
         );
 
         match result {

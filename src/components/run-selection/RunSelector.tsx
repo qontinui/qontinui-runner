@@ -15,6 +15,7 @@ import {
   Activity,
   StopCircle,
   Trash2,
+  RotateCcw,
 } from "lucide-react";
 import { useRunSelection } from "../../contexts/RunSelectionContext";
 import type { TaskRun, TaskRunStatus } from "../../types/aiData";
@@ -147,6 +148,7 @@ function RunItem({
       className={`
         w-full flex items-center gap-3 px-3 py-2 text-left transition-colors
         ${isSelected ? "bg-primary/10" : "hover:bg-muted/50"}
+        ${run.is_reflection ? "border-l-2 border-purple-500/50" : ""}
       `}
     >
       {/* Status Icon */}
@@ -163,6 +165,12 @@ function RunItem({
               className={`px-1.5 py-0.5 text-xs ${getStatusColors("running").bg} ${getStatusColors("running").text} rounded`}
             >
               In Progress
+            </span>
+          )}
+          {run.is_reflection && (
+            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 text-xs bg-purple-500/20 text-purple-400 rounded">
+              <RotateCcw className="w-3 h-3" />
+              Reflection
             </span>
           )}
         </div>

@@ -144,13 +144,25 @@ pub fn get_fixes_by_workflow_name(
     status_filter: Option<&str>,
     effectiveness_filter: Option<&str>,
 ) -> Result<Vec<ReflectionFix>, String> {
+    let prefixed_columns = SELECT_ALL_COLUMNS
+        .split(',')
+        .map(|col| {
+            let col = col.trim();
+            if col.is_empty() {
+                String::new()
+            } else {
+                format!("rf.{}", col)
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ");
+
     let mut sql = format!(
-        r#"SELECT rf.{} FROM reflection_fixes rf
+        r#"SELECT {} FROM reflection_fixes rf
         INNER JOIN task_runs tr ON rf.source_task_run_id = tr.id
         WHERE tr.workflow_name = ?1"#,
-        SELECT_ALL_COLUMNS
-            .replace("id,", "rf.id,")
-            .replace("source_task_run_id,", "rf.source_task_run_id,")
+        prefixed_columns
     );
 
     // Build dynamic WHERE clauses

@@ -79,6 +79,7 @@ import {
   Terminal,
   AlertCircle,
   ListChecks,
+  RotateCcw,
 } from "lucide-react";
 
 // Import shared navigation structure and state management
@@ -164,6 +165,7 @@ const ICON_MAP: Record<IconName, LucideIcon> = {
   Terminal,
   AlertCircle,
   ListChecks,
+  RotateCcw,
 };
 
 function getIconComponent(iconName: IconName): LucideIcon {
@@ -737,7 +739,9 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
         localStorage.setItem(STORAGE_KEYS.appMode, newMode);
       }
     });
-    return () => { unlisten.then(fn => fn()); };
+    return () => {
+      unlisten.then((fn) => fn());
+    };
   }, [appMode]);
 
   // Flyout state

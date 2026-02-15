@@ -1455,6 +1455,7 @@ pub struct AgenticExecutor {
     app_state: Arc<AppState>,
     ai_executor: UnifiedAiSessionExecutor,
     checkpoint_db: Arc<CheckpointDb>,
+    reflection_fix_ctx: Option<crate::mcp::shared::ReflectionFixContext>,
 }
 
 impl AgenticExecutor {
@@ -1468,12 +1469,18 @@ impl AgenticExecutor {
             app_state: app_state.clone(),
             ai_executor: UnifiedAiSessionExecutor::new(app_state, app_handle, pid_tracker),
             checkpoint_db,
+            reflection_fix_ctx: None,
         }
     }
 
     /// Enable interactive sessions via the session manager.
     pub fn set_session_manager(&mut self, sm: Arc<crate::claude_session::SessionManager>) {
         self.ai_executor.session_manager = Some(sm);
+    }
+
+    /// Set the reflection fix context for parsing [REFLECTION_FIX:...] markers.
+    pub fn set_reflection_fix_ctx(&mut self, ctx: crate::mcp::shared::ReflectionFixContext) {
+        self.reflection_fix_ctx = Some(ctx);
     }
 
     /// Run the AI with the given prompt and failure context.
@@ -1503,9 +1510,9 @@ impl AgenticExecutor {
         agentic_steps: &[ExecutionStepConfig],
         logger: &StepEventLogger,
     ) -> AgenticOutcome {
-        if !has_agentic_steps {
+        if !has_agentic_steps && config.base_prompt.is_empty() {
             info!(
-                "AGENTIC-PHASE: No agentic steps defined, skipping (iteration {})",
+                "AGENTIC-PHASE: No agentic steps and no base prompt, skipping (iteration {})",
                 iteration
             );
             return AgenticOutcome::Skipped;
@@ -1529,18 +1536,19 @@ impl AgenticExecutor {
             .collect();
         let agentic_steps = agentic_steps.as_slice();
 
-        if agentic_steps.is_empty() {
+        if agentic_steps.is_empty() && config.base_prompt.is_empty() {
             info!(
-                "AGENTIC-PHASE: All agentic steps are dev-mode-only, skipping (iteration {})",
+                "AGENTIC-PHASE: No remaining agentic steps and no base prompt, skipping (iteration {})",
                 iteration
             );
             return AgenticOutcome::Skipped;
         }
 
-        // Check if any agentic step uses response mode
-        let has_response_mode = agentic_steps
-            .iter()
-            .any(|s| s.prompt_mode.as_deref() == Some("response"));
+        // Check if any agentic step uses response mode (only relevant when steps exist)
+        let has_response_mode = !agentic_steps.is_empty()
+            && agentic_steps
+                .iter()
+                .any(|s| s.prompt_mode.as_deref() == Some("response"));
 
         // If response mode, handle with simple prompt->response instead of full session
         if has_response_mode {
@@ -1871,9 +1879,14 @@ impl AgenticExecutor {
         );
 
         // Use the unified AI session executor with timing
-        let ai_config =
+        let mut ai_config =
             AiSessionConfig::agentic(&config.execution_id, &config.workflow_name, iteration)
                 .with_checkpoint_id(&checkpoint.id);
+
+        // Attach reflection fix context if this is a reflection workflow
+        if let Some(ref ctx) = self.reflection_fix_ctx {
+            ai_config = ai_config.with_reflection_fix_ctx(ctx.clone());
+        }
 
         let (result, duration_ms) = timeout_helper::timed_result_async(self.ai_executor.execute(
             &ai_config,

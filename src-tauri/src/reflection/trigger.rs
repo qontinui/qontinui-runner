@@ -7,7 +7,6 @@
 //! 3. Parent hierarchy tracking
 
 use std::sync::Arc;
-use tauri::Manager;
 use tracing::{debug, info};
 
 use crate::config_storage::ConfigStorage;
@@ -39,6 +38,20 @@ pub fn should_launch_reflection(
     let source_id = source_task_run_id.to_string();
 
     db.with_conn(|conn| {
+        // Guard 0: Check if a reflection workflow is already running
+        let has_running: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM task_runs WHERE status = 'running' AND is_reflection = 1 AND workflow_type = 'unified'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+
+        if has_running {
+            debug!("Skipping reflection — another reflection workflow is already running");
+            return Ok(false);
+        }
+
         // Guard 1: Check if source task run is already a reflection run
         let is_reflection: bool = conn
             .query_row(
@@ -163,14 +176,20 @@ pub fn launch_reflection(
 
     let setup_steps = super::workflow::build_setup_steps(&source_task_run_id, &workflow_name);
     let verification_steps = super::workflow::build_verification_steps();
-    let completion_prompt_steps = super::workflow::build_completion_steps(&workflow_name);
+    let mut completion_steps = super::workflow::build_completion_steps(&workflow_name);
+    // Split completion steps: first is automation (api_request), rest are prompt steps
+    let completion_prompt_steps = completion_steps.split_off(1);
+    let completion_automation_steps = completion_steps;
 
     // Build LoopController with full deps
-    let session_manager: Arc<crate::claude_session::SessionManager> = deps
-        .app_handle
-        .state::<Arc<crate::claude_session::SessionManager>>()
-        .inner()
-        .clone();
+    // Note: We intentionally do NOT pass session_manager here.
+    // Reflection workflows use inline mode (one-shot), not interactive sessions,
+    // because the Claude CLI interactive session fails during initialization
+    // when spawned programmatically from a background task.
+    let reflection_fix_ctx = crate::mcp::shared::ReflectionFixContext {
+        source_task_run_id: source_task_run_id.clone(),
+        reflection_task_run_id: reflection_id.clone(),
+    };
 
     let mut controller = crate::unified_workflow_executor::LoopController::new(
         deps.app_state.clone(),
@@ -178,7 +197,7 @@ pub fn launch_reflection(
         deps.app_handle.clone(),
         deps.pid_tracker.clone(),
     )
-    .with_session_manager(session_manager);
+    .with_reflection_fix_ctx(reflection_fix_ctx);
 
     info!(
         "Spawning reflection workflow '{}' (id: {}) with {} setup steps",
@@ -200,12 +219,12 @@ pub fn launch_reflection(
             controller
                 .run(
                     loop_config,
-                    setup_steps,             // setup automation steps (API requests)
-                    Vec::new(),              // setup prompt steps (none)
-                    verification_steps,      // verification steps
-                    Vec::new(),              // agentic steps (prompt is in loop_config.base_prompt)
-                    Vec::new(),              // completion automation steps (none)
-                    completion_prompt_steps,  // completion prompt steps
+                    setup_steps,                // setup automation steps (API requests)
+                    Vec::new(),                 // setup prompt steps (none)
+                    verification_steps,         // verification steps
+                    Vec::new(),                 // agentic steps (prompt is in loop_config.base_prompt)
+                    completion_automation_steps, // completion automation steps (batch evaluation)
+                    completion_prompt_steps,     // completion prompt steps
                 )
                 .await
         }),

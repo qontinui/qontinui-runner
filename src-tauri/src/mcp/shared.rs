@@ -161,6 +161,16 @@ pub struct ProgressContext {
     pub task_run_id: String,
 }
 
+/// Context for reflection fix detection during AI sessions.
+/// Contains the information needed to store reflection fixes in the database.
+#[derive(Debug, Clone)]
+pub struct ReflectionFixContext {
+    /// The task run ID being analyzed (source)
+    pub source_task_run_id: String,
+    /// The reflection workflow's own task run ID
+    pub reflection_task_run_id: String,
+}
+
 /// Emit AI output event to frontend and persist to file.
 ///
 /// Previously, persistence depended on a fragile round-trip:

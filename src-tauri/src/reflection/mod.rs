@@ -14,6 +14,7 @@
 #![allow(dead_code)]
 
 pub mod effectiveness;
+pub mod parser;
 pub mod storage;
 pub mod trigger;
 pub mod types;

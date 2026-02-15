@@ -114,8 +114,8 @@ impl ClaudeSession {
             "bypassPermissions",
         ])
         .current_dir(working_dir)
-        // Prevent "cannot be launched inside another Claude Code session" error
-        // when the runner itself is started from within a Claude Code session
+        // Remove CLAUDECODE env var to prevent "nested session" detection.
+        // The runner spawns Claude CLI as an automation tool, not as a nested session.
         .env_remove("CLAUDECODE")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -201,7 +201,7 @@ impl ClaudeSession {
                 }
 
                 let elapsed_secs = start_time.elapsed().as_secs();
-                if elapsed_secs > 0 && elapsed_secs % 30 == 0 && elapsed_secs != last_update {
+                if elapsed_secs > 0 && elapsed_secs.is_multiple_of(30) && elapsed_secs != last_update {
                     last_update = elapsed_secs;
                     let mins = elapsed_secs / 60;
                     let secs = elapsed_secs % 60;

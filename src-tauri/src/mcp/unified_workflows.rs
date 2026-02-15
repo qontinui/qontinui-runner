@@ -1131,6 +1131,12 @@ pub struct RunUnifiedWorkflowRequest {
     force_fresh_start: bool,
 }
 
+/// Response body for running a unified workflow (non-blocking)
+#[derive(Debug, Serialize)]
+pub struct RunUnifiedWorkflowResponse {
+    pub task_run_id: String,
+}
+
 /// Request body for executing an inline workflow (without saving to database)
 /// Used by Quick Fix to run a workflow directly without cluttering the library
 #[derive(Debug, Deserialize, Serialize)]
@@ -1216,7 +1222,7 @@ pub async fn run_unified_workflow(
     Path(id): Path<String>,
     Json(request): Json<RunUnifiedWorkflowRequest>,
 ) -> Result<
-    Json<ApiResponse<crate::step_executor::ExecutionResult>>,
+    Json<ApiResponse<RunUnifiedWorkflowResponse>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
     info!("Running unified workflow: {}", id);
@@ -1578,21 +1584,10 @@ pub async fn run_unified_workflow(
     }
 
     if all_steps.is_empty() {
-        return Ok(Json(ApiResponse::success(
-            crate::step_executor::ExecutionResult {
-                success: true,
-                total_steps: 0,
-                successful_steps: 0,
-                failed_steps: 0,
-                total_duration_ms: 0,
-                steps: vec![],
-                captured_logs: None,
-                captured_runner_logs: None,
-                verification_passed: None,
-                loop_result: None,
-                task_summary: None,
-            },
-        )));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error("Workflow has no steps to execute".to_string())),
+        ));
     }
 
     // Pre-fetch external elements for spec steps to avoid HTTP self-call deadlock
@@ -1870,32 +1865,50 @@ pub async fn run_unified_workflow(
             is_dev_mode: cfg!(debug_assertions),
         };
 
-        let session_manager: Arc<crate::claude_session::SessionManager> = state
-            .app_handle
-            .state::<Arc<crate::claude_session::SessionManager>>()
-            .inner()
-            .clone();
-        let mut controller = crate::unified_workflow_executor::LoopController::new(
-            state.app_state.clone(),
-            state.config_storage.clone(),
-            state.app_handle.clone(),
-            state.current_ai_pids.clone(),
-        )
-        .with_session_manager(session_manager);
+        // Spawn execution in background (non-blocking) — same pattern as
+        // generate_unified_workflow_async_handler
+        let checkpoint_db = state.app_state.checkpoint_db.clone();
+        let execution_id_for_guard = execution_id.clone();
+        let workflow_name_for_guard = workflow.name.clone();
+        let app_state = state.app_state.clone();
+        let config_storage = state.config_storage.clone();
+        let app_handle = state.app_handle.clone();
+        let pid_tracker = state.current_ai_pids.clone();
 
-        let result = controller
-            .run(
-                loop_config,
-                setup_automation_steps,
-                setup_prompt_steps,
-                verification_steps,
-                agentic_steps,
-                completion_automation_steps,
-                completion_prompt_steps,
-            )
-            .await;
+        crate::unified_workflow_executor::spawn_workflow_with_panic_guard(
+            checkpoint_db,
+            execution_id_for_guard,
+            workflow_name_for_guard,
+            async move {
+                let session_manager: Arc<crate::claude_session::SessionManager> = app_handle
+                    .state::<Arc<crate::claude_session::SessionManager>>()
+                    .inner()
+                    .clone();
+                let mut controller = crate::unified_workflow_executor::LoopController::new(
+                    app_state,
+                    config_storage,
+                    app_handle,
+                    pid_tracker,
+                )
+                .with_session_manager(session_manager);
 
-        return Ok(Json(ApiResponse::success(result.to_execution_result())));
+                controller
+                    .run(
+                        loop_config,
+                        setup_automation_steps,
+                        setup_prompt_steps,
+                        verification_steps,
+                        agentic_steps,
+                        completion_automation_steps,
+                        completion_prompt_steps,
+                    )
+                    .await
+            },
+        );
+
+        return Ok(Json(ApiResponse::success(RunUnifiedWorkflowResponse {
+            task_run_id: execution_id,
+        })));
     }
 
     // No prompt steps - use step_executor for automation-only workflow
@@ -1917,53 +1930,61 @@ pub async fn run_unified_workflow(
         );
     }
 
-    // Create step executor
-    let executor = crate::step_executor::StepExecutor::with_app_handle(
-        state.app_state.clone(),
-        state.config_storage.clone(),
-        state.app_handle.clone(),
-    );
+    // Spawn automation execution in background (non-blocking)
+    let response_task_run_id = execution_id.clone();
+    let checkpoint_db = state.app_state.checkpoint_db.clone();
+    let execution_id_for_guard = execution_id.clone();
+    let workflow_name_for_guard = workflow.name.clone();
+    let app_state = state.app_state.clone();
+    let config_storage = state.config_storage.clone();
+    let app_handle = state.app_handle.clone();
 
-    // Execute automation steps only (no prompt steps)
-    let result = executor
-        .execute_steps_with_log_sources(&automation_steps, &execution_id, &[])
-        .await;
-
-    info!(
-        "Unified workflow '{}' completed: {} of {} steps succeeded",
-        workflow.name, result.successful_steps, result.total_steps
-    );
-
-    // Update task_run status based on result
-    if result.success {
-        if let Err(e) = state
-            .app_state
-            .checkpoint_db
-            .complete_task_run(&execution_id)
-        {
-            warn!(
-                "Failed to mark task_run {} as completed: {}",
-                execution_id, e
+    crate::unified_workflow_executor::spawn_sequence_with_panic_guard(
+        checkpoint_db,
+        execution_id_for_guard,
+        workflow_name_for_guard,
+        async move {
+            let executor = crate::step_executor::StepExecutor::with_app_handle(
+                app_state.clone(),
+                config_storage,
+                app_handle,
             );
-        }
-    } else {
-        let error_msg = result
-            .steps
-            .iter()
-            .find(|s| !s.success)
-            .and_then(|s| s.error.as_ref())
-            .map(|s| s.as_str())
-            .unwrap_or("Unknown error");
-        if let Err(e) = state
-            .app_state
-            .checkpoint_db
-            .fail_task_run(&execution_id, error_msg)
-        {
-            warn!("Failed to mark task_run {} as failed: {}", execution_id, e);
-        }
-    }
 
-    Ok(Json(ApiResponse::success(result)))
+            let result = executor
+                .execute_steps_with_log_sources(&automation_steps, &execution_id, &[])
+                .await;
+
+            info!(
+                "Unified workflow automation completed: {} of {} steps succeeded",
+                result.successful_steps, result.total_steps
+            );
+
+            // Update task_run status based on result
+            if result.success {
+                if let Err(e) = app_state.checkpoint_db.complete_task_run(&execution_id) {
+                    warn!(
+                        "Failed to mark task_run {} as completed: {}",
+                        execution_id, e
+                    );
+                }
+            } else {
+                let error_msg = result
+                    .steps
+                    .iter()
+                    .find(|s| !s.success)
+                    .and_then(|s| s.error.as_ref())
+                    .map(|s| s.as_str())
+                    .unwrap_or("Unknown error");
+                if let Err(e) = app_state.checkpoint_db.fail_task_run(&execution_id, error_msg) {
+                    warn!("Failed to mark task_run {} as failed: {}", execution_id, e);
+                }
+            }
+        },
+    );
+
+    Ok(Json(ApiResponse::success(RunUnifiedWorkflowResponse {
+        task_run_id: response_task_run_id,
+    })))
 }
 
 /// Stores the last inline workflow request for re-execution via "Run Last Workflow".

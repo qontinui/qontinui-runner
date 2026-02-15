@@ -31,7 +31,7 @@ use tracing::{error, info, instrument, warn};
 use crate::database::CreateTaskRunEventInput;
 use crate::doctor::DoctorHandle;
 use crate::execution_context::AiSessionContext;
-use crate::mcp::shared::{FindingContext, ProgressContext, FINDING_INSTRUCTIONS};
+use crate::mcp::shared::{FindingContext, ProgressContext, ReflectionFixContext, FINDING_INSTRUCTIONS};
 use crate::runtime_env::{
     get_available_mcp_tools, AiSessionContextExt, AiSessionContextToolsExt, ExecutionContextExt,
 };
@@ -71,6 +71,9 @@ pub struct AiSessionConfig {
     /// Metadata for sub-steps when using consolidated prompts.
     /// Used for granular progress tracking with [STEP_COMPLETE:id] markers.
     pub sub_step_metadata: Option<Vec<crate::executor::prompt_builder::SubStepMetadata>>,
+    /// Optional context for reflection fix marker detection.
+    /// When set, the AI session will parse [REFLECTION_FIX:...] markers and store them in the database.
+    pub reflection_fix_ctx: Option<ReflectionFixContext>,
 }
 
 impl AiSessionConfig {
@@ -91,6 +94,7 @@ impl AiSessionConfig {
             strip_completion_markers: true,
             checkpoint_id: None,
             sub_step_metadata: None,
+            reflection_fix_ctx: None,
         }
     }
 
@@ -111,6 +115,7 @@ impl AiSessionConfig {
             strip_completion_markers: true,
             checkpoint_id: None,
             sub_step_metadata: None,
+            reflection_fix_ctx: None,
         }
     }
 
@@ -132,6 +137,7 @@ impl AiSessionConfig {
             strip_completion_markers: true,
             checkpoint_id: None,
             sub_step_metadata: None,
+            reflection_fix_ctx: None,
         }
     }
 
@@ -153,6 +159,15 @@ impl AiSessionConfig {
         metadata: Vec<crate::executor::prompt_builder::SubStepMetadata>,
     ) -> Self {
         self.sub_step_metadata = Some(metadata);
+        self
+    }
+
+    /// Set the reflection fix context for parsing [REFLECTION_FIX:...] markers.
+    ///
+    /// When set, the AI session will detect and store reflection fixes emitted by the AI.
+    /// This is only used during reflection workflows.
+    pub fn with_reflection_fix_ctx(mut self, ctx: ReflectionFixContext) -> Self {
+        self.reflection_fix_ctx = Some(ctx);
         self
     }
 }
@@ -401,6 +416,7 @@ impl UnifiedAiSessionExecutor {
             None
         };
         let task_run_id_for_claude = config.task_run_id.clone();
+        let reflection_fix_ctx = config.reflection_fix_ctx.clone();
 
         let result = tokio::task::spawn_blocking(move || {
             let doctor_ref = doctor_handle.as_ref();
@@ -419,6 +435,7 @@ impl UnifiedAiSessionExecutor {
                     sm,
                     &task_run_id_for_claude,
                     doctor_ref,
+                    reflection_fix_ctx,
                 )
             } else {
                 // Inline mode: one-shot session (either no session manager or interactive disabled)
@@ -437,6 +454,7 @@ impl UnifiedAiSessionExecutor {
                     Some(pid_tracker),
                     Some(&retry_config),
                     doctor_ref,
+                    reflection_fix_ctx,
                 )
             }
         })

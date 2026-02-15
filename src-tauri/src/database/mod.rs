@@ -6065,6 +6065,36 @@ impl CheckpointDb {
         Ok(())
     }
 
+    /// Check if there's a running reflection workflow.
+    /// Returns the task_run ID if one exists, None otherwise.
+    /// Used to prevent duplicate reflection workflows from being created.
+    pub fn has_running_reflection_workflow(&self) -> Result<Option<String>, String> {
+        let conn = self.get_conn()?;
+
+        let result: Result<String, rusqlite::Error> = conn.query_row(
+            r#"
+            SELECT id
+            FROM task_runs
+            WHERE status = 'running'
+              AND is_reflection = 1
+              AND workflow_type = 'unified'
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+            [],
+            |row| row.get(0),
+        );
+
+        match result {
+            Ok(id) => Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!(
+                "Failed to check for running reflection workflow: {}",
+                e
+            )),
+        }
+    }
+
     /// Check if there's a running error-fix workflow.
     /// Returns the task_run ID if one exists, None otherwise.
     /// Used to prevent duplicate error-fix workflows from being created.

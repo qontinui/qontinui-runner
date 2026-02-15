@@ -51,6 +51,7 @@ pub struct LoopController {
     app_handle: tauri::AppHandle,
     pid_tracker: Arc<std::sync::Mutex<Vec<u32>>>,
     doctor_handle: Option<DoctorHandle>,
+    reflection_fix_ctx: Option<crate::mcp::shared::ReflectionFixContext>,
 }
 
 impl LoopController {
@@ -95,6 +96,7 @@ impl LoopController {
             app_handle,
             pid_tracker,
             doctor_handle,
+            reflection_fix_ctx: None,
         }
     }
 
@@ -103,6 +105,13 @@ impl LoopController {
         self.setup_executor.set_session_manager(sm.clone());
         self.agentic_executor.set_session_manager(sm.clone());
         self.completion_executor.set_session_manager(sm);
+        self
+    }
+
+    /// Set the reflection fix context for parsing [REFLECTION_FIX:...] markers during agentic phase.
+    pub fn with_reflection_fix_ctx(mut self, ctx: crate::mcp::shared::ReflectionFixContext) -> Self {
+        self.agentic_executor.set_reflection_fix_ctx(ctx.clone());
+        self.reflection_fix_ctx = Some(ctx);
         self
     }
 
@@ -511,7 +520,7 @@ impl LoopController {
                     &config,
                     agentic_iteration,
                     &agentic_context,
-                    !agentic_steps.is_empty(),
+                    !agentic_steps.is_empty() || !config.base_prompt.is_empty(),
                     &agentic_steps,
                     &logger,
                 )
@@ -552,7 +561,7 @@ impl LoopController {
             self.run_verification_agentic_loop(
                 &resumed_config,
                 &verification_steps,
-                !agentic_steps.is_empty(),
+                !agentic_steps.is_empty() || !resumed_config.base_prompt.is_empty(),
                 &agentic_steps,
                 &mut all_step_results,
                 &mut transitions,
@@ -589,7 +598,7 @@ impl LoopController {
             self.run_verification_agentic_loop(
                 &adjusted_config,
                 &verification_steps,
-                !agentic_steps.is_empty(),
+                !agentic_steps.is_empty() || !adjusted_config.base_prompt.is_empty(),
                 &agentic_steps,
                 &mut all_step_results,
                 &mut transitions,

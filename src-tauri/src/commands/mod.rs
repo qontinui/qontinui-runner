@@ -86,6 +86,7 @@ pub mod state_explorer; // State explorer for AI-driven state machine exploratio
 pub mod state_machine;
 pub mod step_outputs; // Step output collection for test builder
 pub mod storage;
+pub mod library_sync; // Sync library items (checks, macros, etc.) to web backend
 pub mod task_sync; // renamed from ai_task_reporting
 pub mod test_orchestrator; // AI-driven multi-step API test orchestration
 pub mod testing;

@@ -100,6 +100,7 @@ fn default_retryable_errors() -> Vec<String> {
         "ETIMEDOUT".to_string(),
         "ECONNRESET".to_string(),
         "ECONNREFUSED".to_string(),
+        "exited during initialization".to_string(),
     ]
 }
 

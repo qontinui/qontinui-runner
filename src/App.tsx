@@ -172,6 +172,7 @@ import { ExternalLogsTab as _ExternalLogsTab } from "./components/ExternalLogsTa
 import { CategoryManager } from "./components/findings/CategoryManager";
 import { HooksManagerPanel } from "./components/hooks";
 import { ErrorMonitorTab } from "./components/error-monitor";
+import { ReflectionDashboard } from "./components/reflection-dashboard/ReflectionDashboard";
 
 // Development tools
 import { PerformanceOverlay } from "./components/dev";
@@ -190,6 +191,7 @@ type MainTabId =
   | "runs"
   | "history"
   | "error-monitor"
+  | "reflection"
   // Observe group - new structure
   | "run-recap"
   | "run-actions"
@@ -261,6 +263,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "runs",
   "history",
   "error-monitor",
+  "reflection",
   // New observe tabs
   "run-recap",
   "run-actions",
@@ -1057,6 +1060,13 @@ function AppContent() {
         return (
           <div className="h-full overflow-hidden">
             <ErrorMonitorTab />
+          </div>
+        );
+
+      case "reflection":
+        return (
+          <div className="h-full overflow-hidden">
+            <ReflectionDashboard />
           </div>
         );
 

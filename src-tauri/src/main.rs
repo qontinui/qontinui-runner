@@ -568,6 +568,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::task_sync::sync_ai_task_completed,
             commands::task_sync::full_sync_ai_task,
             commands::task_sync::sync_all_pending_ai_tasks,
+            // Library Sync commands (sync library items to qontinui-web)
+            commands::library_sync::sync_library_to_backend,
+            commands::library_sync::sync_checks_to_backend,
+            commands::library_sync::sync_check_groups_to_backend,
+            commands::library_sync::sync_shell_commands_to_backend,
+            commands::library_sync::sync_api_requests_to_backend,
+            commands::library_sync::sync_contexts_to_backend,
+            commands::library_sync::sync_macros_to_backend,
+            commands::library_sync::sync_scriptlets_to_backend,
             // Verification testing commands
             commands::testing::execute_verification_test,
             commands::testing::execute_verification_test_suite,
