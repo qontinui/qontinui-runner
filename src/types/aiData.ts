@@ -844,6 +844,19 @@ export interface VerificationStepDetails {
   exit_code?: number | null;
   /** For check_group steps: individual check results with details */
   check_results?: IndividualCheckResult[] | null;
+  /** Console errors captured during this step's execution (from UI Bridge ConsoleCapture) */
+  console_errors?: ConsoleError[] | null;
+}
+
+/**
+ * Console error captured by UI Bridge ConsoleCapture
+ */
+export interface ConsoleError {
+  type: "error" | "warn" | "unhandledError" | "unhandledRejection";
+  message: string;
+  timestamp?: number;
+  source?: string;
+  stack?: string;
 }
 
 /**
@@ -921,6 +934,8 @@ export interface VerificationPhaseResult {
   total_duration_ms: number;
   step_results: VerificationStepResult[];
   critical_failure: boolean;
+  /** Console errors captured during the entire verification phase */
+  console_errors?: ConsoleError[] | null;
 }
 
 /**

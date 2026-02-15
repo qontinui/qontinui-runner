@@ -60,11 +60,16 @@ export interface HealthCheckUrl {
 /**
  * Base interface for all step types
  */
-interface BaseStep {
+export interface BaseStep {
   /** Unique identifier (UUID v4) */
   id: string;
   /** Display name for the step */
   name: string;
+  /**
+   * If true, step fails when console errors are captured during execution
+   * (even if the step itself passes). Default: false (console errors are informational).
+   */
+  fail_on_console_errors?: boolean;
 }
 
 // -----------------------------------------------------------------------------

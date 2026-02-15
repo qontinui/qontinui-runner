@@ -20,7 +20,11 @@ import {
   AlertCircle,
 } from "lucide-react";
 import { useTaskRunVerificationResults } from "../../hooks/useAiData";
-import type { VerificationPhaseResult, VerificationStepResult } from "../../types/aiData";
+import type {
+  ConsoleError,
+  VerificationPhaseResult,
+  VerificationStepResult,
+} from "../../types/aiData";
 
 interface VerificationTabProps {
   taskRunId: string;
@@ -49,6 +53,43 @@ function StepTypeIcon({ stepType }: { stepType: string }) {
   }
 }
 
+function ConsoleErrorsList({
+  errors,
+  dataUiPrefix,
+}: {
+  errors: ConsoleError[];
+  dataUiPrefix: string;
+}) {
+  return (
+    <div data-ui-id={`${dataUiPrefix}-console-errors`}>
+      <h4 className="text-sm font-medium mb-1 text-red-400 flex items-center gap-1.5">
+        <AlertTriangle className="w-3.5 h-3.5" />
+        Console Errors ({errors.length})
+      </h4>
+      <div className="space-y-1">
+        {errors.slice(0, 15).map((err, i) => (
+          <div
+            key={i}
+            className={`text-xs p-2 rounded flex items-start gap-2 ${
+              err.type === "warn"
+                ? "bg-amber-500/10 text-amber-400"
+                : "bg-red-500/10 text-red-400"
+            }`}
+          >
+            <span className="font-mono opacity-70 shrink-0">[{err.type}]</span>
+            <span className="whitespace-pre-wrap break-all">{err.message}</span>
+          </div>
+        ))}
+        {errors.length > 15 && (
+          <p className="text-xs text-muted-foreground">
+            ... and {errors.length - 15} more console errors
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function StepResultCard({
   step,
   isExpanded,
@@ -58,11 +99,14 @@ function StepResultCard({
   isExpanded: boolean;
   onToggle: () => void;
 }) {
+  const consoleErrors = step.verification_details?.console_errors;
+  const hasConsoleErrors = consoleErrors && consoleErrors.length > 0;
   const hasDetails =
     step.error ||
     step.verification_details?.stdout ||
     step.verification_details?.stderr ||
-    step.verification_details?.console_output;
+    step.verification_details?.console_output ||
+    hasConsoleErrors;
 
   return (
     <div
@@ -168,6 +212,14 @@ function StepResultCard({
               </pre>
             </div>
           )}
+
+          {/* Console errors (from UI Bridge ConsoleCapture) */}
+          {hasConsoleErrors && (
+            <ConsoleErrorsList
+              errors={consoleErrors}
+              dataUiPrefix={`verification-step-${step.step_index}`}
+            />
+          )}
         </div>
       )}
     </div>
@@ -229,6 +281,13 @@ function IterationCard({
                 {result.skipped_steps} skipped
               </span>
             )}
+            {result.console_errors && result.console_errors.length > 0 && (
+              <span className="text-xs px-2 py-0.5 rounded bg-amber-500/10 text-amber-500 flex items-center gap-1">
+                <AlertTriangle className="w-3 h-3" />
+                {result.console_errors.length} console error
+                {result.console_errors.length !== 1 ? "s" : ""}
+              </span>
+            )}
           </div>
         </div>
 
@@ -258,6 +317,16 @@ function IterationCard({
                 onToggle={() => toggleStep(step.step_index)}
               />
             ))
+          )}
+
+          {/* Phase-level console errors */}
+          {result.console_errors && result.console_errors.length > 0 && (
+            <div className="mt-3 border border-red-500/20 rounded-lg p-3">
+              <ConsoleErrorsList
+                errors={result.console_errors}
+                dataUiPrefix={`verification-iteration-${result.iteration}`}
+              />
+            </div>
           )}
         </div>
       )}

@@ -29,6 +29,7 @@ import type {
   McpCallStep,
   CheckType,
   GateStep,
+  BaseStep,
 } from "../../types/unified-workflow";
 import { GUI_ACTION_TYPES, STEP_TYPES } from "../../types";
 import { CHECK_TOOLS, CHECK_TYPE_INFO } from "../check-builder/types";
@@ -1686,6 +1687,37 @@ export function StepConfigPanel({ onClose }: StepConfigPanelProps) {
             onUpdate={handleUpdate}
             verificationSteps={state.workflow.verification_steps}
           />
+        )}
+
+        {/* Console Error Handling — shown for all verification phase steps except gates */}
+        {phase === "verification" && selectedStep.type !== "gate" && (
+          <div className="mt-4 pt-4 border-t border-zinc-700">
+            <h4 className="text-xs font-medium text-zinc-500 uppercase tracking-wider mb-3">
+              Console Errors
+            </h4>
+            <div className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                id="fail_on_console_errors"
+                checked={(selectedStep as BaseStep).fail_on_console_errors ?? false}
+                onChange={(e) =>
+                  handleUpdate({ fail_on_console_errors: e.target.checked } as Partial<UnifiedStep>)
+                }
+                className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
+                data-ui-id="workflow-builder-step-config-fail-on-console-errors-checkbox"
+              />
+              <label
+                htmlFor="fail_on_console_errors"
+                className="text-sm text-zinc-300"
+              >
+                Fail on console errors
+              </label>
+            </div>
+            <p className="text-xs text-zinc-500 mt-1 ml-6">
+              Step will fail if browser console errors are detected during
+              execution, even if the step itself passes.
+            </p>
+          </div>
         )}
       </div>
 

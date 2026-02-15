@@ -590,6 +590,16 @@ async fn handle_console_errors(
     }
 }
 
+/// POST /ui-bridge/sdk/console-errors/clear — Clear console errors in SDK app
+async fn handle_clear_console_errors(
+    State(state): State<Arc<ApiState>>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/control/console-errors/clear", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
 /// POST /ui-bridge/sdk/ai/search — AI-powered element search
 async fn handle_ai_search(
     State(state): State<Arc<ApiState>>,
@@ -976,6 +986,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route(
             "/ui-bridge/sdk/console-errors",
             get(handle_console_errors),
+        )
+        .route(
+            "/ui-bridge/sdk/console-errors/clear",
+            post(handle_clear_console_errors),
         )
         // Screenshot (monitor capture for SDK apps that can't self-screenshot)
         .route("/ui-bridge/sdk/screenshot", get(handle_screenshot))

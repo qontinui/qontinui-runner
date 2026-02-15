@@ -49,6 +49,7 @@ type UIBridgeRequestType =
   | "discover"
   | "get_snapshot"
   | "get_console_errors"
+  | "clear_console_errors"
   | "get_specs"
   | "get_spec"
   | "page_refresh"
@@ -407,6 +408,7 @@ export function useUIBridgeEventHandler(): void {
               | {
                   getSince: (ts: number) => unknown[];
                   getRecent: (n?: number) => unknown[];
+                  clear: () => void;
                 }
               | undefined;
 
@@ -432,6 +434,27 @@ export function useUIBridgeEventHandler(): void {
               type,
               success: true,
               data: { errors, count: errors.length },
+              timestamp: Date.now(),
+            });
+            break;
+          }
+
+          case "clear_console_errors": {
+            const w2 = window as unknown as Record<string, unknown>;
+            const bridge2 = w2.__UI_BRIDGE__ as Record<string, unknown> | undefined;
+            const capture2 = bridge2?.consoleCapture as
+              | { clear: () => void }
+              | undefined;
+
+            if (capture2) {
+              capture2.clear();
+            }
+
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: { cleared: !!capture2 },
               timestamp: Date.now(),
             });
             break;

@@ -63,48 +63,100 @@ use crate::mcp::types::MCP_API_PORT;
 // Console Error Fetching (UI Bridge)
 // =============================================================================
 
-/// Fetch accumulated console errors from the UI Bridge via the MCP API.
+/// Clear accumulated console errors from the UI Bridge (best-effort).
 ///
-/// This is best-effort — if the UI Bridge isn't available (e.g., headless execution
-/// or frontend not running), it returns an empty vec or an error.
-async fn fetch_console_errors_from_ui_bridge() -> Result<Vec<serde_json::Value>, String> {
-    let url = format!(
-        "http://127.0.0.1:{}/ui-bridge/control/console-errors?limit=50",
+/// Called at the start of each verification phase so each iteration
+/// only captures its own console errors.
+async fn clear_console_errors() {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    // Clear runner's own frontend console errors
+    let control_url = format!(
+        "http://127.0.0.1:{}/ui-bridge/control/console-errors/clear",
         MCP_API_PORT
     );
+    let _ = client.post(&control_url).send().await;
 
+    // Clear SDK app console errors (if connected)
+    let sdk_url = format!(
+        "http://127.0.0.1:{}/ui-bridge/sdk/console-errors/clear",
+        MCP_API_PORT
+    );
+    let _ = client.post(&sdk_url).send().await;
+}
+
+/// Extract console errors from a JSON response body.
+///
+/// Handles both formats:
+/// - Runner control: `{ "success": true, "data": { "errors": [...] } }`
+/// - SDK proxy: `{ "success": true, "data": { "errors": [...] } }` or `{ "errors": [...] }`
+fn extract_console_errors_from_response(body: &serde_json::Value) -> Vec<serde_json::Value> {
+    // Try { "data": { "errors": [...] } } first (control endpoint)
+    body.get("data")
+        .and_then(|d| d.get("errors"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        // Fallback: { "errors": [...] } (SDK proxy may return unwrapped)
+        .or_else(|| {
+            body.get("errors")
+                .and_then(|v| v.as_array())
+                .cloned()
+        })
+        .unwrap_or_default()
+}
+
+/// Fetch accumulated console errors from both the runner frontend and SDK app.
+///
+/// This is best-effort — if endpoints aren't available (e.g., headless execution,
+/// no SDK app connected), they silently return empty results.
+async fn fetch_console_errors_from_ui_bridge() -> Result<Vec<serde_json::Value>, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("Console errors request failed: {}", e))?;
+    let control_url = format!(
+        "http://127.0.0.1:{}/ui-bridge/control/console-errors?limit=50",
+        MCP_API_PORT
+    );
+    let sdk_url = format!(
+        "http://127.0.0.1:{}/ui-bridge/sdk/console-errors?limit=50",
+        MCP_API_PORT
+    );
 
-    if !response.status().is_success() {
-        return Err(format!(
-            "Console errors endpoint returned {}",
-            response.status()
-        ));
+    // Fetch from both endpoints concurrently
+    let (control_result, sdk_result) = tokio::join!(
+        client.get(&control_url).send(),
+        client.get(&sdk_url).send(),
+    );
+
+    let mut all_errors = Vec::new();
+
+    // Extract control endpoint errors
+    if let Ok(response) = control_result {
+        if response.status().is_success() {
+            if let Ok(body) = response.json::<serde_json::Value>().await {
+                all_errors.extend(extract_console_errors_from_response(&body));
+            }
+        }
     }
 
-    let body: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse console errors response: {}", e))?;
+    // Extract SDK endpoint errors
+    if let Ok(response) = sdk_result {
+        if response.status().is_success() {
+            if let Ok(body) = response.json::<serde_json::Value>().await {
+                all_errors.extend(extract_console_errors_from_response(&body));
+            }
+        }
+    }
 
-    // The endpoint returns { "success": true, "data": { "errors": [...] } }
-    let errors = body
-        .get("data")
-        .and_then(|d| d.get("errors"))
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    Ok(errors)
+    Ok(all_errors)
 }
 
 // =============================================================================
@@ -1161,6 +1213,10 @@ impl VerificationExecutor {
             .cloned()
             .collect();
         let steps = steps.as_slice();
+
+        // Clear console errors before running verification so each iteration
+        // only captures its own errors
+        clear_console_errors().await;
 
         if steps.is_empty() {
             info!(

@@ -429,6 +429,21 @@ pub async fn ui_bridge_get_console_errors_handler(
     }
 }
 
+/// Clear console errors captured by the UI Bridge ConsoleCapture.
+pub async fn ui_bridge_clear_console_errors_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Clearing console errors");
+
+    match ui_bridge_request_sync(&state, "clear_console_errors", serde_json::json!({})).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
 /// Get all loaded specs from the SpecStore.
 pub async fn ui_bridge_get_specs_handler(
     State(state): State<Arc<ApiState>>,
@@ -905,6 +920,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/control/console-errors",
             get(ui_bridge_get_console_errors_handler),
+        )
+        .route(
+            "/ui-bridge/control/console-errors/clear",
+            post(ui_bridge_clear_console_errors_handler),
         )
         .route("/ui-bridge/control/specs", get(ui_bridge_get_specs_handler))
         .route(

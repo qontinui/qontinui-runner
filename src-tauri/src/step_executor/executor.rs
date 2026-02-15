@@ -468,6 +468,18 @@ pub struct ExecutionStepConfig {
     /// Error Resolved: Specific log source where the error originated
     #[serde(rename = "errorSource", alias = "error_source")]
     pub error_source: Option<String>,
+
+    // ========================================================================
+    // Console Error Handling
+    // ========================================================================
+    /// If true, step fails when console errors are captured during execution
+    /// (even if the step itself passes). Default: false (console errors are informational).
+    #[serde(
+        default,
+        rename = "failOnConsoleErrors",
+        alias = "fail_on_console_errors"
+    )]
+    pub fail_on_console_errors: bool,
 }
 
 impl ExecutionStepConfig {
@@ -3814,7 +3826,7 @@ impl StepExecutor {
                 .unwrap_or_else(|| format!("Step {}", index + 1));
 
             // Execute based on step type
-            let (success, error, mut verification_details, step_output_data) = match step
+            let (mut success, mut error, mut verification_details, step_output_data) = match step
                 .step_type
                 .as_str()
             {
@@ -4054,6 +4066,25 @@ impl StepExecutor {
                         if errors.as_ref().is_some_and(|e| !e.is_empty()) {
                             details.console_errors = errors;
                         }
+                    }
+                }
+            }
+
+            // Auto-fail: if fail_on_console_errors is set and console errors were captured,
+            // flip a passing step to failed
+            if success && step.fail_on_console_errors {
+                if let Some(ref details) = verification_details {
+                    if details.console_errors.as_ref().is_some_and(|e| !e.is_empty()) {
+                        let count = details.console_errors.as_ref().map_or(0, |e| e.len());
+                        warn!(
+                            "Verification step '{}' passed but has {} console error(s) — failing due to fail_on_console_errors",
+                            step_name, count
+                        );
+                        success = false;
+                        error = Some(format!(
+                            "Step passed but {} console error(s) detected (fail_on_console_errors=true)",
+                            count
+                        ));
                     }
                 }
             }
