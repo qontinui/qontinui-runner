@@ -406,6 +406,29 @@ pub async fn ui_bridge_get_snapshot_handler(
     }
 }
 
+/// Get console errors captured by the UI Bridge ConsoleCapture.
+pub async fn ui_bridge_get_console_errors_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<ConsoleErrorsQuery>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Getting console errors");
+
+    let payload = serde_json::json!({
+        "params": {
+            "since": query.since,
+            "limit": query.limit
+        }
+    });
+
+    match ui_bridge_request_sync(&state, "get_console_errors", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
 /// Get all loaded specs from the SpecStore.
 pub async fn ui_bridge_get_specs_handler(
     State(state): State<Arc<ApiState>>,
@@ -440,6 +463,16 @@ pub async fn ui_bridge_get_spec_handler(
 // ============================================================================
 // Page Navigation Handlers
 // ============================================================================
+
+/// Query parameters for console errors endpoint
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsoleErrorsQuery {
+    #[serde(default)]
+    since: Option<f64>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
 
 /// Request for page navigation
 #[derive(Debug, Deserialize)]
@@ -868,6 +901,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/control/snapshot",
             get(ui_bridge_get_snapshot_handler),
+        )
+        .route(
+            "/ui-bridge/control/console-errors",
+            get(ui_bridge_get_console_errors_handler),
         )
         .route("/ui-bridge/control/specs", get(ui_bridge_get_specs_handler))
         .route(

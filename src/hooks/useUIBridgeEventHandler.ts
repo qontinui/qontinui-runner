@@ -48,6 +48,7 @@ type UIBridgeRequestType =
   | "execute_component_action"
   | "discover"
   | "get_snapshot"
+  | "get_console_errors"
   | "get_specs"
   | "get_spec"
   | "page_refresh"
@@ -394,6 +395,43 @@ export function useUIBridgeEventHandler(): void {
               type,
               success: true,
               data: snapshot,
+              timestamp: Date.now(),
+            });
+            break;
+          }
+
+          case "get_console_errors": {
+            const w = window as Record<string, unknown>;
+            const bridge = w.__UI_BRIDGE__ as Record<string, unknown> | undefined;
+            const capture = bridge?.consoleCapture as
+              | {
+                  getSince: (ts: number) => unknown[];
+                  getRecent: (n?: number) => unknown[];
+                }
+              | undefined;
+
+            if (!capture) {
+              await sendResponse({
+                requestId,
+                type,
+                success: true,
+                data: { errors: [], count: 0, note: "ConsoleCapture not installed" },
+                timestamp: Date.now(),
+              });
+              return;
+            }
+
+            const since = payload.params?.since as number | undefined;
+            const limit = payload.params?.limit as number | undefined;
+            const errors = since
+              ? capture.getSince(since)
+              : capture.getRecent(limit ?? 50);
+
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: { errors, count: errors.length },
               timestamp: Date.now(),
             });
             break;

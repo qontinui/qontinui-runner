@@ -202,10 +202,16 @@ impl HealthCheckTask {
         loop {
             tick.tick().await;
 
-            // Check if monitoring is still active
-            if !self.monitor.is_active().await {
+            // Check if monitoring has been stopped (vs not yet started)
+            let status = self.monitor.get_status().await;
+            if matches!(status, HealthStatus::Stopped) {
                 info!("Health monitoring stopped, exiting task");
                 break;
+            }
+
+            // Skip health checks until monitoring is active (waiting for READY)
+            if !self.monitor.is_active().await {
+                continue;
             }
 
             // Send ping command to Python executor

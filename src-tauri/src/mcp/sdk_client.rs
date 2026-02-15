@@ -568,6 +568,28 @@ async fn handle_component(
     }
 }
 
+/// GET /ui-bridge/sdk/console-errors — Get console errors from SDK app
+async fn handle_console_errors(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let mut path = "/control/console-errors".to_string();
+    let mut params = vec![];
+    if let Some(since) = query.get("since").and_then(|v| v.as_f64()) {
+        params.push(format!("since={}", since));
+    }
+    if let Some(limit) = query.get("limit").and_then(|v| v.as_u64()) {
+        params.push(format!("limit={}", limit));
+    }
+    if !params.is_empty() {
+        path = format!("{}?{}", path, params.join("&"));
+    }
+    match sdk_request(&state, Method::GET, &path, None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
 /// POST /ui-bridge/sdk/ai/search — AI-powered element search
 async fn handle_ai_search(
     State(state): State<Arc<ApiState>>,
@@ -950,6 +972,11 @@ pub fn routes() -> Router<Arc<ApiState>> {
         // Snapshot & discovery
         .route("/ui-bridge/sdk/snapshot", get(handle_snapshot))
         .route("/ui-bridge/sdk/discover", post(handle_discover))
+        // Console errors
+        .route(
+            "/ui-bridge/sdk/console-errors",
+            get(handle_console_errors),
+        )
         // Screenshot (monitor capture for SDK apps that can't self-screenshot)
         .route("/ui-bridge/sdk/screenshot", get(handle_screenshot))
         // Components

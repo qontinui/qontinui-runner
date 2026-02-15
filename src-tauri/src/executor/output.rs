@@ -91,6 +91,12 @@ impl OutputProcessor {
                                 continue;
                             }
 
+                            // Start health monitoring when READY signal arrives
+                            if matches!(&message, ExecutorMessage::Ready { .. }) {
+                                info!("[OUTPUT_PROCESSOR] Starting health monitoring after READY signal");
+                                health_monitor.start().await;
+                            }
+
                             info!(
                                 "[OUTPUT_PROCESSOR] Parsed message type: {:?}",
                                 std::mem::discriminant(&message)
@@ -311,6 +317,12 @@ impl OutputProcessor {
                             if matches!(message, ExecutorMessage::Pong { .. }) {
                                 health_monitor.record_pong().await;
                                 continue;
+                            }
+
+                            // Start health monitoring when READY signal arrives
+                            if matches!(&message, ExecutorMessage::Ready { .. }) {
+                                info!("[HEADLESS_BRIDGE] Starting health monitoring after READY signal");
+                                health_monitor.start().await;
                             }
 
                             debug!(

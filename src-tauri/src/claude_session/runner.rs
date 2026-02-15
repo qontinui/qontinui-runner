@@ -157,6 +157,8 @@ fn run_claude_session_inline(
             "bypassPermissions",
         ])
         .current_dir(working_dir)
+        // Prevent "cannot be launched inside another Claude Code session" error
+        .env_remove("CLAUDECODE")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

@@ -796,6 +796,9 @@ pub struct VerificationStepDetails {
     /// For check_group steps: individual check results with details
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check_results: Option<Vec<IndividualCheckResult>>,
+    /// Console errors captured during this step's execution (from UI Bridge ConsoleCapture)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console_errors: Option<Vec<serde_json::Value>>,
 }
 
 /// Individual check result within a check group
@@ -959,6 +962,9 @@ pub struct VerificationPhaseResult {
     /// Whether evaluation was gate-based (true) or all-steps-based (false)
     #[serde(default)]
     pub gate_based_evaluation: bool,
+    /// Console errors captured during the entire verification phase
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console_errors: Option<Vec<serde_json::Value>>,
 }
 
 /// Extract a text representation from a handler's output_data for AI context.
@@ -1081,6 +1087,31 @@ impl VerificationPhaseResult {
                                 "**Assertions:** {}/{} passed\n",
                                 passed, total
                             ));
+                        }
+                    }
+                    if let Some(ref console_errors) = details.console_errors {
+                        if !console_errors.is_empty() {
+                            context.push_str(&format!(
+                                "**Console Errors ({}):**\n",
+                                console_errors.len()
+                            ));
+                            for err in console_errors.iter().take(10) {
+                                let msg = err
+                                    .get("message")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("Unknown error");
+                                let err_type = err
+                                    .get("type")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("error");
+                                context.push_str(&format!("- [{}] {}\n", err_type, msg));
+                            }
+                            if console_errors.len() > 10 {
+                                context.push_str(&format!(
+                                    "  ... and {} more console errors\n",
+                                    console_errors.len() - 10
+                                ));
+                            }
                         }
                     }
                 }
@@ -1262,6 +1293,35 @@ impl VerificationPhaseResult {
                     "- ✓ {} ({}ms)\n",
                     result.step_name, result.duration_ms
                 ));
+            }
+        }
+
+        // Phase-level console errors (captured between steps, not during any specific step)
+        if let Some(ref console_errors) = self.console_errors {
+            if !console_errors.is_empty() {
+                context.push_str("\n### Console Errors During Verification\n\n");
+                context.push_str(&format!(
+                    "{} console error(s) captured during the verification phase:\n\n",
+                    console_errors.len()
+                ));
+                for err in console_errors.iter().take(15) {
+                    let msg = err
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Unknown error");
+                    let err_type = err
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("error");
+                    context.push_str(&format!("- [{}] {}\n", err_type, msg));
+                }
+                if console_errors.len() > 15 {
+                    context.push_str(&format!(
+                        "  ... and {} more\n",
+                        console_errors.len() - 15
+                    ));
+                }
+                context.push('\n');
             }
         }
 
@@ -3790,6 +3850,7 @@ impl StepExecutor {
                                         .map(|s| s.to_string()),
                                     exit_code: test_result.exit_code,
                                     check_results: None,
+                                    console_errors: None,
                                 };
                                 (
                                     passed,
@@ -3976,6 +4037,27 @@ impl StepExecutor {
                 }
             }
 
+            // Extract consoleErrors from output_data and attach to verification_details
+            if let Some(ref mut details) = verification_details {
+                if details.console_errors.is_none() {
+                    if let Some(ref output) = step_output_data {
+                        // consoleErrors may be at top level (action response) or nested in spec_result
+                        let errors = output
+                            .get("consoleErrors")
+                            .or_else(|| {
+                                output
+                                    .get("spec_result")
+                                    .and_then(|sr| sr.get("consoleErrors"))
+                            })
+                            .and_then(|v| v.as_array())
+                            .cloned();
+                        if errors.as_ref().map_or(false, |e| !e.is_empty()) {
+                            details.console_errors = errors;
+                        }
+                    }
+                }
+            }
+
             let duration_ms = step_start.elapsed().as_millis() as u64;
 
             if success {
@@ -4149,6 +4231,7 @@ impl StepExecutor {
             critical_failure,
             gate_results,
             gate_based_evaluation: has_gates,
+            console_errors: None, // Populated by phases.rs after verification completes
         };
 
         info!("{}", result.summary());

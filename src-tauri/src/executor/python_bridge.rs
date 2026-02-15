@@ -202,9 +202,8 @@ impl PythonBridge {
         // The READY signal will be processed asynchronously when it arrives
         info!("Python process started, will process READY signal asynchronously");
 
-        // Start health monitoring
-        info!("Starting health monitoring");
-        self.health_monitor.start().await;
+        // Health monitoring will be started by the output processor when READY is received
+        // (not here, to avoid false-positive health check failures during Python startup)
 
         // Start health check task
         let health_monitor_task = Arc::clone(&self.health_monitor);

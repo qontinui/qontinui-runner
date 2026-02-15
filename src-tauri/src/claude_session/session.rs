@@ -114,6 +114,9 @@ impl ClaudeSession {
             "bypassPermissions",
         ])
         .current_dir(working_dir)
+        // Prevent "cannot be launched inside another Claude Code session" error
+        // when the runner itself is started from within a Claude Code session
+        .env_remove("CLAUDECODE")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -599,6 +602,7 @@ impl ClaudeSession {
         // Wait briefly for the init handshake to complete
         // The dispatcher handles the ControlResponse and transitions to Ready
         let init_deadline = Instant::now() + Duration::from_secs(30);
+        let mut stderr_handle = Some(stderr_handle);
         loop {
             let current_state = state_tracker.get();
             if current_state == SessionState::Ready {
@@ -606,13 +610,28 @@ impl ClaudeSession {
                 break;
             }
             if current_state == SessionState::Closed {
-                return Err("Claude CLI exited during initialization".to_string());
+                // Try to capture stderr for diagnostics
+                let stderr_output = stderr_handle
+                    .take()
+                    .and_then(|h| h.join().ok())
+                    .unwrap_or_default();
+                let stderr_trimmed = stderr_output.trim();
+                if stderr_trimmed.is_empty() {
+                    return Err("Claude CLI exited during initialization".to_string());
+                } else {
+                    warn!("Claude CLI stderr: {}", stderr_trimmed);
+                    return Err(format!(
+                        "Claude CLI exited during initialization: {}",
+                        stderr_trimmed
+                    ));
+                }
             }
             if Instant::now() > init_deadline {
                 return Err("Initialization timeout (30s) - Claude CLI did not respond".to_string());
             }
             thread::sleep(Duration::from_millis(50));
         }
+        let stderr_handle = stderr_handle.expect("stderr handle consumed unexpectedly");
 
         Ok(Self {
             session_id: session_id.to_string(),

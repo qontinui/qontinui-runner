@@ -429,7 +429,7 @@ pub struct GlobalLogSource {
     #[serde(default)]
     pub category: LogSourceCategory,
     /// Type: "file" or "directory"
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default = "default_source_type")]
     pub source_type: String,
     /// Absolute path to log file or directory
     pub path: String,
@@ -483,6 +483,10 @@ fn default_tail_lines() -> u32 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_source_type() -> String {
+    "file".to_string()
 }
 
 fn default_format() -> String {

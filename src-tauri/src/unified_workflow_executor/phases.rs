@@ -57,6 +57,56 @@ use super::phase_configs::{
 };
 use super::types::{get_parent_task_id, AgenticOutcome, LoopConfig};
 
+use crate::mcp::types::MCP_API_PORT;
+
+// =============================================================================
+// Console Error Fetching (UI Bridge)
+// =============================================================================
+
+/// Fetch accumulated console errors from the UI Bridge via the MCP API.
+///
+/// This is best-effort — if the UI Bridge isn't available (e.g., headless execution
+/// or frontend not running), it returns an empty vec or an error.
+async fn fetch_console_errors_from_ui_bridge() -> Result<Vec<serde_json::Value>, String> {
+    let url = format!(
+        "http://127.0.0.1:{}/ui-bridge/control/console-errors?limit=50",
+        MCP_API_PORT
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Console errors request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "Console errors endpoint returned {}",
+            response.status()
+        ));
+    }
+
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse console errors response: {}", e))?;
+
+    // The endpoint returns { "success": true, "data": { "errors": [...] } }
+    let errors = body
+        .get("data")
+        .and_then(|d| d.get("errors"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    Ok(errors)
+}
+
 // =============================================================================
 // Execution Timing Context
 // =============================================================================
@@ -1131,6 +1181,7 @@ impl VerificationExecutor {
                     step_results: Vec::new(),
                     gate_results: Vec::new(),
                     gate_based_evaluation: false,
+                    console_errors: None,
                 },
                 Vec::new(),
             );
@@ -1208,6 +1259,7 @@ impl VerificationExecutor {
                             step_results: vec![connectivity_result.clone()],
                             gate_results: Vec::new(),
                             gate_based_evaluation: false,
+                            console_errors: None,
                         },
                         vec![connectivity_result],
                     );
@@ -1329,6 +1381,26 @@ impl VerificationExecutor {
                 );
             }
         }
+
+        // Fetch accumulated console errors from UI Bridge (best-effort)
+        let console_errors = match fetch_console_errors_from_ui_bridge().await {
+            Ok(errors) => {
+                if !errors.is_empty() {
+                    debug!(
+                        "VERIFICATION-PHASE: Captured {} console errors during verification",
+                        errors.len()
+                    );
+                }
+                Some(errors).filter(|e| !e.is_empty())
+            }
+            Err(e) => {
+                debug!("VERIFICATION-PHASE: Could not fetch console errors: {}", e);
+                None
+            }
+        };
+
+        let mut result = result;
+        result.console_errors = console_errors;
 
         let step_results = result.step_results.clone();
         (result, step_results)
