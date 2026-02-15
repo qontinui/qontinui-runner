@@ -213,23 +213,25 @@ fn build_api_step(
     body: Option<&str>,
     output_variable: Option<&str>,
 ) -> ExecutionStepConfig {
-    let mut step = ExecutionStepConfig::default();
-    step.step_type = "api_request".to_string();
-    step.name = Some(name.to_string());
-    step.api_method = Some(method.to_string());
-    step.api_url = Some(url.to_string());
-    step.api_body = body.map(|b| b.to_string());
-    step.api_output_variable = output_variable.map(|v| v.to_string());
-    step.is_setup = Some(true);
-    step.run_on_subsequent_iterations = Some(false);
-    step
+    ExecutionStepConfig {
+        step_type: "api_request".to_string(),
+        name: Some(name.to_string()),
+        api_method: Some(method.to_string()),
+        api_url: Some(url.to_string()),
+        api_body: body.map(|b| b.to_string()),
+        api_output_variable: output_variable.map(|v| v.to_string()),
+        is_setup: Some(true),
+        run_on_subsequent_iterations: Some(false),
+        ..Default::default()
+    }
 }
 
 /// Helper: Build a prompt step.
 fn build_prompt_step(name: &str, content: &str) -> ExecutionStepConfig {
-    let mut step = ExecutionStepConfig::default();
-    step.step_type = "prompt".to_string();
-    step.name = Some(name.to_string());
-    step.prompt_content = Some(content.to_string());
-    step
+    ExecutionStepConfig {
+        step_type: "prompt".to_string(),
+        name: Some(name.to_string()),
+        prompt_content: Some(content.to_string()),
+        ..Default::default()
+    }
 }

@@ -401,7 +401,7 @@ export function useUIBridgeEventHandler(): void {
           }
 
           case "get_console_errors": {
-            const w = window as Record<string, unknown>;
+            const w = window as unknown as Record<string, unknown>;
             const bridge = w.__UI_BRIDGE__ as Record<string, unknown> | undefined;
             const capture = bridge?.consoleCapture as
               | {
