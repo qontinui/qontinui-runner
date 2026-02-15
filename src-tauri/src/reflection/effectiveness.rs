@@ -101,15 +101,8 @@ pub fn evaluate_fix(conn: &Connection, fix: &ReflectionFix) -> Result<Evaluation
         );
     }
 
-    // If no source finding, we can only do a basic check — no recurrence signal
-    Ok(EvaluationResult {
-        fix_id: fix.id.clone(),
-        effectiveness: FixEffectiveness::Inconclusive,
-        evidence: format!(
-            "No source finding linked — cannot track recurrence. {} subsequent run(s) exist.",
-            subsequent_run_ids.len()
-        ),
-    })
+    // No source finding — use outcome-based heuristic for knowledge/context fixes
+    evaluate_by_workflow_outcome(conn, fix, &workflow_name, &subsequent_run_ids)
 }
 
 /// Evaluate a fix by checking if its source finding's signature recurs.
@@ -228,6 +221,91 @@ fn check_for_regression(
     }
 
     Ok(false)
+}
+
+/// Evaluate a fix without a source finding by comparing workflow outcomes.
+///
+/// For knowledge_base_update and context_addition fixes, checks if subsequent
+/// runs have fewer findings than the source run. This is a weaker signal than
+/// signature-based tracking but better than permanent "inconclusive".
+fn evaluate_by_workflow_outcome(
+    conn: &Connection,
+    fix: &ReflectionFix,
+    _workflow_name: &str,
+    subsequent_run_ids: &[String],
+) -> Result<EvaluationResult, String> {
+    // Count findings in the source run
+    let source_findings: u32 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM task_run_findings WHERE task_run_id = ?1",
+            params![fix.source_task_run_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("Failed to count source findings: {}", e))?;
+
+    // Count findings across subsequent runs (average per run)
+    let mut total_subsequent_findings: u32 = 0;
+    for run_id in subsequent_run_ids {
+        let count: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_run_findings WHERE task_run_id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to count subsequent findings: {}", e))?;
+        total_subsequent_findings += count;
+    }
+
+    let avg_subsequent = total_subsequent_findings as f64 / subsequent_run_ids.len() as f64;
+
+    // For knowledge/context fixes: if subsequent runs are cleaner, mark effective
+    match fix.fix_type.as_str() {
+        "knowledge_base_update" | "context_addition" | "instruction_clarification" => {
+            if source_findings == 0 && total_subsequent_findings == 0 {
+                // Source had no findings either — fix may be preventive, mark effective
+                // if subsequent runs succeeded
+                Ok(EvaluationResult {
+                    fix_id: fix.id.clone(),
+                    effectiveness: FixEffectiveness::Effective,
+                    evidence: format!(
+                        "Knowledge/context fix with {} subsequent successful run(s), \
+                         no findings in source or subsequent runs",
+                        subsequent_run_ids.len()
+                    ),
+                })
+            } else if avg_subsequent < source_findings as f64 {
+                Ok(EvaluationResult {
+                    fix_id: fix.id.clone(),
+                    effectiveness: FixEffectiveness::Effective,
+                    evidence: format!(
+                        "Findings decreased: {} in source → {:.1} avg in {} subsequent run(s)",
+                        source_findings, avg_subsequent, subsequent_run_ids.len()
+                    ),
+                })
+            } else {
+                Ok(EvaluationResult {
+                    fix_id: fix.id.clone(),
+                    effectiveness: FixEffectiveness::Inconclusive,
+                    evidence: format!(
+                        "Findings did not decrease: {} in source → {:.1} avg in {} subsequent run(s). \
+                         No source finding linked for precise tracking.",
+                        source_findings, avg_subsequent, subsequent_run_ids.len()
+                    ),
+                })
+            }
+        }
+        // For other fix types without source findings, remain inconclusive
+        _ => Ok(EvaluationResult {
+            fix_id: fix.id.clone(),
+            effectiveness: FixEffectiveness::Inconclusive,
+            evidence: format!(
+                "Fix type '{}' has no source finding — cannot track recurrence. \
+                 {} subsequent run(s) exist.",
+                fix.fix_type,
+                subsequent_run_ids.len()
+            ),
+        }),
+    }
 }
 
 /// Batch evaluate all unevaluated fixes for a workflow.
@@ -477,5 +555,138 @@ mod tests {
         let result = evaluate_fix(&conn, &fix).unwrap();
         assert_eq!(result.effectiveness, FixEffectiveness::Ineffective);
         assert!(result.evidence.contains("recurred"));
+    }
+
+    #[test]
+    fn test_evaluate_knowledge_fix_effective_when_findings_decrease() {
+        let conn = setup_test_db();
+
+        // Source run with 5 findings
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, workflow_name, status, completed_at, created_at, updated_at) VALUES ('src-1', 'Test', 'wf-1', 'complete', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+        for i in 0..5 {
+            conn.execute(
+                &format!("INSERT INTO task_run_findings (id, task_run_id, signature_hash, detected_at) VALUES ('f-{}', 'src-1', 'hash-{}', '2025-01-01T00:00:00Z')", i, i),
+                [],
+            ).unwrap();
+        }
+
+        // Subsequent run with 1 finding (improvement)
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, workflow_name, status, is_reflection, completed_at, created_at, updated_at) VALUES ('run-2', 'Test', 'wf-1', 'complete', 0, '2025-01-01T02:00:00Z', '2025-01-01T02:00:00Z', '2025-01-01T02:00:00Z')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO task_run_findings (id, task_run_id, signature_hash, detected_at) VALUES ('f-sub', 'run-2', 'hash-new', '2025-01-01T02:00:00Z')",
+            [],
+        ).unwrap();
+
+        let fix = ReflectionFix {
+            id: "fix-1".to_string(),
+            source_task_run_id: "src-1".to_string(),
+            reflection_task_run_id: "ref-1".to_string(),
+            source_finding_id: None, // No source finding!
+            source_knowledge_id: None,
+            fix_type: "knowledge_base_update".to_string(),
+            fix_description: "Added knowledge".to_string(),
+            file_changed: None,
+            old_value: None,
+            new_value: None,
+            confidence: "high".to_string(),
+            content_hash: None,
+            status: "applied".to_string(),
+            effectiveness: None,
+            effectiveness_evidence: None,
+            applied_at: "2025-01-01T01:00:00Z".to_string(),
+            evaluated_at: None,
+            created_at: "2025-01-01T01:00:00Z".to_string(),
+        };
+
+        let result = evaluate_fix(&conn, &fix).unwrap();
+        assert_eq!(result.effectiveness, FixEffectiveness::Effective);
+        assert!(result.evidence.contains("decreased"));
+    }
+
+    #[test]
+    fn test_evaluate_knowledge_fix_effective_when_zero_findings() {
+        let conn = setup_test_db();
+
+        // Source run with 0 findings
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, workflow_name, status, completed_at, created_at, updated_at) VALUES ('src-1', 'Test', 'wf-1', 'complete', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+
+        // Subsequent run with 0 findings
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, workflow_name, status, is_reflection, completed_at, created_at, updated_at) VALUES ('run-2', 'Test', 'wf-1', 'complete', 0, '2025-01-01T02:00:00Z', '2025-01-01T02:00:00Z', '2025-01-01T02:00:00Z')",
+            [],
+        ).unwrap();
+
+        let fix = ReflectionFix {
+            id: "fix-1".to_string(),
+            source_task_run_id: "src-1".to_string(),
+            reflection_task_run_id: "ref-1".to_string(),
+            source_finding_id: None,
+            source_knowledge_id: None,
+            fix_type: "context_addition".to_string(),
+            fix_description: "Added context".to_string(),
+            file_changed: None,
+            old_value: None,
+            new_value: None,
+            confidence: "medium".to_string(),
+            content_hash: None,
+            status: "applied".to_string(),
+            effectiveness: None,
+            effectiveness_evidence: None,
+            applied_at: "2025-01-01T01:00:00Z".to_string(),
+            evaluated_at: None,
+            created_at: "2025-01-01T01:00:00Z".to_string(),
+        };
+
+        let result = evaluate_fix(&conn, &fix).unwrap();
+        assert_eq!(result.effectiveness, FixEffectiveness::Effective);
+        assert!(result.evidence.contains("no findings"));
+    }
+
+    #[test]
+    fn test_evaluate_other_fix_type_stays_inconclusive_without_finding() {
+        let conn = setup_test_db();
+
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, workflow_name, status, completed_at, created_at, updated_at) VALUES ('src-1', 'Test', 'wf-1', 'complete', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, workflow_name, status, is_reflection, completed_at, created_at, updated_at) VALUES ('run-2', 'Test', 'wf-1', 'complete', 0, '2025-01-01T02:00:00Z', '2025-01-01T02:00:00Z', '2025-01-01T02:00:00Z')",
+            [],
+        ).unwrap();
+
+        let fix = ReflectionFix {
+            id: "fix-1".to_string(),
+            source_task_run_id: "src-1".to_string(),
+            reflection_task_run_id: "ref-1".to_string(),
+            source_finding_id: None,
+            source_knowledge_id: None,
+            fix_type: "selector_fix".to_string(),
+            fix_description: "Fixed selector".to_string(),
+            file_changed: None,
+            old_value: None,
+            new_value: None,
+            confidence: "high".to_string(),
+            content_hash: None,
+            status: "applied".to_string(),
+            effectiveness: None,
+            effectiveness_evidence: None,
+            applied_at: "2025-01-01T01:00:00Z".to_string(),
+            evaluated_at: None,
+            created_at: "2025-01-01T01:00:00Z".to_string(),
+        };
+
+        let result = evaluate_fix(&conn, &fix).unwrap();
+        assert_eq!(result.effectiveness, FixEffectiveness::Inconclusive);
     }
 }

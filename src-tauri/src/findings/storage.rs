@@ -506,7 +506,20 @@ pub fn get_finding_summary(conn: &Connection, task_run_id: &str) -> Result<Findi
     Ok(summary)
 }
 
-/// Compute a signature hash for deduplication
+/// Normalize a finding title for deduplication.
+/// AI-generated titles often vary in case, whitespace, and minor wording.
+fn normalize_title(title: &str) -> String {
+    title
+        .to_lowercase()
+        .trim()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Compute a signature hash for deduplication.
+/// Titles are normalized (lowercased, whitespace-collapsed) to catch near-duplicates
+/// where the AI rephrases the same issue with minor variations.
 fn compute_signature_hash(
     category: &FindingCategory,
     title: &str,
@@ -516,9 +529,11 @@ fn compute_signature_hash(
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
+    let normalized_title = normalize_title(title);
+
     let mut hasher = DefaultHasher::new();
     category.as_str().hash(&mut hasher);
-    title.hash(&mut hasher);
+    normalized_title.hash(&mut hasher);
     file.hash(&mut hasher);
     line.hash(&mut hasher);
     format!("{:x}", hasher.finish())
@@ -958,5 +973,58 @@ mod tests {
         assert!(prompt.contains("API design choice"));
         assert!(prompt.contains("REST or GraphQL?"));
         assert!(prompt.contains("Response: REST"));
+    }
+
+    #[test]
+    fn test_normalize_title() {
+        assert_eq!(normalize_title("Hello World"), "hello world");
+        assert_eq!(normalize_title("  Extra   Spaces  "), "extra spaces");
+        assert_eq!(normalize_title("ESLint verification step"), "eslint verification step");
+        assert_eq!(
+            normalize_title("ESLint Verification Step"),
+            normalize_title("eslint verification step")
+        );
+    }
+
+    #[test]
+    fn test_dedup_catches_case_variations() {
+        let conn = create_test_db();
+
+        let parsed1 = ParsedFinding {
+            category: FindingCategory::ConfigIssue,
+            severity: FindingSeverity::Medium,
+            needs_input: false,
+            is_resolved: false,
+            title: "ESLint verification step used wrong path pattern".to_string(),
+            description: "First detection".to_string(),
+            file: None,
+            line: None,
+            resolution: None,
+            question: None,
+            options: None,
+        };
+
+        let parsed2 = ParsedFinding {
+            category: FindingCategory::ConfigIssue,
+            severity: FindingSeverity::Medium,
+            needs_input: false,
+            is_resolved: false,
+            title: "eslint verification step used wrong path pattern".to_string(),
+            description: "Second detection with different case".to_string(),
+            file: None,
+            line: None,
+            resolution: None,
+            question: None,
+            options: None,
+        };
+
+        let first = insert_finding(&conn, "task-case", 1, &parsed1).unwrap();
+        let second = insert_finding(&conn, "task-case", 2, &parsed2).unwrap();
+
+        // Should be deduplicated despite case difference
+        assert_eq!(first.id, second.id);
+
+        let all = get_findings_for_task(&conn, "task-case").unwrap();
+        assert_eq!(all.len(), 1);
     }
 }

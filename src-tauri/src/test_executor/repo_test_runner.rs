@@ -57,11 +57,22 @@ pub fn execute_repo_test(test_def: &TestDefinition) -> TestExecutionResult {
 
     // Execute the test command
     let output = if cfg!(target_os = "windows") {
-        Command::new("cmd.exe")
-            .args(["/c", &command])
-            .current_dir(&working_dir)
-            .envs(&config.environment)
-            .output()
+        // cmd.exe doesn't understand single quotes — strip them.
+        let cmd_command = command.replace('\'', "");
+
+        // Extract Unix-style env var prefixes (KEY=VALUE) from the command.
+        // cmd.exe doesn't support "KEY=VALUE command" syntax, so we parse out
+        // env vars and pass them via Command::env() instead.
+        let (extra_envs, actual_command) = extract_env_prefix(&cmd_command);
+
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(["/c", &actual_command]);
+        cmd.current_dir(&working_dir);
+        cmd.envs(&config.environment);
+        for (key, value) in &extra_envs {
+            cmd.env(key, value);
+        }
+        cmd.output()
     } else {
         Command::new("sh")
             .args(["-c", &command])
@@ -192,6 +203,31 @@ fn substitute_variables(input: &str) -> String {
     }
 
     result
+}
+
+/// Extract Unix-style env var prefixes (KEY=VALUE) from a command string.
+/// Returns the extracted env vars and the remaining command.
+/// Example: "SKIP_WEB_SERVER=1 npx playwright test" -> ([("SKIP_WEB_SERVER", "1")], "npx playwright test")
+fn extract_env_prefix(command: &str) -> (Vec<(String, String)>, String) {
+    let mut envs = Vec::new();
+    let mut remaining = command.trim();
+
+    // Match leading KEY=VALUE pairs (KEY must be uppercase/underscore identifier)
+    while let Some(eq_pos) = remaining.find('=') {
+        let prefix = &remaining[..eq_pos];
+        // Validate that the prefix is a valid env var name (alphanumeric + underscore, no spaces)
+        if prefix.is_empty() || prefix.contains(' ') || !prefix.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            break;
+        }
+        // Find the end of the value (next space)
+        let after_eq = &remaining[eq_pos + 1..];
+        let value_end = after_eq.find(' ').unwrap_or(after_eq.len());
+        let value = &after_eq[..value_end];
+        envs.push((prefix.to_string(), value.to_string()));
+        remaining = after_eq[value_end..].trim_start();
+    }
+
+    (envs, remaining.to_string())
 }
 
 /// Parse pytest JSON output (pytest-json-report)

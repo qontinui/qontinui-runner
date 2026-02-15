@@ -77,11 +77,12 @@ pub fn build_setup_steps(source_task_run_id: &str, source_workflow_name: &str) -
             true,
         ),
         // Step 5: Load previous reflection fixes for effectiveness evaluation
+        // Filter to status=applied to exclude superseded duplicates (reduces context from ~40 to ~15 entries)
         build_api_step(
             "Load previous fixes",
             "GET",
             &format!(
-                "{}/reflection-fixes?workflow_name={}",
+                "{}/reflection-fixes?workflow_name={}&status=applied",
                 base_url,
                 urlencoding::encode(source_workflow_name)
             ),

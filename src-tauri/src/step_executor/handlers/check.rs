@@ -148,8 +148,17 @@ impl StepHandler for CheckHandler {
                 c.args(["-NoProfile", "-NonInteractive", "-Command", &final_command]);
                 c
             } else {
+                // cmd.exe doesn't understand single quotes as string delimiters —
+                // strip them so tools receive unquoted paths (e.g., Next.js route groups
+                // like src/app/(app)/... work correctly).
+                let stripped = final_command.replace('\'', "");
+                // Extract Unix-style KEY=VALUE env prefixes that cmd.exe can't handle
+                let (extra_envs, actual_cmd) = Self::extract_env_prefix_for_cmd(&stripped);
                 let mut c = Command::new("cmd");
-                c.args(["/C", &final_command]);
+                c.args(["/C", &actual_cmd]);
+                for (key, value) in extra_envs {
+                    c.env(key, value);
+                }
                 c
             }
         } else {
@@ -260,6 +269,29 @@ impl StepHandler for CheckHandler {
 }
 
 impl CheckHandler {
+    /// Extract Unix-style KEY=VALUE env prefixes from a command string.
+    /// cmd.exe doesn't support inline env vars like `SKIP_WEB_SERVER=1 npx ...`,
+    /// so we parse them out and pass via Command::env() instead.
+    fn extract_env_prefix_for_cmd(command: &str) -> (Vec<(String, String)>, String) {
+        let mut envs = Vec::new();
+        let mut remaining = command.trim();
+        while let Some(eq_pos) = remaining.find('=') {
+            let prefix = &remaining[..eq_pos];
+            if prefix.is_empty()
+                || prefix.contains(' ')
+                || !prefix.chars().all(|c| c.is_alphanumeric() || c == '_')
+            {
+                break;
+            }
+            let after_eq = &remaining[eq_pos + 1..];
+            let value_end = after_eq.find(' ').unwrap_or(after_eq.len());
+            let value = &after_eq[..value_end];
+            envs.push((prefix.to_string(), value.to_string()));
+            remaining = after_eq[value_end..].trim_start();
+        }
+        (envs, remaining.to_string())
+    }
+
     /// Check if a command uses PowerShell syntax.
     /// This mirrors the detection logic from shell_command.rs
     fn is_powershell_syntax(command: &str) -> bool {
@@ -982,5 +1014,28 @@ mod tests {
     fn test_apply_auto_fix_python_lint() {
         let cmd = CheckHandler::apply_auto_fix("ruff check .", "lint", "python");
         assert_eq!(cmd, "ruff check --fix .");
+    }
+
+    #[test]
+    fn test_extract_env_prefix_simple() {
+        let (envs, cmd) = CheckHandler::extract_env_prefix_for_cmd("SKIP_WEB_SERVER=1 npx playwright test");
+        assert_eq!(envs, vec![("SKIP_WEB_SERVER".to_string(), "1".to_string())]);
+        assert_eq!(cmd, "npx playwright test");
+    }
+
+    #[test]
+    fn test_extract_env_prefix_multiple() {
+        let (envs, cmd) = CheckHandler::extract_env_prefix_for_cmd("FOO=bar BAZ=123 echo hello");
+        assert_eq!(envs.len(), 2);
+        assert_eq!(envs[0], ("FOO".to_string(), "bar".to_string()));
+        assert_eq!(envs[1], ("BAZ".to_string(), "123".to_string()));
+        assert_eq!(cmd, "echo hello");
+    }
+
+    #[test]
+    fn test_extract_env_prefix_none() {
+        let (envs, cmd) = CheckHandler::extract_env_prefix_for_cmd("npx eslint .");
+        assert!(envs.is_empty());
+        assert_eq!(cmd, "npx eslint .");
     }
 }

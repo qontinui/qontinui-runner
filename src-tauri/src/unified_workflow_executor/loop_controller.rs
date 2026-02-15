@@ -2321,14 +2321,18 @@ pub fn convert_json_steps_with_phase(
                 }
                 config
             } else {
-                // Fall back to minimal conversion
+                // Fall back to manual field extraction — preserve command, working directory,
+                // and other key fields so that check/test steps with inline commands still work
                 let step_type = step.get("type").and_then(|t| t.as_str())?;
                 ExecutionStepConfig {
                     step_type: step_type.to_string(),
-                    name: step
-                        .get("name")
-                        .and_then(|n| n.as_str())
-                        .map(|s| s.to_string()),
+                    name: step.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()),
+                    id: step.get("id").and_then(|i| i.as_str()).map(|s| s.to_string()),
+                    shell_command: step.get("command").and_then(|c| c.as_str()).map(|s| s.to_string()),
+                    shell_command_working_directory: step.get("working_directory").and_then(|w| w.as_str()).map(|s| s.to_string()),
+                    check_type: step.get("check_type").and_then(|c| c.as_str()).map(|s| s.to_string()),
+                    test_type: step.get("test_type").and_then(|t| t.as_str()).map(|s| s.to_string()),
+                    test_id: step.get("test_id").and_then(|t| t.as_str()).map(|s| s.to_string()),
                     monitor_index: Some(monitor),
                     ..Default::default()
                 }
@@ -2372,14 +2376,18 @@ pub fn convert_all_json_steps_with_phase(
                 }
                 config
             } else {
-                // Fall back to minimal conversion
+                // Fall back to manual field extraction — preserve command, working directory,
+                // and other key fields so that check/test steps with inline commands still work
                 let step_type = step.get("type").and_then(|t| t.as_str())?;
                 ExecutionStepConfig {
                     step_type: step_type.to_string(),
-                    name: step
-                        .get("name")
-                        .and_then(|n| n.as_str())
-                        .map(|s| s.to_string()),
+                    name: step.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()),
+                    id: step.get("id").and_then(|i| i.as_str()).map(|s| s.to_string()),
+                    shell_command: step.get("command").and_then(|c| c.as_str()).map(|s| s.to_string()),
+                    shell_command_working_directory: step.get("working_directory").and_then(|w| w.as_str()).map(|s| s.to_string()),
+                    check_type: step.get("check_type").and_then(|c| c.as_str()).map(|s| s.to_string()),
+                    test_type: step.get("test_type").and_then(|t| t.as_str()).map(|s| s.to_string()),
+                    test_id: step.get("test_id").and_then(|t| t.as_str()).map(|s| s.to_string()),
                     monitor_index: Some(monitor),
                     ..Default::default()
                 }

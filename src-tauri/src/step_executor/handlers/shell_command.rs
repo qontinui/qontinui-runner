@@ -235,6 +235,29 @@ impl StepHandler for ShellCommandHandler {
 }
 
 impl ShellCommandHandler {
+    /// Extract Unix-style KEY=VALUE env prefixes from a command string.
+    /// cmd.exe doesn't support inline env vars like `SKIP_WEB_SERVER=1 npx ...`,
+    /// so we parse them out and pass via Command::env() instead.
+    fn extract_env_prefix_for_cmd(command: &str) -> (Vec<(String, String)>, String) {
+        let mut envs = Vec::new();
+        let mut remaining = command.trim();
+        while let Some(eq_pos) = remaining.find('=') {
+            let prefix = &remaining[..eq_pos];
+            if prefix.is_empty()
+                || prefix.contains(' ')
+                || !prefix.chars().all(|c| c.is_alphanumeric() || c == '_')
+            {
+                break;
+            }
+            let after_eq = &remaining[eq_pos + 1..];
+            let value_end = after_eq.find(' ').unwrap_or(after_eq.len());
+            let value = &after_eq[..value_end];
+            envs.push((prefix.to_string(), value.to_string()));
+            remaining = after_eq[value_end..].trim_start();
+        }
+        (envs, remaining.to_string())
+    }
+
     /// Check if a command uses PowerShell syntax.
     fn is_powershell_command(command: &str) -> bool {
         command.contains("Get-")
@@ -286,8 +309,16 @@ impl ShellCommandHandler {
                 c.args(["-NoProfile", "-NonInteractive", "-Command", command]);
                 c
             } else {
+                // cmd.exe doesn't understand single quotes as string delimiters —
+                // strip them so tools receive unquoted paths correctly.
+                let stripped = command.replace('\'', "");
+                // Extract Unix-style KEY=VALUE env prefixes that cmd.exe can't handle
+                let (extra_envs, actual_cmd) = Self::extract_env_prefix_for_cmd(&stripped);
                 let mut c = Command::new("cmd");
-                c.args(["/C", command]);
+                c.args(["/C", &actual_cmd]);
+                for (key, value) in extra_envs {
+                    c.env(key, value);
+                }
                 c
             }
         } else {

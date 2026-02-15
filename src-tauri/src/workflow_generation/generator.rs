@@ -450,6 +450,7 @@ For EVERY step in setup_steps, verification_steps, and completion_steps, verify:
 - `method` is a valid HTTP method
 - If `body` is provided, `content_type` is consistent (JSON body → application/json)
 - `assertions` reference valid types ("status_code", "body_contains", etc.)
+- **WEAK SDK ASSERTION CHECK:** If the `url` contains `/ui-bridge/sdk/` AND the only assertion is `status_code: 200` (no `body_contains`, no `json_path`, no `header_contains`), flag it: "WEAK ASSERTION: api_request '{{step name}}' targets SDK endpoint {{url}} but only checks status_code 200. SDK endpoints return 200 even for empty results. Add a body_contains assertion to verify meaningful content (e.g., expected element text, search result, or page title)."
 
 ### prompt steps (especially in agentic_steps)
 - Content is substantive — at least 2 sentences with specific instructions
@@ -468,6 +469,11 @@ For EVERY step in setup_steps, verification_steps, and completion_steps, verify:
 - If the workflow targets a web app (localhost:3001, localhost:1420, or similar React/Next.js app) but does NOT include a setup step to connect via UI Bridge SDK (POST to /ui-bridge/sdk/connect), flag it: "Workflow targets a web app but is missing a UI Bridge SDK connect step in setup — add POST /ui-bridge/sdk/connect to enable direct element access."
 - If the workflow targets a web app and uses Playwright (script or test steps) for simple element inspection or clicking when SDK endpoints could be used instead, flag it: "Consider using UI Bridge SDK endpoints instead of Playwright for '{{step name}}' — the SDK provides direct element access without browser overhead."
 - If agentic prompt steps mention web UI interaction but don't reference SDK tools (sdk_elements, sdk_snapshot, sdk_ai_execute, sdk_ai_search), flag it: "Agentic prompt '{{step name}}' should reference SDK tools for web UI interaction."
+
+### Agentic-verification correspondence
+- For EACH prompt step in agentic_steps, there MUST be at least one corresponding deterministic verification step (check, test, api_request, or spec) that can detect whether that agentic step's work succeeded. Examine each agentic prompt's content to identify what it implements, then check whether verification_steps has a step that specifically tests that feature.
+- If an agentic step has no corresponding verification step, flag it: "MISSING VERIFICATION: agentic_steps[N] '{{step name}}' implements {{feature}} but no verification step tests for this. Add an api_request or check step that verifies {{feature}} and include its ID in the gate's required_steps."
+- Tab/section existence checks (e.g., searching for "State View" text) do NOT count as adequate verification for the tab's CONTENT or FUNCTIONALITY. A tab can exist while being empty or broken.
 
 ### Cross-step and structural checks
 - If there are verification steps, there should be at least one agentic prompt step

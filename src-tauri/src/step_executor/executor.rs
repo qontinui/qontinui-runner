@@ -987,6 +987,32 @@ pub struct VerificationPhaseResult {
 
 /// Extract a text representation from a handler's output_data for AI context.
 ///
+/// Extract Unix-style env var prefixes (KEY=VALUE) from a command string.
+/// cmd.exe doesn't support "KEY=VALUE command" syntax, so we parse out
+/// env vars to pass them via Command::env() instead.
+/// Example: "SKIP_WEB_SERVER=1 npx test" -> ([("SKIP_WEB_SERVER", "1")], "npx test")
+fn extract_env_prefix_for_cmd(command: &str) -> (Vec<(String, String)>, String) {
+    let mut envs = Vec::new();
+    let mut remaining = command.trim();
+
+    while let Some(eq_pos) = remaining.find('=') {
+        let prefix = &remaining[..eq_pos];
+        if prefix.is_empty()
+            || prefix.contains(' ')
+            || !prefix.chars().all(|c| c.is_alphanumeric() || c == '_')
+        {
+            break;
+        }
+        let after_eq = &remaining[eq_pos + 1..];
+        let value_end = after_eq.find(' ').unwrap_or(after_eq.len());
+        let value = &after_eq[..value_end];
+        envs.push((prefix.to_string(), value.to_string()));
+        remaining = after_eq[value_end..].trim_start();
+    }
+
+    (envs, remaining.to_string())
+}
+
 /// Handlers store their output in different shapes inside `output_data`.
 /// This function tries common patterns to extract human-readable text:
 /// 1. `output_data.output` — combined stdout+stderr (used by check handler)
@@ -3897,7 +3923,20 @@ impl StepExecutor {
                             ),
                         }
                     } else {
-                        (false, Some("No test_id specified".to_string()), None, None)
+                        // No test_id — delegate to handler system which supports
+                        // repository tests, inline commands (check_command/shell_command),
+                        // and auto-detection fallbacks.
+                        let (success, handler_error, _screenshot, handler_output_data) =
+                            self.execute_single_step(step).await;
+                        let details = VerificationStepDetails {
+                            step_id: step
+                                .name
+                                .clone()
+                                .unwrap_or_else(|| format!("step-{}", index)),
+                            phase: "verification".to_string(),
+                            ..Default::default()
+                        };
+                        (success, handler_error, Some(details), handler_output_data)
                     }
                 }
                 "check" => {
@@ -4597,8 +4636,16 @@ impl StepExecutor {
                 c.args(["-NoProfile", "-NonInteractive", "-Command", &command]);
                 c
             } else {
+                // cmd.exe doesn't understand single quotes — strip them.
+                // Also extract Unix-style KEY=VALUE env var prefixes since
+                // cmd.exe doesn't support "KEY=VALUE command" syntax.
+                let stripped = command.replace('\'', "");
+                let (extra_envs, actual_cmd) = extract_env_prefix_for_cmd(&stripped);
                 let mut c = Command::new("cmd");
-                c.args(["/C", &command]);
+                c.args(["/C", &actual_cmd]);
+                for (key, value) in extra_envs {
+                    c.env(key, value);
+                }
                 c
             }
         } else {
@@ -5420,11 +5467,40 @@ impl StepExecutor {
         // Emit to Tauri frontend for action log refresh
         self.emit_tree_event("action_started", &action_node, timestamp, sequence);
 
+        // Detect if command uses PowerShell syntax (same logic as shell_command_step)
+        let is_powershell = final_command.contains("Get-")
+            || final_command.contains("Set-")
+            || final_command.contains("New-")
+            || final_command.contains("Remove-")
+            || final_command.contains("Invoke-")
+            || final_command.contains("ForEach-Object")
+            || final_command.contains("Where-Object")
+            || final_command.contains("Select-Object")
+            || final_command.contains("$_")
+            || final_command.contains("$env:")
+            || final_command.contains("-ErrorAction")
+            || final_command.contains("| %")
+            || final_command.contains("| ?");
+
         // Build the command
         let mut cmd = if cfg!(target_os = "windows") {
-            let mut c = Command::new("cmd");
-            c.args(["/C", &final_command]);
-            c
+            if is_powershell {
+                let mut c = Command::new("powershell");
+                c.args(["-NoProfile", "-NonInteractive", "-Command", &final_command]);
+                c
+            } else {
+                // cmd.exe doesn't understand single quotes — strip them.
+                // Also extract Unix-style KEY=VALUE env var prefixes since
+                // cmd.exe doesn't support "KEY=VALUE command" syntax.
+                let stripped = final_command.replace('\'', "");
+                let (extra_envs, actual_cmd) = extract_env_prefix_for_cmd(&stripped);
+                let mut c = Command::new("cmd");
+                c.args(["/C", &actual_cmd]);
+                for (key, value) in extra_envs {
+                    c.env(key, value);
+                }
+                c
+            }
         } else {
             let mut c = Command::new("sh");
             c.args(["-c", &final_command]);

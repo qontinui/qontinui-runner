@@ -942,6 +942,21 @@ impl SetupExecutor {
                         warn!("Failed to save setup response-mode step checkpoint: {}", e);
                     }
 
+                    // Log start event for Active Dashboard visibility
+                    let metadata = StepMetadata::setup(
+                        execution_id,
+                        StepType::Prompt,
+                        step_name,
+                        step_idx,
+                    );
+                    if let Err(e) = logger.log_start(
+                        StepEventKind::SetupAiStart,
+                        metadata,
+                        StepDetails::default(),
+                    ) {
+                        warn!("Failed to log setup AI step start event: {}", e);
+                    }
+
                     let doctor_handle = self.app_state.doctor_handle.lock().await.clone();
                     let start = std::time::Instant::now();
                     match execute_prompt_response_mode(
@@ -972,6 +987,22 @@ impl SetupExecutor {
                             resp_checkpoint.mark_success(Some(output.clone()), duration_ms as i64);
                             if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
                                 warn!("Failed to save setup response-mode step completion checkpoint: {}", e);
+                            }
+
+                            // Log complete event for Active Dashboard visibility
+                            let metadata = StepMetadata::setup(
+                                execution_id,
+                                StepType::Prompt,
+                                step_name,
+                                step_idx,
+                            );
+                            if let Err(e) = logger.log_complete(
+                                StepEventKind::SetupAiComplete,
+                                metadata,
+                                StepDetails::default(),
+                                duration_ms as i64,
+                            ) {
+                                warn!("Failed to log setup AI step complete event: {}", e);
                             }
                             response_step_count += 1;
                             all_results.push(StepExecutionResult {
@@ -1010,6 +1041,24 @@ impl SetupExecutor {
                             if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
                                 warn!("Failed to save setup response-mode step failure checkpoint: {}", e);
                             }
+
+                            // Log error event for Active Dashboard visibility
+                            let metadata = StepMetadata::setup(
+                                execution_id,
+                                StepType::Prompt,
+                                step_name,
+                                step_idx,
+                            );
+                            if let Err(log_err) = logger.log_error(
+                                StepEventKind::SetupAiError,
+                                metadata,
+                                StepDetails::default(),
+                                duration_ms as i64,
+                                Some(&e),
+                            ) {
+                                warn!("Failed to log setup AI step error event: {}", log_err);
+                            }
+
                             all_results.push(StepExecutionResult {
                                 step_index: all_results.len(),
                                 step_type: "prompt".to_string(),
@@ -1058,6 +1107,23 @@ impl SetupExecutor {
                     warn!("Failed to save setup AI step checkpoint: {}", e);
                 }
 
+                // Log start event for Active Dashboard visibility
+                {
+                    let metadata = StepMetadata::setup(
+                        execution_id,
+                        StepType::Prompt,
+                        &step_name,
+                        ai_step_idx,
+                    );
+                    if let Err(e) = logger.log_start(
+                        StepEventKind::SetupAiStart,
+                        metadata,
+                        StepDetails::default(),
+                    ) {
+                        warn!("Failed to log setup AI session start event: {}", e);
+                    }
+                }
+
                 // Use structured prompts for granular sub-step tracking
                 let (setup_prompt, sub_step_metadata) =
                     prompt_builder::consolidate_prompts_structured(&session_prompt_steps, "setup");
@@ -1094,6 +1160,36 @@ impl SetupExecutor {
 
                     if let Err(e) = checkpoint_mgr.save_step(&ai_checkpoint) {
                         warn!("Failed to save setup AI step completion checkpoint: {}", e);
+                    }
+
+                    // Log complete/error event for Active Dashboard visibility
+                    {
+                        let metadata = StepMetadata::setup(
+                            execution_id,
+                            StepType::Prompt,
+                            &step_name,
+                            ai_step_idx,
+                        );
+                        if result.success {
+                            if let Err(e) = logger.log_complete(
+                                StepEventKind::SetupAiComplete,
+                                metadata,
+                                StepDetails::default(),
+                                duration_ms,
+                            ) {
+                                warn!("Failed to log setup AI session complete event: {}", e);
+                            }
+                        } else {
+                            if let Err(e) = logger.log_error(
+                                StepEventKind::SetupAiError,
+                                metadata,
+                                StepDetails::default(),
+                                duration_ms,
+                                Some("AI session failed"),
+                            ) {
+                                warn!("Failed to log setup AI session error event: {}", e);
+                            }
+                        }
                     }
 
                     if !result.success {
@@ -2353,6 +2449,21 @@ impl CompletionExecutor {
                         warn!("Failed to save completion response-mode step checkpoint: {}", e);
                     }
 
+                    // Log start event for Active Dashboard visibility
+                    let metadata = StepMetadata::completion(
+                        execution_id,
+                        StepType::Prompt,
+                        step_name,
+                        step_idx,
+                    );
+                    if let Err(e) = logger.log_start(
+                        StepEventKind::CompletionAiStart,
+                        metadata,
+                        StepDetails::default(),
+                    ) {
+                        warn!("Failed to log completion AI step start event: {}", e);
+                    }
+
                     let doctor_handle = self.app_state.doctor_handle.lock().await.clone();
                     let start = std::time::Instant::now();
                     match execute_prompt_response_mode(
@@ -2383,6 +2494,22 @@ impl CompletionExecutor {
                             resp_checkpoint.mark_success(Some(output.clone()), duration_ms as i64);
                             if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
                                 warn!("Failed to save completion response-mode step completion checkpoint: {}", e);
+                            }
+
+                            // Log complete event for Active Dashboard visibility
+                            let metadata = StepMetadata::completion(
+                                execution_id,
+                                StepType::Prompt,
+                                step_name,
+                                step_idx,
+                            );
+                            if let Err(e) = logger.log_complete(
+                                StepEventKind::CompletionAiComplete,
+                                metadata,
+                                StepDetails::default(),
+                                duration_ms as i64,
+                            ) {
+                                warn!("Failed to log completion AI step complete event: {}", e);
                             }
                             response_step_count += 1;
                             all_results.push(StepExecutionResult {
@@ -2421,6 +2548,24 @@ impl CompletionExecutor {
                             if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
                                 warn!("Failed to save completion response-mode step failure checkpoint: {}", e);
                             }
+
+                            // Log error event for Active Dashboard visibility
+                            let metadata = StepMetadata::completion(
+                                execution_id,
+                                StepType::Prompt,
+                                step_name,
+                                step_idx,
+                            );
+                            if let Err(log_err) = logger.log_error(
+                                StepEventKind::CompletionAiError,
+                                metadata,
+                                StepDetails::default(),
+                                duration_ms as i64,
+                                Some(&e),
+                            ) {
+                                warn!("Failed to log completion AI step error event: {}", log_err);
+                            }
+
                             response_step_count += 1;
                             all_results.push(StepExecutionResult {
                                 step_index: all_results.len(),
@@ -2469,6 +2614,23 @@ impl CompletionExecutor {
                 ai_checkpoint.mark_started();
                 if let Err(e) = checkpoint_mgr.save_step(&ai_checkpoint) {
                     warn!("Failed to save completion AI step checkpoint: {}", e);
+                }
+
+                // Log start event for Active Dashboard visibility
+                {
+                    let metadata = StepMetadata::completion(
+                        execution_id,
+                        StepType::Prompt,
+                        &step_name,
+                        ai_step_idx,
+                    );
+                    if let Err(e) = logger.log_start(
+                        StepEventKind::CompletionAiStart,
+                        metadata,
+                        StepDetails::default(),
+                    ) {
+                        warn!("Failed to log completion AI session start event: {}", e);
+                    }
                 }
 
                 // Use structured prompts for granular sub-step tracking
@@ -2529,6 +2691,36 @@ impl CompletionExecutor {
                             "Failed to save completion AI step completion checkpoint: {}",
                             e
                         );
+                    }
+
+                    // Log complete/error event for Active Dashboard visibility
+                    {
+                        let metadata = StepMetadata::completion(
+                            execution_id,
+                            StepType::Prompt,
+                            &step_name,
+                            ai_step_idx,
+                        );
+                        if result.success {
+                            if let Err(e) = logger.log_complete(
+                                StepEventKind::CompletionAiComplete,
+                                metadata,
+                                StepDetails::default(),
+                                duration_ms,
+                            ) {
+                                warn!("Failed to log completion AI session complete event: {}", e);
+                            }
+                        } else {
+                            if let Err(e) = logger.log_error(
+                                StepEventKind::CompletionAiError,
+                                metadata,
+                                StepDetails::default(),
+                                duration_ms,
+                                Some("AI session failed"),
+                            ) {
+                                warn!("Failed to log completion AI session error event: {}", e);
+                            }
+                        }
                     }
 
                     // Don't save completion AI output as summary here --

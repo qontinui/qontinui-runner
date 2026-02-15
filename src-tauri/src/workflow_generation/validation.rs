@@ -214,6 +214,66 @@ pub fn fix_workflow(workflow: &mut UnifiedWorkflow) {
     fix_step_ids_and_phases(&mut workflow.verification_steps, "verification");
     fix_step_ids_and_phases(&mut workflow.agentic_steps, "agentic");
     fix_step_ids_and_phases(&mut workflow.completion_steps, "completion");
+
+    // Ensure gate required_steps covers all non-gate/non-prompt verification steps
+    fix_gate_required_steps(&mut workflow.verification_steps);
+}
+
+/// Ensure gate steps in verification include ALL non-gate, non-prompt step IDs.
+///
+/// The gate determines verification pass/fail — any step NOT in `required_steps` is
+/// invisible to the verification loop. This prevents the scenario where a feature
+/// completeness check fails but the gate passes because that check wasn't listed.
+fn fix_gate_required_steps(verification_steps: &mut [Value]) {
+    // Collect all non-gate, non-prompt verification step IDs
+    let non_gate_ids: Vec<String> = verification_steps
+        .iter()
+        .filter_map(|step| {
+            let step_type = step.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if step_type == "gate" || step_type == "prompt" {
+                return None;
+            }
+            step.get("id").and_then(|v| v.as_str()).map(String::from)
+        })
+        .collect();
+
+    if non_gate_ids.is_empty() {
+        return;
+    }
+
+    for step in verification_steps.iter_mut() {
+        let step_type = step.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if step_type != "gate" {
+            continue;
+        }
+
+        if let Value::Object(map) = step {
+            let current_required: Vec<String> = map
+                .get("required_steps")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // Add any missing non-gate/non-prompt step IDs
+            let mut updated = current_required.clone();
+            for id in &non_gate_ids {
+                if !updated.contains(id) {
+                    updated.push(id.clone());
+                }
+            }
+
+            if updated.len() != current_required.len() {
+                map.insert(
+                    "required_steps".to_string(),
+                    Value::Array(updated.into_iter().map(Value::String).collect()),
+                );
+            }
+        }
+    }
 }
 
 fn fix_step_ids_and_phases(steps: &mut [Value], phase: &str) {
@@ -243,6 +303,7 @@ fn fix_step_ids_and_phases(steps: &mut [Value], phase: &str) {
 mod tests {
     use super::*;
     use crate::unified_workflows::LogSourceSelection;
+    use serde_json::json;
 
     #[test]
     fn test_validate_empty_name() {
@@ -278,5 +339,82 @@ mod tests {
 
         let errors = validate_workflow(&workflow);
         assert!(errors.iter().any(|e| e.field == "name"));
+    }
+
+    #[test]
+    fn test_fix_gate_adds_missing_required_steps() {
+        let mut steps = vec![
+            json!({"id": "check-1", "type": "check", "phase": "verification"}),
+            json!({"id": "api-1", "type": "api_request", "phase": "verification"}),
+            json!({"id": "test-1", "type": "test", "phase": "verification"}),
+            json!({"id": "gate-1", "type": "gate", "phase": "verification", "required_steps": ["check-1"]}),
+        ];
+
+        fix_gate_required_steps(&mut steps);
+
+        let gate = &steps[3];
+        let required: Vec<&str> = gate["required_steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(required.contains(&"check-1"));
+        assert!(required.contains(&"api-1"));
+        assert!(required.contains(&"test-1"));
+        assert_eq!(required.len(), 3);
+    }
+
+    #[test]
+    fn test_fix_gate_skips_prompt_steps() {
+        let mut steps = vec![
+            json!({"id": "check-1", "type": "check", "phase": "verification"}),
+            json!({"id": "prompt-1", "type": "prompt", "phase": "verification"}),
+            json!({"id": "gate-1", "type": "gate", "phase": "verification", "required_steps": []}),
+        ];
+
+        fix_gate_required_steps(&mut steps);
+
+        let gate = &steps[2];
+        let required: Vec<&str> = gate["required_steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(required.contains(&"check-1"));
+        assert!(!required.contains(&"prompt-1"));
+        assert_eq!(required.len(), 1);
+    }
+
+    #[test]
+    fn test_fix_gate_noop_when_complete() {
+        let mut steps = vec![
+            json!({"id": "check-1", "type": "check", "phase": "verification"}),
+            json!({"id": "gate-1", "type": "gate", "phase": "verification", "required_steps": ["check-1"]}),
+        ];
+
+        fix_gate_required_steps(&mut steps);
+
+        let gate = &steps[1];
+        let required: Vec<&str> = gate["required_steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(required, vec!["check-1"]);
+    }
+
+    #[test]
+    fn test_fix_gate_noop_without_gates() {
+        let mut steps = vec![
+            json!({"id": "check-1", "type": "check", "phase": "verification"}),
+            json!({"id": "api-1", "type": "api_request", "phase": "verification"}),
+        ];
+
+        let original = steps.clone();
+        fix_gate_required_steps(&mut steps);
+        assert_eq!(steps, original);
     }
 }

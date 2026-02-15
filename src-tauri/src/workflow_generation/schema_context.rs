@@ -239,8 +239,14 @@ These rules are NON-NEGOTIABLE. Workflows that violate them will be rejected.
    - An `api_request` step querying UI Bridge SDK endpoints (preferred) to verify UI state programmatically
    - A `test` step with `test_type: "playwright"` for browser-based verification
    - A `spec` step with UI Bridge assertions
-9. **Gate step required**: Every workflow with 2+ verification steps MUST include a `gate` step that depends on the automated (non-prompt) verification steps
+9. **Gate step required with ALL non-prompt steps**: Every workflow with 2+ verification steps MUST include a `gate` step whose `required_steps` array lists the IDs of ALL non-gate, non-prompt verification steps. The gate passes only when every required step passes — there is NO threshold. If a step is worth including in verification, it MUST be in the gate's `required_steps`. Omitting a step from the gate makes its failure invisible to the verification loop.
 10. **Prompts are supplementary**: `prompt` type steps in verification are acceptable as supplementary checks (e.g., semantic code review, cross-referencing documentation) but must NEVER be the sole verification mechanism
+11. **Test steps with inline commands MUST use test_type "repository"**: When a `test` step runs a shell command (e.g., `npx playwright test ...`, `cargo test ...`), set `test_type: "repository"`. The `test_type: "playwright"` value is ONLY for steps that provide `code` with Playwright assertions to be executed via CDP. Using `"playwright"` for shell commands causes a "No test_id specified" error.
+12. **Next.js App Router path conventions**: For Next.js projects using the App Router (`src/app/`), components are organized under route groups like `src/app/(app)/`. When creating ESLint `check` steps, use the correct paths — e.g., `src/app/(app)/management/` not `src/components/`. Always verify path patterns match the actual project structure.
+13. **Verification step caching**: Running tasks cache their verification steps at startup. Updating a workflow definition via the API (e.g., `PUT /unified-workflows/{{id}}`) does NOT affect the currently executing task's verification steps. The AI agent should NOT attempt to fix verification step configuration by updating the workflow API mid-run — instead, it should focus on fixing the underlying code issues or report the config issue for the next run.
+14. **Feature-specific verification required**: Verification plans for feature-implementation workflows MUST include feature-specific checks (element presence, tab visibility, component rendering) in addition to compilation/lint gates. Compilation-only verification causes premature completion when the AI fixes pre-existing errors without implementing the actual feature.
+15. **SDK assertions must verify content, not just reachability**: When an `api_request` step targets a UI Bridge SDK endpoint (`/ui-bridge/sdk/...`), a `status_code: 200` assertion alone is INSUFFICIENT. SDK endpoints return 200 even for empty results (e.g., `ai/search` returns `{{"results": [], "total": 0}}`). Every SDK `api_request` MUST include at least one of: `body_contains` (with expected text/element), `json_path` (with expected value), or `header_contains`. Example — BAD: only `{{"type": "status_code", "expected": 200}}`. GOOD: `[{{"type": "status_code", "expected": 200}}, {{"type": "body_contains", "expected": "Settings"}}]`.
+16. **Every agentic step must have a corresponding deterministic verification step**: Each `prompt` step in `agentic_steps` describes a specific piece of work (e.g., "implement drag-and-drop", "add thumbnails"). For EACH agentic step, `verification_steps` MUST contain at least one deterministic step (`check`, `test`, `api_request`, or `spec`) that verifies the output of that work. The gate's `required_steps` must include these verification steps so their failure triggers the agentic loop. Without this, the AI may claim a feature is "done" but the verification loop has no way to confirm it. Example: if an agentic step says "implement element thumbnails in state nodes", verification must include an `api_request` to the UI Bridge SDK that searches for thumbnail-related elements or content, NOT just a tab-existence check.
 
 ## Environment Aliases
 When the user mentions these terms, map them to the correct endpoints:
@@ -256,8 +262,24 @@ you MUST use the UI Bridge SDK for verification steps. The SDK provides direct p
 to registered UI elements AND page content without browser automation overhead.
 Playwright may be used as a SUPPLEMENT but is NOT a substitute for SDK-based verification when the SDK is available.
 
-### Detecting SDK Availability
-Add an api_request step in setup to connect to the target app's SDK:
+### How the SDK Works
+
+The UI Bridge SDK is installed globally at the application level — it instruments ALL pages automatically.
+The SDK's `UIBridgeProvider` and `AutoRegisterProvider` are mounted in the root layout and use a
+`MutationObserver` to auto-discover every interactive and content element on every page. No per-page
+or per-component setup is needed.
+
+### How Snapshots Work
+
+The runner provides TWO snapshot paths:
+1. **Control snapshot** (`GET /ui-bridge/control/snapshot`) — Captures the runner's OWN React frontend (Tauri webview). No setup needed.
+2. **SDK snapshot** (`GET /ui-bridge/sdk/snapshot`) — Captures an EXTERNAL SDK-integrated app via HTTP proxy. **Requires `sdk_connect` first.**
+
+The SDK snapshot is a proxy: the runner forwards your request to the connected app's `/api/ui-bridge/control/snapshot` endpoint. If no app is connected, the snapshot fails — NOT because the page lacks SDK instrumentation, but because the proxy has no target.
+
+### Setup: Connect Before Snapshot
+
+Every workflow that uses SDK snapshots MUST include a connect step in setup:
 ```json
 {{
   "type": "api_request",
@@ -271,6 +293,10 @@ Add an api_request step in setup to connect to the target app's SDK:
 }}
 ```
 If this succeeds, the target app has the SDK installed and all SDK endpoints become available.
+
+**IMPORTANT:** After connecting, the snapshot returns whatever page the user's browser is currently showing.
+To verify a specific page, navigate first using `POST /ui-bridge/sdk/page/navigate` with the target URL,
+then take the snapshot. The SDK instruments ALL pages — the snapshot will work on any page the browser navigates to.
 
 ### SDK Endpoints (via Runner API at localhost:9876)
 After connecting, these endpoints are available:
@@ -301,6 +327,37 @@ After connecting, these endpoints are available:
 - `GET /ui-bridge/sdk/ai/analyze/structured-data` — Extract tables and lists
 - `POST /ui-bridge/sdk/ai/analyze/cross-app-compare` — Compare two app snapshots (includes content comparison)
 
+### SDK Response Schemas (for writing meaningful assertions)
+
+**CRITICAL:** A `status_code: 200` from an SDK endpoint does NOT prove the UI is correct.
+Many SDK endpoints return 200 with empty results (e.g., `ai/search` returns `{{"results": []}}` when nothing matches).
+Always add `body_contains` or `json_path` assertions to verify the response has meaningful content.
+
+**`POST /ui-bridge/sdk/ai/search`** — Returns matched elements:
+```json
+{{"results": [{{"id": "element-id", "type": "button", "text": "Submit", "score": 0.95}}], "total": 1}}
+```
+- On no match: `{{"results": [], "total": 0}}` (still 200!)
+- Good assertion: `body_contains` with the expected element text or `json_path: "$.total"` with `operator: ">"`, `expected: "0"`
+
+**`GET /ui-bridge/sdk/elements`** — Returns element list:
+```json
+{{"elements": [{{"id": "...", "type": "button", "tagName": "BUTTON", "state": {{"textContent": "Save"}}}}], "total": 42}}
+```
+- Good assertion: `body_contains` with a known element ID or text content
+
+**`GET /ui-bridge/sdk/snapshot`** — Returns full page state:
+```json
+{{"elements": [...], "metadata": {{"url": "http://...", "title": "Page Title"}}, "timestamp": "..."}}
+```
+- Good assertion: `body_contains` with expected page title or element content
+
+**`POST /ui-bridge/sdk/discover`** — Returns discovered elements:
+```json
+{{"elements": [...], "total": 5}}
+```
+- Good assertion: `body_contains` with expected element attributes
+
 ### Content Discovery
 The SDK automatically discovers **content elements** in addition to interactive elements.
 Content elements include headings, paragraphs, labels, metrics, badges, status messages, and more.
@@ -319,7 +376,8 @@ This means workflows can **read page text without screenshots**:
 ### When to Use UI Bridge vs Playwright
 - **UI Bridge SDK**: Element inspection, state checking, clicking/typing on registered elements,
   **reading page text content**, verifying metric values, checking status indicators,
-  navigation analysis, form validation, page structure analysis, page navigation (refresh/back/forward)
+  navigation analysis, form validation, page structure analysis, page navigation (refresh/back/forward).
+  Works on ALL pages of an SDK-integrated app — no per-page setup required.
 - **Playwright**: Full browser testing, visual regression, complex multi-page flows,
   testing apps WITHOUT the SDK, screenshot-based verification, pixel-level checks
 
@@ -472,6 +530,30 @@ mod tests {
         let context = build_schema_context_full("run pytest", None, None);
         assert!(context.contains("### shell_command"));
         assert!(context.contains("### test"));
+    }
+
+    #[test]
+    fn test_context_contains_sdk_response_schemas() {
+        let context = build_schema_context();
+        assert!(context.contains("SDK Response Schemas"));
+        assert!(context.contains("ai/search"));
+        assert!(context.contains("results"));
+        assert!(context.contains("status_code: 200"));
+        assert!(context.contains("body_contains"));
+    }
+
+    #[test]
+    fn test_context_contains_assertion_best_practices() {
+        let context = build_schema_context();
+        assert!(context.contains("SDK assertions must verify content"));
+        assert!(context.contains("INSUFFICIENT"));
+    }
+
+    #[test]
+    fn test_context_contains_agentic_verification_rule() {
+        let context = build_schema_context();
+        assert!(context.contains("Every agentic step must have a corresponding"));
+        assert!(context.contains("deterministic verification step"));
     }
 
     #[test]

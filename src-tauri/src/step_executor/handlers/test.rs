@@ -42,8 +42,16 @@ impl StepHandler for TestHandler {
         } else if step.test_type.as_deref() == Some("repository") {
             // Path B: Execute repository test (shell command)
             self.execute_repository_test(step, step_name, context).await
+        } else if step.check_command.is_some() || step.shell_command.is_some() {
+            // Path C: Any test type with an inline command runs as repository test
+            info!(
+                "Test step '{}' has no test_id but has inline command, running as repository test (test_type={:?})",
+                step_name,
+                step.test_type
+            );
+            self.execute_repository_test(step, step_name, context).await
         } else {
-            StepHandlerResult::failure("No test_id specified and not a repository test")
+            StepHandlerResult::failure("No test_id specified and no inline command provided")
         }
     }
 }
