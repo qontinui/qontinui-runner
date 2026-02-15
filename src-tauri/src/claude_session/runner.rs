@@ -780,6 +780,52 @@ fn run_claude_session_inline(
                                     );
                                 }
                             }));
+
+                            // Auto-apply safe fix types as task knowledge entries
+                            let should_auto_apply = match (fix.fix_type.as_str(), fix.confidence.as_str()) {
+                                ("knowledge_base_update", "high" | "medium") => true,
+                                ("context_addition", "high") => true,
+                                _ => false,
+                            };
+
+                            if should_auto_apply {
+                                let category = match fix.fix_type.as_str() {
+                                    "knowledge_base_update" => "recurring_pattern",
+                                    "context_addition" => "context",
+                                    _ => "observation",
+                                };
+
+                                let related_files: Vec<String> = fix.file_changed.iter().cloned().collect();
+
+                                match db.create_task_knowledge(
+                                    &ctx.source_task_run_id,
+                                    category,
+                                    "reflection",
+                                    1,
+                                    &fix.fix_description,
+                                    fix.file_changed.as_deref(),
+                                    &fix.confidence,
+                                    &related_files,
+                                ) {
+                                    Ok(knowledge) => {
+                                        info!("Auto-applied reflection fix as knowledge entry: {}", knowledge.id);
+                                        let auto_msg = format!(
+                                            "Auto-applied fix as {} knowledge: {}",
+                                            category, fix.fix_description
+                                        );
+                                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                            emit_ai_output(
+                                                &app_handle_reflection,
+                                                &auto_msg,
+                                                "reflection_auto_apply",
+                                                None,
+                                                session_ctx_for_reflection.as_ref(),
+                                            );
+                                        }));
+                                    }
+                                    Err(e) => warn!("Failed to auto-apply fix as knowledge: {}", e),
+                                }
+                            }
                         }
                         Err(e) => {
                             warn!("Failed to store reflection fix: {}", e);

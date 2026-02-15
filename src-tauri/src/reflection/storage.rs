@@ -4,7 +4,7 @@
 
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::types::{CreateReflectionFixInput, EffectivenessReport, ReflectionFix};
 
@@ -22,6 +22,7 @@ fn row_to_fix(row: &rusqlite::Row) -> rusqlite::Result<ReflectionFix> {
         old_value: row.get("old_value")?,
         new_value: row.get("new_value")?,
         confidence: row.get("confidence")?,
+        content_hash: row.get("content_hash")?,
         status: row.get("status")?,
         effectiveness: row.get("effectiveness")?,
         effectiveness_evidence: row.get("effectiveness_evidence")?,
@@ -35,16 +36,61 @@ const SELECT_ALL_COLUMNS: &str = r#"
     id, source_task_run_id, reflection_task_run_id,
     source_finding_id, source_knowledge_id,
     fix_type, fix_description, file_changed,
-    old_value, new_value, confidence, status,
-    effectiveness, effectiveness_evidence,
+    old_value, new_value, confidence, content_hash,
+    status, effectiveness, effectiveness_evidence,
     applied_at, evaluated_at, created_at
 "#;
 
+/// Compute a content hash for deduplication of reflection fixes.
+fn compute_content_hash(
+    fix_type: &str,
+    description: &str,
+    old_value: Option<&str>,
+    new_value: Option<&str>,
+) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    fix_type.hash(&mut hasher);
+    description.hash(&mut hasher);
+    old_value.hash(&mut hasher);
+    new_value.hash(&mut hasher);
+    format!("{:x}", hasher.finish())
+}
+
 /// Insert a new reflection fix into the database.
+/// Deduplicates by content hash — if an identical fix already exists with status 'applied',
+/// the existing fix is returned instead of creating a duplicate.
 pub fn insert_fix(
     conn: &Connection,
     input: &CreateReflectionFixInput,
 ) -> Result<ReflectionFix, String> {
+    let content_hash = compute_content_hash(
+        &input.fix_type,
+        &input.fix_description,
+        input.old_value.as_deref(),
+        input.new_value.as_deref(),
+    );
+
+    // Check for existing fix with same content hash that's already applied
+    let existing_id: Option<String> = conn
+        .query_row(
+            "SELECT id FROM reflection_fixes WHERE content_hash = ?1 AND status = 'applied' LIMIT 1",
+            params![content_hash],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("Failed to check for duplicate fix: {}", e))?;
+
+    if let Some(existing_id) = existing_id {
+        warn!(
+            "Skipping duplicate reflection fix (hash: {}, existing: {})",
+            content_hash, existing_id
+        );
+        return get_fix(conn, &existing_id)?
+            .ok_or_else(|| "Existing fix not found after dedup check".to_string());
+    }
+
     let now = Utc::now().to_rfc3339();
     let id = uuid::Uuid::new_v4().to_string();
 
@@ -54,9 +100,9 @@ pub fn insert_fix(
             id, source_task_run_id, reflection_task_run_id,
             source_finding_id, source_knowledge_id,
             fix_type, fix_description, file_changed,
-            old_value, new_value, confidence, status,
-            applied_at, created_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'applied', ?12, ?12)
+            old_value, new_value, confidence, content_hash,
+            status, applied_at, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'applied', ?13, ?13)
         "#,
         params![
             id,
@@ -70,6 +116,7 @@ pub fn insert_fix(
             input.old_value,
             input.new_value,
             input.confidence,
+            content_hash,
             now,
         ],
     )
@@ -399,6 +446,7 @@ mod tests {
                 old_value TEXT,
                 new_value TEXT,
                 confidence TEXT NOT NULL DEFAULT 'medium',
+                content_hash TEXT,
                 status TEXT NOT NULL DEFAULT 'applied',
                 effectiveness TEXT,
                 effectiveness_evidence TEXT,
@@ -525,5 +573,111 @@ mod tests {
             Some("No recurrence in 3 runs")
         );
         assert!(updated.evaluated_at.is_some());
+    }
+
+    #[test]
+    fn test_dedup_skips_duplicate_fix() {
+        let conn = setup_test_db();
+
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, created_at, updated_at) VALUES ('s1', 'T', datetime('now'), datetime('now'))",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, is_reflection, created_at, updated_at) VALUES ('r1', 'R', 1, datetime('now'), datetime('now'))",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, is_reflection, created_at, updated_at) VALUES ('r2', 'R2', 1, datetime('now'), datetime('now'))",
+            [],
+        ).unwrap();
+
+        let input = CreateReflectionFixInput {
+            source_task_run_id: "s1".to_string(),
+            reflection_task_run_id: "r1".to_string(),
+            source_finding_id: None,
+            source_knowledge_id: None,
+            fix_type: "knowledge_base_update".to_string(),
+            fix_description: "Added missing context about API endpoints".to_string(),
+            file_changed: None,
+            old_value: None,
+            new_value: Some("New API docs".to_string()),
+            confidence: "high".to_string(),
+        };
+
+        let fix1 = insert_fix(&conn, &input).unwrap();
+        assert!(fix1.content_hash.is_some());
+
+        // Insert identical fix from a different reflection run — should be deduped
+        let input2 = CreateReflectionFixInput {
+            source_task_run_id: "s1".to_string(),
+            reflection_task_run_id: "r2".to_string(),
+            source_finding_id: None,
+            source_knowledge_id: None,
+            fix_type: "knowledge_base_update".to_string(),
+            fix_description: "Added missing context about API endpoints".to_string(),
+            file_changed: None,
+            old_value: None,
+            new_value: Some("New API docs".to_string()),
+            confidence: "high".to_string(),
+        };
+
+        let fix2 = insert_fix(&conn, &input2).unwrap();
+
+        // Should return the existing fix, not create a new one
+        assert_eq!(fix1.id, fix2.id);
+
+        // Only one fix should exist in the database
+        let all_fixes = get_fixes_for_source_run(&conn, "s1").unwrap();
+        assert_eq!(all_fixes.len(), 1);
+    }
+
+    #[test]
+    fn test_dedup_allows_different_content() {
+        let conn = setup_test_db();
+
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, created_at, updated_at) VALUES ('s1', 'T', datetime('now'), datetime('now'))",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, is_reflection, created_at, updated_at) VALUES ('r1', 'R', 1, datetime('now'), datetime('now'))",
+            [],
+        ).unwrap();
+
+        let input1 = CreateReflectionFixInput {
+            source_task_run_id: "s1".to_string(),
+            reflection_task_run_id: "r1".to_string(),
+            source_finding_id: None,
+            source_knowledge_id: None,
+            fix_type: "knowledge_base_update".to_string(),
+            fix_description: "Fix A".to_string(),
+            file_changed: None,
+            old_value: None,
+            new_value: None,
+            confidence: "high".to_string(),
+        };
+
+        let input2 = CreateReflectionFixInput {
+            source_task_run_id: "s1".to_string(),
+            reflection_task_run_id: "r1".to_string(),
+            source_finding_id: None,
+            source_knowledge_id: None,
+            fix_type: "knowledge_base_update".to_string(),
+            fix_description: "Fix B".to_string(),
+            file_changed: None,
+            old_value: None,
+            new_value: None,
+            confidence: "high".to_string(),
+        };
+
+        let fix1 = insert_fix(&conn, &input1).unwrap();
+        let fix2 = insert_fix(&conn, &input2).unwrap();
+
+        // Different descriptions → different hashes → both should be created
+        assert_ne!(fix1.id, fix2.id);
+
+        let all_fixes = get_fixes_for_source_run(&conn, "s1").unwrap();
+        assert_eq!(all_fixes.len(), 2);
     }
 }

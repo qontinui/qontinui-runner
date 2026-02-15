@@ -482,6 +482,45 @@ impl LoopController {
         }
 
         // =====================================================================
+        // EXPAND RUNTIME VARIABLES in prompts from setup phase outputs
+        // =====================================================================
+        // Setup API steps store their outputs in the setup executor's SharedVariableStore.
+        // These need to be substituted into {{variable_name}} patterns in:
+        // - config.base_prompt (agentic phase prompt)
+        // - completion prompt step content
+        {
+            let shared_vars = self.setup_executor.shared_variables().get_all();
+            if !shared_vars.is_empty() {
+                info!(
+                    "Expanding {} runtime variables from setup phase into prompts",
+                    shared_vars.len()
+                );
+                for (name, value) in &shared_vars {
+                    let pattern = format!("{{{{{}}}}}", name);
+                    if config.base_prompt.contains(&pattern) {
+                        info!(
+                            "  Substituting {{{{{}}}}} ({} chars) into base_prompt",
+                            name,
+                            value.len()
+                        );
+                        config.base_prompt = config.base_prompt.replace(&pattern, value);
+                    }
+                }
+                // Also substitute into completion prompt step content
+                for step in completion_prompt_steps.iter_mut() {
+                    if let Some(ref mut content) = step.prompt_content {
+                        for (name, value) in &shared_vars {
+                            let pattern = format!("{{{{{}}}}}", name);
+                            if content.contains(&pattern) {
+                                *content = content.replace(&pattern, value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
         // HANDLE AGENTIC PHASE RESUME (if we're resuming mid-agentic)
         // =====================================================================
         let loop_result = if run_agentic_first {
@@ -532,24 +571,48 @@ impl LoopController {
                 &UnifiedWorkflowState::agentic_complete(agentic_iteration),
             );
 
-            match &agentic_outcome {
-                AgenticOutcome::Success { .. } => {
-                    info!("Resumed agentic phase completed successfully");
-                }
-                AgenticOutcome::Failed { error, .. } => {
-                    warn!(
-                        "Resumed agentic phase failed: {}, but continuing with verification loop",
-                        error
+            // Log agentic output to database and increment session count
+            {
+                let output_text = match &agentic_outcome {
+                    AgenticOutcome::Success { output } => {
+                        info!("Resumed agentic phase completed successfully");
+                        format!(
+                            "\n=== Agentic Phase (iteration {}) ===\n{}",
+                            agentic_iteration, output
+                        )
+                    }
+                    AgenticOutcome::Failed { output, error } => {
+                        warn!(
+                            "Resumed agentic phase failed: {}, but continuing with verification loop",
+                            error
+                        );
+                        format!(
+                            "\n=== Agentic Phase (iteration {}, FAILED: {}) ===\n{}",
+                            agentic_iteration, error, output
+                        )
+                    }
+                    AgenticOutcome::Error { error } => {
+                        warn!(
+                            "Resumed agentic phase errored: {}, but continuing with verification loop",
+                            error
+                        );
+                        format!(
+                            "\n=== Agentic Phase (iteration {}, ERROR: {}) ===\n",
+                            agentic_iteration, error
+                        )
+                    }
+                    AgenticOutcome::Skipped => {
+                        info!("Resumed agentic phase was skipped (no agentic steps)");
+                        String::new()
+                    }
+                };
+                if !output_text.is_empty() {
+                    let _ = self.checkpoint_db.append_task_output_ex(
+                        &config.execution_id,
+                        &output_text,
+                        true,  // increment session count
+                        false, // Don't check for completion marker
                     );
-                }
-                AgenticOutcome::Error { error } => {
-                    warn!(
-                        "Resumed agentic phase errored: {}, but continuing with verification loop",
-                        error
-                    );
-                }
-                AgenticOutcome::Skipped => {
-                    info!("Resumed agentic phase was skipped (no agentic steps)");
                 }
             }
 

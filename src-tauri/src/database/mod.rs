@@ -4527,6 +4527,51 @@ impl CheckpointDb {
             info!("Successfully migrated to version 58 (reflection workflow system)");
         }
 
+        // Version 59: Reflection deduplication, auto-apply support, and stale fix archival
+        if current_version < 59 {
+            info!("Migrating database to version 59 (reflection dedup & auto-apply)");
+            conn.execute_batch(
+                r#"
+                -- Add content_hash column for deduplication
+                ALTER TABLE reflection_fixes ADD COLUMN content_hash TEXT;
+                CREATE INDEX IF NOT EXISTS idx_reflection_fixes_content_hash ON reflection_fixes(content_hash);
+
+                -- Archive stale template variable resolution fixes (resolved by code fix)
+                UPDATE reflection_fixes SET status = 'superseded'
+                WHERE fix_description LIKE '%template variable%' AND status = 'applied';
+
+                -- Archive stale UI Bridge API migration fixes (already absorbed)
+                UPDATE reflection_fixes SET status = 'superseded'
+                WHERE (fix_description LIKE '%@qontinui/ui-bridge%' OR fix_description LIKE '%CapturedError%' OR fix_description LIKE '%onBrowserEvent%')
+                AND status = 'applied';
+
+                -- Archive duplicate finding dedup instruction fixes (issue resolved)
+                UPDATE reflection_fixes SET status = 'superseded'
+                WHERE fix_description LIKE '%duplicate%FINDING%' AND status = 'applied';
+
+                -- Best practice knowledge entry: verification plans must include feature-specific checks
+                INSERT OR IGNORE INTO task_knowledge (id, task_run_id, category, agent_type, iteration, content, confidence, related_files, is_resolved, created_at)
+                VALUES (
+                    'best-practice-verification-plans',
+                    'e2a404ce-9fbb-467d-8d86-789340069ff5',
+                    'recurring_pattern',
+                    'reflection',
+                    1,
+                    'Verification plans for feature-implementation workflows MUST include feature-specific checks (element presence, tab visibility, component rendering) in addition to compilation/lint gates. Compilation-only verification causes premature completion when the AI fixes pre-existing errors without implementing features.',
+                    'high',
+                    '[]',
+                    0,
+                    datetime('now')
+                );
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (59, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 59: {}", e))?;
+
+            info!("Successfully migrated to version 59 (reflection dedup & auto-apply)");
+        }
+
         Ok(())
     }
 

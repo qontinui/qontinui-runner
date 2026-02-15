@@ -34,6 +34,9 @@ pub struct ReflectionFix {
     pub new_value: Option<String>,
     /// Confidence level of the fix
     pub confidence: String,
+    /// Content hash for deduplication across reflection runs
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
     /// Current status of the fix
     pub status: String,
     /// Effectiveness evaluation result (NULL until evaluated)

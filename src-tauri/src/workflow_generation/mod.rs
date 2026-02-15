@@ -6,6 +6,7 @@
 pub mod example_workflows;
 pub mod feedback;
 pub mod generator;
+pub mod hardener;
 pub mod meta_workflow;
 pub mod relevance_filter;
 pub mod schema_context;

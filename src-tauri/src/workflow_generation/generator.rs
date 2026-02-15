@@ -20,6 +20,7 @@ use crate::ai_router::TaskContext;
 use crate::context;
 use crate::doctor::DoctorHandle;
 use crate::unified_workflows::UnifiedWorkflow;
+use crate::workflow_generation::hardener::{self, HardeningSummary};
 use crate::workflow_generation::schema_context::{build_schema_context, build_schema_context_full};
 use rusqlite::Connection;
 use crate::workflow_generation::validation::{fix_workflow, validate_workflow, ValidationError};
@@ -105,6 +106,9 @@ pub struct GenerateWorkflowResponse {
     /// Details of each verification→fix iteration (empty when skipped)
     #[serde(default)]
     pub verification_iterations: Vec<VerificationIteration>,
+    /// Summary of verification hardening (prompt → deterministic conversions)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hardening_summary: Option<HardeningSummary>,
 }
 
 // ============================================================================
@@ -212,6 +216,10 @@ pub fn generate_workflow(
         }
     }
 
+    // ── Hardener Agent ───────────────────────────────────────────────────
+    let (workflow, hardening_summary) =
+        hardener::run_hardener_agent(&workflow, &request.description, doctor_handle);
+
     // ── Final structural validation ────────────────────────────────────────
     let validation_errors: Vec<ValidationError> = validate_workflow(&workflow);
     let validation_error_strings: Vec<String> =
@@ -241,6 +249,7 @@ pub fn generate_workflow(
         error: None,
         model_used: None,
         verification_iterations: iterations,
+        hardening_summary,
     }
 }
 
@@ -340,6 +349,7 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
             )),
             model_used: None,
             verification_iterations: vec![],
+            hardening_summary: None,
         }));
     }
 
@@ -359,6 +369,7 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
             )),
             model_used: None,
             verification_iterations: vec![],
+            hardening_summary: None,
         })
     })
 }

@@ -1,5 +1,5 @@
 -- SQLite Schema for qontinui-runner
--- Version: 58
+-- Version: 59
 --
 -- This schema provides persistent storage for task runs, settings,
 -- prompts, and scheduler state.
@@ -37,6 +37,7 @@
 -- Version 53 adds preflight_check_enabled to unified_workflows for automatic pre-flight environment checks.
 -- Version 55 adds embedding BLOB columns for hybrid RAG search and workflow_generation_feedback table.
 -- Version 58 adds reflection workflow system (reflection_fixes table, is_reflection/reflection_source_task_run_id on task_runs, reflection_fix_id on findings/knowledge).
+-- Version 59 adds content_hash to reflection_fixes for deduplication, archives stale fixes, adds verification best practice knowledge entry.
 
 -- Schema version tracking
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -2093,6 +2094,7 @@ CREATE TABLE IF NOT EXISTS reflection_fixes (
     old_value TEXT,
     new_value TEXT,
     confidence TEXT NOT NULL DEFAULT 'medium', -- high, medium, low
+    content_hash TEXT,                         -- Hash for deduplication (v59)
     status TEXT NOT NULL DEFAULT 'applied',    -- applied, reverted, superseded
     effectiveness TEXT,                        -- NULL -> effective, ineffective, caused_regression, inconclusive
     effectiveness_evidence TEXT,
@@ -2107,6 +2109,7 @@ CREATE TABLE IF NOT EXISTS reflection_fixes (
 
 CREATE INDEX IF NOT EXISTS idx_reflection_fixes_source ON reflection_fixes(source_task_run_id);
 CREATE INDEX IF NOT EXISTS idx_reflection_fixes_reflection ON reflection_fixes(reflection_task_run_id);
+CREATE INDEX IF NOT EXISTS idx_reflection_fixes_content_hash ON reflection_fixes(content_hash);
 CREATE INDEX IF NOT EXISTS idx_reflection_fixes_status ON reflection_fixes(status);
 CREATE INDEX IF NOT EXISTS idx_reflection_fixes_effectiveness ON reflection_fixes(effectiveness);
 CREATE INDEX IF NOT EXISTS idx_reflection_fixes_applied_at ON reflection_fixes(applied_at);

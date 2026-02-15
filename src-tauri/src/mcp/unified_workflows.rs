@@ -830,6 +830,7 @@ pub async fn generate_unified_workflow_handler(
                     error: Some(format!("Database error during generation: {}", e)),
                     model_used: None,
                     verification_iterations: vec![],
+                    hardening_summary: None,
                 }
             }
         }

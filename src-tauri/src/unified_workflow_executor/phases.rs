@@ -767,6 +767,15 @@ impl SetupExecutor {
         self.executor.set_task_run_id(task_run_id);
     }
 
+    /// Get the shared variable store from the inner step executor.
+    ///
+    /// After setup phase completes, this contains all variables set by API steps
+    /// (e.g., `source_findings`, `source_knowledge`). These need to be substituted
+    /// into the agentic prompt before the agentic phase runs.
+    pub fn shared_variables(&self) -> &crate::orchestrator::context_propagation::SharedVariableStore {
+        self.executor.shared_variables()
+    }
+
     /// Run setup steps. Returns true if successful.
     ///
     /// Executes automation steps first (shell commands, etc.), then prompt steps (AI tasks).
@@ -2138,6 +2147,14 @@ impl CompletionExecutor {
         self.executor.set_task_run_id(task_run_id);
     }
 
+    /// Get the shared variable store from the inner step executor.
+    ///
+    /// After completion automation steps run, this contains output variables
+    /// (e.g., `evaluation_results`) that need substitution into prompt step content.
+    pub fn shared_variables(&self) -> &crate::orchestrator::context_propagation::SharedVariableStore {
+        self.executor.shared_variables()
+    }
+
     /// Run completion steps.
     ///
     /// This should ONLY be called when verification has passed.
@@ -2273,6 +2290,30 @@ impl CompletionExecutor {
         }
 
         // Run prompt completion steps (AI summary)
+        // Expand runtime variables in prompt step content before execution.
+        // Variables set by automation steps (e.g., evaluation_results) need to be
+        // substituted into {{variable_name}} patterns in prompt content.
+        let prompt_steps: Vec<ExecutionStepConfig> = {
+            let shared_vars = self.executor.shared_variables().get_all();
+            if shared_vars.is_empty() {
+                prompt_steps.to_vec()
+            } else {
+                prompt_steps.iter().map(|step| {
+                    let mut step = step.clone();
+                    if let Some(ref mut content) = step.prompt_content {
+                        for (name, value) in &shared_vars {
+                            let pattern = format!("{{{{{}}}}}", name);
+                            if content.contains(&pattern) {
+                                *content = content.replace(&pattern, value);
+                            }
+                        }
+                    }
+                    step
+                }).collect()
+            }
+        };
+        let prompt_steps = prompt_steps.as_slice();
+
         if !prompt_steps.is_empty() {
             info!(
                 "COMPLETION-PHASE: Running {} prompt steps (AI summary)",

@@ -21,7 +21,7 @@ use tracing::{info, warn};
 fn get_api_base_url() -> String {
     std::env::var("QONTINUI_API_URL").unwrap_or_else(|_| {
         if cfg!(debug_assertions) {
-            "http://localhost:8000".to_string()
+            "http://127.0.0.1:8000".to_string()
         } else {
             "https://qontinui.io".to_string()
         }

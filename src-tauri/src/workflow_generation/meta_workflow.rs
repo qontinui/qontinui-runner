@@ -194,8 +194,18 @@ pub fn build_meta_workflow_template(
             "output_path": "{{artifact_dir}}/workflow.json"
         })],
 
-        // Phase 4: Self-analysis (dev only) + Save the generated workflow to the library
+        // Phase 4: Hardening + Self-analysis (dev only) + Save the generated workflow
         completion_steps: vec![
+            json!({
+                "id": Uuid::new_v4().to_string(),
+                "name": "Harden prompt verification steps",
+                "type": "prompt",
+                "phase": "completion",
+                "prompt_mode": "response",
+                "content": build_hardener_completion_prompt(),
+                "input_path": "{{artifact_dir}}/workflow.json",
+                "output_path": "{{artifact_dir}}/workflow.json"
+            }),
             json!({
                 "id": Uuid::new_v4().to_string(),
                 "name": "Analyze generation quality (dev)",
@@ -433,6 +443,39 @@ Output the corrected workflow JSON now:
     );
 
     prompt
+}
+
+/// Build the prompt for the hardener completion step.
+///
+/// This step reads the generated workflow JSON and converts prompt-type verification
+/// steps to deterministic equivalents where possible.
+fn build_hardener_completion_prompt() -> String {
+    r#"You are a verification hardener agent. Read the input workflow JSON and convert prompt-type verification steps to deterministic equivalents where possible.
+
+## Conversion Rules
+
+| Prompt check type | Convert to | Method |
+|---|---|---|
+| UI element presence/structure | `api_request` | UI Bridge SDK `GET /ui-bridge/sdk/elements` with `body_contains` assertion |
+| Content/text on page | `api_request` | UI Bridge SDK `GET /ui-bridge/sdk/ai/search` with `body_contains` assertion |
+| File existence | `check` | `custom_command` with `test -f <path>` |
+| File content | `check` | `custom_command` with `grep -q <pattern> <file>` |
+| Code quality (lint) | `check` | `check_type: "lint"` with appropriate command |
+| Code quality (typecheck) | `check` | `check_type: "typecheck"` with appropriate command |
+| API health/response | `api_request` | Direct HTTP with `status_code` assertion |
+| Subjective/qualitative | Keep as `prompt` | Cannot be made deterministic |
+
+## Rules
+
+1. ONLY modify verification_steps — do NOT change setup_steps, agentic_steps, or completion_steps
+2. Preserve step count, step IDs, and step order
+3. If a prompt step is genuinely subjective, keep it as `prompt`
+4. For `api_request` conversions, include `assertions` array with at least a `status_code` check
+5. For `check` conversions, include `check_type`, `command`, and `working_directory`
+
+If there are no prompt-type verification steps, return the workflow unchanged.
+
+Output ONLY the complete, valid UnifiedWorkflow JSON. No markdown, no code fences, no explanations."#.to_string()
 }
 
 /// Build the "past fixes" section from resolved findings on meta task runs.

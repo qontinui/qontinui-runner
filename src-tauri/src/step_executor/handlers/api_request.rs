@@ -122,7 +122,7 @@ impl StepHandler for ApiRequestHandler {
             } else {
                 Some(extractions)
             },
-            assertions: None,
+            assertions: step.api_assertions.clone(),
         };
 
         info!(

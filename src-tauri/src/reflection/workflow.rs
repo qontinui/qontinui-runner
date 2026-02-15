@@ -250,6 +250,20 @@ Finding: finding-abc123
 - `medium` — Likely fix but needs validation, apply and monitor
 - `low` — Speculative, log but don't auto-apply
 
+### Auto-Applied Fix Types
+The following fix types are automatically applied by the system (creating knowledge base entries):
+- `knowledge_base_update` at high/medium confidence → Creates a recurring_pattern knowledge entry
+- `context_addition` at high confidence → Creates a context knowledge entry
+
+All other fix types are recorded for manual review. Use these auto-applied types when you have
+clear, actionable insights that should persist across runs. Avoid low-confidence auto-applied types
+as they will only be recorded without creating knowledge entries.
+
+### Deduplication
+Fixes are deduplicated by content hash (fix_type + description + old_value + new_value).
+If an identical fix already exists with status 'applied', the duplicate will be skipped.
+Only emit fixes for genuinely new insights — do NOT re-emit fixes from previous reflection runs.
+
 ### Step 5: Evaluate Previous Fixes
 Compare the source run's findings against previously applied fixes:
 - If a fix's source finding signature does NOT appear in this run → fix was effective

@@ -37,7 +37,9 @@ use jsonpath_rust::JsonPathFinder;
 use regex::Regex;
 
 use crate::action_service::UnifiedActionService;
-use crate::api_request::{ApiRequestConfig, ApiRequestSession, HttpMethod, VariableExtraction};
+use crate::api_request::{
+    ApiAssertion, ApiRequestConfig, ApiRequestSession, HttpMethod, VariableExtraction,
+};
 use crate::commands::AppState;
 use crate::config_storage::ConfigStorage;
 use crate::database::CreateTaskRunEventInput;
@@ -320,6 +322,10 @@ pub struct ExecutionStepConfig {
     /// API Request: Timeout in milliseconds (optional, no timeout if not specified)
     #[serde(alias = "apiTimeoutMs", alias = "timeout_ms")]
     pub api_timeout_ms: Option<u64>,
+
+    /// API Request: Assertions for response verification
+    #[serde(alias = "apiAssertions", alias = "assertions")]
+    pub api_assertions: Option<Vec<ApiAssertion>>,
 
     // ========================================================================
     // Check Step Fields

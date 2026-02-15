@@ -13,13 +13,14 @@ use tracing::{error, info, warn};
 
 /// Get API base URL for qontinui-web backend
 /// Uses environment variable QONTINUI_API_URL or defaults based on build mode:
-/// - Development: http://localhost:8000
+/// - Development: http://127.0.0.1:8000
 /// - Production: https://qontinui.io (or production backend URL)
 fn get_api_base_url() -> String {
     std::env::var("QONTINUI_API_URL").unwrap_or_else(|_| {
         if cfg!(debug_assertions) {
-            // Development mode - use localhost
-            "http://localhost:8000".to_string()
+            // Development mode - use 127.0.0.1 (not localhost) because the backend
+            // only binds to IPv4, and localhost may resolve to IPv6 (::1) first
+            "http://127.0.0.1:8000".to_string()
         } else {
             // Production mode - use production backend
             // Note: Update this when production backend is deployed
@@ -165,7 +166,7 @@ pub async fn login(email: String, password: String) -> Result<LoginResponse, Str
         .send()
         .await
         .map_err(|e| {
-            error!("Login request failed: {}", e);
+            error!("Login request failed: {:?}", e);
             format!("Network error: {}", e)
         })?;
 
