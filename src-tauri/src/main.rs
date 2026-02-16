@@ -66,6 +66,7 @@ mod settings;
 mod state_explorer;
 mod step_event_builder;
 mod step_executor;
+mod step_injection;
 mod step_metadata;
 mod step_registry;
 mod step_types;

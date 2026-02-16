@@ -336,6 +336,50 @@ fn build_builder_prompt(
 - Include a `gate` step that depends on all automated check/test/spec steps
 - `prompt` steps in verification are fine as SUPPLEMENTARY checks but must not be the only verification
 
+### UI Bridge SDK Capabilities & Limitations
+
+When the workflow uses the UI Bridge SDK for verification, choose the right tool for each check:
+
+**SDK CAN do (use `api_request` steps with SDK endpoints):**
+- Click, double-click, right-click elements
+- Type text into inputs
+- Select dropdown options
+- Focus/blur elements
+- Hover over elements
+- Scroll elements
+- Check/uncheck/toggle checkboxes
+- Drag-and-drop between elements (pass `target.elementId` or `targetPosition` in params)
+- Find and query elements by ID, role, text, or CSS selector
+- Get element state (value, checked, disabled, visible, etc.)
+- Take page snapshots
+- AI-powered semantic search and natural language actions
+
+**SDK CANNOT do (use `test` steps with Playwright instead):**
+- Keyboard shortcuts (Ctrl+Z, Delete, Ctrl+S, etc.)
+- File upload dialogs
+- Form submit/reset actions
+- Multi-tab or multi-window interactions
+- Screenshot pixel-comparison testing
+- Browser devtools or network interception
+
+**Rule:** Use Playwright `test` steps ONLY for interactions the SDK cannot handle. For everything else, prefer SDK `api_request` steps — they are faster, more reliable, and don't require browser binaries.
+
+### Agentic-Verification Coverage
+
+Every agentic step MUST have at least one corresponding verification step that would FAIL if that agentic step's work was NOT done. Common gaps to avoid:
+- Agentic step "add keyboard shortcuts" with no verification for keyboard functionality → add a Playwright test
+- Agentic step "add thumbnails to nodes" with only a tab-existence check → add an SDK element check for thumbnail content
+- Agentic step "implement drag-and-drop" with only a visual review → add a Playwright interaction test
+
+If an agentic step has multiple distinct goals (e.g., "edge labels, initial state badge, and keyboard shortcuts"), each goal needs its own verification step or a combined test that checks all of them.
+
+### Out-of-Scope Enforcement
+
+If the task description includes "out of scope", "do not change", "do not modify", "must not", or similar boundary constraints:
+1. Add a verification `check` step with `custom_command` that validates the constraint (e.g., `git diff --name-only | grep -v <allowed-patterns>` to detect changes to files that should not be modified)
+2. Or add a `prompt` verification step that specifically reviews whether scope boundaries were respected
+3. Reference the specific constraints in the verification step name (e.g., "Verify data model unchanged")
+
 Generate the workflow JSON now:
 "#,
     );
@@ -364,6 +408,8 @@ Check for these issues:
 14. **Code change typecheck**: If the workflow creates or modifies code files (TypeScript, Python, Rust), there MUST be a `check` step with appropriate typecheck command (npx tsc --noEmit, mypy, cargo check). Missing typecheck for code-modifying workflows MUST be flagged.
 15. **Web app SDK verification**: If the workflow targets a web app (localhost:3001, localhost:1420), there SHOULD be a UI Bridge SDK api_request step or spec step in verification to verify UI state programmatically. Flag as a warning if missing.
 16. **Gate step**: Workflows with 2+ verification steps SHOULD have a gate step aggregating the automated checks. Flag as a warning if missing.
+17. **Agentic-verification coverage**: Every agentic step MUST have at least one verification step that would FAIL if that agentic step's work was NOT done. A tab-existence check does NOT count as coverage for an agentic step that adds content within that tab. Flag as a failure if any agentic step has no corresponding verification.
+18. **Out-of-scope enforcement**: If the task description contains "out of scope", "do not change", "do not modify", or similar boundary constraints, there SHOULD be at least one verification step that checks those boundaries were respected. Flag as a warning if missing.
 "#
     .to_string();
 
@@ -475,6 +521,8 @@ If the workflow has a UI Bridge SDK connect step in setup AND has Playwright tes
 - Include `body_contains` assertions that check for specific text/patterns
 
 Do NOT convert Playwright tests that are purely functional (form submission, navigation flows) — only convert UI verification tests.
+
+**SDK capability limits:** Do NOT convert Playwright tests involving keyboard shortcuts (Ctrl+Z, Delete, etc.), file uploads, form submit/reset, multi-tab interactions, or screenshot pixel comparisons — the SDK cannot perform these. These MUST stay as Playwright tests. Note: drag-and-drop CAN be converted to SDK — use the `drag` action with `target.elementId` or `targetPosition` params.
 
 ## Rule 3: Strengthen weak SDK assertions
 

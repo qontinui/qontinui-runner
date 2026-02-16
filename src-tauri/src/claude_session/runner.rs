@@ -21,6 +21,9 @@ use crate::orchestrator::{RetryConfig, RetryService, RetryState};
 use crate::reflection::parser::{ParsedReflectionFix, ReflectionFixParser};
 use crate::reflection::storage as reflection_storage;
 use crate::reflection::types::CreateReflectionFixInput;
+use crate::step_executor::ExecutionStepConfig;
+use crate::step_injection::parser::InjectedStepParser;
+use crate::step_injection::types::StepInjectionContext;
 use crate::workflow_state::{ParsedProgress, ProgressParser};
 
 #[cfg(target_os = "windows")]
@@ -117,7 +120,8 @@ fn run_claude_session_inline(
     pid_tracker: Option<Arc<std::sync::Mutex<Vec<u32>>>>,
     doctor_handle: Option<&DoctorHandle>,
     reflection_fix_ctx: Option<ReflectionFixContext>,
-) -> Result<(bool, String), String> {
+    step_injection_ctx: Option<StepInjectionContext>,
+) -> Result<(bool, String, Vec<ExecutionStepConfig>), String> {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{mpsc, Arc};
@@ -286,6 +290,9 @@ fn run_claude_session_inline(
     // Channel for parsed reflection fixes (sent from stdout thread to reflection fix processor thread)
     let (reflection_fix_tx, reflection_fix_rx) = mpsc::channel::<ParsedReflectionFix>();
 
+    // Channel for injected steps (sent from stdout thread, collected in main)
+    let (injected_step_tx, injected_step_rx) = mpsc::channel::<ExecutionStepConfig>();
+
     // Stdout reader thread
     let stdout = child.stdout.take();
     let app_handle_stdout = app_handle.clone();
@@ -294,6 +301,7 @@ fn run_claude_session_inline(
     let finding_ctx_for_stdout = finding_ctx.clone();
     let progress_ctx_for_stdout = progress_ctx.clone();
     let reflection_fix_ctx_for_stdout = reflection_fix_ctx.clone();
+    let step_injection_ctx_for_stdout = step_injection_ctx.clone();
 
     // On Windows, save the raw pipe handle before moving stdout into the reader thread.
     // After the Claude process exits, child processes may still hold inherited copies of
@@ -326,6 +334,13 @@ fn run_claude_session_inline(
         // Create reflection fix parser if we have a reflection fix context
         let mut reflection_fix_parser = if reflection_fix_ctx_for_stdout.is_some() {
             Some(ReflectionFixParser::new())
+        } else {
+            None
+        };
+
+        // Create step injection parser if we have a step injection context
+        let mut step_injection_parser = if step_injection_ctx_for_stdout.is_some() {
+            Some(InjectedStepParser::new())
         } else {
             None
         };
@@ -390,6 +405,13 @@ fn run_claude_session_inline(
                                     let _ = reflection_fix_tx.send(parsed_fix);
                                 }
                             }
+
+                            // Parse for step injection markers
+                            if let Some(ref mut parser) = step_injection_parser {
+                                if let Some(injected_step) = parser.process_line(&complete_line) {
+                                    let _ = injected_step_tx.send(injected_step);
+                                }
+                            }
                         }
 
                         all_text.push_str(&text);
@@ -419,6 +441,11 @@ fn run_claude_session_inline(
             if let Some(ref mut parser) = reflection_fix_parser {
                 if let Some(parsed_fix) = parser.process_line(&line_buffer) {
                     let _ = reflection_fix_tx.send(parsed_fix);
+                }
+            }
+            if let Some(ref mut parser) = step_injection_parser {
+                if let Some(injected_step) = parser.process_line(&line_buffer) {
+                    let _ = injected_step_tx.send(injected_step);
                 }
             }
         }
@@ -781,49 +808,94 @@ fn run_claude_session_inline(
                                 }
                             }));
 
-                            // Auto-apply safe fix types as task knowledge entries
+                            // Auto-apply safe fix types
                             let should_auto_apply = match (fix.fix_type.as_str(), fix.confidence.as_str()) {
                                 ("knowledge_base_update", "high" | "medium") => true,
                                 ("context_addition", "high") => true,
+                                ("instruction_clarification", "high") => true,
+                                ("workflow_step_rewrite", "high") => true,
                                 _ => false,
                             };
 
                             if should_auto_apply {
-                                let category = match fix.fix_type.as_str() {
-                                    "knowledge_base_update" => "recurring_pattern",
-                                    "context_addition" => "context",
-                                    _ => "observation",
-                                };
+                                match fix.fix_type.as_str() {
+                                    "knowledge_base_update" | "context_addition" => {
+                                        // Create task knowledge entry (existing behavior)
+                                        let category = match fix.fix_type.as_str() {
+                                            "knowledge_base_update" => "recurring_pattern",
+                                            "context_addition" => "context",
+                                            _ => "observation",
+                                        };
 
-                                let related_files: Vec<String> = fix.file_changed.iter().cloned().collect();
+                                        let related_files: Vec<String> = fix.file_changed.iter().cloned().collect();
 
-                                match db.create_task_knowledge(
-                                    &ctx.source_task_run_id,
-                                    category,
-                                    "reflection",
-                                    1,
-                                    &fix.fix_description,
-                                    fix.file_changed.as_deref(),
-                                    &fix.confidence,
-                                    &related_files,
-                                ) {
-                                    Ok(knowledge) => {
-                                        info!("Auto-applied reflection fix as knowledge entry: {}", knowledge.id);
-                                        let auto_msg = format!(
-                                            "Auto-applied fix as {} knowledge: {}",
-                                            category, fix.fix_description
-                                        );
-                                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                            emit_ai_output(
-                                                &app_handle_reflection,
-                                                &auto_msg,
-                                                "reflection_auto_apply",
-                                                None,
-                                                session_ctx_for_reflection.as_ref(),
-                                            );
-                                        }));
+                                        match db.create_task_knowledge(
+                                            &ctx.source_task_run_id,
+                                            category,
+                                            "reflection",
+                                            1,
+                                            &fix.fix_description,
+                                            fix.file_changed.as_deref(),
+                                            &fix.confidence,
+                                            &related_files,
+                                        ) {
+                                            Ok(knowledge) => {
+                                                info!("Auto-applied reflection fix as knowledge entry: {}", knowledge.id);
+                                                let auto_msg = format!(
+                                                    "Auto-applied fix as {} knowledge: {}",
+                                                    category, fix.fix_description
+                                                );
+                                                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                                    emit_ai_output(
+                                                        &app_handle_reflection,
+                                                        &auto_msg,
+                                                        "reflection_auto_apply",
+                                                        None,
+                                                        session_ctx_for_reflection.as_ref(),
+                                                    );
+                                                }));
+                                            }
+                                            Err(e) => warn!("Failed to auto-apply fix as knowledge: {}", e),
+                                        }
                                     }
-                                    Err(e) => warn!("Failed to auto-apply fix as knowledge: {}", e),
+                                    "instruction_clarification" | "workflow_step_rewrite" => {
+                                        // Create generation rule entry
+                                        use crate::workflow_generation::rules;
+                                        let agent = rules::infer_agent_from_fix(&fix.fix_description);
+                                        let section = rules::infer_section_from_fix(&fix.fix_description, &agent);
+                                        let next_num = rules::next_rule_number(&conn, &agent, &section);
+                                        let title = rules::truncate_to_title(&fix.fix_description);
+
+                                        match rules::insert_rule(&conn, &rules::InsertRuleInput {
+                                            agent: agent.clone(),
+                                            section: section.clone(),
+                                            rule_number: next_num,
+                                            title: title.clone(),
+                                            content: fix.fix_description.clone(),
+                                            condition: None,
+                                            provenance: "reflection".to_string(),
+                                            source_fix_id: Some(fix.id.clone()),
+                                        }) {
+                                            Ok(rule) => {
+                                                info!("Auto-applied reflection fix as generation rule: {} (agent={}, section={})", rule.id, agent, section);
+                                                let auto_msg = format!(
+                                                    "Auto-applied fix as generation rule [{}/{}]: {}",
+                                                    agent, section, title
+                                                );
+                                                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                                    emit_ai_output(
+                                                        &app_handle_reflection,
+                                                        &auto_msg,
+                                                        "reflection_auto_apply",
+                                                        None,
+                                                        session_ctx_for_reflection.as_ref(),
+                                                    );
+                                                }));
+                                            }
+                                            Err(e) => warn!("Failed to auto-apply fix as generation rule: {}", e),
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -920,6 +992,11 @@ fn run_claude_session_inline(
     let progress_count = progress_processor_handle.join().unwrap_or_default();
     // Wait for the reflection fix processor thread to complete
     let reflection_fix_count = reflection_fix_processor_handle.join().unwrap_or_default();
+    // Collect all injected steps from the channel
+    let mut injected_steps: Vec<ExecutionStepConfig> = Vec::new();
+    while let Ok(step) = injected_step_rx.try_recv() {
+        injected_steps.push(step);
+    }
     let _ = std::fs::remove_file(&prompt_file);
 
     // Log summary of detected findings
@@ -947,6 +1024,15 @@ fn run_claude_session_inline(
         );
     }
 
+    // Log summary of injected steps
+    if !injected_steps.is_empty() {
+        info!(
+            "Session {} collected {} injected verification step(s)",
+            session_id,
+            injected_steps.len()
+        );
+    }
+
     // Emit stderr if any
     if !stderr_output.is_empty() {
         for line in stderr_output.lines() {
@@ -965,19 +1051,20 @@ fn run_claude_session_inline(
     let success = status.success();
 
     info!(
-        "Session {} completed: success={}, output_len={}, findings={}, progress_markers={}, reflection_fixes={}",
+        "Session {} completed: success={}, output_len={}, findings={}, progress_markers={}, reflection_fixes={}, injected_steps={}",
         session_id,
         success,
         all_output.len(),
         detected_findings.len(),
         progress_count,
-        reflection_fix_count
+        reflection_fix_count,
+        injected_steps.len()
     );
 
     // Remove PID from tracker now that session is complete
     remove_pid(&pid_tracker);
 
-    Ok((success, all_output))
+    Ok((success, all_output, injected_steps))
 }
 
 /// Run Claude session with retry support.
@@ -1004,7 +1091,8 @@ pub fn run_claude_session_with_retry(
     retry_config: Option<&RetryConfig>,
     doctor_handle: Option<&DoctorHandle>,
     reflection_fix_ctx: Option<ReflectionFixContext>,
-) -> Result<(bool, String, Option<RetryState>), String> {
+    step_injection_ctx: Option<StepInjectionContext>,
+) -> Result<(bool, String, Option<RetryState>, Vec<ExecutionStepConfig>), String> {
     use std::thread;
     use std::time::Duration;
 
@@ -1023,8 +1111,9 @@ pub fn run_claude_session_with_retry(
                 pid_tracker,
                 doctor_handle,
                 reflection_fix_ctx,
+                step_injection_ctx,
             )?;
-            return Ok((result.0, result.1, None));
+            return Ok((result.0, result.1, None, result.2));
         }
     };
 
@@ -1039,6 +1128,7 @@ pub fn run_claude_session_with_retry(
         let progress_ctx_clone = progress_ctx.clone();
         let pid_tracker_clone = pid_tracker.clone();
         let reflection_fix_ctx_clone = reflection_fix_ctx.clone();
+        let step_injection_ctx_clone = step_injection_ctx.clone();
 
         // Update retry information on the context if this is a retry attempt
         if retry_state.attempt > 0 {
@@ -1062,10 +1152,11 @@ pub fn run_claude_session_with_retry(
             pid_tracker_clone,
             doctor_handle,
             reflection_fix_ctx_clone,
+            step_injection_ctx_clone,
         );
 
         match result {
-            Ok((success, output)) => {
+            Ok((success, output, injected_steps)) => {
                 // Session succeeded (or at least completed without error)
                 if retry_state.attempt > 0 {
                     info!(
@@ -1073,7 +1164,7 @@ pub fn run_claude_session_with_retry(
                         session_id, retry_state.attempt
                     );
                 }
-                return Ok((success, output, Some(retry_state)));
+                return Ok((success, output, Some(retry_state), injected_steps));
             }
             Err(error) => {
                 // Session failed - check if we should retry
@@ -1147,7 +1238,8 @@ pub fn run_claude_session_interactive(
     task_run_id: &str,
     doctor_handle: Option<&DoctorHandle>,
     _reflection_fix_ctx: Option<ReflectionFixContext>,
-) -> Result<(bool, String), String> {
+    _step_injection_ctx: Option<StepInjectionContext>,
+) -> Result<(bool, String, Vec<ExecutionStepConfig>), String> {
     use crate::claude_session::ClaudeSession;
     use crate::commands::ai_chat::emit_session_state;
     use std::sync::Arc;
@@ -1231,7 +1323,8 @@ pub fn run_claude_session_interactive(
         output.len()
     );
 
-    Ok((success, output))
+    // Note: Step injection not implemented for interactive sessions yet
+    Ok((success, output, Vec::new()))
 }
 
 /// Run an interactive Claude CLI session with retry support.
@@ -1253,7 +1346,8 @@ pub fn run_claude_session_interactive_with_retry(
     task_run_id: &str,
     doctor_handle: Option<&DoctorHandle>,
     reflection_fix_ctx: Option<ReflectionFixContext>,
-) -> Result<(bool, String, Option<RetryState>), String> {
+    step_injection_ctx: Option<StepInjectionContext>,
+) -> Result<(bool, String, Option<RetryState>, Vec<ExecutionStepConfig>), String> {
     use std::thread;
     use std::time::Duration;
 
@@ -1274,8 +1368,9 @@ pub fn run_claude_session_interactive_with_retry(
                 task_run_id,
                 doctor_handle,
                 reflection_fix_ctx,
+                step_injection_ctx,
             )?;
-            return Ok((result.0, result.1, None));
+            return Ok((result.0, result.1, None, result.2));
         }
     };
 
@@ -1289,6 +1384,7 @@ pub fn run_claude_session_interactive_with_retry(
         let progress_ctx_clone = progress_ctx.clone();
         let pid_tracker_clone = pid_tracker.clone();
         let reflection_fix_ctx_clone = reflection_fix_ctx.clone();
+        let step_injection_ctx_clone = step_injection_ctx.clone();
 
         // Update retry information on the context if this is a retry attempt
         if retry_state.attempt > 0 {
@@ -1311,17 +1407,18 @@ pub fn run_claude_session_interactive_with_retry(
             task_run_id,
             doctor_handle,
             reflection_fix_ctx_clone,
+            step_injection_ctx_clone,
         );
 
         match result {
-            Ok((success, output)) => {
+            Ok((success, output, injected_steps)) => {
                 if retry_state.attempt > 0 {
                     info!(
                         "Interactive session {} succeeded after {} retries",
                         session_id, retry_state.attempt
                     );
                 }
-                return Ok((success, output, Some(retry_state)));
+                return Ok((success, output, Some(retry_state), injected_steps));
             }
             Err(error) => {
                 let decision = retry_service.should_retry(&error, &retry_state);

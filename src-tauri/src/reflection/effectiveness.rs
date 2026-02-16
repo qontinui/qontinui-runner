@@ -294,21 +294,49 @@ fn evaluate_by_workflow_outcome(
                 })
             }
         }
-        // For other fix types without source findings, remain inconclusive
-        _ => Ok(EvaluationResult {
-            fix_id: fix.id.clone(),
-            effectiveness: FixEffectiveness::Inconclusive,
-            evidence: format!(
-                "Fix type '{}' has no source finding — cannot track recurrence. \
-                 {} subsequent run(s) exist.",
-                fix.fix_type,
-                subsequent_run_ids.len()
-            ),
-        }),
+        // For other fix types without source findings: if both source and
+        // subsequent runs have zero findings, the workflow is clean — mark effective.
+        // Otherwise remain inconclusive without signature-based tracking.
+        _ => {
+            if source_findings == 0 && total_subsequent_findings == 0 {
+                Ok(EvaluationResult {
+                    fix_id: fix.id.clone(),
+                    effectiveness: FixEffectiveness::Effective,
+                    evidence: format!(
+                        "Fix type '{}' with no source finding, but {} subsequent successful \
+                         run(s) with zero findings — workflow is clean",
+                        fix.fix_type,
+                        subsequent_run_ids.len()
+                    ),
+                })
+            } else if avg_subsequent < source_findings as f64 {
+                Ok(EvaluationResult {
+                    fix_id: fix.id.clone(),
+                    effectiveness: FixEffectiveness::Effective,
+                    evidence: format!(
+                        "Fix type '{}': findings decreased {} → {:.1} avg across {} subsequent run(s)",
+                        fix.fix_type, source_findings, avg_subsequent, subsequent_run_ids.len()
+                    ),
+                })
+            } else {
+                Ok(EvaluationResult {
+                    fix_id: fix.id.clone(),
+                    effectiveness: FixEffectiveness::Inconclusive,
+                    evidence: format!(
+                        "Fix type '{}' has no source finding — cannot track recurrence. \
+                         {} subsequent run(s) exist.",
+                        fix.fix_type,
+                        subsequent_run_ids.len()
+                    ),
+                })
+            }
+        }
     }
 }
 
 /// Batch evaluate all unevaluated fixes for a workflow.
+/// Also re-evaluates fixes previously marked 'inconclusive' in case new
+/// subsequent runs now provide enough signal to determine effectiveness.
 ///
 /// Called during the completion phase of each reflection run.
 pub fn evaluate_pending_fixes(
@@ -316,12 +344,30 @@ pub fn evaluate_pending_fixes(
     workflow_name: &str,
 ) -> Result<Vec<EvaluationResult>, String> {
     // Get all applied, unevaluated fixes for this workflow
-    let fixes = storage::get_fixes_by_workflow_name(
+    let mut fixes = storage::get_fixes_by_workflow_name(
         conn,
         workflow_name,
         Some("applied"),
         Some("unevaluated"),
     )?;
+
+    // Also re-evaluate inconclusive fixes — they may now have enough
+    // subsequent run data to transition to 'effective' or 'ineffective'
+    let inconclusive_fixes = storage::get_fixes_by_workflow_name(
+        conn,
+        workflow_name,
+        Some("applied"),
+        Some("inconclusive"),
+    )?;
+
+    if !inconclusive_fixes.is_empty() {
+        info!(
+            "Re-evaluating {} previously inconclusive fixes for workflow '{}'",
+            inconclusive_fixes.len(),
+            workflow_name
+        );
+    }
+    fixes.extend(inconclusive_fixes);
 
     if fixes.is_empty() {
         debug!("No pending fixes to evaluate for workflow '{}'", workflow_name);
@@ -329,7 +375,7 @@ pub fn evaluate_pending_fixes(
     }
 
     info!(
-        "Evaluating {} pending fixes for workflow '{}'",
+        "Evaluating {} total fixes for workflow '{}'",
         fixes.len(),
         workflow_name
     );
@@ -338,14 +384,20 @@ pub fn evaluate_pending_fixes(
     for fix in &fixes {
         match evaluate_fix(conn, fix) {
             Ok(result) => {
-                // Persist the evaluation
-                if let Err(e) = storage::update_fix_effectiveness(
-                    conn,
-                    &result.fix_id,
-                    result.effectiveness.as_str(),
-                    Some(&result.evidence),
-                ) {
-                    warn!("Failed to persist evaluation for fix {}: {}", result.fix_id, e);
+                // Only persist if the evaluation changed (avoid unnecessary writes
+                // for fixes that remain inconclusive)
+                let changed = fix.effectiveness.as_deref()
+                    != Some(result.effectiveness.as_str());
+
+                if changed {
+                    if let Err(e) = storage::update_fix_effectiveness(
+                        conn,
+                        &result.fix_id,
+                        result.effectiveness.as_str(),
+                        Some(&result.evidence),
+                    ) {
+                        warn!("Failed to persist evaluation for fix {}: {}", result.fix_id, e);
+                    }
                 }
                 results.push(result);
             }
@@ -355,12 +407,13 @@ pub fn evaluate_pending_fixes(
         }
     }
 
+    let effective_count = results.iter().filter(|r| r.effectiveness == FixEffectiveness::Effective).count();
+    let ineffective_count = results.iter().filter(|r| r.effectiveness == FixEffectiveness::Ineffective).count();
+    let inconclusive_count = results.iter().filter(|r| r.effectiveness == FixEffectiveness::Inconclusive).count();
+
     info!(
         "Evaluated {} fixes: {} effective, {} ineffective, {} inconclusive",
-        results.len(),
-        results.iter().filter(|r| r.effectiveness == FixEffectiveness::Effective).count(),
-        results.iter().filter(|r| r.effectiveness == FixEffectiveness::Ineffective).count(),
-        results.iter().filter(|r| r.effectiveness == FixEffectiveness::Inconclusive).count(),
+        results.len(), effective_count, ineffective_count, inconclusive_count,
     );
 
     Ok(results)
@@ -652,18 +705,75 @@ mod tests {
     }
 
     #[test]
-    fn test_evaluate_other_fix_type_stays_inconclusive_without_finding() {
+    fn test_evaluate_other_fix_type_effective_when_zero_findings() {
         let conn = setup_test_db();
 
+        // Source run with 0 findings
         conn.execute(
             "INSERT INTO task_runs (id, task_name, workflow_name, status, completed_at, created_at, updated_at) VALUES ('src-1', 'Test', 'wf-1', 'complete', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')",
             [],
         ).unwrap();
 
+        // Subsequent run with 0 findings
         conn.execute(
             "INSERT INTO task_runs (id, task_name, workflow_name, status, is_reflection, completed_at, created_at, updated_at) VALUES ('run-2', 'Test', 'wf-1', 'complete', 0, '2025-01-01T02:00:00Z', '2025-01-01T02:00:00Z', '2025-01-01T02:00:00Z')",
             [],
         ).unwrap();
+
+        let fix = ReflectionFix {
+            id: "fix-1".to_string(),
+            source_task_run_id: "src-1".to_string(),
+            reflection_task_run_id: "ref-1".to_string(),
+            source_finding_id: None,
+            source_knowledge_id: None,
+            fix_type: "selector_fix".to_string(),
+            fix_description: "Fixed selector".to_string(),
+            file_changed: None,
+            old_value: None,
+            new_value: None,
+            confidence: "high".to_string(),
+            content_hash: None,
+            status: "applied".to_string(),
+            effectiveness: None,
+            effectiveness_evidence: None,
+            applied_at: "2025-01-01T01:00:00Z".to_string(),
+            evaluated_at: None,
+            created_at: "2025-01-01T01:00:00Z".to_string(),
+        };
+
+        // Now marks effective since both source and subsequent have zero findings
+        let result = evaluate_fix(&conn, &fix).unwrap();
+        assert_eq!(result.effectiveness, FixEffectiveness::Effective);
+        assert!(result.evidence.contains("workflow is clean"));
+    }
+
+    #[test]
+    fn test_evaluate_other_fix_type_inconclusive_when_findings_persist() {
+        let conn = setup_test_db();
+
+        // Source run with 2 findings
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, workflow_name, status, completed_at, created_at, updated_at) VALUES ('src-1', 'Test', 'wf-1', 'complete', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+        for i in 0..2 {
+            conn.execute(
+                &format!("INSERT INTO task_run_findings (id, task_run_id, signature_hash, detected_at) VALUES ('f-src-{}', 'src-1', 'hash-{}', '2025-01-01T00:00:00Z')", i, i),
+                [],
+            ).unwrap();
+        }
+
+        // Subsequent run with 3 findings (more than source)
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, workflow_name, status, is_reflection, completed_at, created_at, updated_at) VALUES ('run-2', 'Test', 'wf-1', 'complete', 0, '2025-01-01T02:00:00Z', '2025-01-01T02:00:00Z', '2025-01-01T02:00:00Z')",
+            [],
+        ).unwrap();
+        for i in 0..3 {
+            conn.execute(
+                &format!("INSERT INTO task_run_findings (id, task_run_id, signature_hash, detected_at) VALUES ('f-sub-{}', 'run-2', 'hash-sub-{}', '2025-01-01T02:00:00Z')", i, i),
+                [],
+            ).unwrap();
+        }
 
         let fix = ReflectionFix {
             id: "fix-1".to_string(),

@@ -74,6 +74,10 @@ pub struct AiSessionConfig {
     /// Optional context for reflection fix marker detection.
     /// When set, the AI session will parse [REFLECTION_FIX:...] markers and store them in the database.
     pub reflection_fix_ctx: Option<ReflectionFixContext>,
+    /// Optional context for step injection marker detection.
+    /// When set, the AI session will parse [INJECT_STEP]...[/INJECT_STEP] markers
+    /// and collect injected verification steps.
+    pub step_injection_ctx: Option<crate::step_injection::types::StepInjectionContext>,
 }
 
 impl AiSessionConfig {
@@ -95,6 +99,7 @@ impl AiSessionConfig {
             checkpoint_id: None,
             sub_step_metadata: None,
             reflection_fix_ctx: None,
+            step_injection_ctx: None,
         }
     }
 
@@ -116,6 +121,7 @@ impl AiSessionConfig {
             checkpoint_id: None,
             sub_step_metadata: None,
             reflection_fix_ctx: None,
+            step_injection_ctx: None,
         }
     }
 
@@ -138,6 +144,7 @@ impl AiSessionConfig {
             checkpoint_id: None,
             sub_step_metadata: None,
             reflection_fix_ctx: None,
+            step_injection_ctx: None,
         }
     }
 
@@ -170,6 +177,17 @@ impl AiSessionConfig {
         self.reflection_fix_ctx = Some(ctx);
         self
     }
+
+    /// Set the step injection context for parsing [INJECT_STEP]...[/INJECT_STEP] markers.
+    ///
+    /// When set, the AI session will collect injected verification steps from the AI output.
+    pub fn with_step_injection_ctx(
+        mut self,
+        ctx: crate::step_injection::types::StepInjectionContext,
+    ) -> Self {
+        self.step_injection_ctx = Some(ctx);
+        self
+    }
 }
 
 /// Result of an AI session execution.
@@ -181,6 +199,9 @@ pub struct AiSessionResult {
     pub output: String,
     /// Duration of the session in milliseconds.
     pub duration_ms: i64,
+    /// Dynamically injected verification steps parsed from AI output.
+    /// These are collected from `[INJECT_STEP]...[/INJECT_STEP]` markers.
+    pub injected_steps: Vec<crate::step_executor::ExecutionStepConfig>,
 }
 
 // =============================================================================
@@ -417,6 +438,7 @@ impl UnifiedAiSessionExecutor {
         };
         let task_run_id_for_claude = config.task_run_id.clone();
         let reflection_fix_ctx = config.reflection_fix_ctx.clone();
+        let step_injection_ctx = config.step_injection_ctx.clone();
 
         let result = tokio::task::spawn_blocking(move || {
             let doctor_ref = doctor_handle.as_ref();
@@ -436,6 +458,7 @@ impl UnifiedAiSessionExecutor {
                     &task_run_id_for_claude,
                     doctor_ref,
                     reflection_fix_ctx,
+                    step_injection_ctx,
                 )
             } else {
                 // Inline mode: one-shot session (either no session manager or interactive disabled)
@@ -455,6 +478,7 @@ impl UnifiedAiSessionExecutor {
                     Some(&retry_config),
                     doctor_ref,
                     reflection_fix_ctx,
+                    step_injection_ctx,
                 )
             }
         })
@@ -467,13 +491,14 @@ impl UnifiedAiSessionExecutor {
 
         // Handle result and log appropriate events
         match result {
-            Ok(Ok((success, output, _))) => {
+            Ok(Ok((success, output, _, injected_steps))) => {
                 info!(
-                    "UNIFIED-AI-SESSION: {} completed (success={}, output={} chars, duration={}ms)",
+                    "UNIFIED-AI-SESSION: {} completed (success={}, output={} chars, duration={}ms, injected_steps={})",
                     config.phase.as_str(),
                     success,
                     output.len(),
-                    duration_ms
+                    duration_ms,
+                    injected_steps.len()
                 );
 
                 let details =
@@ -502,6 +527,7 @@ impl UnifiedAiSessionExecutor {
                     success,
                     output,
                     duration_ms,
+                    injected_steps,
                 }
             }
             Ok(Err(e)) => {
@@ -523,6 +549,7 @@ impl UnifiedAiSessionExecutor {
                     success: false,
                     output: String::new(),
                     duration_ms,
+                    injected_steps: Vec::new(),
                 }
             }
             Err(e) => {
@@ -545,6 +572,7 @@ impl UnifiedAiSessionExecutor {
                     success: false,
                     output: String::new(),
                     duration_ms,
+                    injected_steps: Vec::new(),
                 }
             }
         }

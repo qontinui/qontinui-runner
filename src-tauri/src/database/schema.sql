@@ -1,5 +1,5 @@
 -- SQLite Schema for qontinui-runner
--- Version: 59
+-- Version: 60
 --
 -- This schema provides persistent storage for task runs, settings,
 -- prompts, and scheduler state.
@@ -2114,7 +2114,34 @@ CREATE INDEX IF NOT EXISTS idx_reflection_fixes_status ON reflection_fixes(statu
 CREATE INDEX IF NOT EXISTS idx_reflection_fixes_effectiveness ON reflection_fixes(effectiveness);
 CREATE INDEX IF NOT EXISTS idx_reflection_fixes_applied_at ON reflection_fixes(applied_at);
 
+-- =============================================================================
+-- Generation Rules (Version 60)
+-- =============================================================================
+-- Externalized workflow generation rules. Rules that were previously hardcoded
+-- as Rust string literals across schema_context.rs, hardener.rs, and generator.rs
+-- are now stored here, enabling runtime modification by the reflection system.
+
+CREATE TABLE IF NOT EXISTS generation_rules (
+    id TEXT PRIMARY KEY,
+    agent TEXT NOT NULL,          -- 'schema_context', 'hardener', 'verification'
+    section TEXT NOT NULL,        -- 'important_rules', 'verification_quality', 'conversion_rules', 'critical_rules', 'check_rules'
+    rule_number INTEGER NOT NULL, -- Ordering within section
+    title TEXT NOT NULL,          -- Short title (e.g., "Gate step required with ALL non-prompt steps")
+    content TEXT NOT NULL,        -- Full markdown rule text
+    condition TEXT,               -- NULL = always, 'has_sdk_connect', 'targets_web_app'
+    status TEXT NOT NULL DEFAULT 'active',  -- 'active', 'disabled', 'superseded'
+    provenance TEXT NOT NULL DEFAULT 'seed', -- 'seed' (original hardcoded), 'reflection' (created by reflection auto-apply)
+    source_fix_id TEXT,           -- FK to reflection_fixes.id if provenance = 'reflection'
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (source_fix_id) REFERENCES reflection_fixes(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_generation_rules_agent ON generation_rules(agent);
+CREATE INDEX IF NOT EXISTS idx_generation_rules_status ON generation_rules(status);
+CREATE INDEX IF NOT EXISTS idx_generation_rules_agent_section ON generation_rules(agent, section, rule_number);
+
 -- Initialize singleton tables
 INSERT OR IGNORE INTO gui_lock (id, holder_session_id, acquired_at) VALUES (1, NULL, NULL);
 INSERT OR IGNORE INTO scheduler_settings (id) VALUES (1);
-INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (58, datetime('now'));
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (60, datetime('now'));

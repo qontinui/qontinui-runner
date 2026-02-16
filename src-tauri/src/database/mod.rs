@@ -4572,6 +4572,234 @@ impl CheckpointDb {
             info!("Successfully migrated to version 59 (reflection dedup & auto-apply)");
         }
 
+        // Version 60: Generation rules table — externalized workflow generation rules
+        if current_version < 60 {
+            info!("Migrating database to version 60 (generation_rules table)");
+
+            // Create the table
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS generation_rules (
+                    id TEXT PRIMARY KEY,
+                    agent TEXT NOT NULL,
+                    section TEXT NOT NULL,
+                    rule_number INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    condition TEXT,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    provenance TEXT NOT NULL DEFAULT 'seed',
+                    source_fix_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (source_fix_id) REFERENCES reflection_fixes(id) ON DELETE SET NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_generation_rules_agent ON generation_rules(agent);
+                CREATE INDEX IF NOT EXISTS idx_generation_rules_status ON generation_rules(status);
+                CREATE INDEX IF NOT EXISTS idx_generation_rules_agent_section ON generation_rules(agent, section, rule_number);
+                "#,
+            )
+            .map_err(|e| format!("Failed to create generation_rules table (version 60): {}", e))?;
+
+            // Seed schema_context important_rules (rules 1-5)
+            let now = Utc::now().to_rfc3339();
+            let seed_rules: Vec<(&str, &str, &str, i32, &str, &str, Option<&str>)> = vec![
+                // schema_context / important_rules
+                ("seed-schema_context-important_rules-1", "schema_context", "important_rules", 1,
+                 "Generate valid UUIDs",
+                 "Generate valid UUIDs for all `id` fields (format: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx)",
+                 None),
+                ("seed-schema_context-important_rules-2", "schema_context", "important_rules", 2,
+                 "Phase field must match array",
+                 "`phase` field MUST match the array the step is in (setup_steps -> \"setup\", etc.)",
+                 None),
+                ("seed-schema_context-important_rules-3", "schema_context", "important_rules", 3,
+                 "Agentic steps are prompt only",
+                 "`agentic_steps` can ONLY contain `prompt` type steps",
+                 None),
+                ("seed-schema_context-important_rules-4", "schema_context", "important_rules", 4,
+                 "ISO 8601 timestamps",
+                 "Use ISO 8601 format for timestamps (e.g., \"2024-01-15T10:30:00Z\")",
+                 None),
+                ("seed-schema_context-important_rules-5", "schema_context", "important_rules", 5,
+                 "JSON only output",
+                 "Return ONLY the JSON object, no markdown formatting",
+                 None),
+
+                // schema_context / verification_quality (rules 6-16)
+                ("seed-schema_context-verification_quality-6", "schema_context", "verification_quality", 6,
+                 "Deterministic verification step required",
+                 "verification_steps MUST include at least one deterministic, automated step — one of: `check`, `test`, `spec`, or `api_request` with assertions. Do NOT use only `prompt` type steps for verification. Prompts provide AI judgment, not deterministic pass/fail results. A verification phase with ONLY prompt steps is INVALID.",
+                 None),
+                ("seed-schema_context-verification_quality-7", "schema_context", "verification_quality", 7,
+                 "Code modification requires typecheck",
+                 "When the workflow creates or modifies source code files (TypeScript, Python, Rust, etc.), verification MUST include a `check` step with the appropriate type checker:\n   - TypeScript/TSX/JSX: `{\"type\": \"check\", \"check_type\": \"typecheck\", \"command\": \"npx tsc --noEmit\", \"working_directory\": \"...\"}`\n   - Python: `{\"type\": \"check\", \"check_type\": \"typecheck\", \"command\": \"mypy .\", \"working_directory\": \"...\"}`\n   - Rust: `{\"type\": \"check\", \"check_type\": \"typecheck\", \"command\": \"cargo check\", \"working_directory\": \"...\"}`",
+                 None),
+                ("seed-schema_context-verification_quality-8", "schema_context", "verification_quality", 8,
+                 "Web app verification requires SDK or Playwright",
+                 "When the workflow targets a web application (localhost:3001, localhost:1420), verification MUST include at least one of:\n   - An `api_request` step querying UI Bridge SDK endpoints (preferred) to verify UI state programmatically\n   - A `test` step with `test_type: \"playwright\"` for browser-based verification\n   - A `spec` step with UI Bridge assertions",
+                 None),
+                ("seed-schema_context-verification_quality-9", "schema_context", "verification_quality", 9,
+                 "Gate step required with ALL non-prompt steps",
+                 "Every workflow with 2+ verification steps MUST include a `gate` step whose `required_steps` array lists the IDs of ALL non-gate, non-prompt verification steps. The gate passes only when every required step passes — there is NO threshold. If a step is worth including in verification, it MUST be in the gate's `required_steps`. Omitting a step from the gate makes its failure invisible to the verification loop.",
+                 None),
+                ("seed-schema_context-verification_quality-10", "schema_context", "verification_quality", 10,
+                 "Prompts are supplementary",
+                 "`prompt` type steps in verification are acceptable as supplementary checks (e.g., semantic code review, cross-referencing documentation) but must NEVER be the sole verification mechanism",
+                 None),
+                ("seed-schema_context-verification_quality-11", "schema_context", "verification_quality", 11,
+                 "Test steps with inline commands use repository",
+                 "When a `test` step runs a shell command (e.g., `npx playwright test ...`, `cargo test ...`), set `test_type: \"repository\"`. The `test_type: \"playwright\"` value is ONLY for steps that provide `code` with Playwright assertions to be executed via CDP. Using `\"playwright\"` for shell commands causes a \"No test_id specified\" error.",
+                 None),
+                ("seed-schema_context-verification_quality-12", "schema_context", "verification_quality", 12,
+                 "Next.js App Router path conventions",
+                 "For Next.js projects using the App Router (`src/app/`), components are organized under route groups like `src/app/(app)/`. When creating ESLint `check` steps, use the correct paths — e.g., `src/app/(app)/management/` not `src/components/`. Always verify path patterns match the actual project structure.",
+                 None),
+                ("seed-schema_context-verification_quality-13", "schema_context", "verification_quality", 13,
+                 "Verification step caching",
+                 "Running tasks cache their verification steps at startup. Updating a workflow definition via the API (e.g., `PUT /unified-workflows/{id}`) does NOT affect the currently executing task's verification steps. The AI agent should NOT attempt to fix verification step configuration by updating the workflow API mid-run — instead, it should focus on fixing the underlying code issues or report the config issue for the next run.",
+                 None),
+                ("seed-schema_context-verification_quality-14", "schema_context", "verification_quality", 14,
+                 "Feature-specific verification required",
+                 "Verification plans for feature-implementation workflows MUST include feature-specific checks (element presence, tab visibility, component rendering) in addition to compilation/lint gates. Compilation-only verification causes premature completion when the AI fixes pre-existing errors without implementing the actual feature.",
+                 None),
+                ("seed-schema_context-verification_quality-15", "schema_context", "verification_quality", 15,
+                 "SDK assertions must verify content",
+                 "When an `api_request` step targets a UI Bridge SDK endpoint (`/ui-bridge/sdk/...`), a `status_code: 200` assertion alone is INSUFFICIENT. SDK endpoints return 200 even for empty results (e.g., `ai/search` returns `{\"results\": [], \"total\": 0}`). Every SDK `api_request` MUST include at least one of: `body_contains` (with expected text/element), `json_path` (with expected value), or `header_contains`.",
+                 None),
+                ("seed-schema_context-verification_quality-16", "schema_context", "verification_quality", 16,
+                 "Agentic-verification correspondence",
+                 "Each `prompt` step in `agentic_steps` describes a specific piece of work (e.g., \"implement drag-and-drop\", \"add thumbnails\"). For EACH agentic step, `verification_steps` MUST contain at least one deterministic step (`check`, `test`, `api_request`, or `spec`) that verifies the output of that work. The gate's `required_steps` must include these verification steps so their failure triggers the agentic loop.",
+                 None),
+
+                // hardener / conversion_rules
+                ("seed-hardener-conversion_rules-1", "hardener", "conversion_rules", 1,
+                 "Convert prompt steps to deterministic",
+                 "Convert `prompt` steps to deterministic equivalents:\n| Prompt check type | Convert to | Method |\n|---|---|---|\n| UI element presence/structure | `api_request` | UI Bridge SDK endpoint with assertions |\n| Content/text on page | `api_request` | UI Bridge SDK `/ai/search` with `body_contains` assertion |\n| File existence | `check` | `custom_command` with `test -f <path>` |\n| File content | `check` | `custom_command` with `grep -q <pattern> <file>` |\n| Code quality (lint) | `check` | `check_type: \"lint\"` with appropriate command |\n| Code quality (typecheck) | `check` | `check_type: \"typecheck\"` with appropriate command |\n| API health/response | `api_request` | Direct HTTP with `status_code` assertion |\n| Subjective/qualitative | Keep as `prompt` | Cannot be made deterministic |",
+                 None),
+                ("seed-hardener-conversion_rules-2", "hardener", "conversion_rules", 2,
+                 "Replace Playwright with SDK checks",
+                 "When the UI Bridge SDK is connected, Playwright-based UI verification tests should be converted to `api_request` steps using SDK endpoints. The SDK provides direct programmatic access to registered UI elements without requiring a Playwright browser instance. If a single Playwright test checks multiple things, split it into multiple `api_request` steps — one per distinct verification concern.",
+                 Some("has_sdk_connect")),
+                ("seed-hardener-conversion_rules-3", "hardener", "conversion_rules", 3,
+                 "Strengthen weak SDK assertions",
+                 "If an existing `api_request` step targets a UI Bridge SDK endpoint but only has a `status_code` assertion, add a `body_contains` assertion to verify meaningful content. A 200 response from the SDK just means the endpoint is reachable — it doesn't verify the UI state. SDK endpoints return 200 even for EMPTY results.",
+                 Some("has_sdk_connect")),
+                ("seed-hardener-conversion_rules-4", "hardener", "conversion_rules", 4,
+                 "Inject page navigation before SDK checks",
+                 "If the workflow's setup_steps include a page navigation step (`POST /ui-bridge/sdk/page/navigate` with a target URL), the verification phase MUST also navigate to that same URL before any SDK element checks. This is because the agentic phase may navigate the browser away from the target page.",
+                 Some("has_sdk_connect")),
+                ("seed-hardener-conversion_rules-5", "hardener", "conversion_rules", 5,
+                 "Agentic-verification correspondence",
+                 "Examine EACH prompt step in `agentic_steps` and identify the distinct goals/features it describes. Then check whether `verification_steps` has at least one deterministic step (check, test, api_request, spec) that would FAIL if that specific goal was NOT implemented. For each uncovered agentic goal, ADD a new `api_request` verification step and add its ID to the gate's `required_steps` array.",
+                 None),
+
+                // hardener / critical_rules
+                ("seed-hardener-critical_rules-1", "hardener", "critical_rules", 1,
+                 "Only modify verification_steps",
+                 "Do NOT change setup_steps, agentic_steps, or completion_steps",
+                 None),
+                ("seed-hardener-critical_rules-2", "hardener", "critical_rules", 2,
+                 "Preserve step IDs",
+                 "Every step must keep its original `id` field (unless splitting a step, in which case keep the original ID on one and generate new UUIDs for additions)",
+                 None),
+                ("seed-hardener-critical_rules-3", "hardener", "critical_rules", 3,
+                 "Preserve step order",
+                 "Steps must remain in the same relative position",
+                 None),
+                ("seed-hardener-critical_rules-4", "hardener", "critical_rules", 4,
+                 "Adding steps is allowed",
+                 "If a Playwright test step checks multiple things, you MAY replace it with multiple `api_request` steps. You MAY also add NEW verification steps to cover uncovered agentic goals. Keep original `id`s on existing steps and generate new UUIDs for additions. Update `gate` required_steps if you add new step IDs.",
+                 None),
+                ("seed-hardener-critical_rules-5", "hardener", "critical_rules", 5,
+                 "Keep subjective prompts",
+                 "If a prompt step is genuinely subjective (e.g., \"Is the UX intuitive?\"), keep it as `prompt`",
+                 None),
+                ("seed-hardener-critical_rules-6", "hardener", "critical_rules", 6,
+                 "Complete required fields",
+                 "Every converted step must have all required fields for its new type",
+                 None),
+                ("seed-hardener-critical_rules-7", "hardener", "critical_rules", 7,
+                 "API request assertions required",
+                 "For `api_request` steps, ALWAYS include `assertions` with at least `status_code` AND `body_contains`",
+                 None),
+                ("seed-hardener-critical_rules-8", "hardener", "critical_rules", 8,
+                 "Check conversion fields",
+                 "For `check` conversions, include `check_type`, `command`, and `working_directory`",
+                 None),
+                ("seed-hardener-critical_rules-9", "hardener", "critical_rules", 9,
+                 "Do not convert check steps",
+                 "Do NOT convert `check` steps (lint, typecheck, etc.) — they are already deterministic",
+                 None),
+                ("seed-hardener-critical_rules-10", "hardener", "critical_rules", 10,
+                 "Do not convert gate steps",
+                 "Do NOT convert `gate` steps — they are structural",
+                 None),
+
+                // verification / check_rules
+                ("seed-verification-check_rules-1", "verification", "check_rules", 1,
+                 "shell_command validation",
+                 "`command` is a real, syntactically valid shell command (not a placeholder like \"echo TODO\" or \"/path/to/script\"). `working_directory`, if present, looks like a real path. `timeout_seconds` is reasonable. `fail_on_error` is appropriate.",
+                 None),
+                ("seed-verification-check_rules-2", "verification", "check_rules", 2,
+                 "check step consistency",
+                 "`check_type` and `command` are consistent: \"lint\" → linter, \"typecheck\" → type checker, \"format\" → formatter check, \"analyze\" → static analysis, \"security\" → security scanner, \"custom_command\" → any command. `command` is non-empty and syntactically valid.",
+                 None),
+                ("seed-verification-check_rules-3", "verification", "check_rules", 3,
+                 "test step validation",
+                 "Has either `command` (for repository/custom_command) or `code` (for playwright/python). `test_type` is one of: playwright, qontinui_vision, python, repository, custom_command. The command/code looks substantive (not a placeholder).",
+                 None),
+                ("seed-verification-check_rules-4", "verification", "check_rules", 4,
+                 "api_request validation and weak SDK assertion check",
+                 "`url` starts with \"http://\" or \"https://\" and is a plausible URL. `method` is a valid HTTP method. If `body` is provided, `content_type` is consistent. `assertions` reference valid types. WEAK SDK ASSERTION CHECK: If the `url` contains `/ui-bridge/sdk/` AND the only assertion is `status_code: 200`, flag it.",
+                 None),
+                ("seed-verification-check_rules-5", "verification", "check_rules", 5,
+                 "prompt step quality",
+                 "Content is substantive — at least 2 sentences with specific instructions. Agentic prompts reference verification results and describe what to fix. Not a generic placeholder like \"Fix the errors\" or \"Do the task\".",
+                 None),
+                ("seed-verification-check_rules-6", "verification", "check_rules", 6,
+                 "spec step validation",
+                 "`spec_group` has a `name` and non-empty `assertions` array. `element_source` is \"control\" or \"external\". Each assertion has `assertionType`, `target` with search criteria.",
+                 None),
+                ("seed-verification-check_rules-7", "verification", "check_rules", 7,
+                 "gate step validation",
+                 "`required_steps` references step IDs that actually exist in the same verification_steps array.",
+                 None),
+                ("seed-verification-check_rules-8", "verification", "check_rules", 8,
+                 "UI Bridge SDK usage",
+                 "If the workflow targets a web app but does NOT include a setup step to connect via UI Bridge SDK (POST to /ui-bridge/sdk/connect), flag it. If the workflow uses Playwright for simple element inspection when SDK endpoints could be used instead, flag it. If agentic prompt steps mention web UI interaction but don't reference SDK tools, flag it.",
+                 None),
+                ("seed-verification-check_rules-9", "verification", "check_rules", 9,
+                 "Agentic-verification correspondence",
+                 "For EACH prompt step in agentic_steps, there MUST be at least one corresponding deterministic verification step that can detect whether that agentic step's work succeeded. Tab/section existence checks do NOT count as adequate verification for the tab's CONTENT or FUNCTIONALITY.",
+                 None),
+                ("seed-verification-check_rules-10", "verification", "check_rules", 10,
+                 "Cross-step and structural checks",
+                 "If there are verification steps, there should be at least one agentic prompt step. Setup steps should logically prepare for what verification checks. Step names are descriptive (not \"Step 1\", \"Test\", \"Check\"). No duplicate step IDs. Steps match the user's original request.",
+                 None),
+            ];
+
+            for (id, agent, section, rule_number, title, content, condition) in &seed_rules {
+                conn.execute(
+                    "INSERT OR IGNORE INTO generation_rules (id, agent, section, rule_number, title, content, condition, status, provenance, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', 'seed', ?8, ?9)",
+                    params![id, agent, section, rule_number, title, content, condition, now, now],
+                )
+                .map_err(|e| format!("Failed to seed generation rule {}: {}", id, e))?;
+            }
+
+            conn.execute_batch(
+                "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (60, datetime('now'));",
+            )
+            .map_err(|e| format!("Failed to update schema version to 60: {}", e))?;
+
+            info!(
+                "Successfully migrated to version 60 (generation_rules table with {} seed rules)",
+                seed_rules.len()
+            );
+        }
+
         Ok(())
     }
 

@@ -1617,6 +1617,7 @@ pub struct AgenticExecutor {
     ai_executor: UnifiedAiSessionExecutor,
     checkpoint_db: Arc<CheckpointDb>,
     reflection_fix_ctx: Option<crate::mcp::shared::ReflectionFixContext>,
+    step_injection_ctx: Option<crate::step_injection::types::StepInjectionContext>,
 }
 
 impl AgenticExecutor {
@@ -1631,6 +1632,7 @@ impl AgenticExecutor {
             ai_executor: UnifiedAiSessionExecutor::new(app_state, app_handle, pid_tracker),
             checkpoint_db,
             reflection_fix_ctx: None,
+            step_injection_ctx: None,
         }
     }
 
@@ -1642,6 +1644,11 @@ impl AgenticExecutor {
     /// Set the reflection fix context for parsing [REFLECTION_FIX:...] markers.
     pub fn set_reflection_fix_ctx(&mut self, ctx: crate::mcp::shared::ReflectionFixContext) {
         self.reflection_fix_ctx = Some(ctx);
+    }
+
+    /// Set the step injection context for parsing [INJECT_STEP]...[/INJECT_STEP] markers.
+    pub fn set_step_injection_ctx(&mut self, ctx: crate::step_injection::types::StepInjectionContext) {
+        self.step_injection_ctx = Some(ctx);
     }
 
     /// Run the AI with the given prompt and failure context.
@@ -1670,13 +1677,13 @@ impl AgenticExecutor {
         has_agentic_steps: bool,
         agentic_steps: &[ExecutionStepConfig],
         logger: &StepEventLogger,
-    ) -> AgenticOutcome {
+    ) -> (AgenticOutcome, Vec<ExecutionStepConfig>) {
         if !has_agentic_steps && config.base_prompt.is_empty() {
             info!(
                 "AGENTIC-PHASE: No agentic steps and no base prompt, skipping (iteration {})",
                 iteration
             );
-            return AgenticOutcome::Skipped;
+            return (AgenticOutcome::Skipped, Vec::new());
         }
 
         // Filter out dev_mode_only steps when not in dev mode
@@ -1702,7 +1709,7 @@ impl AgenticExecutor {
                 "AGENTIC-PHASE: No remaining agentic steps and no base prompt, skipping (iteration {})",
                 iteration
             );
-            return AgenticOutcome::Skipped;
+            return (AgenticOutcome::Skipped, Vec::new());
         }
 
         // Check if any agentic step uses response mode (only relevant when steps exist)
@@ -1849,7 +1856,7 @@ impl AgenticExecutor {
                         if let Err(e) = self.checkpoint_db.create_task_run_event(&complete_event) {
                             warn!("Failed to emit agentic response-mode completion event: {}", e);
                         }
-                        return AgenticOutcome::Success { output };
+                        return (AgenticOutcome::Success { output }, Vec::new());
                     }
                     Err(e) => {
                         let duration_ms = start.elapsed().as_millis() as u64;
@@ -1901,13 +1908,13 @@ impl AgenticExecutor {
                         if let Err(e2) = self.checkpoint_db.create_task_run_event(&error_event) {
                             warn!("Failed to emit agentic response-mode error event: {}", e2);
                         }
-                        return AgenticOutcome::Error { error: e };
+                        return (AgenticOutcome::Error { error: e }, Vec::new());
                     }
                 }
             }
 
             // If we get here, no response-mode steps were found (shouldn't happen)
-            return AgenticOutcome::Skipped;
+            return (AgenticOutcome::Skipped, Vec::new());
         }
 
         // Create checkpoint manager for step-level checkpointing
@@ -2049,6 +2056,11 @@ impl AgenticExecutor {
             ai_config = ai_config.with_reflection_fix_ctx(ctx.clone());
         }
 
+        // Attach step injection context if set
+        if let Some(ref ctx) = self.step_injection_ctx {
+            ai_config = ai_config.with_step_injection_ctx(ctx.clone());
+        }
+
         let (result, duration_ms) = timeout_helper::timed_result_async(self.ai_executor.execute(
             &ai_config,
             &enhanced_prompt,
@@ -2068,6 +2080,7 @@ impl AgenticExecutor {
         )
         .with_step_name("AI Fixing Issues");
 
+        let injected_steps = result.injected_steps;
         let outcome = if result.success {
             completion_checkpoint.mark_success(Some(result.output.clone()), duration_ms);
             AgenticOutcome::Success {
@@ -2142,7 +2155,14 @@ impl AgenticExecutor {
             warn!("Failed to emit agentic completion event: {}", e);
         }
 
-        outcome
+        if !injected_steps.is_empty() {
+            info!(
+                "AGENTIC-PHASE: Collected {} injected verification step(s) from AI output",
+                injected_steps.len()
+            );
+        }
+
+        (outcome, injected_steps)
     }
 
     /// Get progress marker context from previous checkpoints.
@@ -3066,7 +3086,7 @@ impl Executor for AgenticExecutor {
             is_dev_mode: false,
         };
 
-        let outcome = self
+        let (outcome, _injected_steps) = self
             .run_agentic(
                 &loop_config,
                 config.iteration,

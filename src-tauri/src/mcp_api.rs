@@ -305,6 +305,7 @@ pub fn create_router(
         .merge(crate::mcp::error_monitor::routes())
         .merge(crate::mcp::extraction::routes())
         .merge(crate::mcp::findings_api::routes())
+        .merge(crate::mcp::generation_rules_api::routes())
         .merge(crate::mcp::hooks::routes())
         .merge(crate::mcp::interaction_recording::routes())
         .merge(crate::mcp::log_sources::routes())

@@ -9,6 +9,7 @@ pub mod generator;
 pub mod hardener;
 pub mod meta_workflow;
 pub mod relevance_filter;
+pub mod rules;
 pub mod schema_context;
 pub mod self_improve;
 pub mod similar_workflows;

@@ -52,6 +52,7 @@ pub struct LoopController {
     pid_tracker: Arc<std::sync::Mutex<Vec<u32>>>,
     doctor_handle: Option<DoctorHandle>,
     reflection_fix_ctx: Option<crate::mcp::shared::ReflectionFixContext>,
+    step_injection_ctx: Option<crate::step_injection::types::StepInjectionContext>,
 }
 
 impl LoopController {
@@ -97,6 +98,7 @@ impl LoopController {
             pid_tracker,
             doctor_handle,
             reflection_fix_ctx: None,
+            step_injection_ctx: None,
         }
     }
 
@@ -112,6 +114,13 @@ impl LoopController {
     pub fn with_reflection_fix_ctx(mut self, ctx: crate::mcp::shared::ReflectionFixContext) -> Self {
         self.agentic_executor.set_reflection_fix_ctx(ctx.clone());
         self.reflection_fix_ctx = Some(ctx);
+        self
+    }
+
+    /// Set the step injection context for parsing [INJECT_STEP]...[/INJECT_STEP] markers during agentic phase.
+    pub fn with_step_injection_ctx(mut self, ctx: crate::step_injection::types::StepInjectionContext) -> Self {
+        self.agentic_executor.set_step_injection_ctx(ctx.clone());
+        self.step_injection_ctx = Some(ctx);
         self
     }
 
@@ -553,7 +562,7 @@ impl LoopController {
                 agentic_iteration,
             );
 
-            let agentic_outcome = self
+            let (agentic_outcome, pre_loop_injected_steps) = self
                 .agentic_executor
                 .run_agentic(
                     &config,
@@ -564,6 +573,13 @@ impl LoopController {
                     &logger,
                 )
                 .await;
+
+            if !pre_loop_injected_steps.is_empty() {
+                info!(
+                    "Pre-loop agentic phase injected {} dynamic verification step(s)",
+                    pre_loop_injected_steps.len()
+                );
+            }
 
             // Persist workflow state: AgenticComplete
             self.persist_workflow_state(
@@ -630,6 +646,7 @@ impl LoopController {
                 &mut transitions,
                 &mut current_stage,
                 &logger,
+                pre_loop_injected_steps,
             )
             .await
         } else if skip_to_completion {
@@ -667,6 +684,7 @@ impl LoopController {
                 &mut transitions,
                 &mut current_stage,
                 &logger,
+                Vec::new(), // No initial dynamic steps for normal flow
             )
             .await
         };
@@ -977,10 +995,21 @@ impl LoopController {
         transitions: &mut Vec<StageTransition>,
         current_stage: &mut String,
         logger: &StepEventLogger,
+        initial_dynamic_steps: Vec<ExecutionStepConfig>,
     ) -> LoopResult {
         let mut iteration_results = Vec::new();
         // Start from the configured starting_iteration (for resume) or 0 (for fresh start)
         let mut iteration = config.starting_iteration;
+
+        // Dynamic verification steps accumulated from agentic phase outputs.
+        // These are merged with the static verification steps for subsequent iterations.
+        let mut dynamic_steps: Vec<ExecutionStepConfig> = initial_dynamic_steps;
+        if !dynamic_steps.is_empty() {
+            info!(
+                "Starting verification-agentic loop with {} pre-injected dynamic step(s)",
+                dynamic_steps.len()
+            );
+        }
 
         loop {
             iteration += 1;
@@ -1083,10 +1112,25 @@ impl LoopController {
                 iteration,
             );
 
+            // Build effective verification steps: static steps + any dynamically injected steps
+            let effective_verification_steps: Vec<ExecutionStepConfig> = if dynamic_steps.is_empty() {
+                verification_steps.to_vec()
+            } else {
+                let mut combined = verification_steps.to_vec();
+                combined.extend(dynamic_steps.iter().cloned());
+                info!(
+                    "Verification using {} static + {} dynamic = {} total steps",
+                    verification_steps.len(),
+                    dynamic_steps.len(),
+                    combined.len()
+                );
+                combined
+            };
+
             let (verification_result, step_results) = self
                 .verification_executor
                 .run_verification(
-                    verification_steps,
+                    &effective_verification_steps,
                     &config.execution_id,
                     iteration,
                     &config.workflow_name,
@@ -1331,7 +1375,7 @@ impl LoopController {
                 iteration,
             );
 
-            let agentic_outcome = self
+            let (agentic_outcome, new_injected_steps) = self
                 .agentic_executor
                 .run_agentic(
                     config,
@@ -1342,6 +1386,16 @@ impl LoopController {
                     logger,
                 )
                 .await;
+
+            // Accumulate any newly injected steps for future verification iterations
+            if !new_injected_steps.is_empty() {
+                info!(
+                    "Injected {} dynamic verification step(s) from agentic phase (iteration {})",
+                    new_injected_steps.len(),
+                    iteration
+                );
+                dynamic_steps.extend(new_injected_steps);
+            }
 
             // Persist workflow state: AgenticComplete
             self.persist_workflow_state(

@@ -6,12 +6,20 @@
 //! 2. `is_reflection` column check on source task run
 //! 3. Parent hierarchy tracking
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
+use rusqlite::Connection;
 use tracing::{debug, info};
 
 use crate::config_storage::ConfigStorage;
 use crate::database::CheckpointDb;
 use crate::AppState;
+
+/// Number of consecutive successful runs (zero findings) before suppressing reflection.
+const CONVERGENCE_THRESHOLD: u32 = 5;
+
+/// Number of consecutive reflection runs with identical findings before declaring stall.
+const REPEAT_THRESHOLD: u32 = 3;
 
 /// Dependencies required to launch a reflection workflow.
 ///
@@ -107,8 +115,175 @@ pub fn should_launch_reflection(
             return Ok(false);
         }
 
+        // Guard 4: Convergence suppression — skip reflection if the workflow has
+        // had N consecutive successful runs with zero findings. This prevents
+        // spawning vacuous reflections that find nothing new.
+        let converged = has_converged(conn, &source_id)?;
+        if converged {
+            info!(
+                "Skipping reflection for {} — workflow has converged",
+                source_id
+            );
+            return Ok(false);
+        }
+
         Ok(true)
     })
+}
+
+/// Check whether a workflow has converged — i.e., the last N consecutive
+/// non-reflection runs of the same workflow all completed successfully with
+/// zero findings. When this is true, spawning another reflection is wasteful.
+fn has_converged(conn: &Connection, source_task_run_id: &str) -> Result<bool, String> {
+    // Get the workflow name for the source run
+    let workflow_name: Option<String> = conn
+        .query_row(
+            "SELECT workflow_name FROM task_runs WHERE id = ?1",
+            rusqlite::params![source_task_run_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("Failed to get workflow_name: {}", e))?;
+
+    let workflow_name = match workflow_name {
+        Some(name) => name,
+        None => return Ok(false), // No workflow name → can't check convergence
+    };
+
+    // Get the last CONVERGENCE_THRESHOLD non-reflection completed runs of this workflow,
+    // ordered by most recent first
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT tr.id, tr.status,
+                   (SELECT COUNT(*) FROM task_run_findings WHERE task_run_id = tr.id) as finding_count
+            FROM task_runs tr
+            WHERE tr.workflow_name = ?1
+              AND tr.is_reflection = 0
+              AND tr.status IN ('complete', 'completed')
+            ORDER BY tr.completed_at DESC
+            LIMIT ?2
+            "#,
+        )
+        .map_err(|e| format!("Failed to prepare convergence query: {}", e))?;
+
+    let rows: Vec<(String, u32)> = stmt
+        .query_map(
+            rusqlite::params![workflow_name, CONVERGENCE_THRESHOLD],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u32>(2)?,
+                ))
+            },
+        )
+        .map_err(|e| format!("Failed to query convergence: {}", e))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Need at least CONVERGENCE_THRESHOLD runs to declare convergence
+    if rows.len() < CONVERGENCE_THRESHOLD as usize {
+        return Ok(false);
+    }
+
+    // All runs must have zero findings
+    let all_clean = rows.iter().all(|(_, count)| *count == 0);
+    if all_clean {
+        debug!(
+            "Workflow '{}' has {} consecutive clean runs — converged (zero findings)",
+            workflow_name,
+            rows.len()
+        );
+        return Ok(true);
+    }
+
+    // Check for repeated identical findings across reflection runs
+    if has_repeated_findings(conn, source_task_run_id, &workflow_name)? {
+        info!(
+            "Workflow '{}' has converged — last {} reflection runs found identical issues",
+            workflow_name, REPEAT_THRESHOLD
+        );
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+/// Check whether recent reflection runs keep finding the same issues.
+/// If the last REPEAT_THRESHOLD consecutive reflections for the same workflow
+/// produced identical signature_hash sets, the reflection loop has stalled.
+fn has_repeated_findings(
+    conn: &Connection,
+    _source_task_run_id: &str,
+    workflow_name: &str,
+) -> Result<bool, String> {
+    // Get last REPEAT_THRESHOLD reflection runs for this workflow
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT tr.id
+            FROM task_runs tr
+            WHERE tr.workflow_name LIKE 'Reflection: %'
+              AND tr.is_reflection = 1
+              AND tr.status IN ('complete', 'completed')
+              AND tr.reflection_source_task_run_id IN (
+                SELECT id FROM task_runs WHERE workflow_name = ?1
+              )
+            ORDER BY tr.completed_at DESC
+            LIMIT ?2
+            "#,
+        )
+        .map_err(|e| format!("Failed to prepare repeated-findings query: {}", e))?;
+
+    let reflection_ids: Vec<String> = stmt
+        .query_map(rusqlite::params![workflow_name, REPEAT_THRESHOLD], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|e| format!("Failed to query reflection runs: {}", e))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Need at least REPEAT_THRESHOLD reflection runs
+    if reflection_ids.len() < REPEAT_THRESHOLD as usize {
+        return Ok(false);
+    }
+
+    // Collect signature sets for each reflection run
+    let mut finding_sets: Vec<BTreeSet<String>> = Vec::new();
+    let mut sig_stmt = conn
+        .prepare(
+            r#"
+            SELECT COALESCE(signature_hash, title) as sig
+            FROM task_run_findings
+            WHERE task_run_id = ?1
+            ORDER BY sig
+            "#,
+        )
+        .map_err(|e| format!("Failed to prepare signature query: {}", e))?;
+
+    for ref_id in &reflection_ids {
+        let sigs: BTreeSet<String> = sig_stmt
+            .query_map(rusqlite::params![ref_id], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("Failed to query findings for {}: {}", ref_id, e))?
+            .filter_map(|r| r.ok())
+            .collect();
+        finding_sets.push(sigs);
+    }
+
+    // All sets must be identical and non-empty
+    let first = &finding_sets[0];
+    if first.is_empty() {
+        return Ok(false);
+    }
+
+    let all_identical = finding_sets.iter().all(|s| s == first);
+    if all_identical {
+        debug!(
+            "Last {} reflection runs for '{}' all found identical findings: {:?}",
+            REPEAT_THRESHOLD, workflow_name, first
+        );
+    }
+
+    Ok(all_identical)
 }
 
 /// Launch a reflection workflow to analyze the given source task run.
@@ -191,13 +366,18 @@ pub fn launch_reflection(
         reflection_task_run_id: reflection_id.clone(),
     };
 
+    let step_injection_ctx = crate::step_injection::types::StepInjectionContext {
+        execution_id: reflection_id.clone(),
+    };
+
     let mut controller = crate::unified_workflow_executor::LoopController::new(
         deps.app_state.clone(),
         deps.config_storage.clone(),
         deps.app_handle.clone(),
         deps.pid_tracker.clone(),
     )
-    .with_reflection_fix_ctx(reflection_fix_ctx);
+    .with_reflection_fix_ctx(reflection_fix_ctx)
+    .with_step_injection_ctx(step_injection_ctx);
 
     info!(
         "Spawning reflection workflow '{}' (id: {}) with {} setup steps",
@@ -236,4 +416,242 @@ pub fn launch_reflection(
     );
 
     Ok(reflection_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn setup_test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE task_runs (
+                id TEXT PRIMARY KEY,
+                task_name TEXT NOT NULL,
+                workflow_name TEXT,
+                status TEXT DEFAULT 'running',
+                is_reflection INTEGER DEFAULT 0,
+                reflection_source_task_run_id TEXT,
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE task_run_findings (
+                id TEXT PRIMARY KEY,
+                task_run_id TEXT NOT NULL,
+                signature_hash TEXT,
+                category TEXT,
+                title TEXT,
+                detected_at TEXT
+            );
+            "#,
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_clean_run(conn: &Connection, id: &str, workflow_name: &str, completed_at: &str) {
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, workflow_name, status, is_reflection, completed_at, created_at, updated_at) \
+             VALUES (?1, 'Test', ?2, 'complete', 0, ?3, ?3, ?3)",
+            rusqlite::params![id, workflow_name, completed_at],
+        )
+        .unwrap();
+    }
+
+    fn insert_run_with_findings(
+        conn: &Connection,
+        id: &str,
+        workflow_name: &str,
+        completed_at: &str,
+        finding_count: u32,
+    ) {
+        insert_clean_run(conn, id, workflow_name, completed_at);
+        for i in 0..finding_count {
+            conn.execute(
+                "INSERT INTO task_run_findings (id, task_run_id, category, title, detected_at) \
+                 VALUES (?1, ?2, 'test', 'finding', ?3)",
+                rusqlite::params![format!("{}-f{}", id, i), id, completed_at],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_has_converged_true_after_threshold() {
+        let conn = setup_test_db();
+        let wf = "my-workflow";
+        // Insert exactly CONVERGENCE_THRESHOLD clean runs
+        for i in 0..CONVERGENCE_THRESHOLD {
+            insert_clean_run(
+                &conn,
+                &format!("run-{}", i),
+                wf,
+                &format!("2025-01-01T{:02}:00:00Z", i),
+            );
+        }
+        // Source run is the latest one
+        let source_id = format!("run-{}", CONVERGENCE_THRESHOLD - 1);
+        assert!(has_converged(&conn, &source_id).unwrap());
+    }
+
+    #[test]
+    fn test_has_converged_false_below_threshold() {
+        let conn = setup_test_db();
+        let wf = "my-workflow";
+        // Insert fewer than threshold
+        for i in 0..(CONVERGENCE_THRESHOLD - 1) {
+            insert_clean_run(
+                &conn,
+                &format!("run-{}", i),
+                wf,
+                &format!("2025-01-01T{:02}:00:00Z", i),
+            );
+        }
+        let source_id = format!("run-{}", CONVERGENCE_THRESHOLD - 2);
+        assert!(!has_converged(&conn, &source_id).unwrap());
+    }
+
+    #[test]
+    fn test_has_converged_false_when_findings_present() {
+        let conn = setup_test_db();
+        let wf = "my-workflow";
+        // Insert CONVERGENCE_THRESHOLD runs, but one has findings
+        for i in 0..CONVERGENCE_THRESHOLD {
+            if i == 2 {
+                insert_run_with_findings(
+                    &conn,
+                    &format!("run-{}", i),
+                    wf,
+                    &format!("2025-01-01T{:02}:00:00Z", i),
+                    3,
+                );
+            } else {
+                insert_clean_run(
+                    &conn,
+                    &format!("run-{}", i),
+                    wf,
+                    &format!("2025-01-01T{:02}:00:00Z", i),
+                );
+            }
+        }
+        let source_id = format!("run-{}", CONVERGENCE_THRESHOLD - 1);
+        assert!(!has_converged(&conn, &source_id).unwrap());
+    }
+
+    #[test]
+    fn test_has_converged_false_no_workflow_name() {
+        let conn = setup_test_db();
+        // Insert a run without a workflow name
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, status, is_reflection, completed_at, created_at, updated_at) \
+             VALUES ('run-1', 'Test', 'complete', 0, '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        assert!(!has_converged(&conn, "run-1").unwrap());
+    }
+
+    // --- Repeated-findings tests ---
+
+    fn insert_reflection_run(
+        conn: &Connection,
+        id: &str,
+        source_workflow: &str,
+        source_run_id: &str,
+        completed_at: &str,
+        finding_hashes: &[&str],
+    ) {
+        let reflection_name = format!("Reflection: {}", source_workflow);
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, workflow_name, status, is_reflection, reflection_source_task_run_id, completed_at, created_at, updated_at) \
+             VALUES (?1, 'Reflection', ?2, 'complete', 1, ?3, ?4, ?4, ?4)",
+            rusqlite::params![id, reflection_name, source_run_id, completed_at],
+        )
+        .unwrap();
+        for (i, hash) in finding_hashes.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO task_run_findings (id, task_run_id, signature_hash, category, title, detected_at) \
+                 VALUES (?1, ?2, ?3, 'test', 'finding', ?4)",
+                rusqlite::params![format!("{}-f{}", id, i), id, hash, completed_at],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_has_repeated_findings_true_when_same_hashes() {
+        let conn = setup_test_db();
+        let wf = "my-workflow";
+        // Insert source run
+        insert_clean_run(&conn, "source-1", wf, "2025-01-01T00:00:00Z");
+
+        // Insert 3 reflection runs with identical finding hashes
+        for i in 0..REPEAT_THRESHOLD {
+            insert_reflection_run(
+                &conn,
+                &format!("ref-{}", i),
+                wf,
+                "source-1",
+                &format!("2025-01-01T{:02}:00:00Z", i + 1),
+                &["hash-a", "hash-b"],
+            );
+        }
+
+        assert!(has_repeated_findings(&conn, "source-1", wf).unwrap());
+    }
+
+    #[test]
+    fn test_has_repeated_findings_false_when_different_hashes() {
+        let conn = setup_test_db();
+        let wf = "my-workflow";
+        insert_clean_run(&conn, "source-1", wf, "2025-01-01T00:00:00Z");
+
+        // 3 reflection runs with varying findings
+        insert_reflection_run(&conn, "ref-0", wf, "source-1", "2025-01-01T01:00:00Z", &["hash-a", "hash-b"]);
+        insert_reflection_run(&conn, "ref-1", wf, "source-1", "2025-01-01T02:00:00Z", &["hash-a", "hash-c"]);
+        insert_reflection_run(&conn, "ref-2", wf, "source-1", "2025-01-01T03:00:00Z", &["hash-a", "hash-b"]);
+
+        assert!(!has_repeated_findings(&conn, "source-1", wf).unwrap());
+    }
+
+    #[test]
+    fn test_has_repeated_findings_false_below_threshold() {
+        let conn = setup_test_db();
+        let wf = "my-workflow";
+        insert_clean_run(&conn, "source-1", wf, "2025-01-01T00:00:00Z");
+
+        // Only 2 reflection runs (below REPEAT_THRESHOLD of 3)
+        insert_reflection_run(&conn, "ref-0", wf, "source-1", "2025-01-01T01:00:00Z", &["hash-a"]);
+        insert_reflection_run(&conn, "ref-1", wf, "source-1", "2025-01-01T02:00:00Z", &["hash-a"]);
+
+        assert!(!has_repeated_findings(&conn, "source-1", wf).unwrap());
+    }
+
+    #[test]
+    fn test_has_converged_ignores_reflection_runs() {
+        let conn = setup_test_db();
+        let wf = "my-workflow";
+        // Insert clean non-reflection runs below threshold
+        for i in 0..(CONVERGENCE_THRESHOLD - 1) {
+            insert_clean_run(
+                &conn,
+                &format!("run-{}", i),
+                wf,
+                &format!("2025-01-01T{:02}:00:00Z", i),
+            );
+        }
+        // Insert a reflection run (should be ignored)
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, workflow_name, status, is_reflection, completed_at, created_at, updated_at) \
+             VALUES ('ref-1', 'Reflection', ?1, 'complete', 1, '2025-01-01T10:00:00Z', '2025-01-01T10:00:00Z', '2025-01-01T10:00:00Z')",
+            rusqlite::params![wf],
+        )
+        .unwrap();
+        // Still below threshold because the reflection run is excluded
+        let source_id = format!("run-{}", CONVERGENCE_THRESHOLD - 2);
+        assert!(!has_converged(&conn, &source_id).unwrap());
+    }
 }

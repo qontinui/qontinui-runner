@@ -21,6 +21,7 @@ use crate::context;
 use crate::doctor::DoctorHandle;
 use crate::unified_workflows::UnifiedWorkflow;
 use crate::workflow_generation::hardener::{self, HardeningSummary};
+use crate::workflow_generation::rules;
 use crate::workflow_generation::schema_context::{build_schema_context, build_schema_context_full};
 use rusqlite::Connection;
 use crate::workflow_generation::validation::{fix_workflow, validate_workflow, ValidationError};
@@ -153,7 +154,7 @@ pub fn generate_workflow(
             info!("Verification iteration {}/{}", iter_num, max_fix_iters);
 
             // Run verification agent
-            let issues = run_verification_agent(&workflow, &request.description, doctor_handle);
+            let issues = run_verification_agent(&workflow, &request.description, doctor_handle, conn);
 
             let issue_count = issues.len();
             info!("Verification found {} issues", issue_count);
@@ -218,7 +219,7 @@ pub fn generate_workflow(
 
     // ── Hardener Agent ───────────────────────────────────────────────────
     let (workflow, hardening_summary) =
-        hardener::run_hardener_agent(&workflow, &request.description, doctor_handle);
+        hardener::run_hardener_agent(&workflow, &request.description, doctor_handle, conn);
 
     // ── Final structural validation ────────────────────────────────────────
     let validation_errors: Vec<ValidationError> = validate_workflow(&workflow);
@@ -386,6 +387,7 @@ fn run_verification_agent(
     workflow: &UnifiedWorkflow,
     user_description: &str,
     doctor_handle: Option<&DoctorHandle>,
+    conn: Option<&Connection>,
 ) -> Vec<String> {
     let workflow_json = match serde_json::to_string_pretty(workflow) {
         Ok(j) => j,
@@ -398,7 +400,7 @@ fn run_verification_agent(
         }
     };
 
-    let prompt = build_verification_prompt(&workflow_json, user_description);
+    let prompt = build_verification_prompt(&workflow_json, user_description, conn);
     let task_context = TaskContext::from_prompt(&prompt);
     let ai_result: AiResponse = run_prompt_with_routing(&prompt, &task_context, doctor_handle);
 
@@ -415,72 +417,32 @@ fn run_verification_agent(
 }
 
 /// Build the prompt for the verification agent.
-fn build_verification_prompt(workflow_json: &str, user_description: &str) -> String {
+fn build_verification_prompt(workflow_json: &str, user_description: &str, conn: Option<&Connection>) -> String {
+    // Load check rules from DB if available
+    let check_rules_section = if let Some(conn) = conn {
+        let check_rules = rules::load_rules(conn, "verification", "check_rules");
+        if !check_rules.is_empty() {
+            let mut s = String::from("## What to check\n\nFor EVERY step in setup_steps, verification_steps, and completion_steps, verify:\n\n");
+            for rule in &check_rules {
+                s.push_str(&format!("### {}\n{}\n\n", rule.title, rule.content));
+            }
+            Some(s)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let checks = check_rules_section.unwrap_or_else(|| FALLBACK_VERIFICATION_CHECKS.to_string());
+
     format!(
         r#"You are a workflow verification agent for Qontinui Runner.
 Your job is to review a generated UnifiedWorkflow JSON and find semantic errors in the deterministic steps — WITHOUT running anything.
 
-## What to check
+{checks}
 
-For EVERY step in setup_steps, verification_steps, and completion_steps, verify:
-
-### shell_command steps
-- `command` is a real, syntactically valid shell command (not a placeholder like "echo TODO" or "/path/to/script")
-- `working_directory`, if present, looks like a real path (not "/path/to/project" or "{{placeholder}}")
-- `timeout_seconds` is reasonable for the command (not 0, not absurdly high for simple commands)
-- `fail_on_error` is appropriate (setup deps should usually fail, cleanups often shouldn't)
-
-### check steps
-- `check_type` and `command` are consistent:
-  - "lint" → command should run a linter (eslint, ruff, pylint, clippy, etc.)
-  - "typecheck" → command should run a type checker (tsc, mypy, pyright, etc.)
-  - "format" → command should run a formatter check (prettier, black, rustfmt, etc.)
-  - "analyze" → static analysis tool
-  - "security" → security scanner
-  - "custom_command" → any command is fine
-- `command` is non-empty and syntactically valid
-
-### test steps
-- Has either `command` (for repository/custom_command) or `code` (for playwright/python)
-- `test_type` is one of: playwright, qontinui_vision, python, repository, custom_command
-- The command/code looks substantive (not a placeholder)
-
-### api_request steps
-- `url` starts with "http://" or "https://" and is a plausible URL (not "http://example.com" unless testing)
-- `method` is a valid HTTP method
-- If `body` is provided, `content_type` is consistent (JSON body → application/json)
-- `assertions` reference valid types ("status_code", "body_contains", etc.)
-- **WEAK SDK ASSERTION CHECK:** If the `url` contains `/ui-bridge/sdk/` AND the only assertion is `status_code: 200` (no `body_contains`, no `json_path`, no `header_contains`), flag it: "WEAK ASSERTION: api_request '{{step name}}' targets SDK endpoint {{url}} but only checks status_code 200. SDK endpoints return 200 even for empty results. Add a body_contains assertion to verify meaningful content (e.g., expected element text, search result, or page title)."
-
-### prompt steps (especially in agentic_steps)
-- Content is substantive — at least 2 sentences with specific instructions
-- Agentic prompts reference verification results and describe what to fix
-- Not a generic placeholder like "Fix the errors" or "Do the task"
-
-### spec steps
-- `spec_group` has a `name` and non-empty `assertions` array
-- `element_source` is "control" or "external"
-- Each assertion has `assertionType`, `target` with search criteria
-
-### gate steps
-- `required_steps` references step IDs that actually exist in the same verification_steps array
-
-### UI Bridge SDK usage
-- If the workflow targets a web app (localhost:3001, localhost:1420, or similar React/Next.js app) but does NOT include a setup step to connect via UI Bridge SDK (POST to /ui-bridge/sdk/connect), flag it: "Workflow targets a web app but is missing a UI Bridge SDK connect step in setup — add POST /ui-bridge/sdk/connect to enable direct element access."
-- If the workflow targets a web app and uses Playwright (script or test steps) for simple element inspection or clicking when SDK endpoints could be used instead, flag it: "Consider using UI Bridge SDK endpoints instead of Playwright for '{{step name}}' — the SDK provides direct element access without browser overhead."
-- If agentic prompt steps mention web UI interaction but don't reference SDK tools (sdk_elements, sdk_snapshot, sdk_ai_execute, sdk_ai_search), flag it: "Agentic prompt '{{step name}}' should reference SDK tools for web UI interaction."
-
-### Agentic-verification correspondence
-- For EACH prompt step in agentic_steps, there MUST be at least one corresponding deterministic verification step (check, test, api_request, or spec) that can detect whether that agentic step's work succeeded. Examine each agentic prompt's content to identify what it implements, then check whether verification_steps has a step that specifically tests that feature.
-- If an agentic step has no corresponding verification step, flag it: "MISSING VERIFICATION: agentic_steps[N] '{{step name}}' implements {{feature}} but no verification step tests for this. Add an api_request or check step that verifies {{feature}} and include its ID in the gate's required_steps."
-- Tab/section existence checks (e.g., searching for "State View" text) do NOT count as adequate verification for the tab's CONTENT or FUNCTIONALITY. A tab can exist while being empty or broken.
-
-### Cross-step and structural checks
-- If there are verification steps, there should be at least one agentic prompt step
-- Setup steps should logically prepare for what verification checks
-- Step names are descriptive (not "Step 1", "Test", "Check", etc.)
-- No duplicate step IDs
-- Steps match the user's original request: "{user_description}"
+Steps match the user's original request: "{user_description}"
 
 ## Output format
 
@@ -497,10 +459,46 @@ Examples:
 ## Workflow JSON to verify
 
 {workflow_json}"#,
+        checks = checks,
         user_description = user_description,
         workflow_json = workflow_json,
     )
 }
+
+/// Hardcoded fallback verification checks, used when no DB connection is available.
+const FALLBACK_VERIFICATION_CHECKS: &str = r#"## What to check
+
+For EVERY step in setup_steps, verification_steps, and completion_steps, verify:
+
+### shell_command validation
+`command` is a real, syntactically valid shell command (not a placeholder like "echo TODO" or "/path/to/script"). `working_directory`, if present, looks like a real path. `timeout_seconds` is reasonable. `fail_on_error` is appropriate.
+
+### check step consistency
+`check_type` and `command` are consistent: "lint" → linter, "typecheck" → type checker, "format" → formatter check, "analyze" → static analysis, "security" → security scanner, "custom_command" → any command. `command` is non-empty and syntactically valid.
+
+### test step validation
+Has either `command` (for repository/custom_command) or `code` (for playwright/python). `test_type` is one of: playwright, qontinui_vision, python, repository, custom_command. The command/code looks substantive (not a placeholder).
+
+### api_request validation and weak SDK assertion check
+`url` starts with "http://" or "https://" and is a plausible URL. `method` is a valid HTTP method. If `body` is provided, `content_type` is consistent. `assertions` reference valid types. WEAK SDK ASSERTION CHECK: If the `url` contains `/ui-bridge/sdk/` AND the only assertion is `status_code: 200`, flag it.
+
+### prompt step quality
+Content is substantive — at least 2 sentences with specific instructions. Agentic prompts reference verification results and describe what to fix. Not a generic placeholder like "Fix the errors" or "Do the task".
+
+### spec step validation
+`spec_group` has a `name` and non-empty `assertions` array. `element_source` is "control" or "external". Each assertion has `assertionType`, `target` with search criteria.
+
+### gate step validation
+`required_steps` references step IDs that actually exist in the same verification_steps array.
+
+### UI Bridge SDK usage
+If the workflow targets a web app but does NOT include a setup step to connect via UI Bridge SDK (POST to /ui-bridge/sdk/connect), flag it. If the workflow uses Playwright for simple element inspection when SDK endpoints could be used instead, flag it. If agentic prompt steps mention web UI interaction but don't reference SDK tools, flag it.
+
+### Agentic-verification correspondence
+For EACH prompt step in agentic_steps, there MUST be at least one corresponding deterministic verification step that can detect whether that agentic step's work succeeded. Tab/section existence checks do NOT count as adequate verification for the tab's CONTENT or FUNCTIONALITY.
+
+### Cross-step and structural checks
+If there are verification steps, there should be at least one agentic prompt step. Setup steps should logically prepare for what verification checks. Step names are descriptive (not "Step 1", "Test", "Check"). No duplicate step IDs."#;
 
 /// Parse the verification agent's response into a list of issue strings.
 fn parse_verification_response(response: &str) -> Vec<String> {

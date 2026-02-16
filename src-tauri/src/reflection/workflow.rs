@@ -16,7 +16,7 @@ pub fn build_reflection_config(
     source_workflow_name: &str,
 ) -> LoopConfig {
     LoopConfig {
-        max_iterations: 2,
+        max_iterations: 3,
         base_prompt: build_agentic_prompt(source_workflow_name),
         workflow_name: workflow_name.to_string(),
         workflow_id: format!("reflection-{}", execution_id),
@@ -252,9 +252,11 @@ Finding: finding-abc123
 - `low` — Speculative, log but don't auto-apply
 
 ### Auto-Applied Fix Types
-The following fix types are automatically applied by the system (creating knowledge base entries):
+The following fix types are automatically applied by the system:
 - `knowledge_base_update` at high/medium confidence → Creates a recurring_pattern knowledge entry
 - `context_addition` at high confidence → Creates a context knowledge entry
+- `instruction_clarification` at high confidence → Creates a new generation rule for the relevant prompt agent (schema_context, hardener, or verification). Use this for insights about how generation prompts should be improved.
+- `workflow_step_rewrite` at high confidence → Creates a new generation rule for the relevant prompt agent. Use this for patterns about how specific step types should be generated differently.
 
 All other fix types are recorded for manual review. Use these auto-applied types when you have
 clear, actionable insights that should persist across runs. Avoid low-confidence auto-applied types
@@ -264,6 +266,30 @@ as they will only be recorded without creating knowledge entries.
 Fixes are deduplicated by content hash (fix_type + description + old_value + new_value).
 If an identical fix already exists with status 'applied', the duplicate will be skipped.
 Only emit fixes for genuinely new insights — do NOT re-emit fixes from previous reflection runs.
+
+## Verification Steps
+
+For EACH fix you apply, also output a verification step using `[INJECT_STEP]...[/INJECT_STEP]` markers.
+The step should verify that the fix was correctly applied. Use JSON format with these step types:
+- `api_request`: HTTP request with expected status code
+- `check_command`: Shell command that should exit 0
+- `prompt`: AI verification question
+
+These injected steps will be added to the verification phase to confirm your fixes work.
+
+### Example
+
+```
+[INJECT_STEP]
+{{"type": "api_request", "name": "Verify KB entry exists", "api_url": "http://localhost:9876/task-runs/current/knowledge", "api_method": "GET", "api_expected_status": 200}}
+[/INJECT_STEP]
+```
+
+```
+[INJECT_STEP]
+{{"type": "prompt", "name": "Verify context fix applied", "promptContent": "Check that the workspace root path is now included in the setup context for subsequent runs."}}
+[/INJECT_STEP]
+```
 
 ### Step 5: Evaluate Previous Fixes
 Compare the source run's findings against previously applied fixes:

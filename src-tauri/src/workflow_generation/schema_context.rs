@@ -8,6 +8,7 @@ use rusqlite::Connection;
 
 use super::example_workflows::{find_relevant_examples, format_examples_for_prompt};
 use super::relevance_filter::filter_relevant_step_types;
+use super::rules;
 use super::step_type_metadata::{get_all_step_type_metadata, StepTypeMetadata};
 
 /// Build the complete schema context prompt for AI workflow generation.
@@ -18,7 +19,7 @@ pub fn build_schema_context() -> String {
     let type_refs: Vec<&StepTypeMetadata> = all_types.iter().collect();
     let step_types_doc = generate_step_types_documentation(&type_refs);
     let phase_table = generate_phase_constraint_table(&type_refs);
-    assemble_prompt(&step_types_doc, &phase_table, "")
+    assemble_prompt(&step_types_doc, &phase_table, "", None)
 }
 
 /// Build schema context filtered by description keywords.
@@ -30,7 +31,7 @@ pub fn build_schema_context_for_description(description: &str) -> String {
     let filtered = filter_relevant_step_types(description, all_types);
     let step_types_doc = generate_step_types_documentation(&filtered);
     let phase_table = generate_phase_constraint_table(&filtered);
-    assemble_prompt(&step_types_doc, &phase_table, "")
+    assemble_prompt(&step_types_doc, &phase_table, "", None)
 }
 
 /// Build full schema context with filtered types + RAG examples from DB.
@@ -59,7 +60,7 @@ pub fn build_schema_context_full(
         String::new()
     };
 
-    assemble_prompt(&step_types_doc, &phase_table, &examples_section)
+    assemble_prompt(&step_types_doc, &phase_table, &examples_section, conn)
 }
 
 // ============================================================================
@@ -159,12 +160,15 @@ pub fn generate_phase_constraint_table(types: &[&StepTypeMetadata]) -> String {
 // Prompt Assembly
 // ============================================================================
 
-fn assemble_prompt(step_types: &str, phase_table: &str, examples: &str) -> String {
+fn assemble_prompt(step_types: &str, phase_table: &str, examples: &str, conn: Option<&Connection>) -> String {
     let examples_section = if examples.is_empty() {
         String::new()
     } else {
         format!("## Examples\n\n{}", examples)
     };
+
+    // Build rules from DB if available, otherwise use hardcoded fallback
+    let rules_section = build_rules_section(conn);
 
     format!(
         r#"You are a workflow generation assistant for Qontinui Runner.
@@ -219,34 +223,7 @@ The Verification/Agentic loop continues until all blocking checks pass or max_it
 
 {examples_section}
 
-## Important Rules
-1. Generate valid UUIDs for all `id` fields (format: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx)
-2. `phase` field MUST match the array the step is in (setup_steps -> "setup", etc.)
-3. `agentic_steps` can ONLY contain `prompt` type steps
-4. Use ISO 8601 format for timestamps (e.g., "2024-01-15T10:30:00Z")
-5. Return ONLY the JSON object, no markdown formatting
-
-## Verification Quality Rules (MANDATORY)
-
-These rules are NON-NEGOTIABLE. Workflows that violate them will be rejected.
-
-6. **verification_steps MUST include at least one deterministic, automated step** — one of: `check`, `test`, `spec`, or `api_request` with assertions. Do NOT use only `prompt` type steps for verification. Prompts provide AI judgment, not deterministic pass/fail results. A verification phase with ONLY prompt steps is INVALID.
-7. **Code modification requires typecheck**: When the workflow creates or modifies source code files (TypeScript, Python, Rust, etc.), verification MUST include a `check` step with the appropriate type checker:
-   - TypeScript/TSX/JSX: `{{"type": "check", "check_type": "typecheck", "command": "npx tsc --noEmit", "working_directory": "..."}}`
-   - Python: `{{"type": "check", "check_type": "typecheck", "command": "mypy .", "working_directory": "..."}}`
-   - Rust: `{{"type": "check", "check_type": "typecheck", "command": "cargo check", "working_directory": "..."}}`
-8. **Web app verification requires SDK or Playwright**: When the workflow targets a web application (localhost:3001, localhost:1420), verification MUST include at least one of:
-   - An `api_request` step querying UI Bridge SDK endpoints (preferred) to verify UI state programmatically
-   - A `test` step with `test_type: "playwright"` for browser-based verification
-   - A `spec` step with UI Bridge assertions
-9. **Gate step required with ALL non-prompt steps**: Every workflow with 2+ verification steps MUST include a `gate` step whose `required_steps` array lists the IDs of ALL non-gate, non-prompt verification steps. The gate passes only when every required step passes — there is NO threshold. If a step is worth including in verification, it MUST be in the gate's `required_steps`. Omitting a step from the gate makes its failure invisible to the verification loop.
-10. **Prompts are supplementary**: `prompt` type steps in verification are acceptable as supplementary checks (e.g., semantic code review, cross-referencing documentation) but must NEVER be the sole verification mechanism
-11. **Test steps with inline commands MUST use test_type "repository"**: When a `test` step runs a shell command (e.g., `npx playwright test ...`, `cargo test ...`), set `test_type: "repository"`. The `test_type: "playwright"` value is ONLY for steps that provide `code` with Playwright assertions to be executed via CDP. Using `"playwright"` for shell commands causes a "No test_id specified" error.
-12. **Next.js App Router path conventions**: For Next.js projects using the App Router (`src/app/`), components are organized under route groups like `src/app/(app)/`. When creating ESLint `check` steps, use the correct paths — e.g., `src/app/(app)/management/` not `src/components/`. Always verify path patterns match the actual project structure.
-13. **Verification step caching**: Running tasks cache their verification steps at startup. Updating a workflow definition via the API (e.g., `PUT /unified-workflows/{{id}}`) does NOT affect the currently executing task's verification steps. The AI agent should NOT attempt to fix verification step configuration by updating the workflow API mid-run — instead, it should focus on fixing the underlying code issues or report the config issue for the next run.
-14. **Feature-specific verification required**: Verification plans for feature-implementation workflows MUST include feature-specific checks (element presence, tab visibility, component rendering) in addition to compilation/lint gates. Compilation-only verification causes premature completion when the AI fixes pre-existing errors without implementing the actual feature.
-15. **SDK assertions must verify content, not just reachability**: When an `api_request` step targets a UI Bridge SDK endpoint (`/ui-bridge/sdk/...`), a `status_code: 200` assertion alone is INSUFFICIENT. SDK endpoints return 200 even for empty results (e.g., `ai/search` returns `{{"results": [], "total": 0}}`). Every SDK `api_request` MUST include at least one of: `body_contains` (with expected text/element), `json_path` (with expected value), or `header_contains`. Example — BAD: only `{{"type": "status_code", "expected": 200}}`. GOOD: `[{{"type": "status_code", "expected": 200}}, {{"type": "body_contains", "expected": "Settings"}}]`.
-16. **Every agentic step must have a corresponding deterministic verification step**: Each `prompt` step in `agentic_steps` describes a specific piece of work (e.g., "implement drag-and-drop", "add thumbnails"). For EACH agentic step, `verification_steps` MUST contain at least one deterministic step (`check`, `test`, `api_request`, or `spec`) that verifies the output of that work. The gate's `required_steps` must include these verification steps so their failure triggers the agentic loop. Without this, the AI may claim a feature is "done" but the verification loop has no way to confirm it. Example: if an agentic step says "implement element thumbnails in state nodes", verification must include an `api_request` to the UI Bridge SDK that searches for thumbnail-related elements or content, NOT just a tab-existence check.
+{rules_section}
 
 ## Environment Aliases
 When the user mentions these terms, map them to the correct endpoints:
@@ -415,6 +392,55 @@ These are preferred over Playwright for inspection, content reading, and simple 
 
 // ============================================================================
 // Helpers
+// ============================================================================
+
+/// Build the Important Rules + Verification Quality Rules section.
+///
+/// Loads from `generation_rules` DB table if a connection is available,
+/// otherwise falls back to the hardcoded text.
+fn build_rules_section(conn: Option<&Connection>) -> String {
+    if let Some(conn) = conn {
+        let important = rules::load_rules(conn, "schema_context", "important_rules");
+        let quality = rules::load_rules(conn, "schema_context", "verification_quality");
+
+        // Only use DB rules if we actually got results (table might not be seeded yet)
+        if !important.is_empty() || !quality.is_empty() {
+            let mut s = String::from("## Important Rules\n");
+            s.push_str(&rules::format_rules_as_markdown(&important));
+            s.push_str("\n\n## Verification Quality Rules (MANDATORY)\n\nThese rules are NON-NEGOTIABLE. Workflows that violate them will be rejected.\n\n");
+            s.push_str(&rules::format_rules_as_markdown(&quality));
+            return s;
+        }
+    }
+
+    // Fallback: hardcoded rules
+    FALLBACK_SCHEMA_CONTEXT_RULES.to_string()
+}
+
+/// Hardcoded fallback rules used when no DB connection is available.
+const FALLBACK_SCHEMA_CONTEXT_RULES: &str = r#"## Important Rules
+1. **Generate valid UUIDs**: Generate valid UUIDs for all `id` fields (format: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx)
+2. **Phase field must match array**: `phase` field MUST match the array the step is in (setup_steps -> "setup", etc.)
+3. **Agentic steps are prompt only**: `agentic_steps` can ONLY contain `prompt` type steps
+4. **ISO 8601 timestamps**: Use ISO 8601 format for timestamps (e.g., "2024-01-15T10:30:00Z")
+5. **JSON only output**: Return ONLY the JSON object, no markdown formatting
+
+## Verification Quality Rules (MANDATORY)
+
+These rules are NON-NEGOTIABLE. Workflows that violate them will be rejected.
+
+6. **Deterministic verification step required**: verification_steps MUST include at least one deterministic, automated step — one of: `check`, `test`, `spec`, or `api_request` with assertions. Do NOT use only `prompt` type steps for verification.
+7. **Code modification requires typecheck**: When the workflow creates or modifies source code files, verification MUST include a `check` step with the appropriate type checker.
+8. **Web app verification requires SDK or Playwright**: When the workflow targets a web application, verification MUST include SDK-based or Playwright-based checks.
+9. **Gate step required with ALL non-prompt steps**: Every workflow with 2+ verification steps MUST include a `gate` step whose `required_steps` array lists the IDs of ALL non-gate, non-prompt verification steps.
+10. **Prompts are supplementary**: `prompt` type steps in verification must NEVER be the sole verification mechanism.
+11. **Test steps with inline commands use repository**: When a `test` step runs a shell command, set `test_type: "repository"`.
+12. **Next.js App Router path conventions**: Use correct paths like `src/app/(app)/`.
+13. **Verification step caching**: Running tasks cache verification steps at startup; API updates don't affect current task.
+14. **Feature-specific verification required**: Must include feature-specific checks, not just compilation/lint gates.
+15. **SDK assertions must verify content**: A `status_code: 200` assertion alone is INSUFFICIENT for SDK endpoints.
+16. **Agentic-verification correspondence**: Each agentic step must have a corresponding deterministic verification step."#;
+
 // ============================================================================
 
 fn format_phases_for_header(phases: &[&str]) -> String {

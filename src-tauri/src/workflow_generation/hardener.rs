@@ -24,6 +24,8 @@ use crate::ai_router::TaskContext;
 use crate::doctor::DoctorHandle;
 use crate::unified_workflows::UnifiedWorkflow;
 use crate::workflow_generation::generator::extract_json_from_response;
+use crate::workflow_generation::rules;
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, info, warn};
@@ -280,6 +282,7 @@ pub fn run_hardener_agent(
     workflow: &UnifiedWorkflow,
     description: &str,
     doctor_handle: Option<&DoctorHandle>,
+    conn: Option<&Connection>,
 ) -> (UnifiedWorkflow, Option<HardeningSummary>) {
     if !should_harden_verification(workflow) {
         debug!("No hardenable verification steps found, skipping");
@@ -301,7 +304,7 @@ pub fn run_hardener_agent(
         }
     };
 
-    let prompt = build_hardener_prompt(&workflow_json, description, &app_context);
+    let prompt = build_hardener_prompt(&workflow_json, description, &app_context, conn);
     let task_context = TaskContext::from_prompt(&prompt);
     let ai_result: AiResponse = run_prompt_with_routing(&prompt, &task_context, doctor_handle);
 
@@ -368,7 +371,7 @@ fn count_candidates(workflow: &UnifiedWorkflow) -> usize {
 // Prompt builder
 // ============================================================================
 
-fn build_hardener_prompt(workflow_json: &str, description: &str, app_context: &AppContext) -> String {
+fn build_hardener_prompt(workflow_json: &str, description: &str, app_context: &AppContext, conn: Option<&Connection>) -> String {
     let mut prompt = format!(
         r#"You are a verification hardener agent for Qontinui Runner.
 
@@ -376,7 +379,39 @@ Your job is to analyze ALL verification steps and convert them to the best avail
 approach. The workflow below was generated for this task: "{description}"
 
 ## Conversion Rules
+"#,
+        description = description,
+    );
 
+    // Load conversion rules from DB or use fallback
+    let conversion_rules = if let Some(conn) = conn {
+        let all = rules::load_rules(conn, "hardener", "conversion_rules");
+        if !all.is_empty() {
+            // Filter by condition
+            let filtered: Vec<_> = all
+                .into_iter()
+                .filter(|r| match r.condition.as_deref() {
+                    None => true,
+                    Some("has_sdk_connect") => app_context.has_sdk_connect,
+                    Some("targets_web_app") => app_context.targets_web_app,
+                    _ => true,
+                })
+                .collect();
+            Some(filtered)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some(ref db_rules) = conversion_rules {
+        for rule in db_rules {
+            prompt.push_str(&format!("\n### Rule {}: {}\n\n{}\n", rule.rule_number, rule.title, rule.content));
+        }
+    } else {
+        // Fallback: hardcoded conversion rules
+        prompt.push_str(r#"
 ### Rule 1: Convert `prompt` steps to deterministic equivalents
 
 | Prompt check type | Convert to | Method |
@@ -389,13 +424,10 @@ approach. The workflow below was generated for this task: "{description}"
 | Code quality (typecheck) | `check` | `check_type: "typecheck"` with appropriate command |
 | API health/response | `api_request` | Direct HTTP with `status_code` assertion |
 | Subjective/qualitative | Keep as `prompt` | Cannot be made deterministic |
-"#,
-        description = description,
-    );
+"#);
 
-    // Rule 2: Playwright → SDK conversion (only when SDK is available)
-    if app_context.has_sdk_connect {
-        prompt.push_str(r#"
+        if app_context.has_sdk_connect {
+            prompt.push_str(r#"
 ### Rule 2: Replace Playwright UI tests with UI Bridge SDK checks
 
 When the UI Bridge SDK is connected (it IS connected in this workflow's setup), Playwright-based UI
@@ -426,12 +458,25 @@ Common conversions:
 
 Keep the original `test` step's `id` on ONE of the replacement `api_request` steps, and generate new
 UUIDs for additional steps. If you add steps, update the step count accordingly.
-"#);
-    }
 
-    // Rule 3: Strengthen weak SDK assertions
-    if app_context.has_sdk_connect {
-        prompt.push_str(r#"
+**IMPORTANT — SDK capability limits.** Do NOT convert Playwright tests that involve any of these
+interactions, because the UI Bridge SDK cannot perform them:
+- **Keyboard shortcuts** (Ctrl+Z, Delete, Ctrl+S, etc.)
+- **File upload dialogs**
+- **Form submit/reset** (not implemented in SDK)
+- **Multi-tab or multi-window** interactions
+- **Screenshot pixel comparisons**
+
+These tests MUST remain as Playwright `test` steps.
+
+Note: **Drag-and-drop CAN be converted** to SDK. Use `POST /ui-bridge/sdk/ai/execute` with
+`{"action":"drag","elementId":"<source>","params":{"target":{"elementId":"<target>"}}}` or
+with `{"action":"drag","elementId":"<source>","params":{"targetPosition":{"x":N,"y":N}}}`.
+"#);
+        }
+
+        if app_context.has_sdk_connect {
+            prompt.push_str(r#"
 ### Rule 3: Strengthen weak SDK api_request assertions
 
 If an existing `api_request` step targets a UI Bridge SDK endpoint but only has a `status_code` assertion,
@@ -457,11 +502,10 @@ endpoint is reachable — it doesn't verify the UI state. SDK endpoints return 2
 - **`GET /ui-bridge/sdk/ai/summary`** or **`GET /ui-bridge/sdk/ai/snapshot`**:
   Add `body_contains` with a keyword from the expected page content.
 "#);
-    }
+        }
 
-    // Rule 4: Page navigation injection (only when SDK is connected)
-    if app_context.has_sdk_connect {
-        prompt.push_str(r#"
+        if app_context.has_sdk_connect {
+            prompt.push_str(r#"
 ### Rule 4: Inject page navigation before SDK verification checks
 
 If the workflow's setup_steps include a page navigation step (`POST /ui-bridge/sdk/page/navigate` with a target URL),
@@ -489,10 +533,9 @@ app routes), and verification needs to be on the correct page to check UI state.
    ```
 4. If verification already starts with a navigate step to the same URL, skip this rule.
 "#);
-    }
+        }
 
-    // Rule 5: Agentic-verification correspondence (always applies)
-    prompt.push_str(r#"
+        prompt.push_str(r#"
 ### Rule 5: Ensure every agentic step has corresponding verification coverage
 
 Examine EACH prompt step in `agentic_steps` and identify the distinct goals/features it describes.
@@ -515,6 +558,7 @@ that would FAIL if that specific goal was NOT implemented.
 **Tab/section existence is NOT adequate coverage.** Checking that a tab named "State View" exists does NOT
 verify that the tab has spatial visualization content. Add content-specific checks.
 "#);
+    }
 
     // Add context-specific guidance
     if app_context.targets_web_app {
@@ -551,23 +595,40 @@ verify that the tab has spatial visualization content. Add content-specific chec
         ));
     }
 
-    prompt.push_str(&format!(
-        r#"
+    // Load critical rules from DB or use fallback
+    let critical_section = if let Some(conn) = conn {
+        let critical = rules::load_rules(conn, "hardener", "critical_rules");
+        if !critical.is_empty() {
+            let mut s = String::from("\n## Critical Rules\n\n");
+            s.push_str(&rules::format_rules_as_markdown(&critical));
+            Some(s)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some(critical) = critical_section {
+        prompt.push_str(&critical);
+    } else {
+        prompt.push_str(r#"
 ## Critical Rules
 
-1. **ONLY modify verification_steps** — do NOT change setup_steps, agentic_steps, or completion_steps
-2. **Preserve step IDs** — every step must keep its original `id` field (unless splitting a step, see below)
-3. **Preserve step order** — steps must remain in the same relative position
-4. **Adding steps is allowed** — if a Playwright test step checks multiple things, you MAY replace it with
-   multiple `api_request` steps. You MAY also add NEW verification steps to cover uncovered agentic goals (Rule 5).
-   Keep original `id`s on existing steps and generate new UUIDs for additions. Update `gate` required_steps
-   if you add new step IDs.
-5. If a prompt step is genuinely subjective (e.g., "Is the UX intuitive?"), keep it as `prompt`
-6. Every converted step must have all required fields for its new type
-7. For `api_request` steps, ALWAYS include `assertions` with at least `status_code` AND `body_contains`
-8. For `check` conversions, include `check_type`, `command`, and `working_directory`
-9. Do NOT convert `check` steps (lint, typecheck, etc.) — they are already deterministic
-10. Do NOT convert `gate` steps — they are structural
+1. **Only modify verification_steps**: Do NOT change setup_steps, agentic_steps, or completion_steps
+2. **Preserve step IDs**: Every step must keep its original `id` field (unless splitting a step, in which case keep the original ID on one and generate new UUIDs for additions)
+3. **Preserve step order**: Steps must remain in the same relative position
+4. **Adding steps is allowed**: If a Playwright test step checks multiple things, you MAY replace it with multiple `api_request` steps. You MAY also add NEW verification steps to cover uncovered agentic goals. Keep original `id`s on existing steps and generate new UUIDs for additions. Update `gate` required_steps if you add new step IDs.
+5. **Keep subjective prompts**: If a prompt step is genuinely subjective (e.g., "Is the UX intuitive?"), keep it as `prompt`
+6. **Complete required fields**: Every converted step must have all required fields for its new type
+7. **API request assertions required**: For `api_request` steps, ALWAYS include `assertions` with at least `status_code` AND `body_contains`
+8. **Check conversion fields**: For `check` conversions, include `check_type`, `command`, and `working_directory`
+9. **Do not convert check steps**: Do NOT convert `check` steps (lint, typecheck, etc.) — they are already deterministic
+10. **Do not convert gate steps**: Do NOT convert `gate` steps — they are structural"#);
+    }
+
+    prompt.push_str(&format!(
+        r#"
 
 ## Output
 
@@ -1026,7 +1087,7 @@ mod tests {
             json!({"id": "s1", "type": "prompt", "content": "Check page"}),
         ]);
         let ctx = AppContext::from_workflow(&workflow, "test");
-        let prompt = build_hardener_prompt("{}", "test", &ctx);
+        let prompt = build_hardener_prompt("{}", "test", &ctx, None);
         assert!(prompt.contains("Rule 4"));
         assert!(prompt.contains("page navigation"));
     }
@@ -1037,7 +1098,7 @@ mod tests {
             json!({"id": "s1", "type": "api_request", "url": "http://localhost:9876/ui-bridge/sdk/ai/search", "assertions": [{"type": "status_code", "expected": 200}]}),
         ]);
         let ctx = AppContext::from_workflow(&workflow, "test");
-        let prompt = build_hardener_prompt("{}", "test", &ctx);
+        let prompt = build_hardener_prompt("{}", "test", &ctx, None);
         assert!(prompt.contains("ai/search"));
         assert!(prompt.contains("total"));
         assert!(prompt.contains("body_contains"));
@@ -1084,7 +1145,7 @@ mod tests {
             json!({"id": "a1", "type": "prompt", "content": "Implement thumbnails"}),
         ];
         let ctx = AppContext::from_workflow(&workflow, "test");
-        let prompt = build_hardener_prompt("{}", "test", &ctx);
+        let prompt = build_hardener_prompt("{}", "test", &ctx, None);
         assert!(prompt.contains("Rule 5"));
         assert!(prompt.contains("agentic step"));
         assert!(prompt.contains("verification coverage"));

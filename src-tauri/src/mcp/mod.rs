@@ -26,6 +26,7 @@ pub mod dom_capture;
 pub mod error_monitor;
 pub mod extraction;
 pub mod findings_api;
+pub mod generation_rules_api;
 pub mod goals;
 pub mod hooks;
 pub mod interaction_recording;
