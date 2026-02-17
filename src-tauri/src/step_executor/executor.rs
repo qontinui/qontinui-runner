@@ -373,6 +373,27 @@ pub struct ExecutionStepConfig {
     )]
     pub ai_review_validate_as_workflow: Option<bool>,
 
+    /// Check (ci_cd): GitHub repository in owner/repo format
+    #[serde(alias = "repository", alias = "ciCdRepository")]
+    pub ci_cd_repository: Option<String>,
+
+    /// Check (ci_cd): GitHub Actions workflow name filter
+    #[serde(alias = "workflow_name", alias = "workflowName", alias = "ciCdWorkflowName")]
+    pub ci_cd_workflow_name: Option<String>,
+
+    /// Check (ci_cd): Branch filter
+    #[serde(alias = "branch", alias = "ciCdBranch")]
+    pub ci_cd_branch: Option<String>,
+
+    /// Check (ci_cd): Wait for in-progress runs to complete
+    #[serde(
+        alias = "wait_for_completion",
+        alias = "waitForCompletion",
+        alias = "ciCdWait",
+        default
+    )]
+    pub ci_cd_wait: Option<bool>,
+
     // ========================================================================
     // Prompt Step Response Mode Fields
     // ========================================================================

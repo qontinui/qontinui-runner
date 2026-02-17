@@ -230,7 +230,8 @@ When the user mentions these terms, map them to the correct endpoints:
 - "runner" / "desktop app" → Qontinui Runner at http://localhost:1420 (UI) / http://localhost:9876 (API)
 - "web" / "web app" / "frontend" → Qontinui Web at http://localhost:3001
 - "backend" / "API" / "server" → Web backend at http://localhost:8000
-- Use health check API requests to verify services are running before testing
+- "supervisor" / "dev supervisor" → Qontinui Supervisor at http://localhost:9875 (health: GET /health, NOT /status)
+- Use health check API requests to verify services are running before testing. The supervisor uses GET /health (NOT /status).
 
 ## UI Bridge SDK (REQUIRED for Web App Verification)
 
@@ -439,7 +440,8 @@ These rules are NON-NEGOTIABLE. Workflows that violate them will be rejected.
 13. **Verification step caching**: Running tasks cache verification steps at startup; API updates don't affect current task.
 14. **Feature-specific verification required**: Must include feature-specific checks, not just compilation/lint gates.
 15. **SDK assertions must verify content**: A `status_code: 200` assertion alone is INSUFFICIENT for SDK endpoints.
-16. **Agentic-verification correspondence**: Each agentic step must have a corresponding deterministic verification step."#;
+16. **Agentic-verification correspondence**: Each agentic step must have a corresponding deterministic verification step.
+17. **Valid assertion types only**: API request assertions MUST use one of these 5 types: `status_code`, `body_contains`, `json_path`, `header`, `response_time`. Do NOT use `body_not_contains` or any other unlisted type — they will cause runtime errors. To check that a body does NOT contain something, use `json_path` with an appropriate operator instead."#;
 
 // ============================================================================
 
@@ -578,7 +580,7 @@ mod tests {
     #[test]
     fn test_context_contains_agentic_verification_rule() {
         let context = build_schema_context();
-        assert!(context.contains("Every agentic step must have a corresponding"));
+        assert!(context.contains("Each agentic step must have a corresponding"));
         assert!(context.contains("deterministic verification step"));
     }
 

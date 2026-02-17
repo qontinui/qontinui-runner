@@ -351,6 +351,8 @@ pub async fn get_unified_workflow(
                 preflight_check_enabled: Some(workflow.preflight_check_enabled),
                 targeted_error_ids: None,
                 generated_by_task_run_id: workflow.generated_by_task_run_id.clone(),
+                enable_sweep: Some(workflow.enable_sweep),
+                max_sweep_iterations: Some(workflow.max_sweep_iterations),
             };
             if let Err(e) = state
                 .app_state
@@ -749,6 +751,8 @@ pub async fn import_unified_workflow(
         preflight_check_enabled: Some(workflow.preflight_check_enabled),
         targeted_error_ids: None,
         generated_by_task_run_id: workflow.generated_by_task_run_id.clone(),
+        enable_sweep: Some(workflow.enable_sweep),
+        max_sweep_iterations: Some(workflow.max_sweep_iterations),
     };
 
     // Use the database's create function but with our custom ID
@@ -953,6 +957,8 @@ pub async fn generate_unified_workflow_async_handler(
         prompt_template: meta_workflow.prompt_template.clone(),
         targeted_error_ids: Some(meta_workflow.targeted_error_ids.clone()),
         generated_by_task_run_id: None, // Will be set after task run creation
+        enable_sweep: Some(meta_workflow.enable_sweep),
+        max_sweep_iterations: Some(meta_workflow.max_sweep_iterations),
     };
 
     let saved_workflow = match state
@@ -1059,6 +1065,8 @@ pub async fn generate_unified_workflow_async_handler(
             run_agentic_first,
             artifact_dir: None,
             is_dev_mode: cfg!(debug_assertions),
+            enable_sweep: saved_workflow.enable_sweep,
+            max_sweep_iterations: saved_workflow.max_sweep_iterations,
         };
 
         // Clone state fields for the background task
@@ -1864,6 +1872,8 @@ pub async fn run_unified_workflow(
             run_agentic_first,
             artifact_dir: None,
             is_dev_mode: cfg!(debug_assertions),
+            enable_sweep: workflow.enable_sweep,
+            max_sweep_iterations: workflow.max_sweep_iterations,
         };
 
         // Spawn execution in background (non-blocking) — same pattern as
@@ -2112,6 +2122,8 @@ pub async fn execute_inline_workflow(
         health_check_enabled: false,
         health_check_urls: vec![],
         preflight_check_enabled: true,
+        enable_sweep: false,
+        max_sweep_iterations: 5,
         generated_by_task_run_id: None,
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
@@ -2375,6 +2387,8 @@ pub async fn execute_inline_workflow(
             run_agentic_first,
             artifact_dir: None,
             is_dev_mode: cfg!(debug_assertions),
+            enable_sweep: workflow.enable_sweep,
+            max_sweep_iterations: workflow.max_sweep_iterations,
         };
 
         let session_manager: Arc<crate::claude_session::SessionManager> = state
@@ -3032,6 +3046,8 @@ pub async fn run_workflow_sequence(
                         run_agentic_first,
                         artifact_dir: None,
                         is_dev_mode: cfg!(debug_assertions),
+                        enable_sweep: workflow.enable_sweep,
+                        max_sweep_iterations: workflow.max_sweep_iterations,
                     };
 
                     let result = controller

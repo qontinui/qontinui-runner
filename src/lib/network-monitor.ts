@@ -95,11 +95,18 @@ export class NetworkMonitor {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
       const method = init?.method || "GET";
 
+      // Add X-Request-ID header for trace correlation
+      const headers = new Headers(init?.headers);
+      if (!headers.has("X-Request-ID")) {
+        headers.set("X-Request-ID", requestId);
+      }
+      const enhancedInit = { ...init, headers };
+
       // Start tracking
       this.startRequest(requestId, url, method);
 
       try {
-        const response = await this.originalFetch!(input, init);
+        const response = await this.originalFetch!(input, enhancedInit);
 
         // End tracking with success
         this.endRequest(requestId, response.status);

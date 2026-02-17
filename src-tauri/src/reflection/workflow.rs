@@ -26,6 +26,8 @@ pub fn build_reflection_config(
         run_agentic_first: true, // Run analysis before verification
         artifact_dir: None,
         is_dev_mode: false, // CRITICAL: Prevents cascade reflection
+        enable_sweep: false,
+        max_sweep_iterations: 5,
     }
 }
 
@@ -94,11 +96,32 @@ pub fn build_setup_steps(source_task_run_id: &str, source_workflow_name: &str) -
 }
 
 /// Build verification steps for the reflection workflow.
-pub fn build_verification_steps() -> Vec<ExecutionStepConfig> {
-    // Reflection verification is lightweight — just ensure no destructive changes
-    vec![build_verification_prompt_step(
-        "Verify reflection safety",
-        r#"Verify that the reflection analysis is complete and no destructive changes were applied.
+pub fn build_verification_steps(source_task_run_id: &str) -> Vec<ExecutionStepConfig> {
+    let base_url = "http://localhost:9876";
+
+    vec![
+        // Step 1: Verify reflection fixes were recorded via API
+        {
+            let mut step = ExecutionStepConfig {
+                step_type: "api_request".to_string(),
+                name: Some("Verify reflection data accessible".to_string()),
+                api_method: Some("GET".to_string()),
+                api_url: Some(format!(
+                    "{}/task-runs/{}/knowledge",
+                    base_url, source_task_run_id
+                )),
+                expected_status: Some(200),
+                ..Default::default()
+            };
+            step.phase = Some("verification".to_string());
+            step
+        },
+        // Step 2: Lightweight prompt check (no UI Bridge dependency)
+        build_verification_prompt_step(
+            "Verify reflection safety",
+            r#"Verify that the reflection analysis is complete and no destructive changes were applied.
+DO NOT use any UI Bridge SDK tools — they are not available in reflection mode.
+Base your verification ONLY on the data already loaded in runtime variables and your own output.
 
 Check:
 1. All significant findings from the source run were analyzed
@@ -107,7 +130,8 @@ Check:
 4. Fix descriptions are clear and actionable
 
 If any issues are found, report them. Otherwise, confirm the reflection is safe."#,
-    )]
+        ),
+    ]
 }
 
 /// Build completion steps for the reflection workflow.
@@ -271,23 +295,31 @@ Only emit fixes for genuinely new insights — do NOT re-emit fixes from previou
 
 For EACH fix you apply, also output a verification step using `[INJECT_STEP]...[/INJECT_STEP]` markers.
 The step should verify that the fix was correctly applied. Use JSON format with these step types:
-- `api_request`: HTTP request with expected status code
+- `api_request`: HTTP request with assertions (PREFERRED — always use this for checking runner data like knowledge, findings, rules)
 - `check_command`: Shell command that should exit 0
-- `prompt`: AI verification question
+- `check` with `check_type: "ci_cd"`: Verify GitHub CI/CD pipeline passes (set `repository` to owner/repo or `working_directory` to a git repo root)
+- `prompt`: AI verification question (AVOID in reflection — no UI Bridge SDK connection is available, so prompt steps that depend on UI state will fail)
+
+Valid assertion types for api_request: `status_code`, `body_contains`, `json_path`, `header`, `response_time`. Do NOT use `body_not_contains` — it does not exist.
 
 These injected steps will be added to the verification phase to confirm your fixes work.
+
+**IMPORTANT: Prefer `api_request` steps over `prompt` steps for verification.**
+Prompt-type verification steps require an active UI Bridge SDK connection, which is NOT available during reflection workflows.
+Use `api_request` steps targeting the runner API at http://localhost:9876 to verify data stored in the runner (knowledge entries, findings, generation rules, etc.).
+Only use `prompt` steps for high-level semantic checks that cannot be expressed as API assertions.
 
 ### Example
 
 ```
 [INJECT_STEP]
-{{"type": "api_request", "name": "Verify KB entry exists", "api_url": "http://localhost:9876/task-runs/current/knowledge", "api_method": "GET", "api_expected_status": 200}}
+{{"type": "api_request", "name": "Verify KB entry exists", "api_url": "http://localhost:9876/task-runs/current/knowledge", "api_method": "GET", "api_expected_status": 200, "assertions": [{{"type": "body_contains", "expected": "expected_keyword"}}]}}
 [/INJECT_STEP]
 ```
 
 ```
 [INJECT_STEP]
-{{"type": "prompt", "name": "Verify context fix applied", "promptContent": "Check that the workspace root path is now included in the setup context for subsequent runs."}}
+{{"type": "api_request", "name": "Verify generation rule created", "api_url": "http://localhost:9876/generation-rules?agent=schema_context&status=active", "api_method": "GET", "api_expected_status": 200, "assertions": [{{"type": "body_contains", "expected": "rule_title_keyword"}}]}}
 [/INJECT_STEP]
 ```
 

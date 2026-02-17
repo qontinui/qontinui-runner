@@ -98,6 +98,8 @@ impl StepHandler for SaveWorkflowArtifactHandler {
             prompt_template: workflow.prompt_template.clone(),
             targeted_error_ids: Some(workflow.targeted_error_ids.clone()),
             generated_by_task_run_id: workflow.generated_by_task_run_id.clone(),
+            enable_sweep: Some(workflow.enable_sweep),
+            max_sweep_iterations: Some(workflow.max_sweep_iterations),
         };
 
         // Save to database

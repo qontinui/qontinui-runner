@@ -607,12 +607,17 @@ function CheckConfig({
     analyze: "analyze",
     security: "security",
     custom_command: "custom_command",
+    http_status: "http_status",
+    ai_review: "ai_review",
+    ci_cd: "ci_cd",
   };
 
   // Filter tools by check type
   const availableTools = CHECK_TOOLS.filter((t) => t.check_type === step.check_type);
   const selectedTool = CHECK_TOOLS.find((t) => t.tool === step.tool);
   const _checkTypeInfo = CHECK_TYPE_INFO.find((t) => t.type === step.check_type);
+
+  const isCiCd = step.check_type === "ci_cd";
 
   return (
     <div className="space-y-4">
@@ -635,107 +640,218 @@ function CheckConfig({
           <option value="analyze">Analyze (code metrics)</option>
           <option value="security">Security (vulnerability scan)</option>
           <option value="custom_command">Custom Command</option>
+          <option value="ci_cd">CI/CD (GitHub Actions)</option>
         </select>
       </div>
 
-      {/* Tool Selection */}
-      {step.check_type !== "custom_command" && availableTools.length > 0 && (
-        <div>
-          <label className="block text-sm font-medium text-zinc-400 mb-1">Tool</label>
-          <select
-            value={step.tool || ""}
-            onChange={(e) => {
-              const tool = CHECK_TOOLS.find((t) => t.tool === e.target.value);
-              onUpdate({
-                tool: e.target.value || undefined,
-                command: tool?.default_command || undefined,
-              });
-            }}
-            className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-            data-ui-id="workflow-builder-step-config-check-tool-select"
-          >
-            <option value="">Select a tool...</option>
-            {availableTools.map((tool) => (
-              <option key={tool.tool} value={tool.tool}>
-                {tool.name} - {tool.description}
-              </option>
-            ))}
-          </select>
-          {selectedTool && (
+      {isCiCd ? (
+        <>
+          {/* Repository */}
+          <div>
+            <label className="block text-sm font-medium text-zinc-400 mb-1">Repository</label>
+            <input
+              type="text"
+              value={step.repository || ""}
+              onChange={(e) => onUpdate({ repository: e.target.value || undefined })}
+              placeholder="owner/repo"
+              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 font-mono text-sm"
+              data-ui-id="workflow-builder-step-config-check-cicd-repo-input"
+            />
             <p className="text-xs text-zinc-500 mt-1">
-              Language: {selectedTool.language} | Auto-fix:{" "}
-              {selectedTool.supports_auto_fix ? "Yes" : "No"}
+              GitHub repository (e.g., jspindev/qontinui-runner). Leave blank to auto-detect from
+              working directory.
             </p>
+          </div>
+
+          {/* Working Directory (shown when no explicit repo) */}
+          {!step.repository && (
+            <div>
+              <label className="block text-sm font-medium text-zinc-400 mb-1">
+                Working Directory
+              </label>
+              <input
+                type="text"
+                value={step.working_directory || ""}
+                onChange={(e) => onUpdate({ working_directory: e.target.value || undefined })}
+                placeholder="Path to git repo root"
+                className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+                data-ui-id="workflow-builder-step-config-check-cicd-workdir-input"
+              />
+              <p className="text-xs text-zinc-500 mt-1">
+                Git repo directory to auto-detect the GitHub repository from.
+              </p>
+            </div>
           )}
-        </div>
-      )}
 
-      {/* Command Override */}
-      <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-1">
-          Command {step.check_type === "custom_command" ? "(required)" : "(optional override)"}
-        </label>
-        <input
-          type="text"
-          value={step.command || ""}
-          onChange={(e) => onUpdate({ command: e.target.value || undefined })}
-          placeholder={selectedTool?.default_command || "Enter command..."}
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 font-mono text-sm"
-          data-ui-id="workflow-builder-step-config-check-command-input"
-        />
-        {selectedTool?.default_command && !step.command && (
-          <p className="text-xs text-zinc-500 mt-1">
-            Default:{" "}
-            <code className="bg-zinc-700 px-1 rounded">{selectedTool.default_command}</code>
+          {/* Workflow Name */}
+          <div>
+            <label className="block text-sm font-medium text-zinc-400 mb-1">
+              Workflow Name (optional)
+            </label>
+            <input
+              type="text"
+              value={step.workflow_name || ""}
+              onChange={(e) => onUpdate({ workflow_name: e.target.value || undefined })}
+              placeholder="CI"
+              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+              data-ui-id="workflow-builder-step-config-check-cicd-workflow-input"
+            />
+            <p className="text-xs text-zinc-500 mt-1">GitHub Actions workflow name to filter by.</p>
+          </div>
+
+          {/* Branch */}
+          <div>
+            <label className="block text-sm font-medium text-zinc-400 mb-1">
+              Branch (optional)
+            </label>
+            <input
+              type="text"
+              value={step.branch || ""}
+              onChange={(e) => onUpdate({ branch: e.target.value || undefined })}
+              placeholder="main"
+              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+              data-ui-id="workflow-builder-step-config-check-cicd-branch-input"
+            />
+          </div>
+
+          {/* Wait for completion */}
+          <div className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              id="wait_for_completion"
+              checked={step.wait_for_completion ?? false}
+              onChange={(e) => onUpdate({ wait_for_completion: e.target.checked })}
+              className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
+              data-ui-id="workflow-builder-step-config-check-cicd-wait-checkbox"
+            />
+            <label htmlFor="wait_for_completion" className="text-sm text-zinc-300">
+              Wait for in-progress runs
+            </label>
+          </div>
+          <p className="text-xs text-zinc-500 ml-6 -mt-2">
+            Poll until the CI run finishes instead of failing immediately when in progress.
           </p>
-        )}
-      </div>
 
-      {/* Working Directory */}
-      <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-1">
-          Working Directory (optional)
-        </label>
-        <input
-          type="text"
-          value={step.working_directory || ""}
-          onChange={(e) => onUpdate({ working_directory: e.target.value || undefined })}
-          placeholder="Leave empty for project root"
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-          data-ui-id="workflow-builder-step-config-check-working-dir-input"
-        />
-      </div>
+          {/* Timeout */}
+          <div>
+            <label className="block text-sm font-medium text-zinc-400 mb-1">
+              Timeout (seconds)
+            </label>
+            <input
+              type="number"
+              value={step.timeout_seconds ?? 300}
+              onChange={(e) => onUpdate({ timeout_seconds: parseInt(e.target.value) || 300 })}
+              min={15}
+              max={600}
+              className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+              data-ui-id="workflow-builder-step-config-check-cicd-timeout-input"
+            />
+          </div>
+        </>
+      ) : (
+        <>
+          {/* Tool Selection */}
+          {step.check_type !== "custom_command" && availableTools.length > 0 && (
+            <div>
+              <label className="block text-sm font-medium text-zinc-400 mb-1">Tool</label>
+              <select
+                value={step.tool || ""}
+                onChange={(e) => {
+                  const tool = CHECK_TOOLS.find((t) => t.tool === e.target.value);
+                  onUpdate({
+                    tool: e.target.value || undefined,
+                    command: tool?.default_command || undefined,
+                  });
+                }}
+                className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+                data-ui-id="workflow-builder-step-config-check-tool-select"
+              >
+                <option value="">Select a tool...</option>
+                {availableTools.map((tool) => (
+                  <option key={tool.tool} value={tool.tool}>
+                    {tool.name} - {tool.description}
+                  </option>
+                ))}
+              </select>
+              {selectedTool && (
+                <p className="text-xs text-zinc-500 mt-1">
+                  Language: {selectedTool.language} | Auto-fix:{" "}
+                  {selectedTool.supports_auto_fix ? "Yes" : "No"}
+                </p>
+              )}
+            </div>
+          )}
 
-      {/* Auto-fix toggle (only for tools that support it) */}
-      {(selectedTool?.supports_auto_fix || step.check_type === "format") && (
-        <div className="flex items-center gap-2">
-          <input
-            type="checkbox"
-            id="auto_fix"
-            checked={step.auto_fix ?? false}
-            onChange={(e) => onUpdate({ auto_fix: e.target.checked })}
-            className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
-            data-ui-id="workflow-builder-step-config-check-auto-fix-checkbox"
-          />
-          <label htmlFor="auto_fix" className="text-sm text-zinc-300">
-            Auto-fix issues (when supported)
-          </label>
-        </div>
+          {/* Command Override */}
+          <div>
+            <label className="block text-sm font-medium text-zinc-400 mb-1">
+              Command {step.check_type === "custom_command" ? "(required)" : "(optional override)"}
+            </label>
+            <input
+              type="text"
+              value={step.command || ""}
+              onChange={(e) => onUpdate({ command: e.target.value || undefined })}
+              placeholder={selectedTool?.default_command || "Enter command..."}
+              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 font-mono text-sm"
+              data-ui-id="workflow-builder-step-config-check-command-input"
+            />
+            {selectedTool?.default_command && !step.command && (
+              <p className="text-xs text-zinc-500 mt-1">
+                Default:{" "}
+                <code className="bg-zinc-700 px-1 rounded">{selectedTool.default_command}</code>
+              </p>
+            )}
+          </div>
+
+          {/* Working Directory */}
+          <div>
+            <label className="block text-sm font-medium text-zinc-400 mb-1">
+              Working Directory (optional)
+            </label>
+            <input
+              type="text"
+              value={step.working_directory || ""}
+              onChange={(e) => onUpdate({ working_directory: e.target.value || undefined })}
+              placeholder="Leave empty for project root"
+              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+              data-ui-id="workflow-builder-step-config-check-working-dir-input"
+            />
+          </div>
+
+          {/* Auto-fix toggle (only for tools that support it) */}
+          {(selectedTool?.supports_auto_fix || step.check_type === "format") && (
+            <div className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                id="auto_fix"
+                checked={step.auto_fix ?? false}
+                onChange={(e) => onUpdate({ auto_fix: e.target.checked })}
+                className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
+                data-ui-id="workflow-builder-step-config-check-auto-fix-checkbox"
+              />
+              <label htmlFor="auto_fix" className="text-sm text-zinc-300">
+                Auto-fix issues (when supported)
+              </label>
+            </div>
+          )}
+
+          {/* Timeout */}
+          <div>
+            <label className="block text-sm font-medium text-zinc-400 mb-1">
+              Timeout (seconds)
+            </label>
+            <input
+              type="number"
+              value={step.timeout_seconds ?? 60}
+              onChange={(e) => onUpdate({ timeout_seconds: parseInt(e.target.value) || 60 })}
+              min={5}
+              max={600}
+              className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+              data-ui-id="workflow-builder-step-config-check-timeout-input"
+            />
+          </div>
+        </>
       )}
-
-      {/* Timeout */}
-      <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-1">Timeout (seconds)</label>
-        <input
-          type="number"
-          value={step.timeout_seconds ?? 60}
-          onChange={(e) => onUpdate({ timeout_seconds: parseInt(e.target.value) || 60 })}
-          min={5}
-          max={600}
-          className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-          data-ui-id="workflow-builder-step-config-check-timeout-input"
-        />
-      </div>
     </div>
   );
 }
@@ -1706,16 +1822,13 @@ export function StepConfigPanel({ onClose }: StepConfigPanelProps) {
                 className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
                 data-ui-id="workflow-builder-step-config-fail-on-console-errors-checkbox"
               />
-              <label
-                htmlFor="fail_on_console_errors"
-                className="text-sm text-zinc-300"
-              >
+              <label htmlFor="fail_on_console_errors" className="text-sm text-zinc-300">
                 Fail on console errors
               </label>
             </div>
             <p className="text-xs text-zinc-500 mt-1 ml-6">
-              Step will fail if browser console errors are detected during
-              execution, even if the step itself passes.
+              Step will fail if browser console errors are detected during execution, even if the
+              step itself passes.
             </p>
           </div>
         )}

@@ -389,7 +389,7 @@ export function useUIBridgeEventHandler(): void {
           }
 
           case "get_snapshot": {
-            const snapshot: BridgeSnapshot = currentBridge.createSnapshot();
+            const snapshot: BridgeSnapshot = await currentBridge.createSnapshotAsync();
 
             await sendResponse({
               requestId,
@@ -425,9 +425,7 @@ export function useUIBridgeEventHandler(): void {
 
             const since = payload.params?.since as number | undefined;
             const limit = payload.params?.limit as number | undefined;
-            const errors = since
-              ? capture.getSince(since)
-              : capture.getRecent(limit ?? 50);
+            const errors = since ? capture.getSince(since) : capture.getRecent(limit ?? 50);
 
             await sendResponse({
               requestId,
@@ -442,9 +440,7 @@ export function useUIBridgeEventHandler(): void {
           case "clear_console_errors": {
             const w2 = window as unknown as Record<string, unknown>;
             const bridge2 = w2.__UI_BRIDGE__ as Record<string, unknown> | undefined;
-            const capture2 = bridge2?.consoleCapture as
-              | { clear: () => void }
-              | undefined;
+            const capture2 = bridge2?.consoleCapture as { clear: () => void } | undefined;
 
             if (capture2) {
               capture2.clear();

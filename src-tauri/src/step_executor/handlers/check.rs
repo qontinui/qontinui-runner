@@ -58,6 +58,11 @@ impl StepHandler for CheckHandler {
             return Self::execute_ai_review_check(step, step_name, timeout_secs, context).await;
         }
 
+        // Handle ci_cd check type - GitHub CI/CD pipeline status
+        if check_type == "ci_cd" {
+            return Self::execute_ci_cd_check(step, step_name, timeout_secs, context).await;
+        }
+
         // Detect project type from working directory
         let detected_language = Self::detect_language(working_directory.as_deref().unwrap_or("."));
 
@@ -981,6 +986,324 @@ impl CheckHandler {
                     error_msg.unwrap_or_else(|| "HTTP check failed".to_string()),
                 ),
             }
+        }
+    }
+
+    /// Execute a CI/CD check by querying GitHub Actions run status via `gh` CLI.
+    async fn execute_ci_cd_check(
+        step: &ExecutionStepConfig,
+        step_name: &str,
+        timeout_secs: Option<u64>,
+        context: &HandlerContext,
+    ) -> StepHandlerResult {
+        let timeout = timeout_secs
+            .map(|t| Duration::from_secs(t.min(600)))
+            .unwrap_or(Duration::from_secs(300));
+
+        // 1. Resolve the repository
+        let working_directory = step
+            .check_working_directory
+            .clone()
+            .or_else(|| step.shell_command_working_directory.clone());
+
+        let repo = if let Some(r) = &step.ci_cd_repository {
+            if !r.is_empty() {
+                r.clone()
+            } else {
+                // Fall through to auto-detect
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
+        let repo = if repo.is_empty() {
+            // Auto-detect from working_directory
+            let work_dir = match &working_directory {
+                Some(d) if !d.is_empty() => d.clone(),
+                _ => {
+                    return StepHandlerResult::failure(
+                        "CI/CD check requires either 'repository' (owner/repo) or 'working_directory' pointing to a git repo",
+                    );
+                }
+            };
+
+            info!(
+                "CI/CD check '{}': auto-detecting repo from '{}'",
+                step_name, work_dir
+            );
+
+            let detect_result = tokio::time::timeout(Duration::from_secs(15), async {
+                Command::new("gh")
+                    .args(["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"])
+                    .current_dir(&work_dir)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .await
+            })
+            .await;
+
+            match detect_result {
+                Ok(Ok(output)) if output.status.success() => {
+                    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if name.is_empty() || !name.contains('/') {
+                        return StepHandlerResult::failure(format!(
+                            "Could not detect GitHub repo from '{}'. Set 'repository' explicitly.",
+                            work_dir
+                        ));
+                    }
+                    info!("CI/CD check '{}': detected repo '{}'", step_name, name);
+                    name
+                }
+                Ok(Ok(output)) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return StepHandlerResult::failure(format!(
+                        "Failed to detect repo from '{}': {}",
+                        work_dir,
+                        stderr.trim()
+                    ));
+                }
+                Ok(Err(e)) => {
+                    return StepHandlerResult::failure(format!(
+                        "Failed to run 'gh repo view' in '{}': {}. Is the GitHub CLI installed?",
+                        work_dir, e
+                    ));
+                }
+                Err(_) => {
+                    return StepHandlerResult::failure(
+                        "Timed out detecting repo from working directory",
+                    );
+                }
+            }
+        } else {
+            repo
+        };
+
+        info!(
+            "Executing CI/CD check '{}': repo={}, workflow={:?}, branch={:?}, wait={:?}",
+            step_name,
+            repo,
+            step.ci_cd_workflow_name,
+            step.ci_cd_branch,
+            step.ci_cd_wait
+        );
+
+        // Generate action ID for event emission
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CICD_CHECK_SEQUENCE: AtomicU32 = AtomicU32::new(1);
+        let seq_num = CICD_CHECK_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+        let action_id = format!("cicd-check-{}", seq_num);
+        let action_name = format!("CI/CD CHECK: {}", step_name);
+
+        let metadata = json!({
+            "check_type": "ci_cd",
+            "repository": &repo,
+            "workflow_name": step.ci_cd_workflow_name,
+            "branch": step.ci_cd_branch,
+            "wait_for_completion": step.ci_cd_wait.unwrap_or(false),
+        });
+
+        let (timestamp, sequence) =
+            Self::emit_started(context, &action_id, &action_name, metadata).await;
+
+        let start = std::time::Instant::now();
+
+        // 2. Build gh run list command
+        let poll_result = Self::poll_ci_cd_status(
+            &repo,
+            step.ci_cd_workflow_name.as_deref(),
+            step.ci_cd_branch.as_deref(),
+            step.ci_cd_wait.unwrap_or(false),
+            timeout,
+            step_name,
+        )
+        .await;
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        let (final_success, error_msg, output_data) = match poll_result {
+            Ok(data) => {
+                let conclusion = data["conclusion"].as_str().unwrap_or("");
+                let success = conclusion == "success";
+                if success {
+                    (true, None, Some(data))
+                } else {
+                    let msg = format!(
+                        "CI run conclusion: '{}' (run #{}, {})",
+                        conclusion,
+                        data["run_id"].as_u64().unwrap_or(0),
+                        data["url"].as_str().unwrap_or("")
+                    );
+                    (false, Some(msg), Some(data))
+                }
+            }
+            Err(e) => (false, Some(e), None),
+        };
+
+        // Emit completion/failure event
+        let result_metadata = json!({
+            "check_type": "ci_cd",
+            "repository": &repo,
+            "duration_ms": duration_ms,
+        });
+
+        if final_success {
+            Self::emit_completed(
+                context,
+                &action_id,
+                &action_name,
+                timestamp,
+                sequence,
+                result_metadata,
+            )
+            .await;
+        } else {
+            Self::emit_failed(
+                context,
+                &action_id,
+                &action_name,
+                timestamp,
+                sequence,
+                error_msg.as_deref().unwrap_or("CI/CD check failed"),
+                Some(result_metadata),
+            )
+            .await;
+        }
+
+        if final_success {
+            match output_data {
+                Some(data) => StepHandlerResult::success_with_data(data),
+                None => StepHandlerResult::success(),
+            }
+        } else {
+            match output_data {
+                Some(data) => StepHandlerResult::failure_with_data(
+                    error_msg.unwrap_or_else(|| "CI/CD check failed".to_string()),
+                    data,
+                ),
+                None => StepHandlerResult::failure(
+                    error_msg.unwrap_or_else(|| "CI/CD check failed".to_string()),
+                ),
+            }
+        }
+    }
+
+    /// Poll GitHub Actions for the latest run status. If `wait` is true, re-checks every 15s
+    /// until the run concludes or the timeout expires.
+    async fn poll_ci_cd_status(
+        repo: &str,
+        workflow_name: Option<&str>,
+        branch: Option<&str>,
+        wait: bool,
+        timeout_duration: Duration,
+        step_name: &str,
+    ) -> Result<serde_json::Value, String> {
+        let deadline = tokio::time::Instant::now() + timeout_duration;
+
+        loop {
+            // Build command
+            let mut args = vec![
+                "run".to_string(),
+                "list".to_string(),
+                "--repo".to_string(),
+                repo.to_string(),
+                "--limit".to_string(),
+                "1".to_string(),
+                "--json".to_string(),
+                "status,conclusion,name,headBranch,databaseId,url,event".to_string(),
+            ];
+
+            if let Some(wf) = workflow_name {
+                if !wf.is_empty() {
+                    args.push("--workflow".to_string());
+                    args.push(wf.to_string());
+                }
+            }
+
+            if let Some(br) = branch {
+                if !br.is_empty() {
+                    args.push("--branch".to_string());
+                    args.push(br.to_string());
+                }
+            }
+
+            let output = Command::new("gh")
+                .args(&args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .await
+                .map_err(|e| format!("Failed to run 'gh run list': {}. Is the GitHub CLI installed?", e))?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("gh run list failed: {}", stderr.trim()));
+            }
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let runs: Vec<serde_json::Value> = serde_json::from_str(stdout.trim())
+                .map_err(|e| format!("Failed to parse gh output: {}", e))?;
+
+            if runs.is_empty() {
+                return Err(format!(
+                    "No workflow runs found for repo '{}' (workflow={:?}, branch={:?})",
+                    repo, workflow_name, branch
+                ));
+            }
+
+            let run = &runs[0];
+            let status = run["status"].as_str().unwrap_or("");
+            let conclusion = run["conclusion"].as_str().unwrap_or("");
+            let run_id = run["databaseId"].as_u64().unwrap_or(0);
+            let url = run["url"].as_str().unwrap_or("");
+            let workflow = run["name"].as_str().unwrap_or("");
+            let head_branch = run["headBranch"].as_str().unwrap_or("");
+
+            info!(
+                "CI/CD check '{}': run #{} status={}, conclusion={}, workflow={}, branch={}",
+                step_name, run_id, status, conclusion, workflow, head_branch
+            );
+
+            // If the run has concluded, return the result
+            if status == "completed" || !conclusion.is_empty() {
+                return Ok(json!({
+                    "repository": repo,
+                    "run_id": run_id,
+                    "status": status,
+                    "conclusion": conclusion,
+                    "workflow_name": workflow,
+                    "branch": head_branch,
+                    "url": url,
+                }));
+            }
+
+            // Run is still in progress
+            if !wait {
+                return Ok(json!({
+                    "repository": repo,
+                    "run_id": run_id,
+                    "status": status,
+                    "conclusion": "in_progress",
+                    "workflow_name": workflow,
+                    "branch": head_branch,
+                    "url": url,
+                }));
+            }
+
+            // Wait and retry
+            if tokio::time::Instant::now() + Duration::from_secs(15) > deadline {
+                return Err(format!(
+                    "CI/CD check timed out waiting for run #{} to complete (status: {})",
+                    run_id, status
+                ));
+            }
+
+            info!(
+                "CI/CD check '{}': run #{} still {}, polling again in 15s...",
+                step_name, run_id, status
+            );
+            tokio::time::sleep(Duration::from_secs(15)).await;
         }
     }
 }

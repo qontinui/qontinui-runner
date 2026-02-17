@@ -381,7 +381,16 @@ export interface ScreenshotStep extends BaseStep {
 /**
  * Check type categories
  */
-export type CheckType = "lint" | "format" | "typecheck" | "analyze" | "security" | "custom_command";
+export type CheckType =
+  | "lint"
+  | "format"
+  | "typecheck"
+  | "analyze"
+  | "security"
+  | "custom_command"
+  | "http_status"
+  | "ai_review"
+  | "ci_cd";
 
 /**
  * Check Step (Setup, Verification, or Completion)
@@ -411,6 +420,14 @@ export interface CheckStep extends BaseStep {
   fail_on_warning?: boolean;
   /** Timeout in seconds */
   timeout_seconds?: number;
+  /** CI/CD: GitHub repository in owner/repo format */
+  repository?: string;
+  /** CI/CD: GitHub Actions workflow name filter */
+  workflow_name?: string;
+  /** CI/CD: Branch filter */
+  branch?: string;
+  /** CI/CD: Wait for in-progress runs to complete */
+  wait_for_completion?: boolean;
 }
 
 /**
@@ -1158,6 +1175,14 @@ export const STEP_TYPES: Record<WorkflowPhase, StepTypeInfo[]> = {
       phase: "setup",
     },
     {
+      type: "check_ci_cd",
+      label: "CI/CD Check",
+      description: "Check GitHub CI/CD pipeline status",
+      icon: "GitBranch",
+      color: "purple",
+      phase: "setup",
+    },
+    {
       type: "screenshot",
       label: "Screenshot",
       description: "Capture current screen state",
@@ -1288,6 +1313,14 @@ export const STEP_TYPES: Record<WorkflowPhase, StepTypeInfo[]> = {
       description: "Run custom check command",
       icon: "Terminal",
       color: "cyan",
+      phase: "verification",
+    },
+    {
+      type: "check_ci_cd",
+      label: "CI/CD Check",
+      description: "Check GitHub CI/CD pipeline status",
+      icon: "GitBranch",
+      color: "purple",
       phase: "verification",
     },
     {
@@ -1586,6 +1619,14 @@ export const STEP_TYPES: Record<WorkflowPhase, StepTypeInfo[]> = {
       description: "Run custom check command",
       icon: "Terminal",
       color: "cyan",
+      phase: "completion",
+    },
+    {
+      type: "check_ci_cd",
+      label: "CI/CD Check",
+      description: "Check GitHub CI/CD pipeline status",
+      icon: "GitBranch",
+      color: "purple",
       phase: "completion",
     },
     {

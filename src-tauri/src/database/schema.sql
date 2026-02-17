@@ -848,6 +848,10 @@ CREATE TABLE IF NOT EXISTS unified_workflows (
     -- Pre-flight check configuration
     preflight_check_enabled INTEGER DEFAULT 1,  -- 1 = enabled (default), 0 = disabled
 
+    -- Completion sweep configuration
+    enable_sweep INTEGER DEFAULT 0,  -- 0 = disabled (default), 1 = enabled
+    max_sweep_iterations INTEGER DEFAULT 5,  -- Maximum sweep iterations
+
     -- Generation tracking (for workflows created by meta-workflows)
     generated_by_task_run_id TEXT,  -- Links back to the meta-workflow task_run that created this
 

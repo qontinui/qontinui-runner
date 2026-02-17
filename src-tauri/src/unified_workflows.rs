@@ -170,6 +170,15 @@ pub struct UnifiedWorkflow {
     #[serde(default = "default_preflight_check_enabled")]
     pub preflight_check_enabled: bool,
 
+    /// Whether to run a completion sweep after verification passes.
+    /// The sweep reviews all completed work for gaps before proceeding to completion.
+    #[serde(default)]
+    pub enable_sweep: bool,
+
+    /// Maximum number of sweep iterations (default: 5).
+    #[serde(default = "default_max_sweep_iterations")]
+    pub max_sweep_iterations: u32,
+
     /// Task run ID that generated this workflow (for meta-workflow tracking)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_by_task_run_id: Option<String>,
@@ -195,6 +204,10 @@ fn default_health_check_enabled() -> bool {
 
 fn default_preflight_check_enabled() -> bool {
     true
+}
+
+fn default_max_sweep_iterations() -> u32 {
+    5
 }
 
 fn default_category() -> String {
@@ -258,6 +271,12 @@ pub struct CreateUnifiedWorkflowRequest {
     /// Whether to automatically include a pre-flight environment check at the start of setup
     #[serde(default)]
     pub preflight_check_enabled: Option<bool>,
+    /// Whether to run a completion sweep after verification passes
+    #[serde(default)]
+    pub enable_sweep: Option<bool>,
+    /// Maximum number of sweep iterations (default: 5)
+    #[serde(default)]
+    pub max_sweep_iterations: Option<u32>,
     /// Error IDs targeted by this workflow (for auto-resolution on success)
     #[serde(default)]
     pub targeted_error_ids: Option<Vec<i64>>,
@@ -300,6 +319,10 @@ pub struct UpdateUnifiedWorkflowRequest {
     pub health_check_urls: Option<Vec<HealthCheckUrl>>,
     /// Whether to automatically include a pre-flight environment check at the start of setup
     pub preflight_check_enabled: Option<bool>,
+    /// Whether to run a completion sweep after verification passes
+    pub enable_sweep: Option<bool>,
+    /// Maximum number of sweep iterations (default: 5)
+    pub max_sweep_iterations: Option<u32>,
 }
 
 /// Query parameters for searching unified workflows

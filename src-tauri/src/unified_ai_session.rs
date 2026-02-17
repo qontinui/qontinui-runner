@@ -202,6 +202,9 @@ pub struct AiSessionResult {
     /// Dynamically injected verification steps parsed from AI output.
     /// These are collected from `[INJECT_STEP]...[/INJECT_STEP]` markers.
     pub injected_steps: Vec<crate::step_executor::ExecutionStepConfig>,
+    /// Error message when the session failed (e.g., CLI spawn failure, timeout).
+    /// Empty string if no error occurred.
+    pub error: String,
 }
 
 // =============================================================================
@@ -528,6 +531,7 @@ impl UnifiedAiSessionExecutor {
                     output,
                     duration_ms,
                     injected_steps,
+                    error: String::new(),
                 }
             }
             Ok(Err(e)) => {
@@ -550,6 +554,7 @@ impl UnifiedAiSessionExecutor {
                     output: String::new(),
                     duration_ms,
                     injected_steps: Vec::new(),
+                    error: e.to_string(),
                 }
             }
             Err(e) => {
@@ -573,6 +578,7 @@ impl UnifiedAiSessionExecutor {
                     output: String::new(),
                     duration_ms,
                     injected_steps: Vec::new(),
+                    error: error_msg,
                 }
             }
         }

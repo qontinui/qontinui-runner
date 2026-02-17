@@ -75,6 +75,10 @@ pub struct GenerateWorkflowRequest {
     /// Maximum verification→fix iterations (default: 3, 0 = skip verification)
     #[serde(default)]
     pub max_fix_iterations: Option<u32>,
+
+    /// Generation mode: "standard" (default) or "plan"
+    #[serde(default)]
+    pub generation_mode: Option<String>,
 }
 
 /// One pass of the verification→fix loop.

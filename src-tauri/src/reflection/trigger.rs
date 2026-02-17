@@ -350,7 +350,7 @@ pub fn launch_reflection(
     );
 
     let setup_steps = super::workflow::build_setup_steps(&source_task_run_id, &workflow_name);
-    let verification_steps = super::workflow::build_verification_steps();
+    let verification_steps = super::workflow::build_verification_steps(&source_task_run_id);
     let mut completion_steps = super::workflow::build_completion_steps(&workflow_name);
     // Split completion steps: first is automation (api_request), rest are prompt steps
     let completion_prompt_steps = completion_steps.split_off(1);

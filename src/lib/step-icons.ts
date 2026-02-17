@@ -157,6 +157,11 @@ export const STEP_ICON_CONFIG: Record<string, StepIconConfig> = {
     bgClass: "bg-cyan-500/10",
     textClass: "text-cyan-400",
   },
+  check_ci_cd: {
+    icon: GitBranch,
+    bgClass: "bg-purple-500/10",
+    textClass: "text-purple-400",
+  },
 
   // AI steps - use MessageSquare (matching "prompt" in Workflows builder)
   prompt: {

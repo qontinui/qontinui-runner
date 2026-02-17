@@ -121,6 +121,19 @@ pub struct LoopConfig {
     /// Whether this is a dev mode execution (enables dev-only features like
     /// self-analysis steps and learning outcome recording).
     pub is_dev_mode: bool,
+    /// Whether to run a completion sweep after verification passes.
+    pub enable_sweep: bool,
+    /// Maximum number of sweep iterations.
+    pub max_sweep_iterations: u32,
+}
+
+/// Result of the completion sweep phase.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SweepResult {
+    /// Number of sweep iterations executed.
+    pub iterations_run: u32,
+    /// Whether the AI signaled no more work needed.
+    pub no_more_steps: bool,
 }
 
 /// Phase of workflow execution.

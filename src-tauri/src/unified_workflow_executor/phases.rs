@@ -2087,15 +2087,23 @@ impl AgenticExecutor {
                 output: result.output,
             }
         } else if result.output.is_empty() {
-            completion_checkpoint.mark_failed("AI session failed", duration_ms);
-            AgenticOutcome::Error {
-                error: "AI session failed".to_string(),
-            }
+            let error_msg = if result.error.is_empty() {
+                "AI session failed (no output, no error details)".to_string()
+            } else {
+                format!("AI session failed: {}", result.error)
+            };
+            completion_checkpoint.mark_failed(&error_msg, duration_ms);
+            AgenticOutcome::Error { error: error_msg }
         } else {
-            completion_checkpoint.mark_failed("AI reported failure", duration_ms);
+            let error_msg = if result.error.is_empty() {
+                "AI reported failure".to_string()
+            } else {
+                format!("AI reported failure: {}", result.error)
+            };
+            completion_checkpoint.mark_failed(&error_msg, duration_ms);
             AgenticOutcome::Failed {
                 output: result.output,
-                error: "AI reported failure".to_string(),
+                error: error_msg,
             }
         };
 
@@ -3084,6 +3092,8 @@ impl Executor for AgenticExecutor {
             run_agentic_first: false,
             artifact_dir: None,
             is_dev_mode: false,
+            enable_sweep: false,
+            max_sweep_iterations: 5,
         };
 
         let (outcome, _injected_steps) = self

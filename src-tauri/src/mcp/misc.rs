@@ -3729,8 +3729,15 @@ Invoke-RestMethod -Uri "http://localhost:9875/runner/restart" -Method Post -Cont
 - GET /health - Check if supervisor is running
 - POST /runner/stop - Stop the runner
 - POST /runner/restart - Restart runner (options: rebuild, trigger_auto_continue, wait_timeout_seconds)
+- POST /workflow-loop/signal-restart - Signal that runner restart is needed (use during workflow loops)
 
 **IMPORTANT:** If you modified qontinui-runner Rust code, use `"rebuild": true` to recompile before restart.
+
+**Workflow Loop Signal:** If you are running inside a supervisor workflow loop and you modify runner code, call:
+```powershell
+Invoke-RestMethod -Uri "http://localhost:9875/workflow-loop/signal-restart" -Method Post
+```
+This tells the supervisor to restart the runner between iterations. If you don't signal, the loop skips the restart (saving time when only non-runner repos were changed).
 
 ---
 

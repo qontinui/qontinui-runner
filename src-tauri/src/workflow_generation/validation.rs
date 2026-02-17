@@ -331,6 +331,8 @@ mod tests {
             health_check_enabled: true,
             health_check_urls: vec![],
             preflight_check_enabled: true,
+            enable_sweep: false,
+            max_sweep_iterations: 5,
             generated_by_task_run_id: None,
             targeted_error_ids: vec![],
             created_at: chrono::Utc::now().to_rfc3339(),

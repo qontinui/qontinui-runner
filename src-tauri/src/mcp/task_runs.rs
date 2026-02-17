@@ -1046,6 +1046,8 @@ pub async fn resume_task_run(
         run_agentic_first,
         artifact_dir: None,
         is_dev_mode: cfg!(debug_assertions),
+        enable_sweep: workflow.enable_sweep,
+        max_sweep_iterations: workflow.max_sweep_iterations,
     };
 
     // Spawn the workflow execution in background with panic protection

@@ -4800,6 +4800,49 @@ impl CheckpointDb {
             );
         }
 
+        // Migration to version 61: Add sweep fields to unified_workflows
+        if current_version < 61 {
+            info!("Migrating database to version 61 (adding sweep fields to unified_workflows)");
+            conn.execute_batch(
+                r#"
+                ALTER TABLE unified_workflows ADD COLUMN enable_sweep INTEGER DEFAULT 0;
+                ALTER TABLE unified_workflows ADD COLUMN max_sweep_iterations INTEGER DEFAULT 5;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (61, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 61: {}", e))?;
+        }
+
+        // Migration to version 62: Add assertion types generation rule
+        if current_version < 62 {
+            info!("Migrating database to version 62 (adding valid assertion types generation rule)");
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT OR IGNORE INTO generation_rules (id, agent, section, rule_number, title, content, condition, status, provenance, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', 'seed', ?8, ?9)",
+                params![
+                    "seed-schema_context-verification_quality-17",
+                    "schema_context",
+                    "verification_quality",
+                    17,
+                    "Valid assertion types only",
+                    "API request assertions MUST use one of these 5 types: `status_code`, `body_contains`, `json_path`, `header`, `response_time`. Do NOT use `body_not_contains` or any other unlisted type — they will cause runtime errors. Supported operators (optional `operator` field, default `equals`): `equals`, `contains`, `matches` (regex), `greater_than`, `less_than`.",
+                    Option::<&str>::None,
+                    now,
+                    now,
+                ],
+            )
+            .map_err(|e| format!("Failed to seed assertion types rule: {}", e))?;
+
+            conn.execute_batch(
+                "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (62, datetime('now'));",
+            )
+            .map_err(|e| format!("Failed to update schema version to 62: {}", e))?;
+
+            info!("Successfully migrated to version 62 (valid assertion types rule)");
+        }
+
         Ok(())
     }
 
@@ -10674,7 +10717,7 @@ impl CheckpointDb {
                        skip_ai_summary, created_at, updated_at, log_source_selection,
                        context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                        log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
-                       preflight_check_enabled, generated_by_task_run_id
+                       preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations
                 FROM unified_workflows
                 ORDER BY updated_at DESC
                 "#,
@@ -10739,6 +10782,8 @@ impl CheckpointDb {
                     timeout_seconds: row.get::<_, Option<i64>>(23)?.map(|v| v as u64),
                     preflight_check_enabled: row.get::<_, Option<i32>>(24)?.unwrap_or(1) != 0,
                     generated_by_task_run_id: row.get(25)?,
+                    enable_sweep: row.get::<_, Option<i32>>(26)?.unwrap_or(0) != 0,
+                    max_sweep_iterations: row.get::<_, Option<i32>>(27)?.unwrap_or(5) as u32,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -10764,7 +10809,7 @@ impl CheckpointDb {
                    skip_ai_summary, created_at, updated_at, log_source_selection,
                    context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                    log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
-                   preflight_check_enabled, generated_by_task_run_id
+                   preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations
             FROM unified_workflows
             WHERE id = ?1
             "#,
@@ -10826,6 +10871,8 @@ impl CheckpointDb {
                     timeout_seconds: row.get::<_, Option<i64>>(23)?.map(|v| v as u64),
                     preflight_check_enabled: row.get::<_, Option<i32>>(24)?.unwrap_or(1) != 0,
                     generated_by_task_run_id: row.get(25)?,
+                    enable_sweep: row.get::<_, Option<i32>>(26)?.unwrap_or(0) != 0,
+                    max_sweep_iterations: row.get::<_, Option<i32>>(27)?.unwrap_or(5) as u32,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -10853,7 +10900,7 @@ impl CheckpointDb {
                    skip_ai_summary, created_at, updated_at, log_source_selection,
                    context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                    log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
-                   preflight_check_enabled, generated_by_task_run_id
+                   preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations
             FROM unified_workflows
             WHERE name = ?1
             ORDER BY updated_at DESC
@@ -10917,6 +10964,8 @@ impl CheckpointDb {
                     timeout_seconds: row.get::<_, Option<i64>>(23)?.map(|v| v as u64),
                     preflight_check_enabled: row.get::<_, Option<i32>>(24)?.unwrap_or(1) != 0,
                     generated_by_task_run_id: row.get(25)?,
+                    enable_sweep: row.get::<_, Option<i32>>(26)?.unwrap_or(0) != 0,
+                    max_sweep_iterations: row.get::<_, Option<i32>>(27)?.unwrap_or(5) as u32,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -10981,8 +11030,8 @@ impl CheckpointDb {
                 skip_ai_summary, created_at, updated_at, log_source_selection,
                 context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                 log_watch_enabled, health_check_enabled, health_check_urls, preflight_check_enabled,
-                generated_by_task_run_id
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
+                generated_by_task_run_id, enable_sweep, max_sweep_iterations
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
             "#,
             params![
                 id,
@@ -11011,6 +11060,8 @@ impl CheckpointDb {
                 health_check_urls_json,
                 preflight_check_enabled,
                 request.generated_by_task_run_id,
+                request.enable_sweep.unwrap_or(false),
+                request.max_sweep_iterations.unwrap_or(5) as i64,
             ],
         )
         .map_err(|e| format!("Failed to create unified workflow: {}", e))?;
@@ -11070,8 +11121,8 @@ impl CheckpointDb {
                 skip_ai_summary, created_at, updated_at, log_source_selection,
                 context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                 log_watch_enabled, health_check_enabled, health_check_urls, preflight_check_enabled,
-                generated_by_task_run_id
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
+                generated_by_task_run_id, enable_sweep, max_sweep_iterations
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
             "#,
             params![
                 id,
@@ -11100,6 +11151,8 @@ impl CheckpointDb {
                 health_check_urls_json,
                 preflight_check_enabled,
                 request.generated_by_task_run_id,
+                request.enable_sweep.unwrap_or(false),
+                request.max_sweep_iterations.unwrap_or(5) as i64,
             ],
         )
         .map_err(|e| format!("Failed to create unified workflow: {}", e))?;
@@ -11193,6 +11246,12 @@ impl CheckpointDb {
         let preflight_check_enabled = request
             .preflight_check_enabled
             .unwrap_or(existing.preflight_check_enabled);
+        let enable_sweep = request
+            .enable_sweep
+            .unwrap_or(existing.enable_sweep);
+        let max_sweep_iterations = request
+            .max_sweep_iterations
+            .unwrap_or(existing.max_sweep_iterations);
 
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
         let setup_steps_json =
@@ -11237,8 +11296,10 @@ impl CheckpointDb {
                 log_watch_enabled = ?20,
                 health_check_enabled = ?21,
                 health_check_urls = ?22,
-                preflight_check_enabled = ?23
-            WHERE id = ?24
+                preflight_check_enabled = ?23,
+                enable_sweep = ?24,
+                max_sweep_iterations = ?25
+            WHERE id = ?26
             "#,
             params![
                 name,
@@ -11264,6 +11325,8 @@ impl CheckpointDb {
                 health_check_enabled,
                 health_check_urls_json,
                 preflight_check_enabled,
+                enable_sweep,
+                max_sweep_iterations as i64,
                 id,
             ],
         )
@@ -11298,7 +11361,7 @@ impl CheckpointDb {
                    skip_ai_summary, created_at, updated_at, log_source_selection,
                    context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                    log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
-                   preflight_check_enabled, generated_by_task_run_id
+                   preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations
             FROM unified_workflows
             WHERE 1=1
             "#,
@@ -11392,6 +11455,8 @@ impl CheckpointDb {
                     timeout_seconds: row.get::<_, Option<i64>>(23)?.map(|v| v as u64),
                     preflight_check_enabled: row.get::<_, Option<i32>>(24)?.unwrap_or(1) != 0,
                     generated_by_task_run_id: row.get(25)?,
+                    enable_sweep: row.get::<_, Option<i32>>(26)?.unwrap_or(0) != 0,
+                    max_sweep_iterations: row.get::<_, Option<i32>>(27)?.unwrap_or(5) as u32,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -11437,6 +11502,8 @@ impl CheckpointDb {
             preflight_check_enabled: Some(original.preflight_check_enabled),
             targeted_error_ids: None,
             generated_by_task_run_id: None, // Don't copy the generator reference
+            enable_sweep: Some(original.enable_sweep),
+            max_sweep_iterations: Some(original.max_sweep_iterations),
         };
 
         self.create_unified_workflow(&create_request)
@@ -11460,7 +11527,8 @@ impl CheckpointDb {
                        skip_ai_summary, created_at, updated_at, log_source_selection,
                        context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                        log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
-                       preflight_check_enabled, generated_by_task_run_id
+                       preflight_check_enabled, generated_by_task_run_id, enable_sweep,
+                       max_sweep_iterations
                 FROM unified_workflows
                 WHERE sync_pending = 1
                 "#,
@@ -11525,6 +11593,8 @@ impl CheckpointDb {
                     timeout_seconds: row.get::<_, Option<i64>>(23)?.map(|v| v as u64),
                     preflight_check_enabled: row.get::<_, Option<i32>>(24)?.unwrap_or(1) != 0,
                     generated_by_task_run_id: row.get(25)?,
+                    enable_sweep: row.get::<_, Option<i32>>(26)?.unwrap_or(0) != 0,
+                    max_sweep_iterations: row.get::<_, Option<i32>>(27)?.unwrap_or(5) as u32,
                     targeted_error_ids: vec![],
                 })
             })

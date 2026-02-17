@@ -387,7 +387,8 @@ export function AddStepDropdown({
       case "check_typecheck":
       case "check_analyze":
       case "check_security":
-      case "check_custom": {
+      case "check_custom":
+      case "check_ci_cd": {
         const checkTypeMap: Record<string, CheckType> = {
           check_lint: "lint",
           check_format: "format",
@@ -395,6 +396,7 @@ export function AddStepDropdown({
           check_analyze: "analyze",
           check_security: "security",
           check_custom: "custom_command",
+          check_ci_cd: "ci_cd",
         };
         step = {
           id,

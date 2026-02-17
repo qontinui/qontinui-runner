@@ -30,7 +30,7 @@ use crate::AppState;
 use super::phases::{AgenticExecutor, CompletionExecutor, SetupExecutor, VerificationExecutor};
 use super::resume::{ResumeManager, ResumePoint};
 use super::states::UnifiedWorkflowState;
-use super::types::{get_parent_task_id, AgenticOutcome, IterationResult, LoopConfig, LoopResult};
+use super::types::{get_parent_task_id, AgenticOutcome, IterationResult, LoopConfig, LoopResult, SweepResult};
 
 /// The main loop controller for unified workflows.
 ///
@@ -690,6 +690,30 @@ impl LoopController {
         };
 
         info!("Loop completed: {}", loop_result.summary());
+
+        // =====================================================================
+        // PHASE 2.5: COMPLETION SWEEP (optional, runs after verification passes)
+        // =====================================================================
+        if config.enable_sweep
+            && loop_result.verification_passed
+            && !self.is_task_stopped(&config.execution_id)
+        {
+            info!("=== PHASE 2.5: COMPLETION SWEEP (max {} iterations) ===", config.max_sweep_iterations);
+
+            let sweep_result = self
+                .run_sweep_loop(
+                    &config,
+                    &mut all_step_results,
+                    &logger,
+                    loop_result.iterations_run,
+                )
+                .await;
+
+            info!(
+                "Sweep completed: {} iteration(s), no_more_steps={}",
+                sweep_result.iterations_run, sweep_result.no_more_steps
+            );
+        }
 
         // =====================================================================
         // PHASE 3: COMPLETION (only if verification passed!)
@@ -1818,6 +1842,183 @@ impl LoopController {
             }
         }
     }
+
+    /// Run the completion sweep loop.
+    ///
+    /// After verification passes, this reviews all completed work for gaps
+    /// before proceeding to the completion phase. Each iteration runs an AI session
+    /// that checks for overlooked items, incomplete implementations, and edge cases.
+    ///
+    /// The sweep exits when:
+    /// - The AI outputs `[NO_MORE_STEPS]` (all work is complete)
+    /// - Max sweep iterations are reached
+    /// - The task is stopped externally
+    /// - An AI session fails
+    async fn run_sweep_loop(
+        &self,
+        config: &LoopConfig,
+        _all_step_results: &mut Vec<crate::step_executor::StepExecutionResult>,
+        logger: &StepEventLogger,
+        loop_iterations_run: u32,
+    ) -> SweepResult {
+        let max_iterations = config.max_sweep_iterations.max(1);
+        let mut iterations_run = 0u32;
+
+        for iteration in 0..max_iterations {
+            if self.is_task_stopped(&config.execution_id) {
+                info!("SWEEP: Task stopped before iteration {}", iteration + 1);
+                break;
+            }
+
+            info!(
+                "SWEEP: Starting iteration {}/{}",
+                iteration + 1,
+                max_iterations
+            );
+
+            let sweep_prompt = Self::build_sweep_prompt(
+                &config.workflow_name,
+                &config.base_prompt,
+                loop_iterations_run,
+                iteration,
+                max_iterations,
+            );
+
+            // Run the sweep as an agentic AI session
+            let sweep_step = ExecutionStepConfig {
+                name: Some(format!("Completion Sweep {}", iteration + 1)),
+                step_type: "prompt".to_string(),
+                phase: Some("agentic".to_string()),
+                prompt_content: Some(sweep_prompt),
+                prompt_mode: None, // Full session mode
+                ..Default::default()
+            };
+
+            let (outcome, _injected) = self
+                .agentic_executor
+                .run_agentic(
+                    config,
+                    loop_iterations_run + iteration + 1, // Continue iteration numbering
+                    "", // No failure context for sweep
+                    true,
+                    &[sweep_step],
+                    logger,
+                )
+                .await;
+
+            // Append sweep output to task output_log
+            let output_text = match &outcome {
+                AgenticOutcome::Success { output } => {
+                    format!(
+                        "\n\n=== Completion Sweep (Iteration {}/{}) ===\n\n{}",
+                        iteration + 1,
+                        max_iterations,
+                        output
+                    )
+                }
+                AgenticOutcome::Failed { output, error } => {
+                    warn!("SWEEP: Iteration {} failed: {}", iteration + 1, error);
+                    format!(
+                        "\n\n=== Completion Sweep (Iteration {}/{}, FAILED: {}) ===\n\n{}",
+                        iteration + 1,
+                        max_iterations,
+                        error,
+                        output
+                    )
+                }
+                AgenticOutcome::Error { error } => {
+                    error!("SWEEP: Iteration {} errored: {}", iteration + 1, error);
+                    format!(
+                        "\n\n=== Completion Sweep (Iteration {}/{}, ERROR) ===\n\n{}",
+                        iteration + 1,
+                        max_iterations,
+                        error
+                    )
+                }
+                AgenticOutcome::Skipped => String::new(),
+            };
+
+            if !output_text.is_empty() {
+                let _ = self.checkpoint_db.append_task_output_ex(
+                    &config.execution_id,
+                    &output_text,
+                    true,  // increment session count
+                    false, // don't check for completion marker
+                );
+            }
+
+            iterations_run = iteration + 1;
+
+            // Check for stop signal
+            let output_str = outcome.output().unwrap_or("");
+            if output_str.contains("[NO_MORE_STEPS]") {
+                info!("SWEEP: AI signaled [NO_MORE_STEPS], ending sweep loop");
+                return SweepResult {
+                    iterations_run,
+                    no_more_steps: true,
+                };
+            }
+
+            // Stop on failure
+            if !outcome.is_success() {
+                warn!("SWEEP: Iteration {} was not successful, ending loop", iteration + 1);
+                break;
+            }
+        }
+
+        SweepResult {
+            iterations_run,
+            no_more_steps: false,
+        }
+    }
+
+    /// Build the prompt for a completion sweep iteration.
+    fn build_sweep_prompt(
+        workflow_name: &str,
+        base_prompt: &str,
+        verification_iterations: u32,
+        sweep_iteration: u32,
+        max_sweep_iterations: u32,
+    ) -> String {
+        let mut prompt = format!(
+            "## Completion Sweep for: {} (Iteration {}/{})\n\n",
+            workflow_name,
+            sweep_iteration + 1,
+            max_sweep_iterations,
+        );
+
+        if !base_prompt.is_empty() {
+            prompt.push_str(&format!(
+                "### Original Task\n\n{}\n\n",
+                base_prompt
+            ));
+        }
+
+        prompt.push_str(&format!(
+            "### Context\n\nThe verification-agentic loop passed after {} iteration(s). All verification checks are now passing.\n\n",
+            verification_iterations
+        ));
+
+        prompt.push_str(
+            r#"## Your Task
+
+Review ALL work done during this workflow execution. Look for:
+
+1. **Overlooked items** from the original task that weren't fully addressed
+2. **Incomplete implementations** - partially done work, stub functions, placeholder code
+3. **Edge cases** that weren't handled
+4. **Integration gaps** - components that don't connect properly
+5. **TODO/FIXME markers** left in the code
+
+**IMPORTANT:** Do not just list items. Actually implement any fixes or missing pieces you find.
+
+**STOP SIGNAL:** If ALL work is complete and there are no remaining items to address, output `[NO_MORE_STEPS]` at the end of your response. Only output this marker when you are confident everything is done.
+If there IS remaining work, implement it now. Do NOT output `[NO_MORE_STEPS]` if you made changes or found issues.
+"#,
+        );
+
+        prompt
+    }
 }
 
 /// Result of running a complete workflow.
@@ -2055,6 +2256,8 @@ pub async fn resume_interrupted_workflows(
                                 run_agentic_first,
                                 artifact_dir: None,
                                 is_dev_mode: cfg!(debug_assertions),
+                                enable_sweep: workflow.enable_sweep,
+                                max_sweep_iterations: workflow.max_sweep_iterations,
                             };
 
                             controller
@@ -2195,6 +2398,8 @@ pub async fn resume_interrupted_workflows(
                                 run_agentic_first,
                                 artifact_dir: None,
                                 is_dev_mode: cfg!(debug_assertions),
+                                enable_sweep: workflow.enable_sweep,
+                                max_sweep_iterations: workflow.max_sweep_iterations,
                             };
 
                             controller

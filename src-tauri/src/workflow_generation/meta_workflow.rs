@@ -137,14 +137,30 @@ pub fn build_meta_workflow_template(
 
     // Build the prompt strings for each agent
     let schema_context = build_schema_context_for_description(&request.description);
-    let builder_prompt = build_builder_prompt(
-        &request.description,
-        &schema_context,
-        resolved_contexts,
-        request.prompt_template.as_deref(),
-        request.category.as_deref(),
-        historical_context,
-    );
+    let is_plan_mode = request
+        .generation_mode
+        .as_deref()
+        .map(|m| m == "plan")
+        .unwrap_or(false);
+    let builder_prompt = if is_plan_mode {
+        build_plan_builder_prompt(
+            &request.description,
+            &schema_context,
+            resolved_contexts,
+            request.prompt_template.as_deref(),
+            request.category.as_deref(),
+            historical_context,
+        )
+    } else {
+        build_builder_prompt(
+            &request.description,
+            &schema_context,
+            resolved_contexts,
+            request.prompt_template.as_deref(),
+            request.category.as_deref(),
+            historical_context,
+        )
+    };
     let verification_prompt = build_verification_review_prompt(historical_context);
     let fixer_prompt =
         build_fixer_base_prompt(&request.description, &schema_context, historical_context);
@@ -240,6 +256,8 @@ pub fn build_meta_workflow_template(
         health_check_enabled: false,
         health_check_urls: Vec::new(),
         preflight_check_enabled: false,
+        enable_sweep: false,
+        max_sweep_iterations: 5,
         generated_by_task_run_id: None,
         created_at: now.clone(),
         updated_at: now,
@@ -379,6 +397,116 @@ If the task description includes "out of scope", "do not change", "do not modify
 1. Add a verification `check` step with `custom_command` that validates the constraint (e.g., `git diff --name-only | grep -v <allowed-patterns>` to detect changes to files that should not be modified)
 2. Or add a `prompt` verification step that specifically reviews whether scope boundaries were respected
 3. Reference the specific constraints in the verification step name (e.g., "Verify data model unchanged")
+
+Generate the workflow JSON now:
+"#,
+    );
+
+    prompt
+}
+
+/// Build the prompt for the plan-aware builder agent.
+///
+/// This variant parses the description as an ordered implementation plan and generates
+/// a workflow with per-phase verification steps and plan-aware agentic prompts.
+fn build_plan_builder_prompt(
+    description: &str,
+    schema_context: &str,
+    resolved_contexts: &str,
+    custom_template: Option<&str>,
+    category: Option<&str>,
+    historical: Option<&HistoricalContext>,
+) -> String {
+    let mut prompt = format!(
+        r#"You are a workflow generation AI operating in **Plan Mode**. Your task is to create a UnifiedWorkflow JSON from an ordered implementation plan.
+
+## Workflow Schema & Rules
+
+{schema_context}
+
+## Implementation Plan
+
+The following is an ordered implementation plan. Each numbered item or section represents a distinct phase of work that must be completed in sequence.
+
+{description}
+"#,
+        schema_context = schema_context,
+        description = description,
+    );
+
+    if let Some(cat) = category {
+        prompt.push_str(&format!("\nUse category: {}\n", cat));
+    }
+
+    if !resolved_contexts.is_empty() {
+        prompt.push_str(&format!(
+            "\n## Additional Context\n\n{}\n",
+            resolved_contexts
+        ));
+    }
+
+    if let Some(template) = custom_template {
+        prompt.push_str(&format!("\n## Custom Instructions\n\n{}\n", template));
+    }
+
+    if let Some(ctx) = historical {
+        if !ctx.improvement_section.is_empty() {
+            prompt.push('\n');
+            prompt.push_str(&ctx.improvement_section);
+        }
+        if !ctx.similar_section.is_empty() {
+            prompt.push('\n');
+            prompt.push_str(&ctx.similar_section);
+        }
+    }
+
+    prompt.push_str(
+        r#"
+## Plan Mode Instructions
+
+Because the input is a structured plan (not a freeform description), follow these additional rules:
+
+### 1. Parse Plan Phases
+- Identify each distinct phase/step/section in the plan
+- Preserve the ordering — earlier phases should be completed before later ones
+- Each plan phase maps to work the AI must do in the agentic phase
+
+### 2. Create Per-Phase Verification Steps
+For EACH phase identified in the plan, create verification steps that would FAIL if that phase's work is incomplete:
+- Use `check` steps with `custom_command` to verify file changes, compilation, test passes
+- Use `shell_command` steps to verify expected outputs exist
+- Use `test` steps for automated testing of the phase's deliverables
+- Each verification step name should reference the plan phase (e.g., "Verify Phase 1: Schema updates")
+- NEVER rely solely on `prompt` type verification — always include automated checks
+
+### 3. Create Plan-Aware Agentic Prompts
+The agentic `prompt` step(s) should:
+- Reference the full plan with phase numbering
+- Instruct the AI to check verification failures and fix the specific failing phase
+- Include `[INJECT_STEP]` awareness: mention that the AI can output `[INJECT_STEP]` markers to dynamically add verification steps during execution
+- Structure the prompt so the AI works through plan phases systematically
+
+### 4. Gate Steps
+- Add a `gate` step that depends on ALL phase-specific verification steps
+- This ensures the agentic loop continues until ALL plan phases pass verification
+
+## Output Requirements
+
+1. Output ONLY valid JSON — no markdown, no code fences, no explanation
+2. The JSON must be a complete UnifiedWorkflow object
+3. Every step must have a unique UUID v4 `id` field
+4. Every step's `phase` field must match the array it's in
+5. Use descriptive `name` fields for each step
+6. Set reasonable `timeout_seconds` for each step
+
+### Quality checklist:
+- Every `shell_command` has a real, syntactically-valid command (no placeholders)
+- Every `check` step has a `command` that matches its `check_type`
+- Every `prompt` in the agentic phase has substantive, multi-sentence instructions referencing the plan phases and verification failures
+- verification_steps MUST include at least one automated step per plan phase
+- A `gate` step depends on all automated verification step IDs
+- Step names reference specific plan phases (not generic names)
+- `working_directory` paths are real absolute or project-relative paths
 
 Generate the workflow JSON now:
 "#,
