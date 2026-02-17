@@ -13,6 +13,7 @@ pub mod rules;
 pub mod schema_context;
 pub mod self_improve;
 pub mod similar_workflows;
+pub mod step_type_knowledge;
 pub mod step_type_metadata;
 pub mod validation;
 

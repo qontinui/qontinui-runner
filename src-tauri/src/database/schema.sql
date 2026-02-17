@@ -2145,6 +2145,30 @@ CREATE INDEX IF NOT EXISTS idx_generation_rules_agent ON generation_rules(agent)
 CREATE INDEX IF NOT EXISTS idx_generation_rules_status ON generation_rules(status);
 CREATE INDEX IF NOT EXISTS idx_generation_rules_agent_section ON generation_rules(agent, section, rule_number);
 
+-- =============================================================================
+-- Step Type Knowledge (v63)
+-- Per-step-type best practices and pitfalls for workflow generation.
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS step_type_knowledge (
+    id TEXT PRIMARY KEY,
+    step_type TEXT NOT NULL,
+    layer TEXT NOT NULL DEFAULT 'universal',  -- 'universal' | 'system_specific'
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,      -- higher = more important
+    status TEXT NOT NULL DEFAULT 'active',     -- 'active' | 'disabled'
+    provenance TEXT NOT NULL DEFAULT 'seed',   -- 'seed' | 'reflection' | 'manual'
+    source_fix_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (source_fix_id) REFERENCES reflection_fixes(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_stk_step_type ON step_type_knowledge(step_type);
+CREATE INDEX IF NOT EXISTS idx_stk_layer ON step_type_knowledge(layer);
+CREATE INDEX IF NOT EXISTS idx_stk_composite ON step_type_knowledge(step_type, layer, status);
+
 -- Initialize singleton tables
 INSERT OR IGNORE INTO gui_lock (id, holder_session_id, acquired_at) VALUES (1, NULL, NULL);
 INSERT OR IGNORE INTO scheduler_settings (id) VALUES (1);

@@ -9,6 +9,7 @@ use rusqlite::Connection;
 use super::example_workflows::{find_relevant_examples, format_examples_for_prompt};
 use super::relevance_filter::filter_relevant_step_types;
 use super::rules;
+use super::step_type_knowledge;
 use super::step_type_metadata::{get_all_step_type_metadata, StepTypeMetadata};
 
 /// Build the complete schema context prompt for AI workflow generation.
@@ -19,7 +20,7 @@ pub fn build_schema_context() -> String {
     let type_refs: Vec<&StepTypeMetadata> = all_types.iter().collect();
     let step_types_doc = generate_step_types_documentation(&type_refs);
     let phase_table = generate_phase_constraint_table(&type_refs);
-    assemble_prompt(&step_types_doc, &phase_table, "", None)
+    assemble_prompt(&step_types_doc, &phase_table, "", "", None)
 }
 
 /// Build schema context filtered by description keywords.
@@ -31,7 +32,7 @@ pub fn build_schema_context_for_description(description: &str) -> String {
     let filtered = filter_relevant_step_types(description, all_types);
     let step_types_doc = generate_step_types_documentation(&filtered);
     let phase_table = generate_phase_constraint_table(&filtered);
-    assemble_prompt(&step_types_doc, &phase_table, "", None)
+    assemble_prompt(&step_types_doc, &phase_table, "", "", None)
 }
 
 /// Build full schema context with filtered types + RAG examples from DB.
@@ -60,7 +61,27 @@ pub fn build_schema_context_full(
         String::new()
     };
 
-    assemble_prompt(&step_types_doc, &phase_table, &examples_section, conn)
+    // Load step type knowledge filtered to relevant step types
+    let knowledge_section = if let Some(conn) = conn {
+        let step_type_names: Vec<&str> = filtered.iter().map(|m| m.step_type).collect();
+        let entries =
+            step_type_knowledge::load_knowledge_for_step_types(conn, &step_type_names);
+        if !entries.is_empty() {
+            step_type_knowledge::format_knowledge_as_markdown(&entries)
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    assemble_prompt(
+        &step_types_doc,
+        &phase_table,
+        &examples_section,
+        &knowledge_section,
+        conn,
+    )
 }
 
 // ============================================================================
@@ -160,7 +181,7 @@ pub fn generate_phase_constraint_table(types: &[&StepTypeMetadata]) -> String {
 // Prompt Assembly
 // ============================================================================
 
-fn assemble_prompt(step_types: &str, phase_table: &str, examples: &str, conn: Option<&Connection>) -> String {
+fn assemble_prompt(step_types: &str, phase_table: &str, examples: &str, knowledge: &str, conn: Option<&Connection>) -> String {
     let examples_section = if examples.is_empty() {
         String::new()
     } else {
@@ -169,6 +190,12 @@ fn assemble_prompt(step_types: &str, phase_table: &str, examples: &str, conn: Op
 
     // Build rules from DB if available, otherwise use hardcoded fallback
     let rules_section = build_rules_section(conn);
+
+    let knowledge_section = if knowledge.is_empty() {
+        String::new()
+    } else {
+        knowledge.to_string()
+    };
 
     format!(
         r#"You are a workflow generation assistant for Qontinui Runner.
@@ -216,6 +243,8 @@ The Verification/Agentic loop continues until all blocking checks pass or max_it
 - `phase`: Which phase this step belongs to (required)
 
 {step_types}
+
+{knowledge_section}
 
 ## Phase Constraints
 

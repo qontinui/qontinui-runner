@@ -859,40 +859,75 @@ fn run_claude_session_inline(
                                         }
                                     }
                                     "instruction_clarification" | "workflow_step_rewrite" => {
-                                        // Create generation rule entry
                                         use crate::workflow_generation::rules;
-                                        let agent = rules::infer_agent_from_fix(&fix.fix_description);
-                                        let section = rules::infer_section_from_fix(&fix.fix_description, &agent);
-                                        let next_num = rules::next_rule_number(&conn, &agent, &section);
-                                        let title = rules::truncate_to_title(&fix.fix_description);
+                                        use crate::workflow_generation::step_type_knowledge;
 
-                                        match rules::insert_rule(&conn, &rules::InsertRuleInput {
-                                            agent: agent.clone(),
-                                            section: section.clone(),
-                                            rule_number: next_num,
-                                            title: title.clone(),
-                                            content: fix.fix_description.clone(),
-                                            condition: None,
-                                            provenance: "reflection".to_string(),
-                                            source_fix_id: Some(fix.id.clone()),
-                                        }) {
-                                            Ok(rule) => {
-                                                info!("Auto-applied reflection fix as generation rule: {} (agent={}, section={})", rule.id, agent, section);
-                                                let auto_msg = format!(
-                                                    "Auto-applied fix as generation rule [{}/{}]: {}",
-                                                    agent, section, title
-                                                );
-                                                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                                    emit_ai_output(
-                                                        &app_handle_reflection,
-                                                        &auto_msg,
-                                                        "reflection_auto_apply",
-                                                        None,
-                                                        session_ctx_for_reflection.as_ref(),
+                                        // Check if this fix targets a specific step type
+                                        if let Some(step_type) = step_type_knowledge::infer_step_type_from_fix(&fix.fix_description) {
+                                            // Create step type knowledge entry (system-specific layer)
+                                            let title = rules::truncate_to_title(&fix.fix_description);
+                                            match step_type_knowledge::insert_knowledge(&conn, &step_type_knowledge::InsertKnowledgeInput {
+                                                step_type: step_type.clone(),
+                                                layer: "system_specific".to_string(),
+                                                title: title.clone(),
+                                                content: fix.fix_description.clone(),
+                                                priority: 5,
+                                                provenance: "reflection".to_string(),
+                                                source_fix_id: Some(fix.id.clone()),
+                                            }) {
+                                                Ok(entry) => {
+                                                    info!("Auto-applied reflection fix as step type knowledge: {} (step_type={})", entry.id, step_type);
+                                                    let auto_msg = format!(
+                                                        "Auto-applied fix as step type knowledge [{}]: {}",
+                                                        step_type, title
                                                     );
-                                                }));
+                                                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                                        emit_ai_output(
+                                                            &app_handle_reflection,
+                                                            &auto_msg,
+                                                            "reflection_auto_apply",
+                                                            None,
+                                                            session_ctx_for_reflection.as_ref(),
+                                                        );
+                                                    }));
+                                                }
+                                                Err(e) => warn!("Failed to auto-apply fix as step type knowledge: {}", e),
                                             }
-                                            Err(e) => warn!("Failed to auto-apply fix as generation rule: {}", e),
+                                        } else {
+                                            // No step type detected — create generation rule entry (existing behavior)
+                                            let agent = rules::infer_agent_from_fix(&fix.fix_description);
+                                            let section = rules::infer_section_from_fix(&fix.fix_description, &agent);
+                                            let next_num = rules::next_rule_number(&conn, &agent, &section);
+                                            let title = rules::truncate_to_title(&fix.fix_description);
+
+                                            match rules::insert_rule(&conn, &rules::InsertRuleInput {
+                                                agent: agent.clone(),
+                                                section: section.clone(),
+                                                rule_number: next_num,
+                                                title: title.clone(),
+                                                content: fix.fix_description.clone(),
+                                                condition: None,
+                                                provenance: "reflection".to_string(),
+                                                source_fix_id: Some(fix.id.clone()),
+                                            }) {
+                                                Ok(rule) => {
+                                                    info!("Auto-applied reflection fix as generation rule: {} (agent={}, section={})", rule.id, agent, section);
+                                                    let auto_msg = format!(
+                                                        "Auto-applied fix as generation rule [{}/{}]: {}",
+                                                        agent, section, title
+                                                    );
+                                                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                                        emit_ai_output(
+                                                            &app_handle_reflection,
+                                                            &auto_msg,
+                                                            "reflection_auto_apply",
+                                                            None,
+                                                            session_ctx_for_reflection.as_ref(),
+                                                        );
+                                                    }));
+                                                }
+                                                Err(e) => warn!("Failed to auto-apply fix as generation rule: {}", e),
+                                            }
                                         }
                                     }
                                     _ => {}

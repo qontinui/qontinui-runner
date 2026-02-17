@@ -4843,6 +4843,160 @@ impl CheckpointDb {
             info!("Successfully migrated to version 62 (valid assertion types rule)");
         }
 
+        // Migration to version 63: Add step_type_knowledge table with seed data
+        if current_version < 63 {
+            info!("Migrating database to version 63 (adding step_type_knowledge table)");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS step_type_knowledge (
+                    id TEXT PRIMARY KEY,
+                    step_type TEXT NOT NULL,
+                    layer TEXT NOT NULL DEFAULT 'universal',
+                    title TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    provenance TEXT NOT NULL DEFAULT 'seed',
+                    source_fix_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (source_fix_id) REFERENCES reflection_fixes(id) ON DELETE SET NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_stk_step_type ON step_type_knowledge(step_type);
+                CREATE INDEX IF NOT EXISTS idx_stk_layer ON step_type_knowledge(layer);
+                CREATE INDEX IF NOT EXISTS idx_stk_composite ON step_type_knowledge(step_type, layer, status);
+                "#,
+            )
+            .map_err(|e| format!("Failed to create step_type_knowledge table: {}", e))?;
+
+            // Seed universal knowledge entries
+            let now = chrono::Utc::now().to_rfc3339();
+            let seed_entries: &[(&str, &str, &str, i32)] = &[
+                // shell_command (3 entries)
+                (
+                    "shell_command",
+                    "Always set working_directory",
+                    "Shell commands must specify working_directory to ensure they run in the correct location. Without it, the command runs in whatever directory the runner process happens to be in, which is unpredictable.",
+                    10,
+                ),
+                (
+                    "shell_command",
+                    "Use fail_on_error appropriately",
+                    "Set fail_on_error: true for critical setup steps (installing deps, building). Set fail_on_error: false only for commands where non-zero exit is expected (e.g., grep that may match nothing).",
+                    8,
+                ),
+                (
+                    "shell_command",
+                    "Keep commands simple and single-purpose",
+                    "Each shell_command step should do one thing. Avoid long chained commands with && or ||. Split complex operations into multiple steps so failures are attributable to a specific operation.",
+                    6,
+                ),
+                // api_request (3 entries)
+                (
+                    "api_request",
+                    "Always include content-specific assertions",
+                    "A status_code: 200 assertion alone is INSUFFICIENT. Always add body_contains or json_path assertions to verify the response has the expected content. Many endpoints return 200 with empty or error bodies.",
+                    10,
+                ),
+                (
+                    "api_request",
+                    "Set content_type for request bodies",
+                    "When sending a request body, always set content_type (usually 'application/json'). Missing content_type causes the server to reject or misinterpret the body.",
+                    8,
+                ),
+                (
+                    "api_request",
+                    "Use json_path for structured response validation",
+                    "Prefer json_path assertions over body_contains for JSON APIs. Use json_path with operators like 'greater_than' or 'contains' for flexible yet precise validation. Example: json_path '$.total' greater_than '0'.",
+                    6,
+                ),
+                // prompt (2 entries)
+                (
+                    "prompt",
+                    "Include specific agent instructions",
+                    "The prompt field must contain clear, actionable instructions for the AI agent. Vague prompts like 'fix the errors' lead to unfocused actions. Tell the agent exactly what to look for and what corrective actions to take.",
+                    10,
+                ),
+                (
+                    "prompt",
+                    "Reference verification failures explicitly",
+                    "In agentic prompts, tell the agent to check previous verification results and address specific failures. Use phrases like 'Check which verification steps failed and fix the underlying issues'.",
+                    8,
+                ),
+                // check (2 entries)
+                (
+                    "check",
+                    "Match check_type to the technology",
+                    "Use the correct check_type for the project: 'typescript' for TS/JS projects, 'python' for Python, 'rust' for Rust. Using the wrong check_type produces misleading results.",
+                    10,
+                ),
+                (
+                    "check",
+                    "Set path to the project directory",
+                    "Always set the path field to the project root or source directory being checked. Without it, the checker may run in the wrong location or fail to find source files.",
+                    8,
+                ),
+                // test (2 entries)
+                (
+                    "test",
+                    "Use test_type repository for inline commands",
+                    "When a test step runs a shell command (e.g., 'npm test', 'pytest'), set test_type: 'repository'. The 'repository' type executes the command in the project directory.",
+                    10,
+                ),
+                (
+                    "test",
+                    "Target specific test files or patterns",
+                    "Avoid running the entire test suite when only specific functionality needs verification. Use the command field to target specific test files or patterns (e.g., 'pytest tests/test_auth.py').",
+                    6,
+                ),
+                // gate (2 entries)
+                (
+                    "gate",
+                    "List ALL non-gate non-prompt verification step IDs",
+                    "The required_steps array must contain the IDs of every non-gate, non-prompt step in verification_steps. Missing a step ID means that step's failure won't block the workflow from completing.",
+                    10,
+                ),
+                (
+                    "gate",
+                    "Use exactly one gate step per workflow",
+                    "Each workflow should have exactly one gate step in verification_steps. Multiple gates create confusing pass/fail semantics. The single gate aggregates all deterministic check results.",
+                    8,
+                ),
+                // spec (2 entries)
+                (
+                    "spec",
+                    "Describe behavioral requirements not implementation",
+                    "Spec content should describe what the system should DO, not how it's implemented. Focus on observable behavior: 'The login form should display an error message when credentials are invalid'.",
+                    10,
+                ),
+                (
+                    "spec",
+                    "Pair with deterministic verification",
+                    "Spec steps use AI to evaluate behavior, which is non-deterministic. Always pair spec steps with deterministic steps (check, test, api_request) for reliable verification.",
+                    8,
+                ),
+            ];
+
+            for (step_type, title, content, priority) in seed_entries {
+                let id = format!("seed-stk-{}-{}", step_type, title.to_lowercase().replace(' ', "-").chars().take(30).collect::<String>());
+                conn.execute(
+                    "INSERT OR IGNORE INTO step_type_knowledge (id, step_type, layer, title, content, priority, status, provenance, created_at, updated_at)
+                     VALUES (?1, ?2, 'universal', ?3, ?4, ?5, 'active', 'seed', ?6, ?7)",
+                    params![id, step_type, title, content, priority, now, now],
+                )
+                .map_err(|e| format!("Failed to seed step type knowledge: {}", e))?;
+            }
+
+            conn.execute_batch(
+                "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (63, datetime('now'));",
+            )
+            .map_err(|e| format!("Failed to update schema version to 63: {}", e))?;
+
+            info!("Successfully migrated to version 63 (step_type_knowledge table with {} seed entries)", seed_entries.len());
+        }
+
         Ok(())
     }
 
