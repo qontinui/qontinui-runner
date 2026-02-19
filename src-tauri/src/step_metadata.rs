@@ -714,7 +714,7 @@ mod tests {
 
     #[test]
     fn test_step_metadata_builder() {
-        let metadata = StepMetadata::setup("task-789", StepType::ShellCommand, "Build", 0)
+        let metadata = StepMetadata::setup("task-789", StepType::Command, "Build", 0)
             .with_expected_duration(5000)
             .with_timeout(30000)
             .with_tags(vec!["build".to_string(), "npm".to_string()])
@@ -731,8 +731,8 @@ mod tests {
 
     #[test]
     fn test_step_metadata_default_expected_duration() {
-        // ShellCommand default is 30_000ms
-        let shell_metadata = StepMetadata::setup("task-123", StepType::ShellCommand, "Build", 0);
+        // Command default is 30_000ms
+        let shell_metadata = StepMetadata::setup("task-123", StepType::Command, "Build", 0);
         assert_eq!(shell_metadata.expected_duration_ms, Some(30_000));
 
         // AiSession default is 300_000ms (5 minutes)
@@ -794,7 +794,7 @@ mod tests {
 
     #[test]
     fn test_step_details_merge() {
-        let metadata = StepMetadata::setup("task-789", StepType::ShellCommand, "Build", 0);
+        let metadata = StepMetadata::setup("task-789", StepType::Command, "Build", 0);
         let details = StepDetails::shell_command("npm run build".to_string(), None, None);
 
         // Convert metadata to JSON object
@@ -805,7 +805,7 @@ mod tests {
         details.merge_into(obj);
 
         assert_eq!(combined["task_run_id"], "task-789");
-        assert_eq!(combined["step_type"], "shell_command");
+        assert_eq!(combined["step_type"], "command");
         assert_eq!(combined["command"], "npm run build");
     }
 }

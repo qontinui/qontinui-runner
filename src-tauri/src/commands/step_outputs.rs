@@ -627,7 +627,7 @@ fn create_step_output(
             }
             Some(output)
         }
-        "shell_command" => {
+        "command" | "shell_command" => {
             let mut output = base.clone();
             if let serde_json::Value::Object(ref mut map) = output {
                 if let Some(d) = data {
@@ -884,6 +884,7 @@ fn create_step_output(
 
 fn get_display_name(step_type: &str) -> String {
     match step_type {
+        "command" => "Command".to_string(),
         "api_request" => "API Request".to_string(),
         "gui_action" => "GUI Action".to_string(),
         "shell_command" => "Shell Command".to_string(),

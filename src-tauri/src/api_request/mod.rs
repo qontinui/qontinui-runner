@@ -16,7 +16,6 @@ pub mod variable_resolver;
 
 pub use curl_parser::parse_curl;
 pub use executor::ApiRequestExecutor;
-pub use session::ApiRequestSession;
 pub use types::*;
 // Note: VariableResolver is used internally by executor and session modules
 // but is not exposed publicly as users should work with ApiRequestSession instead

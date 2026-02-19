@@ -204,7 +204,7 @@ mod tests {
     fn test_tracker_multiple_steps() {
         let mut tracker = ExecutionTracker::new("test-exec-2");
 
-        let key1 = StepKey::setup(StepType::ShellCommand, 0);
+        let key1 = StepKey::setup(StepType::Command, 0);
         let key2 = StepKey::setup(StepType::Prompt, 1);
 
         // Start both

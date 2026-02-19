@@ -249,6 +249,18 @@ The Verification/Agentic loop continues until all blocking checks pass or max_it
 - `id`: UUID v4 string (required)
 - `name`: Display name (required)
 - `phase`: Which phase this step belongs to (required)
+- `required`: boolean (optional, default true) — If false, step failure does not fail the workflow
+- `depends_on`: string[] (optional) — Step IDs that must complete before this step runs. Creates a DAG execution order.
+- `inputs`: object (optional) — Map of variable names to values. Values can reference other step outputs using `${{step_id.field}}` syntax.
+- `extract`: object (optional) — Map of variable names to extraction expressions. Extracts values from step output for use by downstream steps via `inputs`.
+
+### Data Flow Between Steps
+
+Steps can pass data to each other using `inputs` and `extract`:
+1. A step uses `extract` to pull values from its output (e.g., `{{"token": "$.access_token"}}`)
+2. A downstream step uses `inputs` to receive those values (e.g., `{{"auth_token": "${{login_step.token}}"}}`)
+3. Use `depends_on` to ensure execution order when steps need data from earlier steps
+4. Circular dependencies in `depends_on` are invalid and will be rejected
 
 {step_types}
 
@@ -297,14 +309,11 @@ The SDK snapshot is a proxy: the runner forwards your request to the connected a
 Every workflow that uses SDK snapshots MUST include a connect step in setup:
 ```json
 {{
-  "type": "api_request",
+  "type": "command",
   "phase": "setup",
   "name": "Connect UI Bridge SDK",
-  "method": "POST",
-  "url": "http://localhost:9876/ui-bridge/sdk/connect",
-  "body": "{{\"url\": \"http://localhost:3001\"}}",
-  "content_type": "application/json",
-  "assertions": [{{"type": "status_code", "expected": 200}}]
+  "command": "curl -s -X POST http://localhost:9876/ui-bridge/sdk/connect -H \"Content-Type: application/json\" -d \"{{\\\"url\\\": \\\"http://localhost:3001\\\"}}\"",
+  "fail_on_error": true
 }}
 ```
 If this succeeds, the target app has the SDK installed and all SDK endpoints become available.
@@ -396,16 +405,14 @@ This means workflows can **read page text without screenshots**:
 - **Playwright**: Full browser testing, visual regression, complex multi-page flows,
   testing apps WITHOUT the SDK, screenshot-based verification, pixel-level checks
 
-### Retry Support for API Requests
+### Retry Support for Verification Commands
 After page navigation, the WebSocket connection needs ~15 seconds to reconnect. Use `retry_count` and `retry_delay_ms` on verification steps that follow navigation:
 ```json
 {{
-  "type": "api_request",
+  "type": "command",
   "phase": "verification",
   "name": "Verify page loaded",
-  "method": "GET",
-  "url": "http://localhost:9876/ui-bridge/sdk/snapshot",
-  "assertions": [{{"type": "status_code", "expected": 200}}, {{"type": "body_contains", "expected": "expected-element-id"}}],
+  "command": "curl -sf http://localhost:9876/ui-bridge/sdk/snapshot | grep expected-element-id",
   "retry_count": 5,
   "retry_delay_ms": 3000
 }}
@@ -413,15 +420,13 @@ After page navigation, the WebSocket connection needs ~15 seconds to reconnect. 
 This retries up to 5 times with 3s delay between attempts — enough time for the WebSocket to reconnect after navigation.
 
 ### SDK in Verification Steps
-Use `api_request` steps to query SDK endpoints for verification:
+Use `command` steps with curl to query SDK endpoints for verification:
 ```json
 {{
-  "type": "api_request",
+  "type": "command",
   "phase": "verification",
   "name": "Check Page Content",
-  "method": "GET",
-  "url": "http://localhost:9876/ui-bridge/sdk/elements?contentOnly=true",
-  "assertions": [{{"type": "status_code", "expected": 200}}]
+  "command": "curl -sf http://localhost:9876/ui-bridge/sdk/elements?contentOnly=true"
 }}
 ```
 
@@ -483,18 +488,17 @@ const FALLBACK_SCHEMA_CONTEXT_RULES: &str = r#"## Important Rules
 
 These rules are NON-NEGOTIABLE. Workflows that violate them will be rejected.
 
-6. **Deterministic verification step required**: verification_steps MUST include at least one deterministic, automated step — one of: `check`, `test`, `spec`, or `api_request` with assertions. Do NOT use only `prompt` type steps for verification.
-7. **Code modification requires typecheck**: When the workflow creates or modifies source code files, verification MUST include a `check` step with the appropriate type checker.
-8. **Web app verification requires SDK or Playwright**: When the workflow targets a web application, verification MUST include SDK-based or Playwright-based checks.
-9. **Gate step required with ALL non-prompt steps**: Every workflow with 2+ verification steps MUST include a `gate` step whose `required_steps` array lists the IDs of ALL non-gate, non-prompt verification steps.
+6. **Deterministic verification step required**: verification_steps MUST include at least one deterministic, automated step — one of: `command` (with check_type or a command), `test`, or `ui_bridge` (assert action). Do NOT use only `prompt` type steps for verification.
+7. **Code modification requires typecheck**: When the workflow creates or modifies source code files, verification MUST include a `command` step with `check_type` set to the appropriate type checker.
+8. **Web app verification requires SDK or Playwright**: When the workflow targets a web application, verification MUST include `ui_bridge` steps or Playwright-based checks.
+9. **Data flow references must be valid**: All step IDs referenced in `inputs`, `depends_on`, and `extract` must correspond to existing step IDs within the same workflow. Circular dependencies in `depends_on` are invalid.
 10. **Prompts are supplementary**: `prompt` type steps in verification must NEVER be the sole verification mechanism.
 11. **Test steps with inline commands use repository**: When a `test` step runs a shell command, set `test_type: "repository"`.
 12. **Next.js App Router path conventions**: Use correct paths like `src/app/(app)/`.
 13. **Verification step caching**: Running tasks cache verification steps at startup; API updates don't affect current task.
-14. **Feature-specific verification required**: Must include feature-specific checks, not just compilation/lint gates.
-15. **SDK assertions must verify content**: A `status_code: 200` assertion alone is INSUFFICIENT for SDK endpoints.
-16. **Agentic-verification correspondence**: Each agentic step must have a corresponding deterministic verification step.
-17. **Valid assertion types only**: API request assertions MUST use one of these 5 types: `status_code`, `body_contains`, `json_path`, `header`, `response_time`. Do NOT use `body_not_contains` or any other unlisted type — they will cause runtime errors. To check that a body does NOT contain something, use `json_path` with an appropriate operator instead."#;
+14. **Feature-specific verification required**: Must include feature-specific checks, not just compilation/lint checks.
+15. **Agentic-verification correspondence**: Each agentic step must have a corresponding deterministic verification step.
+16. **Only 4 step types exist**: The only valid step types are `command`, `test`, `ui_bridge`, and `prompt`. Do NOT use `shell_command`, `api_request`, `mcp_call`, `check`, or `check_group` — these are not valid types."#;
 
 // ============================================================================
 
@@ -541,25 +545,24 @@ mod tests {
     #[test]
     fn test_build_schema_context_contains_step_types() {
         let context = build_schema_context();
-        assert!(context.contains("### shell_command"));
+        assert!(context.contains("### command"));
         assert!(context.contains("### prompt"));
-        assert!(context.contains("### check"));
         assert!(context.contains("### test"));
-        assert!(context.contains("### api_request"));
+        assert!(context.contains("### ui_bridge"));
     }
 
     #[test]
     fn test_build_schema_context_contains_phase_table() {
         let context = build_schema_context();
         assert!(context.contains("| Step Type | setup | verification | agentic | completion |"));
-        assert!(context.contains("| shell_command |"));
+        assert!(context.contains("| command |"));
     }
 
     #[test]
     fn test_filtered_context_smaller_than_full() {
         let full = build_schema_context();
         let filtered = build_schema_context_for_description("run pytest and fix errors");
-        // Filtered should be smaller (no GUI, no AWAS types)
+        // Filtered should be smaller (no automation types)
         assert!(
             filtered.len() < full.len(),
             "Filtered context ({}) should be smaller than full ({})",
@@ -571,24 +574,22 @@ mod tests {
     #[test]
     fn test_filtered_context_still_has_core_types() {
         let filtered = build_schema_context_for_description("run pytest and fix errors");
-        assert!(filtered.contains("### shell_command"));
+        assert!(filtered.contains("### command"));
         assert!(filtered.contains("### prompt"));
-        assert!(filtered.contains("### check"));
         assert!(filtered.contains("### test"));
     }
 
     #[test]
     fn test_filtered_context_excludes_irrelevant_types() {
         let filtered = build_schema_context_for_description("run pytest and fix errors");
-        assert!(!filtered.contains("### gui_action"));
-        assert!(!filtered.contains("### awas_discover"));
+        assert!(!filtered.contains("### ui_bridge"));
     }
 
     #[test]
     fn test_context_contains_verification_rules() {
         let context = build_schema_context();
         assert!(context.contains("Verification Quality Rules"));
-        assert!(context.contains("Gate step required"));
+        assert!(context.contains("Data flow references must be valid"));
     }
 
     #[test]
@@ -609,7 +610,7 @@ mod tests {
     fn test_full_context_without_db() {
         // Should work without DB — just no examples
         let context = build_schema_context_full("run pytest", None, None);
-        assert!(context.contains("### shell_command"));
+        assert!(context.contains("### command"));
         assert!(context.contains("### test"));
     }
 
@@ -624,10 +625,9 @@ mod tests {
     }
 
     #[test]
-    fn test_context_contains_assertion_best_practices() {
+    fn test_context_contains_deterministic_verification_rule() {
         let context = build_schema_context();
-        assert!(context.contains("SDK assertions must verify content"));
-        assert!(context.contains("INSUFFICIENT"));
+        assert!(context.contains("Deterministic verification step required"));
     }
 
     #[test]
@@ -645,6 +645,6 @@ mod tests {
         // Should contain field names from metadata
         assert!(doc.contains("\"command\""));
         assert!(doc.contains("\"check_type\""));
-        assert!(doc.contains("\"method\""));
+        assert!(doc.contains("\"action\""));
     }
 }

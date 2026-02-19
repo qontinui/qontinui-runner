@@ -1,10 +1,12 @@
 //! Programmatic reflection workflow definition.
 //!
 //! Builds the execution steps for a reflection workflow, including:
-//! - Setup phase: Load source run data via API requests
+//! - Setup phase: Load source run data via curl commands
 //! - Agentic phase: AI analyzes the data and applies fixes
 //! - Verification phase: Verify no destructive changes
 //! - Completion phase: Record patterns and evaluate effectiveness
+
+use std::collections::HashMap;
 
 use crate::step_executor::ExecutionStepConfig;
 use crate::unified_workflow_executor::LoopConfig;
@@ -31,7 +33,7 @@ pub fn build_reflection_config(
     }
 }
 
-/// Build setup steps that load source run data via API requests.
+/// Build setup steps that load source run data via curl commands.
 pub fn build_setup_steps(
     source_task_run_id: &str,
     source_workflow_name: &str,
@@ -106,10 +108,10 @@ pub fn build_verification_steps(source_task_run_id: &str) -> Vec<ExecutionStepCo
         // Step 1: Verify reflection fixes were recorded via API
         {
             let mut step = ExecutionStepConfig {
-                step_type: "api_request".to_string(),
+                step_type: "command".to_string(),
                 name: Some("Verify reflection data accessible".to_string()),
-                api_method: Some("GET".to_string()),
-                api_url: Some(format!(
+                check_type: Some("http_status".to_string()),
+                check_url: Some(format!(
                     "{}/task-runs/{}/knowledge",
                     base_url, source_task_run_id
                 )),
@@ -298,31 +300,28 @@ Only emit fixes for genuinely new insights — do NOT re-emit fixes from previou
 
 For EACH fix you apply, also output a verification step using `[INJECT_STEP]...[/INJECT_STEP]` markers.
 The step should verify that the fix was correctly applied. Use JSON format with these step types:
-- `api_request`: HTTP request with assertions (PREFERRED — always use this for checking runner data like knowledge, findings, rules)
-- `check_command`: Shell command that should exit 0
-- `check` with `check_type: "ci_cd"`: Verify GitHub CI/CD pipeline passes (set `repository` to owner/repo or `working_directory` to a git repo root)
+- `command`: Shell command (PREFERRED — use curl commands for checking runner data like knowledge, findings, rules)
+- `command` with `check_type: "ci_cd"`: Verify GitHub CI/CD pipeline passes (set `repository` to owner/repo or `working_directory` to a git repo root)
 - `prompt`: AI verification question (AVOID in reflection — no UI Bridge SDK connection is available, so prompt steps that depend on UI state will fail)
-
-Valid assertion types for api_request: `status_code`, `body_contains`, `json_path`, `header`, `response_time`. Do NOT use `body_not_contains` — it does not exist.
 
 These injected steps will be added to the verification phase to confirm your fixes work.
 
-**IMPORTANT: Prefer `api_request` steps over `prompt` steps for verification.**
+**IMPORTANT: Prefer `command` steps with curl over `prompt` steps for verification.**
 Prompt-type verification steps require an active UI Bridge SDK connection, which is NOT available during reflection workflows.
-Use `api_request` steps targeting the runner API at http://localhost:9876 to verify data stored in the runner (knowledge entries, findings, generation rules, etc.).
-Only use `prompt` steps for high-level semantic checks that cannot be expressed as API assertions.
+Use `command` steps with curl targeting the runner API at http://localhost:9876 to verify data stored in the runner (knowledge entries, findings, generation rules, etc.).
+Only use `prompt` steps for high-level semantic checks that cannot be expressed as command assertions.
 
 ### Example
 
 ```
 [INJECT_STEP]
-{{"type": "api_request", "name": "Verify KB entry exists", "api_url": "http://localhost:9876/task-runs/current/knowledge", "api_method": "GET", "api_expected_status": 200, "assertions": [{{"type": "body_contains", "expected": "expected_keyword"}}]}}
+{{"type": "command", "name": "Verify KB entry exists", "command": "curl -sf http://localhost:9876/task-runs/current/knowledge | grep expected_keyword"}}
 [/INJECT_STEP]
 ```
 
 ```
 [INJECT_STEP]
-{{"type": "api_request", "name": "Verify generation rule created", "api_url": "http://localhost:9876/generation-rules?agent=schema_context&status=active", "api_method": "GET", "api_expected_status": 200, "assertions": [{{"type": "body_contains", "expected": "rule_title_keyword"}}]}}
+{{"type": "command", "name": "Verify generation rule created", "command": "curl -sf 'http://localhost:9876/generation-rules?agent=schema_context&status=active' | grep rule_title_keyword"}}
 [/INJECT_STEP]
 ```
 
@@ -339,7 +338,10 @@ and record any new fixes needed using `[REFLECTION_FIX:...]` markers."#,
     )
 }
 
-/// Helper: Build an API request step.
+/// Helper: Build a command step that makes an HTTP request via curl.
+///
+/// Constructs a `command` step with a curl shell command.
+/// The `output_variable` is extracted from the step output by the runtime.
 fn build_api_step(
     name: &str,
     method: &str,
@@ -348,18 +350,32 @@ fn build_api_step(
     output_variable: Option<&str>,
     is_setup: bool,
 ) -> ExecutionStepConfig {
+    // Build curl command
+    let curl_cmd = if let Some(body_str) = body {
+        format!(
+            "curl -sf -X {} -H \"Content-Type: application/json\" -d '{}' '{}'",
+            method, body_str, url
+        )
+    } else {
+        format!("curl -sf -X {} '{}'", method, url)
+    };
+
+    // If we need to capture output into a variable, use extract
+    let extract = output_variable.map(|var| {
+        let mut map = HashMap::new();
+        map.insert(var.to_string(), "$".to_string());
+        map
+    });
+
     let mut step = ExecutionStepConfig {
-        step_type: "api_request".to_string(),
+        step_type: "command".to_string(),
         name: Some(name.to_string()),
-        api_method: Some(method.to_string()),
-        api_url: Some(url.to_string()),
-        api_body: body.map(|b| b.to_string()),
-        api_output_variable: output_variable.map(|v| v.to_string()),
+        shell_command: Some(curl_cmd),
+        extract,
         ..Default::default()
     };
     if is_setup {
         step.phase = Some("setup".to_string());
-        step.is_setup = Some(true);
         step.run_on_subsequent_iterations = Some(false);
     } else {
         step.phase = Some("completion".to_string());

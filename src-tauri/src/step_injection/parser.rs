@@ -8,11 +8,9 @@
 //! ```text
 //! [INJECT_STEP]
 //! {
-//!   "type": "api_request",
+//!   "type": "command",
 //!   "name": "Verify KB entry created",
-//!   "api_url": "http://localhost:9876/task-runs/xxx/knowledge",
-//!   "api_method": "GET",
-//!   "api_expected_status": 200
+//!   "command": "curl -s http://localhost:9876/task-runs/xxx/knowledge"
 //! }
 //! [/INJECT_STEP]
 //! ```
@@ -39,6 +37,7 @@ fn get_end_pattern() -> &'static Regex {
 
 /// Allowed step types for injected steps.
 const ALLOWED_STEP_TYPES: &[&str] = &[
+    "command",
     "api_request",
     "check_command",
     "shell_command",

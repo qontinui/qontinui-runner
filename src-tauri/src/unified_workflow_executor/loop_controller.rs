@@ -2530,7 +2530,6 @@ fn substitute_step_vars(step: &mut ExecutionStepConfig, artifact_dir: &str, exec
 
     sub(&mut step.output_path);
     sub(&mut step.input_path);
-    sub(&mut step.artifact_input_path);
     sub(&mut step.ai_review_input_path);
     sub(&mut step.shell_command);
     sub(&mut step.shell_command_working_directory);
@@ -2560,7 +2559,7 @@ pub fn convert_json_steps_to_execution_steps(
 /// This is the preferred function for unified workflow execution.
 pub fn convert_json_steps_with_phase(
     steps: &[serde_json::Value],
-    monitor: i32,
+    _monitor: i32,
     explicit_phase: Option<&str>,
 ) -> Vec<ExecutionStepConfig> {
     use crate::step_executor::StepPhase;
@@ -2573,51 +2572,46 @@ pub fn convert_json_steps_with_phase(
             step_type != "prompt" && step_type != "ai_session"
         })
         .filter_map(|step| {
-            let mut config = if let Ok(mut config) =
-                serde_json::from_value::<ExecutionStepConfig>(step.clone())
-            {
-                if config.monitor_index.is_none() {
-                    config.monitor_index = Some(monitor);
-                }
-                config
-            } else {
-                // Fall back to manual field extraction — preserve command, working directory,
-                // and other key fields so that check/test steps with inline commands still work
-                let step_type = step.get("type").and_then(|t| t.as_str())?;
-                ExecutionStepConfig {
-                    step_type: step_type.to_string(),
-                    name: step
-                        .get("name")
-                        .and_then(|n| n.as_str())
-                        .map(|s| s.to_string()),
-                    id: step
-                        .get("id")
-                        .and_then(|i| i.as_str())
-                        .map(|s| s.to_string()),
-                    shell_command: step
-                        .get("command")
-                        .and_then(|c| c.as_str())
-                        .map(|s| s.to_string()),
-                    shell_command_working_directory: step
-                        .get("working_directory")
-                        .and_then(|w| w.as_str())
-                        .map(|s| s.to_string()),
-                    check_type: step
-                        .get("check_type")
-                        .and_then(|c| c.as_str())
-                        .map(|s| s.to_string()),
-                    test_type: step
-                        .get("test_type")
-                        .and_then(|t| t.as_str())
-                        .map(|s| s.to_string()),
-                    test_id: step
-                        .get("test_id")
-                        .and_then(|t| t.as_str())
-                        .map(|s| s.to_string()),
-                    monitor_index: Some(monitor),
-                    ..Default::default()
-                }
-            };
+            let mut config =
+                if let Ok(config) = serde_json::from_value::<ExecutionStepConfig>(step.clone()) {
+                    config
+                } else {
+                    // Fall back to manual field extraction — preserve command, working directory,
+                    // and other key fields so that check/test steps with inline commands still work
+                    let step_type = step.get("type").and_then(|t| t.as_str())?;
+                    ExecutionStepConfig {
+                        step_type: step_type.to_string(),
+                        name: step
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .map(|s| s.to_string()),
+                        id: step
+                            .get("id")
+                            .and_then(|i| i.as_str())
+                            .map(|s| s.to_string()),
+                        shell_command: step
+                            .get("command")
+                            .and_then(|c| c.as_str())
+                            .map(|s| s.to_string()),
+                        shell_command_working_directory: step
+                            .get("working_directory")
+                            .and_then(|w| w.as_str())
+                            .map(|s| s.to_string()),
+                        check_type: step
+                            .get("check_type")
+                            .and_then(|c| c.as_str())
+                            .map(|s| s.to_string()),
+                        test_type: step
+                            .get("test_type")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.to_string()),
+                        test_id: step
+                            .get("test_id")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.to_string()),
+                        ..Default::default()
+                    }
+                };
 
             // Set explicit phase if not already set
             if config.phase.is_none() {
@@ -2638,10 +2632,10 @@ pub fn convert_json_steps_with_phase(
 /// Unlike `convert_json_steps_with_phase` which filters out prompt steps,
 /// this function preserves all step types in their original order.
 /// This is needed for the verification phase where prompt-type steps
-/// (AI-evaluated checks) must be included so that gate steps can reference them.
+/// (AI-evaluated checks) must be included alongside automation steps.
 pub fn convert_all_json_steps_with_phase(
     steps: &[serde_json::Value],
-    monitor: i32,
+    _monitor: i32,
     explicit_phase: Option<&str>,
 ) -> Vec<ExecutionStepConfig> {
     use crate::step_executor::StepPhase;
@@ -2649,51 +2643,46 @@ pub fn convert_all_json_steps_with_phase(
     steps
         .iter()
         .filter_map(|step| {
-            let mut config = if let Ok(mut config) =
-                serde_json::from_value::<ExecutionStepConfig>(step.clone())
-            {
-                if config.monitor_index.is_none() {
-                    config.monitor_index = Some(monitor);
-                }
-                config
-            } else {
-                // Fall back to manual field extraction — preserve command, working directory,
-                // and other key fields so that check/test steps with inline commands still work
-                let step_type = step.get("type").and_then(|t| t.as_str())?;
-                ExecutionStepConfig {
-                    step_type: step_type.to_string(),
-                    name: step
-                        .get("name")
-                        .and_then(|n| n.as_str())
-                        .map(|s| s.to_string()),
-                    id: step
-                        .get("id")
-                        .and_then(|i| i.as_str())
-                        .map(|s| s.to_string()),
-                    shell_command: step
-                        .get("command")
-                        .and_then(|c| c.as_str())
-                        .map(|s| s.to_string()),
-                    shell_command_working_directory: step
-                        .get("working_directory")
-                        .and_then(|w| w.as_str())
-                        .map(|s| s.to_string()),
-                    check_type: step
-                        .get("check_type")
-                        .and_then(|c| c.as_str())
-                        .map(|s| s.to_string()),
-                    test_type: step
-                        .get("test_type")
-                        .and_then(|t| t.as_str())
-                        .map(|s| s.to_string()),
-                    test_id: step
-                        .get("test_id")
-                        .and_then(|t| t.as_str())
-                        .map(|s| s.to_string()),
-                    monitor_index: Some(monitor),
-                    ..Default::default()
-                }
-            };
+            let mut config =
+                if let Ok(config) = serde_json::from_value::<ExecutionStepConfig>(step.clone()) {
+                    config
+                } else {
+                    // Fall back to manual field extraction — preserve command, working directory,
+                    // and other key fields so that check/test steps with inline commands still work
+                    let step_type = step.get("type").and_then(|t| t.as_str())?;
+                    ExecutionStepConfig {
+                        step_type: step_type.to_string(),
+                        name: step
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .map(|s| s.to_string()),
+                        id: step
+                            .get("id")
+                            .and_then(|i| i.as_str())
+                            .map(|s| s.to_string()),
+                        shell_command: step
+                            .get("command")
+                            .and_then(|c| c.as_str())
+                            .map(|s| s.to_string()),
+                        shell_command_working_directory: step
+                            .get("working_directory")
+                            .and_then(|w| w.as_str())
+                            .map(|s| s.to_string()),
+                        check_type: step
+                            .get("check_type")
+                            .and_then(|c| c.as_str())
+                            .map(|s| s.to_string()),
+                        test_type: step
+                            .get("test_type")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.to_string()),
+                        test_id: step
+                            .get("test_id")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.to_string()),
+                        ..Default::default()
+                    }
+                };
 
             // Set explicit phase if not already set
             if config.phase.is_none() {

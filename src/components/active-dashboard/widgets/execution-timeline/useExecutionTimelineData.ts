@@ -122,19 +122,19 @@ function mapStepType(apiType: string): StepType {
     playwright: "playwright",
     test: "test",
     check: "check",
-    check_group: "check_group",
+    check_group: "check",
     error_check: "check",
     log_check: "check",
 
-    // Command
+    // Command (unified: shell commands, API requests, MCP calls)
     shell: "shell",
     shell_command: "shell",
     command: "shell",
-    api_request: "api_request",
-    api: "api_request",
-    http: "api_request",
-    mcp_call: "mcp_call",
-    mcp: "mcp_call",
+    api_request: "shell",
+    api: "shell",
+    http: "shell",
+    mcp_call: "shell",
+    mcp: "shell",
 
     // AI
     prompt: "prompt",
@@ -594,10 +594,7 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
       // Count verification steps that are checks/tests
       const checkSteps = iterGroup.steps.filter(
         (s) =>
-          s.type === "check" ||
-          s.type === "test" ||
-          s.type === "playwright" ||
-          s.type === "check_group",
+          s.type === "check" || s.type === "test" || s.type === "playwright" || s.type === "shell",
       );
       const passed = checkSteps.filter((s) => s.status === "success").length;
       const total = checkSteps.length;

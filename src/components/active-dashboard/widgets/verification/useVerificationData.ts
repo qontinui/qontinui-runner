@@ -2,7 +2,7 @@
  * useVerificationData Hook
  *
  * Fetches and manages verification result data for the widget.
- * Fetches from both the verification log API and the steps API for check_group steps.
+ * Fetches from both the verification log API and the steps API for command/check steps.
  */
 
 import { useState, useEffect, useCallback, useMemo } from "react";
@@ -66,16 +66,18 @@ interface CurrentExecutionStepsResponse {
  */
 function mapCheckType(stepType: string): VerificationTestType {
   const typeMap: Record<string, VerificationTestType> = {
-    check_group: "check_group",
-    check: "check_group",
-    error_check: "check_group",
-    log_check: "check_group",
-    shell: "check_group",
+    command: "command",
+    check_group: "command", // Legacy: mapped to command
+    check: "command",
+    error_check: "command",
+    log_check: "command",
+    shell: "command",
+    shell_command: "command", // Legacy
     playwright: "playwright",
     gui_automation: "gui_automation",
     repo_test: "repo_test",
   };
-  return typeMap[stepType.toLowerCase()] || "check_group";
+  return typeMap[stepType.toLowerCase()] || "command";
 }
 
 /**
@@ -93,7 +95,7 @@ export function useVerificationData(): VerificationData {
   // Fetch check steps from current-execution/steps API
   const fetchCheckSteps = useCallback(async () => {
     try {
-      // Fetch check_group and check steps
+      // Fetch command and check steps
       const response = await fetch(`${API_BASE}/current-execution/steps?step_type=check`);
       if (response.ok) {
         const apiData: CurrentExecutionStepsResponse = await response.json();

@@ -45,11 +45,7 @@ import { PromptLibraryPicker } from "./PromptLibraryPicker";
 import { ShellCommandLibraryPicker } from "./ShellCommandLibraryPicker";
 import { CheckLibraryPicker } from "./CheckLibraryPicker";
 import { CheckGroupLibraryPicker } from "./CheckGroupLibraryPicker";
-import { MacroLibraryPicker } from "./MacroLibraryPicker";
-import { PlaywrightScriptLibraryPicker } from "./PlaywrightScriptLibraryPicker";
 import { TestLibraryPicker } from "./TestLibraryPicker";
-import { WorkflowLibraryPicker } from "./WorkflowLibraryPicker";
-import { StateLibraryPicker } from "./StateLibraryPicker";
 import { McpServerToolPicker } from "./McpServerToolPicker";
 import { AiGenerateWorkflowModal } from "./AiGenerateWorkflowModal";
 import { GenerateFromStatesModal } from "./GenerateFromStatesModal";
@@ -791,23 +787,6 @@ function WorkflowBuilderContent({
   const [checkGroupPickerOpen, setCheckGroupPickerOpen] = useState(false);
   const [checkGroupPickerPhase, setCheckGroupPickerPhase] = useState<WorkflowPhase>("verification");
 
-  // Macro library picker state
-  const [macroPickerOpen, setMacroPickerOpen] = useState(false);
-  const [macroPickerPhase, setMacroPickerPhase] = useState<WorkflowPhase>("setup");
-
-  // Playwright script library picker state
-  const [playwrightScriptPickerOpen, setPlaywrightScriptPickerOpen] = useState(false);
-  const [playwrightScriptPickerPhase, setPlaywrightScriptPickerPhase] =
-    useState<WorkflowPhase>("verification");
-
-  // Workflow library picker state
-  const [workflowPickerOpen, setWorkflowPickerOpen] = useState(false);
-  const [workflowPickerPhase, setWorkflowPickerPhase] = useState<WorkflowPhase>("setup");
-
-  // State library picker state
-  const [statePickerOpen, setStatePickerOpen] = useState(false);
-  const [statePickerPhase, setStatePickerPhase] = useState<WorkflowPhase>("setup");
-
   // MCP server tool picker state
   const [mcpPickerOpen, setMcpPickerOpen] = useState(false);
   const [mcpPickerPhase, setMcpPickerPhase] = useState<WorkflowPhase>("setup");
@@ -1213,8 +1192,8 @@ function WorkflowBuilderContent({
     (command: SavedShellCommand, phase: WorkflowPhase) => {
       const step: UnifiedStep = {
         id: generateStepId(),
-        type: "shell_command",
-        phase: phase as "setup" | "completion",
+        type: "command",
+        phase: phase as "setup" | "verification" | "completion",
         name: command.name || (phase === "setup" ? "Setup Command" : "Completion Command"),
         command: command.command,
         shell_command_id: command.id,
@@ -1258,8 +1237,8 @@ function WorkflowBuilderContent({
     (check: SavedCheck, phase: WorkflowPhase) => {
       const step: UnifiedStep = {
         id: generateStepId(),
-        type: "check",
-        phase: "verification",
+        type: "command",
+        phase: phase as "setup" | "verification" | "completion",
         name: check.name,
         check_type: check.check_type as
           | "lint"
@@ -1355,145 +1334,14 @@ function WorkflowBuilderContent({
     (group: CheckGroup, checksInGroup: { id: string; name: string }[], phase: WorkflowPhase) => {
       const step: UnifiedStep = {
         id: generateStepId(),
-        type: "check_group",
-        phase: "verification",
+        type: "command",
+        phase: phase as "setup" | "verification" | "completion",
         name: group.name,
         check_group_id: group.id,
       };
 
       addStep(step, phase);
       setCheckGroupPickerOpen(false);
-    },
-    [addStep],
-  );
-
-  // Handler to open the macro library picker
-  const handleOpenMacroLibrary = useCallback((phase: WorkflowPhase) => {
-    setMacroPickerPhase(phase);
-    setMacroPickerOpen(true);
-  }, []);
-
-  // Type for saved macro from MacroLibraryPicker
-  interface SavedMacro {
-    id: string;
-    name: string;
-    description: string;
-    steps: { id: string; action_type: string; description: string }[];
-    category: string;
-    tags: string[];
-  }
-
-  // Handler for when a macro is selected from the library
-  const handleMacroSelected = useCallback(
-    (macro: SavedMacro, phase: WorkflowPhase) => {
-      const step: UnifiedStep = {
-        id: generateStepId(),
-        type: "macro",
-        phase: "setup",
-        name: macro.name || "Run Macro",
-        macro_id: macro.id,
-      };
-
-      addStep(step, phase);
-      setMacroPickerOpen(false);
-    },
-    [addStep],
-  );
-
-  // Handler to open the playwright script library picker
-  const handleOpenPlaywrightScriptLibrary = useCallback((phase: WorkflowPhase) => {
-    setPlaywrightScriptPickerPhase(phase);
-    setPlaywrightScriptPickerOpen(true);
-  }, []);
-
-  // Type for saved playwright script from PlaywrightScriptLibraryPicker
-  interface SavedPlaywrightScript {
-    id: string;
-    name: string;
-    description: string;
-    target_url: string;
-    script_content: string;
-    category: string;
-    tags: string[];
-    timeout_seconds: number;
-    display_mode: string;
-    browser: string;
-    headless: boolean;
-  }
-
-  // Handler for when a playwright script is selected from the library
-  const handlePlaywrightScriptSelected = useCallback(
-    (script: SavedPlaywrightScript, phase: WorkflowPhase) => {
-      const step: UnifiedStep = {
-        id: generateStepId(),
-        type: "test",
-        phase: "verification",
-        name: script.name || "Playwright Test",
-        test_type: "playwright",
-        script_id: script.id,
-        script_content: script.script_content,
-        target_url: script.target_url,
-        timeout_seconds: script.timeout_seconds,
-      };
-
-      addStep(step, phase);
-      setPlaywrightScriptPickerOpen(false);
-    },
-    [addStep],
-  );
-
-  // Handler to open the workflow library picker
-  const handleOpenWorkflowLibrary = useCallback((phase: WorkflowPhase) => {
-    setWorkflowPickerPhase(phase);
-    setWorkflowPickerOpen(true);
-  }, []);
-
-  // Handler for when a workflow is selected from the library
-  const handleWorkflowSelected = useCallback(
-    (workflow: UnifiedWorkflow, phase: WorkflowPhase) => {
-      const step: UnifiedStep = {
-        id: generateStepId(),
-        type: "workflow_ref",
-        phase: phase as "setup" | "verification" | "completion",
-        name: workflow.name || "Run Workflow",
-        workflow_id: workflow.id,
-      };
-
-      addStep(step, phase);
-      setWorkflowPickerOpen(false);
-    },
-    [addStep],
-  );
-
-  // Handler to open the state library picker
-  const handleOpenStateLibrary = useCallback((phase: WorkflowPhase) => {
-    setStatePickerPhase(phase);
-    setStatePickerOpen(true);
-  }, []);
-
-  // Type for state from StateLibraryPicker
-  interface StateInfo {
-    id: string;
-    name: string;
-    description?: string;
-    tags?: string[];
-    is_initial?: boolean;
-    is_terminal?: boolean;
-  }
-
-  // Handler for when a state is selected from the library
-  const handleStateSelected = useCallback(
-    (stateInfo: StateInfo, phase: WorkflowPhase) => {
-      const step: UnifiedStep = {
-        id: generateStepId(),
-        type: "state",
-        phase: phase as "setup" | "verification",
-        name: stateInfo.name || "Navigate to State",
-        state_id: stateInfo.id,
-      };
-
-      addStep(step, phase);
-      setStatePickerOpen(false);
     },
     [addStep],
   );
@@ -1528,12 +1376,10 @@ function WorkflowBuilderContent({
     (server: McpServerConfig, tool: McpToolInfo, phase: WorkflowPhase) => {
       const step: UnifiedStep = {
         id: generateStepId(),
-        type: "mcp_call",
+        type: "command",
         phase: phase as "setup" | "verification" | "completion",
         name: `${server.name}: ${tool.name}`,
-        server_id: server.id,
-        tool_name: tool.name,
-        tool_description: tool.description,
+        command: `# MCP tool: ${tool.name} from ${server.name}`,
       };
 
       addStep(step, phase);
@@ -1992,11 +1838,7 @@ function WorkflowBuilderContent({
                     onOpenShellCommandLibrary={handleOpenShellCommandLibrary}
                     onOpenCheckLibrary={handleOpenCheckLibrary}
                     onOpenCheckGroupLibrary={handleOpenCheckGroupLibrary}
-                    onOpenMacroLibrary={handleOpenMacroLibrary}
-                    onOpenPlaywrightScriptLibrary={handleOpenPlaywrightScriptLibrary}
                     onOpenTestLibrary={handleOpenTestLibrary}
-                    onOpenWorkflowLibrary={handleOpenWorkflowLibrary}
-                    onOpenStateLibrary={handleOpenStateLibrary}
                     onOpenMcpServerToolPicker={handleOpenMcpServerToolPicker}
                   />
                 </div>
@@ -2041,39 +1883,6 @@ function WorkflowBuilderContent({
               onClose={() => setCheckGroupPickerOpen(false)}
               onSelect={handleCheckGroupSelected}
               phase={checkGroupPickerPhase}
-            />
-
-            {/* Macro Library Picker */}
-            <MacroLibraryPicker
-              isOpen={macroPickerOpen}
-              onClose={() => setMacroPickerOpen(false)}
-              onSelect={handleMacroSelected}
-              phase={macroPickerPhase}
-            />
-
-            {/* Playwright Script Library Picker */}
-            <PlaywrightScriptLibraryPicker
-              isOpen={playwrightScriptPickerOpen}
-              onClose={() => setPlaywrightScriptPickerOpen(false)}
-              onSelect={handlePlaywrightScriptSelected}
-              phase={playwrightScriptPickerPhase}
-            />
-
-            {/* Workflow Library Picker */}
-            <WorkflowLibraryPicker
-              isOpen={workflowPickerOpen}
-              onClose={() => setWorkflowPickerOpen(false)}
-              onSelect={handleWorkflowSelected}
-              phase={workflowPickerPhase}
-              excludeWorkflowId={state.workflow.id}
-            />
-
-            {/* State Library Picker */}
-            <StateLibraryPicker
-              isOpen={statePickerOpen}
-              onClose={() => setStatePickerOpen(false)}
-              onSelect={handleStateSelected}
-              phase={statePickerPhase}
             />
 
             {/* MCP Server Tool Picker */}

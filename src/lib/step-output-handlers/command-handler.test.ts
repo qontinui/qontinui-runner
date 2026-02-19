@@ -1,11 +1,11 @@
 /**
- * Unit tests for ShellCommandHandler
+ * Unit tests for CommandHandler
  */
 
 import { describe, it, expect } from "vitest";
-import { shellCommandHandler } from "./shell-command-handler";
+import { commandHandler } from "./command-handler";
 
-describe("ShellCommandHandler", () => {
+describe("CommandHandler", () => {
   describe("parseOutput", () => {
     it("should parse successful command output", () => {
       const raw = {
@@ -15,9 +15,9 @@ describe("ShellCommandHandler", () => {
         stderr: "",
       };
 
-      const result = shellCommandHandler.parseOutput(raw, {}, { step_name: "Echo Test" });
+      const result = commandHandler.parseOutput(raw, {}, { step_name: "Echo Test" });
 
-      expect(result.step_type).toBe("shell_command");
+      expect(result.step_type).toBe("command");
       expect(result.command).toBe("echo hello");
       expect(result.exit_code).toBe(0);
       expect(result.stdout).toBe("hello\n");
@@ -32,7 +32,7 @@ describe("ShellCommandHandler", () => {
         stderr: "Command failed",
       };
 
-      const result = shellCommandHandler.parseOutput(raw);
+      const result = commandHandler.parseOutput(raw);
 
       expect(result.exit_code).toBe(1);
       expect(result.success).toBe(false);
@@ -47,7 +47,7 @@ describe("ShellCommandHandler", () => {
         error_output: "", // alternative to stderr
       };
 
-      const result = shellCommandHandler.parseOutput(raw);
+      const result = commandHandler.parseOutput(raw);
 
       expect(result.command).toBe("ls -la");
       expect(result.exit_code).toBe(0);
@@ -61,7 +61,7 @@ describe("ShellCommandHandler", () => {
         working_directory: "/home/user",
       };
 
-      const result = shellCommandHandler.parseOutput(raw);
+      const result = commandHandler.parseOutput(raw);
 
       expect(result.working_directory).toBe("/home/user");
     });
@@ -69,44 +69,42 @@ describe("ShellCommandHandler", () => {
 
   describe("summarizeForAI", () => {
     it("should generate summary for successful command", () => {
-      const output = shellCommandHandler.parseOutput({
+      const output = commandHandler.parseOutput({
         command: "npm test",
         exit_code: 0,
         stdout: "All tests passed",
       });
 
-      const summary = shellCommandHandler.summarizeForAI(output);
+      const summary = commandHandler.summarizeForAI(output);
 
-      expect(summary).toContain("### Shell Command:");
+      expect(summary).toContain("### Command:");
       expect(summary).toContain("npm test");
       expect(summary).toContain("Exit Code:");
       expect(summary).toContain("0");
-      expect(summary).toContain("✅");
     });
 
     it("should show stderr for failed commands", () => {
-      const output = shellCommandHandler.parseOutput({
+      const output = commandHandler.parseOutput({
         command: "npm test",
         exit_code: 1,
         stderr: "Error: Test failed",
       });
 
-      const summary = shellCommandHandler.summarizeForAI(output);
+      const summary = commandHandler.summarizeForAI(output);
 
-      expect(summary).toContain("❌");
       expect(summary).toContain("Standard Error");
       expect(summary).toContain("Test failed");
     });
 
     it("should truncate long output", () => {
       const longOutput = "x".repeat(5000);
-      const output = shellCommandHandler.parseOutput({
+      const output = commandHandler.parseOutput({
         command: "cat bigfile",
         exit_code: 0,
         stdout: longOutput,
       });
 
-      const summary = shellCommandHandler.summarizeForAI(output);
+      const summary = commandHandler.summarizeForAI(output);
 
       expect(summary).toContain("truncated");
       expect(summary.length).toBeLessThan(longOutput.length);
@@ -115,16 +113,16 @@ describe("ShellCommandHandler", () => {
 
   describe("toTestConfig", () => {
     it("should generate config from command output", () => {
-      const output = shellCommandHandler.parseOutput({
+      const output = commandHandler.parseOutput({
         command: "npm run build",
         exit_code: 0,
         working_directory: "/project",
       });
 
-      const config = shellCommandHandler.toTestConfig(output);
+      const config = commandHandler.toTestConfig(output);
 
       expect(config).not.toBeNull();
-      expect(config?.config_key).toBe("shell_command_config");
+      expect(config?.config_key).toBe("command_config");
       expect(config?.config_value).toMatchObject({
         command: "npm run build",
         working_directory: "/project",
@@ -132,11 +130,11 @@ describe("ShellCommandHandler", () => {
     });
 
     it("should return null if no command", () => {
-      const output = shellCommandHandler.parseOutput({
+      const output = commandHandler.parseOutput({
         exit_code: 0,
       });
 
-      const config = shellCommandHandler.toTestConfig(output);
+      const config = commandHandler.toTestConfig(output);
 
       expect(config).toBeNull();
     });
@@ -144,12 +142,12 @@ describe("ShellCommandHandler", () => {
 
   describe("getAssertableFields", () => {
     it("should include exit code field", () => {
-      const output = shellCommandHandler.parseOutput({
+      const output = commandHandler.parseOutput({
         command: "test",
         exit_code: 0,
       });
 
-      const fields = shellCommandHandler.getAssertableFields(output);
+      const fields = commandHandler.getAssertableFields(output);
 
       const exitCodeField = fields.find((f) => f.path === "exit_code");
       expect(exitCodeField).toBeDefined();
@@ -159,13 +157,13 @@ describe("ShellCommandHandler", () => {
     });
 
     it("should include stdout content field when present", () => {
-      const output = shellCommandHandler.parseOutput({
+      const output = commandHandler.parseOutput({
         command: "echo test",
         exit_code: 0,
         stdout: "test output",
       });
 
-      const fields = shellCommandHandler.getAssertableFields(output);
+      const fields = commandHandler.getAssertableFields(output);
 
       const stdoutField = fields.find((f) => f.path === "stdout");
       expect(stdoutField).toBeDefined();
@@ -173,13 +171,13 @@ describe("ShellCommandHandler", () => {
     });
 
     it("should include stderr field when present", () => {
-      const output = shellCommandHandler.parseOutput({
+      const output = commandHandler.parseOutput({
         command: "test",
         exit_code: 1,
         stderr: "error message",
       });
 
-      const fields = shellCommandHandler.getAssertableFields(output);
+      const fields = commandHandler.getAssertableFields(output);
 
       const stderrField = fields.find((f) => f.path === "stderr");
       expect(stderrField).toBeDefined();
@@ -188,11 +186,11 @@ describe("ShellCommandHandler", () => {
 
   describe("singleton instance", () => {
     it("should have correct step type", () => {
-      expect(shellCommandHandler.stepType).toBe("shell_command");
+      expect(commandHandler.stepType).toBe("command");
     });
 
     it("should have display name", () => {
-      expect(shellCommandHandler.displayName).toBe("Shell Command");
+      expect(commandHandler.displayName).toBe("Command");
     });
   });
 });

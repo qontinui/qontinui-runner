@@ -15,9 +15,15 @@ import type { StepOutput } from "../../types/step-output";
 describe("StepOutputHandlerRegistry", () => {
   describe("get", () => {
     it("should return handler for registered type", () => {
-      const handler = stepOutputRegistry.get("api_request");
+      const handler = stepOutputRegistry.get("command");
       expect(handler).toBeDefined();
-      expect(handler?.stepType).toBe("api_request");
+      expect(handler?.stepType).toBe("command");
+    });
+
+    it("should return handler for shell_command (backward compat)", () => {
+      const handler = stepOutputRegistry.get("shell_command");
+      expect(handler).toBeDefined();
+      expect(handler?.stepType).toBe("shell_command");
     });
 
     it("should return undefined for unregistered type", () => {
@@ -27,32 +33,21 @@ describe("StepOutputHandlerRegistry", () => {
     });
 
     it("should have all expected handlers registered", () => {
-      const expectedTypes = [
-        "api_request",
-        "gui_action",
-        "shell_command",
-        "mcp_call",
-        "screenshot",
-        "workflow_ref",
-        "playwright_script",
-        "state_navigation",
-        "check",
-      ];
+      const expectedTypes = ["command", "shell_command", "check"];
 
       for (const type of expectedTypes) {
         const handler = stepOutputRegistry.get(
           type as Parameters<typeof stepOutputRegistry.get>[0],
         );
         expect(handler).toBeDefined();
-        expect(handler?.stepType).toBe(type);
       }
     });
   });
 
   describe("has", () => {
     it("should return true for registered types", () => {
-      expect(stepOutputRegistry.has("api_request")).toBe(true);
-      expect(stepOutputRegistry.has("gui_action")).toBe(true);
+      expect(stepOutputRegistry.has("command")).toBe(true);
+      expect(stepOutputRegistry.has("shell_command")).toBe(true);
       expect(stepOutputRegistry.has("check")).toBe(true);
     });
 
@@ -65,10 +60,11 @@ describe("StepOutputHandlerRegistry", () => {
   describe("getAll", () => {
     it("should return all registered handlers", () => {
       const handlers = stepOutputRegistry.getAll();
-      expect(handlers.length).toBeGreaterThanOrEqual(9);
+      // command, shell_command (alias), check
+      expect(handlers.length).toBeGreaterThanOrEqual(3);
 
       const types = handlers.map((h) => h.stepType);
-      expect(types).toContain("api_request");
+      expect(types).toContain("command");
       expect(types).toContain("check");
     });
   });
@@ -76,14 +72,8 @@ describe("StepOutputHandlerRegistry", () => {
   describe("getRegisteredTypes", () => {
     it("should return all registered step types", () => {
       const types = stepOutputRegistry.getRegisteredTypes();
-      expect(types).toContain("api_request");
-      expect(types).toContain("gui_action");
+      expect(types).toContain("command");
       expect(types).toContain("shell_command");
-      expect(types).toContain("mcp_call");
-      expect(types).toContain("screenshot");
-      expect(types).toContain("workflow_ref");
-      expect(types).toContain("playwright_script");
-      expect(types).toContain("state_navigation");
       expect(types).toContain("check");
     });
   });
@@ -91,23 +81,15 @@ describe("StepOutputHandlerRegistry", () => {
 
 describe("collectTestConfigs", () => {
   it("should collect configs from multiple outputs", () => {
-    // Use handlers to create properly structured outputs
-    const apiHandler = stepOutputRegistry.get("api_request")!;
-    const shellHandler = stepOutputRegistry.get("shell_command")!;
+    const commandHandler = stepOutputRegistry.get("command")!;
 
-    const apiOutput = apiHandler.parseOutput(
-      { status_code: 200 },
-      { method: "GET", url: "https://api.example.com/test" },
-      { step_name: "API Call" },
-    );
-
-    const shellOutput = shellHandler.parseOutput(
+    const commandOutput = commandHandler.parseOutput(
       { exit_code: 0, stdout: "hello" },
       { command: "echo hello" },
-      { step_name: "Shell" },
+      { step_name: "Command" },
     );
 
-    const configs = collectTestConfigs([apiOutput, shellOutput]);
+    const configs = collectTestConfigs([commandOutput]);
 
     expect(configs.length).toBeGreaterThanOrEqual(1);
   });
@@ -118,30 +100,28 @@ describe("collectTestConfigs", () => {
   });
 
   it("should skip outputs with no config", () => {
-    // Create output via handler - without URL, toTestConfig returns null
-    const apiHandler = stepOutputRegistry.get("api_request")!;
-    const output = apiHandler.parseOutput(
-      { status_code: 200 },
-      {}, // No URL in config
-      { step_name: "No URL" },
+    const commandHandler = stepOutputRegistry.get("command")!;
+    const output = commandHandler.parseOutput(
+      { exit_code: 0 },
+      {}, // No command in config
+      { step_name: "No Command" },
     );
 
     const configs = collectTestConfigs([output]);
-    // Should be empty because no URL means null config
+    // Should be empty because no command means null config
     expect(configs).toEqual([]);
   });
 });
 
 describe("summarizeOutputsForAI", () => {
   it("should generate combined summary for multiple outputs", () => {
-    // Use handlers to create properly structured outputs
-    const apiHandler = stepOutputRegistry.get("api_request")!;
+    const commandHandler = stepOutputRegistry.get("command")!;
     const checkHandler = stepOutputRegistry.get("check")!;
 
-    const apiOutput = apiHandler.parseOutput(
-      { status_code: 200, response: { data: "test" } },
-      { method: "GET", url: "https://api.example.com/data" },
-      { step_name: "Fetch Data" },
+    const commandOutput = commandHandler.parseOutput(
+      { exit_code: 0, stdout: "ok" },
+      { command: "echo ok" },
+      { step_name: "Run Command" },
     );
 
     const checkOutput = checkHandler.parseOutput(
@@ -150,13 +130,12 @@ describe("summarizeOutputsForAI", () => {
       { step_name: "Validate" },
     );
 
-    const summary = summarizeOutputsForAI([apiOutput, checkOutput]);
+    const summary = summarizeOutputsForAI([commandOutput, checkOutput]);
 
     expect(summary).toContain("Step Outputs");
-    expect(summary).toContain("Fetch Data");
+    expect(summary).toContain("Run Command");
     expect(summary).toContain("Validate");
-    // Summary uses display names, not step_type strings
-    expect(summary).toContain("API Request");
+    expect(summary).toContain("Command");
     expect(summary).toContain("Check");
   });
 
@@ -190,19 +169,15 @@ describe("collectAssertableFields", () => {
     const outputs: StepOutput[] = [
       {
         id: "1",
-        step_type: "api_request",
-        step_name: "API",
+        step_type: "command",
+        step_name: "Command",
         executed_at: new Date().toISOString(),
         duration_ms: 100,
         success: true,
-        status_code: 200,
-        method: "GET",
-        url: "https://example.com/api",
-        response: { data: "test" },
-        source_config: {
-          method: "GET",
-          url: "https://example.com/api",
-        },
+        command: "echo test",
+        exit_code: 0,
+        stdout: "test",
+        stderr: "",
       },
       {
         id: "2",
@@ -223,10 +198,10 @@ describe("collectAssertableFields", () => {
     expect(fields.length).toBeGreaterThan(0);
 
     // Should have fields from both outputs - fields are prefixed with output id
-    const hasStatusCode = fields.some((f) => f.path.includes("status_code"));
+    const hasExitCode = fields.some((f) => f.path.includes("exit_code"));
     const hasChecksPassed = fields.some((f) => f.path.includes("checks_passed"));
 
-    expect(hasStatusCode).toBe(true);
+    expect(hasExitCode).toBe(true);
     expect(hasChecksPassed).toBe(true);
   });
 
@@ -239,19 +214,15 @@ describe("collectAssertableFields", () => {
     const outputs: StepOutput[] = [
       {
         id: "test-id-123",
-        step_type: "api_request",
-        step_name: "My API Call",
+        step_type: "command",
+        step_name: "My Command",
         executed_at: new Date().toISOString(),
         duration_ms: 100,
         success: true,
-        status_code: 200,
-        method: "GET",
-        url: "https://example.com/api",
-        response: { data: "test" },
-        source_config: {
-          method: "GET",
-          url: "https://example.com/api",
-        },
+        command: "echo test",
+        exit_code: 0,
+        stdout: "test",
+        stderr: "",
       },
     ];
 
@@ -260,6 +231,6 @@ describe("collectAssertableFields", () => {
     // Fields should be prefixed with output id
     expect(fields.length).toBeGreaterThan(0);
     expect(fields[0].path.startsWith("test-id-123.")).toBe(true);
-    expect(fields[0].name.includes("My API Call")).toBe(true);
+    expect(fields[0].name.includes("My Command")).toBe(true);
   });
 });

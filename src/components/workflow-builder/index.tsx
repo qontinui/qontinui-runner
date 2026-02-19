@@ -10,7 +10,6 @@ export { PhaseSection } from "./PhaseSection";
 export { StepItem } from "./StepItem";
 export { AddStepDropdown, AddStepButton } from "./AddStepDropdown";
 export { StepConfigPanel } from "./StepConfigPanel";
-export { ApiLibraryPicker } from "./ApiLibraryPicker";
 export { PromptLibraryPicker } from "./PromptLibraryPicker";
 export { ShellCommandLibraryPicker } from "./ShellCommandLibraryPicker";
 export { TestLibraryPicker } from "./TestLibraryPicker";

@@ -4876,40 +4876,39 @@ impl CheckpointDb {
             // Seed universal knowledge entries
             let now = chrono::Utc::now().to_rfc3339();
             let seed_entries: &[(&str, &str, &str, i32)] = &[
-                // shell_command (3 entries)
+                // command (6 entries - covers shell commands, API requests, checks)
                 (
-                    "shell_command",
-                    "Always set working_directory",
+                    "command",
+                    "Always set working_directory for shell commands",
                     "Shell commands must specify working_directory to ensure they run in the correct location. Without it, the command runs in whatever directory the runner process happens to be in, which is unpredictable.",
                     10,
                 ),
                 (
-                    "shell_command",
+                    "command",
                     "Use fail_on_error appropriately",
                     "Set fail_on_error: true for critical setup steps (installing deps, building). Set fail_on_error: false only for commands where non-zero exit is expected (e.g., grep that may match nothing).",
                     8,
                 ),
                 (
-                    "shell_command",
+                    "command",
                     "Keep commands simple and single-purpose",
-                    "Each shell_command step should do one thing. Avoid long chained commands with && or ||. Split complex operations into multiple steps so failures are attributable to a specific operation.",
+                    "Each command step should do one thing. Avoid long chained commands with && or ||. Split complex operations into multiple steps so failures are attributable to a specific operation.",
                     6,
                 ),
-                // api_request (3 entries)
                 (
-                    "api_request",
-                    "Always include content-specific assertions",
+                    "command",
+                    "Always include content-specific assertions for API requests",
                     "A status_code: 200 assertion alone is INSUFFICIENT. Always add body_contains or json_path assertions to verify the response has the expected content. Many endpoints return 200 with empty or error bodies.",
                     10,
                 ),
                 (
-                    "api_request",
+                    "command",
                     "Set content_type for request bodies",
                     "When sending a request body, always set content_type (usually 'application/json'). Missing content_type causes the server to reject or misinterpret the body.",
                     8,
                 ),
                 (
-                    "api_request",
+                    "command",
                     "Use json_path for structured response validation",
                     "Prefer json_path assertions over body_contains for JSON APIs. Use json_path with operators like 'greater_than' or 'contains' for flexible yet precise validation. Example: json_path '$.total' greater_than '0'.",
                     6,
@@ -4927,16 +4926,16 @@ impl CheckpointDb {
                     "In agentic prompts, tell the agent to check previous verification results and address specific failures. Use phrases like 'Check which verification steps failed and fix the underlying issues'.",
                     8,
                 ),
-                // check (2 entries)
+                // check-related knowledge (stored under "command" since check is now command)
                 (
-                    "check",
+                    "command",
                     "Match check_type to the technology",
                     "Use the correct check_type for the project: 'typescript' for TS/JS projects, 'python' for Python, 'rust' for Rust. Using the wrong check_type produces misleading results.",
                     10,
                 ),
                 (
-                    "check",
-                    "Set path to the project directory",
+                    "command",
+                    "Set path to the project directory for checks",
                     "Always set the path field to the project root or source directory being checked. Without it, the checker may run in the wrong location or fail to find source files.",
                     8,
                 ),

@@ -278,13 +278,8 @@ export type {
   WorkflowPhase,
   LogSourceSelection,
   HealthCheckUrl,
-  ScriptStep,
-  StateStep,
-  WorkflowRefStep,
-  MacroRefStep,
-  GuiActionStep,
+  CommandStep,
   TestStep,
-  ScreenshotStep,
   PromptStep,
   UnifiedStep,
   SetupStep,
@@ -294,12 +289,10 @@ export type {
   UnifiedWorkflow,
   WorkflowFeatures,
   StepTypeInfo,
-  GuiActionType as UnifiedGuiActionType,
   TestType as UnifiedTestType,
   PlaywrightExecutionMode,
   ApiVariableExtraction,
   ApiAssertion,
-  ApiRequestStep,
   HttpMethod,
   ApiContentType,
   // Export/Import types
@@ -309,15 +302,11 @@ export type {
 } from "./unified-workflow";
 
 // Re-export unified workflow types with original names for internal use
-export type {
-  GuiActionType as WorkflowGuiActionType,
-  TestType as WorkflowTestType,
-} from "./unified-workflow";
+export type { TestType as WorkflowTestType } from "./unified-workflow";
 
 export {
   detectWorkflowFeatures,
   STEP_TYPES,
-  GUI_ACTION_TYPES,
   PHASE_INFO,
   generateStepId,
   createDefaultStep,
@@ -464,31 +453,17 @@ export type {
   StepOutput,
   StepOutputType,
   BaseStepOutput,
-  ApiRequestStepOutput,
-  GuiActionStepOutput,
-  ShellCommandStepOutput,
-  McpCallStepOutput,
-  ScreenshotStepOutput,
-  WorkflowRefStepOutput,
-  PlaywrightScriptStepOutput,
-  StateNavigationStepOutput,
+  CommandStepOutput,
   CheckStepOutput,
-  ScreenBoundingBox,
-  DetectedScreenElement,
+  UiBridgeStepOutput,
   CheckIssue,
 } from "./step-output";
 
 export {
   generateStepOutputId,
-  isApiRequestOutput,
-  isGuiActionOutput,
-  isShellCommandOutput,
-  isMcpCallOutput,
-  isScreenshotOutput,
-  isWorkflowRefOutput,
-  isPlaywrightScriptOutput,
-  isStateNavigationOutput,
+  isCommandOutput,
   isCheckOutput,
+  isUiBridgeOutput,
 } from "./step-output";
 
 // Execution Variables types (auth source, custom variables)

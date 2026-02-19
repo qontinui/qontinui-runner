@@ -7,12 +7,6 @@
 
 import React from "react";
 import {
-  MousePointer2,
-  MousePointerClick,
-  MousePointer,
-  Keyboard,
-  Command,
-  ArrowUpDown,
   TestTube2,
   Eye,
   Code,
@@ -28,16 +22,6 @@ import {
 } from "lucide-react";
 import type { UnifiedStep, WorkflowPhase, PromptStep } from "../../types";
 import { getStepIconConfig } from "@/lib/step-icons";
-
-// Icon mapping for GUI action types (sub-types of gui_action)
-const GUI_ACTION_ICONS: Record<string, React.ElementType> = {
-  click: MousePointer2,
-  double_click: MousePointerClick,
-  right_click: MousePointer,
-  type: Keyboard,
-  hotkey: Command,
-  scroll: ArrowUpDown,
-};
 
 // Icon mapping for test types (sub-types of test)
 const TEST_ICONS: Record<string, React.ElementType> = {
@@ -88,13 +72,6 @@ export function StepItem({
   // Get the appropriate icon and colors from shared config
   const getIconAndColors = () => {
     // Handle sub-types that have their own icon mappings
-    if (step.type === "gui_action" && step.action) {
-      const SubIcon = GUI_ACTION_ICONS[step.action];
-      if (SubIcon) {
-        const config = getStepIconConfig("gui_action");
-        return { Icon: SubIcon, bgClass: config.bgClass, textClass: config.textClass };
-      }
-    }
     if (step.type === "test" && step.test_type) {
       const SubIcon = TEST_ICONS[step.test_type];
       if (SubIcon) {
@@ -113,16 +90,17 @@ export function StepItem({
   // Get step subtitle/description
   const getSubtitle = (): string => {
     switch (step.type) {
-      case "script":
-        return step.target_url ? `URL: ${step.target_url}` : "Playwright script";
-      case "state":
-        return step.state_name || step.state_id || "Select a state";
-      case "workflow_ref":
-        return step.workflow_name || step.workflow_id || "Select a workflow";
-      case "gui_action":
-        if (step.action === "type") return step.text_input || "Enter text...";
-        if (step.action === "hotkey") return step.hotkey || "Set hotkey...";
-        return step.target_image_names?.join(", ") || "Select target...";
+      case "command":
+        if (step.check_group_id) return `Group: ${step.check_group_id}`;
+        if (step.check_type)
+          return step.command || step.tool || step.check_type || "Configure check...";
+        return step.command
+          ? step.command.substring(0, 50) + (step.command.length > 50 ? "..." : "")
+          : "Enter command...";
+      case "prompt":
+        return step.content
+          ? step.content.substring(0, 50) + (step.content.length > 50 ? "..." : "")
+          : "Enter prompt...";
       case "test":
         if (step.command) return step.command;
         if (step.test_type === "playwright") return "Browser test";
@@ -130,29 +108,12 @@ export function StepItem({
         if (step.test_type === "python") return "Python test";
         if (step.test_type === "repository") return "Repository test";
         return "Custom command";
-      case "screenshot":
-        return step.monitor ? `Monitor: ${step.monitor}` : "Capture screen";
-      case "api_request":
-        return step.url ? `${step.method} ${step.url}` : "Configure request...";
-      case "prompt":
-        return step.content
-          ? step.content.substring(0, 50) + (step.content.length > 50 ? "..." : "")
-          : "Enter prompt...";
-      // AWAS step types
-      case "awas_discover":
-        return step.url || "Enter URL to discover...";
-      case "awas_execute":
-        return step.action_id ? `Action: ${step.action_id}` : "Select action...";
-      case "awas_check_support":
-        return step.url || "Enter URL to check...";
-      case "awas_list_actions":
-        return step.url || "List available actions";
-      case "awas_extract_elements":
-        return step.base_url || "Extract AWAS elements";
-      case "shell_command":
-        return step.command
-          ? step.command.substring(0, 50) + (step.command.length > 50 ? "..." : "")
-          : "Enter command...";
+      case "ui_bridge":
+        if (step.action === "navigate") return step.url || "Enter URL...";
+        if (step.action === "execute") return step.instruction || "Enter instruction...";
+        if (step.action === "assert") return step.target || "Configure assertion...";
+        if (step.action === "snapshot") return "Take snapshot";
+        return step.action;
       default:
         return "";
     }
@@ -161,36 +122,19 @@ export function StepItem({
   // Check if step needs configuration
   const needsConfig = (): boolean => {
     switch (step.type) {
-      case "state":
-        return !step.state_id;
-      case "workflow_ref":
-        return !step.workflow_id;
-      case "gui_action":
-        if (
-          step.action === "click" ||
-          step.action === "double_click" ||
-          step.action === "right_click"
-        ) {
-          return !step.target_image_ids || step.target_image_ids.length === 0;
-        }
-        if (step.action === "type") return !step.text_input;
-        if (step.action === "hotkey") return !step.hotkey;
-        return false;
-      case "api_request":
-        return !step.url;
+      case "command":
+        if (step.check_group_id) return false; // check group ID is set
+        if (step.check_type) return !step.command && !step.check_id;
+        return !step.command;
       case "prompt":
         return !step.content;
-      // AWAS step types
-      case "awas_discover":
-        return !step.url;
-      case "awas_execute":
-        return !step.url || !step.action_id;
-      case "awas_check_support":
-        return !step.url;
-      case "awas_extract_elements":
-        return !step.html;
-      case "shell_command":
-        return !step.command;
+      case "test":
+        return !step.command && !step.code && !step.test_id && !step.script_id;
+      case "ui_bridge":
+        if (step.action === "navigate") return !step.url;
+        if (step.action === "execute") return !step.instruction;
+        if (step.action === "assert") return !step.target;
+        return false; // snapshot needs no config
       default:
         return false;
     }

@@ -6,7 +6,7 @@
  * and the live page generator's spec workflow mode.
  */
 
-import type { UnifiedWorkflow, SpecStep, PromptStep } from "../../types/unified-workflow";
+import type { UnifiedWorkflow, PromptStep } from "../../types/unified-workflow";
 import { createSummaryStep } from "../../types/unified-workflow";
 
 // Re-export SpecConfig type shape for consumers that don't import ui-bridge directly
@@ -54,7 +54,7 @@ export interface BuildSpecWorkflowInput {
 /**
  * Build a complete UnifiedWorkflow from a SpecConfig.
  *
- * Produces: setup (optional navigate) → verification (SpecSteps) → agentic (prompt) → completion (summary)
+ * Produces: setup (optional navigate) -> verification (prompt steps) -> agentic (prompt) -> completion (summary)
  */
 export function buildSpecWorkflow(input: BuildSpecWorkflowInput): UnifiedWorkflow {
   const {
@@ -79,17 +79,17 @@ export function buildSpecWorkflow(input: BuildSpecWorkflowInput): UnifiedWorkflo
 
   // Setup steps: navigate to page URL if provided
   const setupSteps: PromptStep[] = [];
-  // Note: We don't add a ScriptStep for navigation in spec workflow mode
+  // Note: We don't add a step for navigation in spec workflow mode
   // because the page is already connected via the SDK or extension.
   // The workflow assumes the page is already loaded.
 
-  // Verification steps: each selected group becomes a SpecStep
+  // Verification steps: each selected group becomes a verification prompt
   const sourceExplanation =
     elementSource === "external"
       ? "Elements are fetched from an external SDK-connected app. The AI must fix the web application code so these assertions pass when checked against the live page."
       : "Elements are fetched from the runner's own webview (control mode).";
 
-  const verificationSteps: SpecStep[] = selectedGroups.map((group) => {
+  const verificationSteps: PromptStep[] = selectedGroups.map((group) => {
     const enabledAssertions = group.assertions.filter((a) => a.enabled);
     const assertionDescriptions = enabledAssertions
       .map((a) => `- ${a.description} [${a.severity}]`)
@@ -97,12 +97,10 @@ export function buildSpecWorkflow(input: BuildSpecWorkflowInput): UnifiedWorkflo
 
     return {
       id: crypto.randomUUID(),
-      type: "spec",
+      type: "prompt",
       phase: "verification",
       name: group.name,
-      spec_group: group,
-      element_source: elementSource,
-      description: `${group.description}\n\nElement source: ${elementSource} — ${sourceExplanation}\n\nAssertions:\n${assertionDescriptions}`,
+      content: `${group.description}\n\nElement source: ${elementSource} — ${sourceExplanation}\n\nAssertions:\n${assertionDescriptions}`,
     };
   });
 

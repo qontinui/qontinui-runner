@@ -12,7 +12,6 @@ import type {
   VerificationStep,
   AgenticStep,
   CompletionStep,
-  StateStep,
   PromptStep,
 } from "../types/unified-workflow";
 import { generateStepId, createSummaryStep } from "../types/unified-workflow";
@@ -210,22 +209,22 @@ class WorkflowGeneratorServiceClass {
   }
 
   /**
-   * Create a StateStep for navigation/verification.
+   * Create a prompt step for state navigation/verification.
+   * Encodes the state context as prompt content for AI-driven verification.
    */
   private createStateStep(
     state: GeneratorState,
     phase: "setup" | "verification" | "completion",
-    timeoutSeconds: number,
-  ): StateStep {
+    _timeoutSeconds: number,
+  ): PromptStep {
+    const semanticContext = this.buildSemanticContextForSingleState(state);
     return {
       id: generateStepId(),
-      type: "state",
+      type: "prompt",
       phase,
       name: `Verify: ${state.name}`,
-      state_id: state.id,
-      state_name: state.name,
-      timeout_seconds: timeoutSeconds,
-    } as StateStep;
+      content: `Verify the application is in the "${state.name}" state.\n\n${semanticContext}`,
+    };
   }
 
   /**
@@ -392,7 +391,7 @@ Fix any navigation issues to successfully reach all expected states.`;
    * Generate verification steps for a single state.
    *
    * Creates multiple verification approaches based on the state's properties:
-   * - StateStep: Navigate to and verify the state is active
+   * - PromptStep: AI-driven verification of the state
    * - TestStep (qontinui_vision): Visual verification using state images
    * - TestStep (playwright): Browser-based verification for web states
    *
@@ -413,17 +412,9 @@ Fix any navigation issues to successfully reach all expected states.`;
 
     const steps: VerificationStep[] = [];
 
-    // 1. StateStep - Basic state navigation/verification
+    // 1. Prompt step - AI-driven state verification
     if (includeStateStep) {
-      steps.push({
-        id: generateStepId(),
-        type: "state",
-        phase: "verification",
-        name: `Verify: ${state.name}`,
-        state_id: state.id,
-        state_name: state.name,
-        timeout_seconds: timeoutSeconds,
-      } as StateStep);
+      steps.push(this.createStateStep(state, "verification", timeoutSeconds));
     }
 
     // 2. Vision Test - Visual verification using state images
@@ -753,7 +744,7 @@ ${assertions.join("\n")}
  * Options for generating steps for a single state
  */
 export interface SingleStateGeneratorOptions {
-  /** Include a StateStep for navigation/verification (default: true) */
+  /** Include a prompt step for state navigation/verification (default: true) */
   includeStateStep?: boolean;
   /** Include a qontinui_vision test step (default: true) */
   includeVisionTest?: boolean;

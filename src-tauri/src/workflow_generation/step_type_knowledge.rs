@@ -138,8 +138,8 @@ pub fn load_knowledge_for_step_types(
 /// ```text
 /// ## Step Type Best Practices
 ///
-/// ### shell_command
-/// - **Always set working_directory**: Shell commands must specify...
+/// ### command
+/// - **Always set working_directory**: Command steps must specify...
 /// ```
 pub fn format_knowledge_as_markdown(entries: &[StepTypeKnowledge]) -> String {
     if entries.is_empty() {
@@ -370,42 +370,32 @@ pub fn infer_step_type_from_fix(description: &str) -> Option<String> {
     // Each entry: (step_type, keywords) -- more specific keywords listed first
     let mappings: &[(&str, &[&str])] = &[
         (
-            "shell_command",
+            "command",
             &[
+                "command",
                 "shell_command",
                 "shell command",
                 "working_directory",
                 "fail_on_error",
-            ],
-        ),
-        (
-            "api_request",
-            &[
+                "check_type",
+                "check step",
+                "typecheck",
+                "lint check",
+                "format check",
+                "check_group",
                 "api_request",
                 "api request",
-                "status_code",
-                "body_contains",
-                "json_path",
-                "http_status",
+                "curl",
             ],
         ),
         (
             "prompt",
             &[
                 "prompt step",
+                "prompt ",
                 "agentic prompt",
                 "agent instruction",
                 "base_prompt",
-            ],
-        ),
-        (
-            "check",
-            &[
-                "check_type",
-                "check step",
-                "typecheck",
-                "lint check",
-                "format check",
             ],
         ),
         (
@@ -419,10 +409,15 @@ pub fn infer_step_type_from_fix(description: &str) -> Option<String> {
                 "test runner",
             ],
         ),
-        ("gate", &["gate step", "gate ", "required_steps"]),
         (
-            "spec",
-            &["spec step", "spec ", "specification", "behavioral spec"],
+            "ui_bridge",
+            &[
+                "ui_bridge",
+                "ui bridge",
+                "ui_bridge_action",
+                "navigate",
+                "snapshot",
+            ],
         ),
     ];
 
@@ -480,17 +475,17 @@ mod tests {
     fn test_step_type_knowledge_insert_and_get() {
         let conn = create_test_db();
         let input = InsertKnowledgeInput {
-            step_type: "shell_command".to_string(),
+            step_type: "command".to_string(),
             layer: "universal".to_string(),
             title: "Set working_directory".to_string(),
-            content: "Always set working_directory for shell commands.".to_string(),
+            content: "Always set working_directory for command steps.".to_string(),
             priority: 10,
             provenance: "seed".to_string(),
             source_fix_id: None,
         };
 
         let entry = insert_knowledge(&conn, &input).unwrap();
-        assert_eq!(entry.step_type, "shell_command");
+        assert_eq!(entry.step_type, "command");
         assert_eq!(entry.title, "Set working_directory");
         assert_eq!(entry.priority, 10);
 
@@ -503,7 +498,7 @@ mod tests {
     fn test_step_type_knowledge_update() {
         let conn = create_test_db();
         let input = InsertKnowledgeInput {
-            step_type: "api_request".to_string(),
+            step_type: "command".to_string(),
             layer: "universal".to_string(),
             title: "Old title".to_string(),
             content: "Old content".to_string(),
@@ -530,7 +525,7 @@ mod tests {
     fn test_step_type_knowledge_delete() {
         let conn = create_test_db();
         let input = InsertKnowledgeInput {
-            step_type: "check".to_string(),
+            step_type: "command".to_string(),
             layer: "universal".to_string(),
             title: "Test".to_string(),
             content: "Test content".to_string(),
@@ -548,9 +543,9 @@ mod tests {
         let conn = create_test_db();
 
         for (st, layer) in &[
-            ("shell_command", "universal"),
-            ("api_request", "universal"),
-            ("shell_command", "system_specific"),
+            ("command", "universal"),
+            ("test", "universal"),
+            ("command", "system_specific"),
         ] {
             let input = InsertKnowledgeInput {
                 step_type: st.to_string(),
@@ -566,7 +561,7 @@ mod tests {
 
         // Filter by step_type
         let query = ListKnowledgeQuery {
-            step_type: Some("shell_command".to_string()),
+            step_type: Some("command".to_string()),
             ..Default::default()
         };
         let results = list_knowledge(&conn, &query).unwrap();
@@ -585,12 +580,7 @@ mod tests {
     fn test_load_knowledge_for_step_types() {
         let conn = create_test_db();
 
-        for (st, priority) in &[
-            ("shell_command", 10),
-            ("shell_command", 5),
-            ("api_request", 8),
-            ("check", 3),
-        ] {
+        for (st, priority) in &[("command", 10), ("command", 5), ("test", 8), ("prompt", 3)] {
             let input = InsertKnowledgeInput {
                 step_type: st.to_string(),
                 layer: "universal".to_string(),
@@ -603,16 +593,16 @@ mod tests {
             insert_knowledge(&conn, &input).unwrap();
         }
 
-        // Load for shell_command and api_request only
-        let entries = load_knowledge_for_step_types(&conn, &["shell_command", "api_request"]);
-        assert_eq!(entries.len(), 3); // 2 shell_command + 1 api_request
+        // Load for command and test only
+        let entries = load_knowledge_for_step_types(&conn, &["command", "test"]);
+        assert_eq!(entries.len(), 3); // 2 command + 1 test
                                       // Verify ordering: within each step_type, higher priority first
-        let shell_entries: Vec<_> = entries
+        let command_entries: Vec<_> = entries
             .iter()
-            .filter(|e| e.step_type == "shell_command")
+            .filter(|e| e.step_type == "command")
             .collect();
-        assert_eq!(shell_entries[0].priority, 10);
-        assert_eq!(shell_entries[1].priority, 5);
+        assert_eq!(command_entries[0].priority, 10);
+        assert_eq!(command_entries[1].priority, 5);
     }
 
     #[test]
@@ -660,10 +650,10 @@ mod tests {
         let entries = vec![
             StepTypeKnowledge {
                 id: "1".into(),
-                step_type: "shell_command".into(),
+                step_type: "command".into(),
                 layer: "universal".into(),
                 title: "Set working_directory".into(),
-                content: "Always set working_directory for shell commands.".into(),
+                content: "Always set working_directory for command steps.".into(),
                 priority: 10,
                 status: "active".into(),
                 provenance: "seed".into(),
@@ -673,10 +663,10 @@ mod tests {
             },
             StepTypeKnowledge {
                 id: "2".into(),
-                step_type: "api_request".into(),
+                step_type: "test".into(),
                 layer: "universal".into(),
-                title: "Content assertions".into(),
-                content: "Always include content-specific assertions.".into(),
+                title: "Test type required".into(),
+                content: "Always specify test_type for test steps.".into(),
                 priority: 10,
                 status: "active".into(),
                 provenance: "seed".into(),
@@ -688,12 +678,9 @@ mod tests {
 
         let md = format_knowledge_as_markdown(&entries);
         assert!(md.contains("## Step Type Best Practices"));
-        assert!(md.contains("### api_request"));
-        assert!(md.contains("### shell_command"));
+        assert!(md.contains("### command"));
+        assert!(md.contains("### test"));
         assert!(md.contains("- **Set working_directory**: Always set working_directory"));
-        assert!(
-            md.contains("- **Content assertions**: Always include content-specific assertions.")
-        );
     }
 
     #[test]
@@ -704,16 +691,16 @@ mod tests {
     #[test]
     fn test_infer_step_type_from_fix() {
         assert_eq!(
-            infer_step_type_from_fix("shell_command missing working_directory"),
-            Some("shell_command".to_string())
+            infer_step_type_from_fix("command missing working_directory"),
+            Some("command".to_string())
         );
         assert_eq!(
-            infer_step_type_from_fix("api_request needs body_contains assertion"),
-            Some("api_request".to_string())
+            infer_step_type_from_fix("shell_command needs fail_on_error"),
+            Some("command".to_string())
         );
         assert_eq!(
-            infer_step_type_from_fix("gate step missing required_steps"),
-            Some("gate".to_string())
+            infer_step_type_from_fix("ui_bridge action not supported"),
+            Some("ui_bridge".to_string())
         );
         assert_eq!(
             infer_step_type_from_fix("prompt instructions unclear"),

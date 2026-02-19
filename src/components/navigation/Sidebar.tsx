@@ -89,12 +89,8 @@ import {
   type IconName,
   type NavigationState as _NavigationState,
   type NavigationAction as _NavigationAction,
-  type AppMode,
-  getRunnerNavigation as _getRunnerNavigation,
-  getRunnerNavigationForMode,
-  getChildrenForPlatformAndMode,
-  isItemAvailableForMode as _isItemAvailableForMode,
-  findItemById,
+  getRunnerNavigation,
+  getChildrenForPlatform,
   CHILDREN_MAP,
   STORAGE_KEYS,
   createInitialState,
@@ -105,9 +101,6 @@ import {
   serializeState,
   deserializeState,
 } from "qontinui-navigation";
-
-import { listen } from "@tauri-apps/api/event";
-import ModeSwitcher from "./ModeSwitcher";
 
 // ============================================================================
 // Icon Mapping
@@ -226,30 +219,14 @@ function transformGroup(group: SharedNavigationGroup): ResolvedNavigationGroup {
   };
 }
 
-function getChildItems(parentId: string, mode?: AppMode): ResolvedNavigationItem[] {
-  // If mode is provided, filter children by mode
-  const children = mode
-    ? getChildrenForPlatformAndMode(parentId, "runner", mode)
-    : CHILDREN_MAP[parentId] || [];
+function getChildItems(parentId: string): ResolvedNavigationItem[] {
+  const children = getChildrenForPlatform(parentId, "runner");
   return children.map(transformItem);
 }
 
-function buildNavigationGroups(mode: AppMode): ResolvedNavigationGroup[] {
-  const sharedGroups = getRunnerNavigationForMode(mode);
+function buildNavigationGroups(): ResolvedNavigationGroup[] {
+  const sharedGroups = getRunnerNavigation();
   return sharedGroups.map(transformGroup);
-}
-
-/**
- * Check if a navigation item ID requires advanced mode.
- * Returns true if the item is only available in advanced mode.
- */
-function _requiresAdvancedMode(itemId: string): boolean {
-  const item = findItemById(itemId);
-  if (!item) return false;
-  if (item.modes && item.modes.length > 0 && !item.modes.includes("simple")) {
-    return true;
-  }
-  return false;
 }
 
 // ============================================================================
@@ -486,7 +463,6 @@ interface NavGroupProps {
   onKeyDown: (e: KeyboardEvent, itemId: string) => void;
   getTabIndex: (itemId: string) => number;
   openFlyoutId: string | null;
-  appMode: AppMode;
 }
 
 function NavGroup({
@@ -499,7 +475,6 @@ function NavGroup({
   onKeyDown,
   getTabIndex,
   openFlyoutId,
-  appMode,
 }: NavGroupProps) {
   const ChevronIcon = isExpanded ? ChevronDown : ChevronRight;
 
@@ -508,8 +483,7 @@ function NavGroup({
       <div className="space-y-1">
         {group.items.map((item) => {
           const isParentActive =
-            item.hasChildren &&
-            getChildItems(item.id, appMode).some((child) => child.id === activeTab);
+            item.hasChildren && getChildItems(item.id).some((child) => child.id === activeTab);
 
           return (
             <NavItem
@@ -552,8 +526,7 @@ function NavGroup({
       >
         {group.items.map((item) => {
           const isParentActive =
-            item.hasChildren &&
-            getChildItems(item.id, appMode).some((child) => child.id === activeTab);
+            item.hasChildren && getChildItems(item.id).some((child) => child.id === activeTab);
           const isFlyoutOpen = openFlyoutId === item.id;
 
           return (
@@ -689,16 +662,12 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
       if (stored) {
         const parsed = deserializeState(stored);
         if (parsed) {
-          let appMode = parsed.appMode ?? "advanced";
-          if (appMode === ("automation" as string)) appMode = "simple";
-          if (appMode === ("developer" as string)) appMode = "advanced";
           return {
             activeItemId: activeTab,
             expandedGroups: parsed.expandedGroups ?? new Set(["run", "system"]),
             expandedItems: parsed.expandedItems ?? new Set(),
             secondarySidebar: { isOpen: false, parentId: null, items: [] },
             isCollapsed: collapsed,
-            appMode,
           };
         }
       }
@@ -708,41 +677,11 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
     return createInitialState({
       activeItemId: activeTab,
       isCollapsed: collapsed,
-      appMode: "advanced",
     });
   });
 
-  // Get current app mode from state
-  const appMode = navState.appMode;
-
-  // Build navigation groups based on current mode
-  const navigationGroups = useMemo(() => buildNavigationGroups(appMode), [appMode]);
-
-  const handleModeChange = useCallback(() => {
-    const newMode: AppMode = appMode === "simple" ? "advanced" : "simple";
-    dispatch(navigationActions.setAppMode(newMode));
-    localStorage.setItem(STORAGE_KEYS.appMode, newMode);
-    // Persist to settings file so web can sync
-    fetch("http://localhost:9876/settings/app-mode", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mode: newMode }),
-    }).catch(() => {}); // fire-and-forget
-  }, [appMode]);
-
-  // Listen for mode changes from other apps (e.g. web pushing via runner API)
-  useEffect(() => {
-    const unlisten = listen<string>("app-mode-changed", (event) => {
-      const newMode = event.payload as AppMode;
-      if (newMode !== appMode) {
-        dispatch(navigationActions.setAppMode(newMode));
-        localStorage.setItem(STORAGE_KEYS.appMode, newMode);
-      }
-    });
-    return () => {
-      unlisten.then((fn) => fn());
-    };
-  }, [appMode]);
+  // Build navigation groups (no mode filtering needed)
+  const navigationGroups = useMemo(() => buildNavigationGroups(), []);
 
   // Flyout state
   const [openFlyout, setOpenFlyout] = useState<{
@@ -762,17 +701,14 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
     dispatch(navigationActions.toggleGroup(groupId));
   }, []);
 
-  const openFlyoutSidebar = useCallback(
-    (item: ResolvedNavigationItem) => {
-      const children = getChildItems(item.id, appMode);
-      setOpenFlyout({
-        id: item.id,
-        label: item.label,
-        items: children,
-      });
-    },
-    [appMode],
-  );
+  const openFlyoutSidebar = useCallback((item: ResolvedNavigationItem) => {
+    const children = getChildItems(item.id);
+    setOpenFlyout({
+      id: item.id,
+      label: item.label,
+      items: children,
+    });
+  }, []);
 
   const closeFlyout = useCallback(() => {
     setOpenFlyout(null);
@@ -786,7 +722,7 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
         } else {
           openFlyoutSidebar(item);
           if (item.selectsFirstChild) {
-            const children = getChildItems(item.id, appMode);
+            const children = getChildItems(item.id);
             if (children.length > 0) {
               onTabChange(children[0].id);
             }
@@ -797,7 +733,7 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
         closeFlyout();
       }
     },
-    [openFlyout, closeFlyout, openFlyoutSidebar, onTabChange, appMode],
+    [openFlyout, closeFlyout, openFlyoutSidebar, onTabChange],
   );
 
   const flattenedItems = useMemo(
@@ -921,40 +857,8 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
               onKeyDown={handleKeyDown}
               getTabIndex={getTabIndex}
               openFlyoutId={openFlyout?.id ?? null}
-              appMode={appMode}
             />
           ))}
-        </div>
-
-        {/* Mode Toggle Button */}
-        <div className="border-t border-border/50 p-2">
-          <Tooltip
-            content={appMode === "simple" ? "Show All Pages" : "Show Fewer Pages"}
-            disabled={!collapsed}
-          >
-            <button
-              onClick={handleModeChange}
-              data-ui-id="sidebar-mode-toggle-btn"
-              className={`
-                w-full flex items-center gap-3 px-3 py-2 rounded-md text-sm
-                text-muted-foreground hover:text-foreground hover:bg-muted/30
-                transition-colors outline-none
-                focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2
-                focus-visible:ring-offset-background
-                ${collapsed ? "justify-center px-0" : ""}
-              `}
-              aria-label={appMode === "simple" ? "Show All Pages" : "Show Fewer Pages"}
-            >
-              {collapsed ? (
-                <Layers className="w-4 h-4" />
-              ) : (
-                <>
-                  <Layers className="w-4 h-4" />
-                  <span>{appMode === "simple" ? "Show All Pages" : "Show Fewer Pages"}</span>
-                </>
-              )}
-            </button>
-          </Tooltip>
         </div>
 
         {/* Collapse Toggle Button */}

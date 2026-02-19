@@ -400,7 +400,14 @@ pub fn prepend_log_watch_step(
         return verification_steps;
     }
 
-    let mut steps = vec![crate::step_executor::ExecutionStepConfig::default_log_watch()];
+    let mut steps = vec![crate::step_executor::ExecutionStepConfig {
+        step_type: "log_watch".to_string(),
+        name: Some("Log Watch".to_string()),
+        phase: Some("verification".to_string()),
+        run_on_subsequent_iterations: Some(true),
+        required: Some(false),
+        ..Default::default()
+    }];
     steps.extend(verification_steps);
     steps
 }

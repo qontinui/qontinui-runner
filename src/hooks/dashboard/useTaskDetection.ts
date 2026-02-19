@@ -124,7 +124,7 @@ function parseExecutionSteps(stepsJson?: string): DetectedStepTypes {
       "verify",
       "test",
       "check",
-      "check_group", // Unified workflow check groups
+      "check_group", // Legacy: check groups (now part of "command")
       "link_check",
       "format_check",
       "type_check",
@@ -133,9 +133,9 @@ function parseExecutionSteps(stepsJson?: string): DetectedStepTypes {
       "repository_test",
     ];
 
-    // Shell command step types
+    // Command step types (unified: shell commands, API requests, MCP calls, checks)
     const shellCommandStepTypes = [
-      "shell_command",
+      "shell_command", // Legacy
       "shell",
       "command",
       "cmd",
@@ -146,7 +146,7 @@ function parseExecutionSteps(stepsJson?: string): DetectedStepTypes {
     // AI/Prompt step types (for detecting AI activity from execution steps)
     const aiStepTypes = ["prompt", "ai_task", "ai", "agentic", "llm"];
 
-    // API request step types
+    // API request step types (legacy - now part of "command", but kept for backward compat detection)
     const apiRequestStepTypes = ["api_request", "api", "http", "request"];
 
     // Script step types
@@ -155,7 +155,7 @@ function parseExecutionSteps(stepsJson?: string): DetectedStepTypes {
     // Workflow reference step types
     const workflowRefStepTypes = ["workflow_ref", "sub_workflow", "subworkflow"];
 
-    // MCP call step types
+    // MCP call step types (legacy - now part of "command", but kept for backward compat detection)
     const mcpCallStepTypes = ["mcp_call", "mcp", "tool_call", "mcp_tool"];
 
     for (const step of steps) {

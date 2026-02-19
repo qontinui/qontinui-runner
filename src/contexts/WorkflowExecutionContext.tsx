@@ -327,11 +327,12 @@ function mapStepType(apiType: string): StepType {
     playwright: "playwright",
     test: "test",
     check: "check",
-    check_group: "check_group",
+    check_group: "check",
     shell: "shell",
     shell_command: "shell",
-    api_request: "api_request",
-    mcp_call: "mcp_call",
+    command: "shell",
+    api_request: "shell",
+    mcp_call: "shell",
     prompt: "prompt",
     ai_session: "ai_session",
     awas: "awas",
@@ -544,10 +545,7 @@ function calculateTimelineStats(phaseGroups: PhaseGroup[], elapsedTime: number):
   const verificationResults = verificationIterations.map((iter) => {
     const checkSteps = iter.steps.filter(
       (s) =>
-        s.type === "check" ||
-        s.type === "test" ||
-        s.type === "playwright" ||
-        s.type === "check_group",
+        s.type === "check" || s.type === "test" || s.type === "playwright" || s.type === "shell",
     );
     const passed = checkSteps.filter((s) => s.status === "success").length;
     const total = checkSteps.length;
@@ -660,7 +658,8 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
       // If all steps are done, freeze elapsed time at the last step's completion
       // rather than continuing to count while post-step processing runs.
       const lastCompletedTime =
-        completedCheckpoints.length > 0 && completedCheckpoints[completedCheckpoints.length - 1].completedAt
+        completedCheckpoints.length > 0 &&
+        completedCheckpoints[completedCheckpoints.length - 1].completedAt
           ? new Date(completedCheckpoints[completedCheckpoints.length - 1].completedAt!).getTime()
           : null;
       const allStepsFinished =

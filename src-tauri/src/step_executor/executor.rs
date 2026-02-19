@@ -22,24 +22,18 @@
 //! All step types are implemented as separate handlers in the `handlers/` module.
 //! The `HandlerRegistry` maps step type strings to handler implementations.
 //!
-//! ## Step Categories (25 handlers)
+//! ## Core Step Types (4 handlers)
 //!
-//! - **GUI** (7): workflow, workflow_ref, state, action, gui_action, screenshot, macro
-//! - **Shell/Script** (4): shell_command, shell, script, playwright
-//! - **Verification** (5): log_watch, check, check_group, test, spec
-//! - **API/MCP** (2): api_request, mcp_call
-//! - **AWAS** (5): awas_discover, awas_execute, awas_check_support, awas_list_actions, awas_extract_elements
-//! - **Other** (1): prompt
+//! - **Command**: command (unified: shell command, check, check group)
+//! - **Verification**: test
+//! - **UI Bridge**: ui_bridge
+//! - **AI**: prompt
 
 #![allow(dead_code)]
 
-use jsonpath_rust::JsonPathFinder;
 use regex::Regex;
 
 use crate::action_service::UnifiedActionService;
-use crate::api_request::{
-    ApiAssertion, ApiRequestConfig, ApiRequestSession, HttpMethod, VariableExtraction,
-};
 use crate::commands::AppState;
 use crate::config_storage::ConfigStorage;
 use crate::database::CreateTaskRunEventInput;
@@ -49,7 +43,6 @@ use crate::iteration_bundle::{
     parse_action_events, parse_image_recognition_events, ActionEvent, ImageRecognitionEvent,
     RelevantLogSources,
 };
-use crate::mcp_client::CreateMcpCallInput;
 use crate::orchestrator::context_propagation::{
     ExpressionEvaluator, RuntimeContext, SharedVariableStore,
 };
@@ -59,7 +52,7 @@ use crate::unified_workflow_executor::get_parent_task_id;
 use super::handlers::{HandlerContext, HandlerRegistry};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
@@ -111,10 +104,135 @@ impl std::fmt::Display for StepPhase {
     }
 }
 
-/// Configuration for a single execution step
+// ============================================================================
+// DAG Execution Engine
+// ============================================================================
+
+/// Compute execution layers from step dependencies using topological sort (Kahn's algorithm).
+///
+/// Steps are organized into layers where all steps in a layer can execute in parallel.
+/// Dependencies come from two sources:
+/// 1. `inputs` — referenced step IDs are implicit dependencies
+/// 2. `depends_on` — explicit ordering constraints
+///
+/// Returns `Vec<Vec<usize>>` where each inner vec is a layer of step indices that
+/// can run concurrently. Returns Err if a cycle is detected.
+pub fn compute_execution_layers(steps: &[ExecutionStepConfig]) -> Result<Vec<Vec<usize>>, String> {
+    let n = steps.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Build a map from step ID to index
+    let mut id_to_index: HashMap<String, usize> = HashMap::new();
+    for (i, step) in steps.iter().enumerate() {
+        if let Some(ref id) = step.id {
+            id_to_index.insert(id.clone(), i);
+        }
+    }
+
+    // Build adjacency list and in-degree counts
+    let mut in_degree = vec![0usize; n];
+    let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+    for (i, step) in steps.iter().enumerate() {
+        // Collect dependencies from `inputs` (extract referenced step IDs)
+        if let Some(ref inputs) = step.inputs {
+            for reference in inputs.values() {
+                // Parse "step-id.property[.path]" — extract the step ID (first segment)
+                let step_id = reference.split('.').next().unwrap_or("");
+                if let Some(&dep_index) = id_to_index.get(step_id) {
+                    if dep_index != i {
+                        adjacency[dep_index].push(i);
+                        in_degree[i] += 1;
+                    }
+                }
+            }
+        }
+
+        // Collect dependencies from `depends_on` (explicit ordering)
+        if let Some(ref deps) = step.depends_on {
+            for dep_id in deps {
+                if let Some(&dep_index) = id_to_index.get(dep_id) {
+                    if dep_index != i {
+                        adjacency[dep_index].push(i);
+                        in_degree[i] += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Kahn's algorithm: BFS topological sort, grouping into layers
+    let mut queue: VecDeque<usize> = VecDeque::new();
+    for (i, &deg) in in_degree.iter().enumerate().take(n) {
+        if deg == 0 {
+            queue.push_back(i);
+        }
+    }
+
+    let mut layers: Vec<Vec<usize>> = Vec::new();
+    let mut processed = 0;
+
+    while !queue.is_empty() {
+        let layer_size = queue.len();
+        let mut layer = Vec::with_capacity(layer_size);
+
+        for _ in 0..layer_size {
+            let node = queue.pop_front().unwrap();
+            layer.push(node);
+            processed += 1;
+
+            for &neighbor in &adjacency[node] {
+                in_degree[neighbor] -= 1;
+                if in_degree[neighbor] == 0 {
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+
+        layers.push(layer);
+    }
+
+    if processed != n {
+        return Err(format!(
+            "Circular dependency detected: {} of {} steps could not be ordered",
+            n - processed,
+            n
+        ));
+    }
+
+    Ok(layers)
+}
+
+/// Extract step IDs referenced in an `inputs` map.
+///
+/// Each input value has format "step-id.property[.path]".
+/// Returns the unique set of referenced step IDs.
+pub fn extract_input_dependencies(inputs: &HashMap<String, String>) -> HashSet<String> {
+    inputs
+        .values()
+        .filter_map(|reference| {
+            let step_id = reference.split('.').next()?;
+            if step_id.is_empty() {
+                None
+            } else {
+                Some(step_id.to_string())
+            }
+        })
+        .collect()
+}
+
+// ============================================================================
+// Step Configuration
+// ============================================================================
+
+/// Configuration for a single execution step.
+///
+/// Supports 4 core step types: command, test, ui_bridge, prompt.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ExecutionStepConfig {
-    /// Step type: "workflow", "state", "action", "screenshot", "playwright", "prompt"
+    /// Step type: "command", "test", "ui_bridge", "prompt"
     #[serde(rename = "type")]
     pub step_type: String,
 
@@ -122,86 +240,65 @@ pub struct ExecutionStepConfig {
     #[serde(default)]
     pub id: Option<String>,
 
-    /// Step name (workflow name, state name, or description)
+    /// Step name (description)
     #[serde(default)]
     pub name: Option<String>,
-
-    /// For action steps: "click", "double_click", "right_click"
-    #[serde(rename = "actionType")]
-    pub action_type: Option<String>,
-
-    /// Target image ID for action steps
-    #[serde(rename = "targetImageId")]
-    pub target_image_id: Option<String>,
-
-    /// Target image name for display
-    #[serde(rename = "targetImageName")]
-    pub target_image_name: Option<String>,
-
-    /// Monitor index (0 = primary)
-    #[serde(rename = "monitorIndex", default)]
-    pub monitor_index: Option<i32>,
-
-    /// Whether to take screenshot after this step
-    #[serde(rename = "takeScreenshot", default)]
-    pub take_screenshot: bool,
-
-    /// Delay before screenshot in seconds
-    #[serde(rename = "screenshotDelay", default)]
-    pub screenshot_delay: u32,
-
-    /// Monitor for screenshot ("all" or index)
-    #[serde(rename = "screenshotMonitor", default)]
-    pub screenshot_monitor: Option<serde_json::Value>,
-
-    /// Playwright script ID
-    #[serde(rename = "playwrightScriptId")]
-    pub playwright_script_id: Option<String>,
-
-    /// Playwright script content (for combined/inline scripts)
-    #[serde(rename = "playwrightScriptContent")]
-    pub playwright_script_content: Option<String>,
-
-    /// Playwright target URL (for combined scripts)
-    #[serde(rename = "playwrightTargetUrl")]
-    pub playwright_target_url: Option<String>,
-
-    /// Prompt content (for prompt steps - not executed, passed to AI)
-    /// Frontend uses "content" field, so we accept both "promptContent" and "content"
-    #[serde(rename = "promptContent", alias = "content")]
-    pub prompt_content: Option<String>,
-
-    /// Timeout for this step in seconds (default: 300 for workflows, 30 for actions)
-    #[serde(rename = "timeoutSeconds", default)]
-    pub timeout_seconds: Option<u64>,
-
-    /// Initial state IDs for workflow steps (overrides default initial states)
-    #[serde(rename = "initialStateIds", default)]
-    pub initial_state_ids: Option<Vec<String>>,
-
-    /// Whether this step is a setup step (brings app to target state) vs verification step.
-    /// Setup steps typically run on the first iteration only.
-    /// Default: true for GUI automation steps (workflow, state, action, gui_workflow)
-    /// Default: false for verification steps (playwright, test, screenshot)
-    #[serde(rename = "isSetup", default)]
-    pub is_setup: Option<bool>,
 
     /// Workflow phase: "setup", "verification", "agentic", or "completion"
     #[serde(default)]
     pub phase: Option<String>,
 
+    /// Timeout for this step in seconds
+    #[serde(rename = "timeoutSeconds", default)]
+    pub timeout_seconds: Option<u64>,
+
     /// Whether to run this step on subsequent iterations (after the first).
     /// Default: true (all steps run on each iteration for fresh data)
-    /// Users can toggle off individual steps if they only need to run once (e.g., one-time setup)
     #[serde(rename = "runOnSubsequentIterations", default)]
     pub run_on_subsequent_iterations: Option<bool>,
 
     /// Optional sub-step identifier for granular progress tracking.
-    /// When multiple prompts are consolidated, each sub-step has a unique ID
-    /// that allows tracking completion at a granular level.
     #[serde(rename = "subStepId", alias = "sub_step_id")]
     pub sub_step_id: Option<String>,
 
+    /// Whether this step should only run in dev mode
+    #[serde(alias = "devModeOnly", alias = "dev_mode_only", default)]
+    pub dev_mode_only: Option<bool>,
+
+    // ========================================================================
+    // Data Flow (NEW - replaces gates)
+    // ========================================================================
+    /// Input mappings: name -> "step-id.field" or "step-id.output.json.path"
+    /// References are resolved just-in-time before step execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inputs: Option<HashMap<String, String>>,
+
+    /// Extract named values from this step's output using JSON paths.
+    /// name -> JSON path into step output
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extract: Option<HashMap<String, String>>,
+
+    /// Explicit ordering dependencies beyond those implied by inputs.
+    /// Step IDs that must complete before this step runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depends_on: Option<Vec<String>>,
+
+    /// Whether this step is required for verification to pass.
+    /// Default: true. Set to false for informational-only steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+
+    /// Number of retry attempts on failure (0 = no retries)
+    #[serde(alias = "retryCount", alias = "retry_count", default)]
+    pub retry_count: Option<u32>,
+
+    /// Delay in milliseconds between retry attempts (default: 2000)
+    #[serde(alias = "retryDelayMs", alias = "retry_delay_ms", default)]
+    pub retry_delay_ms: Option<u64>,
+
+    // ========================================================================
+    // Test Step Fields
+    // ========================================================================
     /// Test ID for verification test steps
     #[serde(rename = "testId", alias = "test_id")]
     pub test_id: Option<String>,
@@ -221,53 +318,7 @@ pub struct ExecutionStepConfig {
     pub test_is_critical: Option<bool>,
 
     // ========================================================================
-    // AWAS Step Fields
-    // ========================================================================
-    /// AWAS: URL for AWAS operations (discover, execute, check_support)
-    #[serde(rename = "awasUrl")]
-    pub awas_url: Option<String>,
-
-    /// AWAS: Action ID to execute (for awas_execute steps)
-    #[serde(rename = "awasActionId")]
-    pub awas_action_id: Option<String>,
-
-    /// AWAS: Parameters for action execution (for awas_execute steps)
-    #[serde(rename = "awasParams")]
-    pub awas_params: Option<serde_json::Value>,
-
-    /// AWAS: HTML content for element extraction (for awas_extract_elements steps)
-    #[serde(rename = "awasHtml")]
-    pub awas_html: Option<String>,
-
-    /// AWAS: Base URL for resolving relative URLs (for awas_extract_elements steps)
-    #[serde(rename = "awasBaseUrl")]
-    pub awas_base_url: Option<String>,
-
-    // ========================================================================
-    // MCP Call Step Fields
-    // ========================================================================
-    /// MCP: Server ID for the MCP server to call
-    #[serde(rename = "mcpServerId")]
-    pub mcp_server_id: Option<String>,
-
-    /// MCP: Server name for display purposes
-    #[serde(rename = "mcpServerName")]
-    pub mcp_server_name: Option<String>,
-
-    /// MCP: Tool name to call on the MCP server
-    #[serde(rename = "mcpToolName")]
-    pub mcp_tool_name: Option<String>,
-
-    /// MCP: Arguments to pass to the tool (JSON object)
-    #[serde(rename = "mcpArguments")]
-    pub mcp_arguments: Option<serde_json::Value>,
-
-    /// MCP: Whether to fail the workflow if the MCP call fails
-    #[serde(rename = "mcpFailOnError", default)]
-    pub mcp_fail_on_error: Option<bool>,
-
-    // ========================================================================
-    // Shell Command Step Fields
+    // Shell Command Step Fields (used by command type)
     // ========================================================================
     /// Shell Command: The command to execute
     #[serde(alias = "shellCommand", alias = "command")]
@@ -286,70 +337,17 @@ pub struct ExecutionStepConfig {
     pub shell_command_fail_on_error: Option<bool>,
 
     // ========================================================================
-    // API Request Step Fields
-    // ========================================================================
-    /// API Request: HTTP method (GET, POST, PUT, PATCH, DELETE)
-    #[serde(alias = "apiMethod", alias = "method")]
-    pub api_method: Option<String>,
-
-    /// API Request: URL to request
-    #[serde(alias = "apiUrl", alias = "url")]
-    pub api_url: Option<String>,
-
-    /// API Request: Request headers as JSON object
-    #[serde(alias = "apiHeaders", alias = "headers")]
-    pub api_headers: Option<serde_json::Value>,
-
-    /// API Request: Request body
-    #[serde(alias = "apiBody", alias = "body")]
-    pub api_body: Option<String>,
-
-    /// API Request: Content type
-    #[serde(alias = "apiContentType", alias = "content_type")]
-    pub api_content_type: Option<String>,
-
-    /// API Request: Variable name to store response body (enables request chaining)
-    /// If specified, the response body will be stored in RuntimeContext with this name.
-    /// Subsequent steps can reference it using `{{variable_name}}` syntax.
-    #[serde(alias = "apiOutputVariable", alias = "output_variable")]
-    pub api_output_variable: Option<String>,
-
-    /// API Request: Variable extractions from response using JSON paths.
-    /// Each extraction specifies a variable name and JSON path to extract from the response.
-    #[serde(alias = "apiExtractions", alias = "extractions")]
-    pub api_extractions: Option<Vec<VariableExtraction>>,
-
-    /// API Request: Timeout in milliseconds (optional, no timeout if not specified)
-    #[serde(alias = "apiTimeoutMs", alias = "timeout_ms")]
-    pub api_timeout_ms: Option<u64>,
-
-    /// API Request: Assertions for response verification
-    #[serde(alias = "apiAssertions", alias = "assertions")]
-    pub api_assertions: Option<Vec<ApiAssertion>>,
-
-    /// API Request: Number of retry attempts when assertions fail (0 = no retries)
-    #[serde(alias = "retryCount", alias = "retry_count")]
-    pub api_retry_count: Option<u32>,
-
-    /// API Request: Delay in milliseconds between retry attempts (default: 2000)
-    #[serde(alias = "retryDelayMs", alias = "retry_delay_ms")]
-    pub api_retry_delay_ms: Option<u64>,
-
-    // ========================================================================
-    // Check Step Fields
+    // Check Step Fields (used by command type with check_type)
     // ========================================================================
     /// Check: Type of check (lint, format, typecheck, analyze, security, custom_command)
     #[serde(alias = "checkType", alias = "check_type")]
     pub check_type: Option<String>,
 
     /// Check: Command to run
-    /// Note: The "command" alias conflicts with shell_command, so JSON "command" will go there.
-    /// The execute_check_step function handles this by checking both fields.
     #[serde(alias = "checkCommand")]
     pub check_command: Option<String>,
 
     /// Check: Working directory
-    /// Also used for repository test steps
     #[serde(alias = "checkWorkingDirectory")]
     pub check_working_directory: Option<String>,
 
@@ -369,7 +367,7 @@ pub struct ExecutionStepConfig {
     #[serde(alias = "aiReviewPrompt", alias = "ai_review_prompt")]
     pub ai_review_prompt: Option<String>,
 
-    /// Check (ai_review): Path to file to review (supports {{artifact_dir}} substitution)
+    /// Check (ai_review): Path to file to review
     #[serde(alias = "aiReviewInputPath", alias = "ai_review_input_path")]
     pub ai_review_input_path: Option<String>,
 
@@ -407,37 +405,23 @@ pub struct ExecutionStepConfig {
     pub ci_cd_wait: Option<bool>,
 
     // ========================================================================
-    // Prompt Step Response Mode Fields
+    // Prompt Step Fields
     // ========================================================================
+    /// Prompt content (for prompt steps - not executed, passed to AI)
+    #[serde(rename = "promptContent", alias = "content")]
+    pub prompt_content: Option<String>,
+
     /// Prompt execution mode: "session" (default) or "response" (simple prompt→response)
     #[serde(alias = "promptMode", alias = "prompt_mode")]
     pub prompt_mode: Option<String>,
 
-    /// Path to write AI response output (supports {{artifact_dir}} substitution)
+    /// Path to write AI response output
     #[serde(alias = "outputPath", alias = "output_path")]
     pub output_path: Option<String>,
 
     /// Path to read input from (content appended to prompt)
     #[serde(alias = "inputPath", alias = "input_path")]
     pub input_path: Option<String>,
-
-    /// Whether this step should only run in dev mode
-    #[serde(alias = "devModeOnly", alias = "dev_mode_only", default)]
-    pub dev_mode_only: Option<bool>,
-
-    // ========================================================================
-    // Save Workflow Artifact Step Fields
-    // ========================================================================
-    /// SaveWorkflowArtifact: Path to workflow JSON file to save
-    #[serde(alias = "artifactInputPath", alias = "artifact_input_path")]
-    pub artifact_input_path: Option<String>,
-
-    // ========================================================================
-    // Macro Step Fields
-    // ========================================================================
-    /// Macro: ID of the saved macro to execute
-    #[serde(alias = "macroId", alias = "macro_id")]
-    pub macro_id: Option<String>,
 
     // ========================================================================
     // Check Group Step Fields
@@ -447,66 +431,35 @@ pub struct ExecutionStepConfig {
     pub check_group_id: Option<String>,
 
     // ========================================================================
-    // UI Bridge Spec Step Fields
+    // UI Bridge Step Fields
     // ========================================================================
-    /// Spec: JSON spec group for UI Bridge spec verification (for "spec" step type)
-    #[serde(alias = "specGroup", alias = "spec_group")]
-    pub spec_group_json: Option<serde_json::Value>,
+    /// UI Bridge: Action to perform ("navigate", "execute", "assert", "snapshot")
+    #[serde(alias = "uiBridgeAction", alias = "ui_bridge_action")]
+    pub ui_bridge_action: Option<String>,
 
-    /// Spec: Element source - "control" (runner UI) or "external" (browser tab)
-    #[serde(alias = "specElementSource", alias = "element_source")]
-    pub spec_element_source: Option<String>,
+    /// UI Bridge: URL to navigate to or connect to
+    #[serde(alias = "uiBridgeUrl", alias = "ui_bridge_url")]
+    pub ui_bridge_url: Option<String>,
 
-    /// Spec: Whether failure should stop remaining verification steps
-    #[serde(alias = "specStopOnFailure", alias = "stop_on_failure")]
-    pub spec_stop_on_failure: Option<bool>,
+    /// UI Bridge: Natural language instruction for execute action
+    #[serde(alias = "uiBridgeInstruction", alias = "ui_bridge_instruction")]
+    pub ui_bridge_instruction: Option<String>,
 
-    /// Spec: Pre-fetched external elements (injected at runtime to avoid HTTP self-call)
-    /// This field is populated by the workflow executor before passing to the step handler.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub spec_prefetched_elements: Option<serde_json::Value>,
+    /// UI Bridge: Target element selector or description for assert action
+    #[serde(alias = "uiBridgeTarget", alias = "ui_bridge_target")]
+    pub ui_bridge_target: Option<String>,
 
-    // ========================================================================
-    // Gate Step Fields
-    // ========================================================================
-    /// Gate: Step IDs that must all pass for this gate to pass
-    #[serde(alias = "gateRequiredSteps", alias = "required_steps")]
-    pub gate_required_steps: Option<Vec<String>>,
+    /// UI Bridge: Assertion type ("exists", "text_equals", "contains", "visible", "enabled")
+    #[serde(alias = "uiBridgeAssertType", alias = "ui_bridge_assert_type")]
+    pub ui_bridge_assert_type: Option<String>,
 
-    /// Gate: Whether to skip remaining verification steps when this gate fails
-    #[serde(alias = "gateStopOnFailure", alias = "gate_stop_on_failure", default)]
-    pub gate_stop_on_failure: Option<bool>,
+    /// UI Bridge: Expected value for assertions
+    #[serde(alias = "uiBridgeExpected", alias = "ui_bridge_expected")]
+    pub ui_bridge_expected: Option<String>,
 
-    // ========================================================================
-    // Log Watch Step Fields
-    // ========================================================================
-    /// Log Watch: Log sources to watch (e.g., ["backend.log", "frontend.log"])
-    /// If not specified, defaults to ["backend.log", "frontend.log"]
-    #[serde(rename = "logSources", alias = "log_sources")]
-    pub log_sources: Option<Vec<String>>,
-
-    /// Log Watch: Time window in seconds to scan (default: 60)
-    #[serde(rename = "timeWindowSeconds", alias = "time_window_seconds")]
-    pub time_window_seconds: Option<u64>,
-
-    /// Log Watch: Custom error patterns to match (in addition to defaults)
-    #[serde(rename = "errorPatterns", alias = "error_patterns")]
-    pub error_patterns: Option<Vec<String>>,
-
-    // ========================================================================
-    // Error Resolved Step Fields (for error-specific verification)
-    // ========================================================================
-    /// Error Resolved: ID of the specific error to check (from error_events table)
-    #[serde(rename = "errorId", alias = "error_id")]
-    pub error_id: Option<i64>,
-
-    /// Error Resolved: Error message pattern to check for (regex or literal)
-    #[serde(rename = "errorPattern", alias = "error_pattern")]
-    pub error_pattern: Option<String>,
-
-    /// Error Resolved: Specific log source where the error originated
-    #[serde(rename = "errorSource", alias = "error_source")]
-    pub error_source: Option<String>,
+    /// UI Bridge: Timeout in milliseconds for UI Bridge operations
+    #[serde(alias = "uiBridgeTimeoutMs", alias = "ui_bridge_timeout_ms")]
+    pub ui_bridge_timeout_ms: Option<u64>,
 
     // ========================================================================
     // Console Error Handling
@@ -538,178 +491,6 @@ impl ExecutionStepConfig {
         self.phase = Some(phase.as_str().to_string());
     }
 
-    /// Create a workflow step (convenience constructor)
-    pub fn workflow(name: &str) -> Self {
-        Self {
-            step_type: "workflow".to_string(),
-            name: Some(name.to_string()),
-            is_setup: Some(true), // Workflow is setup by default
-            run_on_subsequent_iterations: Some(true), // Default: run on all iterations for fresh data
-            ..Default::default()
-        }
-    }
-
-    /// Create a workflow step with screenshot
-    pub fn workflow_with_screenshot(name: &str, delay: u32) -> Self {
-        Self {
-            step_type: "workflow".to_string(),
-            name: Some(name.to_string()),
-            take_screenshot: true,
-            screenshot_delay: delay,
-            is_setup: Some(true), // Workflow is setup by default
-            run_on_subsequent_iterations: Some(true), // Default: run on all iterations for fresh data
-            ..Default::default()
-        }
-    }
-
-    /// Create a screenshot step
-    pub fn screenshot(monitor: Option<i32>, delay: u32) -> Self {
-        Self {
-            step_type: "screenshot".to_string(),
-            name: Some("Capture Screenshot".to_string()),
-            monitor_index: monitor,
-            take_screenshot: true,
-            screenshot_delay: delay,
-            screenshot_monitor: monitor.map(|m| serde_json::Value::Number(m.into())),
-            is_setup: Some(false), // Screenshot is verification, not setup
-            run_on_subsequent_iterations: Some(true), // Verification runs on all iterations
-            ..Default::default()
-        }
-    }
-
-    // ========================================================================
-    // AWAS Step Constructors
-    // ========================================================================
-
-    /// Create an AWAS discover step
-    pub fn awas_discover(url: &str) -> Self {
-        Self {
-            step_type: "awas_discover".to_string(),
-            name: Some(format!("AWAS Discover: {}", url)),
-            is_setup: Some(true), // AWAS discover is typically setup
-            run_on_subsequent_iterations: Some(false), // Usually only discover once
-            awas_url: Some(url.to_string()),
-            ..Default::default()
-        }
-    }
-
-    /// Create an AWAS execute step
-    pub fn awas_execute(url: &str, action_id: &str, params: Option<serde_json::Value>) -> Self {
-        Self {
-            step_type: "awas_execute".to_string(),
-            name: Some(format!("AWAS Execute: {}", action_id)),
-            is_setup: Some(false), // AWAS execute is typically an action step
-            run_on_subsequent_iterations: Some(true),
-            awas_url: Some(url.to_string()),
-            awas_action_id: Some(action_id.to_string()),
-            awas_params: params,
-            ..Default::default()
-        }
-    }
-
-    /// Create an AWAS check support step
-    pub fn awas_check_support(url: &str) -> Self {
-        Self {
-            step_type: "awas_check_support".to_string(),
-            name: Some(format!("AWAS Check Support: {}", url)),
-            is_setup: Some(true), // Check support is typically setup
-            run_on_subsequent_iterations: Some(false),
-            awas_url: Some(url.to_string()),
-            ..Default::default()
-        }
-    }
-
-    /// Create an AWAS list actions step
-    pub fn awas_list_actions() -> Self {
-        Self {
-            step_type: "awas_list_actions".to_string(),
-            name: Some("AWAS List Actions".to_string()),
-            is_setup: Some(false),
-            run_on_subsequent_iterations: Some(true),
-            ..Default::default()
-        }
-    }
-
-    /// Create an AWAS extract elements step
-    pub fn awas_extract_elements(html: &str, base_url: Option<&str>) -> Self {
-        Self {
-            step_type: "awas_extract_elements".to_string(),
-            name: Some("AWAS Extract Elements".to_string()),
-            is_setup: Some(false),
-            run_on_subsequent_iterations: Some(true),
-            awas_html: Some(html.to_string()),
-            awas_base_url: base_url.map(|s| s.to_string()),
-            ..Default::default()
-        }
-    }
-
-    // ========================================================================
-    // MCP Call Step Constructor
-    // ========================================================================
-
-    /// Create an MCP call step
-    pub fn mcp_call(
-        server_id: &str,
-        tool_name: &str,
-        arguments: Option<serde_json::Value>,
-    ) -> Self {
-        Self {
-            step_type: "mcp_call".to_string(),
-            name: Some(format!("MCP Call: {}", tool_name)),
-            is_setup: Some(false),
-            run_on_subsequent_iterations: Some(true),
-            mcp_server_id: Some(server_id.to_string()),
-            mcp_tool_name: Some(tool_name.to_string()),
-            mcp_arguments: arguments,
-            mcp_fail_on_error: Some(true),
-            ..Default::default()
-        }
-    }
-
-    /// Create a macro step (runs a saved macro by ID)
-    pub fn macro_step(macro_id: &str, name: Option<&str>) -> Self {
-        Self {
-            step_type: "macro".to_string(),
-            name: name.map(|n| n.to_string()),
-            is_setup: Some(true), // Macro is setup by default
-            run_on_subsequent_iterations: Some(true),
-            macro_id: Some(macro_id.to_string()),
-            ..Default::default()
-        }
-    }
-
-    /// Create a log_watch step for automatic error detection.
-    ///
-    /// This step scans development log files for errors within a time window.
-    /// Used by the automatic log watch feature when `log_watch_enabled` is true.
-    pub fn log_watch(name: &str, log_sources: Vec<String>, time_window_seconds: u64) -> Self {
-        Self {
-            step_type: "log_watch".to_string(),
-            name: Some(name.to_string()),
-            phase: Some("verification".to_string()),
-            log_sources: Some(log_sources),
-            time_window_seconds: Some(time_window_seconds),
-            // Log watch is informative by default - doesn't block the workflow
-            test_is_critical: Some(false),
-            run_on_subsequent_iterations: Some(true),
-            ..Default::default()
-        }
-    }
-
-    /// Create the default log_watch step used when `log_watch_enabled` is true.
-    ///
-    /// This creates a step that:
-    /// - Monitors log sources from global settings (Settings > Log Sources)
-    /// - Scans the last 60 seconds for errors
-    /// - Is non-critical (won't fail the workflow, just reports errors)
-    pub fn default_log_watch() -> Self {
-        Self::log_watch(
-            "Check for runtime errors",
-            get_default_log_source_names(),
-            60,
-        )
-    }
-
     /// Create the default pre-flight environment check step.
     ///
     /// This creates a step that runs inline commands to verify:
@@ -733,7 +514,7 @@ impl ExecutionStepConfig {
         };
 
         Self {
-            step_type: "check".to_string(),
+            step_type: "command".to_string(),
             name: Some("Pre-flight Environment Check".to_string()),
             phase: Some("setup".to_string()),
             check_type: Some("custom_command".to_string()),
@@ -759,7 +540,7 @@ impl ExecutionStepConfig {
         is_critical: bool,
     ) -> Self {
         Self {
-            step_type: "check".to_string(),
+            step_type: "command".to_string(),
             name: Some(name.to_string()),
             phase: Some("verification".to_string()),
             check_type: Some("http_status".to_string()),
@@ -796,7 +577,7 @@ pub struct StepExecutionResult {
     pub step_type: String,
     /// Step name for display
     pub step_name: String,
-    /// Step ID from the workflow definition (UUID), used for gate matching
+    /// Step ID from the workflow definition (UUID)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step_id: Option<String>,
     /// Whether the step succeeded
@@ -818,9 +599,18 @@ pub struct StepExecutionResult {
     /// Verification-specific fields (for test/check steps in verification phase)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification_details: Option<VerificationStepDetails>,
-    /// Additional output data from the step handler (e.g., spec assertion results)
+    /// Additional output data from the step handler
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_data: Option<serde_json::Value>,
+    /// Whether this step is required for verification pass/fail (from step config)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+    /// Resolved input values (for debugging data flow)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_inputs: Option<HashMap<String, serde_json::Value>>,
+    /// Extracted values from step output (for debugging data flow)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extracted_values: Option<HashMap<String, serde_json::Value>>,
 }
 
 /// Verification-specific details for test and check steps
@@ -904,22 +694,8 @@ pub struct CheckIssueDetail {
 /// Step configuration captured for AI visibility
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StepExecutionConfig {
-    /// For action steps: "click", "double_click", "right_click"
-    pub action_type: Option<String>,
-    /// Target image ID for action steps
-    pub target_image_id: Option<String>,
-    /// Target image name for display
-    pub target_image_name: Option<String>,
-    /// Monitor index (0 = primary)
-    pub monitor_index: Option<i32>,
-    /// Delay before screenshot in seconds
-    pub screenshot_delay: Option<u32>,
     /// Timeout for this step in seconds
     pub timeout_seconds: Option<u64>,
-    /// Playwright script ID
-    pub playwright_script_id: Option<String>,
-    /// Initial state IDs for workflow steps
-    pub initial_state_ids: Option<Vec<String>>,
     /// For check steps: "lint", "format", "typecheck", "analyze", "security", "custom_command"
     pub check_type: Option<String>,
     /// Shell command or check command
@@ -930,6 +706,8 @@ pub struct StepExecutionConfig {
     pub test_type: Option<String>,
     /// Working directory for shell commands and checks
     pub working_directory: Option<String>,
+    /// UI Bridge action type
+    pub ui_bridge_action: Option<String>,
 }
 
 /// Result of executing all steps
@@ -964,34 +742,20 @@ pub struct ExecutionResult {
     pub task_summary: Option<String>,
 }
 
-/// Result of evaluating a single gate step
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GateEvaluationResult {
-    /// Gate step name
-    pub gate_name: String,
-    /// Step IDs that the gate requires
-    pub required_step_ids: Vec<String>,
-    /// Step IDs that passed
-    pub passed_step_ids: Vec<String>,
-    /// Step IDs that failed
-    pub failed_step_ids: Vec<String>,
-    /// Step IDs that were not found in results
-    pub missing_step_ids: Vec<String>,
-    /// Whether the gate passed (all required steps passed)
-    pub passed: bool,
-}
-
 /// Result of running all verification_steps in a unified workflow
 ///
 /// This is returned by execute_verification_steps and used to:
 /// 1. Determine if the agentic phase should run (any failures)
 /// 2. Build context for the AI about what failed
 /// 3. Store results in the database for the Recap page
+///
+/// Verification pass/fail is determined by `required` steps:
+/// all_passed = all steps with required=true (default) succeeded.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationPhaseResult {
     /// Iteration number (1-indexed)
     pub iteration: u32,
-    /// Whether all verification steps passed
+    /// Whether all required verification steps passed
     pub all_passed: bool,
     /// Total number of verification steps
     pub total_steps: usize,
@@ -999,20 +763,15 @@ pub struct VerificationPhaseResult {
     pub passed_steps: usize,
     /// Number of steps that failed
     pub failed_steps: usize,
-    /// Number of steps that were skipped (due to gate stop_on_failure)
+    /// Number of steps that were skipped
     pub skipped_steps: usize,
     /// Total execution time in milliseconds
     pub total_duration_ms: u64,
     /// Individual step results
     pub step_results: Vec<StepExecutionResult>,
-    /// Whether a critical gate failure occurred (stop_on_failure gate failed)
+    /// Whether an unrecoverable failure occurred (e.g., connectivity failure)
+    /// that makes agentic retry pointless
     pub critical_failure: bool,
-    /// Gate evaluation results (empty if no gate steps)
-    #[serde(default)]
-    pub gate_results: Vec<GateEvaluationResult>,
-    /// Whether evaluation was gate-based (true) or all-steps-based (false)
-    #[serde(default)]
-    pub gate_based_evaluation: bool,
     /// Console errors captured during the entire verification phase
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub console_errors: Option<Vec<serde_json::Value>>,
@@ -1331,31 +1090,6 @@ impl VerificationPhaseResult {
                 }
 
                 context.push('\n');
-            }
-        }
-
-        // Gate results section
-        if !self.gate_results.is_empty() {
-            context.push_str("### Gate Results\n\n");
-            for gate in &self.gate_results {
-                let status = if gate.passed { "PASSED" } else { "FAILED" };
-                context.push_str(&format!("**{}: {}**\n", gate.gate_name, status));
-                if !gate.failed_step_ids.is_empty() {
-                    context.push_str(&format!(
-                        "  Failed steps: {}\n",
-                        gate.failed_step_ids.join(", ")
-                    ));
-                }
-                if !gate.missing_step_ids.is_empty() {
-                    context.push_str(&format!(
-                        "  Missing steps (not found): {}\n",
-                        gate.missing_step_ids.join(", ")
-                    ));
-                }
-            }
-            context.push('\n');
-            if self.gate_based_evaluation {
-                context.push_str("*Note: Only gated steps affect the agentic loop decision.*\n\n");
             }
         }
 
@@ -1810,9 +1544,6 @@ impl StepExecutor {
             "stdout": stdout,
             "stderr": stderr,
             "error": error,
-            "playwright_script_id": step.playwright_script_id,
-            "target_image_name": step.target_image_name,
-            "action_type": step.action_type,
         });
 
         let event_input = CreateTaskRunEventInput {
@@ -1948,162 +1679,28 @@ impl StepExecutor {
         steps: &[ExecutionStepConfig],
         iteration: u32,
     ) -> Vec<ExecutionStepConfig> {
-        // Separate Playwright steps from other steps
-        let (playwright_steps, other_steps): (Vec<_>, Vec<_>) =
-            steps.iter().partition(|s| s.step_type == "playwright");
+        // For first iteration, return all steps as-is
+        if iteration <= 1 {
+            return steps.to_vec();
+        }
 
-        // For first iteration, still combine Playwright scripts for efficiency
-        // For subsequent iterations, also filter non-Playwright steps
-
-        // Filter non-Playwright steps based on iteration
-        let filtered_other_steps: Vec<ExecutionStepConfig> = if iteration <= 1 {
-            other_steps.into_iter().cloned().collect()
-        } else {
-            other_steps
-                .into_iter()
-                .filter(|step| {
-                    let should_run = step.should_run_on_iteration(iteration);
-                    if !should_run {
-                        info!(
-                            "Iteration {}: Skipping setup step '{}' (type: {})",
-                            iteration,
-                            step.name.as_deref().unwrap_or("unnamed"),
-                            step.step_type
-                        );
-                    }
-                    should_run
-                })
-                .cloned()
-                .collect()
-        };
-
-        // Combine Playwright steps if there are multiple
-        let combined_playwright = Self::combine_playwright_steps(&playwright_steps);
-
-        // Reconstruct steps in original order, but with combined Playwright step
-        // placed at the position of the first Playwright step
-        let mut result = Vec::new();
-        let mut playwright_inserted = false;
-
-        for step in steps {
-            if step.step_type == "playwright" {
-                if !playwright_inserted {
-                    // Insert the combined Playwright step at the first Playwright position
-                    if let Some(ref combined) = combined_playwright {
-                        result.push(combined.clone());
-                    }
-                    playwright_inserted = true;
+        // For subsequent iterations, filter out steps that shouldn't run
+        steps
+            .iter()
+            .filter(|step| {
+                let should_run = step.should_run_on_iteration(iteration);
+                if !should_run {
+                    info!(
+                        "Iteration {}: Skipping step '{}' (type: {})",
+                        iteration,
+                        step.name.as_deref().unwrap_or("unnamed"),
+                        step.step_type
+                    );
                 }
-                // Skip individual Playwright steps (they're now combined)
-            } else {
-                // Include non-Playwright steps that passed the filter
-                if filtered_other_steps
-                    .iter()
-                    .any(|s| s.name == step.name && s.step_type == step.step_type)
-                {
-                    result.push(step.clone());
-                }
-            }
-        }
-
-        result
-    }
-
-    /// Combine multiple Playwright steps into a single step with combined script content
-    ///
-    /// This ensures all Playwright scripts run in the same browser session.
-    /// Setup scripts are placed first, followed by verification scripts.
-    fn combine_playwright_steps(steps: &[&ExecutionStepConfig]) -> Option<ExecutionStepConfig> {
-        if steps.is_empty() {
-            return None;
-        }
-
-        // If only one step, return it as-is
-        if steps.len() == 1 {
-            return Some(steps[0].clone());
-        }
-
-        // Separate setup and verification Playwright steps
-        let (setup_steps, verification_steps): (
-            Vec<&&ExecutionStepConfig>,
-            Vec<&&ExecutionStepConfig>,
-        ) = steps.iter().partition(|s| s.is_setup.unwrap_or(false));
-
-        info!(
-            "Combining {} Playwright scripts ({} setup, {} verification) into single script",
-            steps.len(),
-            setup_steps.len(),
-            verification_steps.len()
-        );
-
-        // Collect script IDs for the combined step name
-        let script_names: Vec<String> = steps.iter().filter_map(|s| s.name.clone()).collect();
-
-        // Collect script contents (setup first, then verification)
-        let mut combined_content_parts: Vec<String> = Vec::new();
-        let mut target_url: Option<String> = None;
-        let mut script_ids: Vec<String> = Vec::<String>::new();
-
-        // Add setup scripts first
-        for step in &setup_steps {
-            if let Some(ref content) = step.playwright_script_content {
-                combined_content_parts.push(format!(
-                    "// === Setup: {} ===\n{}",
-                    step.name.as_deref().unwrap_or("unnamed"),
-                    content
-                ));
-            }
-            if let Some(id) = &step.playwright_script_id {
-                script_ids.push(id.to_string());
-            }
-            if target_url.is_none() {
-                target_url = step.playwright_target_url.clone();
-            }
-        }
-
-        // Add verification scripts
-        for step in &verification_steps {
-            if let Some(ref content) = step.playwright_script_content {
-                combined_content_parts.push(format!(
-                    "// === Verification: {} ===\n{}",
-                    step.name.as_deref().unwrap_or("unnamed"),
-                    content
-                ));
-            }
-            if let Some(id) = &step.playwright_script_id {
-                script_ids.push(id.to_string());
-            }
-            if target_url.is_none() {
-                target_url = step.playwright_target_url.clone();
-            }
-        }
-
-        // Create combined step
-        Some(ExecutionStepConfig {
-            step_type: "playwright".to_string(),
-            name: Some(format!("Combined: {}", script_names.join(" + "))),
-            take_screenshot: steps.iter().any(|s| s.take_screenshot),
-            screenshot_delay: steps.iter().map(|s| s.screenshot_delay).max().unwrap_or(0),
-            // Use the first script ID for fallback if no content is available
-            playwright_script_id: script_ids.first().cloned(),
-            // Combined script content
-            playwright_script_content: if combined_content_parts.is_empty() {
-                None
-            } else {
-                Some(combined_content_parts.join("\n\n"))
-            },
-            playwright_target_url: target_url,
-            timeout_seconds: Some(
-                steps
-                    .iter()
-                    .filter_map(|s| s.timeout_seconds)
-                    .sum::<u64>()
-                    .max(60),
-            ),
-            is_setup: Some(false), // Combined step is treated as verification
-            run_on_subsequent_iterations: Some(true), // Always runs
-            ..Default::default()
-        })
+                should_run
+            })
+            .cloned()
+            .collect()
     }
 
     /// Execute steps with log source configuration for log capture
@@ -2203,15 +1800,7 @@ impl StepExecutor {
             let (success, error, screenshot_path, _output_data) =
                 self.execute_single_step(step).await;
 
-            // Take post-step screenshot if requested (and step succeeded)
-            let final_screenshot =
-                if step.take_screenshot && success && step.step_type != "screenshot" {
-                    self.capture_post_step_screenshot(step)
-                        .await
-                        .or(screenshot_path)
-                } else {
-                    screenshot_path
-                };
+            let final_screenshot = screenshot_path;
 
             let duration_ms = start_time.elapsed().as_millis() as u64;
 
@@ -2271,18 +1860,7 @@ impl StepExecutor {
                 ended_at: Some(ended_at),
                 duration_ms,
                 config: StepExecutionConfig {
-                    action_type: step.action_type.clone(),
-                    target_image_id: step.target_image_id.clone(),
-                    target_image_name: step.target_image_name.clone(),
-                    monitor_index: step.monitor_index,
-                    screenshot_delay: if step.screenshot_delay > 0 {
-                        Some(step.screenshot_delay)
-                    } else {
-                        None
-                    },
                     timeout_seconds: step.timeout_seconds,
-                    playwright_script_id: step.playwright_script_id.clone(),
-                    initial_state_ids: step.initial_state_ids.clone(),
                     check_type: step.check_type.clone(),
                     command: step
                         .check_command
@@ -2294,9 +1872,13 @@ impl StepExecutor {
                         .check_working_directory
                         .clone()
                         .or_else(|| step.shell_command_working_directory.clone()),
+                    ui_bridge_action: step.ui_bridge_action.clone(),
                 },
                 verification_details: None,
                 output_data: None,
+                required: step.required,
+                resolved_inputs: None,
+                extracted_values: None,
             });
         }
 
@@ -2703,318 +2285,13 @@ impl StepExecutor {
             );
         }
 
-        // Legacy match statement for step types not yet migrated to handlers.
-        // As handlers are implemented, the match arms below will be removed.
+        // Fallback match statement for step types without registered handlers.
+        // Most step types are handled by the handler registry dispatch above.
 
         // Timeouts are disabled by default - only apply if explicitly specified
         let timeout = step.timeout_seconds;
 
         match step.step_type.as_str() {
-            // NOTE: These step types now have handlers registered:
-            // - "workflow", "state", "action", "screenshot", "shell_command", "prompt"
-            // The handler registry dispatch above will handle them.
-            // The match arms remain as fallback but should never be reached.
-            "workflow" => {
-                if let Some(ref workflow_name) = step.name {
-                    match self
-                        .action_service
-                        .run_workflow(
-                            workflow_name,
-                            None,
-                            step.monitor_index,
-                            timeout,
-                            step.initial_state_ids.as_deref(),
-                        )
-                        .await
-                    {
-                        Ok(result) => (result.success, result.error, None, None),
-                        Err(e) => (false, Some(format!("Workflow error: {}", e)), None, None),
-                    }
-                } else {
-                    (
-                        false,
-                        Some("No workflow name specified".to_string()),
-                        None,
-                        None,
-                    )
-                }
-            }
-            "state" => {
-                if let Some(ref state_name) = step.name {
-                    match self
-                        .action_service
-                        .go_to_state(state_name, None, step.monitor_index, timeout)
-                        .await
-                    {
-                        Ok(result) => {
-                            if result.success {
-                                info!(
-                                    "GO_TO_STATE '{}': Success. Check Python logs for details \
-                                    (transition may have been skipped if state was already active)",
-                                    state_name
-                                );
-                            }
-                            (result.success, result.error, None, None)
-                        }
-                        Err(e) => (
-                            false,
-                            Some(format!("State navigation error: {}", e)),
-                            None,
-                            None,
-                        ),
-                    }
-                } else {
-                    (
-                        false,
-                        Some("No state name specified".to_string()),
-                        None,
-                        None,
-                    )
-                }
-            }
-            "action" => {
-                if let (Some(ref action_type), Some(ref image_id)) =
-                    (&step.action_type, &step.target_image_id)
-                {
-                    match self
-                        .action_service
-                        .execute_action(action_type, image_id, None, step.monitor_index)
-                        .await
-                    {
-                        Ok(result) => (
-                            result.success,
-                            result.message.filter(|_| !result.success),
-                            None,
-                            None,
-                        ),
-                        Err(e) => (false, Some(format!("Action error: {}", e)), None, None),
-                    }
-                } else {
-                    (
-                        false,
-                        Some("No action type or image ID specified".to_string()),
-                        None,
-                        None,
-                    )
-                }
-            }
-            "screenshot" => {
-                let monitor = match &step.screenshot_monitor {
-                    Some(serde_json::Value::Number(n)) => n.as_i64().map(|v| v as i32),
-                    Some(serde_json::Value::String(s)) if s == "all" => None,
-                    _ => step.monitor_index,
-                };
-                let delay = if step.screenshot_delay > 0 {
-                    Some(step.screenshot_delay as f64)
-                } else {
-                    None
-                };
-
-                // Get sequence number for tree events
-                use std::sync::atomic::{AtomicU32, Ordering};
-                static SCREENSHOT_SEQUENCE: AtomicU32 = AtomicU32::new(1);
-                let sequence = SCREENSHOT_SEQUENCE.fetch_add(1, Ordering::SeqCst);
-                let timestamp = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
-                let action_id = format!("screenshot-{}", sequence);
-
-                // Build action node for tree events
-                // Must include: id, node_type, name, timestamp, status for ActionLogProfile
-                let action_node = json!({
-                    "id": &action_id,
-                    "node_type": "action",
-                    "name": "SCREENSHOT",
-                    "timestamp": timestamp,
-                    "status": "pending",
-                    "metadata": {
-                        "monitor": monitor.map(|m| m.to_string()).unwrap_or_else(|| "all".to_string()),
-                        "delay_seconds": delay.unwrap_or(0.0),
-                    }
-                });
-
-                // Emit action_started tree event to file log
-                FileLogger::log_tree_event(
-                    "action_started",
-                    &action_node,
-                    &[],
-                    timestamp,
-                    sequence,
-                );
-
-                // Also add to DisplayProcessor for Session/Actions page
-                {
-                    let raw_event = RawEvent {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        event_type: "action_started".to_string(),
-                        timestamp,
-                        data: json!({ "node": action_node.clone() }),
-                        sequence: sequence as u64,
-                    };
-                    let mut processor = self.app_state.display_processor.lock().await;
-                    processor.event_log_mut().add_event(raw_event);
-                }
-
-                // Emit to Tauri frontend for action log refresh
-                self.emit_tree_event("action_started", &action_node, timestamp, sequence);
-
-                let result = self.action_service.capture_screenshot(monitor, delay).await;
-                let end_timestamp = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
-
-                match result {
-                    // Use absolute_path instead of screenshot_path to avoid relative path resolution issues
-                    Ok(res) => {
-                        // Record screenshot event for automation logs
-                        let file_path = res.absolute_path.clone().unwrap_or_default();
-
-                        // Emit action_completed tree event
-                        // Must include: id, node_type, name, timestamp, status for ActionLogProfile
-                        let completed_node = json!({
-                            "id": &action_id,
-                            "node_type": "action",
-                            "name": "SCREENSHOT",
-                            "timestamp": end_timestamp,
-                            "status": if res.success { "success" } else { "failed" },
-                            "duration": end_timestamp - timestamp,
-                            "metadata": {
-                                "monitor": monitor.map(|m| m.to_string()).unwrap_or_else(|| "all".to_string()),
-                                "delay_seconds": delay.unwrap_or(0.0),
-                                "filename": &file_path,
-                            }
-                        });
-                        let event_type = if res.success {
-                            "action_completed"
-                        } else {
-                            "action_failed"
-                        };
-                        FileLogger::log_tree_event(
-                            event_type,
-                            &completed_node,
-                            &[],
-                            end_timestamp,
-                            sequence,
-                        );
-
-                        // Also add to DisplayProcessor for Session/Actions page
-                        {
-                            let raw_event = RawEvent {
-                                id: uuid::Uuid::new_v4().to_string(),
-                                event_type: event_type.to_string(),
-                                timestamp: end_timestamp,
-                                data: json!({ "node": completed_node.clone() }),
-                                sequence: sequence as u64,
-                            };
-                            let mut processor = self.app_state.display_processor.lock().await;
-                            processor.event_log_mut().add_event(raw_event);
-                        }
-
-                        // Emit to Tauri frontend for action log refresh
-                        self.emit_tree_event(event_type, &completed_node, end_timestamp, sequence);
-
-                        self.record_screenshot_event(
-                            "standalone",
-                            &file_path,
-                            monitor,
-                            if step.screenshot_delay > 0 {
-                                Some(step.screenshot_delay)
-                            } else {
-                                None
-                            },
-                            res.success,
-                            None,
-                            res.error.clone(),
-                        )
-                        .await;
-                        (res.success, res.error, res.absolute_path, None)
-                    }
-                    Err(e) => {
-                        let error_msg = format!("Screenshot error: {}", e);
-
-                        // Emit action_failed tree event
-                        // Must include: id, node_type, name, timestamp, status for ActionLogProfile
-                        let failed_node = json!({
-                            "id": &action_id,
-                            "node_type": "action",
-                            "name": "SCREENSHOT",
-                            "timestamp": end_timestamp,
-                            "status": "failed",
-                            "duration": end_timestamp - timestamp,
-                            "error": &error_msg,
-                            "metadata": {
-                                "monitor": monitor.map(|m| m.to_string()).unwrap_or_else(|| "all".to_string()),
-                                "delay_seconds": delay.unwrap_or(0.0),
-                            }
-                        });
-                        FileLogger::log_tree_event(
-                            "action_failed",
-                            &failed_node,
-                            &[],
-                            end_timestamp,
-                            sequence,
-                        );
-
-                        // Also add to DisplayProcessor for Session/Actions page
-                        {
-                            let raw_event = RawEvent {
-                                id: uuid::Uuid::new_v4().to_string(),
-                                event_type: "action_failed".to_string(),
-                                timestamp: end_timestamp,
-                                data: json!({ "node": failed_node.clone() }),
-                                sequence: sequence as u64,
-                            };
-                            let mut processor = self.app_state.display_processor.lock().await;
-                            processor.event_log_mut().add_event(raw_event);
-                        }
-
-                        // Emit to Tauri frontend for action log refresh
-                        self.emit_tree_event(
-                            "action_failed",
-                            &failed_node,
-                            end_timestamp,
-                            sequence,
-                        );
-
-                        // Record failed screenshot event
-                        self.record_screenshot_event(
-                            "standalone",
-                            "",
-                            monitor,
-                            if step.screenshot_delay > 0 {
-                                Some(step.screenshot_delay)
-                            } else {
-                                None
-                            },
-                            false,
-                            None,
-                            Some(error_msg.clone()),
-                        )
-                        .await;
-                        (false, Some(error_msg), None, None)
-                    }
-                }
-            }
-            "playwright" => {
-                // If we have inline script content (from combined scripts), run it directly
-                if let Some(ref script_content) = step.playwright_script_content {
-                    let (s, e, p) = self
-                        .run_playwright_inline(
-                            script_content,
-                            step.playwright_target_url.as_deref(),
-                            step.name.as_deref().unwrap_or("combined_script"),
-                        )
-                        .await;
-                    (s, e, p, None)
-                } else if let Some(ref script_id) = step.playwright_script_id {
-                    // Otherwise, run by script ID
-                    let (s, e, p) = self.run_playwright_script(script_id).await;
-                    (s, e, p, None)
-                } else {
-                    (
-                        false,
-                        Some("No Playwright script ID or content specified".to_string()),
-                        None,
-                        None,
-                    )
-                }
-            }
             "test" => {
                 // Execute verification test with tree event emission
                 use std::sync::atomic::{AtomicU32, Ordering};
@@ -3271,158 +2548,10 @@ impl StepExecutor {
                 (true, None, None, None)
             }
             // ================================================================
-            // MCP Call Step Type
-            // ================================================================
-            "mcp_call" => {
-                if let (Some(ref server_id), Some(ref tool_name)) =
-                    (&step.mcp_server_id, &step.mcp_tool_name)
-                {
-                    let (s, e, p) = self
-                        .execute_mcp_call(
-                            server_id,
-                            tool_name,
-                            step.mcp_arguments.clone().unwrap_or(serde_json::json!({})),
-                            timeout,
-                            step.name.as_deref(),
-                            step.mcp_fail_on_error.unwrap_or(true),
-                        )
-                        .await;
-                    (s, e, p, None)
-                } else {
-                    (
-                        false,
-                        Some("Server ID and tool name required for MCP call".to_string()),
-                        None,
-                        None,
-                    )
-                }
-            }
-            // ================================================================
             // Shell Command Step Type
             // ================================================================
             "shell_command" => {
                 let (s, e, p) = self.execute_shell_command_step(step, timeout).await;
-                (s, e, p, None)
-            }
-            // ================================================================
-            // Script Step Type (Playwright inline code)
-            // ================================================================
-            "script" => {
-                // Script steps contain inline Playwright code - treat like playwright
-                if let Some(ref script_content) = step.playwright_script_content {
-                    let (s, e, p) = self
-                        .run_playwright_inline(
-                            script_content,
-                            step.playwright_target_url.as_deref(),
-                            step.name.as_deref().unwrap_or("script"),
-                        )
-                        .await;
-                    (s, e, p, None)
-                } else if let Some(ref script_id) = step.playwright_script_id {
-                    let (s, e, p) = self.run_playwright_script(script_id).await;
-                    (s, e, p, None)
-                } else {
-                    (
-                        false,
-                        Some("No script code or script ID specified".to_string()),
-                        None,
-                        None,
-                    )
-                }
-            }
-            // ================================================================
-            // Workflow Reference Step Type (by ID)
-            // ================================================================
-            "workflow_ref" => {
-                // workflow_ref runs another workflow by ID
-                // For now, we look up the workflow name and delegate to the workflow handler
-                if let Some(ref workflow_name) = step.name {
-                    match self
-                        .action_service
-                        .run_workflow(
-                            workflow_name,
-                            None,
-                            step.monitor_index,
-                            timeout,
-                            step.initial_state_ids.as_deref(),
-                        )
-                        .await
-                    {
-                        Ok(result) => (result.success, result.error, None, None),
-                        Err(e) => (
-                            false,
-                            Some(format!("Workflow ref error: {}", e)),
-                            None,
-                            None,
-                        ),
-                    }
-                } else {
-                    (
-                        false,
-                        Some("No workflow name specified for workflow_ref".to_string()),
-                        None,
-                        None,
-                    )
-                }
-            }
-            // ================================================================
-            // GUI Action Step Type (vision-based)
-            // ================================================================
-            "gui_action" => {
-                // gui_action uses vision-based automation
-                // Map to action handler with appropriate field extraction
-                if let Some(ref action_type) = step.action_type {
-                    if let Some(ref image_id) = step.target_image_id {
-                        match self
-                            .action_service
-                            .execute_action(action_type, image_id, None, step.monitor_index)
-                            .await
-                        {
-                            Ok(result) => (
-                                result.success,
-                                result.message.filter(|_| !result.success),
-                                None,
-                                None,
-                            ),
-                            Err(e) => (false, Some(format!("GUI action error: {}", e)), None, None),
-                        }
-                    } else {
-                        // For type/hotkey actions that don't need a target image
-                        match action_type.as_str() {
-                            "type" | "hotkey" | "scroll" => {
-                                // These would need special handling via Python bridge
-                                (
-                                    false,
-                                    Some(format!(
-                                        "GUI action '{}' not yet implemented in step executor",
-                                        action_type
-                                    )),
-                                    None,
-                                    None,
-                                )
-                            }
-                            _ => (
-                                false,
-                                Some("No target image ID specified for GUI action".to_string()),
-                                None,
-                                None,
-                            ),
-                        }
-                    }
-                } else {
-                    (
-                        false,
-                        Some("No action type specified for GUI action".to_string()),
-                        None,
-                        None,
-                    )
-                }
-            }
-            // ================================================================
-            // API Request Step Type
-            // ================================================================
-            "api_request" => {
-                let (s, e, p) = self.execute_api_request_step(step, timeout).await;
                 (s, e, p, None)
             }
             // ================================================================
@@ -3441,29 +2570,6 @@ impl StepExecutor {
                 (success, error, summary, None)
             }
             // ================================================================
-            // Macro Step Type (runs a saved macro by ID)
-            // ================================================================
-            "macro" => {
-                if let Some(ref macro_id) = step.macro_id {
-                    let (s, e, p) = self.execute_macro_step(macro_id, step.monitor_index).await;
-                    (s, e, p, None)
-                } else {
-                    (
-                        false,
-                        Some("No macro ID specified for macro step".to_string()),
-                        None,
-                        None,
-                    )
-                }
-            }
-            // ================================================================
-            // Log Watch Step Type (deterministic error detection from logs)
-            // ================================================================
-            "log_watch" => {
-                let (s, e, p) = self.execute_log_watch_step(step).await;
-                (s, e, p, None)
-            }
-            // ================================================================
             // Shell Step Type (execute shell command)
             // ================================================================
             "shell" => {
@@ -3474,6 +2580,7 @@ impl StepExecutor {
                 (success, error, output, None)
             }
             _ => {
+                // Delegate to handler registry for any unrecognized step type
                 warn!("Unknown step type: {}", step.step_type);
                 (
                     false,
@@ -3481,73 +2588,6 @@ impl StepExecutor {
                     None,
                     None,
                 )
-            }
-        }
-    }
-
-    /// Capture a post-step screenshot
-    async fn capture_post_step_screenshot(&self, step: &ExecutionStepConfig) -> Option<String> {
-        // Apply configured screenshot delay (no default delay)
-        if step.screenshot_delay > 0 {
-            info!(
-                "Waiting {}s before screenshot capture",
-                step.screenshot_delay
-            );
-            tokio::time::sleep(std::time::Duration::from_secs(step.screenshot_delay as u64)).await;
-        }
-
-        let monitor = match &step.screenshot_monitor {
-            Some(serde_json::Value::Number(n)) => n.as_i64().map(|v| v as i32),
-            Some(serde_json::Value::String(s)) if s == "all" => None,
-            _ => step.monitor_index,
-        };
-
-        // Build associated action description
-        let associated_action = match step.step_type.as_str() {
-            "workflow" => step.name.clone().map(|n| format!("workflow:{}", n)),
-            "action" => step.action_type.clone().map(|t| format!("action:{}", t)),
-            "state" => step.name.clone().map(|n| format!("state:{}", n)),
-            _ => Some(format!("step:{}", step.step_type)),
-        };
-
-        match self.action_service.capture_screenshot(monitor, None).await {
-            Ok(result) => {
-                let file_path = result.absolute_path.clone().unwrap_or_default();
-                // Record post-action screenshot event
-                self.record_screenshot_event(
-                    "post_action",
-                    &file_path,
-                    monitor,
-                    if step.screenshot_delay > 0 {
-                        Some(step.screenshot_delay)
-                    } else {
-                        None
-                    },
-                    result.success,
-                    associated_action,
-                    result.error,
-                )
-                .await;
-                result.absolute_path // Use absolute path for step screenshots
-            }
-            Err(e) => {
-                warn!("Failed to capture post-step screenshot: {}", e);
-                // Record failed post-action screenshot event
-                self.record_screenshot_event(
-                    "post_action",
-                    "",
-                    monitor,
-                    if step.screenshot_delay > 0 {
-                        Some(step.screenshot_delay)
-                    } else {
-                        None
-                    },
-                    false,
-                    associated_action,
-                    Some(format!("Screenshot error: {}", e)),
-                )
-                .await;
-                None
             }
         }
     }
@@ -3814,8 +2854,7 @@ impl StepExecutor {
         let mut passed_steps = 0;
         let mut failed_steps = 0;
         let mut skipped_steps = 0;
-        let mut critical_failure = false;
-        let mut gate_results: Vec<GateEvaluationResult> = Vec::new();
+        let critical_failure = false;
 
         // Filter to only verification phase steps
         let verification_steps: Vec<_> = steps
@@ -3848,22 +2887,19 @@ impl StepExecutor {
                     ended_at: Some(skipped_at),
                     duration_ms: 0,
                     config: StepExecutionConfig {
-                        action_type: None,
-                        target_image_id: None,
-                        target_image_name: None,
-                        monitor_index: None,
-                        screenshot_delay: None,
                         timeout_seconds: None,
-                        playwright_script_id: None,
-                        initial_state_ids: None,
                         check_type: None,
                         command: None,
                         test_id: step.test_id.clone(),
                         test_type: step.test_type.clone(),
                         working_directory: None,
+                        ui_bridge_action: None,
                     },
                     verification_details: None,
                     output_data: None,
+                    required: step.required,
+                    resolved_inputs: None,
+                    extracted_values: None,
                 };
                 step_results.push(result);
                 skipped_steps += 1;
@@ -3878,75 +2914,89 @@ impl StepExecutor {
                 .unwrap_or_else(|| format!("Step {}", index + 1));
 
             // Execute based on step type
-            let (mut success, mut error, mut verification_details, step_output_data) = match step
-                .step_type
-                .as_str()
-            {
-                "test" => {
-                    if let Some(ref test_id) = step.test_id {
-                        match self.execute_verification_test_with_details(test_id).await {
-                            Ok(test_result) => {
-                                let passed = test_result.status == TestStatus::Passed;
-                                let details = VerificationStepDetails {
-                                    step_id: step
-                                        .name
-                                        .clone()
-                                        .unwrap_or_else(|| format!("step-{}", index)),
-                                    phase: "verification".to_string(),
-                                    stdout: Some(test_result.output.clone()),
-                                    stderr: None,
-                                    assertions_passed: Some(test_result.assertions_passed),
-                                    assertions_total: Some(
-                                        test_result.assertions_passed
-                                            + test_result.assertions_failed,
-                                    ),
-                                    console_output: test_result
-                                        .structured_output
-                                        .as_ref()
-                                        .and_then(|v| v.get("console_output"))
-                                        .and_then(|v| v.as_str())
-                                        .map(|s| s.to_string()),
-                                    page_snapshot: test_result
-                                        .structured_output
-                                        .as_ref()
-                                        .and_then(|v| v.get("page_snapshot"))
-                                        .and_then(|v| v.as_str())
-                                        .map(|s| s.to_string()),
-                                    exit_code: test_result.exit_code,
-                                    check_results: None,
-                                    console_errors: None,
-                                };
-                                (
-                                    passed,
-                                    if passed {
-                                        None
-                                    } else {
-                                        test_result.error.clone()
-                                    },
-                                    Some(details),
+            let (mut success, mut error, mut verification_details, step_output_data) =
+                match step.step_type.as_str() {
+                    "test" => {
+                        if let Some(ref test_id) = step.test_id {
+                            match self.execute_verification_test_with_details(test_id).await {
+                                Ok(test_result) => {
+                                    let passed = test_result.status == TestStatus::Passed;
+                                    let details = VerificationStepDetails {
+                                        step_id: step
+                                            .name
+                                            .clone()
+                                            .unwrap_or_else(|| format!("step-{}", index)),
+                                        phase: "verification".to_string(),
+                                        stdout: Some(test_result.output.clone()),
+                                        stderr: None,
+                                        assertions_passed: Some(test_result.assertions_passed),
+                                        assertions_total: Some(
+                                            test_result.assertions_passed
+                                                + test_result.assertions_failed,
+                                        ),
+                                        console_output: test_result
+                                            .structured_output
+                                            .as_ref()
+                                            .and_then(|v| v.get("console_output"))
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.to_string()),
+                                        page_snapshot: test_result
+                                            .structured_output
+                                            .as_ref()
+                                            .and_then(|v| v.get("page_snapshot"))
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.to_string()),
+                                        exit_code: test_result.exit_code,
+                                        check_results: None,
+                                        console_errors: None,
+                                    };
+                                    (
+                                        passed,
+                                        if passed {
+                                            None
+                                        } else {
+                                            test_result.error.clone()
+                                        },
+                                        Some(details),
+                                        None,
+                                    )
+                                }
+                                Err(e) => (
+                                    false,
+                                    Some(format!("Test execution error: {}", e)),
+                                    Some(VerificationStepDetails {
+                                        step_id: step
+                                            .name
+                                            .clone()
+                                            .unwrap_or_else(|| format!("step-{}", index)),
+                                        phase: "verification".to_string(),
+                                        stderr: Some(e),
+                                        ..Default::default()
+                                    }),
                                     None,
-                                )
+                                ),
                             }
-                            Err(e) => (
-                                false,
-                                Some(format!("Test execution error: {}", e)),
-                                Some(VerificationStepDetails {
-                                    step_id: step
-                                        .name
-                                        .clone()
-                                        .unwrap_or_else(|| format!("step-{}", index)),
-                                    phase: "verification".to_string(),
-                                    stderr: Some(e),
-                                    ..Default::default()
-                                }),
-                                None,
-                            ),
+                        } else {
+                            // No test_id — delegate to handler system which supports
+                            // repository tests, inline commands (check_command/shell_command),
+                            // and auto-detection fallbacks.
+                            let (success, handler_error, _screenshot, handler_output_data) =
+                                self.execute_single_step(step).await;
+                            let details = VerificationStepDetails {
+                                step_id: step
+                                    .name
+                                    .clone()
+                                    .unwrap_or_else(|| format!("step-{}", index)),
+                                phase: "verification".to_string(),
+                                ..Default::default()
+                            };
+                            (success, handler_error, Some(details), handler_output_data)
                         }
-                    } else {
-                        // No test_id — delegate to handler system which supports
-                        // repository tests, inline commands (check_command/shell_command),
-                        // and auto-detection fallbacks.
-                        let (success, handler_error, _screenshot, handler_output_data) =
+                    }
+                    "check" => {
+                        // Execute check step (shell command for checks like lint, typecheck, etc.)
+                        // Output is extracted by post-match normalization from handler_output_data.
+                        let (success, error, _screenshot, handler_output_data) =
                             self.execute_single_step(step).await;
                         let details = VerificationStepDetails {
                             step_id: step
@@ -3954,139 +3004,65 @@ impl StepExecutor {
                                 .clone()
                                 .unwrap_or_else(|| format!("step-{}", index)),
                             phase: "verification".to_string(),
+                            // stdout filled by post-match normalization from handler_output_data
                             ..Default::default()
                         };
-                        (success, handler_error, Some(details), handler_output_data)
+                        (success, error, Some(details), handler_output_data)
                     }
-                }
-                "check" => {
-                    // Execute check step (shell command for checks like lint, typecheck, etc.)
-                    // Output is extracted by post-match normalization from handler_output_data.
-                    let (success, error, _screenshot, handler_output_data) =
-                        self.execute_single_step(step).await;
-                    let details = VerificationStepDetails {
-                        step_id: step
-                            .name
-                            .clone()
-                            .unwrap_or_else(|| format!("step-{}", index)),
-                        phase: "verification".to_string(),
-                        // stdout filled by post-match normalization from handler_output_data
-                        ..Default::default()
-                    };
-                    (success, error, Some(details), handler_output_data)
-                }
-                "shell" => {
-                    // Execute shell command step
-                    // Timeouts are disabled by default
-                    let timeout = step.timeout_seconds;
-                    let (success, error, output) =
-                        self.execute_shell_command_step(step, timeout).await;
-                    let details = VerificationStepDetails {
-                        step_id: step
-                            .name
-                            .clone()
-                            .unwrap_or_else(|| format!("step-{}", index)),
-                        phase: "verification".to_string(),
-                        stdout: output, // Capture output for AI context
-                        ..Default::default()
-                    };
-                    (success, error, Some(details), None)
-                }
-                "check_group" => {
-                    // Execute check group - runs all checks in the group
-                    // Timeouts are disabled by default
-                    let timeout = step.timeout_seconds;
-                    let (success, error, summary, check_results) =
-                        self.execute_check_group_step(step, timeout).await;
-                    let details = VerificationStepDetails {
-                        step_id: step
-                            .name
-                            .clone()
-                            .unwrap_or_else(|| format!("step-{}", index)),
-                        phase: "verification".to_string(),
-                        // Capture the detailed summary with all check results for AI context
-                        stdout: summary,
-                        // Include structured check results for UI display
-                        check_results,
-                        ..Default::default()
-                    };
-                    (success, error, Some(details), None)
-                }
-                "gate" => {
-                    // Gate step: evaluate results of required steps
-                    let required_ids = step.gate_required_steps.clone().unwrap_or_default();
-                    let mut passed_ids = Vec::new();
-                    let mut failed_ids = Vec::new();
-                    let mut missing_ids = Vec::new();
-
-                    for req_id in &required_ids {
-                        // Look up the required step in accumulated results by matching:
-                        // 1. step_name (human-readable name)
-                        // 2. step_id on the result (UUID from workflow definition)
-                        // 3. step_id in verification_details (set to step.name for some step types)
-                        let found = step_results.iter().find(|r| {
-                            r.step_name == *req_id
-                                || r.step_id.as_deref() == Some(req_id)
-                                || r.verification_details
-                                    .as_ref()
-                                    .is_some_and(|d| d.step_id == *req_id)
+                    "shell" => {
+                        // Execute shell command step
+                        // Timeouts are disabled by default
+                        let timeout = step.timeout_seconds;
+                        let (success, error, output) =
+                            self.execute_shell_command_step(step, timeout).await;
+                        let details = VerificationStepDetails {
+                            step_id: step
+                                .name
+                                .clone()
+                                .unwrap_or_else(|| format!("step-{}", index)),
+                            phase: "verification".to_string(),
+                            stdout: output, // Capture output for AI context
+                            ..Default::default()
+                        };
+                        (success, error, Some(details), None)
+                    }
+                    "check_group" => {
+                        // Execute check group - runs all checks in the group
+                        // Timeouts are disabled by default
+                        let timeout = step.timeout_seconds;
+                        let (success, error, summary, check_results) =
+                            self.execute_check_group_step(step, timeout).await;
+                        let details = VerificationStepDetails {
+                            step_id: step
+                                .name
+                                .clone()
+                                .unwrap_or_else(|| format!("step-{}", index)),
+                            phase: "verification".to_string(),
+                            // Capture the detailed summary with all check results for AI context
+                            stdout: summary,
+                            // Include structured check results for UI display
+                            check_results,
+                            ..Default::default()
+                        };
+                        (success, error, Some(details), None)
+                    }
+                    _ => {
+                        // Generic handler for all other step types in verification.
+                        // Output is captured by the post-match normalization block below.
+                        let (success, error, screenshot, handler_output_data) =
+                            self.execute_single_step(step).await;
+                        let details = screenshot.map(|s| VerificationStepDetails {
+                            step_id: step
+                                .name
+                                .clone()
+                                .unwrap_or_else(|| format!("step-{}", index)),
+                            phase: "verification".to_string(),
+                            stdout: Some(s),
+                            ..Default::default()
                         });
-                        match found {
-                            Some(r) if r.success => passed_ids.push(req_id.clone()),
-                            Some(_) => failed_ids.push(req_id.clone()),
-                            None => missing_ids.push(req_id.clone()),
-                        }
+                        (success, error, details, handler_output_data)
                     }
-
-                    let gate_passed = failed_ids.is_empty() && missing_ids.is_empty();
-                    let gate_result = GateEvaluationResult {
-                        gate_name: step_name.clone(),
-                        required_step_ids: required_ids.clone(),
-                        passed_step_ids: passed_ids,
-                        failed_step_ids: failed_ids.clone(),
-                        missing_step_ids: missing_ids.clone(),
-                        passed: gate_passed,
-                    };
-                    gate_results.push(gate_result);
-
-                    let error_msg = if gate_passed {
-                        None
-                    } else {
-                        let mut parts = Vec::new();
-                        if !failed_ids.is_empty() {
-                            parts.push(format!("failed: {}", failed_ids.join(", ")));
-                        }
-                        if !missing_ids.is_empty() {
-                            parts.push(format!("missing: {}", missing_ids.join(", ")));
-                        }
-                        Some(format!("Gate failed - {}", parts.join("; ")))
-                    };
-
-                    // If gate has stop_on_failure and it failed, set critical_failure
-                    if !gate_passed && step.gate_stop_on_failure.unwrap_or(false) {
-                        critical_failure = true;
-                        warn!("Gate '{}' failed with stop_on_failure - skipping remaining verification steps", step_name);
-                    }
-
-                    (gate_passed, error_msg, None, None)
-                }
-                _ => {
-                    // Generic handler for all other step types in verification.
-                    // Output is captured by the post-match normalization block below.
-                    let (success, error, screenshot, handler_output_data) =
-                        self.execute_single_step(step).await;
-                    let details = screenshot.map(|s| VerificationStepDetails {
-                        step_id: step
-                            .name
-                            .clone()
-                            .unwrap_or_else(|| format!("step-{}", index)),
-                        phase: "verification".to_string(),
-                        stdout: Some(s),
-                        ..Default::default()
-                    });
-                    (success, error, details, handler_output_data)
-                }
-            };
+                };
 
             // === Post-match normalization ===
             // Ensure every verification step has VerificationStepDetails with stdout
@@ -4174,7 +3150,7 @@ impl StepExecutor {
                     error.as_deref().unwrap_or("unknown error")
                 );
 
-                // Note: critical_failure is now set by gate steps with stop_on_failure
+                // Note: critical_failure is set by connectivity or infrastructure failures
             }
 
             let step_ended_at = chrono::Utc::now().to_rfc3339();
@@ -4191,18 +3167,7 @@ impl StepExecutor {
                 ended_at: Some(step_ended_at),
                 duration_ms,
                 config: StepExecutionConfig {
-                    action_type: step.action_type.clone(),
-                    target_image_id: step.target_image_id.clone(),
-                    target_image_name: step.target_image_name.clone(),
-                    monitor_index: step.monitor_index,
-                    screenshot_delay: if step.screenshot_delay > 0 {
-                        Some(step.screenshot_delay)
-                    } else {
-                        None
-                    },
                     timeout_seconds: step.timeout_seconds,
-                    playwright_script_id: step.playwright_script_id.clone(),
-                    initial_state_ids: step.initial_state_ids.clone(),
                     check_type: step.check_type.clone(),
                     command: step
                         .check_command
@@ -4214,16 +3179,20 @@ impl StepExecutor {
                         .check_working_directory
                         .clone()
                         .or_else(|| step.shell_command_working_directory.clone()),
+                    ui_bridge_action: step.ui_bridge_action.clone(),
                 },
                 verification_details,
                 output_data: step_output_data,
+                required: step.required,
+                resolved_inputs: None,
+                extracted_values: None,
             };
 
             // Emit completion event for this step (real-time UI update)
             // This allows the frontend to show progress as each step finishes
             if workflow_name.is_some() {
                 let step_type_enum =
-                    StepType::from_str_compat(&step.step_type).unwrap_or(StepType::CheckGroup);
+                    StepType::from_str_compat(&step.step_type).unwrap_or(StepType::Command);
                 let metadata = StepMetadata::verification(
                     &event_execution_id, // Use parent ID for FK constraint
                     step_type_enum,
@@ -4261,7 +3230,7 @@ impl StepExecutor {
                 let checkpoint_mgr =
                     CheckpointManager::new(self.app_state.checkpoint_db.clone(), "unified");
                 let cp_step_type =
-                    StepType::from_str_compat(&step.step_type).unwrap_or(StepType::CheckGroup);
+                    StepType::from_str_compat(&step.step_type).unwrap_or(StepType::Command);
                 let mut checkpoint = StepCheckpoint::new(
                     execution_id,
                     "unified",
@@ -4309,15 +3278,13 @@ impl StepExecutor {
 
         let total_duration_ms = start.elapsed().as_millis() as u64;
 
-        // Determine all_passed:
-        // - If gate steps exist: only gate results matter (gate-based evaluation)
-        // - If no gate steps: all step failures matter (backward compat)
-        let has_gates = !gate_results.is_empty();
-        let all_passed = if has_gates {
-            gate_results.iter().all(|g| g.passed)
-        } else {
-            failed_steps == 0 && skipped_steps == 0
-        };
+        // Determine all_passed: all required steps must succeed.
+        // Steps with required=false are informational only — their failure
+        // doesn't trigger the agentic loop.
+        let all_passed = step_results.iter().all(|r| {
+            let is_required = r.required.unwrap_or(true); // default: required
+            r.success || !is_required
+        });
 
         let result = VerificationPhaseResult {
             iteration,
@@ -4329,165 +3296,11 @@ impl StepExecutor {
             total_duration_ms,
             step_results,
             critical_failure,
-            gate_results,
-            gate_based_evaluation: has_gates,
             console_errors: None, // Populated by phases.rs after verification completes
         };
 
         info!("{}", result.summary());
         result
-    }
-
-    // =========================================================================
-    // MCP Call Step Execution
-    // =========================================================================
-
-    /// Execute an MCP call step - calls a tool on an MCP server
-    async fn execute_mcp_call(
-        &self,
-        server_id: &str,
-        tool_name: &str,
-        arguments: serde_json::Value,
-        _timeout_secs: Option<u64>,
-        step_name: Option<&str>,
-        fail_on_error: bool,
-    ) -> (bool, Option<String>, Option<String>) {
-        info!("MCP Call: {}.{}", server_id, tool_name);
-
-        let start_time = std::time::Instant::now();
-
-        // Get the MCP client manager from app state
-        let mcp_manager = self.app_state.mcp_client_manager.lock().await;
-
-        // Temporarily set timeout on the server config (not persisted)
-        // The actual timeout is handled by the MCP client implementation
-        let result = mcp_manager
-            .call_tool(server_id, tool_name, arguments.clone())
-            .await;
-        let duration_ms = start_time.elapsed().as_millis() as i64;
-
-        match result {
-            Ok(call_result) => {
-                // Save result to database
-                self.save_mcp_call_result(
-                    server_id,
-                    tool_name,
-                    &arguments,
-                    call_result.content.as_ref(),
-                    &call_result.response_type,
-                    call_result.success,
-                    call_result.error.as_deref(),
-                    duration_ms,
-                    step_name,
-                );
-
-                if call_result.success {
-                    info!(
-                        "MCP Call '{}.{}' succeeded in {}ms",
-                        server_id, tool_name, duration_ms
-                    );
-                    // Return the content as a JSON string in the screenshot_path field
-                    // (repurposing this field for MCP result data)
-                    let result_data = call_result
-                        .content
-                        .map(|c| serde_json::to_string(&c).unwrap_or_default());
-                    (true, None, result_data)
-                } else {
-                    let error = call_result
-                        .error
-                        .unwrap_or_else(|| "MCP call failed".to_string());
-                    if fail_on_error {
-                        (false, Some(error), None)
-                    } else {
-                        // Return success but include the error message
-                        info!(
-                            "MCP Call '{}.{}' failed but fail_on_error=false, continuing",
-                            server_id, tool_name
-                        );
-                        (true, Some(format!("(ignored) {}", error)), None)
-                    }
-                }
-            }
-            Err(e) => {
-                let error_msg = format!("MCP call error: {}", e);
-
-                // Save error result to database
-                self.save_mcp_call_result(
-                    server_id,
-                    tool_name,
-                    &arguments,
-                    None,
-                    "error",
-                    false,
-                    Some(&error_msg),
-                    duration_ms,
-                    step_name,
-                );
-
-                if fail_on_error {
-                    (false, Some(error_msg), None)
-                } else {
-                    info!(
-                        "MCP Call '{}.{}' errored but fail_on_error=false, continuing",
-                        server_id, tool_name
-                    );
-                    (true, Some(format!("(ignored) {}", error_msg)), None)
-                }
-            }
-        }
-    }
-
-    /// Save an MCP call result to the database (if task_run_id is set)
-    fn save_mcp_call_result(
-        &self,
-        server_id: &str,
-        tool_name: &str,
-        arguments: &serde_json::Value,
-        response: Option<&serde_json::Value>,
-        response_type: &str,
-        success: bool,
-        error: Option<&str>,
-        duration_ms: i64,
-        step_name: Option<&str>,
-    ) {
-        // Only save if we have a task_run_id
-        let Some(ref task_run_id) = self.task_run_id else {
-            return;
-        };
-
-        let input = CreateMcpCallInput {
-            task_run_id: task_run_id.clone(),
-            step_id: uuid::Uuid::new_v4().to_string(), // Generate a step ID if not provided
-            step_name: step_name.map(|s| s.to_string()),
-            server_id: server_id.to_string(),
-            server_name: None, // Could be resolved from MCP client manager if needed
-            tool_name: tool_name.to_string(),
-            arguments: Some(serde_json::to_string(arguments).unwrap_or_default()),
-            resolved_arguments: None, // Same as arguments in this case
-            response: response.map(|r| serde_json::to_string(r).unwrap_or_default()),
-            response_type: response_type.to_string(),
-            duration_ms,
-            extractions: None, // No variable extractions for now
-            assertions: None,  // No assertions for now
-            success,
-            error_message: error.map(|e| e.to_string()),
-        };
-
-        match self
-            .app_state
-            .checkpoint_db
-            .create_task_run_mcp_call(&input)
-        {
-            Ok(id) => {
-                info!(
-                    "Saved MCP call result to database: {} (tool: {})",
-                    id, tool_name
-                );
-            }
-            Err(e) => {
-                warn!("Failed to save MCP call result to database: {}", e);
-            }
-        }
     }
 
     // =========================================================================
@@ -4864,264 +3677,6 @@ impl StepExecutor {
         // Tree events above are still emitted for the Session/Actions page.
 
         (final_success, error_msg, output_data)
-    }
-
-    // =========================================================================
-    // API Request Step Execution
-    // =========================================================================
-
-    /// Parse an output variable specification to extract variable name and optional JSON path.
-    ///
-    /// Supports two formats:
-    /// - `var_name` - stores entire response in `var_name`
-    /// - `var_name.path.to.field` - stores value at JSON path `$.path.to.field` in `var_name`
-    ///
-    /// Returns (variable_name, optional_json_path) where json_path is in JSONPath syntax (e.g., `$.path.to.field`)
-    fn parse_output_variable_spec(spec: &str) -> (String, Option<String>) {
-        if let Some(dot_pos) = spec.find('.') {
-            let var_name = spec[..dot_pos].to_string();
-            let path_part = &spec[dot_pos + 1..];
-            // Convert dot notation to JSONPath: "data.token" -> "$.data.token"
-            let json_path = format!("$.{}", path_part);
-            (var_name, Some(json_path))
-        } else {
-            (spec.to_string(), None)
-        }
-    }
-
-    /// Extract a value from a JSON string using a JSONPath expression.
-    ///
-    /// Returns the extracted value as a string, or None if:
-    /// - The JSON is invalid
-    /// - The path doesn't match anything (returns Null)
-    /// - The path syntax is invalid
-    fn extract_json_path_value(json_body: &str, json_path: &str) -> Option<String> {
-        let finder = match JsonPathFinder::from_str(json_body, json_path) {
-            Ok(f) => f,
-            Err(e) => {
-                warn!("Invalid JSON path '{}': {}", json_path, e);
-                return None;
-            }
-        };
-
-        let results = finder.find_slice();
-        if results.is_empty() {
-            warn!("JSON path '{}' matched no values", json_path);
-            return None;
-        }
-
-        // Get first result and convert to string
-        // Note: jsonpath_rust returns Null for missing fields, which we treat as "not found"
-        let data = results[0].clone().to_data();
-
-        // Treat Null as "not found" - the field doesn't exist in the JSON
-        if data.is_null() {
-            warn!(
-                "JSON path '{}' resolved to null (field not found)",
-                json_path
-            );
-            return None;
-        }
-
-        let value = match data {
-            serde_json::Value::String(s) => s,
-            serde_json::Value::Number(n) => n.to_string(),
-            serde_json::Value::Bool(b) => b.to_string(),
-            serde_json::Value::Null => unreachable!(), // Already handled above
-            other => other.to_string(),                // Arrays/objects become JSON strings
-        };
-
-        Some(value)
-    }
-
-    /// Execute an API request step using ApiRequestSession for proper variable chaining.
-    ///
-    /// Variables from the SharedVariableStore can be referenced in the URL, headers, and body
-    /// using `{{variable_name}}` syntax. This enables API request chaining where response
-    /// data from one request can be used in subsequent requests.
-    ///
-    /// The function uses ApiRequestSession which provides:
-    /// - Proper variable resolution via VariableResolver
-    /// - JSON path extractions for extracting specific fields from responses
-    /// - Automatic variable storage for chained requests
-    async fn execute_api_request_step(
-        &self,
-        step: &ExecutionStepConfig,
-        timeout_secs: Option<u64>,
-    ) -> (bool, Option<String>, Option<String>) {
-        // Validate required fields
-        let method_str = match &step.api_method {
-            Some(m) => m.to_uppercase(),
-            None => {
-                return (
-                    false,
-                    Some("No HTTP method specified for API request".to_string()),
-                    None,
-                );
-            }
-        };
-
-        let url = match &step.api_url {
-            Some(u) => u.clone(),
-            None => {
-                return (
-                    false,
-                    Some("No URL specified for API request".to_string()),
-                    None,
-                );
-            }
-        };
-
-        // Parse HTTP method
-        let method = match method_str.as_str() {
-            "GET" => HttpMethod::Get,
-            "POST" => HttpMethod::Post,
-            "PUT" => HttpMethod::Put,
-            "PATCH" => HttpMethod::Patch,
-            "DELETE" => HttpMethod::Delete,
-            _ => {
-                return (
-                    false,
-                    Some(format!("Unsupported HTTP method: {}", method_str)),
-                    None,
-                );
-            }
-        };
-
-        let step_name = step.name.as_deref().unwrap_or("API Request");
-
-        // First, expand variables in URL using RuntimeContext (for step outputs, etc.)
-        let evaluator = ExpressionEvaluator::new();
-        let url_with_context = evaluator.evaluate(&url, &self.runtime_context);
-
-        // Build headers HashMap from serde_json::Value
-        let headers: Option<HashMap<String, String>> = step.api_headers.as_ref().and_then(|h| {
-            h.as_object().map(|obj| {
-                obj.iter()
-                    .filter_map(|(k, v)| {
-                        v.as_str().map(|s| {
-                            // Expand variables in header values
-                            let expanded = evaluator.evaluate(s, &self.runtime_context);
-                            (k.clone(), expanded)
-                        })
-                    })
-                    .collect()
-            })
-        });
-
-        // Expand variables in body
-        let body = step
-            .api_body
-            .as_ref()
-            .map(|b| evaluator.evaluate(b, &self.runtime_context));
-
-        // Build extractions list - combine api_extractions with legacy api_output_variable
-        let mut extractions = step.api_extractions.clone().unwrap_or_default();
-
-        // Support legacy api_output_variable format: "var_name.path.to.field" extracts $.path.to.field
-        if let Some(ref var_spec) = step.api_output_variable {
-            let (var_name, json_path) = Self::parse_output_variable_spec(var_spec);
-            let json_path_str = json_path.unwrap_or_else(|| "$".to_string());
-            extractions.push(VariableExtraction {
-                variable_name: var_name,
-                json_path: json_path_str,
-                default_value: None,
-            });
-        }
-
-        // Determine timeout: use step-specific, then function parameter, then default
-        let timeout_ms = step
-            .api_timeout_ms
-            .or_else(|| timeout_secs.map(|s| s * 1000))
-            .unwrap_or(30_000);
-
-        // Build ApiRequestConfig
-        let config = ApiRequestConfig {
-            step_id: None,
-            step_name: Some(step_name.to_string()),
-            method,
-            url: url_with_context.clone(),
-            resolved_url: None,
-            headers,
-            body,
-            content_type: step.api_content_type.clone(),
-            timeout_ms: Some(timeout_ms),
-            follow_redirects: Some(true),
-            credential_id: None,
-            extractions: if extractions.is_empty() {
-                None
-            } else {
-                Some(extractions)
-            },
-            assertions: None,
-        };
-
-        info!(
-            "Executing API request '{}': {} {} (timeout: {}ms)",
-            step_name, method_str, url_with_context, timeout_ms
-        );
-
-        // Create session from shared variable store for proper variable chaining
-        let mut session = ApiRequestSession::from_shared_store(&self.shared_variables);
-
-        // Execute the request
-        match session.execute(&config, None).await {
-            Ok(result) => {
-                // Sync extracted variables back to the shared store
-                session.sync_to_shared_store(&self.shared_variables);
-
-                // Log extraction results
-                for ext in &result.extractions {
-                    if ext.success {
-                        if let Some(ref value) = ext.extracted_value {
-                            let preview = if value.len() > 50 {
-                                format!("{}...", &value[..50])
-                            } else {
-                                value.clone()
-                            };
-                            info!(
-                                "Extracted '{}' using JSON path '{}' -> '{}' ({} chars)",
-                                ext.variable_name,
-                                ext.json_path,
-                                preview,
-                                value.len()
-                            );
-                        }
-                    } else if let Some(ref error) = ext.error {
-                        warn!(
-                            "Extraction failed for '{}' ({}): {}",
-                            ext.variable_name, ext.json_path, error
-                        );
-                    }
-                }
-
-                info!(
-                    "API request '{}' completed: status={}, duration={}ms, extractions={}",
-                    step_name,
-                    result.status_code,
-                    result.response_time_ms,
-                    result.extractions.len()
-                );
-
-                if result.success {
-                    (true, None, result.response_body)
-                } else {
-                    let error_msg = result.error.unwrap_or_else(|| {
-                        format!(
-                            "HTTP {}: {}",
-                            result.status_code,
-                            result
-                                .response_body
-                                .as_ref()
-                                .map(|b| b.chars().take(500).collect::<String>())
-                                .unwrap_or_default()
-                        )
-                    });
-                    (false, Some(error_msg), result.response_body)
-                }
-            }
-            Err(e) => (false, Some(format!("API request failed: {}", e)), None),
-        }
     }
 
     // =========================================================================
@@ -6147,193 +4702,6 @@ impl StepExecutor {
             )
         }
     }
-
-    // =========================================================================
-    // Macro Step Execution
-    // =========================================================================
-
-    /// Execute a saved macro by ID
-    async fn execute_macro_step(
-        &self,
-        macro_id: &str,
-        monitor_index: Option<i32>,
-    ) -> (bool, Option<String>, Option<String>) {
-        use crate::macros;
-
-        // Get the macro
-        let macro_item = match macros::get_macro(macro_id) {
-            Some(m) => m,
-            None => {
-                return (false, Some(format!("Macro not found: {}", macro_id)), None);
-            }
-        };
-
-        info!("Executing macro: {} ({})", macro_item.name, macro_id);
-
-        // Increment run count
-        if let Err(e) = macros::increment_run_count(macro_id) {
-            warn!(
-                "Failed to increment run count for macro {}: {}",
-                macro_id, e
-            );
-        }
-
-        let mut all_success = true;
-        let mut errors: Vec<String> = Vec::new();
-
-        // Execute each step
-        for (idx, step) in macro_item.steps.iter().enumerate() {
-            let step_monitor = step.monitor_index.or(monitor_index);
-
-            let result = match step.action_type.as_str() {
-                "click" | "double_click" | "right_click" => {
-                    if let Some(ref image_ids) = step.target_image_ids {
-                        if let Some(first_image_id) = image_ids.first() {
-                            self.action_service
-                                .execute_action(
-                                    &step.action_type,
-                                    first_image_id,
-                                    None,
-                                    step_monitor,
-                                )
-                                .await
-                                .map(|r| r.success)
-                                .map_err(|e| format!("{:?}", e))
-                        } else {
-                            Err("No target image specified".to_string())
-                        }
-                    } else {
-                        Err("No target image IDs specified".to_string())
-                    }
-                }
-                "type" => {
-                    if let Some(ref text) = step.text_input {
-                        let config = json!({"text": text});
-                        self.action_service
-                            .execute_action("TYPE", "", Some(&config), step_monitor)
-                            .await
-                            .map(|r| r.success)
-                            .map_err(|e| format!("{:?}", e))
-                    } else {
-                        Err("No text specified for type action".to_string())
-                    }
-                }
-                "hotkey" => {
-                    if let Some(ref hotkey) = step.hotkey {
-                        let config = json!({"hotkey": hotkey});
-                        self.action_service
-                            .execute_action("HOTKEY", "", Some(&config), step_monitor)
-                            .await
-                            .map(|r| r.success)
-                            .map_err(|e| format!("{:?}", e))
-                    } else {
-                        Err("No hotkey specified".to_string())
-                    }
-                }
-                "go_to_state" => {
-                    if let Some(ref state_ids) = step.target_state_ids {
-                        if let Some(first_state_id) = state_ids.first() {
-                            // Timeouts are disabled by default
-                            let timeout = step.timeout_seconds;
-                            self.action_service
-                                .go_to_state(first_state_id, None, step_monitor, timeout)
-                                .await
-                                .map(|r| r.success)
-                                .map_err(|e| format!("{:?}", e))
-                        } else {
-                            Err("No target state specified".to_string())
-                        }
-                    } else {
-                        Err("No target state IDs specified".to_string())
-                    }
-                }
-                _ => Err(format!("Unknown action type: {}", step.action_type)),
-            };
-
-            match result {
-                Ok(success) => {
-                    if !success {
-                        all_success = false;
-                        errors.push(format!("Step {} '{}' failed", idx + 1, step.name));
-                    }
-                }
-                Err(e) => {
-                    all_success = false;
-                    errors.push(format!("Step {} '{}': {}", idx + 1, step.name, e));
-                }
-            }
-
-            // Apply pause_after_ms if specified
-            if let Some(pause_ms) = step.pause_after_ms {
-                tokio::time::sleep(tokio::time::Duration::from_millis(pause_ms as u64)).await;
-            }
-        }
-
-        let error_msg = if errors.is_empty() {
-            None
-        } else {
-            Some(errors.join("; "))
-        };
-
-        (all_success, error_msg, None)
-    }
-
-    // =========================================================================
-    // Log Watch Step Execution
-    // =========================================================================
-
-    /// Execute a log_watch step - scans log files for errors
-    ///
-    /// This step provides deterministic error detection from log files.
-    /// It scans configured log sources within a time window and returns
-    /// failure if any errors are found, along with a formatted report.
-    async fn execute_log_watch_step(
-        &self,
-        step: &ExecutionStepConfig,
-    ) -> (bool, Option<String>, Option<String>) {
-        let step_name = step.name.as_deref().unwrap_or("Log Watch");
-        let time_window = step
-            .time_window_seconds
-            .unwrap_or(DEFAULT_TIME_WINDOW_SECONDS);
-
-        // Get log sources - use configured or global settings defaults
-        let log_sources: Vec<String> = step
-            .log_sources
-            .clone()
-            .unwrap_or_else(get_default_log_source_names);
-
-        // Get custom patterns (will be combined with defaults)
-        let custom_patterns = step.error_patterns.as_deref();
-
-        info!(
-            "Executing log_watch step '{}': sources={:?}, time_window={}s",
-            step_name, log_sources, time_window
-        );
-
-        // Collect errors from all log sources
-        let errors = collect_recent_log_errors(&log_sources, time_window, custom_patterns).await;
-
-        if errors.is_empty() {
-            info!("Log watch '{}': No errors detected in logs", step_name);
-            (true, None, Some("No errors detected in logs".to_string()))
-        } else {
-            let error_count = errors.len();
-            let formatted_report = format_log_errors_for_ai(&errors);
-
-            warn!(
-                "Log watch '{}': Found {} error(s) in logs",
-                step_name, error_count
-            );
-
-            // Return failure with the formatted report as the output (third parameter)
-            // This allows the AI to see the full error details
-            (
-                false,
-                Some(format!("Found {} error(s) in logs", error_count)),
-                Some(formatted_report),
-            )
-        }
-    }
 }
 
 // ============================================================================
@@ -6607,23 +4975,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_workflow_step_creation() {
-        let step = ExecutionStepConfig::workflow("TestWorkflow");
-        assert_eq!(step.step_type, "workflow");
-        assert_eq!(step.name, Some("TestWorkflow".to_string()));
-        assert!(!step.take_screenshot);
-    }
-
-    #[test]
-    fn test_workflow_with_screenshot_creation() {
-        let step = ExecutionStepConfig::workflow_with_screenshot("TestWorkflow", 2);
-        assert_eq!(step.step_type, "workflow");
-        assert_eq!(step.name, Some("TestWorkflow".to_string()));
-        assert!(step.take_screenshot);
-        assert_eq!(step.screenshot_delay, 2);
-    }
-
-    #[test]
     fn test_execution_result_empty_summary() {
         let result = ExecutionResult {
             success: true,
@@ -6664,6 +5015,9 @@ mod tests {
                     config: StepExecutionConfig::default(),
                     verification_details: None,
                     output_data: None,
+                    required: None,
+                    resolved_inputs: None,
+                    extracted_values: None,
                 },
                 StepExecutionResult {
                     step_index: 1,
@@ -6679,6 +5033,9 @@ mod tests {
                     config: StepExecutionConfig::default(),
                     verification_details: None,
                     output_data: None,
+                    required: None,
+                    resolved_inputs: None,
+                    extracted_values: None,
                 },
             ],
             captured_logs: None,
@@ -6693,90 +5050,123 @@ mod tests {
         assert!(summary.contains("2 of 2 steps completed successfully"));
     }
 
-    #[test]
-    fn test_parse_output_variable_spec_simple() {
-        let (var_name, json_path) = StepExecutor::parse_output_variable_spec("auth_response");
-        assert_eq!(var_name, "auth_response");
-        assert!(json_path.is_none());
+    // ========================================================================
+    // compute_execution_layers tests
+    // ========================================================================
+
+    fn make_step(id: &str, step_type: &str) -> ExecutionStepConfig {
+        ExecutionStepConfig {
+            id: Some(id.to_string()),
+            step_type: step_type.to_string(),
+            name: Some(id.to_string()),
+            ..Default::default()
+        }
     }
 
     #[test]
-    fn test_parse_output_variable_spec_with_path() {
-        let (var_name, json_path) = StepExecutor::parse_output_variable_spec("auth_response.token");
-        assert_eq!(var_name, "auth_response");
-        assert_eq!(json_path, Some("$.token".to_string()));
+    fn test_dag_no_dependencies() {
+        // Three independent steps should form one layer
+        let steps = vec![
+            make_step("a", "check"),
+            make_step("b", "check"),
+            make_step("c", "check"),
+        ];
+        let layers = compute_execution_layers(&steps).unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].len(), 3);
     }
 
     #[test]
-    fn test_parse_output_variable_spec_nested_path() {
-        let (var_name, json_path) =
-            StepExecutor::parse_output_variable_spec("response.data.user.id");
-        assert_eq!(var_name, "response");
-        assert_eq!(json_path, Some("$.data.user.id".to_string()));
+    fn test_dag_linear_chain() {
+        // a -> b -> c (each depends on the previous)
+        let a = make_step("a", "shell_command");
+        let mut b = make_step("b", "shell_command");
+        b.depends_on = Some(vec!["a".to_string()]);
+        let mut c = make_step("c", "shell_command");
+        c.depends_on = Some(vec!["b".to_string()]);
+
+        let steps = vec![a, b, c];
+        let layers = compute_execution_layers(&steps).unwrap();
+        assert_eq!(layers.len(), 3);
+        assert_eq!(layers[0], vec![0]); // a
+        assert_eq!(layers[1], vec![1]); // b
+        assert_eq!(layers[2], vec![2]); // c
     }
 
     #[test]
-    fn test_extract_json_path_value_string() {
-        let json = r#"{"token": "abc123", "expires_in": 3600}"#;
-        let result = StepExecutor::extract_json_path_value(json, "$.token");
-        assert_eq!(result, Some("abc123".to_string()));
+    fn test_dag_diamond() {
+        // a -> b, a -> c, b -> d, c -> d
+        let a = make_step("a", "api_request");
+        let mut b = make_step("b", "check");
+        b.depends_on = Some(vec!["a".to_string()]);
+        let mut c = make_step("c", "check");
+        c.depends_on = Some(vec!["a".to_string()]);
+        let mut d = make_step("d", "prompt");
+        d.depends_on = Some(vec!["b".to_string(), "c".to_string()]);
+
+        let steps = vec![a, b, c, d];
+        let layers = compute_execution_layers(&steps).unwrap();
+        assert_eq!(layers.len(), 3);
+        assert_eq!(layers[0], vec![0]); // a
+        assert!(layers[1].contains(&1)); // b and c in parallel
+        assert!(layers[1].contains(&2));
+        assert_eq!(layers[2], vec![3]); // d
     }
 
     #[test]
-    fn test_extract_json_path_value_number() {
-        let json = r#"{"token": "abc123", "expires_in": 3600}"#;
-        let result = StepExecutor::extract_json_path_value(json, "$.expires_in");
-        assert_eq!(result, Some("3600".to_string()));
+    fn test_dag_input_dependencies() {
+        // b reads from a's output via inputs
+        let a = make_step("a", "api_request");
+        let mut b = make_step("b", "check");
+        let mut inputs = std::collections::HashMap::new();
+        inputs.insert("response".to_string(), "a.output.body".to_string());
+        b.inputs = Some(inputs);
+
+        let steps = vec![a, b];
+        let layers = compute_execution_layers(&steps).unwrap();
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[0], vec![0]); // a first
+        assert_eq!(layers[1], vec![1]); // then b
     }
 
     #[test]
-    fn test_extract_json_path_value_nested() {
-        let json = r#"{"data": {"user": {"id": 42, "name": "John"}}}"#;
-        let result = StepExecutor::extract_json_path_value(json, "$.data.user.id");
-        assert_eq!(result, Some("42".to_string()));
+    fn test_dag_cycle_detection() {
+        // a -> b -> a (cycle)
+        let mut a = make_step("a", "check");
+        a.depends_on = Some(vec!["b".to_string()]);
+        let mut b = make_step("b", "check");
+        b.depends_on = Some(vec!["a".to_string()]);
+
+        let steps = vec![a, b];
+        let result = compute_execution_layers(&steps);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Circular"));
     }
 
     #[test]
-    fn test_extract_json_path_value_nested_string() {
-        let json = r#"{"data": {"user": {"id": 42, "name": "John"}}}"#;
-        let result = StepExecutor::extract_json_path_value(json, "$.data.user.name");
-        assert_eq!(result, Some("John".to_string()));
+    fn test_dag_empty_steps() {
+        let steps: Vec<ExecutionStepConfig> = vec![];
+        let layers = compute_execution_layers(&steps).unwrap();
+        assert!(layers.is_empty());
     }
 
     #[test]
-    fn test_extract_json_path_value_boolean() {
-        let json = r#"{"success": true, "enabled": false}"#;
-        let result = StepExecutor::extract_json_path_value(json, "$.success");
-        assert_eq!(result, Some("true".to_string()));
+    fn test_dag_single_step() {
+        let steps = vec![make_step("a", "shell_command")];
+        let layers = compute_execution_layers(&steps).unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0], vec![0]);
     }
 
     #[test]
-    fn test_extract_json_path_value_not_found() {
-        let json = r#"{"token": "abc123"}"#;
-        let result = StepExecutor::extract_json_path_value(json, "$.missing_field");
-        assert!(result.is_none());
-    }
+    fn test_dag_unknown_dependency_ignored() {
+        // Step references a non-existent dependency - should be ignored
+        let mut a = make_step("a", "check");
+        a.depends_on = Some(vec!["nonexistent".to_string()]);
 
-    #[test]
-    fn test_extract_json_path_value_invalid_json() {
-        let json = "not valid json";
-        let result = StepExecutor::extract_json_path_value(json, "$.token");
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_json_path_value_array_element() {
-        let json = r#"{"items": [{"id": 1}, {"id": 2}, {"id": 3}]}"#;
-        let result = StepExecutor::extract_json_path_value(json, "$.items[0].id");
-        assert_eq!(result, Some("1".to_string()));
-    }
-
-    #[test]
-    fn test_extract_json_path_value_explicit_null() {
-        // When a field explicitly contains null, we treat it as "not found"
-        // since there's no meaningful value to extract
-        let json = r#"{"value": null}"#;
-        let result = StepExecutor::extract_json_path_value(json, "$.value");
-        assert!(result.is_none());
+        let steps = vec![a];
+        let layers = compute_execution_layers(&steps).unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0], vec![0]);
     }
 }

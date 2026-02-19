@@ -59,7 +59,7 @@ interface TestResult {
   step_type?: string;
   /** Test type for verification tests (e.g., 'python', 'repository') */
   test_type?: string;
-  /** For check_group steps: individual check results with detailed issues */
+  /** For command steps with check groups: individual check results with detailed issues */
   check_results?: IndividualCheckResult[];
 }
 
@@ -446,7 +446,7 @@ function TestResultCard({ test, isExpanded, onToggle }: TestResultCardProps) {
 
       {isExpanded && (
         <div className="border-t border-border p-4 space-y-4">
-          {/* Individual Check Results (for check_group steps) */}
+          {/* Individual Check Results (for command steps with check groups) */}
           {test.check_results && test.check_results.length > 0 && (
             <div data-ui-id="recap-test-check-results">
               <h4 className="text-sm font-medium mb-3 flex items-center gap-2">

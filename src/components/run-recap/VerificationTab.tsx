@@ -46,7 +46,8 @@ function StepTypeIcon({ stepType }: { stepType: string }) {
     case "check":
     case "code_check":
       return <ShieldCheck className="w-4 h-4" />;
-    case "shell_command":
+    case "command":
+    case "shell_command": // Legacy
       return <FileText className="w-4 h-4" />;
     default:
       return <AlertCircle className="w-4 h-4" />;
@@ -71,9 +72,7 @@ function ConsoleErrorsList({
           <div
             key={i}
             className={`text-xs p-2 rounded flex items-start gap-2 ${
-              err.type === "warn"
-                ? "bg-amber-500/10 text-amber-400"
-                : "bg-red-500/10 text-red-400"
+              err.type === "warn" ? "bg-amber-500/10 text-amber-400" : "bg-red-500/10 text-red-400"
             }`}
           >
             <span className="font-mono opacity-70 shrink-0">[{err.type}]</span>

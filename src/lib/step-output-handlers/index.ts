@@ -11,10 +11,10 @@
  *
  * Usage:
  * ```typescript
- * import { stepOutputRegistry, apiRequestHandler } from './step-output-handlers';
+ * import { stepOutputRegistry, commandHandler } from './step-output-handlers';
  *
  * // Get a handler for a specific step type
- * const handler = stepOutputRegistry.get('api_request');
+ * const handler = stepOutputRegistry.get('command');
  *
  * // Parse raw output
  * const output = handler.parseOutput(rawData, stepConfig);
@@ -45,26 +45,12 @@ export {
 } from "./registry";
 
 // Export individual handlers
-export { ApiRequestHandler, apiRequestHandler } from "./api-request-handler";
-export { GuiActionHandler, guiActionHandler } from "./gui-action-handler";
-export { ShellCommandHandler, shellCommandHandler } from "./shell-command-handler";
-export { McpCallHandler, mcpCallHandler } from "./mcp-call-handler";
-export { ScreenshotHandler, screenshotHandler } from "./screenshot-handler";
-export { WorkflowRefHandler, workflowRefHandler } from "./workflow-ref-handler";
-export { PlaywrightScriptHandler, playwrightScriptHandler } from "./playwright-script-handler";
-export { StateNavigationHandler, stateNavigationHandler } from "./state-navigation-handler";
+export { CommandHandler, commandHandler } from "./command-handler";
 export { CheckHandler, checkHandler } from "./check-handler";
 
 // Import for registration
 import { stepOutputRegistry } from "./registry";
-import { apiRequestHandler } from "./api-request-handler";
-import { guiActionHandler } from "./gui-action-handler";
-import { shellCommandHandler } from "./shell-command-handler";
-import { mcpCallHandler } from "./mcp-call-handler";
-import { screenshotHandler } from "./screenshot-handler";
-import { workflowRefHandler } from "./workflow-ref-handler";
-import { playwrightScriptHandler } from "./playwright-script-handler";
-import { stateNavigationHandler } from "./state-navigation-handler";
+import { commandHandler } from "./command-handler";
 import { checkHandler } from "./check-handler";
 
 // ============================================================================
@@ -81,15 +67,13 @@ function initializeRegistry(): void {
   }
 
   // Register all built-in handlers
-  stepOutputRegistry.register(apiRequestHandler);
-  stepOutputRegistry.register(guiActionHandler);
-  stepOutputRegistry.register(shellCommandHandler);
-  stepOutputRegistry.register(mcpCallHandler);
-  stepOutputRegistry.register(screenshotHandler);
-  stepOutputRegistry.register(workflowRefHandler);
-  stepOutputRegistry.register(playwrightScriptHandler);
-  stepOutputRegistry.register(stateNavigationHandler);
+  stepOutputRegistry.register(commandHandler);
   stepOutputRegistry.register(checkHandler);
+
+  // Backward compat: also register "shell_command" pointing to the command handler
+  const shellCommandAlias = Object.create(commandHandler);
+  shellCommandAlias.stepType = "shell_command";
+  stepOutputRegistry.register(shellCommandAlias);
 
   // Mark as initialized
   stepOutputRegistry.markInitialized();
@@ -106,29 +90,15 @@ export type {
   StepOutput,
   StepOutputType,
   BaseStepOutput,
-  ApiRequestStepOutput,
-  GuiActionStepOutput,
-  ShellCommandStepOutput,
-  McpCallStepOutput,
-  ScreenshotStepOutput,
-  WorkflowRefStepOutput,
-  PlaywrightScriptStepOutput,
-  StateNavigationStepOutput,
+  CommandStepOutput,
   CheckStepOutput,
-  ScreenBoundingBox,
-  DetectedScreenElement,
+  UiBridgeStepOutput,
   CheckIssue,
 } from "../../types/step-output";
 
 export {
   generateStepOutputId,
-  isApiRequestOutput,
-  isGuiActionOutput,
-  isShellCommandOutput,
-  isMcpCallOutput,
-  isScreenshotOutput,
-  isWorkflowRefOutput,
-  isPlaywrightScriptOutput,
-  isStateNavigationOutput,
+  isCommandOutput,
   isCheckOutput,
+  isUiBridgeOutput,
 } from "../../types/step-output";

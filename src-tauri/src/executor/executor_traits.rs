@@ -146,6 +146,9 @@ mod tests {
             config: StepExecutionConfig::default(),
             verification_details: None,
             output_data: None,
+            required: None,
+            resolved_inputs: None,
+            extracted_values: None,
         }
     }
 
@@ -164,6 +167,9 @@ mod tests {
             config: StepExecutionConfig::default(),
             verification_details: None,
             output_data: None,
+            required: None,
+            resolved_inputs: None,
+            extracted_values: None,
         }
     }
 

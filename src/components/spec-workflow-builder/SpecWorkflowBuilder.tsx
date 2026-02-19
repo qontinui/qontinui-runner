@@ -21,8 +21,8 @@ import { WorkflowPreview } from "./WorkflowPreview";
 import type { SpecConfig, GeneratorSpecMetadata } from "./types";
 import type {
   UnifiedWorkflow,
-  ScriptStep,
-  SpecStep,
+  SetupStep,
+  VerificationStep,
   PromptStep,
 } from "../../types/unified-workflow";
 import { createSummaryStep } from "../../types/unified-workflow";
@@ -101,7 +101,7 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
     const workflowName = isNavigation ? "Navigation Verification" : "Snapshot Verification";
 
     // Setup steps
-    const setupSteps: ScriptStep[] = [];
+    const setupSteps: SetupStep[] = [];
     if (isNavigation && transitions.length > 0) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const explorationMeta = (genMeta as any)?.explorationMetadata;
@@ -109,19 +109,17 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
       if (pageUrl) {
         setupSteps.push({
           id: crypto.randomUUID(),
-          type: "script",
+          type: "command",
           phase: "setup",
           name: `Navigate to ${pageUrl}`,
-          target_url: pageUrl,
-          code: `import { test } from '@playwright/test';\ntest('navigate', async ({ page }) => {\n  await page.goto('${pageUrl}');\n  await page.waitForLoadState('networkidle');\n});`,
-          refinement_enabled: false,
-        });
+          command: `playwright test --headed -g 'navigate' -- --base-url='${pageUrl}'`,
+        } satisfies SetupStep);
       }
     }
 
-    // Verification steps: each selected group becomes a SpecStep
+    // Verification steps: each selected group becomes a prompt-based verification step
     const selectedGroups = loadedData.groups.filter((g) => selectedSpecIds.has(g.id));
-    const verificationSteps: SpecStep[] = selectedGroups.map((group) => {
+    const verificationSteps: VerificationStep[] = selectedGroups.map((group) => {
       const enabledAssertions = group.assertions.filter((a) => a.enabled);
       const assertionDescriptions = enabledAssertions
         .map((a) => `- ${a.description} [${a.severity}]`)
@@ -129,13 +127,11 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
 
       return {
         id: crypto.randomUUID(),
-        type: "spec",
+        type: "prompt",
         phase: "verification",
         name: group.name,
-        spec_group: group,
-        element_source: elementSource,
-        description: `${group.description}\n\nAssertions:\n${assertionDescriptions}`,
-      };
+        content: `${group.description}\n\nAssertions:\n${assertionDescriptions}`,
+      } satisfies VerificationStep;
     });
 
     // Agentic steps

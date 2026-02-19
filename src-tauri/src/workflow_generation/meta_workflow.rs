@@ -209,7 +209,7 @@ pub fn build_meta_workflow_template(
         verification_steps: vec![json!({
             "id": Uuid::new_v4().to_string(),
             "name": "AI semantic review",
-            "type": "check",
+            "type": "command",
             "phase": "verification",
             "check_type": "ai_review",
             "ai_review_prompt": verification_prompt,
@@ -360,29 +360,35 @@ fn build_builder_prompt(
 8. Include meaningful `description` and `tags`
 
 ### Quality checklist — ensure your output meets ALL of these:
-- Every `shell_command` has a real, syntactically-valid command (no placeholders)
-- Every `check` step has a `command` that matches its `check_type` (e.g. lint -> eslint/ruff, typecheck -> tsc/mypy)
-- Every `api_request` has a well-formed URL starting with http:// or https://
+- Every `command` step has a real, syntactically-valid command (no placeholders)
+- Every `command` step with `check_type` has a matching command (e.g. lint -> eslint/ruff, typecheck -> tsc/mypy)
 - Every `test` step has a valid `test_type` and either a `command` or `code` field
 - Every `prompt` in the agentic phase has substantive, multi-sentence instructions referencing verification results
 - If verification steps exist there MUST be at least one agentic `prompt` step
-- `gate` steps only reference `required_steps` IDs that exist in the same phase
+- All `depends_on` and `inputs` references point to valid step IDs within the workflow
+- No circular dependencies exist in `depends_on` chains
 - Step names are descriptive (not "Step 1", "Test", etc.)
 - `working_directory` paths are real absolute or project-relative paths (no placeholders)
+- Only use these 4 step types: `command`, `test`, `ui_bridge`, `prompt`
 
 ### CRITICAL — Verification must be automated, not just AI judgment:
-- verification_steps MUST include at least one automated step (`check`, `test`, `spec`, or `api_request` with assertions). NEVER create a workflow where ALL verification steps are `prompt` type — this is the #1 most common generation mistake.
-- If the workflow creates/modifies TypeScript files, ALWAYS include: `{{"type": "check", "check_type": "typecheck", "command": "npx tsc --noEmit", "working_directory": "<project_dir>"}}`
-- If the workflow creates/modifies Python files, ALWAYS include: `{{"type": "check", "check_type": "typecheck", "command": "mypy .", "working_directory": "<project_dir>"}}`
-- If the workflow targets a web app (localhost:3001 or localhost:1420), ALWAYS include a UI Bridge SDK `api_request` step in verification to verify UI state — e.g., `GET /ui-bridge/sdk/elements` with assertions. Add SDK connect in setup first.
-- Include a `gate` step that depends on all automated check/test/spec steps
+- verification_steps MUST include at least one automated step (`command`, `test`, or `ui_bridge` with assert action). NEVER create a workflow where ALL verification steps are `prompt` type — this is the #1 most common generation mistake.
+- If the workflow creates/modifies TypeScript files, ALWAYS include: `{{"type": "command", "check_type": "typecheck", "command": "npx tsc --noEmit", "working_directory": "<project_dir>"}}`
+- If the workflow creates/modifies Python files, ALWAYS include: `{{"type": "command", "check_type": "typecheck", "command": "mypy .", "working_directory": "<project_dir>"}}`
+- If the workflow targets a web app (localhost:3001 or localhost:1420), ALWAYS include a `ui_bridge` step in verification to verify UI state. Add SDK connect in setup first.
 - `prompt` steps in verification are fine as SUPPLEMENTARY checks but must not be the only verification
+
+### Data Flow Between Steps
+- Use `extract` to capture output values from a step (e.g., `{{"token": "$.access_token"}}`)
+- Use `inputs` on downstream steps to inject extracted values (e.g., `{{"auth_token": "${{login_step.token}}"}}`)
+- Use `depends_on` to enforce execution order when data dependencies exist
+- Mark non-critical steps with `"required": false` so their failure does not block the workflow
 
 ### UI Bridge SDK Capabilities & Limitations
 
 When the workflow uses the UI Bridge SDK for verification, choose the right tool for each check:
 
-**SDK CAN do (use `api_request` steps with SDK endpoints):**
+**SDK CAN do (use `command` steps with curl or `ui_bridge` steps):**
 - Click, double-click, right-click elements
 - Type text into inputs
 - Select dropdown options
@@ -501,8 +507,8 @@ Because the input is a structured plan (not a freeform description), follow thes
 
 ### 2. Create Per-Phase Verification Steps
 For EACH phase identified in the plan, create verification steps that would FAIL if that phase's work is incomplete:
-- Use `check` steps with `custom_command` to verify file changes, compilation, test passes
-- Use `shell_command` steps to verify expected outputs exist
+- Use `command` steps with `check_type` to verify compilation, lint, typecheck passes
+- Use `command` steps (plain) to verify expected outputs exist
 - Use `test` steps for automated testing of the phase's deliverables
 - Each verification step name should reference the plan phase (e.g., "Verify Phase 1: Schema updates")
 - NEVER rely solely on `prompt` type verification — always include automated checks
@@ -514,9 +520,10 @@ The agentic `prompt` step(s) should:
 - Include `[INJECT_STEP]` awareness: mention that the AI can output `[INJECT_STEP]` markers to dynamically add verification steps during execution
 - Structure the prompt so the AI works through plan phases systematically
 
-### 4. Gate Steps
-- Add a `gate` step that depends on ALL phase-specific verification steps
-- This ensures the agentic loop continues until ALL plan phases pass verification
+### 4. Data Flow & Dependencies
+- Use `depends_on` to enforce execution order between steps that share data
+- Use `inputs`/`extract` to pass data between steps (e.g., extract a token in setup, inject it in verification)
+- Mark non-critical steps with `"required": false` so their failure does not block the workflow
 
 ## Output Requirements
 
@@ -528,11 +535,11 @@ The agentic `prompt` step(s) should:
 6. Set reasonable `timeout_seconds` for each step
 
 ### Quality checklist:
-- Every `shell_command` has a real, syntactically-valid command (no placeholders)
-- Every `check` step has a `command` that matches its `check_type`
+- Every `command` step has a real, syntactically-valid command (no placeholders)
+- Every `command` step with `check_type` has a matching command (e.g. lint -> eslint/ruff, typecheck -> tsc/mypy)
 - Every `prompt` in the agentic phase has substantive, multi-sentence instructions referencing the plan phases and verification failures
 - verification_steps MUST include at least one automated step per plan phase
-- A `gate` step depends on all automated verification step IDs
+- All `depends_on` and `inputs` references point to valid step IDs
 - Step names reference specific plan phases (not generic names)
 - `working_directory` paths are real absolute or project-relative paths
 
@@ -551,21 +558,20 @@ Check for these issues:
 1. **Structural**: Valid JSON, all required fields present, correct types
 2. **Step IDs**: All steps have unique UUID v4 IDs
 3. **Phase consistency**: Each step's `phase` field matches the array it's in
-4. **Step type validity**: Step types are valid and appropriate for their phase
+4. **Step type validity**: Step types must be one of the 4 core types (command, test, ui_bridge, prompt) and appropriate for their phase
 5. **Logical flow**: Steps make logical sense in sequence
 6. **Completeness**: The workflow achieves what its description says
 7. **Timeouts**: Reasonable timeout values for each step type
 8. **Names**: Descriptive, non-empty step names
-9. **Command validity**: shell_command steps have real commands (not placeholders)
+9. **Command validity**: command steps have real commands (not placeholders)
 10. **Check consistency**: check_type and command match (lint -> linter, typecheck -> type checker)
 11. **Prompt quality**: Agentic prompts are substantive with specific instructions
-12. **Cross-references**: gate required_steps reference existing step IDs
-13. **CRITICAL — Automated verification required**: verification_steps MUST include at least one deterministic automated step (check, test, spec, or api_request with assertions). A workflow with ONLY prompt-type verification steps is INVALID — this MUST be flagged as a failure.
-14. **Code change typecheck**: If the workflow creates or modifies code files (TypeScript, Python, Rust), there MUST be a `check` step with appropriate typecheck command (npx tsc --noEmit, mypy, cargo check). Missing typecheck for code-modifying workflows MUST be flagged.
-15. **Web app SDK verification**: If the workflow targets a web app (localhost:3001, localhost:1420), there SHOULD be a UI Bridge SDK api_request step or spec step in verification to verify UI state programmatically. Flag as a warning if missing.
-16. **Gate step**: Workflows with 2+ verification steps SHOULD have a gate step aggregating the automated checks. Flag as a warning if missing.
-17. **Agentic-verification coverage**: Every agentic step MUST have at least one verification step that would FAIL if that agentic step's work was NOT done. A tab-existence check does NOT count as coverage for an agentic step that adds content within that tab. Flag as a failure if any agentic step has no corresponding verification.
-18. **Out-of-scope enforcement**: If the task description contains "out of scope", "do not change", "do not modify", or similar boundary constraints, there SHOULD be at least one verification step that checks those boundaries were respected. Flag as a warning if missing.
+12. **Data flow validity**: All `inputs` and `depends_on` references point to existing step IDs. No circular dependencies in `depends_on` chains. `extract` expressions are valid.
+13. **CRITICAL — Automated verification required**: verification_steps MUST include at least one deterministic automated step (command, test, or ui_bridge with assert action). A workflow with ONLY prompt-type verification steps is INVALID — this MUST be flagged as a failure.
+14. **Code change typecheck**: If the workflow creates or modifies code files (TypeScript, Python, Rust), there MUST be a `command` step with `check_type: "typecheck"` and appropriate command (npx tsc --noEmit, mypy, cargo check). Missing typecheck for code-modifying workflows MUST be flagged.
+15. **Web app SDK verification**: If the workflow targets a web app (localhost:3001, localhost:1420), there SHOULD be a `ui_bridge` step in verification to verify UI state programmatically. Flag as a warning if missing.
+16. **Agentic-verification coverage**: Every agentic step MUST have at least one verification step that would FAIL if that agentic step's work was NOT done. A tab-existence check does NOT count as coverage for an agentic step that adds content within that tab. Flag as a failure if any agentic step has no corresponding verification.
+17. **Out-of-scope enforcement**: If the task description contains "out of scope", "do not change", "do not modify", or similar boundary constraints, there SHOULD be at least one verification step that checks those boundaries were respected. Flag as a warning if missing.
 "#
     .to_string();
 
@@ -639,6 +645,9 @@ Fix ALL the issues while preserving the workflow's intent.
 6. Do not remove steps unless they are fundamentally broken
 7. All UUIDs must be valid v4 format
 8. All `phase` fields must match the array they are in
+9. Ensure all `inputs` and `depends_on` references point to valid step IDs
+10. Ensure no circular dependencies exist in `depends_on` chains
+11. Only use the 4 core step types: command, test, ui_bridge, prompt
 
 Output the corrected workflow JSON now:
 "#,
@@ -658,33 +667,32 @@ fn build_hardener_completion_prompt() -> String {
 
 | Prompt check type | Convert to | Method |
 |---|---|---|
-| UI element presence/structure | `api_request` | UI Bridge SDK `GET /ui-bridge/sdk/elements` with `body_contains` assertion |
-| Content/text on page | `api_request` | UI Bridge SDK `POST /ui-bridge/sdk/ai/search` with `body_contains` assertion |
-| File existence | `check` | `custom_command` with `test -f <path>` |
-| File content | `check` | `custom_command` with `grep -q <pattern> <file>` |
-| Code quality (lint) | `check` | `check_type: "lint"` with appropriate command |
-| Code quality (typecheck) | `check` | `check_type: "typecheck"` with appropriate command |
-| API health/response | `api_request` | Direct HTTP with `status_code` assertion |
+| UI element presence/structure | `ui_bridge` | `action: "assert"` with `assert_type: "element_exists"` and target selector |
+| Content/text on page | `ui_bridge` | `action: "assert"` with `assert_type: "element_text"` and expected value |
+| File existence | `command` | `command` with `test -f <path>` |
+| File content | `command` | `command` with `grep -q <pattern> <file>` |
+| Code quality (lint) | `command` | `check_type: "lint"` with appropriate command |
+| Code quality (typecheck) | `command` | `check_type: "typecheck"` with appropriate command |
+| API health/response | `command` | `command` with `curl` and exit code check |
 | Subjective/qualitative | Keep as `prompt` | Cannot be made deterministic |
 
-## Rule 2: Convert Playwright UI tests to UI Bridge SDK api_request steps
+## Rule 2: Convert Playwright UI tests to ui_bridge steps
 
-If the workflow has a UI Bridge SDK connect step in setup AND has Playwright test steps that verify UI features (element presence, tab existence, visual layout, etc.), convert them to one or more `api_request` steps using the UI Bridge SDK.
+If the workflow has Playwright test steps that verify UI features (element presence, tab existence, visual layout, etc.), convert them to `ui_bridge` steps with `action: "assert"`.
 
-- A single Playwright test that checks multiple things SHOULD be split into multiple `api_request` steps
+- A single Playwright test that checks multiple things SHOULD be split into multiple `ui_bridge` assert steps
 - Keep the original step ID on the first converted step; generate new UUIDs for split steps
-- Use SDK endpoints: `GET /ui-bridge/sdk/elements?contentOnly=true` for element checks, `POST /ui-bridge/sdk/ai/search` for semantic search
-- Include `body_contains` assertions that check for specific text/patterns
+- Use `assert_type` values: `element_exists`, `element_text`, `element_visible`, `page_title`, `element_count`
 
 Do NOT convert Playwright tests that are purely functional (form submission, navigation flows) — only convert UI verification tests.
 
-**SDK capability limits:** Do NOT convert Playwright tests involving keyboard shortcuts (Ctrl+Z, Delete, etc.), file uploads, form submit/reset, multi-tab interactions, or screenshot pixel comparisons — the SDK cannot perform these. These MUST stay as Playwright tests. Note: drag-and-drop CAN be converted to SDK — use the `drag` action with `target.elementId` or `targetPosition` params.
+**SDK capability limits:** Do NOT convert Playwright tests involving keyboard shortcuts (Ctrl+Z, Delete, etc.), file uploads, form submit/reset, multi-tab interactions, or screenshot pixel comparisons — the SDK cannot perform these. These MUST stay as Playwright tests.
 
-## Rule 3: Strengthen weak SDK assertions
+## Rule 3: Strengthen weak ui_bridge steps
 
-If an existing `api_request` step targets a UI Bridge SDK endpoint but only has a `status_code` assertion, add `body_contains` assertions that check for meaningful content based on the step name/description.
+If an existing `ui_bridge` step with `action: "assert"` has no `expected` value, add an appropriate `expected` value based on the step name/description.
 
-Example: A step named "Verify state nodes render thumbnails" hitting `/ui-bridge/sdk/elements` with only `{"type":"status_code","expected":200}` should also assert `{"type":"body_contains","expected":"thumbnail"}` or similar.
+Example: A step named "Verify state nodes render thumbnails" with `assert_type: "element_exists"` should include a meaningful `target` selector and `expected` value.
 
 ## General Rules
 
@@ -692,8 +700,8 @@ Example: A step named "Verify state nodes render thumbnails" hitting `/ui-bridge
 2. Preserve all original step IDs (splitting a step keeps the original ID on the first part)
 3. Step count may increase (from splitting) but must never decrease
 4. If a prompt step is genuinely subjective, keep it as `prompt`
-5. For `api_request` conversions, include `assertions` array with at least `status_code` + `body_contains`
-6. For `check` conversions, include `check_type`, `command`, and `working_directory`
+5. For `command` conversions, include `command` and `working_directory`; optionally `check_type` for lint/typecheck/test checks
+6. Only 4 valid step types: `command`, `test`, `ui_bridge`, `prompt`
 
 If there are no steps that need hardening, return the workflow unchanged.
 

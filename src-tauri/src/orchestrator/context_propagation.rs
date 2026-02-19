@@ -147,6 +147,139 @@ impl RuntimeContext {
             })
             .collect()
     }
+
+    /// Resolve input references from step_outputs.
+    ///
+    /// Input values reference other steps' outputs using the format:
+    /// - "step-id.output" — full output of the referenced step
+    /// - "step-id.output.json.path" — nested field from step output
+    /// - "step-id.extracted.var_name" — an extracted variable from that step
+    ///
+    /// Returns a map of input name → resolved JSON value.
+    pub fn resolve_inputs(
+        &self,
+        inputs: &HashMap<String, String>,
+    ) -> Result<HashMap<String, serde_json::Value>, String> {
+        let evaluator = ExpressionEvaluator::new();
+        let mut resolved = HashMap::new();
+
+        for (name, reference) in inputs {
+            // If the reference uses {{expression}} syntax, evaluate it
+            if reference.contains("{{") {
+                let evaluated = evaluator.evaluate(reference, self);
+                resolved.insert(name.clone(), serde_json::Value::String(evaluated));
+                continue;
+            }
+
+            // Parse "step-id.property[.path]" format
+            let parts: Vec<&str> = reference.splitn(3, '.').collect();
+            if parts.len() < 2 {
+                return Err(format!(
+                    "Invalid input reference '{}' for input '{}': expected 'step-id.property[.path]'",
+                    reference, name
+                ));
+            }
+
+            let step_id = parts[0];
+            let property = parts[1];
+
+            let step_output = self.get_step_output(step_id).ok_or_else(|| {
+                format!(
+                    "Input '{}' references step '{}' which has not produced output yet",
+                    name, step_id
+                )
+            })?;
+
+            let value = match property {
+                "output" => {
+                    if parts.len() > 2 {
+                        // Extract nested field from output
+                        let field_path = parts[2];
+                        let eval = ExpressionEvaluator::new();
+                        eval.extract_field(&step_output.output, field_path)
+                            .map(|s| {
+                                // Try to parse back as JSON, fall back to string
+                                serde_json::from_str(&s).unwrap_or(serde_json::Value::String(s))
+                            })
+                            .ok_or_else(|| {
+                                format!(
+                                    "Input '{}': field path '{}' not found in step '{}' output",
+                                    name, field_path, step_id
+                                )
+                            })?
+                    } else {
+                        step_output.output.clone()
+                    }
+                }
+                "extracted" => {
+                    if parts.len() > 2 {
+                        let var_name = parts[2];
+                        step_output
+                            .extracted_variables
+                            .get(var_name)
+                            .cloned()
+                            .ok_or_else(|| {
+                                format!(
+                                    "Input '{}': extracted variable '{}' not found in step '{}'",
+                                    name, var_name, step_id
+                                )
+                            })?
+                    } else {
+                        // Return all extracted variables as a JSON object
+                        serde_json::to_value(&step_output.extracted_variables).map_err(|e| {
+                            format!("Failed to serialize extracted variables: {}", e)
+                        })?
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "Input '{}': unknown property '{}' (expected 'output' or 'extracted')",
+                        name, property
+                    ));
+                }
+            };
+
+            resolved.insert(name.clone(), value);
+        }
+
+        Ok(resolved)
+    }
+
+    /// Apply extraction declarations to populate extracted_variables in step output.
+    ///
+    /// Each extraction maps a name to a JSON path into the step's output.
+    /// The extracted values are stored in the step's `extracted_variables` map
+    /// within the RuntimeContext's step_outputs.
+    pub fn apply_extractions(
+        &mut self,
+        step_id: &str,
+        extract: &HashMap<String, String>,
+        output: &serde_json::Value,
+    ) {
+        let evaluator = ExpressionEvaluator::new();
+        let mut extracted = HashMap::new();
+
+        for (name, json_path) in extract {
+            if let Some(value_str) = evaluator.extract_field(output, json_path) {
+                // Try to parse as JSON, fall back to string
+                let value: serde_json::Value = serde_json::from_str(&value_str)
+                    .unwrap_or(serde_json::Value::String(value_str));
+                extracted.insert(name.clone(), value.clone());
+                // Also set as a context variable for {{name}} syntax
+                self.set_variable(name, value);
+            } else {
+                warn!(
+                    "Extraction '{}' with path '{}' found no value in step '{}' output",
+                    name, json_path, step_id
+                );
+            }
+        }
+
+        // Update the step output's extracted_variables
+        if let Some(step_output) = self.step_outputs.get_mut(step_id) {
+            step_output.extracted_variables.extend(extracted);
+        }
+    }
 }
 
 // ============================================================================
@@ -379,7 +512,7 @@ impl ExpressionEvaluator {
     }
 
     /// Extract a field from a JSON value using dot notation.
-    fn extract_field(&self, value: &serde_json::Value, field_path: &str) -> Option<String> {
+    pub fn extract_field(&self, value: &serde_json::Value, field_path: &str) -> Option<String> {
         let mut current = value;
 
         for part in field_path.split('.') {
@@ -623,5 +756,131 @@ RESULT: all tests passed
         assert_eq!(exported.get("name"), Some(&"Alice".to_string()));
         assert_eq!(exported.get("count"), Some(&"42".to_string()));
         assert_eq!(exported.get("active"), Some(&"true".to_string()));
+    }
+
+    // ========================================================================
+    // resolve_inputs tests
+    // ========================================================================
+
+    #[test]
+    fn test_resolve_inputs_from_step_output() {
+        let mut context = RuntimeContext::new();
+        context.record_step_output(StepOutput {
+            step_id: "api_step".to_string(),
+            step_name: "Fetch Data".to_string(),
+            output: serde_json::json!({"status": 200, "body": {"token": "xyz"}}),
+            extracted_variables: HashMap::new(),
+            completed_at: "2024-01-01T00:00:00Z".to_string(),
+        });
+
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "token".to_string(),
+            "api_step.output.body.token".to_string(),
+        );
+
+        let resolved = context.resolve_inputs(&inputs).unwrap();
+        assert_eq!(resolved.get("token"), Some(&serde_json::json!("xyz")));
+    }
+
+    #[test]
+    fn test_resolve_inputs_from_extracted_variables() {
+        let mut context = RuntimeContext::new();
+        let mut extracted = HashMap::new();
+        extracted.insert("user_id".to_string(), serde_json::json!("u-123"));
+        context.record_step_output(StepOutput {
+            step_id: "setup".to_string(),
+            step_name: "Setup".to_string(),
+            output: serde_json::json!(null),
+            extracted_variables: extracted,
+            completed_at: "2024-01-01T00:00:00Z".to_string(),
+        });
+
+        let mut inputs = HashMap::new();
+        inputs.insert("uid".to_string(), "setup.extracted.user_id".to_string());
+
+        let resolved = context.resolve_inputs(&inputs).unwrap();
+        assert_eq!(resolved.get("uid"), Some(&serde_json::json!("u-123")));
+    }
+
+    #[test]
+    fn test_resolve_inputs_expression_syntax() {
+        let mut context = RuntimeContext::new();
+        context.set_variable("base_url", serde_json::json!("http://localhost:3000"));
+
+        let mut inputs = HashMap::new();
+        inputs.insert("url".to_string(), "{{base_url}}".to_string());
+
+        let resolved = context.resolve_inputs(&inputs).unwrap();
+        assert_eq!(
+            resolved.get("url"),
+            Some(&serde_json::json!("http://localhost:3000"))
+        );
+    }
+
+    #[test]
+    fn test_resolve_inputs_missing_step() {
+        let context = RuntimeContext::new();
+
+        let mut inputs = HashMap::new();
+        inputs.insert("data".to_string(), "nonexistent.output.field".to_string());
+
+        let result = context.resolve_inputs(&inputs);
+        assert!(result.is_err());
+    }
+
+    // ========================================================================
+    // apply_extractions tests
+    // ========================================================================
+
+    #[test]
+    fn test_apply_extractions_simple() {
+        let mut context = RuntimeContext::new();
+        context.record_step_output(StepOutput {
+            step_id: "step1".to_string(),
+            step_name: "Step 1".to_string(),
+            output: serde_json::json!(null),
+            extracted_variables: HashMap::new(),
+            completed_at: "2024-01-01T00:00:00Z".to_string(),
+        });
+
+        let output = serde_json::json!({"users": [{"name": "Alice"}, {"name": "Bob"}], "count": 2});
+        let mut extract = HashMap::new();
+        extract.insert("total".to_string(), "count".to_string());
+        extract.insert("first_user".to_string(), "users.0.name".to_string());
+
+        context.apply_extractions("step1", &extract, &output);
+
+        // Check that variables were set in context
+        assert_eq!(context.get_variable("total"), Some(&serde_json::json!(2)));
+        assert_eq!(
+            context.get_variable("first_user"),
+            Some(&serde_json::json!("Alice"))
+        );
+    }
+
+    #[test]
+    fn test_apply_extractions_updates_step_output() {
+        let mut context = RuntimeContext::new();
+        context.record_step_output(StepOutput {
+            step_id: "api".to_string(),
+            step_name: "API Call".to_string(),
+            output: serde_json::json!(null),
+            extracted_variables: HashMap::new(),
+            completed_at: "2024-01-01T00:00:00Z".to_string(),
+        });
+
+        let output = serde_json::json!({"token": "secret123"});
+        let mut extract = HashMap::new();
+        extract.insert("auth_token".to_string(), "token".to_string());
+
+        context.apply_extractions("api", &extract, &output);
+
+        // Check that step_output's extracted_variables was updated
+        let step_output = context.step_outputs.get("api").unwrap();
+        assert_eq!(
+            step_output.extracted_variables.get("auth_token"),
+            Some(&serde_json::json!("secret123"))
+        );
     }
 }

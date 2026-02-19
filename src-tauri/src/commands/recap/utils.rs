@@ -49,6 +49,7 @@ pub fn get_icon_type(step_type: &str, step_name: &str) -> Option<String> {
         }
         "screenshot" => Some("screenshot".to_string()),
         "script" => Some("script".to_string()),
+        "command" => Some("command".to_string()),
         "shell_command" => Some("shell_command".to_string()),
         "api_request" => Some("api_request".to_string()),
         "prompt" => Some("prompt".to_string()),

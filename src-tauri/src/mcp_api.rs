@@ -171,39 +171,6 @@ pub fn create_router(
         info!("UI Bridge: Response listener set up");
     }
 
-    // Set up Spec Execution response listener
-    // This listens for "spec-execute-response" events from the React frontend
-    // and delivers responses to waiting spec step handlers
-    {
-        let handle = app_handle.clone();
-
-        use tauri::Listener;
-
-        let _listener_id = handle.listen("spec-execute-response", move |event| {
-            // Parse the response payload
-            if let Ok(response) = serde_json::from_str::<serde_json::Value>(event.payload()) {
-                // Spawn a task to handle the response since we need async
-                let runtime = tokio::runtime::Handle::try_current();
-                if let Ok(rt) = runtime {
-                    rt.spawn(async move {
-                        crate::step_executor::handlers::spec::handle_spec_execute_response(
-                            response,
-                        )
-                        .await;
-                    });
-                } else {
-                    warn!("Spec Execute: No tokio runtime available for response handling");
-                }
-            } else {
-                warn!(
-                    "Spec Execute: Failed to parse response payload: {}",
-                    event.payload()
-                );
-            }
-        });
-        info!("Spec Execute: Response listener set up");
-    }
-
     // Resume interrupted unified workflows on startup
     let state_for_resume = api_state.clone();
     let resume_config_storage = api_state.config_storage.clone();

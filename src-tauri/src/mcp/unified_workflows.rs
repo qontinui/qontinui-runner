@@ -55,7 +55,6 @@ pub fn refetch_unified_workflow_steps(
     match db.get_unified_workflow(&workflow_id) {
         Ok(Some(workflow)) => {
             use crate::step_executor::ExecutionStepConfig;
-            let monitor = 0;
             let mut all_steps: Vec<ExecutionStepConfig> = Vec::new();
 
             // Helper closure to convert step
@@ -67,15 +66,11 @@ pub fn refetch_unified_workflow_steps(
                 );
 
                 // Try direct deserialization first
-                if let Ok(mut config) = serde_json::from_value::<ExecutionStepConfig>(step.clone())
-                {
+                if let Ok(config) = serde_json::from_value::<ExecutionStepConfig>(step.clone()) {
                     info!(
                         "refetch_unified_workflow_steps: serde succeeded, check_type={:?}",
                         config.check_type
                     );
-                    if config.monitor_index.is_none() {
-                        config.monitor_index = Some(monitor);
-                    }
                     return Some(config);
                 }
 
@@ -103,7 +98,6 @@ pub fn refetch_unified_workflow_steps(
                 Some(ExecutionStepConfig {
                     step_type: step_type.to_string(),
                     name,
-                    monitor_index: Some(monitor),
                     check_type: get_str(&["check_type", "checkType"]),
                     check_command: get_str(&["command", "check_command", "checkCommand"]),
                     check_working_directory: get_str(&[
@@ -135,7 +129,6 @@ pub fn refetch_unified_workflow_steps(
                         "shellCommandFailOnError",
                     ]),
                     prompt_content: get_str(&["content", "prompt_content", "promptContent"]),
-                    is_setup: get_bool(&["isSetup", "is_setup"]),
                     ..Default::default()
                 })
             };
@@ -143,7 +136,6 @@ pub fn refetch_unified_workflow_steps(
             // Add setup steps (mark as setup phase)
             for step in &workflow.setup_steps {
                 if let Some(mut config) = convert_step(step) {
-                    config.is_setup = Some(true);
                     config.phase = Some("setup".to_string());
                     all_steps.push(config);
                 }
@@ -1275,38 +1267,43 @@ pub async fn run_unified_workflow(
 
     // Helper to convert Value steps to ExecutionStepConfig
     let convert_step = |step: &serde_json::Value,
-                        monitor: i32|
+                        _monitor: i32|
      -> Option<crate::step_executor::ExecutionStepConfig> {
         // Try to deserialize the step directly
         if let Ok(mut config) =
             serde_json::from_value::<crate::step_executor::ExecutionStepConfig>(step.clone())
         {
-            // Set monitor index if not specified
-            if config.monitor_index.is_none() {
-                config.monitor_index = Some(monitor);
-            }
-
             // Fix ambiguous "command" field mapping based on step_type
             // Both shell_command and check_command have alias "command", so serde picks one arbitrarily.
             // We need to ensure the command goes to the right field based on step_type.
             if let Some(command) = step.get("command").and_then(|v| v.as_str()) {
                 let cmd = command.to_string();
                 match config.step_type.as_str() {
-                    "shell_command" => {
-                        if config.shell_command.is_none() {
+                    "command" | "shell_command" | "check" | "check_group" => {
+                        // Route "command" field to the right struct field based on check_type
+                        if config.check_type.is_some() {
+                            if config.check_command.is_none() {
+                                config.check_command = Some(cmd);
+                            }
+                        } else if config.shell_command.is_none() {
                             config.shell_command = Some(cmd);
                         }
-                    }
-                    "check" => {
-                        if config.check_command.is_none() {
-                            config.check_command = Some(cmd);
-                        }
+                        // Normalize legacy step types to "command"
+                        config.step_type = "command".to_string();
                     }
                     "test" => {
                         // Test steps may also use command field
                         if config.shell_command.is_none() {
                             config.shell_command = Some(cmd);
                         }
+                    }
+                    _ => {}
+                }
+            } else {
+                // Even without a "command" field, normalize legacy step types
+                match config.step_type.as_str() {
+                    "shell_command" | "check" | "check_group" => {
+                        config.step_type = "command".to_string();
                     }
                     _ => {}
                 }
@@ -1332,45 +1329,11 @@ pub async fn run_unified_workflow(
         Some(crate::step_executor::ExecutionStepConfig {
             step_type: step_type.to_string(),
             name,
-            action_type: step
-                .get("actionType")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            target_image_id: step
-                .get("targetImageId")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            target_image_name: step
-                .get("targetImageName")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            monitor_index: Some(monitor),
-            take_screenshot: step
-                .get("takeScreenshot")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            screenshot_delay: step
-                .get("screenshotDelay")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32)
-                .unwrap_or(0),
-            screenshot_monitor: step.get("screenshotMonitor").cloned(),
-            playwright_script_id: step
-                .get("playwrightScriptId")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            playwright_script_content: step
-                .get("playwrightScript")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            playwright_target_url: None,
             prompt_content: step
                 .get("content")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
             timeout_seconds: step.get("timeoutSeconds").and_then(|v| v.as_u64()),
-            initial_state_ids: None,
-            is_setup: step.get("isSetup").and_then(|v| v.as_bool()),
             phase: step
                 .get("phase")
                 .and_then(|v| v.as_str())
@@ -1389,34 +1352,6 @@ pub async fn run_unified_workflow(
                 .get("subStepId")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            awas_url: step
-                .get("awasUrl")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            awas_action_id: step
-                .get("awasActionName")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            awas_params: step.get("awasParameters").cloned(),
-            awas_html: None,
-            awas_base_url: step
-                .get("awasBaseUrl")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            mcp_server_id: step
-                .get("mcpServerId")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            mcp_server_name: step
-                .get("mcpServerName")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            mcp_tool_name: step
-                .get("mcpToolName")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            mcp_arguments: step.get("mcpArguments").cloned(),
-            mcp_fail_on_error: step.get("mcpFailOnError").and_then(|v| v.as_bool()),
             // Shell command fields
             shell_command: step
                 .get("command")
@@ -1431,37 +1366,6 @@ pub async fn run_unified_workflow(
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
             shell_command_fail_on_error: step.get("fail_on_error").and_then(|v| v.as_bool()),
-            // API request fields
-            api_method: step
-                .get("method")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            api_url: step
-                .get("url")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            api_headers: step.get("headers").cloned(),
-            api_body: step
-                .get("body")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            api_content_type: step
-                .get("content_type")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            api_output_variable: step
-                .get("output_variable")
-                .or_else(|| step.get("apiOutputVariable"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            api_extractions: step
-                .get("extractions")
-                .or_else(|| step.get("apiExtractions"))
-                .and_then(|v| serde_json::from_value(v.clone()).ok()),
-            api_timeout_ms: step
-                .get("timeout_ms")
-                .or_else(|| step.get("apiTimeoutMs"))
-                .and_then(|v| v.as_u64()),
             // Check fields - support both snake_case and camelCase
             check_type: step
                 .get("check_type")
@@ -1497,62 +1401,12 @@ pub async fn run_unified_workflow(
                 .or_else(|| step.get("expectedStatus"))
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u16),
-            // Macro fields
-            macro_id: step
-                .get("macro_id")
-                .or_else(|| step.get("macroId"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
             // Check group fields
             check_group_id: step
                 .get("check_group_id")
                 .or_else(|| step.get("checkGroupId"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            // Log watch fields
-            log_sources: step
-                .get("logSources")
-                .or_else(|| step.get("log_sources"))
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect()
-                }),
-            time_window_seconds: step
-                .get("timeWindowSeconds")
-                .or_else(|| step.get("time_window_seconds"))
-                .and_then(|v| v.as_u64()),
-            error_patterns: step
-                .get("errorPatterns")
-                .or_else(|| step.get("error_patterns"))
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect()
-                }),
-            // Spec fields
-            spec_group_json: step.get("spec_group").cloned(),
-            spec_element_source: step
-                .get("element_source")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            spec_stop_on_failure: step.get("stop_on_failure").and_then(|v| v.as_bool()),
-            // Gate fields
-            gate_required_steps: step
-                .get("required_steps")
-                .or_else(|| step.get("gateRequiredSteps"))
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect()
-                }),
-            gate_stop_on_failure: step
-                .get("stop_on_failure")
-                .or_else(|| step.get("gateStopOnFailure"))
-                .and_then(|v| v.as_bool()),
             ..Default::default()
         })
     };
@@ -1560,7 +1414,6 @@ pub async fn run_unified_workflow(
     // Add setup steps (mark as setup phase)
     for step in &workflow.setup_steps {
         if let Some(mut config) = convert_step(step, monitor_index) {
-            config.is_setup = Some(true);
             config.phase = Some("setup".to_string());
             all_steps.push(config);
         }
@@ -1595,55 +1448,6 @@ pub async fn run_unified_workflow(
             StatusCode::BAD_REQUEST,
             Json(api_error("Workflow has no steps to execute".to_string())),
         ));
-    }
-
-    // Pre-fetch external elements for spec steps to avoid HTTP self-call deadlock
-    // (same pattern as execute_inline_workflow)
-    let needs_external_elements = all_steps
-        .iter()
-        .any(|s| s.step_type == "spec" && s.spec_element_source.as_deref() == Some("external"));
-
-    let prefetched_elements = if needs_external_elements {
-        info!("Pre-fetching external elements for spec steps via SDK (run endpoint)");
-        match crate::mcp::sdk_client::sdk_request(
-            &state,
-            reqwest::Method::GET,
-            "/control/elements",
-            None,
-        )
-        .await
-        {
-            Ok(response) => {
-                let elements = response
-                    .get("elements")
-                    .cloned()
-                    .unwrap_or(serde_json::json!([]));
-                info!(
-                    "Pre-fetched {} external elements via SDK",
-                    elements.as_array().map(|a| a.len()).unwrap_or(0)
-                );
-                Some(elements)
-            }
-            Err(e) => {
-                warn!("Failed to pre-fetch external elements via SDK: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // Inject prefetched elements into spec steps.
-    // When prefetch fails (None) but external specs exist, inject an empty array
-    // to prevent the SpecHandler from making HTTP self-calls that can deadlock.
-    // The React handler will return a clear "No external elements" error.
-    if needs_external_elements {
-        let elements_to_inject = prefetched_elements.unwrap_or_else(|| serde_json::json!([]));
-        for step in &mut all_steps {
-            if step.step_type == "spec" && step.spec_element_source.as_deref() == Some("external") {
-                step.spec_prefetched_elements = Some(elements_to_inject.clone());
-            }
-        }
     }
 
     // Extract verification-phase steps BEFORE categorize_steps consumes all_steps.
@@ -2151,31 +1955,35 @@ pub async fn execute_inline_workflow(
 
     // Helper to convert Value steps to ExecutionStepConfig
     let convert_step = |step: &serde_json::Value,
-                        monitor: i32|
+                        _monitor: i32|
      -> Option<crate::step_executor::ExecutionStepConfig> {
         if let Ok(mut config) =
             serde_json::from_value::<crate::step_executor::ExecutionStepConfig>(step.clone())
         {
-            if config.monitor_index.is_none() {
-                config.monitor_index = Some(monitor);
-            }
             if let Some(command) = step.get("command").and_then(|v| v.as_str()) {
                 let cmd = command.to_string();
                 match config.step_type.as_str() {
-                    "shell_command" => {
-                        if config.shell_command.is_none() {
+                    "command" | "shell_command" | "check" | "check_group" => {
+                        if config.check_type.is_some() {
+                            if config.check_command.is_none() {
+                                config.check_command = Some(cmd);
+                            }
+                        } else if config.shell_command.is_none() {
                             config.shell_command = Some(cmd);
                         }
-                    }
-                    "check" => {
-                        if config.check_command.is_none() {
-                            config.check_command = Some(cmd);
-                        }
+                        config.step_type = "command".to_string();
                     }
                     "test" => {
                         if config.shell_command.is_none() {
                             config.shell_command = Some(cmd);
                         }
+                    }
+                    _ => {}
+                }
+            } else {
+                match config.step_type.as_str() {
+                    "shell_command" | "check" | "check_group" => {
+                        config.step_type = "command".to_string();
                     }
                     _ => {}
                 }
@@ -2195,7 +2003,6 @@ pub async fn execute_inline_workflow(
         Some(crate::step_executor::ExecutionStepConfig {
             step_type: step_type.to_string(),
             name,
-            monitor_index: Some(monitor),
             ..Default::default()
         })
     };
@@ -2230,51 +2037,6 @@ pub async fn execute_inline_workflow(
         "Converted {} total steps for inline workflow",
         all_steps.len()
     );
-
-    // Pre-fetch external elements for spec steps to avoid HTTP self-call deadlock
-    // Check if any spec steps need external elements
-    let needs_external_elements = all_steps
-        .iter()
-        .any(|s| s.step_type == "spec" && s.spec_element_source.as_deref() == Some("external"));
-
-    let prefetched_elements = if needs_external_elements {
-        info!("Pre-fetching external elements for spec steps via SDK");
-        match crate::mcp::sdk_client::sdk_request(
-            &state,
-            reqwest::Method::GET,
-            "/control/elements",
-            None,
-        )
-        .await
-        {
-            Ok(response) => {
-                let elements = response
-                    .get("elements")
-                    .cloned()
-                    .unwrap_or(serde_json::json!([]));
-                info!(
-                    "Pre-fetched {} external elements via SDK",
-                    elements.as_array().map(|a| a.len()).unwrap_or(0)
-                );
-                Some(elements)
-            }
-            Err(e) => {
-                warn!("Failed to pre-fetch external elements via SDK: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // Inject prefetched elements into spec steps
-    if let Some(ref elements) = prefetched_elements {
-        for step in &mut all_steps {
-            if step.step_type == "spec" && step.spec_element_source.as_deref() == Some("external") {
-                step.spec_prefetched_elements = Some(elements.clone());
-            }
-        }
-    }
 
     // Extract verification-phase steps BEFORE categorize_steps consumes all_steps.
     // This preserves the original step ordering (e.g., prompt checks before gates)
@@ -2798,14 +2560,11 @@ pub async fn run_workflow_sequence(
 
         // Helper to convert Value steps to ExecutionStepConfig (same as run_unified_workflow)
         let convert_step = |step: &serde_json::Value,
-                            monitor: i32|
+                            _monitor: i32|
          -> Option<crate::step_executor::ExecutionStepConfig> {
-            if let Ok(mut config) =
+            if let Ok(config) =
                 serde_json::from_value::<crate::step_executor::ExecutionStepConfig>(step.clone())
             {
-                if config.monitor_index.is_none() {
-                    config.monitor_index = Some(monitor);
-                }
                 return Some(config);
             }
 
@@ -2818,7 +2577,6 @@ pub async fn run_workflow_sequence(
             Some(crate::step_executor::ExecutionStepConfig {
                 step_type: step_type.to_string(),
                 name,
-                monitor_index: Some(monitor),
                 ..Default::default()
             })
         };
@@ -2920,15 +2678,12 @@ pub async fn run_workflow_sequence(
                 let monitor_index = 0i32;
                 let convert_step =
                     |step: &serde_json::Value,
-                     monitor: i32|
+                     _monitor: i32|
                      -> Option<crate::step_executor::ExecutionStepConfig> {
-                        if let Ok(mut config) = serde_json::from_value::<
+                        if let Ok(config) = serde_json::from_value::<
                             crate::step_executor::ExecutionStepConfig,
                         >(step.clone())
                         {
-                            if config.monitor_index.is_none() {
-                                config.monitor_index = Some(monitor);
-                            }
                             return Some(config);
                         }
 
@@ -2941,7 +2696,6 @@ pub async fn run_workflow_sequence(
                         Some(crate::step_executor::ExecutionStepConfig {
                             step_type: step_type.to_string(),
                             name,
-                            monitor_index: Some(monitor),
                             ..Default::default()
                         })
                     };

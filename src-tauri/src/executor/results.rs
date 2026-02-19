@@ -772,6 +772,9 @@ mod tests {
             config: StepExecutionConfig::default(),
             verification_details: None,
             output_data: None,
+            required: None,
+            resolved_inputs: None,
+            extracted_values: None,
         };
 
         let wrapped = StepExecutionOutcome::from(step_result);
@@ -811,6 +814,9 @@ mod tests {
             config: StepExecutionConfig::default(),
             verification_details: None,
             output_data: None,
+            required: None,
+            resolved_inputs: None,
+            extracted_values: None,
         };
 
         let outcome = step_result.into_outcome(5000);
@@ -846,6 +852,9 @@ mod tests {
                 config: StepExecutionConfig::default(),
                 verification_details: None,
                 output_data: None,
+                required: None,
+                resolved_inputs: None,
+                extracted_values: None,
             }],
         };
 
@@ -879,6 +888,9 @@ mod tests {
                 config: StepExecutionConfig::default(),
                 verification_details: None,
                 output_data: None,
+                required: None,
+                resolved_inputs: None,
+                extracted_values: None,
             }],
         };
 

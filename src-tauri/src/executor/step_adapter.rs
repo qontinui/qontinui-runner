@@ -254,6 +254,9 @@ impl StepExecutorAdapter {
                 config: Default::default(),
                 verification_details: None,
                 output_data: None,
+                required: None,
+                resolved_inputs: None,
+                extracted_values: None,
             }
         }
     }
@@ -605,6 +608,9 @@ mod tests {
                 config: Default::default(),
                 verification_details: None,
                 output_data: None,
+                required: None,
+                resolved_inputs: None,
+                extracted_values: None,
             },
             StepExecutionResult {
                 step_index: 1,
@@ -620,6 +626,9 @@ mod tests {
                 config: Default::default(),
                 verification_details: None,
                 output_data: None,
+                required: None,
+                resolved_inputs: None,
+                extracted_values: None,
             },
         ];
 

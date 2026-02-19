@@ -15,7 +15,12 @@ export type VerificationStatus = "pending" | "running" | "passed" | "failed" | "
 /**
  * Type of verification test that was run.
  */
-export type VerificationTestType = "repo_test" | "playwright" | "gui_automation" | "check_group";
+export type VerificationTestType =
+  | "repo_test"
+  | "playwright"
+  | "gui_automation"
+  | "command"
+  | "check_group";
 
 /**
  * Evidence collected during verification.
@@ -41,7 +46,7 @@ export interface CheckStep {
   name: string;
   /** Execution status */
   status: StepExecutionStatus;
-  /** Check type (check_group, check, playwright, etc.) */
+  /** Check type (command, check, playwright, etc.) */
   checkType: VerificationTestType;
   /** Start timestamp */
   startTime?: number;

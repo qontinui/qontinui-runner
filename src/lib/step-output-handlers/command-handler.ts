@@ -1,7 +1,7 @@
 /**
- * Shell Command Step Output Handler
+ * Command Step Output Handler
  *
- * Handles outputs from shell command steps, providing:
+ * Handles outputs from command steps, providing:
  * - Parsing of command output (stdout/stderr)
  * - AI summary generation for verification
  * - Test config auto-population
@@ -9,7 +9,7 @@
  */
 
 import {
-  type ShellCommandStepOutput,
+  type CommandStepOutput,
   type StepOutputType,
   generateStepOutputId,
 } from "../../types/step-output";
@@ -24,7 +24,7 @@ import type {
 // Raw Input Types
 // ============================================================================
 
-interface RawShellCommandOutput {
+interface RawCommandOutput {
   command?: string;
   working_directory?: string;
   exit_code?: number;
@@ -37,7 +37,7 @@ interface RawShellCommandOutput {
   extractions?: Record<string, unknown>;
 }
 
-interface ShellCommandStepConfig {
+interface CommandStepConfig {
   command?: string;
   working_directory?: string;
   cwd?: string; // Alternative field name
@@ -48,18 +48,18 @@ interface ShellCommandStepConfig {
 // Handler Implementation
 // ============================================================================
 
-export class ShellCommandHandler implements StepOutputHandler<ShellCommandStepOutput> {
-  readonly stepType: StepOutputType = "shell_command";
-  readonly displayName = "Shell Command";
+export class CommandHandler implements StepOutputHandler<CommandStepOutput> {
+  readonly stepType: StepOutputType = "command";
+  readonly displayName = "Command";
   readonly description = "Command execution with stdout, stderr, and exit code";
 
   parseOutput(
     rawOutput: unknown,
     stepConfig?: unknown,
     metadata?: StepOutputMetadata,
-  ): ShellCommandStepOutput {
-    const raw = (rawOutput || {}) as RawShellCommandOutput;
-    const config = (stepConfig || {}) as ShellCommandStepConfig;
+  ): CommandStepOutput {
+    const raw = (rawOutput || {}) as RawCommandOutput;
+    const config = (stepConfig || {}) as CommandStepConfig;
 
     const command = raw.command || config.command || "";
     const exitCode = raw.exit_code ?? raw.code ?? 0;
@@ -68,7 +68,7 @@ export class ShellCommandHandler implements StepOutputHandler<ShellCommandStepOu
 
     return {
       id: generateStepOutputId(),
-      step_type: "shell_command",
+      step_type: "command",
       step_id: metadata?.step_id,
       step_name: metadata?.step_name || this.truncateCommand(command),
       executed_at: metadata?.started_at || new Date().toISOString(),
@@ -85,10 +85,10 @@ export class ShellCommandHandler implements StepOutputHandler<ShellCommandStepOu
     };
   }
 
-  summarizeForAI(output: ShellCommandStepOutput): string {
+  summarizeForAI(output: CommandStepOutput): string {
     const lines: string[] = [];
 
-    lines.push(`### Shell Command: ${output.step_name}`);
+    lines.push(`### Command: ${output.step_name}`);
     lines.push("```bash");
     lines.push(output.command);
     lines.push("```");
@@ -144,7 +144,7 @@ export class ShellCommandHandler implements StepOutputHandler<ShellCommandStepOu
     return lines.join("\n");
   }
 
-  toTestConfig(output: ShellCommandStepOutput): TestAutoPopulateConfig | null {
+  toTestConfig(output: CommandStepOutput): TestAutoPopulateConfig | null {
     if (!output.command) {
       return null;
     }
@@ -162,13 +162,13 @@ export class ShellCommandHandler implements StepOutputHandler<ShellCommandStepOu
     }
 
     return {
-      config_key: "shell_command_config",
+      config_key: "command_config",
       config_value: config,
-      description: `Shell command config for: ${this.truncateCommand(output.command)}`,
+      description: `Command config for: ${this.truncateCommand(output.command)}`,
     };
   }
 
-  getAssertableFields(output: ShellCommandStepOutput): AssertableField[] {
+  getAssertableFields(output: CommandStepOutput): AssertableField[] {
     const fields: AssertableField[] = [];
 
     // Exit code
@@ -292,4 +292,4 @@ export class ShellCommandHandler implements StepOutputHandler<ShellCommandStepOu
 // Export singleton instance
 // ============================================================================
 
-export const shellCommandHandler = new ShellCommandHandler();
+export const commandHandler = new CommandHandler();

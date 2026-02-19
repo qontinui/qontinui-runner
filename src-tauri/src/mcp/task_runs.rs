@@ -1743,7 +1743,10 @@ pub async fn get_current_execution_steps(
     for event in events {
         // Only process step-related events
         let event_type = event.event_type.as_str();
-        if event_type != "step_execution" && event_type != "shell_command" {
+        if event_type != "step_execution"
+            && event_type != "command"
+            && event_type != "shell_command"
+        {
             continue;
         }
         // Parse the event data JSON to extract step information

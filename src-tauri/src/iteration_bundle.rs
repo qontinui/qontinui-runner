@@ -450,14 +450,14 @@ impl IterationBundle {
                     duration_ms: step.duration_ms,
                     screenshot_after,
                     config: StepConfigSummary {
-                        action_type: step.config.action_type.clone(),
-                        target_image_id: step.config.target_image_id.clone(),
-                        target_image_name: step.config.target_image_name.clone(),
-                        monitor_index: step.config.monitor_index,
-                        screenshot_delay: step.config.screenshot_delay,
+                        action_type: None,
+                        target_image_id: None,
+                        target_image_name: None,
+                        monitor_index: None,
+                        screenshot_delay: None,
                         timeout_seconds: step.config.timeout_seconds,
-                        playwright_script_id: step.config.playwright_script_id.clone(),
-                        initial_state_ids: step.config.initial_state_ids.clone(),
+                        playwright_script_id: None,
+                        initial_state_ids: None,
                         check_type: step.config.check_type.clone(),
                         command: step.config.command.clone(),
                         test_id: step.config.test_id.clone(),
@@ -1004,22 +1004,12 @@ impl IterationBundle {
                     parts.push(format!("script_id={}", script_id));
                 }
             }
-            "check" => {
+            "command" | "check" | "shell_command" => {
                 if let Some(ref check_type) = config.check_type {
                     parts.push(format!("type={}", check_type));
                 }
                 if let Some(ref command) = config.command {
                     // Truncate long commands
-                    let cmd_display = if command.len() > 50 {
-                        format!("{}...", &command[..50])
-                    } else {
-                        command.clone()
-                    };
-                    parts.push(format!("command=\"{}\"", cmd_display));
-                }
-            }
-            "shell_command" => {
-                if let Some(ref command) = config.command {
                     let cmd_display = if command.len() > 50 {
                         format!("{}...", &command[..50])
                     } else {

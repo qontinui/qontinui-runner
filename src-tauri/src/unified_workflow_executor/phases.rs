@@ -41,8 +41,7 @@ use crate::executor::{
 use crate::findings::storage as finding_storage;
 use crate::findings::{FindingParser, ParsedFinding};
 use crate::step_executor::{
-    handlers::spec::fetch_external_elements, ExecutionStepConfig, StepExecutionResult,
-    StepExecutor, VerificationPhaseResult,
+    ExecutionStepConfig, StepExecutionResult, StepExecutor, VerificationPhaseResult,
 };
 use crate::step_metadata::{StepDetails, StepMetadata};
 use crate::step_registry::{StepEventKind, StepEventLogger};
@@ -836,7 +835,7 @@ impl SetupExecutor {
             // Checkpoint each automation step
             for (idx, step) in automation_steps.iter().enumerate() {
                 let step_type =
-                    StepType::from_str_compat(&step.step_type).unwrap_or(StepType::ShellCommand);
+                    StepType::from_str_compat(&step.step_type).unwrap_or(StepType::Command);
                 let step_name = step.name.as_deref().unwrap_or(&step.step_type);
 
                 // Use Some(0) instead of None for iteration to ensure SQLite's
@@ -865,7 +864,7 @@ impl SetupExecutor {
             for (idx, step_result) in result.steps.iter().enumerate() {
                 let step = &automation_steps[idx];
                 let step_type =
-                    StepType::from_str_compat(&step.step_type).unwrap_or(StepType::ShellCommand);
+                    StepType::from_str_compat(&step.step_type).unwrap_or(StepType::Command);
                 let step_name = step.name.as_deref().unwrap_or(&step.step_type);
 
                 // Use Some(0) instead of None for iteration to ensure SQLite's
@@ -1017,6 +1016,9 @@ impl SetupExecutor {
                                 config: crate::step_executor::StepExecutionConfig::default(),
                                 verification_details: None,
                                 output_data: Some(serde_json::json!({ "output": output })),
+                                required: None,
+                                resolved_inputs: None,
+                                extracted_values: None,
                             });
                         }
                         Err(e) => {
@@ -1071,6 +1073,9 @@ impl SetupExecutor {
                                 config: crate::step_executor::StepExecutionConfig::default(),
                                 verification_details: None,
                                 output_data: None,
+                                required: None,
+                                resolved_inputs: None,
+                                extracted_values: None,
                             });
                             return (false, all_results);
                         }
@@ -1336,8 +1341,6 @@ impl VerificationExecutor {
                     skipped_steps: 0,
                     total_duration_ms: 0,
                     step_results: Vec::new(),
-                    gate_results: Vec::new(),
-                    gate_based_evaluation: false,
                     console_errors: None,
                 },
                 Vec::new(),
@@ -1352,104 +1355,6 @@ impl VerificationExecutor {
 
         // Create checkpoint manager for step-level checkpointing
         let checkpoint_mgr = CheckpointManager::new(self.checkpoint_db.clone(), "unified");
-
-        // Pre-fetch external elements if any spec step needs them
-        // This avoids per-step timeouts and provides early failure detection
-        let needs_external_elements = steps.iter().any(|step| {
-            step.step_type == "spec" && step.spec_element_source.as_deref() == Some("external")
-        });
-
-        let prefetched_elements = if needs_external_elements {
-            info!("VERIFICATION-PHASE: Pre-fetching external elements for spec verification");
-            match fetch_external_elements().await {
-                Ok(elements) => {
-                    let count = elements.as_array().map(|a| a.len()).unwrap_or(0);
-                    info!(
-                        "VERIFICATION-PHASE: Pre-fetched {} external elements from Chrome extension",
-                        count
-                    );
-                    Some(elements)
-                }
-                Err(e) => {
-                    // External elements are required but couldn't be fetched - fail early
-                    // This provides clear feedback about Chrome extension connectivity
-                    warn!(
-                        "VERIFICATION-PHASE: UI Bridge spec verification failed - Chrome extension not connected (not a Playwright issue): {}",
-                        e
-                    );
-
-                    // Return a failed verification result with connectivity error
-                    let error_msg = format!(
-                        "UI Bridge spec verification failed: Chrome extension not connected. \
-                         This is NOT a Playwright test - it's a UI Bridge spec verification \
-                         that requires the Qontinui browser extension to be installed and \
-                         connected to an active browser tab. Error: {}",
-                        e
-                    );
-                    let now = chrono::Utc::now().to_rfc3339();
-                    let connectivity_result = StepExecutionResult {
-                        step_index: 0,
-                        step_type: "ui_bridge_connectivity".to_string(),
-                        step_name: "UI Bridge Extension Connectivity Check".to_string(),
-                        step_id: None,
-                        success: false,
-                        error: Some(error_msg.clone()),
-                        screenshot_path: None,
-                        started_at: Some(now.clone()),
-                        ended_at: Some(now),
-                        duration_ms: 0,
-                        config: crate::step_executor::StepExecutionConfig::default(),
-                        verification_details: None,
-                        output_data: None,
-                    };
-
-                    return (
-                        VerificationPhaseResult {
-                            iteration,
-                            all_passed: false,
-                            critical_failure: true, // Mark as critical since external elements are required
-                            total_steps: steps.len(),
-                            passed_steps: 0,
-                            failed_steps: 1,
-                            skipped_steps: steps.len().saturating_sub(1),
-                            total_duration_ms: 0,
-                            step_results: vec![connectivity_result.clone()],
-                            gate_results: Vec::new(),
-                            gate_based_evaluation: false,
-                            console_errors: None,
-                        },
-                        vec![connectivity_result],
-                    );
-                }
-            }
-        } else {
-            None
-        };
-
-        // Clone steps and inject pre-fetched elements if available
-        let steps_to_execute: Vec<ExecutionStepConfig> = if let Some(ref elements) =
-            prefetched_elements
-        {
-            steps
-                .iter()
-                .map(|step| {
-                    let mut step = step.clone();
-                    if step.step_type == "spec"
-                        && step.spec_element_source.as_deref() == Some("external")
-                    {
-                        debug!(
-                            "VERIFICATION-PHASE: Injecting pre-fetched elements into spec step '{}'",
-                            step.name.as_deref().unwrap_or("unnamed")
-                        );
-                        step.spec_prefetched_elements = Some(elements.clone());
-                    }
-                    step
-                })
-                .collect()
-        } else {
-            steps.to_vec()
-        };
-        let steps = &steps_to_execute;
 
         // Log START events and save checkpoints for each step before execution
         for (idx, step) in steps.iter().enumerate() {
@@ -2356,7 +2261,7 @@ impl CompletionExecutor {
             // Checkpoint each automation step
             for (idx, step) in automation_steps.iter().enumerate() {
                 let step_type =
-                    StepType::from_str_compat(&step.step_type).unwrap_or(StepType::ShellCommand);
+                    StepType::from_str_compat(&step.step_type).unwrap_or(StepType::Command);
                 let step_name = step.name.as_deref().unwrap_or(&step.step_type);
 
                 // Use Some(0) instead of None for iteration to ensure SQLite's
@@ -2385,7 +2290,7 @@ impl CompletionExecutor {
             for (idx, step_result) in result.steps.iter().enumerate() {
                 let step = &automation_steps[idx];
                 let step_type =
-                    StepType::from_str_compat(&step.step_type).unwrap_or(StepType::ShellCommand);
+                    StepType::from_str_compat(&step.step_type).unwrap_or(StepType::Command);
                 let step_name = step.name.as_deref().unwrap_or(&step.step_type);
 
                 // Use Some(0) instead of None for iteration to ensure SQLite's
@@ -2573,6 +2478,9 @@ impl CompletionExecutor {
                                 config: crate::step_executor::StepExecutionConfig::default(),
                                 verification_details: None,
                                 output_data: Some(serde_json::json!({ "output": output })),
+                                required: None,
+                                resolved_inputs: None,
+                                extracted_values: None,
                             });
                         }
                         Err(e) => {
@@ -2628,6 +2536,9 @@ impl CompletionExecutor {
                                 config: crate::step_executor::StepExecutionConfig::default(),
                                 verification_details: None,
                                 output_data: None,
+                                required: None,
+                                resolved_inputs: None,
+                                extracted_values: None,
                             });
                             // Completion failures are non-fatal - don't return early
                             overall_success = false;

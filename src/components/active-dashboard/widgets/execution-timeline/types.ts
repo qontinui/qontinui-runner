@@ -25,11 +25,12 @@ export type StepType =
   | "playwright"
   | "test"
   | "check"
-  | "check_group"
-  // Command
+  | "check_group" // Legacy: now mapped to "check" (kept for historical data)
+  // Command (unified: shell commands, API requests, MCP calls, checks)
   | "shell"
-  | "api_request"
-  | "mcp_call"
+  | "command" // New canonical command type
+  | "api_request" // Legacy: now part of "command" (kept for historical data)
+  | "mcp_call" // Legacy: now part of "command" (kept for historical data)
   // AI
   | "prompt"
   | "ai_session"

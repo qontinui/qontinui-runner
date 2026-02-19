@@ -15,7 +15,7 @@ use serde_json::Value;
 /// # Example
 ///
 /// ```ignore
-/// let metadata = StepMetadata::setup(task_run_id, StepType::ShellCommand, "Install deps", 0);
+/// let metadata = StepMetadata::setup(task_run_id, StepType::Command, "Install deps", 0);
 /// let details = StepDetails::shell_command("npm install".to_string(), None, None);
 ///
 /// let event = StepEventBuilder::new(task_run_id, metadata)
@@ -295,7 +295,7 @@ mod tests {
     fn test_build_start_event() {
         let metadata = StepMetadata::new(
             ExecutionContext::setup("task-123"),
-            StepType::ShellCommand,
+            StepType::Command,
             "Install dependencies",
             0,
         );
@@ -314,7 +314,7 @@ mod tests {
 
         // Verify data contains required fields
         let data: serde_json::Value = serde_json::from_str(event.data.as_ref().unwrap()).unwrap();
-        assert_eq!(data["step_type"], "shell_command");
+        assert_eq!(data["step_type"], "command");
         assert_eq!(data["step_index"], 0);
         assert_eq!(data["phase"], "setup");
         assert_eq!(data["task_run_id"], "task-123");
@@ -343,7 +343,7 @@ mod tests {
 
     #[test]
     fn test_build_error_event() {
-        let metadata = StepMetadata::setup("task-123", StepType::ShellCommand, "Build", 0);
+        let metadata = StepMetadata::setup("task-123", StepType::Command, "Build", 0);
 
         let event = StepEventBuilder::new("task-123", metadata)
             .build_error(500, Some("Command failed with exit code 1"));
@@ -379,7 +379,7 @@ mod tests {
 
         let steps = vec![
             MockStep {
-                step_type: "shell_command".to_string(),
+                step_type: "command".to_string(),
             },
             MockStep {
                 step_type: "prompt".to_string(),
@@ -396,7 +396,7 @@ mod tests {
 
         assert_eq!(automation.len(), 2);
         assert_eq!(ai.len(), 2);
-        assert_eq!(automation[0].step_type, "shell_command");
+        assert_eq!(automation[0].step_type, "command");
         assert_eq!(automation[1].step_type, "playwright");
         assert_eq!(ai[0].step_type, "prompt");
         assert_eq!(ai[1].step_type, "ai_session");

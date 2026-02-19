@@ -51,6 +51,16 @@ pub fn validate_workflow(workflow: &UnifiedWorkflow) -> Vec<ValidationError> {
     validate_phase_constraints(&workflow.agentic_steps, "agentic", &mut errors);
     validate_phase_constraints(&workflow.completion_steps, "completion", &mut errors);
 
+    // Validate data flow: inputs, depends_on, and extract references
+    let all_steps: Vec<&Value> = workflow
+        .setup_steps
+        .iter()
+        .chain(workflow.verification_steps.iter())
+        .chain(workflow.agentic_steps.iter())
+        .chain(workflow.completion_steps.iter())
+        .collect();
+    validate_step_references(&all_steps, &mut errors);
+
     // Validate timestamps
     if chrono::DateTime::parse_from_rfc3339(&workflow.created_at).is_err() {
         errors.push(ValidationError {
@@ -125,51 +135,13 @@ fn validate_steps(steps: &[Value], expected_phase: &str, errors: &mut Vec<Valida
 ///
 /// This is the single source of truth for phase constraints, used by both
 /// validation and the metadata registry.
+///
+/// The 4 core step types are: command, test, ui_bridge, prompt.
 pub fn allowed_types_for_phase(phase: &str) -> &'static [&'static str] {
     match phase {
-        "setup" => &[
-            "script",
-            "state",
-            "workflow_ref",
-            "gui_action",
-            "api_request",
-            "mcp_call",
-            "prompt",
-            "shell_command",
-            "check_group",
-            "macro",
-            "awas_discover",
-            "awas_execute",
-            "awas_check_support",
-            "awas_list_actions",
-        ],
-        "verification" => &[
-            "test",
-            "check",
-            "screenshot",
-            "gui_action",
-            "state",
-            "workflow_ref",
-            "api_request",
-            "mcp_call",
-            "prompt",
-            "spec",
-            "gate",
-            "check_group",
-            "macro",
-            "awas_execute",
-            "awas_list_actions",
-            "awas_extract_elements",
-        ],
-        "completion" => &[
-            "prompt",
-            "script",
-            "api_request",
-            "mcp_call",
-            "shell_command",
-            "check_group",
-            "macro",
-        ],
+        "setup" => &["command", "prompt", "ui_bridge"],
+        "verification" => &["command", "test", "ui_bridge", "prompt"],
+        "completion" => &["command", "prompt", "ui_bridge"],
         "agentic" => &["prompt"],
         _ => &[],
     }
@@ -193,9 +165,157 @@ fn validate_phase_constraints(steps: &[Value], phase: &str, errors: &mut Vec<Val
     }
 }
 
-/// Check if a workflow is a check-group workflow (all verification steps are checks + gate).
+/// Validate that `inputs`, `depends_on`, and `extract` references point to valid step IDs.
 ///
-/// A check-group workflow should have ONLY `check` and `gate` type steps in verification,
+/// Checks:
+/// - All step IDs in `depends_on` arrays reference existing step IDs
+/// - All step ID references in `inputs` values (via `${step_id.field}` syntax) reference existing step IDs
+/// - No circular dependencies exist in `depends_on` chains
+pub fn validate_step_references(all_steps: &[&Value], errors: &mut Vec<ValidationError>) {
+    // Collect all step IDs
+    let step_ids: std::collections::HashSet<String> = all_steps
+        .iter()
+        .filter_map(|step| step.get("id").and_then(|v| v.as_str()).map(String::from))
+        .collect();
+
+    // Build adjacency list for cycle detection
+    let mut adjacency: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+
+    for step in all_steps {
+        let step_id = match step.get("id").and_then(|v| v.as_str()) {
+            Some(id) => id.to_string(),
+            None => continue,
+        };
+        let step_name = step
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        // Validate depends_on references
+        if let Some(depends_on) = step.get("depends_on").and_then(|v| v.as_array()) {
+            let mut deps = Vec::new();
+            for (j, dep) in depends_on.iter().enumerate() {
+                if let Some(dep_id) = dep.as_str() {
+                    if !step_ids.contains(dep_id) {
+                        errors.push(ValidationError {
+                            field: format!("step '{}' ({})", step_name, step_id),
+                            message: format!(
+                                "depends_on[{}] references non-existent step ID: {}",
+                                j, dep_id
+                            ),
+                        });
+                    }
+                    deps.push(dep_id.to_string());
+                }
+            }
+            adjacency.insert(step_id.clone(), deps);
+        }
+
+        // Validate inputs references (look for ${step_id.field} patterns)
+        if let Some(inputs) = step.get("inputs").and_then(|v| v.as_object()) {
+            for (key, value) in inputs {
+                if let Some(val_str) = value.as_str() {
+                    // Extract step ID from ${step_id.field} pattern
+                    let mut start = 0;
+                    while let Some(pos) = val_str[start..].find("${") {
+                        let abs_pos = start + pos + 2;
+                        if let Some(end) = val_str[abs_pos..].find('}') {
+                            let ref_expr = &val_str[abs_pos..abs_pos + end];
+                            if let Some(ref_step_id) = ref_expr.split('.').next() {
+                                if !ref_step_id.is_empty() && !step_ids.contains(ref_step_id) {
+                                    errors.push(ValidationError {
+                                        field: format!("step '{}' ({})", step_name, step_id),
+                                        message: format!(
+                                            "inputs.{} references non-existent step ID: {}",
+                                            key, ref_step_id
+                                        ),
+                                    });
+                                }
+                            }
+                            start = abs_pos + end + 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Detect cycles in depends_on
+    if let Some(cycle) = detect_cycles(&adjacency) {
+        errors.push(ValidationError {
+            field: "depends_on".to_string(),
+            message: format!(
+                "Circular dependency detected in depends_on chain: {}",
+                cycle.join(" -> ")
+            ),
+        });
+    }
+}
+
+/// Detect cycles in the dependency graph using DFS.
+///
+/// Returns the cycle path if one is found, or None if the graph is acyclic.
+pub fn detect_cycles(
+    adjacency: &std::collections::HashMap<String, Vec<String>>,
+) -> Option<Vec<String>> {
+    use std::collections::HashSet;
+
+    let mut visited = HashSet::new();
+    let mut in_stack = HashSet::new();
+    let mut stack = Vec::new();
+
+    for node in adjacency.keys() {
+        if !visited.contains(node) {
+            if let Some(cycle) =
+                dfs_detect_cycle(node, adjacency, &mut visited, &mut in_stack, &mut stack)
+            {
+                return Some(cycle);
+            }
+        }
+    }
+
+    None
+}
+
+fn dfs_detect_cycle(
+    node: &str,
+    adjacency: &std::collections::HashMap<String, Vec<String>>,
+    visited: &mut std::collections::HashSet<String>,
+    in_stack: &mut std::collections::HashSet<String>,
+    stack: &mut Vec<String>,
+) -> Option<Vec<String>> {
+    visited.insert(node.to_string());
+    in_stack.insert(node.to_string());
+    stack.push(node.to_string());
+
+    if let Some(neighbors) = adjacency.get(node) {
+        for neighbor in neighbors {
+            if !visited.contains(neighbor.as_str()) {
+                if let Some(cycle) = dfs_detect_cycle(neighbor, adjacency, visited, in_stack, stack)
+                {
+                    return Some(cycle);
+                }
+            } else if in_stack.contains(neighbor.as_str()) {
+                // Found a cycle — extract the cycle path
+                let cycle_start = stack.iter().position(|n| n == neighbor).unwrap_or(0);
+                let mut cycle: Vec<String> = stack[cycle_start..].to_vec();
+                cycle.push(neighbor.clone());
+                return Some(cycle);
+            }
+        }
+    }
+
+    stack.pop();
+    in_stack.remove(node);
+    None
+}
+
+/// Check if a workflow is a check-group workflow (all verification steps are command steps with check_type).
+///
+/// A check-group workflow should have ONLY `command` type steps (with check_type set) in verification,
 /// with no setup or completion steps. The AI builder sometimes adds unnecessary setup/completion
 /// steps despite instructions — this function detects check-group workflows so we can
 /// deterministically strip those extra phases.
@@ -205,21 +325,22 @@ fn is_check_group_workflow(workflow: &UnifiedWorkflow) -> bool {
         return false;
     }
 
-    // Must have at least one check step and exactly one gate step
+    // Must have only command steps with check_type in verification
     let mut has_check = false;
-    let mut gate_count = 0;
 
     for step in &workflow.verification_steps {
         let step_type = step.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let has_check_type = step.get("check_type").is_some();
         match step_type {
+            // Legacy "check" type or new "command" type with check_type field
             "check" => has_check = true,
-            "gate" => gate_count += 1,
+            "command" if has_check_type => has_check = true,
             // Any other step type means this is NOT a pure check-group workflow
             _ => return false,
         }
     }
 
-    has_check && gate_count == 1
+    has_check
 }
 
 /// Fix common issues in generated workflows
@@ -244,9 +365,6 @@ pub fn fix_workflow(workflow: &mut UnifiedWorkflow) {
     fix_step_ids_and_phases(&mut workflow.agentic_steps, "agentic");
     fix_step_ids_and_phases(&mut workflow.completion_steps, "completion");
 
-    // Ensure gate required_steps covers all non-gate/non-prompt verification steps
-    fix_gate_required_steps(&mut workflow.verification_steps);
-
     // For check-group workflows, strip setup and completion steps.
     // The AI builder often adds unnecessary setup/completion steps despite generation rules.
     // This deterministic fix ensures check-group workflows are clean.
@@ -266,63 +384,6 @@ pub fn fix_workflow(workflow: &mut UnifiedWorkflow) {
                 workflow.name
             );
             workflow.completion_steps.clear();
-        }
-    }
-}
-
-/// Ensure gate steps in verification include ALL non-gate, non-prompt step IDs.
-///
-/// The gate determines verification pass/fail — any step NOT in `required_steps` is
-/// invisible to the verification loop. This prevents the scenario where a feature
-/// completeness check fails but the gate passes because that check wasn't listed.
-fn fix_gate_required_steps(verification_steps: &mut [Value]) {
-    // Collect all non-gate, non-prompt verification step IDs
-    let non_gate_ids: Vec<String> = verification_steps
-        .iter()
-        .filter_map(|step| {
-            let step_type = step.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            if step_type == "gate" || step_type == "prompt" {
-                return None;
-            }
-            step.get("id").and_then(|v| v.as_str()).map(String::from)
-        })
-        .collect();
-
-    if non_gate_ids.is_empty() {
-        return;
-    }
-
-    for step in verification_steps.iter_mut() {
-        let step_type = step.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if step_type != "gate" {
-            continue;
-        }
-
-        if let Value::Object(map) = step {
-            let current_required: Vec<String> = map
-                .get("required_steps")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            // Add any missing non-gate/non-prompt step IDs
-            let mut updated = current_required.clone();
-            for id in &non_gate_ids {
-                if !updated.contains(id) {
-                    updated.push(id.clone());
-                }
-            }
-
-            if updated.len() != current_required.len() {
-                map.insert(
-                    "required_steps".to_string(),
-                    Value::Array(updated.into_iter().map(Value::String).collect()),
-                );
-            }
         }
     }
 }
@@ -395,80 +456,70 @@ mod tests {
     }
 
     #[test]
-    fn test_fix_gate_adds_missing_required_steps() {
-        let mut steps = vec![
-            json!({"id": "check-1", "type": "check", "phase": "verification"}),
-            json!({"id": "api-1", "type": "api_request", "phase": "verification"}),
-            json!({"id": "test-1", "type": "test", "phase": "verification"}),
-            json!({"id": "gate-1", "type": "gate", "phase": "verification", "required_steps": ["check-1"]}),
+    fn test_validate_step_references_valid() {
+        let steps = vec![
+            json!({"id": "step-1", "name": "First", "type": "command", "phase": "setup"}),
+            json!({"id": "step-2", "name": "Second", "type": "command", "phase": "setup", "depends_on": ["step-1"]}),
         ];
-
-        fix_gate_required_steps(&mut steps);
-
-        let gate = &steps[3];
-        let required: Vec<&str> = gate["required_steps"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert!(required.contains(&"check-1"));
-        assert!(required.contains(&"api-1"));
-        assert!(required.contains(&"test-1"));
-        assert_eq!(required.len(), 3);
+        let step_refs: Vec<&Value> = steps.iter().collect();
+        let mut errors = Vec::new();
+        validate_step_references(&step_refs, &mut errors);
+        assert!(
+            errors.is_empty(),
+            "Expected no errors but got: {:?}",
+            errors
+        );
     }
 
     #[test]
-    fn test_fix_gate_skips_prompt_steps() {
-        let mut steps = vec![
-            json!({"id": "check-1", "type": "check", "phase": "verification"}),
-            json!({"id": "prompt-1", "type": "prompt", "phase": "verification"}),
-            json!({"id": "gate-1", "type": "gate", "phase": "verification", "required_steps": []}),
+    fn test_validate_step_references_invalid_depends_on() {
+        let steps = vec![
+            json!({"id": "step-1", "name": "First", "type": "command", "phase": "setup"}),
+            json!({"id": "step-2", "name": "Second", "type": "command", "phase": "setup", "depends_on": ["nonexistent"]}),
         ];
-
-        fix_gate_required_steps(&mut steps);
-
-        let gate = &steps[2];
-        let required: Vec<&str> = gate["required_steps"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert!(required.contains(&"check-1"));
-        assert!(!required.contains(&"prompt-1"));
-        assert_eq!(required.len(), 1);
+        let step_refs: Vec<&Value> = steps.iter().collect();
+        let mut errors = Vec::new();
+        validate_step_references(&step_refs, &mut errors);
+        assert!(errors.iter().any(|e| e.message.contains("nonexistent")));
     }
 
     #[test]
-    fn test_fix_gate_noop_when_complete() {
-        let mut steps = vec![
-            json!({"id": "check-1", "type": "check", "phase": "verification"}),
-            json!({"id": "gate-1", "type": "gate", "phase": "verification", "required_steps": ["check-1"]}),
+    fn test_validate_step_references_invalid_inputs() {
+        let steps = vec![
+            json!({"id": "step-1", "name": "First", "type": "command", "phase": "setup"}),
+            json!({"id": "step-2", "name": "Second", "type": "command", "phase": "setup", "inputs": {"token": "${bad-id.token}"}}),
         ];
-
-        fix_gate_required_steps(&mut steps);
-
-        let gate = &steps[1];
-        let required: Vec<&str> = gate["required_steps"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert_eq!(required, vec!["check-1"]);
+        let step_refs: Vec<&Value> = steps.iter().collect();
+        let mut errors = Vec::new();
+        validate_step_references(&step_refs, &mut errors);
+        assert!(errors.iter().any(|e| e.message.contains("bad-id")));
     }
 
     #[test]
-    fn test_fix_gate_noop_without_gates() {
-        let mut steps = vec![
-            json!({"id": "check-1", "type": "check", "phase": "verification"}),
-            json!({"id": "api-1", "type": "api_request", "phase": "verification"}),
-        ];
+    fn test_detect_cycles_no_cycle() {
+        let mut adjacency = std::collections::HashMap::new();
+        adjacency.insert("a".to_string(), vec!["b".to_string()]);
+        adjacency.insert("b".to_string(), vec!["c".to_string()]);
+        adjacency.insert("c".to_string(), vec![]);
+        assert!(detect_cycles(&adjacency).is_none());
+    }
 
-        let original = steps.clone();
-        fix_gate_required_steps(&mut steps);
-        assert_eq!(steps, original);
+    #[test]
+    fn test_detect_cycles_with_cycle() {
+        let mut adjacency = std::collections::HashMap::new();
+        adjacency.insert("a".to_string(), vec!["b".to_string()]);
+        adjacency.insert("b".to_string(), vec!["c".to_string()]);
+        adjacency.insert("c".to_string(), vec!["a".to_string()]);
+        let cycle = detect_cycles(&adjacency);
+        assert!(cycle.is_some(), "Expected a cycle to be detected");
+    }
+
+    #[test]
+    fn test_detect_cycles_self_reference() {
+        let mut adjacency = std::collections::HashMap::new();
+        adjacency.insert("a".to_string(), vec!["a".to_string()]);
+        let cycle = detect_cycles(&adjacency);
+        assert!(cycle.is_some(), "Expected self-referencing cycle");
     }
 
     fn make_check_group_workflow(
@@ -516,9 +567,8 @@ mod tests {
         let wf = make_check_group_workflow(
             vec![],
             vec![
-                json!({"id": "c1", "type": "check", "phase": "verification"}),
-                json!({"id": "c2", "type": "check", "phase": "verification"}),
-                json!({"id": "g1", "type": "gate", "phase": "verification"}),
+                json!({"id": "c1", "type": "command", "check_type": "lint", "phase": "verification"}),
+                json!({"id": "c2", "type": "command", "check_type": "typecheck", "phase": "verification"}),
             ],
             vec![],
         );
@@ -530,22 +580,8 @@ mod tests {
         let wf = make_check_group_workflow(
             vec![],
             vec![
-                json!({"id": "c1", "type": "check", "phase": "verification"}),
+                json!({"id": "c1", "type": "command", "check_type": "lint", "phase": "verification"}),
                 json!({"id": "t1", "type": "test", "phase": "verification"}),
-                json!({"id": "g1", "type": "gate", "phase": "verification"}),
-            ],
-            vec![],
-        );
-        assert!(!is_check_group_workflow(&wf));
-    }
-
-    #[test]
-    fn test_is_check_group_workflow_false_no_gate() {
-        let wf = make_check_group_workflow(
-            vec![],
-            vec![
-                json!({"id": "c1", "type": "check", "phase": "verification"}),
-                json!({"id": "c2", "type": "check", "phase": "verification"}),
             ],
             vec![],
         );
@@ -556,11 +592,11 @@ mod tests {
     fn test_fix_workflow_strips_setup_completion_for_check_group() {
         let mut wf = make_check_group_workflow(
             vec![
-                json!({"id": Uuid::new_v4().to_string(), "type": "shell_command", "phase": "setup", "name": "Install deps"}),
+                json!({"id": Uuid::new_v4().to_string(), "type": "command", "phase": "setup", "name": "Install deps"}),
             ],
             vec![
-                json!({"id": "c1", "type": "check", "phase": "verification", "name": "Lint"}),
-                json!({"id": "g1", "type": "gate", "phase": "verification", "name": "Gate", "required_steps": ["c1"]}),
+                json!({"id": "c1", "type": "command", "check_type": "lint", "phase": "verification", "name": "Lint"}),
+                json!({"id": "c2", "type": "command", "check_type": "typecheck", "phase": "verification", "name": "Typecheck"}),
             ],
             vec![
                 json!({"id": Uuid::new_v4().to_string(), "type": "prompt", "phase": "completion", "name": "Summary"}),
@@ -580,12 +616,11 @@ mod tests {
     fn test_fix_workflow_preserves_setup_for_non_check_group() {
         let mut wf = make_check_group_workflow(
             vec![
-                json!({"id": Uuid::new_v4().to_string(), "type": "shell_command", "phase": "setup", "name": "Install deps"}),
+                json!({"id": Uuid::new_v4().to_string(), "type": "command", "phase": "setup", "name": "Install deps"}),
             ],
             vec![
-                json!({"id": "c1", "type": "check", "phase": "verification", "name": "Lint"}),
+                json!({"id": "c1", "type": "command", "check_type": "lint", "phase": "verification", "name": "Lint"}),
                 json!({"id": "t1", "type": "test", "phase": "verification", "name": "Unit tests"}),
-                json!({"id": "g1", "type": "gate", "phase": "verification", "name": "Gate", "required_steps": ["c1", "t1"]}),
             ],
             vec![
                 json!({"id": Uuid::new_v4().to_string(), "type": "prompt", "phase": "completion", "name": "Summary"}),

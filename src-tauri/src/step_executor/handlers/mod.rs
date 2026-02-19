@@ -14,16 +14,14 @@
 //!             └── handler.execute(step, context)
 //! ```
 //!
-//! ## Available Handlers (25 total)
+//! ## Available Handlers (4 active)
 //!
 //! | Category | Handlers |
 //! |----------|----------|
-//! | **GUI** | workflow, workflow_ref, state, action, gui_action, screenshot, macro |
-//! | **Shell/Script** | shell_command, shell, script, playwright |
-//! | **Verification** | log_watch, check, check_group, test, spec |
-//! | **API/MCP** | api_request, mcp_call |
-//! | **AWAS** | awas_discover, awas_execute, awas_check_support, awas_list_actions, awas_extract_elements |
-//! | **Other** | prompt |
+//! | **Command** | command (dispatches to shell_command, check, check_group) |
+//! | **Verification** | test |
+//! | **UI Bridge** | ui_bridge |
+//! | **AI** | prompt |
 //!
 //! ## Adding a New Step Type
 //!
@@ -70,71 +68,19 @@ use super::events::TreeEventEmitter;
 use super::executor::ExecutionStepConfig;
 
 // Step handler implementations
-mod action;
-mod api_request;
-mod check;
-mod check_group;
-mod error_resolved;
-mod gui_action;
-mod log_watch;
-mod macro_step;
-mod mcp_call;
-mod playwright;
-mod screenshot;
-mod script;
-mod shell;
-mod shell_command;
-mod state;
+// Internal modules used by CommandHandler (not registered directly)
+pub(super) mod check;
+pub(super) mod check_group;
+pub(super) mod shell_command;
+// Active handlers
+mod command;
 mod test;
-mod workflow;
-mod workflow_ref;
-
-// Save workflow artifact handler
-mod save_workflow_artifact;
-
-// UI Bridge Spec handler
-pub mod spec;
-
-// AWAS handlers
-mod awas_check_support;
-mod awas_common;
-mod awas_discover;
-mod awas_execute;
-mod awas_extract_elements;
-mod awas_list_actions;
+mod ui_bridge;
 
 // Re-export handlers for registration
-pub use action::ActionHandler;
-pub use api_request::ApiRequestHandler;
-pub use check::CheckHandler;
-pub use check_group::CheckGroupHandler;
-pub use error_resolved::ErrorResolvedHandler;
-pub use gui_action::GuiActionHandler;
-pub use log_watch::LogWatchHandler;
-pub use macro_step::MacroHandler;
-pub use mcp_call::McpCallHandler;
-pub use playwright::PlaywrightHandler;
-pub use screenshot::ScreenshotHandler;
-pub use script::ScriptHandler;
-pub use shell::ShellHandler;
-pub use shell_command::ShellCommandHandler;
-pub use state::StateHandler;
-pub use test::TestHandler;
-pub use workflow::WorkflowHandler;
-pub use workflow_ref::WorkflowRefHandler;
-
-// Spec handler re-exports
-pub use spec::SpecHandler;
-
-// Save workflow artifact re-export
-pub use save_workflow_artifact::SaveWorkflowArtifactHandler;
-
-// AWAS handler re-exports
-pub use awas_check_support::AwasCheckSupportHandler;
-pub use awas_discover::AwasDiscoverHandler;
-pub use awas_execute::AwasExecuteHandler;
-pub use awas_extract_elements::AwasExtractElementsHandler;
-pub use awas_list_actions::AwasListActionsHandler;
+use command::CommandHandler;
+use test::TestHandler;
+use ui_bridge::UiBridgeHandler;
 
 /// Result of executing a step handler.
 ///
@@ -401,54 +347,14 @@ impl HandlerRegistry {
     /// Create a registry pre-populated with all standard handlers.
     ///
     /// This is the recommended way to create a registry for production use.
+    /// 4 active handlers: command, test, ui_bridge, prompt
     pub fn with_standard_handlers() -> Self {
         let mut registry = Self::new();
 
-        // GUI Automation handlers
-        registry.register(WorkflowHandler);
-        registry.register(WorkflowRefHandler);
-        registry.register(StateHandler);
-        registry.register(ActionHandler);
-        registry.register(GuiActionHandler);
-        registry.register(ScreenshotHandler);
-        registry.register(MacroHandler);
-
-        // Shell/Script handlers
-        registry.register(ShellCommandHandler);
-        registry.register(ShellHandler); // Alias for shell_command
-        registry.register(ScriptHandler);
-        registry.register(PlaywrightHandler);
-
-        // Verification handlers
-        registry.register(LogWatchHandler);
-        registry.register(ErrorResolvedHandler);
-        registry.register(CheckHandler);
-        registry.register(CheckGroupHandler);
-
-        // API handlers
-        registry.register(ApiRequestHandler);
-
-        // MCP handlers
-        registry.register(McpCallHandler);
-
-        // Test handlers
+        registry.register(CommandHandler);
         registry.register(TestHandler);
-
-        // Simple pass-through handlers
         registry.register(PromptStepHandler);
-
-        // UI Bridge Spec handler
-        registry.register(SpecHandler);
-
-        // Save workflow artifact handler
-        registry.register(SaveWorkflowArtifactHandler);
-
-        // AWAS handlers
-        registry.register(AwasDiscoverHandler);
-        registry.register(AwasExecuteHandler);
-        registry.register(AwasCheckSupportHandler);
-        registry.register(AwasListActionsHandler);
-        registry.register(AwasExtractElementsHandler);
+        registry.register(UiBridgeHandler);
 
         registry
     }

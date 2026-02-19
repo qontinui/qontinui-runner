@@ -7,32 +7,24 @@ use super::step_type_metadata::{StepCategory, StepTypeMetadata};
 
 /// Filter step types to only those relevant to the given description.
 ///
-/// Always includes Core and Verification types. Conditionally includes
-/// WebApp, GUI, AWAS, and Utility types based on keyword matching.
-///
-/// Expected token reduction: 40-60% for non-web/non-GUI workflows.
+/// With only 4 core types, all types are almost always included since
+/// the token overhead is minimal. The Automation category (ui_bridge) is
+/// conditionally included based on web/UI keywords.
 pub fn filter_relevant_step_types(
     description: &str,
     all_types: &'static [StepTypeMetadata],
 ) -> Vec<&'static StepTypeMetadata> {
     let desc_lower = description.to_lowercase();
-
-    let include_web = has_web_keywords(&desc_lower);
-    let include_gui = has_gui_keywords(&desc_lower);
-    let include_awas = has_awas_keywords(&desc_lower);
+    let include_automation = has_web_keywords(&desc_lower);
 
     all_types
         .iter()
         .filter(|meta| {
             match meta.category {
-                // Always include Core and Verification types
-                StepCategory::Core | StepCategory::Verification => true,
-                // Always include Utility types (mcp_call, macro)
-                StepCategory::Utility => true,
+                // Always include Core, Verification, and Utility types
+                StepCategory::Core | StepCategory::Verification | StepCategory::Utility => true,
                 // Conditional inclusion based on keywords
-                StepCategory::WebApp => include_web,
-                StepCategory::Gui => include_gui,
-                StepCategory::Awas => include_awas,
+                StepCategory::Automation => include_automation,
             }
         })
         .collect()
@@ -49,8 +41,6 @@ fn has_web_keywords(desc: &str) -> bool {
         "react",
         "next",
         "playwright",
-        "script",
-        "screenshot",
         "html",
         "css",
         "dom",
@@ -64,37 +54,10 @@ fn has_web_keywords(desc: &str) -> bool {
         "form",
         "modal",
         "dialog",
+        "ui bridge",
+        "sdk",
     ];
     WEB_KEYWORDS.iter().any(|kw| desc.contains(kw))
-}
-
-fn has_gui_keywords(desc: &str) -> bool {
-    const GUI_KEYWORDS: &[&str] = &[
-        "gui",
-        "click",
-        "mouse",
-        "screen",
-        "desktop",
-        "keyboard",
-        "hotkey",
-        "scroll",
-        "window",
-        "application state",
-        "visual automation",
-        "image recognition",
-    ];
-    GUI_KEYWORDS.iter().any(|kw| desc.contains(kw))
-}
-
-fn has_awas_keywords(desc: &str) -> bool {
-    const AWAS_KEYWORDS: &[&str] = &[
-        "awas",
-        "web automation",
-        "manifest",
-        "discover actions",
-        "extract elements",
-    ];
-    AWAS_KEYWORDS.iter().any(|kw| desc.contains(kw))
 }
 
 #[cfg(test)]
@@ -108,8 +71,7 @@ mod tests {
         let filtered = filter_relevant_step_types("run pytest and fix errors", all);
         let names: Vec<&str> = filtered.iter().map(|m| m.step_type).collect();
         assert!(names.contains(&"prompt"));
-        assert!(names.contains(&"shell_command"));
-        assert!(names.contains(&"api_request"));
+        assert!(names.contains(&"command"));
     }
 
     #[test]
@@ -118,55 +80,22 @@ mod tests {
         let filtered = filter_relevant_step_types("run pytest and fix errors", all);
         let names: Vec<&str> = filtered.iter().map(|m| m.step_type).collect();
         assert!(names.contains(&"test"));
-        assert!(names.contains(&"check"));
-        assert!(names.contains(&"gate"));
     }
 
     #[test]
-    fn test_python_workflow_excludes_awas_and_gui() {
+    fn test_python_workflow_excludes_automation() {
         let all = get_all_step_type_metadata();
         let filtered = filter_relevant_step_types("run pytest and fix errors", all);
         let names: Vec<&str> = filtered.iter().map(|m| m.step_type).collect();
-        assert!(!names.contains(&"awas_discover"));
-        assert!(!names.contains(&"gui_action"));
-        assert!(!names.contains(&"state"));
+        assert!(!names.contains(&"ui_bridge"));
     }
 
     #[test]
-    fn test_web_keywords_include_webapp_types() {
+    fn test_web_keywords_include_automation_types() {
         let all = get_all_step_type_metadata();
         let filtered =
             filter_relevant_step_types("check the web frontend has correct UI elements", all);
         let names: Vec<&str> = filtered.iter().map(|m| m.step_type).collect();
-        assert!(names.contains(&"script"));
-        assert!(names.contains(&"screenshot"));
-    }
-
-    #[test]
-    fn test_gui_keywords_include_gui_types() {
-        let all = get_all_step_type_metadata();
-        let filtered =
-            filter_relevant_step_types("click the button on the desktop application", all);
-        let names: Vec<&str> = filtered.iter().map(|m| m.step_type).collect();
-        assert!(names.contains(&"gui_action"));
-        assert!(names.contains(&"state"));
-    }
-
-    #[test]
-    fn test_awas_keywords_include_awas_types() {
-        let all = get_all_step_type_metadata();
-        let filtered = filter_relevant_step_types("discover awas actions on the page", all);
-        let names: Vec<&str> = filtered.iter().map(|m| m.step_type).collect();
-        assert!(names.contains(&"awas_discover"));
-        assert!(names.contains(&"awas_execute"));
-    }
-
-    #[test]
-    fn test_utility_types_always_included() {
-        let all = get_all_step_type_metadata();
-        let filtered = filter_relevant_step_types("run a simple check", all);
-        let names: Vec<&str> = filtered.iter().map(|m| m.step_type).collect();
-        assert!(names.contains(&"mcp_call"));
-        assert!(names.contains(&"macro"));
+        assert!(names.contains(&"ui_bridge"));
     }
 }

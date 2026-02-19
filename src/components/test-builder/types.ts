@@ -497,25 +497,21 @@ export function getStepOutputFromAnalysis(analysis: CollectedAnalysis): StepOutp
     return analysis.data;
   }
 
-  // Convert api_request to ApiRequestStepOutput
+  // Convert api_request analysis to CommandStepOutput
   if (analysis.type === "api_request") {
     const apiData = analysis.data;
     return {
       id: apiData.id,
-      step_type: "api_request",
+      step_type: "command",
       step_name: apiData.request_name,
       executed_at: apiData.executed_at,
       duration_ms: apiData.duration_ms ?? 0,
       success: !apiData.error && (apiData.status_code ?? 0) < 400,
       error: apiData.error,
-      method: apiData.method,
-      url: apiData.url,
-      status_code: apiData.status_code,
-      response: apiData.response,
-      source_config: apiData.source_request_config ?? {
-        method: apiData.method,
-        url: apiData.url,
-      },
+      command: `${apiData.method} ${apiData.url}`,
+      exit_code: apiData.status_code && apiData.status_code >= 400 ? 1 : 0,
+      stdout: JSON.stringify(apiData.response ?? ""),
+      stderr: apiData.error ?? "",
     } as StepOutput;
   }
 

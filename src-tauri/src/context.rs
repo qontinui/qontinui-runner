@@ -2297,25 +2297,26 @@ for comp in client.get_components():
         Context {
             id: "builtin-shell-command-schema".to_string(),
             name: "Shell Command Step Schema".to_string(),
-            content: r#"## Shell Command Step Schema
+            content: r#"## Command Step Schema
 
-The `shell_command` step type executes shell commands during workflow setup and completion phases. The AI already knows standard shell commands — this context documents the **workflow step wrapper format** so commands are configured correctly.
+The `command` step type executes shell commands, API requests, checks, and MCP calls during workflow phases. The AI already knows standard shell commands — this context documents the **workflow step wrapper format** so commands are configured correctly.
 
 ### Allowed Phases
 
-`setup` and `completion` only. Shell commands cannot be used in `verification` or `agentic` phases.
+`setup` and `completion` for shell commands. `verification` for checks and API requests. Shell commands cannot be used in `agentic` phases.
 - **Setup**: Environment preparation (install deps, start services, create dirs, seed data)
 - **Completion**: Cleanup, notifications, final builds, artifact collection
+- **Verification**: Checks (lint, typecheck), API requests with assertions
 
 ### JSON Schema
 
 ```json
 {
-  "type": "shell_command",
+  "type": "command",
   "id": "uuid-v4 (required)",
   "name": "Descriptive step name (required)",
-  "phase": "setup" | "completion",
-  "command": "string (required) — the actual shell command to execute",
+  "phase": "setup" | "completion" | "verification",
+  "command": "string (required for shell commands) — the actual shell command to execute",
   "working_directory": "string (optional) — absolute path where the command runs",
   "timeout_seconds": number (optional, default: 60) — seconds before the step is killed,
   "fail_on_error": boolean (optional, default: true) — whether non-zero exit fails the workflow
@@ -2324,7 +2325,7 @@ The `shell_command` step type executes shell commands during workflow setup and 
 
 ### Field Guidance
 
-**`command`** (required)
+**`command`** (required for shell commands)
 - Must be a real, syntactically valid command — no placeholders like `echo TODO` or `/path/to/script`
 - Use the shell syntax appropriate for the target OS (Windows: PowerShell/cmd, Linux/macOS: bash)
 - Chain related commands with `&&` when order matters
@@ -2352,7 +2353,7 @@ The `shell_command` step type executes shell commands during workflow setup and 
 **Setup: Install dependencies**
 ```json
 {
-  "type": "shell_command",
+  "type": "command",
   "id": "a1b2c3d4-1111-4aaa-b111-111111111111",
   "name": "Install npm dependencies",
   "phase": "setup",
@@ -2366,7 +2367,7 @@ The `shell_command` step type executes shell commands during workflow setup and 
 **Setup: Start a background service**
 ```json
 {
-  "type": "shell_command",
+  "type": "command",
   "id": "b2c3d4e5-2222-4bbb-c222-222222222222",
   "name": "Start dev server",
   "phase": "setup",
@@ -2380,7 +2381,7 @@ The `shell_command` step type executes shell commands during workflow setup and 
 **Completion: Production build verification**
 ```json
 {
-  "type": "shell_command",
+  "type": "command",
   "id": "c3d4e5f6-3333-4ccc-d333-333333333333",
   "name": "Production build verification",
   "phase": "completion",
@@ -2394,7 +2395,7 @@ The `shell_command` step type executes shell commands during workflow setup and 
 **Completion: Cleanup temp files (best-effort)**
 ```json
 {
-  "type": "shell_command",
+  "type": "command",
   "id": "d4e5f6a7-4444-4ddd-e444-444444444444",
   "name": "Clean temp artifacts",
   "phase": "completion",

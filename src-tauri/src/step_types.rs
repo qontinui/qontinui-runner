@@ -10,8 +10,8 @@ use tracing::warn;
 ///
 /// Step types are categorized into groups:
 /// - **GUI Automation**: workflow, state, action, screenshot, gui_workflow
-/// - **Verification**: playwright, test, check, check_group
-/// - **Command**: shell_command, api_request, mcp_call
+/// - **Verification**: playwright, test, ui_bridge
+/// - **Command**: command (unified: shell command, check, or check group)
 /// - **AI**: prompt, ai_session
 /// - **Web Automation**: awas_discover, awas_execute, awas_check_support, awas_list_actions, awas_extract_elements
 /// - **Utility**: macro
@@ -41,28 +41,16 @@ pub enum StepType {
     Playwright,
     /// Execute a verification test by ID
     Test,
-    /// Execute a code quality check
-    Check,
-    /// Execute a group of checks
-    CheckGroup,
     /// Watch logs for errors (runtime error detection)
     LogWatch,
-    /// Execute a UI Bridge spec group verification
-    Spec,
-    /// Gate step - aggregates results of other verification steps
-    Gate,
-    /// Check if a specific error has been resolved (no longer appears in logs)
-    ErrorResolved,
 
     // ========================================================================
     // Command Steps
     // ========================================================================
-    /// Execute a shell command
-    ShellCommand,
-    /// Execute an HTTP API request
-    ApiRequest,
-    /// Call an MCP tool
-    McpCall,
+    /// Unified command step (shell command, check, or check group based on config)
+    Command,
+    /// Execute a UI Bridge action (navigate, execute, assert, snapshot)
+    UiBridge,
 
     // ========================================================================
     // AI Steps
@@ -115,15 +103,12 @@ impl StepType {
     pub fn is_verification_type(&self) -> bool {
         matches!(
             self,
-            StepType::Playwright
+            StepType::Command
+                | StepType::Playwright
                 | StepType::Test
-                | StepType::Check
-                | StepType::CheckGroup
                 | StepType::LogWatch
                 | StepType::Screenshot
-                | StepType::Spec
-                | StepType::Gate
-                | StepType::ErrorResolved
+                | StepType::UiBridge
         )
     }
 
@@ -139,12 +124,9 @@ impl StepType {
         )
     }
 
-    /// Returns true if this step type is a command step (shell, API, MCP).
+    /// Returns true if this step type is a command step.
     pub fn is_command_type(&self) -> bool {
-        matches!(
-            self,
-            StepType::ShellCommand | StepType::ApiRequest | StepType::McpCall
-        )
+        matches!(self, StepType::Command)
     }
 
     /// Returns true if this step type is an AWAS (web automation) step.
@@ -187,17 +169,11 @@ impl StepType {
             // Verification - varies by test complexity
             StepType::Playwright => Some(60_000), // 60 seconds
             StepType::Test => Some(30_000),       // 30 seconds
-            StepType::Check => Some(10_000),      // 10 seconds
-            StepType::CheckGroup => Some(60_000), // 60 seconds
             StepType::LogWatch => Some(5_000),    // 5 seconds (quick log scan)
-            StepType::Spec => Some(30_000),       // 30 seconds (spec group verification)
-            StepType::Gate => Some(100),          // Near-instant (evaluates cached results)
-            StepType::ErrorResolved => Some(5_000), // 5 seconds (quick log scan)
 
             // Command - varies widely, use conservative defaults
-            StepType::ShellCommand => Some(30_000), // 30 seconds
-            StepType::ApiRequest => Some(10_000),   // 10 seconds
-            StepType::McpCall => Some(30_000),      // 30 seconds
+            StepType::Command => Some(30_000),  // 30 seconds
+            StepType::UiBridge => Some(15_000), // 15 seconds
 
             // AI - typically long-running
             StepType::Prompt | StepType::AiSession => Some(300_000), // 5 minutes
@@ -251,17 +227,13 @@ impl StepType {
             // Verification
             "playwright" => Some(StepType::Playwright),
             "test" => Some(StepType::Test),
-            "check" => Some(StepType::Check),
-            "check_group" | "checkgroup" => Some(StepType::CheckGroup),
             "log_watch" | "logwatch" => Some(StepType::LogWatch),
-            "spec" | "spec_group" | "specgroup" => Some(StepType::Spec),
-            "gate" => Some(StepType::Gate),
-            "error_resolved" | "errorresolved" => Some(StepType::ErrorResolved),
 
-            // Command
-            "shell_command" | "shellcommand" | "shell" | "command" => Some(StepType::ShellCommand),
-            "api_request" | "apirequest" | "api" | "http" => Some(StepType::ApiRequest),
-            "mcp_call" | "mcpcall" | "mcp" => Some(StepType::McpCall),
+            // Command (includes legacy: shell_command, check, check_group, api_request, mcp_call)
+            "command" | "shell_command" | "shellcommand" | "shell" | "check" | "check_group"
+            | "checkgroup" | "api_request" | "apirequest" | "api" | "http" | "mcp_call"
+            | "mcpcall" | "mcp" => Some(StepType::Command),
+            "ui_bridge" | "uibridge" => Some(StepType::UiBridge),
 
             // AI
             "prompt" | "ai_prompt" | "aiprompt" => Some(StepType::Prompt),
@@ -302,15 +274,9 @@ impl StepType {
             StepType::GuiWorkflow => "gui_workflow",
             StepType::Playwright => "playwright",
             StepType::Test => "test",
-            StepType::Check => "check",
-            StepType::CheckGroup => "check_group",
             StepType::LogWatch => "log_watch",
-            StepType::Spec => "spec",
-            StepType::Gate => "gate",
-            StepType::ErrorResolved => "error_resolved",
-            StepType::ShellCommand => "shell_command",
-            StepType::ApiRequest => "api_request",
-            StepType::McpCall => "mcp_call",
+            StepType::Command => "command",
+            StepType::UiBridge => "ui_bridge",
             StepType::Prompt => "prompt",
             StepType::AiSession => "ai_session",
             StepType::AwasDiscover => "awas_discover",
@@ -336,24 +302,36 @@ mod tests {
 
     #[test]
     fn test_from_str_compat() {
-        // snake_case
-        assert_eq!(
-            StepType::from_str_compat("shell_command"),
-            Some(StepType::ShellCommand)
-        );
-        assert_eq!(
-            StepType::from_str_compat("api_request"),
-            Some(StepType::ApiRequest)
-        );
-
-        // Aliases
-        assert_eq!(
-            StepType::from_str_compat("shell"),
-            Some(StepType::ShellCommand)
-        );
+        // Current types
         assert_eq!(
             StepType::from_str_compat("command"),
-            Some(StepType::ShellCommand)
+            Some(StepType::Command)
+        );
+        assert_eq!(StepType::from_str_compat("prompt"), Some(StepType::Prompt));
+        assert_eq!(StepType::from_str_compat("test"), Some(StepType::Test));
+        assert_eq!(
+            StepType::from_str_compat("ui_bridge"),
+            Some(StepType::UiBridge)
+        );
+
+        // Legacy names map to Command
+        assert_eq!(
+            StepType::from_str_compat("shell_command"),
+            Some(StepType::Command)
+        );
+        assert_eq!(StepType::from_str_compat("shell"), Some(StepType::Command));
+        assert_eq!(
+            StepType::from_str_compat("api_request"),
+            Some(StepType::Command)
+        );
+        assert_eq!(StepType::from_str_compat("check"), Some(StepType::Command));
+        assert_eq!(
+            StepType::from_str_compat("check_group"),
+            Some(StepType::Command)
+        );
+        assert_eq!(
+            StepType::from_str_compat("mcp_call"),
+            Some(StepType::Command)
         );
 
         // GUI types
@@ -367,7 +345,6 @@ mod tests {
         );
 
         // AI types
-        assert_eq!(StepType::from_str_compat("prompt"), Some(StepType::Prompt));
         assert_eq!(
             StepType::from_str_compat("ai_session"),
             Some(StepType::AiSession)
@@ -382,14 +359,14 @@ mod tests {
         assert!(StepType::Prompt.requires_ai());
         assert!(StepType::AiSession.requires_ai());
         assert!(!StepType::Workflow.requires_ai());
-        assert!(!StepType::ShellCommand.requires_ai());
+        assert!(!StepType::Command.requires_ai());
     }
 
     #[test]
     fn test_is_verification_type() {
         assert!(StepType::Playwright.is_verification_type());
         assert!(StepType::Test.is_verification_type());
-        assert!(StepType::Check.is_verification_type());
+        assert!(StepType::Command.is_verification_type());
         assert!(!StepType::Workflow.is_verification_type());
         assert!(!StepType::Prompt.is_verification_type());
     }
@@ -398,7 +375,7 @@ mod tests {
     fn test_as_str_roundtrip() {
         let step_types = [
             StepType::Workflow,
-            StepType::ShellCommand,
+            StepType::Command,
             StepType::Prompt,
             StepType::Playwright,
         ];
@@ -419,9 +396,9 @@ mod tests {
             Some(2_000)
         );
 
-        // Shell commands medium
+        // Command steps medium
         assert_eq!(
-            StepType::ShellCommand.default_expected_duration_ms(),
+            StepType::Command.default_expected_duration_ms(),
             Some(30_000)
         );
 
@@ -447,7 +424,7 @@ mod tests {
             Some(120_000)
         );
 
-        // All step types should return Some value (no None cases currently)
+        // All step types should return Some value
         let all_types = [
             StepType::Workflow,
             StepType::State,
@@ -456,13 +433,8 @@ mod tests {
             StepType::GuiWorkflow,
             StepType::Playwright,
             StepType::Test,
-            StepType::Check,
-            StepType::CheckGroup,
-            StepType::Gate,
-            StepType::ErrorResolved,
-            StepType::ShellCommand,
-            StepType::ApiRequest,
-            StepType::McpCall,
+            StepType::Command,
+            StepType::UiBridge,
             StepType::Prompt,
             StepType::AiSession,
             StepType::AwasDiscover,

@@ -63,11 +63,12 @@ function getStepIcon(type: StepType) {
     playwright: Globe2,
     test: FlaskConical,
     check: CheckCircle,
-    check_group: FlaskConical,
-    // Command
+    check_group: FlaskConical, // Legacy
+    // Command (unified)
     shell: Terminal,
-    api_request: Globe2,
-    mcp_call: Plug,
+    command: Terminal,
+    api_request: Globe2, // Legacy
+    mcp_call: Plug, // Legacy
     // AI
     prompt: Bot,
     ai_session: Bot,
@@ -98,11 +99,12 @@ function getStepAccentColor(type: StepType): string {
     playwright: "purple",
     test: "teal",
     check: "teal",
-    check_group: "teal",
-    // Command
+    check_group: "teal", // Legacy
+    // Command (unified)
     shell: "slate",
-    api_request: "orange",
-    mcp_call: "violet",
+    command: "slate",
+    api_request: "orange", // Legacy
+    mcp_call: "violet", // Legacy
     // AI
     prompt: "green",
     ai_session: "green",
@@ -337,7 +339,9 @@ function PhaseSection({
   const hasRunningStep = group.steps.some((step) => step.status === "running");
 
   return (
-    <div className={cn("border-b border-border/50 last:border-b-0", group.isUpcoming && "opacity-50")}>
+    <div
+      className={cn("border-b border-border/50 last:border-b-0", group.isUpcoming && "opacity-50")}
+    >
       {/* Phase header */}
       <button
         onClick={() => !group.isUpcoming && setExpanded(!expanded)}
@@ -348,13 +352,12 @@ function PhaseSection({
         )}
       >
         {/* Expand/collapse icon */}
-        {!group.isUpcoming && (
-          expanded ? (
+        {!group.isUpcoming &&
+          (expanded ? (
             <ChevronDown className="h-4 w-4 text-muted-foreground" />
           ) : (
             <ChevronRight className="h-4 w-4 text-muted-foreground" />
-          )
-        )}
+          ))}
         {group.isUpcoming && <div className="w-4" />}
 
         {/* Phase badge */}

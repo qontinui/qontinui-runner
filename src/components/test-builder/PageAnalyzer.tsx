@@ -293,27 +293,18 @@ export function PageAnalyzer({ onAnalysisComplete, initialAnalyses }: PageAnalyz
       const executedAt = new Date().toISOString();
       const outputId = generateId();
 
-      // Create as StepOutput (api_request type)
+      // Create as StepOutput (command type for API request)
       const stepOutput: StepOutput = {
         id: outputId,
-        step_type: "api_request",
+        step_type: "command",
         step_name: selectedRequest.name,
         executed_at: executedAt,
         duration_ms: durationMs,
         success: response.status < 400,
-        method: selectedRequest.method,
-        url: selectedRequest.url,
-        status_code: response.status,
-        response: data,
-        source_config: {
-          method: selectedRequest.method,
-          url: selectedRequest.url,
-          headers:
-            Object.keys(selectedRequest.headers).length > 0 ? selectedRequest.headers : undefined,
-          body: selectedRequest.body,
-          timeout_ms: selectedRequest.timeout_ms,
-          follow_redirects: selectedRequest.follow_redirects,
-        },
+        command: `${selectedRequest.method} ${selectedRequest.url}`,
+        exit_code: response.status >= 400 ? 1 : 0,
+        stdout: JSON.stringify(data),
+        stderr: "",
       } as StepOutput;
 
       const newAnalysis = createAnalysisFromStepOutput(stepOutput);
@@ -1041,26 +1032,12 @@ export function PageAnalyzer({ onAnalysisComplete, initialAnalyses }: PageAnalyz
                         </span>
                       </div>
 
-                      {/* API Request specific info */}
-                      {analysis.data.step_type === "api_request" && (
+                      {/* Command step info (shell commands, API requests, etc.) */}
+                      {analysis.data.step_type === "command" && "command" in analysis.data && (
                         <div className="flex items-center gap-4 text-xs text-neutral-400">
                           <span className="font-mono font-semibold text-blue-400">
-                            {(analysis.data as { method?: string }).method}
+                            {(analysis.data as { command?: string }).command}
                           </span>
-                          <span className="truncate text-neutral-300">
-                            {(analysis.data as { url?: string }).url}
-                          </span>
-                          {(analysis.data as { status_code?: number }).status_code && (
-                            <span
-                              className={
-                                ((analysis.data as { status_code?: number }).status_code ?? 0) < 400
-                                  ? "text-green-400"
-                                  : "text-red-400"
-                              }
-                            >
-                              Status: {(analysis.data as { status_code?: number }).status_code}
-                            </span>
-                          )}
                         </div>
                       )}
 
@@ -1070,20 +1047,15 @@ export function PageAnalyzer({ onAnalysisComplete, initialAnalyses }: PageAnalyz
                         </div>
                       )}
 
-                      {/* Response Data (for API requests) */}
-                      {analysis.data.step_type === "api_request" &&
-                        (analysis.data as { response?: unknown }).response && (
+                      {/* Output Data (for command steps) */}
+                      {analysis.data.step_type === "command" &&
+                        "stdout" in analysis.data &&
+                        (analysis.data as { stdout?: string }).stdout && (
                           <div className="space-y-1">
-                            <span className="text-xs font-medium text-neutral-300">
-                              Response Data:
-                            </span>
+                            <span className="text-xs font-medium text-neutral-300">Output:</span>
                             <div className="max-h-64 overflow-auto p-2 bg-neutral-900 rounded border border-neutral-700">
                               <pre className="text-xs text-neutral-300 font-mono whitespace-pre-wrap">
-                                {JSON.stringify(
-                                  (analysis.data as { response?: unknown }).response,
-                                  null,
-                                  2,
-                                )}
+                                {(analysis.data as { stdout?: string }).stdout}
                               </pre>
                             </div>
                           </div>

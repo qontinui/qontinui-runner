@@ -3,40 +3,21 @@
  *
  * Configuration panel for the selected workflow step.
  * Shows different options based on step type.
+ *
+ * Core step types: command, test, ui_bridge, prompt
  */
 
-import React, { useState } from "react";
-import {
-  X,
-  AlertCircle,
-  Globe,
-  ExternalLink,
-  Wifi,
-  Search,
-  Play,
-  CheckCircle,
-  List,
-  FileSearch,
-  ChevronDown,
-  ChevronRight,
-} from "lucide-react";
+import { useState } from "react";
+import { X, AlertCircle, ChevronDown, ChevronRight, Plus, Trash2 } from "lucide-react";
 import type { UnifiedStep, WorkflowPhase } from "../../types";
 import type {
-  GuiActionType,
   TestType,
   PlaywrightExecutionMode,
-  ApiRequestStep,
-  McpCallStep,
   CheckType,
-  GateStep,
   BaseStep,
 } from "../../types/unified-workflow";
-import { GUI_ACTION_TYPES, STEP_TYPES } from "../../types";
-import { CHECK_TOOLS, CHECK_TYPE_INFO } from "../check-builder/types";
 import { useWorkflowBuilder } from "./WorkflowBuilderContext";
-import { ApiRequestStepEditor } from "./ApiRequestStepEditor";
-import { McpCallStepEditor } from "./McpCallStepEditor";
-import { GuiWorkflowPicker } from "./GuiWorkflowPicker";
+import { CHECK_TOOLS, CHECK_TYPE_INFO } from "../check-builder/types";
 
 // =============================================================================
 // Helper to find step phase
@@ -59,432 +40,228 @@ function findStepPhase(
 }
 
 // =============================================================================
-// Script Step Config
+// Data Flow Section (Universal for all step types)
 // =============================================================================
 
-function ScriptConfig({
+function DataFlowSection({
   step,
   onUpdate,
+  allSteps,
 }: {
-  step: UnifiedStep & { type: "script" };
-  onUpdate: (updates: Partial<typeof step>) => void;
+  step: UnifiedStep;
+  onUpdate: (updates: Partial<UnifiedStep>) => void;
+  allSteps: { id: string; name: string }[];
 }) {
-  return (
-    <div className="space-y-4">
-      <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-1">Target URL</label>
-        <input
-          type="url"
-          value={step.target_url || ""}
-          onChange={(e) => onUpdate({ target_url: e.target.value || undefined })}
-          placeholder="https://example.com"
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-          data-ui-id="workflow-builder-step-config-script-target-url-input"
-        />
-        <p className="text-xs text-zinc-500 mt-1">
-          The URL to navigate to before running the script
-        </p>
-      </div>
+  const [isOpen, setIsOpen] = useState(false);
 
-      <div className="flex items-center gap-2">
-        <input
-          type="checkbox"
-          id="refinement_enabled"
-          checked={step.refinement_enabled ?? true}
-          onChange={(e) => onUpdate({ refinement_enabled: e.target.checked })}
-          className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
-          data-ui-id="workflow-builder-step-config-script-refinement-checkbox"
-        />
-        <label htmlFor="refinement_enabled" className="text-sm text-zinc-300">
-          Enable refinement loop
-        </label>
-      </div>
-      <p className="text-xs text-zinc-500 -mt-2">
-        AI will refine the script until it succeeds or max attempts reached
-      </p>
+  // Type-safe access to data flow fields (on BaseStep)
+  const baseStep = step as BaseStep;
+  const inputs = (baseStep as unknown as Record<string, unknown>).inputs as
+    | Record<string, string>
+    | undefined;
+  const extract = (baseStep as unknown as Record<string, unknown>).extract as
+    | Record<string, string>
+    | undefined;
+  const dependsOn = (baseStep as unknown as Record<string, unknown>).depends_on as
+    | string[]
+    | undefined;
+  const required = (baseStep as unknown as Record<string, unknown>).required as boolean | undefined;
 
-      <div className="p-3 bg-zinc-800/50 rounded-md border border-zinc-700">
-        <p className="text-sm text-zinc-400">
-          Use the dedicated Script Builder to create or edit the Playwright script.
-        </p>
-      </div>
-    </div>
-  );
-}
+  const inputEntries = inputs ? Object.entries(inputs) : [];
+  const extractEntries = extract ? Object.entries(extract) : [];
+  const dependsOnList = dependsOn || [];
 
-// =============================================================================
-// State Step Config
-// =============================================================================
-
-function StateConfig({
-  step,
-  onUpdate,
-}: {
-  step: UnifiedStep & { type: "state" };
-  onUpdate: (updates: Partial<typeof step>) => void;
-}) {
-  return (
-    <div className="space-y-4">
-      <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-1">State Name</label>
-        <input
-          type="text"
-          value={step.state_name || ""}
-          onChange={(e) => onUpdate({ state_name: e.target.value || undefined })}
-          placeholder="Enter state name"
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-          data-ui-id="workflow-builder-step-config-state-name-input"
-        />
-        <p className="text-xs text-zinc-500 mt-1">The state to navigate to</p>
-      </div>
-
-      <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-1">State ID</label>
-        <input
-          type="text"
-          value={step.state_id || ""}
-          onChange={(e) => onUpdate({ state_id: e.target.value })}
-          placeholder="state-uuid"
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-          data-ui-id="workflow-builder-step-config-state-id-input"
-        />
-      </div>
-
-      <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-1">Timeout (seconds)</label>
-        <input
-          type="number"
-          value={step.timeout_seconds ?? 30}
-          onChange={(e) => onUpdate({ timeout_seconds: parseInt(e.target.value) || 30 })}
-          min={5}
-          max={300}
-          className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-          data-ui-id="workflow-builder-step-config-state-timeout-input"
-        />
-      </div>
-
-      {step.phase === "setup" && (
-        <div className="flex items-center gap-2">
-          <input
-            type="checkbox"
-            id="run_subsequent"
-            checked={step.run_on_subsequent_iterations ?? false}
-            onChange={(e) => onUpdate({ run_on_subsequent_iterations: e.target.checked })}
-            className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
-            data-ui-id="workflow-builder-step-config-state-run-subsequent-checkbox"
-          />
-          <label htmlFor="run_subsequent" className="text-sm text-zinc-300">
-            Run on subsequent iterations
-          </label>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// =============================================================================
-// Workflow Ref Step Config
-// =============================================================================
-
-function WorkflowRefConfig({
-  step,
-  onUpdate,
-}: {
-  step: UnifiedStep & { type: "workflow_ref" };
-  onUpdate: (updates: Partial<typeof step>) => void;
-}) {
-  const [showManualOverride, setShowManualOverride] = useState(false);
-
-  // Handle workflow selection from picker
-  const handleWorkflowSelect = (workflow: { id: string; name: string }) => {
-    onUpdate({
-      workflow_id: workflow.id,
-      workflow_name: workflow.name,
-      name: `Run: ${workflow.name}`, // Auto-set step name
-    });
+  const handleAddInput = () => {
+    const newInputs = { ...(inputs || {}), "": "" };
+    onUpdate({ inputs: newInputs } as Partial<UnifiedStep>);
   };
 
+  const handleRemoveInput = (key: string) => {
+    const newInputs = { ...(inputs || {}) };
+    delete newInputs[key];
+    onUpdate({ inputs: newInputs } as Partial<UnifiedStep>);
+  };
+
+  const handleUpdateInputKey = (oldKey: string, newKey: string) => {
+    const newInputs: Record<string, string> = {};
+    for (const [k, v] of Object.entries(inputs || {})) {
+      if (k === oldKey) {
+        newInputs[newKey] = v;
+      } else {
+        newInputs[k] = v;
+      }
+    }
+    onUpdate({ inputs: newInputs } as Partial<UnifiedStep>);
+  };
+
+  const handleUpdateInputValue = (key: string, value: string) => {
+    const newInputs = { ...(inputs || {}), [key]: value };
+    onUpdate({ inputs: newInputs } as Partial<UnifiedStep>);
+  };
+
+  const handleAddExtract = () => {
+    const newExtract = { ...(extract || {}), "": "" };
+    onUpdate({ extract: newExtract } as Partial<UnifiedStep>);
+  };
+
+  const handleRemoveExtract = (key: string) => {
+    const newExtract = { ...(extract || {}) };
+    delete newExtract[key];
+    onUpdate({ extract: newExtract } as Partial<UnifiedStep>);
+  };
+
+  const handleUpdateExtractKey = (oldKey: string, newKey: string) => {
+    const newExtract: Record<string, string> = {};
+    for (const [k, v] of Object.entries(extract || {})) {
+      if (k === oldKey) {
+        newExtract[newKey] = v;
+      } else {
+        newExtract[k] = v;
+      }
+    }
+    onUpdate({ extract: newExtract } as Partial<UnifiedStep>);
+  };
+
+  const handleUpdateExtractValue = (key: string, value: string) => {
+    const newExtract = { ...(extract || {}), [key]: value };
+    onUpdate({ extract: newExtract } as Partial<UnifiedStep>);
+  };
+
+  const handleToggleDependency = (stepId: string) => {
+    const updated = dependsOnList.includes(stepId)
+      ? dependsOnList.filter((id) => id !== stepId)
+      : [...dependsOnList, stepId];
+    onUpdate({ depends_on: updated } as Partial<UnifiedStep>);
+  };
+
+  // Other steps that could be dependencies (exclude self)
+  const otherSteps = allSteps.filter((s) => s.id !== step.id);
+
   return (
-    <div className="space-y-4">
-      {/* Workflow Picker */}
-      <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-1">Select Workflow</label>
-        <GuiWorkflowPicker
-          selectedWorkflowId={step.workflow_id || ""}
-          onSelect={handleWorkflowSelect}
-          placeholder="Select a GUI workflow..."
-        />
-        <p className="text-xs text-zinc-500 mt-1">
-          Choose a workflow from your loaded configuration
-        </p>
-      </div>
+    <div className="mt-4 pt-4 border-t border-zinc-700">
+      <button
+        type="button"
+        onClick={() => setIsOpen(!isOpen)}
+        className="flex items-center gap-2 text-xs font-medium text-zinc-500 uppercase tracking-wider hover:text-zinc-400 transition-colors"
+      >
+        {isOpen ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+        Data Flow
+      </button>
 
-      {/* Current Selection Info */}
-      {step.workflow_id && step.workflow_name && (
-        <div className="p-2 bg-purple-500/10 border border-purple-500/30 rounded-md">
-          <p className="text-xs text-purple-400">
-            <span className="font-medium">Selected:</span> {step.workflow_name}
-          </p>
-          <p className="text-xs text-zinc-500 font-mono mt-0.5">{step.workflow_id}</p>
-        </div>
-      )}
-
-      {/* Manual Override Section (Collapsed by default) */}
-      <div className="border-t border-zinc-700 pt-3">
-        <button
-          type="button"
-          onClick={() => setShowManualOverride(!showManualOverride)}
-          className="flex items-center gap-2 text-sm text-zinc-400 hover:text-zinc-300 transition-colors"
-        >
-          {showManualOverride ? (
-            <ChevronDown className="w-4 h-4" />
-          ) : (
-            <ChevronRight className="w-4 h-4" />
-          )}
-          <span>Manual Override</span>
-        </button>
-
-        {showManualOverride && (
-          <div className="mt-3 space-y-3 pl-6">
-            <div>
-              <label className="block text-sm font-medium text-zinc-400 mb-1">Workflow Name</label>
-              <input
-                type="text"
-                value={step.workflow_name || ""}
-                onChange={(e) => onUpdate({ workflow_name: e.target.value || undefined })}
-                placeholder="Enter workflow name"
-                className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-                data-ui-id="workflow-builder-step-config-workflow-ref-name-input"
-              />
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium text-zinc-400 mb-1">Workflow ID</label>
-              <input
-                type="text"
-                value={step.workflow_id || ""}
-                onChange={(e) => onUpdate({ workflow_id: e.target.value })}
-                placeholder="workflow-uuid"
-                className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-                data-ui-id="workflow-builder-step-config-workflow-ref-id-input"
-              />
-              <p className="text-xs text-zinc-500 mt-1">
-                The workflow ID from your JSON configuration file
-              </p>
-            </div>
+      {isOpen && (
+        <div className="mt-3 space-y-4">
+          {/* Inputs (from other steps) */}
+          <div>
+            <h4 className="text-sm font-medium text-zinc-400 mb-2">Inputs (from other steps)</h4>
+            {inputEntries.map(([key, value], idx) => (
+              <div key={idx} className="flex gap-2 mb-2">
+                <input
+                  type="text"
+                  value={key}
+                  onChange={(e) => handleUpdateInputKey(key, e.target.value)}
+                  placeholder="Variable name"
+                  className="flex-1 px-2 py-1.5 bg-zinc-800 border border-zinc-700 rounded text-zinc-200 placeholder-zinc-500 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500/50"
+                />
+                <input
+                  type="text"
+                  value={value}
+                  onChange={(e) => handleUpdateInputValue(key, e.target.value)}
+                  placeholder="step_id.output_key"
+                  className="flex-1 px-2 py-1.5 bg-zinc-800 border border-zinc-700 rounded text-zinc-200 placeholder-zinc-500 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-blue-500/50"
+                />
+                <button
+                  onClick={() => handleRemoveInput(key)}
+                  className="p-1.5 text-zinc-500 hover:text-red-400 transition-colors"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            ))}
+            <button
+              onClick={handleAddInput}
+              className="flex items-center gap-1 text-xs text-zinc-500 hover:text-zinc-300 transition-colors"
+            >
+              <Plus className="w-3 h-3" />
+              Add input
+            </button>
           </div>
-        )}
-      </div>
 
-      {/* Run on subsequent iterations (setup/verification only) */}
-      {(step.phase === "setup" || step.phase === "verification") && (
-        <div className="flex items-center gap-2">
-          <input
-            type="checkbox"
-            id="run_subsequent_wf"
-            checked={step.run_on_subsequent_iterations ?? false}
-            onChange={(e) => onUpdate({ run_on_subsequent_iterations: e.target.checked })}
-            className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
-            data-ui-id="workflow-builder-step-config-workflow-ref-run-subsequent-checkbox"
-          />
-          <label htmlFor="run_subsequent_wf" className="text-sm text-zinc-300">
-            Run on subsequent iterations
-          </label>
-        </div>
-      )}
-    </div>
-  );
-}
+          {/* Extract (from this step's output) */}
+          <div>
+            <h4 className="text-sm font-medium text-zinc-400 mb-2">
+              Extract (from this step's output)
+            </h4>
+            {extractEntries.map(([key, value], idx) => (
+              <div key={idx} className="flex gap-2 mb-2">
+                <input
+                  type="text"
+                  value={key}
+                  onChange={(e) => handleUpdateExtractKey(key, e.target.value)}
+                  placeholder="Output name"
+                  className="flex-1 px-2 py-1.5 bg-zinc-800 border border-zinc-700 rounded text-zinc-200 placeholder-zinc-500 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500/50"
+                />
+                <input
+                  type="text"
+                  value={value}
+                  onChange={(e) => handleUpdateExtractValue(key, e.target.value)}
+                  placeholder="$.data.result"
+                  className="flex-1 px-2 py-1.5 bg-zinc-800 border border-zinc-700 rounded text-zinc-200 placeholder-zinc-500 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-blue-500/50"
+                />
+                <button
+                  onClick={() => handleRemoveExtract(key)}
+                  className="p-1.5 text-zinc-500 hover:text-red-400 transition-colors"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            ))}
+            <button
+              onClick={handleAddExtract}
+              className="flex items-center gap-1 text-xs text-zinc-500 hover:text-zinc-300 transition-colors"
+            >
+              <Plus className="w-3 h-3" />
+              Add extraction
+            </button>
+          </div>
 
-// =============================================================================
-// Macro Ref Step Config
-// =============================================================================
+          {/* Dependencies */}
+          <div>
+            <h4 className="text-sm font-medium text-zinc-400 mb-2">Dependencies</h4>
+            {otherSteps.length === 0 ? (
+              <p className="text-xs text-zinc-500 italic">No other steps available</p>
+            ) : (
+              <div className="space-y-1 max-h-32 overflow-y-auto border border-zinc-700 rounded-md p-2 bg-zinc-800/50">
+                {otherSteps.map((s) => (
+                  <label
+                    key={s.id}
+                    className="flex items-center gap-2 p-1 rounded hover:bg-zinc-700/50 cursor-pointer"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={dependsOnList.includes(s.id)}
+                      onChange={() => handleToggleDependency(s.id)}
+                      className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
+                    />
+                    <span className="text-sm text-zinc-300 truncate">{s.name}</span>
+                  </label>
+                ))}
+              </div>
+            )}
+          </div>
 
-function MacroRefConfig({
-  step,
-  onUpdate,
-}: {
-  step: UnifiedStep & { type: "macro" };
-  onUpdate: (updates: Partial<typeof step>) => void;
-}) {
-  return (
-    <div className="space-y-4">
-      <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-1">Macro Name</label>
-        <input
-          type="text"
-          value={step.macro_name || ""}
-          onChange={(e) => onUpdate({ macro_name: e.target.value || undefined })}
-          placeholder="Enter macro name"
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-          data-ui-id="workflow-builder-step-config-macro-name-input"
-        />
-        <p className="text-xs text-zinc-500 mt-1">The saved macro to execute</p>
-      </div>
-
-      <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-1">Macro ID</label>
-        <input
-          type="text"
-          value={step.macro_id || ""}
-          onChange={(e) => onUpdate({ macro_id: e.target.value })}
-          placeholder="macro-uuid"
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-          data-ui-id="workflow-builder-step-config-macro-id-input"
-        />
-        <p className="text-xs text-zinc-500 mt-1">
-          The unique identifier of the macro from your macro library
-        </p>
-      </div>
-
-      <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-1">Monitor (optional)</label>
-        <select
-          value={step.monitor_index ?? ""}
-          onChange={(e) =>
-            onUpdate({
-              monitor_index: e.target.value === "" ? undefined : parseInt(e.target.value),
-            })
-          }
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-          data-ui-id="workflow-builder-step-config-macro-monitor-select"
-        >
-          <option value="">All Monitors (default)</option>
-          <option value="0">Primary Monitor (0)</option>
-          <option value="1">Monitor 1</option>
-          <option value="2">Monitor 2</option>
-        </select>
-        <p className="text-xs text-zinc-500 mt-1">Restrict macro execution to a specific monitor</p>
-      </div>
-
-      <div className="p-3 bg-pink-900/20 border border-pink-700/30 rounded-md">
-        <p className="text-xs text-zinc-400">
-          Macros are deterministic action sequences (click, type, hotkey). Create and manage macros
-          in the Macro Builder tab.
-        </p>
-      </div>
-    </div>
-  );
-}
-
-// =============================================================================
-// GUI Action Step Config
-// =============================================================================
-
-function GuiActionConfig({
-  step,
-  onUpdate,
-}: {
-  step: UnifiedStep & { type: "gui_action" };
-  onUpdate: (updates: Partial<typeof step>) => void;
-}) {
-  const _actionInfo = GUI_ACTION_TYPES.find((a) => a.type === step.action);
-
-  return (
-    <div className="space-y-4">
-      <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-1">Action Type</label>
-        <select
-          value={step.action}
-          onChange={(e) => onUpdate({ action: e.target.value as GuiActionType })}
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-          data-ui-id="workflow-builder-step-config-gui-action-type-select"
-        >
-          {GUI_ACTION_TYPES.map((action) => (
-            <option key={action.type} value={action.type}>
-              {action.label}
-            </option>
-          ))}
-        </select>
-      </div>
-
-      {/* Click-based actions need target images */}
-      {(step.action === "click" ||
-        step.action === "double_click" ||
-        step.action === "right_click") && (
-        <div>
-          <label className="block text-sm font-medium text-zinc-400 mb-1">Target Image Names</label>
-          <input
-            type="text"
-            value={step.target_image_names?.join(", ") || ""}
-            onChange={(e) =>
-              onUpdate({
-                target_image_names: e.target.value
-                  .split(",")
-                  .map((s) => s.trim())
-                  .filter(Boolean),
-              })
-            }
-            placeholder="button.png, icon.png"
-            className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-            data-ui-id="workflow-builder-step-config-gui-action-target-images-input"
-          />
-          <p className="text-xs text-zinc-500 mt-1">
-            Comma-separated list of image names from your library
-          </p>
-        </div>
-      )}
-
-      {/* Type action needs text input */}
-      {step.action === "type" && (
-        <div>
-          <label className="block text-sm font-medium text-zinc-400 mb-1">Text to Type</label>
-          <input
-            type="text"
-            value={step.text_input || ""}
-            onChange={(e) => onUpdate({ text_input: e.target.value })}
-            placeholder="Enter text..."
-            className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-            data-ui-id="workflow-builder-step-config-gui-action-text-input"
-          />
-        </div>
-      )}
-
-      {/* Hotkey action needs key combo */}
-      {step.action === "hotkey" && (
-        <div>
-          <label className="block text-sm font-medium text-zinc-400 mb-1">Hotkey Combination</label>
-          <input
-            type="text"
-            value={step.hotkey || ""}
-            onChange={(e) => onUpdate({ hotkey: e.target.value })}
-            placeholder="ctrl+s, alt+tab, etc."
-            className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-            data-ui-id="workflow-builder-step-config-gui-action-hotkey-input"
-          />
-          <p className="text-xs text-zinc-500 mt-1">Use + to combine keys: ctrl+shift+s, alt+f4</p>
-        </div>
-      )}
-
-      {/* Scroll action needs direction */}
-      {step.action === "scroll" && (
-        <div>
-          <label className="block text-sm font-medium text-zinc-400 mb-1">Direction</label>
-          <select
-            value={step.scroll_direction || "down"}
-            onChange={(e) => onUpdate({ scroll_direction: e.target.value as "up" | "down" })}
-            className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-            data-ui-id="workflow-builder-step-config-gui-action-scroll-direction-select"
-          >
-            <option value="up">Up</option>
-            <option value="down">Down</option>
-          </select>
-        </div>
-      )}
-
-      {step.phase === "setup" && (
-        <div className="flex items-center gap-2">
-          <input
-            type="checkbox"
-            id="run_subsequent_gui"
-            checked={step.run_on_subsequent_iterations ?? false}
-            onChange={(e) => onUpdate({ run_on_subsequent_iterations: e.target.checked })}
-            className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
-            data-ui-id="workflow-builder-step-config-gui-action-run-subsequent-checkbox"
-          />
-          <label htmlFor="run_subsequent_gui" className="text-sm text-zinc-300">
-            Run on subsequent iterations
-          </label>
+          {/* Required */}
+          <div className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              id="step_required"
+              checked={required !== false}
+              onChange={(e) => onUpdate({ required: e.target.checked } as Partial<UnifiedStep>)}
+              className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
+            />
+            <label htmlFor="step_required" className="text-sm text-zinc-300">
+              Required (workflow fails if this step fails)
+            </label>
+          </div>
         </div>
       )}
     </div>
@@ -502,8 +279,6 @@ function TestConfig({
   step: UnifiedStep & { type: "test" };
   onUpdate: (updates: Partial<typeof step>) => void;
 }) {
-  const _testTypes = STEP_TYPES.verification.filter((s) => s.type.startsWith("test_"));
-
   return (
     <div className="space-y-4">
       <div>
@@ -589,29 +364,16 @@ function TestConfig({
 }
 
 // =============================================================================
-// Check Step Config
+// Check Fields Config (used within CommandConfig when check_type is set)
 // =============================================================================
 
-function CheckConfig({
+function CheckFieldsConfig({
   step,
   onUpdate,
 }: {
-  step: UnifiedStep & { type: "check" };
+  step: UnifiedStep & { type: "command" };
   onUpdate: (updates: Partial<typeof step>) => void;
 }) {
-  // Get tools for the current check type
-  const _checkTypeMap: Record<CheckType, string> = {
-    lint: "lint",
-    format: "format",
-    typecheck: "typecheck",
-    analyze: "analyze",
-    security: "security",
-    custom_command: "custom_command",
-    http_status: "http_status",
-    ai_review: "ai_review",
-    ci_cd: "ci_cd",
-  };
-
   // Filter tools by check type
   const availableTools = CHECK_TOOLS.filter((t) => t.check_type === step.check_type);
   const selectedTool = CHECK_TOOLS.find((t) => t.tool === step.tool);
@@ -628,7 +390,6 @@ function CheckConfig({
           value={step.check_type}
           onChange={(e) => {
             const newType = e.target.value as CheckType;
-            // Reset tool when type changes
             onUpdate({ check_type: newType, tool: undefined, command: undefined });
           }}
           className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
@@ -857,16 +618,50 @@ function CheckConfig({
 }
 
 // =============================================================================
-// Shell Command Step Config
+// Command Step Config (unified: shell commands, checks, check groups)
 // =============================================================================
 
-function ShellCommandConfig({
+function CommandConfig({
   step,
   onUpdate,
 }: {
-  step: UnifiedStep & { type: "shell_command" };
+  step: UnifiedStep & { type: "command" };
   onUpdate: (updates: Partial<typeof step>) => void;
 }) {
+  // If check_group_id is set, show check group config
+  if (step.check_group_id) {
+    return (
+      <div className="space-y-4">
+        <div>
+          <label className="block text-sm font-medium text-zinc-400 mb-1">Check Group ID</label>
+          <input
+            type="text"
+            value={step.check_group_id || ""}
+            onChange={(e) => onUpdate({ check_group_id: e.target.value })}
+            placeholder="check-group-uuid"
+            className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+            data-ui-id="workflow-builder-step-config-check-group-id-input"
+          />
+          <p className="text-xs text-zinc-500 mt-1">
+            The ID of a saved check group from the Check Builder
+          </p>
+        </div>
+
+        {step.check_group_id && (
+          <div className="p-2 bg-cyan-500/10 border border-cyan-500/30 rounded-md">
+            <p className="text-xs text-cyan-400 font-mono">{step.check_group_id}</p>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // If check_type is set, show check-specific fields
+  if (step.check_type) {
+    return <CheckFieldsConfig step={step} onUpdate={onUpdate} />;
+  }
+
+  // Default: shell command config
   return (
     <div className="space-y-4">
       {/* Command */}
@@ -929,23 +724,6 @@ function ShellCommandConfig({
         </label>
       </div>
 
-      {/* Run on subsequent iterations (setup phase only) */}
-      {step.phase === "setup" && (
-        <div className="flex items-center gap-2">
-          <input
-            type="checkbox"
-            id="run_on_subsequent"
-            checked={step.run_on_subsequent_iterations ?? false}
-            onChange={(e) => onUpdate({ run_on_subsequent_iterations: e.target.checked })}
-            className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
-            data-ui-id="workflow-builder-step-config-shell-run-subsequent-checkbox"
-          />
-          <label htmlFor="run_on_subsequent" className="text-sm text-zinc-300">
-            Run on subsequent iterations (not just first run)
-          </label>
-        </div>
-      )}
-
       {/* Common Examples */}
       <div className="pt-2 border-t border-zinc-700">
         <p className="text-xs text-zinc-500 mb-2">Common examples:</p>
@@ -968,64 +746,6 @@ function ShellCommandConfig({
             </button>
           ))}
         </div>
-      </div>
-    </div>
-  );
-}
-
-// =============================================================================
-// Screenshot Step Config
-// =============================================================================
-
-function ScreenshotConfig({
-  step,
-  onUpdate,
-}: {
-  step: UnifiedStep & { type: "screenshot" };
-  onUpdate: (updates: Partial<typeof step>) => void;
-}) {
-  return (
-    <div className="space-y-4">
-      <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-1">Monitor</label>
-        <select
-          value={step.monitor ?? "primary"}
-          onChange={(e) => {
-            const val = e.target.value;
-            // Handle numeric values for monitor index
-            if (val === "primary" || val === "all" || val === "left" || val === "right") {
-              onUpdate({ monitor: val });
-            } else {
-              onUpdate({ monitor: parseInt(val) || 0 });
-            }
-          }}
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-          data-ui-id="workflow-builder-step-config-screenshot-monitor-select"
-        >
-          <option value="primary">Primary Monitor</option>
-          <option value="all">All Monitors</option>
-          <option value="left">Left Monitor</option>
-          <option value="right">Right Monitor</option>
-          <option value="0">Monitor 0</option>
-          <option value="1">Monitor 1</option>
-          <option value="2">Monitor 2</option>
-        </select>
-        <p className="text-xs text-zinc-500 mt-1">Select which monitor to capture</p>
-      </div>
-
-      <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-1">Delay (ms)</label>
-        <input
-          type="number"
-          value={step.delay_ms ?? 0}
-          onChange={(e) => onUpdate({ delay_ms: parseInt(e.target.value) || 0 })}
-          min={0}
-          max={10000}
-          step={100}
-          className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-          data-ui-id="workflow-builder-step-config-screenshot-delay-input"
-        />
-        <p className="text-xs text-zinc-500 mt-1">Wait before capturing (useful for animations)</p>
       </div>
     </div>
   );
@@ -1095,527 +815,144 @@ function PromptConfig({
 }
 
 // =============================================================================
-// API Request Step Config
+// UI Bridge Step Config
 // =============================================================================
 
-function ApiRequestConfig({
-  step,
-  onUpdate,
-  onOpenEditor,
-}: {
-  step: UnifiedStep & { type: "api_request" };
-  onUpdate: (updates: Partial<typeof step>) => void;
-  onOpenEditor: () => void;
-}) {
-  return (
-    <div className="space-y-4">
-      {/* Summary display */}
-      <div className="p-3 bg-zinc-800 border border-zinc-700 rounded-md space-y-2">
-        <div className="flex items-center gap-2">
-          <span
-            data-content-role="badge"
-            data-content-label="HTTP method"
-            className="px-2 py-0.5 text-xs font-medium rounded bg-cyan-500/20 text-cyan-400"
-          >
-            {step.method}
-          </span>
-          <span
-            data-content-role="body-text"
-            data-content-label="request URL"
-            className="text-sm text-zinc-300 truncate flex-1 font-mono"
-          >
-            {step.url || "No URL configured"}
-          </span>
-        </div>
-        {step.headers && Object.keys(step.headers).length > 0 && (
-          <p className="text-xs text-zinc-500">{Object.keys(step.headers).length} header(s)</p>
-        )}
-        {step.extractions && step.extractions.length > 0 && (
-          <p className="text-xs text-zinc-500">{step.extractions.length} variable extraction(s)</p>
-        )}
-        {step.assertions && step.assertions.length > 0 && (
-          <p className="text-xs text-zinc-500">{step.assertions.length} assertion(s)</p>
-        )}
-      </div>
-
-      {/* Open full editor button */}
-      <button
-        onClick={onOpenEditor}
-        className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white rounded-md font-medium transition-colors"
-        data-ui-id="workflow-builder-step-config-api-request-open-editor-btn"
-      >
-        <Globe className="w-4 h-4" />
-        <span>Open Request Editor</span>
-        <ExternalLink className="w-3 h-3" />
-      </button>
-
-      <p className="text-xs text-zinc-500">
-        Configure method, URL, headers, body, variable extractions, and assertions in the full
-        editor.
-      </p>
-
-      {step.phase === "setup" && (
-        <div className="flex items-center gap-2 pt-2 border-t border-zinc-700">
-          <input
-            type="checkbox"
-            id="run_subsequent_api"
-            checked={step.run_on_subsequent_iterations ?? false}
-            onChange={(e) => onUpdate({ run_on_subsequent_iterations: e.target.checked })}
-            className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
-            data-ui-id="workflow-builder-step-config-api-request-run-subsequent-checkbox"
-          />
-          <label htmlFor="run_subsequent_api" className="text-sm text-zinc-300">
-            Run on subsequent iterations
-          </label>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// =============================================================================
-// MCP Call Step Config
-// =============================================================================
-
-function McpCallConfig({
-  step,
-  onUpdate,
-  onOpenEditor,
-}: {
-  step: UnifiedStep & { type: "mcp_call" };
-  onUpdate: (updates: Partial<typeof step>) => void;
-  onOpenEditor: () => void;
-}) {
-  return (
-    <div className="space-y-4">
-      {/* Summary display */}
-      <div className="p-3 bg-zinc-800 border border-zinc-700 rounded-md space-y-2">
-        <div className="flex items-center gap-2">
-          <span
-            data-content-role="badge"
-            className="px-2 py-0.5 text-xs font-medium rounded bg-purple-500/20 text-purple-400"
-          >
-            MCP
-          </span>
-          <span
-            data-content-role="body-text"
-            data-content-label="MCP server name"
-            className="text-sm text-zinc-300 truncate flex-1 font-mono"
-          >
-            {step.server_name || step.server_id || "No server configured"}
-          </span>
-        </div>
-        {step.tool_name && (
-          <p className="text-xs text-zinc-400">
-            Tool:{" "}
-            <span
-              data-content-role="label"
-              data-content-label="MCP tool name"
-              className="text-zinc-300 font-mono"
-            >
-              {step.tool_name}
-            </span>
-          </p>
-        )}
-        {step.extractions && step.extractions.length > 0 && (
-          <p className="text-xs text-zinc-500">{step.extractions.length} variable extraction(s)</p>
-        )}
-        {step.assertions && step.assertions.length > 0 && (
-          <p className="text-xs text-zinc-500">{step.assertions.length} assertion(s)</p>
-        )}
-      </div>
-
-      {/* Open full editor button */}
-      <button
-        onClick={onOpenEditor}
-        className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-md font-medium transition-colors"
-        data-ui-id="workflow-builder-step-config-mcp-call-open-editor-btn"
-      >
-        <Wifi className="w-4 h-4" />
-        <span>Open MCP Call Editor</span>
-        <ExternalLink className="w-3 h-3" />
-      </button>
-
-      <p className="text-xs text-zinc-500">
-        Configure server, tool, arguments, variable extractions, and assertions in the full editor.
-      </p>
-
-      {step.phase === "verification" && (
-        <div className="flex items-center gap-2 pt-2 border-t border-zinc-700">
-          <input
-            type="checkbox"
-            id="run_subsequent_mcp"
-            checked={step.run_on_subsequent_iterations ?? false}
-            onChange={(e) => onUpdate({ run_on_subsequent_iterations: e.target.checked })}
-            className="rounded bg-zinc-700 border-zinc-600 text-purple-500 focus:ring-purple-500/50"
-            data-ui-id="workflow-builder-step-config-mcp-call-run-subsequent-checkbox"
-          />
-          <label htmlFor="run_subsequent_mcp" className="text-sm text-zinc-300">
-            Run on subsequent iterations
-          </label>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// =============================================================================
-// AWAS Discover Step Config
-// =============================================================================
-
-function AwasDiscoverConfig({
+function UiBridgeConfig({
   step,
   onUpdate,
 }: {
-  step: UnifiedStep & { type: "awas_discover" };
+  step: UnifiedStep & { type: "ui_bridge" };
   onUpdate: (updates: Partial<typeof step>) => void;
 }) {
   return (
-    <div className="space-y-4">
-      <div className="p-3 bg-teal-900/20 border border-teal-700/50 rounded-md">
-        <div
-          data-content-role="heading"
-          className="flex items-center gap-2 text-teal-400 text-sm font-medium mb-1"
+    <div className="space-y-3">
+      <div>
+        <label className="block text-sm font-medium text-zinc-400 mb-1">Action</label>
+        <select
+          value={step.action || "snapshot"}
+          onChange={(e) =>
+            onUpdate({
+              action: e.target.value as "navigate" | "execute" | "assert" | "snapshot",
+            })
+          }
+          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
+          data-ui-id="workflow-builder-step-config-ui-bridge-action-select"
         >
-          <Search className="w-4 h-4" />
-          AWAS Manifest Discovery
+          <option value="navigate">Navigate</option>
+          <option value="execute">Execute Instruction</option>
+          <option value="assert">Assert Condition</option>
+          <option value="snapshot">Take Snapshot</option>
+        </select>
+      </div>
+
+      {/* URL for navigate action */}
+      {step.action === "navigate" && (
+        <div>
+          <label className="block text-sm font-medium text-zinc-400 mb-1">URL</label>
+          <input
+            type="url"
+            value={step.url || ""}
+            onChange={(e) => onUpdate({ url: e.target.value })}
+            placeholder="https://example.com"
+            className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
+            data-ui-id="workflow-builder-step-config-ui-bridge-url-input"
+          />
+          <p className="text-xs text-zinc-500 mt-1">The URL to navigate to</p>
         </div>
-        <p className="text-xs text-zinc-400">
-          Discovers the AWAS manifest from a website's /.well-known/ai-actions.json
-        </p>
-      </div>
+      )}
 
-      <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-1">Target URL *</label>
-        <input
-          type="url"
-          value={step.url || ""}
-          onChange={(e) => onUpdate({ url: e.target.value })}
-          placeholder="https://example.com"
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-teal-500/50"
-        />
-        <p className="text-xs text-zinc-500 mt-1">
-          The base URL of the website to discover AWAS manifest from
-        </p>
-      </div>
+      {/* Instruction for execute action */}
+      {step.action === "execute" && (
+        <div>
+          <label className="block text-sm font-medium text-zinc-400 mb-1">Instruction</label>
+          <textarea
+            value={step.instruction || ""}
+            onChange={(e) => onUpdate({ instruction: e.target.value })}
+            placeholder="Click the submit button, fill in the form..."
+            rows={4}
+            className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 resize-y"
+            data-ui-id="workflow-builder-step-config-ui-bridge-instruction-input"
+          />
+          <p className="text-xs text-zinc-500 mt-1">
+            Natural language instruction for the UI Bridge to execute
+          </p>
+        </div>
+      )}
 
+      {/* Target, assert_type, expected for assert action */}
+      {step.action === "assert" && (
+        <>
+          <div>
+            <label className="block text-sm font-medium text-zinc-400 mb-1">Target Element</label>
+            <input
+              type="text"
+              value={step.target || ""}
+              onChange={(e) => onUpdate({ target: e.target.value })}
+              placeholder='[data-ui-id="submit-btn"], .header-title, etc.'
+              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 font-mono text-sm"
+              data-ui-id="workflow-builder-step-config-ui-bridge-target-input"
+            />
+            <p className="text-xs text-zinc-500 mt-1">
+              CSS selector or data-ui-id of the target element
+            </p>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-zinc-400 mb-1">Assert Type</label>
+            <select
+              value={step.assert_type || "exists"}
+              onChange={(e) =>
+                onUpdate({
+                  assert_type: e.target.value as
+                    | "exists"
+                    | "text_equals"
+                    | "contains"
+                    | "visible"
+                    | "enabled",
+                })
+              }
+              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
+              data-ui-id="workflow-builder-step-config-ui-bridge-assert-type-select"
+            >
+              <option value="exists">Exists</option>
+              <option value="text_equals">Text Equals</option>
+              <option value="contains">Contains</option>
+              <option value="visible">Visible</option>
+              <option value="enabled">Enabled</option>
+            </select>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-zinc-400 mb-1">Expected Value</label>
+            <input
+              type="text"
+              value={step.expected || ""}
+              onChange={(e) => onUpdate({ expected: e.target.value })}
+              placeholder="Expected text or value"
+              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
+              data-ui-id="workflow-builder-step-config-ui-bridge-expected-input"
+            />
+            <p className="text-xs text-zinc-500 mt-1">
+              Expected value for text_equals and contains assertions
+            </p>
+          </div>
+        </>
+      )}
+
+      {/* Timeout */}
       <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-1">Timeout (seconds)</label>
+        <label className="block text-sm font-medium text-zinc-400 mb-1">Timeout (ms)</label>
         <input
           type="number"
-          value={step.timeout_seconds ?? 30}
-          onChange={(e) => onUpdate({ timeout_seconds: parseInt(e.target.value) || 30 })}
-          min={5}
-          max={120}
-          className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-teal-500/50"
+          value={step.timeout_ms ?? 5000}
+          onChange={(e) => onUpdate({ timeout_ms: parseInt(e.target.value) || 5000 })}
+          min={1000}
+          max={60000}
+          step={1000}
+          className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
+          data-ui-id="workflow-builder-step-config-ui-bridge-timeout-input"
         />
-      </div>
-    </div>
-  );
-}
-
-// =============================================================================
-// AWAS Execute Step Config
-// =============================================================================
-
-function AwasExecuteConfig({
-  step,
-  onUpdate,
-}: {
-  step: UnifiedStep & { type: "awas_execute" };
-  onUpdate: (updates: Partial<typeof step>) => void;
-}) {
-  return (
-    <div className="space-y-4">
-      <div className="p-3 bg-teal-900/20 border border-teal-700/50 rounded-md">
-        <div
-          data-content-role="heading"
-          className="flex items-center gap-2 text-teal-400 text-sm font-medium mb-1"
-        >
-          <Play className="w-4 h-4" />
-          AWAS Action Execution
-        </div>
-        <p className="text-xs text-zinc-400">Executes a specific action from an AWAS manifest</p>
-      </div>
-
-      <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-1">Target URL *</label>
-        <input
-          type="url"
-          value={step.url || ""}
-          onChange={(e) => onUpdate({ url: e.target.value })}
-          placeholder="https://example.com"
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-teal-500/50"
-        />
-      </div>
-
-      <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-1">Action ID *</label>
-        <input
-          type="text"
-          value={step.action_id || ""}
-          onChange={(e) => onUpdate({ action_id: e.target.value })}
-          placeholder="list_items, create_record, etc."
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-teal-500/50"
-        />
-        <p className="text-xs text-zinc-500 mt-1">
-          The action ID from the AWAS manifest to execute
-        </p>
-      </div>
-
-      <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-1">Parameters (JSON)</label>
-        <textarea
-          value={step.params ? JSON.stringify(step.params, null, 2) : "{}"}
-          onChange={(e) => {
-            try {
-              const parsed = JSON.parse(e.target.value);
-              onUpdate({ params: parsed });
-            } catch {
-              // Invalid JSON, don't update
-            }
-          }}
-          placeholder='{"param1": "value1"}'
-          rows={4}
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-teal-500/50 font-mono text-sm"
-        />
-        <p className="text-xs text-zinc-500 mt-1">
-          Parameters to pass to the action (path, query, body, header)
-        </p>
-      </div>
-    </div>
-  );
-}
-
-// =============================================================================
-// AWAS Check Support Step Config
-// =============================================================================
-
-function AwasCheckSupportConfig({
-  step,
-  onUpdate,
-}: {
-  step: UnifiedStep & { type: "awas_check_support" };
-  onUpdate: (updates: Partial<typeof step>) => void;
-}) {
-  return (
-    <div className="space-y-4">
-      <div className="p-3 bg-teal-900/20 border border-teal-700/50 rounded-md">
-        <div
-          data-content-role="heading"
-          className="flex items-center gap-2 text-teal-400 text-sm font-medium mb-1"
-        >
-          <CheckCircle className="w-4 h-4" />
-          AWAS Support Check
-        </div>
-        <p className="text-xs text-zinc-400">
-          Checks if a website supports AWAS (has a valid manifest)
-        </p>
-      </div>
-
-      <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-1">Target URL *</label>
-        <input
-          type="url"
-          value={step.url || ""}
-          onChange={(e) => onUpdate({ url: e.target.value })}
-          placeholder="https://example.com"
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-teal-500/50"
-        />
-        <p className="text-xs text-zinc-500 mt-1">
-          Returns true if the website has an AWAS manifest
-        </p>
-      </div>
-    </div>
-  );
-}
-
-// =============================================================================
-// AWAS List Actions Step Config
-// =============================================================================
-
-function AwasListActionsConfig({
-  step,
-  onUpdate,
-}: {
-  step: UnifiedStep & { type: "awas_list_actions" };
-  onUpdate: (updates: Partial<typeof step>) => void;
-}) {
-  return (
-    <div className="space-y-4">
-      <div className="p-3 bg-teal-900/20 border border-teal-700/50 rounded-md">
-        <div
-          data-content-role="heading"
-          className="flex items-center gap-2 text-teal-400 text-sm font-medium mb-1"
-        >
-          <List className="w-4 h-4" />
-          AWAS List Actions
-        </div>
-        <p className="text-xs text-zinc-400">Lists all available actions from an AWAS manifest</p>
-      </div>
-
-      <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-1">
-          Target URL (optional)
-        </label>
-        <input
-          type="url"
-          value={step.url || ""}
-          onChange={(e) => onUpdate({ url: e.target.value })}
-          placeholder="https://example.com"
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-teal-500/50"
-        />
-        <p className="text-xs text-zinc-500 mt-1">
-          If provided, fetches manifest first. Otherwise uses cached manifest.
-        </p>
-      </div>
-    </div>
-  );
-}
-
-// =============================================================================
-// AWAS Extract Elements Step Config
-// =============================================================================
-
-function AwasExtractElementsConfig({
-  step,
-  onUpdate,
-}: {
-  step: UnifiedStep & { type: "awas_extract_elements" };
-  onUpdate: (updates: Partial<typeof step>) => void;
-}) {
-  return (
-    <div className="space-y-4">
-      <div className="p-3 bg-teal-900/20 border border-teal-700/50 rounded-md">
-        <div
-          data-content-role="heading"
-          className="flex items-center gap-2 text-teal-400 text-sm font-medium mb-1"
-        >
-          <FileSearch className="w-4 h-4" />
-          AWAS Element Extraction
-        </div>
-        <p className="text-xs text-zinc-400">
-          Extracts AWAS-annotated elements (data-awas-*) from HTML
-        </p>
-      </div>
-
-      <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-1">HTML Content *</label>
-        <textarea
-          value={step.html || ""}
-          onChange={(e) => onUpdate({ html: e.target.value })}
-          placeholder="<html>...</html>"
-          rows={6}
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-teal-500/50 font-mono text-sm"
-        />
-        <p className="text-xs text-zinc-500 mt-1">
-          HTML content to scan for data-awas-* attributes
-        </p>
-      </div>
-
-      <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-1">Base URL (optional)</label>
-        <input
-          type="url"
-          value={step.base_url || ""}
-          onChange={(e) => onUpdate({ base_url: e.target.value })}
-          placeholder="https://example.com"
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-teal-500/50"
-        />
-        <p className="text-xs text-zinc-500 mt-1">
-          Used to resolve relative URLs in extracted elements
-        </p>
-      </div>
-    </div>
-  );
-}
-
-// =============================================================================
-// Gate Step Config
-// =============================================================================
-
-function GateConfig({
-  step,
-  onUpdate,
-  verificationSteps,
-}: {
-  step: UnifiedStep & { type: "gate" };
-  onUpdate: (updates: Partial<GateStep>) => void;
-  verificationSteps: UnifiedStep[];
-}) {
-  const requiredSteps = step.required_steps ?? [];
-  // Available steps = all non-gate verification steps
-  const availableSteps = verificationSteps.filter((s) => s.type !== "gate" && s.id !== step.id);
-
-  const toggleStep = (stepName: string) => {
-    const updated = requiredSteps.includes(stepName)
-      ? requiredSteps.filter((id) => id !== stepName)
-      : [...requiredSteps, stepName];
-    onUpdate({ required_steps: updated });
-  };
-
-  return (
-    <div className="space-y-4">
-      {/* Description */}
-      <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-1">Description</label>
-        <input
-          type="text"
-          value={step.description ?? ""}
-          onChange={(e) => onUpdate({ description: e.target.value || undefined })}
-          placeholder="What this gate controls..."
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-          data-ui-id="workflow-builder-step-config-gate-description-input"
-        />
-      </div>
-
-      {/* Required Steps */}
-      <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-2">
-          Required Steps ({requiredSteps.length} selected)
-        </label>
-        <p className="text-xs text-zinc-500 mb-2">
-          All selected steps must pass for this gate to pass. Gate results control whether the
-          agentic loop triggers.
-        </p>
-        {availableSteps.length === 0 ? (
-          <p className="text-xs text-zinc-500 italic">
-            No verification steps available. Add test, check, or other verification steps first.
-          </p>
-        ) : (
-          <div className="space-y-1 max-h-48 overflow-y-auto border border-zinc-700 rounded-md p-2 bg-zinc-800/50">
-            {availableSteps.map((vs) => (
-              <label
-                key={vs.id}
-                className="flex items-center gap-2 p-1.5 rounded hover:bg-zinc-700/50 cursor-pointer"
-              >
-                <input
-                  type="checkbox"
-                  checked={requiredSteps.includes(vs.name)}
-                  onChange={() => toggleStep(vs.name)}
-                  className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
-                />
-                <span className="text-sm text-zinc-300">{vs.name}</span>
-                <span className="text-xs text-zinc-500 ml-auto">{vs.type}</span>
-              </label>
-            ))}
-          </div>
-        )}
-      </div>
-
-      {/* Stop on Failure */}
-      <div className="flex items-center gap-2">
-        <input
-          type="checkbox"
-          id="gate_stop_on_failure"
-          checked={step.stop_on_failure ?? false}
-          onChange={(e) => onUpdate({ stop_on_failure: e.target.checked })}
-          className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
-          data-ui-id="workflow-builder-step-config-gate-stop-on-failure-checkbox"
-        />
-        <label htmlFor="gate_stop_on_failure" className="text-sm text-zinc-300">
-          Stop on failure (skip remaining verification steps)
-        </label>
       </div>
     </div>
   );
@@ -1631,8 +968,6 @@ interface StepConfigPanelProps {
 
 export function StepConfigPanel({ onClose }: StepConfigPanelProps) {
   const { state, getSelectedStep, updateStep } = useWorkflowBuilder();
-  const [apiRequestEditorOpen, setApiRequestEditorOpen] = useState(false);
-  const [mcpCallEditorOpen, setMcpCallEditorOpen] = useState(false);
   const selectedStep = getSelectedStep();
 
   if (!selectedStep) {
@@ -1666,44 +1001,26 @@ export function StepConfigPanel({ onClose }: StepConfigPanelProps) {
   // Get step type label
   const stepTypeLabel = (() => {
     switch (selectedStep.type) {
-      case "script":
-        return "Playwright Script";
-      case "state":
-        return "Navigate to State";
-      case "workflow_ref":
-        return "Run Workflow";
-      case "macro":
-        return "Run Macro";
-      case "gui_action":
-        return "GUI Action";
-      case "test":
-        return "Test";
-      case "check":
-        return "Check";
-      case "shell_command":
-        return "Shell Command";
-      case "screenshot":
-        return "Screenshot";
+      case "command":
+        return "Command";
       case "prompt":
         return "AI Prompt";
-      case "api_request":
-        return "API Request";
-      case "awas_discover":
-        return "AWAS Discover";
-      case "awas_execute":
-        return "AWAS Execute";
-      case "awas_check_support":
-        return "AWAS Check Support";
-      case "awas_list_actions":
-        return "AWAS List Actions";
-      case "awas_extract_elements":
-        return "AWAS Extract Elements";
-      case "gate":
-        return "Gate";
+      case "test":
+        return "Test";
+      case "ui_bridge":
+        return "UI Bridge";
       default:
         return "Step";
     }
   })();
+
+  // Collect all steps for dependency selection in data flow
+  const allSteps = [
+    ...state.workflow.setup_steps,
+    ...state.workflow.verification_steps,
+    ...state.workflow.agentic_steps,
+    ...(state.workflow.completion_steps || []),
+  ];
 
   return (
     <div className="h-full flex flex-col bg-zinc-850 border-l border-zinc-700">
@@ -1740,73 +1057,19 @@ export function StepConfigPanel({ onClose }: StepConfigPanelProps) {
         </div>
 
         {/* Type-specific config */}
-        {selectedStep.type === "script" && (
-          <ScriptConfig step={selectedStep} onUpdate={handleUpdate} />
-        )}
-        {selectedStep.type === "state" && (
-          <StateConfig step={selectedStep} onUpdate={handleUpdate} />
-        )}
-        {selectedStep.type === "workflow_ref" && (
-          <WorkflowRefConfig step={selectedStep} onUpdate={handleUpdate} />
-        )}
-        {selectedStep.type === "macro" && (
-          <MacroRefConfig step={selectedStep} onUpdate={handleUpdate} />
-        )}
-        {selectedStep.type === "gui_action" && (
-          <GuiActionConfig step={selectedStep} onUpdate={handleUpdate} />
-        )}
-        {selectedStep.type === "test" && <TestConfig step={selectedStep} onUpdate={handleUpdate} />}
-        {selectedStep.type === "check" && (
-          <CheckConfig step={selectedStep} onUpdate={handleUpdate} />
-        )}
-        {selectedStep.type === "shell_command" && (
-          <ShellCommandConfig step={selectedStep} onUpdate={handleUpdate} />
-        )}
-        {selectedStep.type === "screenshot" && (
-          <ScreenshotConfig step={selectedStep} onUpdate={handleUpdate} />
+        {selectedStep.type === "command" && (
+          <CommandConfig step={selectedStep} onUpdate={handleUpdate} />
         )}
         {selectedStep.type === "prompt" && (
           <PromptConfig step={selectedStep} onUpdate={handleUpdate} />
         )}
-        {selectedStep.type === "api_request" && (
-          <ApiRequestConfig
-            step={selectedStep}
-            onUpdate={handleUpdate}
-            onOpenEditor={() => setApiRequestEditorOpen(true)}
-          />
-        )}
-        {selectedStep.type === "mcp_call" && (
-          <McpCallConfig
-            step={selectedStep}
-            onUpdate={handleUpdate}
-            onOpenEditor={() => setMcpCallEditorOpen(true)}
-          />
-        )}
-        {selectedStep.type === "awas_discover" && (
-          <AwasDiscoverConfig step={selectedStep} onUpdate={handleUpdate} />
-        )}
-        {selectedStep.type === "awas_execute" && (
-          <AwasExecuteConfig step={selectedStep} onUpdate={handleUpdate} />
-        )}
-        {selectedStep.type === "awas_check_support" && (
-          <AwasCheckSupportConfig step={selectedStep} onUpdate={handleUpdate} />
-        )}
-        {selectedStep.type === "awas_list_actions" && (
-          <AwasListActionsConfig step={selectedStep} onUpdate={handleUpdate} />
-        )}
-        {selectedStep.type === "awas_extract_elements" && (
-          <AwasExtractElementsConfig step={selectedStep} onUpdate={handleUpdate} />
-        )}
-        {selectedStep.type === "gate" && (
-          <GateConfig
-            step={selectedStep}
-            onUpdate={handleUpdate}
-            verificationSteps={state.workflow.verification_steps}
-          />
+        {selectedStep.type === "test" && <TestConfig step={selectedStep} onUpdate={handleUpdate} />}
+        {selectedStep.type === "ui_bridge" && (
+          <UiBridgeConfig step={selectedStep} onUpdate={handleUpdate} />
         )}
 
-        {/* Console Error Handling — shown for all verification phase steps except gates */}
-        {phase === "verification" && selectedStep.type !== "gate" && (
+        {/* Console Error Handling -- shown for all verification phase steps */}
+        {phase === "verification" && (
           <div className="mt-4 pt-4 border-t border-zinc-700">
             <h4 className="text-xs font-medium text-zinc-500 uppercase tracking-wider mb-3">
               Console Errors
@@ -1832,33 +1095,10 @@ export function StepConfigPanel({ onClose }: StepConfigPanelProps) {
             </p>
           </div>
         )}
+
+        {/* Data Flow section (universal for all step types) */}
+        <DataFlowSection step={selectedStep} onUpdate={handleUpdate} allSteps={allSteps} />
       </div>
-
-      {/* API Request Editor Modal */}
-      {selectedStep.type === "api_request" && (
-        <ApiRequestStepEditor
-          step={selectedStep as ApiRequestStep}
-          open={apiRequestEditorOpen}
-          onClose={() => setApiRequestEditorOpen(false)}
-          onSave={(updates) => {
-            handleUpdate(updates);
-            setApiRequestEditorOpen(false);
-          }}
-        />
-      )}
-
-      {/* MCP Call Editor Modal */}
-      {selectedStep.type === "mcp_call" && (
-        <McpCallStepEditor
-          step={selectedStep as McpCallStep}
-          open={mcpCallEditorOpen}
-          onClose={() => setMcpCallEditorOpen(false)}
-          onSave={(updates) => {
-            handleUpdate(updates);
-            setMcpCallEditorOpen(false);
-          }}
-        />
-      )}
     </div>
   );
 }
