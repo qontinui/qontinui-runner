@@ -327,6 +327,14 @@ pub struct ExecutionStepConfig {
     #[serde(alias = "apiAssertions", alias = "assertions")]
     pub api_assertions: Option<Vec<ApiAssertion>>,
 
+    /// API Request: Number of retry attempts when assertions fail (0 = no retries)
+    #[serde(alias = "retryCount", alias = "retry_count")]
+    pub api_retry_count: Option<u32>,
+
+    /// API Request: Delay in milliseconds between retry attempts (default: 2000)
+    #[serde(alias = "retryDelayMs", alias = "retry_delay_ms")]
+    pub api_retry_delay_ms: Option<u64>,
+
     // ========================================================================
     // Check Step Fields
     // ========================================================================
@@ -378,7 +386,11 @@ pub struct ExecutionStepConfig {
     pub ci_cd_repository: Option<String>,
 
     /// Check (ci_cd): GitHub Actions workflow name filter
-    #[serde(alias = "workflow_name", alias = "workflowName", alias = "ciCdWorkflowName")]
+    #[serde(
+        alias = "workflow_name",
+        alias = "workflowName",
+        alias = "ciCdWorkflowName"
+    )]
     pub ci_cd_workflow_name: Option<String>,
 
     /// Check (ci_cd): Branch filter
@@ -1165,10 +1177,8 @@ impl VerificationPhaseResult {
                                     .get("message")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("Unknown error");
-                                let err_type = err
-                                    .get("type")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("error");
+                                let err_type =
+                                    err.get("type").and_then(|v| v.as_str()).unwrap_or("error");
                                 context.push_str(&format!("- [{}] {}\n", err_type, msg));
                             }
                             if console_errors.len() > 10 {
@@ -1374,17 +1384,11 @@ impl VerificationPhaseResult {
                         .get("message")
                         .and_then(|v| v.as_str())
                         .unwrap_or("Unknown error");
-                    let err_type = err
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("error");
+                    let err_type = err.get("type").and_then(|v| v.as_str()).unwrap_or("error");
                     context.push_str(&format!("- [{}] {}\n", err_type, msg));
                 }
                 if console_errors.len() > 15 {
-                    context.push_str(&format!(
-                        "  ... and {} more\n",
-                        console_errors.len() - 15
-                    ));
+                    context.push_str(&format!("  ... and {} more\n", console_errors.len() - 15));
                 }
                 context.push('\n');
             }
@@ -1738,16 +1742,10 @@ impl StepExecutor {
         // Build a combined context: merge RuntimeContext variables and SharedVariableStore
         let mut variables = serde_json::Map::new();
         for (name, value) in ctx_vars {
-            variables.insert(
-                name.clone(),
-                json!({ "value": value, "source": "system" }),
-            );
+            variables.insert(name.clone(), json!({ "value": value, "source": "system" }));
         }
         for (name, value) in &shared_vars {
-            variables.insert(
-                name.clone(),
-                json!({ "value": value, "source": "step" }),
-            );
+            variables.insert(name.clone(), json!({ "value": value, "source": "step" }));
         }
 
         let context_json = json!({
@@ -1758,10 +1756,11 @@ impl StepExecutor {
         // Remap to parent ID for workflow sequence children
         let task_run_id = get_parent_task_id(execution_id);
 
-        if let Err(e) = self.app_state.checkpoint_db.update_task_run_runtime_context(
-            &task_run_id,
-            &context_json.to_string(),
-        ) {
+        if let Err(e) = self
+            .app_state
+            .checkpoint_db
+            .update_task_run_runtime_context(&task_run_id, &context_json.to_string())
+        {
             warn!("Failed to persist runtime context: {}", e);
         }
     }
@@ -4140,7 +4139,11 @@ impl StepExecutor {
             // flip a passing step to failed
             if success && step.fail_on_console_errors {
                 if let Some(ref details) = verification_details {
-                    if details.console_errors.as_ref().is_some_and(|e| !e.is_empty()) {
+                    if details
+                        .console_errors
+                        .as_ref()
+                        .is_some_and(|e| !e.is_empty())
+                    {
                         let count = details.console_errors.as_ref().map_or(0, |e| e.len());
                         warn!(
                             "Verification step '{}' passed but has {} console error(s) — failing due to fail_on_console_errors",

@@ -102,8 +102,10 @@ pub fn load_knowledge_for_step_types(
         }
     };
 
-    let params_vec: Vec<&dyn rusqlite::types::ToSql> =
-        step_types.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+    let params_vec: Vec<&dyn rusqlite::types::ToSql> = step_types
+        .iter()
+        .map(|s| s as &dyn rusqlite::types::ToSql)
+        .collect();
 
     let rows = stmt.query_map(params_vec.as_slice(), |row| {
         Ok(StepTypeKnowledge {
@@ -146,7 +148,10 @@ pub fn format_knowledge_as_markdown(entries: &[StepTypeKnowledge]) -> String {
 
     let mut grouped: HashMap<&str, Vec<&StepTypeKnowledge>> = HashMap::new();
     for entry in entries {
-        grouped.entry(entry.step_type.as_str()).or_default().push(entry);
+        grouped
+            .entry(entry.step_type.as_str())
+            .or_default()
+            .push(entry);
     }
 
     // Sort step types for deterministic output
@@ -347,10 +352,7 @@ pub fn update_knowledge(
 /// Delete a knowledge entry (hard delete).
 pub fn delete_knowledge(conn: &Connection, id: &str) -> Result<bool, String> {
     let rows = conn
-        .execute(
-            "DELETE FROM step_type_knowledge WHERE id = ?1",
-            params![id],
-        )
+        .execute("DELETE FROM step_type_knowledge WHERE id = ?1", params![id])
         .map_err(|e| format!("Failed to delete knowledge entry: {}", e))?;
     Ok(rows > 0)
 }
@@ -367,13 +369,61 @@ pub fn infer_step_type_from_fix(description: &str) -> Option<String> {
 
     // Each entry: (step_type, keywords) -- more specific keywords listed first
     let mappings: &[(&str, &[&str])] = &[
-        ("shell_command", &["shell_command", "shell command", "working_directory", "fail_on_error"]),
-        ("api_request", &["api_request", "api request", "status_code", "body_contains", "json_path", "http_status"]),
-        ("prompt", &["prompt step", "agentic prompt", "agent instruction", "base_prompt"]),
-        ("check", &["check_type", "check step", "typecheck", "lint check", "format check"]),
-        ("test", &["test_type", "test step", "pytest", "jest", "cargo test", "test runner"]),
+        (
+            "shell_command",
+            &[
+                "shell_command",
+                "shell command",
+                "working_directory",
+                "fail_on_error",
+            ],
+        ),
+        (
+            "api_request",
+            &[
+                "api_request",
+                "api request",
+                "status_code",
+                "body_contains",
+                "json_path",
+                "http_status",
+            ],
+        ),
+        (
+            "prompt",
+            &[
+                "prompt step",
+                "agentic prompt",
+                "agent instruction",
+                "base_prompt",
+            ],
+        ),
+        (
+            "check",
+            &[
+                "check_type",
+                "check step",
+                "typecheck",
+                "lint check",
+                "format check",
+            ],
+        ),
+        (
+            "test",
+            &[
+                "test_type",
+                "test step",
+                "pytest",
+                "jest",
+                "cargo test",
+                "test runner",
+            ],
+        ),
         ("gate", &["gate step", "gate ", "required_steps"]),
-        ("spec", &["spec step", "spec ", "specification", "behavioral spec"]),
+        (
+            "spec",
+            &["spec step", "spec ", "specification", "behavioral spec"],
+        ),
     ];
 
     let mut best_type: Option<&str> = None;
@@ -497,7 +547,11 @@ mod tests {
     fn test_step_type_knowledge_list_with_filters() {
         let conn = create_test_db();
 
-        for (st, layer) in &[("shell_command", "universal"), ("api_request", "universal"), ("shell_command", "system_specific")] {
+        for (st, layer) in &[
+            ("shell_command", "universal"),
+            ("api_request", "universal"),
+            ("shell_command", "system_specific"),
+        ] {
             let input = InsertKnowledgeInput {
                 step_type: st.to_string(),
                 layer: layer.to_string(),
@@ -531,7 +585,12 @@ mod tests {
     fn test_load_knowledge_for_step_types() {
         let conn = create_test_db();
 
-        for (st, priority) in &[("shell_command", 10), ("shell_command", 5), ("api_request", 8), ("check", 3)] {
+        for (st, priority) in &[
+            ("shell_command", 10),
+            ("shell_command", 5),
+            ("api_request", 8),
+            ("check", 3),
+        ] {
             let input = InsertKnowledgeInput {
                 step_type: st.to_string(),
                 layer: "universal".to_string(),
@@ -547,8 +606,11 @@ mod tests {
         // Load for shell_command and api_request only
         let entries = load_knowledge_for_step_types(&conn, &["shell_command", "api_request"]);
         assert_eq!(entries.len(), 3); // 2 shell_command + 1 api_request
-        // Verify ordering: within each step_type, higher priority first
-        let shell_entries: Vec<_> = entries.iter().filter(|e| e.step_type == "shell_command").collect();
+                                      // Verify ordering: within each step_type, higher priority first
+        let shell_entries: Vec<_> = entries
+            .iter()
+            .filter(|e| e.step_type == "shell_command")
+            .collect();
         assert_eq!(shell_entries[0].priority, 10);
         assert_eq!(shell_entries[1].priority, 5);
     }
@@ -578,10 +640,15 @@ mod tests {
             source_fix_id: None,
         };
         let disabled = insert_knowledge(&conn, &input2).unwrap();
-        update_knowledge(&conn, &disabled.id, &UpdateKnowledgeInput {
-            status: Some("disabled".to_string()),
-            ..Default::default()
-        }).unwrap();
+        update_knowledge(
+            &conn,
+            &disabled.id,
+            &UpdateKnowledgeInput {
+                status: Some("disabled".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         let entries = load_knowledge_for_step_types(&conn, &["gate"]);
         assert_eq!(entries.len(), 1);
@@ -624,7 +691,9 @@ mod tests {
         assert!(md.contains("### api_request"));
         assert!(md.contains("### shell_command"));
         assert!(md.contains("- **Set working_directory**: Always set working_directory"));
-        assert!(md.contains("- **Content assertions**: Always include content-specific assertions."));
+        assert!(
+            md.contains("- **Content assertions**: Always include content-specific assertions.")
+        );
     }
 
     #[test]
@@ -634,10 +703,22 @@ mod tests {
 
     #[test]
     fn test_infer_step_type_from_fix() {
-        assert_eq!(infer_step_type_from_fix("shell_command missing working_directory"), Some("shell_command".to_string()));
-        assert_eq!(infer_step_type_from_fix("api_request needs body_contains assertion"), Some("api_request".to_string()));
-        assert_eq!(infer_step_type_from_fix("gate step missing required_steps"), Some("gate".to_string()));
-        assert_eq!(infer_step_type_from_fix("prompt instructions unclear"), Some("prompt".to_string()));
+        assert_eq!(
+            infer_step_type_from_fix("shell_command missing working_directory"),
+            Some("shell_command".to_string())
+        );
+        assert_eq!(
+            infer_step_type_from_fix("api_request needs body_contains assertion"),
+            Some("api_request".to_string())
+        );
+        assert_eq!(
+            infer_step_type_from_fix("gate step missing required_steps"),
+            Some("gate".to_string())
+        );
+        assert_eq!(
+            infer_step_type_from_fix("prompt instructions unclear"),
+            Some("prompt".to_string())
+        );
         assert_eq!(infer_step_type_from_fix("unrelated description"), None);
     }
 

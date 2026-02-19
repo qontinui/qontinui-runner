@@ -213,10 +213,7 @@ fn assemble_output_from_events(db: &CheckpointDb, task_run_id: &str) -> String {
 
     let mut parts = Vec::new();
     for event in &events {
-        let phase = event
-            .event_subtype
-            .as_deref()
-            .unwrap_or("unknown");
+        let phase = event.event_subtype.as_deref().unwrap_or("unknown");
         let iteration_label = &event.message;
 
         // Extract the "output" field from the event's JSON data

@@ -103,10 +103,7 @@ fn spawn_and_wait_with_doctor(
             // Must pipe stdout/stderr so wait_with_output() can capture them.
             // Without this, spawn() inherits parent's stdio and wait_with_output()
             // returns empty buffers.
-            let child = cmd
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()?;
+            let child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
             let pid = child.id();
 
             // Register with Doctor
@@ -531,18 +528,30 @@ fn process_cli_output(output: std::process::Output) -> AiResponse {
             warn!(
                 "Claude CLI exited successfully but stdout is empty. stderr ({} chars): {}",
                 stderr.len(),
-                if stderr.len() > 1000 { &stderr[..1000] } else { &stderr }
+                if stderr.len() > 1000 {
+                    &stderr[..1000]
+                } else {
+                    &stderr
+                }
             );
             // Return as error since empty output is not useful
             AiResponse::error(format!(
                 "Claude CLI produced no output. stderr: {}",
-                if stderr.len() > 500 { &stderr[..500] } else { &stderr }
+                if stderr.len() > 500 {
+                    &stderr[..500]
+                } else {
+                    &stderr
+                }
             ))
         } else {
             AiResponse::success(stdout)
         }
     } else {
-        error!("Claude CLI failed (exit code {:?}): {}", output.status.code(), stderr);
+        error!(
+            "Claude CLI failed (exit code {:?}): {}",
+            output.status.code(),
+            stderr
+        );
         AiResponse::error_with_output(stdout, format!("Claude CLI failed: {}", stderr))
     }
 }

@@ -32,7 +32,10 @@ pub fn build_reflection_config(
 }
 
 /// Build setup steps that load source run data via API requests.
-pub fn build_setup_steps(source_task_run_id: &str, source_workflow_name: &str) -> Vec<ExecutionStepConfig> {
+pub fn build_setup_steps(
+    source_task_run_id: &str,
+    source_workflow_name: &str,
+) -> Vec<ExecutionStepConfig> {
     let base_url = "http://localhost:9876";
 
     vec![

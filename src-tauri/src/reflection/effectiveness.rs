@@ -93,12 +93,7 @@ pub fn evaluate_fix(conn: &Connection, fix: &ReflectionFix) -> Result<Evaluation
 
     // If we have a source_finding_id, check by signature hash
     if let Some(ref finding_id) = fix.source_finding_id {
-        return evaluate_by_finding_signature(
-            conn,
-            fix,
-            finding_id,
-            &subsequent_run_ids,
-        );
+        return evaluate_by_finding_signature(conn, fix, finding_id, &subsequent_run_ids);
     }
 
     // No source finding — use outcome-based heuristic for knowledge/context fixes
@@ -279,7 +274,9 @@ fn evaluate_by_workflow_outcome(
                     effectiveness: FixEffectiveness::Effective,
                     evidence: format!(
                         "Findings decreased: {} in source → {:.1} avg in {} subsequent run(s)",
-                        source_findings, avg_subsequent, subsequent_run_ids.len()
+                        source_findings,
+                        avg_subsequent,
+                        subsequent_run_ids.len()
                     ),
                 })
             } else {
@@ -370,7 +367,10 @@ pub fn evaluate_pending_fixes(
     fixes.extend(inconclusive_fixes);
 
     if fixes.is_empty() {
-        debug!("No pending fixes to evaluate for workflow '{}'", workflow_name);
+        debug!(
+            "No pending fixes to evaluate for workflow '{}'",
+            workflow_name
+        );
         return Ok(Vec::new());
     }
 
@@ -386,8 +386,7 @@ pub fn evaluate_pending_fixes(
             Ok(result) => {
                 // Only persist if the evaluation changed (avoid unnecessary writes
                 // for fixes that remain inconclusive)
-                let changed = fix.effectiveness.as_deref()
-                    != Some(result.effectiveness.as_str());
+                let changed = fix.effectiveness.as_deref() != Some(result.effectiveness.as_str());
 
                 if changed {
                     if let Err(e) = storage::update_fix_effectiveness(
@@ -396,7 +395,10 @@ pub fn evaluate_pending_fixes(
                         result.effectiveness.as_str(),
                         Some(&result.evidence),
                     ) {
-                        warn!("Failed to persist evaluation for fix {}: {}", result.fix_id, e);
+                        warn!(
+                            "Failed to persist evaluation for fix {}: {}",
+                            result.fix_id, e
+                        );
                     }
                 }
                 results.push(result);
@@ -407,13 +409,25 @@ pub fn evaluate_pending_fixes(
         }
     }
 
-    let effective_count = results.iter().filter(|r| r.effectiveness == FixEffectiveness::Effective).count();
-    let ineffective_count = results.iter().filter(|r| r.effectiveness == FixEffectiveness::Ineffective).count();
-    let inconclusive_count = results.iter().filter(|r| r.effectiveness == FixEffectiveness::Inconclusive).count();
+    let effective_count = results
+        .iter()
+        .filter(|r| r.effectiveness == FixEffectiveness::Effective)
+        .count();
+    let ineffective_count = results
+        .iter()
+        .filter(|r| r.effectiveness == FixEffectiveness::Ineffective)
+        .count();
+    let inconclusive_count = results
+        .iter()
+        .filter(|r| r.effectiveness == FixEffectiveness::Inconclusive)
+        .count();
 
     info!(
         "Evaluated {} fixes: {} effective, {} ineffective, {} inconclusive",
-        results.len(), effective_count, ineffective_count, inconclusive_count,
+        results.len(),
+        effective_count,
+        ineffective_count,
+        inconclusive_count,
     );
 
     Ok(results)

@@ -59,7 +59,9 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use tauri::Emitter;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
@@ -365,6 +367,8 @@ pub async fn start_server(
     app_handle: tauri::AppHandle,
     port: u16,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let emitter = app_handle.clone();
+    let api_ready_flag = app_state.clone();
     let router = create_router(app_state, rag_state, app_handle);
 
     // Try the requested port first, then fallback ports if zombie connections are blocking
@@ -384,6 +388,15 @@ pub async fn start_server(
                     );
                 }
                 info!("MCP API server listening on port {}", try_port);
+
+                // Signal that the API is ready for requests
+                api_ready_flag.api_ready.store(true, Ordering::Relaxed);
+                if let Err(e) = emitter.emit("api-ready", try_port) {
+                    warn!("Failed to emit api-ready event: {}", e);
+                } else {
+                    info!("Emitted api-ready event (port {})", try_port);
+                }
+
                 axum::serve(listener, router).await?;
                 return Ok(());
             }

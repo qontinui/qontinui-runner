@@ -21,7 +21,7 @@
 
 use rusqlite::Connection;
 use serde_json::json;
-use tracing::warn;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::unified_workflows::{LogSourceSelection, UnifiedWorkflow};
@@ -41,6 +41,8 @@ pub struct HistoricalContext {
     pub verifier_focus_items: Vec<String>,
     /// Formatted past successful fixes for the fixer.
     pub past_fixes_section: String,
+    /// Formatted ground truth reference workflows with full JSON.
+    pub gt_reference_section: String,
 }
 
 /// Build historical context from the database.
@@ -48,7 +50,7 @@ pub struct HistoricalContext {
 /// Returns None if there's no useful data or if queries fail.
 pub fn build_historical_context(
     conn: &Connection,
-    _description: &str,
+    description: &str,
     query_embedding: Option<&[f32]>,
     category: Option<&str>,
 ) -> Option<HistoricalContext> {
@@ -78,6 +80,21 @@ pub fn build_historical_context(
         String::new()
     };
 
+    // 2b. Ground truth reference workflows (keyword + optional embedding)
+    let gt_reference_section =
+        match similar_workflows::find_gt_reference_workflows(conn, description, query_embedding, 2)
+        {
+            Ok(gt) if !gt.is_empty() => {
+                info!("Found {} GT reference workflows", gt.len());
+                similar_workflows::format_gt_references(&gt)
+            }
+            Ok(_) => String::new(),
+            Err(e) => {
+                warn!("Failed to find GT reference workflows: {}", e);
+                String::new()
+            }
+        };
+
     // 3. Verifier focus items (top issues from self-improvement data)
     let verifier_focus_items = match self_improve::analyze_generation_patterns(conn) {
         Ok(ctx) => ctx
@@ -94,6 +111,7 @@ pub fn build_historical_context(
 
     if improvement_section.is_empty()
         && similar_section.is_empty()
+        && gt_reference_section.is_empty()
         && verifier_focus_items.is_empty()
         && past_fixes_section.is_empty()
     {
@@ -105,6 +123,7 @@ pub fn build_historical_context(
         similar_section,
         verifier_focus_items,
         past_fixes_section,
+        gt_reference_section,
     })
 }
 
@@ -310,8 +329,13 @@ fn build_builder_prompt(
         prompt.push_str(&format!("\n## Custom Instructions\n\n{}\n", template));
     }
 
-    // === ENHANCED: Add historical patterns and similar workflows ===
+    // === ENHANCED: Add historical patterns, similar workflows, and GT references ===
     if let Some(ctx) = historical {
+        // GT references go first (highest priority — verified correct examples)
+        if !ctx.gt_reference_section.is_empty() {
+            prompt.push('\n');
+            prompt.push_str(&ctx.gt_reference_section);
+        }
         if !ctx.improvement_section.is_empty() {
             prompt.push('\n');
             prompt.push_str(&ctx.improvement_section);
@@ -450,6 +474,10 @@ The following is an ordered implementation plan. Each numbered item or section r
     }
 
     if let Some(ctx) = historical {
+        if !ctx.gt_reference_section.is_empty() {
+            prompt.push('\n');
+            prompt.push_str(&ctx.gt_reference_section);
+        }
         if !ctx.improvement_section.is_empty() {
             prompt.push('\n');
             prompt.push_str(&ctx.improvement_section);

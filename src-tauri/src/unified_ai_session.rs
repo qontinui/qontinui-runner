@@ -31,7 +31,9 @@ use tracing::{error, info, instrument, warn};
 use crate::database::CreateTaskRunEventInput;
 use crate::doctor::DoctorHandle;
 use crate::execution_context::AiSessionContext;
-use crate::mcp::shared::{FindingContext, ProgressContext, ReflectionFixContext, FINDING_INSTRUCTIONS};
+use crate::mcp::shared::{
+    FindingContext, ProgressContext, ReflectionFixContext, FINDING_INSTRUCTIONS,
+};
 use crate::runtime_env::{
     get_available_mcp_tools, AiSessionContextExt, AiSessionContextToolsExt, ExecutionContextExt,
 };

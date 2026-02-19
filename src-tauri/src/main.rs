@@ -93,6 +93,7 @@ use display::DisplayProcessor;
 use doctor::{start_doctor_async, DoctorConfig};
 use error_monitor::{start_error_monitor_async, ErrorMonitorConfig};
 use logging::{init_logging, setup_panic_handler, LoggingConfig};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use storage::LocalStorage;
 use tauri::Manager;
@@ -269,6 +270,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         mcp_client_manager: tokio::sync::Mutex::new(mcp_client_manager),
         error_monitor_handle: TokioMutex::new(None), // Initialized in setup()
         doctor_handle: TokioMutex::new(None),        // Initialized in setup()
+        api_ready: AtomicBool::new(false),           // Set when MCP API server binds
     });
     let mcp_app_state = shared_app_state.clone();
     let mcp_rag_state = rag_state.clone();
@@ -300,6 +302,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::auth::refresh_token,
             commands::auth::get_access_token_for_websocket,
             commands::auth::send_device_heartbeat,
+            commands::auth::is_api_ready,
             // Configuration commands
             commands::config::load_configuration,
             commands::config::get_current_configuration,
@@ -987,9 +990,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             info!("Starting MCP API server on port {}", crate::mcp::types::MCP_API_PORT);
             let mcp_app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                // Wait a bit for app to fully initialize
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-
                 info!("MCP API server task starting...");
                 match mcp_api::start_server(mcp_app_state, mcp_rag_state, mcp_app_handle, crate::mcp::types::MCP_API_PORT).await {
                     Ok(_) => info!("MCP API server stopped normally"),
@@ -1000,8 +1000,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Start scheduler service in background
             info!("Starting scheduler service");
             tauri::async_runtime::spawn(async move {
-                // Wait for MCP API server to be ready
-                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                // Wait briefly for MCP API server to bind
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                 scheduler_service::start_scheduler_service().await;
             });
 

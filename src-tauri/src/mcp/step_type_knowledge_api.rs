@@ -65,10 +65,7 @@ pub async fn get_knowledge_handler(
         Some(e) => Ok(Json(ApiResponse::success(e))),
         None => Err((
             StatusCode::NOT_FOUND,
-            Json(api_error(format!(
-                "Step type knowledge '{}' not found",
-                id
-            ))),
+            Json(api_error(format!("Step type knowledge '{}' not found", id))),
         )),
     }
 }
@@ -156,10 +153,7 @@ pub async fn delete_knowledge_handler(
     } else {
         Err((
             StatusCode::NOT_FOUND,
-            Json(api_error(format!(
-                "Step type knowledge '{}' not found",
-                id
-            ))),
+            Json(api_error(format!("Step type knowledge '{}' not found", id))),
         ))
     }
 }

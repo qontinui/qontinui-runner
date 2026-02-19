@@ -130,10 +130,7 @@ impl WebBackendWorkflowClient {
 
         let response = self
             .client
-            .post(format!(
-                "{}/api/v1/unified-workflows",
-                get_api_base_url()
-            ))
+            .post(format!("{}/api/v1/unified-workflows", get_api_base_url()))
             .bearer_auth(&access_token)
             .json(workflow)
             .send()
@@ -245,7 +242,10 @@ pub async fn sync_workflows_from_backend(
     };
 
     let count = workflows.len();
-    info!("Syncing {} workflows from web backend to local cache", count);
+    info!(
+        "Syncing {} workflows from web backend to local cache",
+        count
+    );
 
     for workflow in &workflows {
         // Check if workflow exists locally
@@ -317,7 +317,10 @@ pub async fn sync_workflows_from_backend(
                 }
             }
             Err(e) => {
-                warn!("Error checking local cache for workflow {}: {}", workflow.id, e);
+                warn!(
+                    "Error checking local cache for workflow {}: {}",
+                    workflow.id, e
+                );
             }
         }
     }

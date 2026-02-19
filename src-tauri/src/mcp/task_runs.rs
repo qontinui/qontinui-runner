@@ -556,7 +556,11 @@ pub async fn get_full_workflow_state(
     // Determine defined phases from the workflow definition
     let defined_phases = if task_run.workflow_type.as_deref() == Some("unified") {
         if let Some(ref wn) = task_run.workflow_name {
-            match state.app_state.checkpoint_db.get_unified_workflow_by_name(wn) {
+            match state
+                .app_state
+                .checkpoint_db
+                .get_unified_workflow_by_name(wn)
+            {
                 Ok(Some(wf)) => {
                     let mut phases = Vec::new();
                     if !wf.setup_steps.is_empty() {

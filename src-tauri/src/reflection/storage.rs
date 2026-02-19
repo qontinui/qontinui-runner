@@ -51,17 +51,14 @@ fn normalize_for_hash(text: &str) -> String {
     use regex::Regex;
 
     static UUID_RE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}").unwrap()
+        Regex::new(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+            .unwrap()
     });
-    static TIMESTAMP_RE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"(?i)\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}[^\s]*").unwrap()
-    });
-    static HEX_RE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"\b[0-9a-fA-F]{8,}\b").unwrap()
-    });
-    static RUN_NUMBER_RE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"(?i)\b(?:run|iteration|session)\s*\d+").unwrap()
-    });
+    static TIMESTAMP_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?i)\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}[^\s]*").unwrap());
+    static HEX_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b[0-9a-fA-F]{8,}\b").unwrap());
+    static RUN_NUMBER_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?i)\b(?:run|iteration|session)\s*\d+").unwrap());
 
     let text = text.to_lowercase();
     let text = UUID_RE.replace_all(&text, "").to_string();
@@ -752,7 +749,10 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(hash1, hash2, "Near-duplicate descriptions should produce the same hash");
+        assert_eq!(
+            hash1, hash2,
+            "Near-duplicate descriptions should produce the same hash"
+        );
     }
 
     #[test]
@@ -769,6 +769,9 @@ mod tests {
             None,
             None,
         );
-        assert_ne!(hash1, hash2, "Genuinely different descriptions should produce different hashes");
+        assert_ne!(
+            hash1, hash2,
+            "Genuinely different descriptions should produce different hashes"
+        );
     }
 }

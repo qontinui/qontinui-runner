@@ -511,7 +511,6 @@ pub fn get_finding_summary(conn: &Connection, task_run_id: &str) -> Result<Findi
 fn normalize_title(title: &str) -> String {
     title
         .to_lowercase()
-        .trim()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -979,7 +978,10 @@ mod tests {
     fn test_normalize_title() {
         assert_eq!(normalize_title("Hello World"), "hello world");
         assert_eq!(normalize_title("  Extra   Spaces  "), "extra spaces");
-        assert_eq!(normalize_title("ESLint verification step"), "eslint verification step");
+        assert_eq!(
+            normalize_title("ESLint verification step"),
+            "eslint verification step"
+        );
         assert_eq!(
             normalize_title("ESLint Verification Step"),
             normalize_title("eslint verification step")

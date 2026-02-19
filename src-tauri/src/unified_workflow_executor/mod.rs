@@ -137,9 +137,9 @@ impl Drop for WorkflowDropGuard {
             );
             let error_message =
                 "Workflow task was unexpectedly terminated (possible task cancellation or runtime shutdown)";
-            if let Err(e) =
-                self.checkpoint_db
-                    .fail_task_run(&self.execution_id, error_message)
+            if let Err(e) = self
+                .checkpoint_db
+                .fail_task_run(&self.execution_id, error_message)
             {
                 error!(
                     "Failed to mark dropped workflow {} as failed: {}",

@@ -178,6 +178,14 @@ static CHECK_FIELDS: &[StepTypeFieldDef] = &[
         default: "",
     },
     StepTypeFieldDef {
+        name: "tool",
+        field_type: FieldType::String,
+        required: false,
+        description: "Tool identifier (e.g., 'ruff', 'eslint', 'prettier', 'tsc', 'cargo', 'mypy'). Helps track which tool this check uses.",
+        enum_values: &[],
+        default: "",
+    },
+    StepTypeFieldDef {
         name: "command",
         field_type: FieldType::String,
         required: false,
@@ -336,6 +344,22 @@ static API_REQUEST_FIELDS: &[StepTypeFieldDef] = &[
         enum_values: &[],
         default: "",
     },
+    StepTypeFieldDef {
+        name: "retry_count",
+        field_type: FieldType::Number,
+        required: false,
+        description: "Number of retry attempts when assertions fail (0 = no retries). Useful after page navigation to wait for WebSocket reconnection.",
+        enum_values: &[],
+        default: "0",
+    },
+    StepTypeFieldDef {
+        name: "retry_delay_ms",
+        field_type: FieldType::Number,
+        required: false,
+        description: "Delay in milliseconds between retry attempts (default: 2000)",
+        enum_values: &[],
+        default: "2000",
+    },
 ];
 
 static SCREENSHOT_FIELDS: &[StepTypeFieldDef] = &[
@@ -363,7 +387,14 @@ static GUI_ACTION_FIELDS: &[StepTypeFieldDef] = &[
         field_type: FieldType::String,
         required: true,
         description: "Action to perform",
-        enum_values: &["click", "double_click", "right_click", "type", "hotkey", "scroll"],
+        enum_values: &[
+            "click",
+            "double_click",
+            "right_click",
+            "type",
+            "hotkey",
+            "scroll",
+        ],
         default: "",
     },
     StepTypeFieldDef {
@@ -519,16 +550,14 @@ static MACRO_FIELDS: &[StepTypeFieldDef] = &[StepTypeFieldDef {
     default: "",
 }];
 
-static AWAS_DISCOVER_FIELDS: &[StepTypeFieldDef] = &[
-    StepTypeFieldDef {
-        name: "url",
-        field_type: FieldType::String,
-        required: true,
-        description: "URL of webpage to discover actions on",
-        enum_values: &[],
-        default: "",
-    },
-];
+static AWAS_DISCOVER_FIELDS: &[StepTypeFieldDef] = &[StepTypeFieldDef {
+    name: "url",
+    field_type: FieldType::String,
+    required: true,
+    description: "URL of webpage to discover actions on",
+    enum_values: &[],
+    default: "",
+}];
 
 static AWAS_EXECUTE_FIELDS: &[StepTypeFieldDef] = &[
     StepTypeFieldDef {

@@ -20,7 +20,7 @@ use crate::config_storage::ConfigStorage;
 use crate::doctor::DoctorHandle;
 use crate::event_system::EventBroadcaster;
 use crate::orchestrator::integration::StageTransition;
-use crate::orchestrator::knowledge::{AgentType, KnowledgeBase, parse_findings_from_output};
+use crate::orchestrator::knowledge::{parse_findings_from_output, AgentType, KnowledgeBase};
 use crate::step_executor::ExecutionStepConfig;
 use crate::step_registry::StepEventLogger;
 use crate::summary_generator::generate_task_summary_async;
@@ -30,7 +30,9 @@ use crate::AppState;
 use super::phases::{AgenticExecutor, CompletionExecutor, SetupExecutor, VerificationExecutor};
 use super::resume::{ResumeManager, ResumePoint};
 use super::states::UnifiedWorkflowState;
-use super::types::{get_parent_task_id, AgenticOutcome, IterationResult, LoopConfig, LoopResult, SweepResult};
+use super::types::{
+    get_parent_task_id, AgenticOutcome, IterationResult, LoopConfig, LoopResult, SweepResult,
+};
 
 /// The main loop controller for unified workflows.
 ///
@@ -111,14 +113,20 @@ impl LoopController {
     }
 
     /// Set the reflection fix context for parsing [REFLECTION_FIX:...] markers during agentic phase.
-    pub fn with_reflection_fix_ctx(mut self, ctx: crate::mcp::shared::ReflectionFixContext) -> Self {
+    pub fn with_reflection_fix_ctx(
+        mut self,
+        ctx: crate::mcp::shared::ReflectionFixContext,
+    ) -> Self {
         self.agentic_executor.set_reflection_fix_ctx(ctx.clone());
         self.reflection_fix_ctx = Some(ctx);
         self
     }
 
     /// Set the step injection context for parsing [INJECT_STEP]...[/INJECT_STEP] markers during agentic phase.
-    pub fn with_step_injection_ctx(mut self, ctx: crate::step_injection::types::StepInjectionContext) -> Self {
+    pub fn with_step_injection_ctx(
+        mut self,
+        ctx: crate::step_injection::types::StepInjectionContext,
+    ) -> Self {
         self.agentic_executor.set_step_injection_ctx(ctx.clone());
         self.step_injection_ctx = Some(ctx);
         self
@@ -698,7 +706,10 @@ impl LoopController {
             && loop_result.verification_passed
             && !self.is_task_stopped(&config.execution_id)
         {
-            info!("=== PHASE 2.5: COMPLETION SWEEP (max {} iterations) ===", config.max_sweep_iterations);
+            info!(
+                "=== PHASE 2.5: COMPLETION SWEEP (max {} iterations) ===",
+                config.max_sweep_iterations
+            );
 
             let sweep_result = self
                 .run_sweep_loop(
@@ -980,7 +991,10 @@ impl LoopController {
                         );
                     }
                     Err(e) => {
-                        warn!("Failed to launch reflection for {}: {}", source_task_run_id, e);
+                        warn!(
+                            "Failed to launch reflection for {}: {}",
+                            source_task_run_id, e
+                        );
                     }
                 }
             });
@@ -1078,12 +1092,7 @@ impl LoopController {
             } else {
                 // Broadcast task-run-update to both Tauri + WebSocket
                 let broadcaster = EventBroadcaster::new(self.app_handle.clone());
-                broadcaster.task_run_update(
-                    &config.execution_id,
-                    "running",
-                    Some(iteration),
-                    None,
-                );
+                broadcaster.task_run_update(&config.execution_id, "running", Some(iteration), None);
             }
 
             // Check if we've exceeded max iterations BEFORE running verification
@@ -1137,7 +1146,8 @@ impl LoopController {
             );
 
             // Build effective verification steps: static steps + any dynamically injected steps
-            let effective_verification_steps: Vec<ExecutionStepConfig> = if dynamic_steps.is_empty() {
+            let effective_verification_steps: Vec<ExecutionStepConfig> = if dynamic_steps.is_empty()
+            {
                 verification_steps.to_vec()
             } else {
                 let mut combined = verification_steps.to_vec();
@@ -1246,10 +1256,8 @@ impl LoopController {
                     let parent_id = get_parent_task_id(&config.execution_id);
                     match self.knowledge_base.get_all_knowledge(&parent_id) {
                         Ok(entries) => {
-                            let unresolved: Vec<_> = entries
-                                .iter()
-                                .filter(|k| !k.is_resolved)
-                                .collect();
+                            let unresolved: Vec<_> =
+                                entries.iter().filter(|k| !k.is_resolved).collect();
                             if !unresolved.is_empty() {
                                 info!(
                                     "Resolving {} unresolved knowledge entries after verification pass",
@@ -1260,7 +1268,10 @@ impl LoopController {
                                         &entry.id,
                                         Some("Resolved: verification passed"),
                                     ) {
-                                        warn!("Failed to resolve knowledge entry {}: {}", entry.id, e);
+                                        warn!(
+                                            "Failed to resolve knowledge entry {}: {}",
+                                            entry.id, e
+                                        );
                                     }
                                 }
                             }
@@ -1462,15 +1473,11 @@ impl LoopController {
                         iteration
                     );
                     for finding in &findings {
-                        if let Err(e) = self.knowledge_base.record_finding(
-                            &parent_id,
-                            finding,
-                            iteration,
-                        ) {
-                            warn!(
-                                "Failed to record finding as knowledge: {}",
-                                e
-                            );
+                        if let Err(e) = self
+                            .knowledge_base
+                            .record_finding(&parent_id, finding, iteration)
+                        {
+                            warn!("Failed to record finding as knowledge: {}", e);
                         }
                     }
                 }
@@ -1486,16 +1493,10 @@ impl LoopController {
                         )
                     }
                     AgenticOutcome::Failed { error, .. } => {
-                        format!(
-                            "Iteration {}: Agentic phase failed: {}",
-                            iteration, error
-                        )
+                        format!("Iteration {}: Agentic phase failed: {}", iteration, error)
                     }
                     AgenticOutcome::Error { error } => {
-                        format!(
-                            "Iteration {}: Agentic phase error: {}",
-                            iteration, error
-                        )
+                        format!("Iteration {}: Agentic phase error: {}", iteration, error)
                     }
                     AgenticOutcome::Skipped => String::new(),
                 };
@@ -1899,7 +1900,7 @@ impl LoopController {
                 .run_agentic(
                     config,
                     loop_iterations_run + iteration + 1, // Continue iteration numbering
-                    "", // No failure context for sweep
+                    "",                                  // No failure context for sweep
                     true,
                     &[sweep_step],
                     logger,
@@ -1961,7 +1962,10 @@ impl LoopController {
 
             // Stop on failure
             if !outcome.is_success() {
-                warn!("SWEEP: Iteration {} was not successful, ending loop", iteration + 1);
+                warn!(
+                    "SWEEP: Iteration {} was not successful, ending loop",
+                    iteration + 1
+                );
                 break;
             }
         }
@@ -1988,10 +1992,7 @@ impl LoopController {
         );
 
         if !base_prompt.is_empty() {
-            prompt.push_str(&format!(
-                "### Original Task\n\n{}\n\n",
-                base_prompt
-            ));
+            prompt.push_str(&format!("### Original Task\n\n{}\n\n", base_prompt));
         }
 
         prompt.push_str(&format!(
@@ -2585,13 +2586,34 @@ pub fn convert_json_steps_with_phase(
                 let step_type = step.get("type").and_then(|t| t.as_str())?;
                 ExecutionStepConfig {
                     step_type: step_type.to_string(),
-                    name: step.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()),
-                    id: step.get("id").and_then(|i| i.as_str()).map(|s| s.to_string()),
-                    shell_command: step.get("command").and_then(|c| c.as_str()).map(|s| s.to_string()),
-                    shell_command_working_directory: step.get("working_directory").and_then(|w| w.as_str()).map(|s| s.to_string()),
-                    check_type: step.get("check_type").and_then(|c| c.as_str()).map(|s| s.to_string()),
-                    test_type: step.get("test_type").and_then(|t| t.as_str()).map(|s| s.to_string()),
-                    test_id: step.get("test_id").and_then(|t| t.as_str()).map(|s| s.to_string()),
+                    name: step
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string()),
+                    id: step
+                        .get("id")
+                        .and_then(|i| i.as_str())
+                        .map(|s| s.to_string()),
+                    shell_command: step
+                        .get("command")
+                        .and_then(|c| c.as_str())
+                        .map(|s| s.to_string()),
+                    shell_command_working_directory: step
+                        .get("working_directory")
+                        .and_then(|w| w.as_str())
+                        .map(|s| s.to_string()),
+                    check_type: step
+                        .get("check_type")
+                        .and_then(|c| c.as_str())
+                        .map(|s| s.to_string()),
+                    test_type: step
+                        .get("test_type")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string()),
+                    test_id: step
+                        .get("test_id")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string()),
                     monitor_index: Some(monitor),
                     ..Default::default()
                 }
@@ -2640,13 +2662,34 @@ pub fn convert_all_json_steps_with_phase(
                 let step_type = step.get("type").and_then(|t| t.as_str())?;
                 ExecutionStepConfig {
                     step_type: step_type.to_string(),
-                    name: step.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()),
-                    id: step.get("id").and_then(|i| i.as_str()).map(|s| s.to_string()),
-                    shell_command: step.get("command").and_then(|c| c.as_str()).map(|s| s.to_string()),
-                    shell_command_working_directory: step.get("working_directory").and_then(|w| w.as_str()).map(|s| s.to_string()),
-                    check_type: step.get("check_type").and_then(|c| c.as_str()).map(|s| s.to_string()),
-                    test_type: step.get("test_type").and_then(|t| t.as_str()).map(|s| s.to_string()),
-                    test_id: step.get("test_id").and_then(|t| t.as_str()).map(|s| s.to_string()),
+                    name: step
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string()),
+                    id: step
+                        .get("id")
+                        .and_then(|i| i.as_str())
+                        .map(|s| s.to_string()),
+                    shell_command: step
+                        .get("command")
+                        .and_then(|c| c.as_str())
+                        .map(|s| s.to_string()),
+                    shell_command_working_directory: step
+                        .get("working_directory")
+                        .and_then(|w| w.as_str())
+                        .map(|s| s.to_string()),
+                    check_type: step
+                        .get("check_type")
+                        .and_then(|c| c.as_str())
+                        .map(|s| s.to_string()),
+                    test_type: step
+                        .get("test_type")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string()),
+                    test_id: step
+                        .get("test_id")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string()),
                     monitor_index: Some(monitor),
                     ..Default::default()
                 }

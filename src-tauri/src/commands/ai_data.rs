@@ -1538,10 +1538,7 @@ pub async fn get_task_run_context(
             if let Some(checkpoint_id) = parsed.get("source_checkpoint_id") {
                 variables.push(RuntimeContextVariable {
                     name: "source_checkpoint_id".to_string(),
-                    value: checkpoint_id
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
+                    value: checkpoint_id.as_str().unwrap_or_default().to_string(),
                     source: "system".to_string(),
                     source_step: None,
                 });

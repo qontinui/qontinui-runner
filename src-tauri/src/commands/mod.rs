@@ -37,6 +37,7 @@ use crate::storage::LocalStorage;
 use crate::tiered_info::RunRecordingHandler;
 use crate::video_recorder::VideoRecordingService;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 use tokio::sync::Mutex as TokioMutex;
@@ -69,6 +70,7 @@ pub mod hooks;
 pub mod interaction;
 pub mod issues;
 pub mod learning; // Learning insights dashboard commands
+pub mod library_sync; // Sync library items (checks, macros, etc.) to web backend
 pub mod logging;
 pub mod mcp; // MCP client management and tool calling
 pub mod mobile; // Mobile development feedback (ADB, screenshots, logcat)
@@ -86,7 +88,6 @@ pub mod state_explorer; // State explorer for AI-driven state machine exploratio
 pub mod state_machine;
 pub mod step_outputs; // Step output collection for test builder
 pub mod storage;
-pub mod library_sync; // Sync library items (checks, macros, etc.) to web backend
 pub mod task_sync; // renamed from ai_task_reporting
 pub mod test_orchestrator; // AI-driven multi-step API test orchestration
 pub mod testing;
@@ -146,6 +147,10 @@ pub struct AppState {
     /// The Doctor observes process health (CPU, memory, process tree, stdout activity)
     /// and emits events when processes appear stuck. It never kills processes.
     pub doctor_handle: TokioMutex<Option<DoctorHandle>>,
+    /// Flag indicating the HTTP API server (port 9876) has bound and is ready.
+    /// Set by `mcp_api::start_server` after successful bind, checked by the
+    /// `is_api_ready` Tauri command so the frontend can gate HTTP calls.
+    pub api_ready: AtomicBool,
 }
 
 /// Standard response structure for command handlers.

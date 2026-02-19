@@ -14,6 +14,7 @@ import {
   ChevronDown,
   ChevronUp,
   Settings2,
+  Search,
 } from "lucide-react";
 import type { UnifiedWorkflow } from "../../types";
 import { getAccentColors } from "@/design-system";
@@ -34,12 +35,20 @@ const LOG_SOURCE_OPTIONS = [
 
 const API_BASE = "http://localhost:9876";
 
+interface DiscoveryCall {
+  tool_name: string;
+  input_summary: string;
+  success: boolean;
+  duration_ms: number;
+}
+
 interface GenerateWorkflowResponse {
   workflow: UnifiedWorkflow | null;
   validation_errors: string[];
   success: boolean;
   error: string | null;
   model_used: string | null;
+  discovery_calls?: DiscoveryCall[];
 }
 
 interface AiGenerateWorkflowModalProps {
@@ -73,6 +82,10 @@ export function AiGenerateWorkflowModal({
   const [skipAiSummary, setSkipAiSummary] = useState(false);
   const [logSourceSelection, setLogSourceSelection] = useState("");
   const [autoIncludeContexts, setAutoIncludeContexts] = useState(true);
+  const [discoveryMode, setDiscoveryMode] = useState<"auto" | "enabled" | "disabled">("auto");
+
+  // Discovery results
+  const [discoveryCalls, setDiscoveryCalls] = useState<DiscoveryCall[]>([]);
 
   const accentColors = getAccentColors("blue");
 
@@ -116,6 +129,9 @@ export function AiGenerateWorkflowModal({
       if (!autoIncludeContexts) {
         requestBody.auto_include_contexts = false;
       }
+      if (discoveryMode !== "auto") {
+        requestBody.discovery_mode = discoveryMode;
+      }
 
       const response = await fetch(`${API_BASE}/unified-workflows/generate`, {
         method: "POST",
@@ -135,6 +151,7 @@ export function AiGenerateWorkflowModal({
       if (data.success && data.workflow) {
         setGeneratedWorkflow(data.workflow);
         setValidationErrors(data.validation_errors || []);
+        setDiscoveryCalls(data.discovery_calls || []);
         setShowPreview(true);
       } else {
         setError(data.error || "Failed to generate workflow. Please try again.");
@@ -154,6 +171,7 @@ export function AiGenerateWorkflowModal({
     skipAiSummary,
     logSourceSelection,
     autoIncludeContexts,
+    discoveryMode,
   ]);
 
   const handleClose = useCallback(() => {
@@ -163,6 +181,7 @@ export function AiGenerateWorkflowModal({
     setError(null);
     setGeneratedWorkflow(null);
     setValidationErrors([]);
+    setDiscoveryCalls([]);
     setShowPreview(false);
     setShowAdvanced(false);
     // Reset advanced options to defaults
@@ -172,6 +191,7 @@ export function AiGenerateWorkflowModal({
     setSkipAiSummary(false);
     setLogSourceSelection("");
     setAutoIncludeContexts(true);
+    setDiscoveryMode("auto");
     onClose();
   }, [onClose]);
 
@@ -374,8 +394,23 @@ export function AiGenerateWorkflowModal({
                   </div>
                 </div>
 
-                {/* Checkboxes */}
+                {/* Discovery Mode and Checkboxes */}
                 <div className="flex items-center gap-6">
+                  <div className="flex items-center gap-2">
+                    <label className="text-xs font-medium text-muted-foreground">Discovery</label>
+                    <select
+                      value={discoveryMode}
+                      onChange={(e) =>
+                        setDiscoveryMode(e.target.value as "auto" | "enabled" | "disabled")
+                      }
+                      className="px-2 py-1 bg-background border border-border rounded-md text-xs focus:outline-none focus:ring-2 focus:ring-primary"
+                      disabled={isGenerating}
+                    >
+                      <option value="auto">Auto</option>
+                      <option value="enabled">Enabled</option>
+                      <option value="disabled">Disabled</option>
+                    </select>
+                  </div>
                   <label className="flex items-center gap-2 text-sm cursor-pointer">
                     <input
                       type="checkbox"
@@ -463,6 +498,36 @@ export function AiGenerateWorkflowModal({
                   </span>
                 </div>
               </div>
+
+              {/* Discovery Results */}
+              {discoveryCalls.length > 0 && (
+                <div className="p-3 bg-blue-500/10 border border-blue-500/30 rounded-md">
+                  <div className="flex items-center gap-2 mb-2">
+                    <Search className="w-4 h-4 text-blue-500" />
+                    <span className="text-sm font-medium text-blue-400">
+                      Discovery ({discoveryCalls.filter((c) => c.success).length}/
+                      {discoveryCalls.length} tools)
+                    </span>
+                    <span className="text-xs text-muted-foreground ml-auto">
+                      {discoveryCalls.reduce((sum, c) => sum + c.duration_ms, 0)}ms
+                    </span>
+                  </div>
+                  <div className="text-xs text-muted-foreground space-y-1">
+                    {discoveryCalls.map((call) => (
+                      <div key={call.tool_name} className="flex items-center gap-2">
+                        {call.success ? (
+                          <Check className="w-3 h-3 text-green-500 flex-shrink-0" />
+                        ) : (
+                          <X className="w-3 h-3 text-red-500 flex-shrink-0" />
+                        )}
+                        <span>{call.tool_name}</span>
+                        <span className="text-muted-foreground/60">{call.input_summary}</span>
+                        <span className="ml-auto">{call.duration_ms}ms</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {/* Validation Warnings */}
               {validationErrors.length > 0 && (

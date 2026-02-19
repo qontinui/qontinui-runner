@@ -216,7 +216,10 @@ fn extract_env_prefix(command: &str) -> (Vec<(String, String)>, String) {
     while let Some(eq_pos) = remaining.find('=') {
         let prefix = &remaining[..eq_pos];
         // Validate that the prefix is a valid env var name (alphanumeric + underscore, no spaces)
-        if prefix.is_empty() || prefix.contains(' ') || !prefix.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        if prefix.is_empty()
+            || prefix.contains(' ')
+            || !prefix.chars().all(|c| c.is_alphanumeric() || c == '_')
+        {
             break;
         }
         // Find the end of the value (next space)

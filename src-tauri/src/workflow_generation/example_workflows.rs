@@ -47,7 +47,16 @@ pub fn find_relevant_examples(
     }
 }
 
-type EmbeddingRow = (String, String, String, String, String, String, String, Vec<u8>);
+type EmbeddingRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Vec<u8>,
+);
 
 fn map_embedding_row(row: &rusqlite::Row) -> rusqlite::Result<EmbeddingRow> {
     Ok((
@@ -97,7 +106,8 @@ fn find_by_embedding(
             |(id, name, description, category, setup, verification, agentic, embedding_blob)| {
                 let embedding = blob_to_f32_vec(&embedding_blob)?;
                 let similarity = cosine_similarity(query_embedding, &embedding);
-                let workflow_json = reconstruct_workflow_json(&name, &description, &setup, &verification, &agentic);
+                let workflow_json =
+                    reconstruct_workflow_json(&name, &description, &setup, &verification, &agentic);
                 Some(ExampleWorkflowRef {
                     id,
                     name,
@@ -111,7 +121,11 @@ fn find_by_embedding(
         .collect();
 
     // Sort by similarity descending
-    scored.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        b.similarity
+            .partial_cmp(&a.similarity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     scored.truncate(limit);
     Ok(scored)
 }
@@ -162,7 +176,8 @@ fn find_by_recency(
         .into_iter()
         .map(
             |(id, name, description, category, setup, verification, agentic)| {
-                let workflow_json = reconstruct_workflow_json(&name, &description, &setup, &verification, &agentic);
+                let workflow_json =
+                    reconstruct_workflow_json(&name, &description, &setup, &verification, &agentic);
                 ExampleWorkflowRef {
                     id,
                     name,
@@ -312,7 +327,7 @@ fn reconstruct_workflow_json(
 }
 
 fn blob_to_f32_vec(blob: &[u8]) -> Option<Vec<f32>> {
-    if blob.len() % 4 != 0 {
+    if !blob.len().is_multiple_of(4) {
         return None;
     }
     Some(

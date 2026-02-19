@@ -262,10 +262,7 @@ async fn update_on_backend(
 async fn delete_from_backend(id: &str) {
     let client = crate::mcp::web_backend_workflows::WebBackendWorkflowClient::new();
     if let Err(e) = client.delete_workflow(id).await {
-        warn!(
-            "Failed to delete workflow '{}' from backend: {}",
-            id, e
-        );
+        warn!("Failed to delete workflow '{}' from backend: {}", id, e);
     }
 }
 
@@ -824,7 +821,10 @@ pub async fn generate_unified_workflow_handler(
         match gen_result {
             Ok(response) => response,
             Err(e) => {
-                warn!("DB access failed for workflow generation, falling back to no-DB path: {}", e);
+                warn!(
+                    "DB access failed for workflow generation, falling back to no-DB path: {}",
+                    e
+                );
                 // This shouldn't happen, but if it does, the request was already moved
                 // into the closure above, so we can't retry. Return an error response.
                 workflow_generation::GenerateWorkflowResponse {
@@ -835,6 +835,7 @@ pub async fn generate_unified_workflow_handler(
                     model_used: None,
                     verification_iterations: vec![],
                     hardening_summary: None,
+                    discovery_calls: vec![],
                 }
             }
         }
@@ -1230,10 +1231,7 @@ pub async fn run_unified_workflow(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
     Json(request): Json<RunUnifiedWorkflowRequest>,
-) -> Result<
-    Json<ApiResponse<RunUnifiedWorkflowResponse>>,
-    (StatusCode, Json<ApiResponse<()>>),
-> {
+) -> Result<Json<ApiResponse<RunUnifiedWorkflowResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("Running unified workflow: {}", id);
 
     // Fetch the workflow
@@ -1986,7 +1984,10 @@ pub async fn run_unified_workflow(
                     .and_then(|s| s.error.as_ref())
                     .map(|s| s.as_str())
                     .unwrap_or("Unknown error");
-                if let Err(e) = app_state.checkpoint_db.fail_task_run(&execution_id, error_msg) {
+                if let Err(e) = app_state
+                    .checkpoint_db
+                    .fail_task_run(&execution_id, error_msg)
+                {
                     warn!("Failed to mark task_run {} as failed: {}", execution_id, e);
                 }
             }
@@ -3192,13 +3193,11 @@ async fn update_example_status_handler(
     state
         .app_state
         .checkpoint_db
-        .with_conn(|conn| {
-            match request.status.as_str() {
-                "active" => example_workflows::promote_workflow_to_example(conn, &id),
-                "excluded" => example_workflows::exclude_workflow_from_examples(conn, &id),
-                "pending" => example_workflows::remove_workflow_from_examples(conn, &id),
-                _ => unreachable!(),
-            }
+        .with_conn(|conn| match request.status.as_str() {
+            "active" => example_workflows::promote_workflow_to_example(conn, &id),
+            "excluded" => example_workflows::exclude_workflow_from_examples(conn, &id),
+            "pending" => example_workflows::remove_workflow_from_examples(conn, &id),
+            _ => unreachable!(),
         })
         .map_err(|e| {
             (

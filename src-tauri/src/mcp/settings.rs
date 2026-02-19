@@ -990,10 +990,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
             get(get_general_settings).put(save_general_settings),
         )
         // App mode
-        .route(
-            "/settings/app-mode",
-            get(get_app_mode).put(save_app_mode),
-        )
+        .route("/settings/app-mode", get(get_app_mode).put(save_app_mode))
         // AI settings
         .route("/settings/ai", get(get_ai_settings).put(save_ai_settings))
         .route("/settings/ai/test-connection", post(test_ai_connection))

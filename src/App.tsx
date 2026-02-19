@@ -95,6 +95,7 @@ import { setupEventHandlers, eventRouter } from "./managers";
 
 // Hooks
 import {
+  useApiReady,
   useActionLogView,
   useLogManager,
   useUIState,
@@ -397,6 +398,9 @@ function migrateTabId(stored: string | null): MainTabId {
 function AppContent() {
   // Auth state from context
   const auth = useAuth();
+
+  // HTTP API readiness (port 9876)
+  const isApiReady = useApiReady();
 
   // Execution state from context
   const execution = useExecution();
@@ -969,8 +973,9 @@ function AppContent() {
     setActiveTab("run-recap");
   }, [lastRun, execution]);
 
-  // Show loading state while checking auth or during dev auto-login
+  // Show loading state while checking auth, during dev auto-login, or while API server starts
   const isAuthLoading = auth.loading || auth.devAutoLoginPending;
+  const isInitializing = isAuthLoading || !isApiReady;
   console.log(
     "[APP] Render - auth.loading:",
     auth.loading,
@@ -978,16 +983,21 @@ function AppContent() {
     auth.devAutoLoginPending,
     "auth.authStatus:",
     auth.authStatus,
+    "isApiReady:",
+    isApiReady,
   );
-  if (isAuthLoading) {
-    console.log("[APP] Rendering loading state");
+  if (isInitializing) {
+    const loadingMessage = auth.devAutoLoginPending
+      ? "Signing in..."
+      : isAuthLoading
+        ? "Checking authentication..."
+        : "Starting API server...";
+    console.log("[APP] Rendering loading state:", loadingMessage);
     return (
       <div className="min-h-screen bg-background grid-dots flex items-center justify-center">
         <div className="card p-8 text-center space-y-4">
           <div className="inline-block w-12 h-12 border-4 border-primary border-t-transparent rounded-full animate-spin" />
-          <p className="text-muted-foreground">
-            {auth.devAutoLoginPending ? "Signing in..." : "Checking authentication..."}
-          </p>
+          <p className="text-muted-foreground">{loadingMessage}</p>
         </div>
       </div>
     );

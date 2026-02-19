@@ -84,8 +84,8 @@ impl AppContext {
     fn from_workflow(workflow: &UnifiedWorkflow, _description: &str) -> Self {
         let workflow_json = serde_json::to_string(workflow).unwrap_or_default();
 
-        let targets_web_app = workflow_json.contains("localhost:3001")
-            || workflow_json.contains("localhost:1420");
+        let targets_web_app =
+            workflow_json.contains("localhost:3001") || workflow_json.contains("localhost:1420");
 
         let has_sdk_connect = workflow_json.contains("ui-bridge/sdk/connect");
 
@@ -114,10 +114,7 @@ impl AppContext {
             .collect();
 
         for step in &all_steps {
-            if let Some(wd) = step
-                .get("working_directory")
-                .and_then(|v| v.as_str())
-            {
+            if let Some(wd) = step.get("working_directory").and_then(|v| v.as_str()) {
                 if !working_directories.contains(&wd.to_string()) {
                     working_directories.push(wd.to_string());
                 }
@@ -176,10 +173,7 @@ pub fn should_harden_verification(workflow: &UnifiedWorkflow) -> bool {
     };
 
     let has_hardenable_steps = workflow.verification_steps.iter().any(|step| {
-        let step_type = step
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let step_type = step.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
         match step_type {
             // Prompt steps are always candidates
@@ -190,10 +184,7 @@ pub fn should_harden_verification(workflow: &UnifiedWorkflow) -> bool {
                 if !has_sdk_connect {
                     return false;
                 }
-                let test_type = step
-                    .get("test_type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let test_type = step.get("test_type").and_then(|v| v.as_str()).unwrap_or("");
                 // Playwright UI tests can be replaced by SDK checks
                 test_type == "playwright" || is_ui_verification_test(step)
             }
@@ -259,17 +250,25 @@ pub fn should_harden_verification(workflow: &UnifiedWorkflow) -> bool {
 /// Check if a test step is doing UI verification (vs. unit/integration tests).
 fn is_ui_verification_test(step: &Value) -> bool {
     let command = step.get("command").and_then(|v| v.as_str()).unwrap_or("");
-    let description = step.get("description").and_then(|v| v.as_str()).unwrap_or("");
+    let description = step
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let name = step.get("name").and_then(|v| v.as_str()).unwrap_or("");
 
     let combined = format!("{} {} {}", command, description, name).to_lowercase();
 
     // UI-related keywords suggest this test verifies UI state
-    combined.contains("ui") || combined.contains("element")
-        || combined.contains("render") || combined.contains("visual")
-        || combined.contains("page") || combined.contains("tab")
-        || combined.contains("button") || combined.contains("component")
-        || combined.contains("graph editor") || combined.contains("thumbnail")
+    combined.contains("ui")
+        || combined.contains("element")
+        || combined.contains("render")
+        || combined.contains("visual")
+        || combined.contains("page")
+        || combined.contains("tab")
+        || combined.contains("button")
+        || combined.contains("component")
+        || combined.contains("graph editor")
+        || combined.contains("thumbnail")
 }
 
 /// Run the hardener agent to strengthen verification steps.
@@ -350,28 +349,37 @@ fn count_candidates(workflow: &UnifiedWorkflow) -> usize {
         json.contains("ui-bridge/sdk/connect")
     };
 
-    workflow.verification_steps.iter().filter(|step| {
-        let t = step.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        match t {
-            "prompt" => true,
-            "test" if has_sdk => {
-                let tt = step.get("test_type").and_then(|v| v.as_str()).unwrap_or("");
-                tt == "playwright" || is_ui_verification_test(step)
+    workflow
+        .verification_steps
+        .iter()
+        .filter(|step| {
+            let t = step.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            match t {
+                "prompt" => true,
+                "test" if has_sdk => {
+                    let tt = step.get("test_type").and_then(|v| v.as_str()).unwrap_or("");
+                    tt == "playwright" || is_ui_verification_test(step)
+                }
+                "api_request" if has_sdk => {
+                    let url = step.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                    url.contains("ui-bridge/sdk")
+                }
+                _ => false,
             }
-            "api_request" if has_sdk => {
-                let url = step.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                url.contains("ui-bridge/sdk")
-            }
-            _ => false,
-        }
-    }).count()
+        })
+        .count()
 }
 
 // ============================================================================
 // Prompt builder
 // ============================================================================
 
-fn build_hardener_prompt(workflow_json: &str, description: &str, app_context: &AppContext, conn: Option<&Connection>) -> String {
+fn build_hardener_prompt(
+    workflow_json: &str,
+    description: &str,
+    app_context: &AppContext,
+    conn: Option<&Connection>,
+) -> String {
     let mut prompt = format!(
         r#"You are a verification hardener agent for Qontinui Runner.
 
@@ -407,11 +415,15 @@ approach. The workflow below was generated for this task: "{description}"
 
     if let Some(ref db_rules) = conversion_rules {
         for rule in db_rules {
-            prompt.push_str(&format!("\n### Rule {}: {}\n\n{}\n", rule.rule_number, rule.title, rule.content));
+            prompt.push_str(&format!(
+                "\n### Rule {}: {}\n\n{}\n",
+                rule.rule_number, rule.title, rule.content
+            ));
         }
     } else {
         // Fallback: hardcoded conversion rules
-        prompt.push_str(r#"
+        prompt.push_str(
+            r#"
 ### Rule 1: Convert `prompt` steps to deterministic equivalents
 
 | Prompt check type | Convert to | Method |
@@ -424,7 +436,8 @@ approach. The workflow below was generated for this task: "{description}"
 | Code quality (typecheck) | `check` | `check_type: "typecheck"` with appropriate command |
 | API health/response | `api_request` | Direct HTTP with `status_code` assertion |
 | Subjective/qualitative | Keep as `prompt` | Cannot be made deterministic |
-"#);
+"#,
+        );
 
         if app_context.has_sdk_connect {
             prompt.push_str(r#"
@@ -568,7 +581,8 @@ verify that the tab has spatial visualization content. Add content-specific chec
             prompt.push_str("UI Bridge SDK is connected in setup. Use SDK endpoints:\n");
             prompt.push_str("- Element list: `GET http://localhost:9876/ui-bridge/sdk/elements?contentOnly=true`\n");
             prompt.push_str("- AI search: `POST http://localhost:9876/ui-bridge/sdk/ai/search` with body `{\"text\":\"query\"}`\n");
-            prompt.push_str("- Page snapshot: `GET http://localhost:9876/ui-bridge/sdk/snapshot`\n");
+            prompt
+                .push_str("- Page snapshot: `GET http://localhost:9876/ui-bridge/sdk/snapshot`\n");
             prompt.push_str("- Execute action: `POST http://localhost:9876/ui-bridge/sdk/ai/execute` with body `{\"action\":\"click\",\"elementId\":\"id\"}`\n");
             if let Some(ref nav_url) = app_context.setup_navigate_url {
                 prompt.push_str(&format!(
@@ -577,7 +591,8 @@ verify that the tab has spatial visualization content. Add content-specific chec
                 ));
             }
         } else {
-            prompt.push_str("No SDK connect step found — prefer file-based or API health checks.\n");
+            prompt
+                .push_str("No SDK connect step found — prefer file-based or API health checks.\n");
         }
     }
 
@@ -742,10 +757,7 @@ fn build_summary(original: &UnifiedWorkflow, hardened: &UnifiedWorkflow) -> Hard
             }
         } else {
             // New step (from splitting) — count as a conversion
-            let hard_name = hard_step
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let hard_name = hard_step.get("name").and_then(|v| v.as_str()).unwrap_or("");
             converted_count += 1;
             conversions.push(HardeningConversion {
                 step_id: hard_id.to_string(),
@@ -871,28 +883,24 @@ mod tests {
 
     #[test]
     fn test_should_harden_detects_weak_sdk_assertions() {
-        let workflow = make_sdk_workflow(vec![
-            json!({
-                "id": "s1", "type": "api_request",
-                "url": "http://localhost:9876/ui-bridge/sdk/elements",
-                "assertions": [{"type": "status_code", "expected": 200}]
-            }),
-        ]);
+        let workflow = make_sdk_workflow(vec![json!({
+            "id": "s1", "type": "api_request",
+            "url": "http://localhost:9876/ui-bridge/sdk/elements",
+            "assertions": [{"type": "status_code", "expected": 200}]
+        })]);
         assert!(should_harden_verification(&workflow));
     }
 
     #[test]
     fn test_should_harden_ignores_strong_sdk_assertions() {
-        let workflow = make_sdk_workflow(vec![
-            json!({
-                "id": "s1", "type": "api_request",
-                "url": "http://localhost:9876/ui-bridge/sdk/elements",
-                "assertions": [
-                    {"type": "status_code", "expected": 200},
-                    {"type": "body_contains", "expected": "button-submit"}
-                ]
-            }),
-        ]);
+        let workflow = make_sdk_workflow(vec![json!({
+            "id": "s1", "type": "api_request",
+            "url": "http://localhost:9876/ui-bridge/sdk/elements",
+            "assertions": [
+                {"type": "status_code", "expected": 200},
+                {"type": "body_contains", "expected": "button-submit"}
+            ]
+        })]);
         assert!(!should_harden_verification(&workflow));
     }
 
@@ -949,12 +957,8 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_missing_original_id() {
-        let original = make_test_workflow(vec![
-            json!({"id": "step-1", "type": "prompt"}),
-        ]);
-        let hardened = make_test_workflow(vec![
-            json!({"id": "step-2", "type": "check"}),
-        ]);
+        let original = make_test_workflow(vec![json!({"id": "step-1", "type": "prompt"})]);
+        let hardened = make_test_workflow(vec![json!({"id": "step-2", "type": "check"})]);
 
         let error = validate_hardened_output(&original, &hardened);
         assert!(error.is_some());
@@ -1073,7 +1077,10 @@ mod tests {
             "content_type": "application/json"
         }));
         let ctx = AppContext::from_workflow(&workflow, "test");
-        assert_eq!(ctx.setup_navigate_url.as_deref(), Some("http://localhost:3001/management"));
+        assert_eq!(
+            ctx.setup_navigate_url.as_deref(),
+            Some("http://localhost:3001/management")
+        );
     }
 
     #[test]
@@ -1143,9 +1150,8 @@ mod tests {
         let mut workflow = make_sdk_workflow(vec![
             json!({"id": "s1", "type": "check", "check_type": "typecheck", "command": "npx tsc --noEmit"}),
         ]);
-        workflow.agentic_steps = vec![
-            json!({"id": "a1", "type": "prompt", "content": "Implement thumbnails"}),
-        ];
+        workflow.agentic_steps =
+            vec![json!({"id": "a1", "type": "prompt", "content": "Implement thumbnails"})];
         let ctx = AppContext::from_workflow(&workflow, "test");
         let prompt = build_hardener_prompt("{}", "test", &ctx, None);
         assert!(prompt.contains("Rule 5"));

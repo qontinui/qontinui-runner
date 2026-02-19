@@ -230,7 +230,7 @@ impl OrchestratorRuntime {
         // Auto-checkpoint based on iteration count
         if self.config.checkpoint.enabled {
             if let Some(every_n) = self.config.checkpoint.checkpoint_every_n_iterations {
-                if self.state.iteration % every_n == 0 {
+                if self.state.iteration.is_multiple_of(every_n) {
                     let _ = self.checkpoint();
                 }
             }

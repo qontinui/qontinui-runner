@@ -6,9 +6,9 @@
 //! 2. `is_reflection` column check on source task run
 //! 3. Parent hierarchy tracking
 
+use rusqlite::Connection;
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use rusqlite::Connection;
 use tracing::{debug, info};
 
 use crate::config_storage::ConfigStorage;
@@ -169,12 +169,7 @@ fn has_converged(conn: &Connection, source_task_run_id: &str) -> Result<bool, St
     let rows: Vec<(String, u32)> = stmt
         .query_map(
             rusqlite::params![workflow_name, CONVERGENCE_THRESHOLD],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, u32>(2)?,
-                ))
-            },
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(2)?)),
         )
         .map_err(|e| format!("Failed to query convergence: {}", e))?
         .filter_map(|r| r.ok())
@@ -343,11 +338,8 @@ pub fn launch_reflection(
     db.create_task_run(&input)?;
 
     // Build the reflection workflow
-    let loop_config = super::workflow::build_reflection_config(
-        &reflection_id,
-        &reflection_name,
-        &workflow_name,
-    );
+    let loop_config =
+        super::workflow::build_reflection_config(&reflection_id, &reflection_name, &workflow_name);
 
     let setup_steps = super::workflow::build_setup_steps(&source_task_run_id, &workflow_name);
     let verification_steps = super::workflow::build_verification_steps(&source_task_run_id);
@@ -399,12 +391,12 @@ pub fn launch_reflection(
             controller
                 .run(
                     loop_config,
-                    setup_steps,                // setup automation steps (API requests)
-                    Vec::new(),                 // setup prompt steps (none)
-                    verification_steps,         // verification steps
-                    Vec::new(),                 // agentic steps (prompt is in loop_config.base_prompt)
+                    setup_steps,                 // setup automation steps (API requests)
+                    Vec::new(),                  // setup prompt steps (none)
+                    verification_steps,          // verification steps
+                    Vec::new(), // agentic steps (prompt is in loop_config.base_prompt)
                     completion_automation_steps, // completion automation steps (batch evaluation)
-                    completion_prompt_steps,     // completion prompt steps
+                    completion_prompt_steps, // completion prompt steps
                 )
                 .await
         }),
@@ -610,9 +602,30 @@ mod tests {
         insert_clean_run(&conn, "source-1", wf, "2025-01-01T00:00:00Z");
 
         // 3 reflection runs with varying findings
-        insert_reflection_run(&conn, "ref-0", wf, "source-1", "2025-01-01T01:00:00Z", &["hash-a", "hash-b"]);
-        insert_reflection_run(&conn, "ref-1", wf, "source-1", "2025-01-01T02:00:00Z", &["hash-a", "hash-c"]);
-        insert_reflection_run(&conn, "ref-2", wf, "source-1", "2025-01-01T03:00:00Z", &["hash-a", "hash-b"]);
+        insert_reflection_run(
+            &conn,
+            "ref-0",
+            wf,
+            "source-1",
+            "2025-01-01T01:00:00Z",
+            &["hash-a", "hash-b"],
+        );
+        insert_reflection_run(
+            &conn,
+            "ref-1",
+            wf,
+            "source-1",
+            "2025-01-01T02:00:00Z",
+            &["hash-a", "hash-c"],
+        );
+        insert_reflection_run(
+            &conn,
+            "ref-2",
+            wf,
+            "source-1",
+            "2025-01-01T03:00:00Z",
+            &["hash-a", "hash-b"],
+        );
 
         assert!(!has_repeated_findings(&conn, "source-1", wf).unwrap());
     }
@@ -624,8 +637,22 @@ mod tests {
         insert_clean_run(&conn, "source-1", wf, "2025-01-01T00:00:00Z");
 
         // Only 2 reflection runs (below REPEAT_THRESHOLD of 3)
-        insert_reflection_run(&conn, "ref-0", wf, "source-1", "2025-01-01T01:00:00Z", &["hash-a"]);
-        insert_reflection_run(&conn, "ref-1", wf, "source-1", "2025-01-01T02:00:00Z", &["hash-a"]);
+        insert_reflection_run(
+            &conn,
+            "ref-0",
+            wf,
+            "source-1",
+            "2025-01-01T01:00:00Z",
+            &["hash-a"],
+        );
+        insert_reflection_run(
+            &conn,
+            "ref-1",
+            wf,
+            "source-1",
+            "2025-01-01T02:00:00Z",
+            &["hash-a"],
+        );
 
         assert!(!has_repeated_findings(&conn, "source-1", wf).unwrap());
     }

@@ -122,6 +122,33 @@ const RUST_TOOLS: &[ToolSuggestion] = &[
     },
 ];
 
+/// Recommended tool info for a language, used by discovery to provide context.
+pub struct RecommendedTool {
+    pub tool: &'static str,
+    pub check_type: &'static str,
+}
+
+/// Returns recommended tools for a given language identifier.
+///
+/// Language names match those used in scanner output: "python", "typescript",
+/// "javascript", "rust".
+pub fn recommended_tools_for_language(language: &str) -> Vec<RecommendedTool> {
+    let suggestions: &[ToolSuggestion] = match language.to_lowercase().as_str() {
+        "python" => PYTHON_TOOLS,
+        "typescript" => TYPESCRIPT_TOOLS,
+        "javascript" => JAVASCRIPT_TOOLS,
+        "rust" => RUST_TOOLS,
+        _ => return vec![],
+    };
+    suggestions
+        .iter()
+        .map(|s| RecommendedTool {
+            tool: s.tool,
+            check_type: s.check_type,
+        })
+        .collect()
+}
+
 /// Generate check suggestions using AI
 pub fn generate_checks(
     request: &GenerateChecksRequest,

@@ -190,10 +190,7 @@ pub async fn update_fix_effectiveness_handler(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!(
-                    "Failed to update effectiveness: {}",
-                    e
-                ))),
+                Json(api_error(format!("Failed to update effectiveness: {}", e))),
             )
         })?;
 
@@ -309,7 +306,11 @@ pub async fn trigger_reflection_handler(
     Path(task_run_id): Path<String>,
 ) -> Result<Json<ApiResponse<TriggerResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     // Check for already-running reflection workflow
-    if let Ok(Some(existing_id)) = state.app_state.checkpoint_db.has_running_reflection_workflow() {
+    if let Ok(Some(existing_id)) = state
+        .app_state
+        .checkpoint_db
+        .has_running_reflection_workflow()
+    {
         return Err((
             StatusCode::CONFLICT,
             Json(api_error(format!(
@@ -340,10 +341,7 @@ pub async fn trigger_reflection_handler(
         }))),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!(
-                "Failed to trigger reflection: {}",
-                e
-            ))),
+            Json(api_error(format!("Failed to trigger reflection: {}", e))),
         )),
     }
 }
@@ -376,9 +374,7 @@ pub async fn evaluate_fixes_handler(
     let evaluated_count = results.len() as u32;
     let effective_count = results
         .iter()
-        .filter(|r| {
-            r.effectiveness == crate::reflection::types::FixEffectiveness::Effective
-        })
+        .filter(|r| r.effectiveness == crate::reflection::types::FixEffectiveness::Effective)
         .count() as u32;
 
     Ok(Json(ApiResponse::success(EvaluateResponse {
@@ -507,10 +503,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         )
         .route("/reflection/evaluate", post(evaluate_fixes_handler))
         // Reflection settings
-        .route(
-            "/reflection/settings",
-            get(get_reflection_settings_handler),
-        )
+        .route("/reflection/settings", get(get_reflection_settings_handler))
         .route(
             "/reflection/settings",
             put(update_reflection_settings_handler),

@@ -193,6 +193,35 @@ fn validate_phase_constraints(steps: &[Value], phase: &str, errors: &mut Vec<Val
     }
 }
 
+/// Check if a workflow is a check-group workflow (all verification steps are checks + gate).
+///
+/// A check-group workflow should have ONLY `check` and `gate` type steps in verification,
+/// with no setup or completion steps. The AI builder sometimes adds unnecessary setup/completion
+/// steps despite instructions — this function detects check-group workflows so we can
+/// deterministically strip those extra phases.
+fn is_check_group_workflow(workflow: &UnifiedWorkflow) -> bool {
+    // Must have at least one verification step
+    if workflow.verification_steps.is_empty() {
+        return false;
+    }
+
+    // Must have at least one check step and exactly one gate step
+    let mut has_check = false;
+    let mut gate_count = 0;
+
+    for step in &workflow.verification_steps {
+        let step_type = step.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match step_type {
+            "check" => has_check = true,
+            "gate" => gate_count += 1,
+            // Any other step type means this is NOT a pure check-group workflow
+            _ => return false,
+        }
+    }
+
+    has_check && gate_count == 1
+}
+
 /// Fix common issues in generated workflows
 pub fn fix_workflow(workflow: &mut UnifiedWorkflow) {
     // Fix invalid UUIDs
@@ -217,6 +246,28 @@ pub fn fix_workflow(workflow: &mut UnifiedWorkflow) {
 
     // Ensure gate required_steps covers all non-gate/non-prompt verification steps
     fix_gate_required_steps(&mut workflow.verification_steps);
+
+    // For check-group workflows, strip setup and completion steps.
+    // The AI builder often adds unnecessary setup/completion steps despite generation rules.
+    // This deterministic fix ensures check-group workflows are clean.
+    if is_check_group_workflow(workflow) {
+        if !workflow.setup_steps.is_empty() {
+            tracing::info!(
+                "Stripping {} setup step(s) from check-group workflow '{}'",
+                workflow.setup_steps.len(),
+                workflow.name
+            );
+            workflow.setup_steps.clear();
+        }
+        if !workflow.completion_steps.is_empty() {
+            tracing::info!(
+                "Stripping {} completion step(s) from check-group workflow '{}'",
+                workflow.completion_steps.len(),
+                workflow.name
+            );
+            workflow.completion_steps.clear();
+        }
+    }
 }
 
 /// Ensure gate steps in verification include ALL non-gate, non-prompt step IDs.
@@ -418,5 +469,133 @@ mod tests {
         let original = steps.clone();
         fix_gate_required_steps(&mut steps);
         assert_eq!(steps, original);
+    }
+
+    fn make_check_group_workflow(
+        setup: Vec<Value>,
+        verification: Vec<Value>,
+        completion: Vec<Value>,
+    ) -> UnifiedWorkflow {
+        UnifiedWorkflow {
+            id: Uuid::new_v4().to_string(),
+            name: "Test Check Group".to_string(),
+            description: "Test".to_string(),
+            setup_steps: setup,
+            verification_steps: verification,
+            agentic_steps: vec![
+                json!({"id": Uuid::new_v4().to_string(), "type": "prompt", "phase": "agentic", "name": "Fix issues"}),
+            ],
+            completion_steps: completion,
+            max_iterations: 10,
+            timeout_seconds: None,
+            provider: None,
+            model: None,
+            log_source_selection: LogSourceSelection::default(),
+            skip_ai_summary: false,
+            category: "check-group".to_string(),
+            tags: vec![],
+            context_ids: vec![],
+            disabled_context_ids: vec![],
+            auto_include_contexts: true,
+            prompt_template: None,
+            log_watch_enabled: true,
+            health_check_enabled: true,
+            health_check_urls: vec![],
+            preflight_check_enabled: true,
+            enable_sweep: false,
+            max_sweep_iterations: 5,
+            generated_by_task_run_id: None,
+            targeted_error_ids: vec![],
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    #[test]
+    fn test_is_check_group_workflow_true() {
+        let wf = make_check_group_workflow(
+            vec![],
+            vec![
+                json!({"id": "c1", "type": "check", "phase": "verification"}),
+                json!({"id": "c2", "type": "check", "phase": "verification"}),
+                json!({"id": "g1", "type": "gate", "phase": "verification"}),
+            ],
+            vec![],
+        );
+        assert!(is_check_group_workflow(&wf));
+    }
+
+    #[test]
+    fn test_is_check_group_workflow_false_with_test_step() {
+        let wf = make_check_group_workflow(
+            vec![],
+            vec![
+                json!({"id": "c1", "type": "check", "phase": "verification"}),
+                json!({"id": "t1", "type": "test", "phase": "verification"}),
+                json!({"id": "g1", "type": "gate", "phase": "verification"}),
+            ],
+            vec![],
+        );
+        assert!(!is_check_group_workflow(&wf));
+    }
+
+    #[test]
+    fn test_is_check_group_workflow_false_no_gate() {
+        let wf = make_check_group_workflow(
+            vec![],
+            vec![
+                json!({"id": "c1", "type": "check", "phase": "verification"}),
+                json!({"id": "c2", "type": "check", "phase": "verification"}),
+            ],
+            vec![],
+        );
+        assert!(!is_check_group_workflow(&wf));
+    }
+
+    #[test]
+    fn test_fix_workflow_strips_setup_completion_for_check_group() {
+        let mut wf = make_check_group_workflow(
+            vec![
+                json!({"id": Uuid::new_v4().to_string(), "type": "shell_command", "phase": "setup", "name": "Install deps"}),
+            ],
+            vec![
+                json!({"id": "c1", "type": "check", "phase": "verification", "name": "Lint"}),
+                json!({"id": "g1", "type": "gate", "phase": "verification", "name": "Gate", "required_steps": ["c1"]}),
+            ],
+            vec![
+                json!({"id": Uuid::new_v4().to_string(), "type": "prompt", "phase": "completion", "name": "Summary"}),
+            ],
+        );
+
+        assert_eq!(wf.setup_steps.len(), 1);
+        assert_eq!(wf.completion_steps.len(), 1);
+
+        fix_workflow(&mut wf);
+
+        assert_eq!(wf.setup_steps.len(), 0);
+        assert_eq!(wf.completion_steps.len(), 0);
+    }
+
+    #[test]
+    fn test_fix_workflow_preserves_setup_for_non_check_group() {
+        let mut wf = make_check_group_workflow(
+            vec![
+                json!({"id": Uuid::new_v4().to_string(), "type": "shell_command", "phase": "setup", "name": "Install deps"}),
+            ],
+            vec![
+                json!({"id": "c1", "type": "check", "phase": "verification", "name": "Lint"}),
+                json!({"id": "t1", "type": "test", "phase": "verification", "name": "Unit tests"}),
+                json!({"id": "g1", "type": "gate", "phase": "verification", "name": "Gate", "required_steps": ["c1", "t1"]}),
+            ],
+            vec![
+                json!({"id": Uuid::new_v4().to_string(), "type": "prompt", "phase": "completion", "name": "Summary"}),
+            ],
+        );
+
+        fix_workflow(&mut wf);
+
+        // Not a check-group (has test step), so setup/completion preserved
+        assert_eq!(wf.setup_steps.len(), 1);
+        assert_eq!(wf.completion_steps.len(), 1);
     }
 }

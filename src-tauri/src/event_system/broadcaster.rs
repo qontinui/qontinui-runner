@@ -185,13 +185,9 @@ impl EventBroadcaster {
         details: Option<serde_json::Value>,
     ) {
         let event = match details {
-            Some(d) => AppEvent::step_progress_with_details(
-                task_run_id,
-                step_index,
-                step_name,
-                status,
-                d,
-            ),
+            Some(d) => {
+                AppEvent::step_progress_with_details(task_run_id, step_index, step_name, status, d)
+            }
             None => AppEvent::step_progress(task_run_id, step_index, step_name, status),
         };
         self.broadcast_or_warn(event);
@@ -214,9 +210,7 @@ impl EventBroadcaster {
             (Some(iter), None) => {
                 AppEvent::task_run_update_with_iteration(task_run_id, status, iter)
             }
-            (None, Some(d)) => {
-                AppEvent::task_run_update_with_details(task_run_id, status, None, d)
-            }
+            (None, Some(d)) => AppEvent::task_run_update_with_details(task_run_id, status, None, d),
             (None, None) => AppEvent::task_run_update(task_run_id, status),
         };
         self.broadcast_or_warn(event);
@@ -312,10 +306,7 @@ pub fn broadcast_ws_notification(
         });
         if let Err(e) = state.event_broadcast.send(ws_event) {
             if state.event_broadcast.receiver_count() > 0 {
-                warn!(
-                    "Failed to broadcast WS notification for {}: {}",
-                    channel, e
-                );
+                warn!("Failed to broadcast WS notification for {}: {}", channel, e);
             }
         }
     }

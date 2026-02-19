@@ -201,7 +201,10 @@ impl ClaudeSession {
                 }
 
                 let elapsed_secs = start_time.elapsed().as_secs();
-                if elapsed_secs > 0 && elapsed_secs.is_multiple_of(30) && elapsed_secs != last_update {
+                if elapsed_secs > 0
+                    && elapsed_secs.is_multiple_of(30)
+                    && elapsed_secs != last_update
+                {
                     last_update = elapsed_secs;
                     let mins = elapsed_secs / 60;
                     let secs = elapsed_secs % 60;

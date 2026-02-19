@@ -71,7 +71,11 @@ fn extract_text_from_stream_json(json_line: &str) -> Option<String> {
                 } else {
                     Some(text.to_string())
                 }
-            } else if let Some(content) = parsed.get("result").and_then(|r| r.get("content")).and_then(|c| c.as_array()) {
+            } else if let Some(content) = parsed
+                .get("result")
+                .and_then(|r| r.get("content"))
+                .and_then(|c| c.as_array())
+            {
                 // Fallback: handle object format with content array
                 let mut text_parts = Vec::new();
                 for item in content {
@@ -743,10 +747,7 @@ fn run_claude_session_inline(
             let db = match CheckpointDb::new() {
                 Ok(db) => Some(db),
                 Err(e) => {
-                    warn!(
-                        "Failed to open database for reflection fix storage: {}",
-                        e
-                    );
+                    warn!("Failed to open database for reflection fix storage: {}", e);
                     None
                 }
             };
@@ -801,21 +802,18 @@ fn run_claude_session_inline(
                                 if let Err(e) =
                                     app_handle_reflection.emit("reflection_fix_recorded", &fix)
                                 {
-                                    warn!(
-                                        "Failed to emit reflection_fix_recorded event: {}",
-                                        e
-                                    );
+                                    warn!("Failed to emit reflection_fix_recorded event: {}", e);
                                 }
                             }));
 
                             // Auto-apply safe fix types
-                            let should_auto_apply = match (fix.fix_type.as_str(), fix.confidence.as_str()) {
-                                ("knowledge_base_update", "high" | "medium") => true,
-                                ("context_addition", "high") => true,
-                                ("instruction_clarification", "high") => true,
-                                ("workflow_step_rewrite", "high") => true,
-                                _ => false,
-                            };
+                            let should_auto_apply = matches!(
+                                (fix.fix_type.as_str(), fix.confidence.as_str()),
+                                ("knowledge_base_update", "high" | "medium")
+                                    | ("context_addition", "high")
+                                    | ("instruction_clarification", "high")
+                                    | ("workflow_step_rewrite", "high")
+                            );
 
                             if should_auto_apply {
                                 match fix.fix_type.as_str() {
@@ -827,7 +825,8 @@ fn run_claude_session_inline(
                                             _ => "observation",
                                         };
 
-                                        let related_files: Vec<String> = fix.file_changed.iter().cloned().collect();
+                                        let related_files: Vec<String> =
+                                            fix.file_changed.iter().cloned().collect();
 
                                         match db.create_task_knowledge(
                                             &ctx.source_task_run_id,
@@ -845,17 +844,22 @@ fn run_claude_session_inline(
                                                     "Auto-applied fix as {} knowledge: {}",
                                                     category, fix.fix_description
                                                 );
-                                                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                                    emit_ai_output(
-                                                        &app_handle_reflection,
-                                                        &auto_msg,
-                                                        "reflection_auto_apply",
-                                                        None,
-                                                        session_ctx_for_reflection.as_ref(),
-                                                    );
-                                                }));
+                                                let _ = std::panic::catch_unwind(
+                                                    std::panic::AssertUnwindSafe(|| {
+                                                        emit_ai_output(
+                                                            &app_handle_reflection,
+                                                            &auto_msg,
+                                                            "reflection_auto_apply",
+                                                            None,
+                                                            session_ctx_for_reflection.as_ref(),
+                                                        );
+                                                    }),
+                                                );
                                             }
-                                            Err(e) => warn!("Failed to auto-apply fix as knowledge: {}", e),
+                                            Err(e) => warn!(
+                                                "Failed to auto-apply fix as knowledge: {}",
+                                                e
+                                            ),
                                         }
                                     }
                                     "instruction_clarification" | "workflow_step_rewrite" => {
@@ -863,9 +867,14 @@ fn run_claude_session_inline(
                                         use crate::workflow_generation::step_type_knowledge;
 
                                         // Check if this fix targets a specific step type
-                                        if let Some(step_type) = step_type_knowledge::infer_step_type_from_fix(&fix.fix_description) {
+                                        if let Some(step_type) =
+                                            step_type_knowledge::infer_step_type_from_fix(
+                                                &fix.fix_description,
+                                            )
+                                        {
                                             // Create step type knowledge entry (system-specific layer)
-                                            let title = rules::truncate_to_title(&fix.fix_description);
+                                            let title =
+                                                rules::truncate_to_title(&fix.fix_description);
                                             match step_type_knowledge::insert_knowledge(&conn, &step_type_knowledge::InsertKnowledgeInput {
                                                 step_type: step_type.clone(),
                                                 layer: "system_specific".to_string(),
@@ -895,10 +904,16 @@ fn run_claude_session_inline(
                                             }
                                         } else {
                                             // No step type detected — create generation rule entry (existing behavior)
-                                            let agent = rules::infer_agent_from_fix(&fix.fix_description);
-                                            let section = rules::infer_section_from_fix(&fix.fix_description, &agent);
-                                            let next_num = rules::next_rule_number(&conn, &agent, &section);
-                                            let title = rules::truncate_to_title(&fix.fix_description);
+                                            let agent =
+                                                rules::infer_agent_from_fix(&fix.fix_description);
+                                            let section = rules::infer_section_from_fix(
+                                                &fix.fix_description,
+                                                &agent,
+                                            );
+                                            let next_num =
+                                                rules::next_rule_number(&conn, &agent, &section);
+                                            let title =
+                                                rules::truncate_to_title(&fix.fix_description);
 
                                             match rules::insert_rule(&conn, &rules::InsertRuleInput {
                                                 agent: agent.clone(),

@@ -101,7 +101,7 @@ fn start_heartbeat() {
             let _ = fs::write(&heartbeat_path, &heartbeat_info);
 
             // Log every 30 seconds to lifecycle log
-            if count % 6 == 0 {
+            if count.is_multiple_of(6) {
                 log_lifecycle(
                     "HEARTBEAT",
                     &format!(

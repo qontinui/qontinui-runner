@@ -4,11 +4,7 @@
 //! loading state machine configs, querying status, executing transitions,
 //! and navigating between states via the Python bridge.
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::Json,
-};
+use axum::{extract::State, http::StatusCode, response::Json};
 use serde::Deserialize;
 use std::sync::Arc;
 use tracing::{error, info};
@@ -74,7 +70,9 @@ pub async fn load_state_machine(
             if response.success {
                 info!("State Machine API: Config loaded successfully");
                 Ok(Json(ApiResponse::success(
-                    response.data.unwrap_or(serde_json::json!({"success": true})),
+                    response
+                        .data
+                        .unwrap_or(serde_json::json!({"success": true})),
                 )))
             } else {
                 let error_msg = response
@@ -124,7 +122,9 @@ pub async fn get_state_machine_status(
         Ok(response) => {
             if response.success {
                 Ok(Json(ApiResponse::success(
-                    response.data.unwrap_or(serde_json::json!({"loaded": false})),
+                    response
+                        .data
+                        .unwrap_or(serde_json::json!({"loaded": false})),
                 )))
             } else {
                 let error_msg = response
@@ -173,7 +173,9 @@ pub async fn get_active_states(
         Ok(response) => {
             if response.success {
                 Ok(Json(ApiResponse::success(
-                    response.data.unwrap_or(serde_json::json!({"active_states": []})),
+                    response
+                        .data
+                        .unwrap_or(serde_json::json!({"active_states": []})),
                 )))
             } else {
                 let error_msg = response
@@ -228,7 +230,9 @@ pub async fn execute_transition(
             if response.success {
                 info!("State Machine API: Transition executed successfully");
                 Ok(Json(ApiResponse::success(
-                    response.data.unwrap_or(serde_json::json!({"success": true})),
+                    response
+                        .data
+                        .unwrap_or(serde_json::json!({"success": true})),
                 )))
             } else {
                 let error_msg = response
@@ -284,7 +288,9 @@ pub async fn navigate_to_states(
             if response.success {
                 info!("State Machine API: Navigation completed");
                 Ok(Json(ApiResponse::success(
-                    response.data.unwrap_or(serde_json::json!({"success": true})),
+                    response
+                        .data
+                        .unwrap_or(serde_json::json!({"success": true})),
                 )))
             } else {
                 let error_msg = response
@@ -385,7 +391,9 @@ pub async fn clear_state_machine(
         Ok(response) => {
             if response.success {
                 info!("State Machine API: State machine cleared");
-                Ok(Json(ApiResponse::success(serde_json::json!({"success": true}))))
+                Ok(Json(ApiResponse::success(
+                    serde_json::json!({"success": true}),
+                )))
             } else {
                 let error_msg = response
                     .error

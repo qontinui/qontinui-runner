@@ -1035,7 +1035,14 @@ impl CheckHandler {
 
             let detect_result = tokio::time::timeout(Duration::from_secs(15), async {
                 Command::new("gh")
-                    .args(["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"])
+                    .args([
+                        "repo",
+                        "view",
+                        "--json",
+                        "nameWithOwner",
+                        "-q",
+                        ".nameWithOwner",
+                    ])
                     .current_dir(&work_dir)
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
@@ -1082,11 +1089,7 @@ impl CheckHandler {
 
         info!(
             "Executing CI/CD check '{}': repo={}, workflow={:?}, branch={:?}, wait={:?}",
-            step_name,
-            repo,
-            step.ci_cd_workflow_name,
-            step.ci_cd_branch,
-            step.ci_cd_wait
+            step_name, repo, step.ci_cd_workflow_name, step.ci_cd_branch, step.ci_cd_wait
         );
 
         // Generate action ID for event emission
@@ -1234,7 +1237,12 @@ impl CheckHandler {
                 .stderr(Stdio::piped())
                 .output()
                 .await
-                .map_err(|e| format!("Failed to run 'gh run list': {}. Is the GitHub CLI installed?", e))?;
+                .map_err(|e| {
+                    format!(
+                        "Failed to run 'gh run list': {}. Is the GitHub CLI installed?",
+                        e
+                    )
+                })?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1341,7 +1349,8 @@ mod tests {
 
     #[test]
     fn test_extract_env_prefix_simple() {
-        let (envs, cmd) = CheckHandler::extract_env_prefix_for_cmd("SKIP_WEB_SERVER=1 npx playwright test");
+        let (envs, cmd) =
+            CheckHandler::extract_env_prefix_for_cmd("SKIP_WEB_SERVER=1 npx playwright test");
         assert_eq!(envs, vec![("SKIP_WEB_SERVER".to_string(), "1".to_string())]);
         assert_eq!(cmd, "npx playwright test");
     }

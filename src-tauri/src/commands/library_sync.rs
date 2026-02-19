@@ -266,7 +266,9 @@ impl LibrarySyncService {
         let checks = match db.list_checks(false, None, None) {
             Ok(c) => c,
             Err(e) => {
-                result.errors.push(format!("Failed to read checks from DB: {}", e));
+                result
+                    .errors
+                    .push(format!("Failed to read checks from DB: {}", e));
                 result.failed = 1;
                 return result;
             }
@@ -329,7 +331,9 @@ impl LibrarySyncService {
         let groups = match db.list_check_groups(false) {
             Ok(g) => g,
             Err(e) => {
-                result.errors.push(format!("Failed to read check groups from DB: {}", e));
+                result
+                    .errors
+                    .push(format!("Failed to read check groups from DB: {}", e));
                 result.failed = 1;
                 return result;
             }
@@ -550,9 +554,7 @@ impl LibrarySyncService {
                 Err(e) => {
                     warn!("Failed to sync context '{}': {}", ctx.name, e);
                     result.failed += 1;
-                    result
-                        .errors
-                        .push(format!("Context '{}': {}", ctx.name, e));
+                    result.errors.push(format!("Context '{}': {}", ctx.name, e));
                 }
             }
         }
@@ -663,17 +665,12 @@ impl LibrarySyncService {
                 tags: s.tags.clone(),
             };
 
-            match self
-                .post_item(&access_token, "scriptlets", &payload)
-                .await
-            {
+            match self.post_item(&access_token, "scriptlets", &payload).await {
                 Ok(()) => result.synced += 1,
                 Err(e) => {
                     warn!("Failed to sync scriptlet '{}': {}", s.name, e);
                     result.failed += 1;
-                    result
-                        .errors
-                        .push(format!("Scriptlet '{}': {}", s.name, e));
+                    result.errors.push(format!("Scriptlet '{}': {}", s.name, e));
                 }
             }
         }

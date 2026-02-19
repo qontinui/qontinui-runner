@@ -1,10 +1,13 @@
 //! API Request Step Handler
 //!
 //! Handles api_request steps that make HTTP requests with variable interpolation,
-//! response extraction, and chaining support.
+//! response extraction, and chaining support. Supports retry with configurable
+//! delay for handling transient failures (e.g., WebSocket reconnection after navigation).
 
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::time::Duration;
+use tokio::time::sleep;
 use tracing::{info, warn};
 
 use super::{HandlerContext, StepHandler, StepHandlerResult};
@@ -104,6 +107,10 @@ impl StepHandler for ApiRequestHandler {
         // Determine timeout: use step-specific, then default
         let timeout_ms = step.api_timeout_ms.unwrap_or(30_000);
 
+        // Retry configuration
+        let retry_count = step.api_retry_count.unwrap_or(0);
+        let retry_delay_ms = step.api_retry_delay_ms.unwrap_or(2000);
+
         // Build ApiRequestConfig
         let config = ApiRequestConfig {
             step_id: None,
@@ -125,66 +132,93 @@ impl StepHandler for ApiRequestHandler {
             assertions: step.api_assertions.clone(),
         };
 
-        info!(
-            "Executing API request '{}': {} {} (timeout: {}ms)",
-            step_name, method_str, url_with_context, timeout_ms
-        );
+        if retry_count > 0 {
+            info!(
+                "Executing API request '{}': {} {} (timeout: {}ms, retries: {}, delay: {}ms)",
+                step_name, method_str, url_with_context, timeout_ms, retry_count, retry_delay_ms
+            );
+        } else {
+            info!(
+                "Executing API request '{}': {} {} (timeout: {}ms)",
+                step_name, method_str, url_with_context, timeout_ms
+            );
+        }
 
-        // Create session from shared variable store for proper variable chaining
-        let mut session = ApiRequestSession::from_shared_store(&context.shared_variables);
+        // Execute with retry loop
+        let max_attempts = retry_count + 1; // 0 retries = 1 attempt
+        for attempt in 1..=max_attempts {
+            // Create session from shared variable store for proper variable chaining
+            let mut session = ApiRequestSession::from_shared_store(&context.shared_variables);
 
-        // Execute the request
-        match session.execute(&config, None).await {
-            Ok(result) => {
-                // Sync extracted variables back to the shared store
-                session.sync_to_shared_store(&context.shared_variables);
+            match session.execute(&config, None).await {
+                Ok(result) => {
+                    // Sync extracted variables back to the shared store
+                    session.sync_to_shared_store(&context.shared_variables);
 
-                // Log extraction results
-                for ext in &result.extractions {
-                    if ext.success {
-                        if let Some(ref value) = ext.extracted_value {
-                            let preview = if value.len() > 50 {
-                                format!("{}...", &value[..50])
-                            } else {
-                                value.clone()
-                            };
-                            info!(
-                                "Extracted '{}' using JSON path '{}' -> '{}' ({} chars)",
-                                ext.variable_name,
-                                ext.json_path,
-                                preview,
-                                value.len()
+                    // Log extraction results
+                    for ext in &result.extractions {
+                        if ext.success {
+                            if let Some(ref value) = ext.extracted_value {
+                                let preview = if value.len() > 50 {
+                                    format!("{}...", &value[..50])
+                                } else {
+                                    value.clone()
+                                };
+                                info!(
+                                    "Extracted '{}' using JSON path '{}' -> '{}' ({} chars)",
+                                    ext.variable_name,
+                                    ext.json_path,
+                                    preview,
+                                    value.len()
+                                );
+                            }
+                        } else if let Some(ref error) = ext.error {
+                            warn!(
+                                "Extraction failed for '{}' ({}): {}",
+                                ext.variable_name, ext.json_path, error
                             );
                         }
-                    } else if let Some(ref error) = ext.error {
+                    }
+
+                    info!(
+                        "API request '{}' completed: status={}, duration={}ms, extractions={}{}",
+                        step_name,
+                        result.status_code,
+                        result.response_time_ms,
+                        result.extractions.len(),
+                        if attempt > 1 {
+                            format!(" (attempt {}/{})", attempt, max_attempts)
+                        } else {
+                            String::new()
+                        }
+                    );
+
+                    if result.success {
+                        let output_data = result.response_body.map(|body| {
+                            serde_json::json!({
+                                "status_code": result.status_code,
+                                "response_time_ms": result.response_time_ms,
+                                "response_body": body,
+                            })
+                        });
+                        return match output_data {
+                            Some(data) => StepHandlerResult::success_with_data(data),
+                            None => StepHandlerResult::success(),
+                        };
+                    }
+
+                    // Assertions failed — retry if attempts remain
+                    if attempt < max_attempts {
+                        let error_msg = result.error.as_deref().unwrap_or("assertions failed");
                         warn!(
-                            "Extraction failed for '{}' ({}): {}",
-                            ext.variable_name, ext.json_path, error
+                            "API request '{}' attempt {}/{} failed ({}), retrying in {}ms...",
+                            step_name, attempt, max_attempts, error_msg, retry_delay_ms
                         );
+                        sleep(Duration::from_millis(retry_delay_ms)).await;
+                        continue;
                     }
-                }
 
-                info!(
-                    "API request '{}' completed: status={}, duration={}ms, extractions={}",
-                    step_name,
-                    result.status_code,
-                    result.response_time_ms,
-                    result.extractions.len()
-                );
-
-                if result.success {
-                    let output_data = result.response_body.map(|body| {
-                        serde_json::json!({
-                            "status_code": result.status_code,
-                            "response_time_ms": result.response_time_ms,
-                            "response_body": body,
-                        })
-                    });
-                    match output_data {
-                        Some(data) => StepHandlerResult::success_with_data(data),
-                        None => StepHandlerResult::success(),
-                    }
-                } else {
+                    // Final attempt failed
                     let error_msg = result.error.unwrap_or_else(|| {
                         format!(
                             "HTTP {}: {}",
@@ -196,11 +230,29 @@ impl StepHandler for ApiRequestHandler {
                                 .unwrap_or_default()
                         )
                     });
-                    StepHandlerResult::failure(error_msg)
+                    return StepHandlerResult::failure(if retry_count > 0 {
+                        format!("{} (after {} attempts)", error_msg, max_attempts)
+                    } else {
+                        error_msg
+                    });
+                }
+                Err(e) => {
+                    // Request-level error (network, timeout) — retry if attempts remain
+                    if attempt < max_attempts {
+                        warn!(
+                            "API request '{}' attempt {}/{} error: {}, retrying in {}ms...",
+                            step_name, attempt, max_attempts, e, retry_delay_ms
+                        );
+                        sleep(Duration::from_millis(retry_delay_ms)).await;
+                        continue;
+                    }
+                    return StepHandlerResult::failure(format!("API request failed: {}", e));
                 }
             }
-            Err(e) => StepHandlerResult::failure(format!("API request failed: {}", e)),
         }
+
+        // Should not reach here, but just in case
+        StepHandlerResult::failure("API request failed: exhausted all retry attempts")
     }
 }
 

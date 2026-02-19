@@ -27,7 +27,7 @@ mod scanner;
 pub mod types;
 
 // Re-export public functions
-pub use generator::generate_checks;
+pub use generator::{generate_checks, recommended_tools_for_language};
 pub use scanner::scan_workspace;
 
 // Re-export commonly used types

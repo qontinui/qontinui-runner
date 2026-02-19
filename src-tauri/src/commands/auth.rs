@@ -7,8 +7,11 @@
 //! - Device information retrieval
 
 use crate::auth::AuthManager;
+use crate::commands::AppState;
 use serde::{Deserialize, Serialize};
 use std::error::Error as StdError;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use tracing::{error, info, warn};
 
 /// Get API base URL for qontinui-web backend
@@ -759,7 +762,9 @@ pub struct HeartbeatResponse {
 }
 
 #[tauri::command]
-pub async fn send_device_heartbeat(project_id: Option<String>) -> Result<HeartbeatResponse, String> {
+pub async fn send_device_heartbeat(
+    project_id: Option<String>,
+) -> Result<HeartbeatResponse, String> {
     info!(
         "[HEARTBEAT] Starting device heartbeat (project_id: {:?})",
         project_id
@@ -886,4 +891,13 @@ pub async fn send_device_heartbeat(project_id: Option<String>) -> Result<Heartbe
         heartbeat_response.has_active_connection
     );
     Ok(heartbeat_response)
+}
+
+/// Check if the HTTP API server (port 9876) is ready to accept requests.
+///
+/// The frontend calls this on mount to detect if the API server started
+/// before the event listener was set up (e.g., after a page refresh).
+#[tauri::command]
+pub fn is_api_ready(app_state: tauri::State<'_, Arc<AppState>>) -> bool {
+    app_state.api_ready.load(Ordering::Relaxed)
 }

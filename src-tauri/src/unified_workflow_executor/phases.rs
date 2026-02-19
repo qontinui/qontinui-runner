@@ -103,11 +103,7 @@ fn extract_console_errors_from_response(body: &serde_json::Value) -> Vec<serde_j
         .and_then(|v| v.as_array())
         .cloned()
         // Fallback: { "errors": [...] } (SDK proxy may return unwrapped)
-        .or_else(|| {
-            body.get("errors")
-                .and_then(|v| v.as_array())
-                .cloned()
-        })
+        .or_else(|| body.get("errors").and_then(|v| v.as_array()).cloned())
         .unwrap_or_default()
 }
 
@@ -131,10 +127,8 @@ async fn fetch_console_errors_from_ui_bridge() -> Result<Vec<serde_json::Value>,
     );
 
     // Fetch from both endpoints concurrently
-    let (control_result, sdk_result) = tokio::join!(
-        client.get(&control_url).send(),
-        client.get(&sdk_url).send(),
-    );
+    let (control_result, sdk_result) =
+        tokio::join!(client.get(&control_url).send(), client.get(&sdk_url).send(),);
 
     let mut all_errors = Vec::new();
 
@@ -602,10 +596,15 @@ fn build_unified_iteration_context(
             if !solutions.is_empty() {
                 let mut lines = vec!["### Previous Solution Attempts".to_string()];
                 for entry in solutions.iter().take(5) {
-                    let status = if entry.is_resolved { "resolved" } else { "unresolved" };
+                    let status = if entry.is_resolved {
+                        "resolved"
+                    } else {
+                        "unresolved"
+                    };
                     lines.push(format!(
                         "- [iter {}, {}] {}",
-                        entry.iteration, status,
+                        entry.iteration,
+                        status,
                         truncate_str(&entry.content, 300),
                     ));
                 }
@@ -698,7 +697,8 @@ fn build_unified_iteration_context(
         );
         tool_lines.push(String::new());
         tool_lines.push(
-            "Check `GET /ui-bridge/sdk/status` to see if an SDK app is already connected.".to_string(),
+            "Check `GET /ui-bridge/sdk/status` to see if an SDK app is already connected."
+                .to_string(),
         );
         sections.push(tool_lines.join("\n"));
     }
@@ -772,7 +772,9 @@ impl SetupExecutor {
     /// After setup phase completes, this contains all variables set by API steps
     /// (e.g., `source_findings`, `source_knowledge`). These need to be substituted
     /// into the agentic prompt before the agentic phase runs.
-    pub fn shared_variables(&self) -> &crate::orchestrator::context_propagation::SharedVariableStore {
+    pub fn shared_variables(
+        &self,
+    ) -> &crate::orchestrator::context_propagation::SharedVariableStore {
         self.executor.shared_variables()
     }
 
@@ -943,12 +945,8 @@ impl SetupExecutor {
                     }
 
                     // Log start event for Active Dashboard visibility
-                    let metadata = StepMetadata::setup(
-                        execution_id,
-                        StepType::Prompt,
-                        step_name,
-                        step_idx,
-                    );
+                    let metadata =
+                        StepMetadata::setup(execution_id, StepType::Prompt, step_name, step_idx);
                     if let Err(e) = logger.log_start(
                         StepEventKind::SetupAiStart,
                         metadata,
@@ -1179,16 +1177,14 @@ impl SetupExecutor {
                             ) {
                                 warn!("Failed to log setup AI session complete event: {}", e);
                             }
-                        } else {
-                            if let Err(e) = logger.log_error(
-                                StepEventKind::SetupAiError,
-                                metadata,
-                                StepDetails::default(),
-                                duration_ms,
-                                Some("AI session failed"),
-                            ) {
-                                warn!("Failed to log setup AI session error event: {}", e);
-                            }
+                        } else if let Err(e) = logger.log_error(
+                            StepEventKind::SetupAiError,
+                            metadata,
+                            StepDetails::default(),
+                            duration_ms,
+                            Some("AI session failed"),
+                        ) {
+                            warn!("Failed to log setup AI session error event: {}", e);
                         }
                     }
 
@@ -1647,7 +1643,10 @@ impl AgenticExecutor {
     }
 
     /// Set the step injection context for parsing [INJECT_STEP]...[/INJECT_STEP] markers.
-    pub fn set_step_injection_ctx(&mut self, ctx: crate::step_injection::types::StepInjectionContext) {
+    pub fn set_step_injection_ctx(
+        &mut self,
+        ctx: crate::step_injection::types::StepInjectionContext,
+    ) {
         self.step_injection_ctx = Some(ctx);
     }
 
@@ -1778,7 +1777,10 @@ impl AgenticExecutor {
                 .with_step_name(step_name);
                 resp_checkpoint.mark_started();
                 if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
-                    warn!("Failed to save agentic response-mode step checkpoint: {}", e);
+                    warn!(
+                        "Failed to save agentic response-mode step checkpoint: {}",
+                        e
+                    );
                 }
 
                 // Create a modified step with failure context appended to the prompt
@@ -1854,7 +1856,10 @@ impl AgenticExecutor {
                             duration_ms: Some(resp_duration),
                         };
                         if let Err(e) = self.checkpoint_db.create_task_run_event(&complete_event) {
-                            warn!("Failed to emit agentic response-mode completion event: {}", e);
+                            warn!(
+                                "Failed to emit agentic response-mode completion event: {}",
+                                e
+                            );
                         }
                         return (AgenticOutcome::Success { output }, Vec::new());
                     }
@@ -1876,7 +1881,10 @@ impl AgenticExecutor {
                         .with_step_name(step_name);
                         resp_checkpoint.mark_failed(&e, duration_ms as i64);
                         if let Err(e2) = checkpoint_mgr.save_step(&resp_checkpoint) {
-                            warn!("Failed to save agentic response-mode step failure checkpoint: {}", e2);
+                            warn!(
+                                "Failed to save agentic response-mode step failure checkpoint: {}",
+                                e2
+                            );
                         }
                         // Emit error event for Active Dashboard
                         let resp_duration = resp_mode_start.elapsed().as_millis() as i64;
@@ -1947,13 +1955,16 @@ impl AgenticExecutor {
             event_type: "step_execution".to_string(),
             event_subtype: Some("start".to_string()),
             message: format!("Starting agentic AI session (iteration {})", iteration),
-            data: Some(serde_json::to_string(&serde_json::json!({
-                "step_index": 0,
-                "step_type": "ai_session",
-                "step_name": "AI Fixing Issues",
-                "phase": "agentic",
-                "iteration": iteration,
-            })).unwrap_or_default()),
+            data: Some(
+                serde_json::to_string(&serde_json::json!({
+                    "step_index": 0,
+                    "step_type": "ai_session",
+                    "step_name": "AI Fixing Issues",
+                    "phase": "agentic",
+                    "iteration": iteration,
+                }))
+                .unwrap_or_default(),
+            ),
             workflow_name: None,
             state_name: None,
             action_id: Some(action_id.clone()),
@@ -2275,7 +2286,9 @@ impl CompletionExecutor {
     ///
     /// After completion automation steps run, this contains output variables
     /// (e.g., `evaluation_results`) that need substitution into prompt step content.
-    pub fn shared_variables(&self) -> &crate::orchestrator::context_propagation::SharedVariableStore {
+    pub fn shared_variables(
+        &self,
+    ) -> &crate::orchestrator::context_propagation::SharedVariableStore {
         self.executor.shared_variables()
     }
 
@@ -2422,18 +2435,21 @@ impl CompletionExecutor {
             if shared_vars.is_empty() {
                 prompt_steps.to_vec()
             } else {
-                prompt_steps.iter().map(|step| {
-                    let mut step = step.clone();
-                    if let Some(ref mut content) = step.prompt_content {
-                        for (name, value) in &shared_vars {
-                            let pattern = format!("{{{{{}}}}}", name);
-                            if content.contains(&pattern) {
-                                *content = content.replace(&pattern, value);
+                prompt_steps
+                    .iter()
+                    .map(|step| {
+                        let mut step = step.clone();
+                        if let Some(ref mut content) = step.prompt_content {
+                            for (name, value) in &shared_vars {
+                                let pattern = format!("{{{{{}}}}}", name);
+                                if content.contains(&pattern) {
+                                    *content = content.replace(&pattern, value);
+                                }
                             }
                         }
-                    }
-                    step
-                }).collect()
+                        step
+                    })
+                    .collect()
             }
         };
         let prompt_steps = prompt_steps.as_slice();
@@ -2474,7 +2490,10 @@ impl CompletionExecutor {
                     .with_step_name(step_name);
                     resp_checkpoint.mark_started();
                     if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
-                        warn!("Failed to save completion response-mode step checkpoint: {}", e);
+                        warn!(
+                            "Failed to save completion response-mode step checkpoint: {}",
+                            e
+                        );
                     }
 
                     // Log start event for Active Dashboard visibility
@@ -2738,16 +2757,14 @@ impl CompletionExecutor {
                             ) {
                                 warn!("Failed to log completion AI session complete event: {}", e);
                             }
-                        } else {
-                            if let Err(e) = logger.log_error(
-                                StepEventKind::CompletionAiError,
-                                metadata,
-                                StepDetails::default(),
-                                duration_ms,
-                                Some("AI session failed"),
-                            ) {
-                                warn!("Failed to log completion AI session error event: {}", e);
-                            }
+                        } else if let Err(e) = logger.log_error(
+                            StepEventKind::CompletionAiError,
+                            metadata,
+                            StepDetails::default(),
+                            duration_ms,
+                            Some("AI session failed"),
+                        ) {
+                            warn!("Failed to log completion AI session error event: {}", e);
                         }
                     }
 

@@ -3,6 +3,7 @@
 //! This module provides functionality to generate UnifiedWorkflows from
 //! natural language descriptions using AI.
 
+pub mod discovery_tools;
 pub mod example_workflows;
 pub mod feedback;
 pub mod generator;

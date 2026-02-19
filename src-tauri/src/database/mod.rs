@@ -4816,7 +4816,9 @@ impl CheckpointDb {
 
         // Migration to version 62: Add assertion types generation rule
         if current_version < 62 {
-            info!("Migrating database to version 62 (adding valid assertion types generation rule)");
+            info!(
+                "Migrating database to version 62 (adding valid assertion types generation rule)"
+            );
             let now = chrono::Utc::now().to_rfc3339();
             conn.execute(
                 "INSERT OR IGNORE INTO generation_rules (id, agent, section, rule_number, title, content, condition, status, provenance, created_at, updated_at)
@@ -4980,7 +4982,16 @@ impl CheckpointDb {
             ];
 
             for (step_type, title, content, priority) in seed_entries {
-                let id = format!("seed-stk-{}-{}", step_type, title.to_lowercase().replace(' ', "-").chars().take(30).collect::<String>());
+                let id = format!(
+                    "seed-stk-{}-{}",
+                    step_type,
+                    title
+                        .to_lowercase()
+                        .replace(' ', "-")
+                        .chars()
+                        .take(30)
+                        .collect::<String>()
+                );
                 conn.execute(
                     "INSERT OR IGNORE INTO step_type_knowledge (id, step_type, layer, title, content, priority, status, provenance, created_at, updated_at)
                      VALUES (?1, ?2, 'universal', ?3, ?4, ?5, 'active', 'seed', ?6, ?7)",
@@ -6747,7 +6758,7 @@ impl CheckpointDb {
                     depth: 0,
                     bridge_id: None,
                     result_data: None,
-                    is_reflection: false,     // Not queried for performance
+                    is_reflection: false, // Not queried for performance
                     reflection_source_task_run_id: None, // Not queried for performance
                     created_at: row.get(19)?,
                     updated_at: row.get(20)?,
@@ -11400,9 +11411,7 @@ impl CheckpointDb {
         let preflight_check_enabled = request
             .preflight_check_enabled
             .unwrap_or(existing.preflight_check_enabled);
-        let enable_sweep = request
-            .enable_sweep
-            .unwrap_or(existing.enable_sweep);
+        let enable_sweep = request.enable_sweep.unwrap_or(existing.enable_sweep);
         let max_sweep_iterations = request
             .max_sweep_iterations
             .unwrap_or(existing.max_sweep_iterations);

@@ -78,7 +78,10 @@ pub async fn create_rule_handler(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to create generation rule: {}", e))),
+                Json(api_error(format!(
+                    "Failed to create generation rule: {}",
+                    e
+                ))),
             )
         })?;
 
@@ -105,7 +108,10 @@ pub async fn update_rule_handler(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to update generation rule: {}", e))),
+                Json(api_error(format!(
+                    "Failed to update generation rule: {}",
+                    e
+                ))),
             )
         })?;
 
@@ -128,7 +134,10 @@ pub async fn delete_rule_handler(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to delete generation rule: {}", e))),
+                Json(api_error(format!(
+                    "Failed to delete generation rule: {}",
+                    e
+                ))),
             )
         })?;
 

@@ -10,6 +10,7 @@ use tracing::{info, warn};
 use super::{HandlerContext, StepHandler, StepHandlerResult};
 use crate::step_executor::executor::ExecutionStepConfig;
 use crate::unified_workflows::{CreateUnifiedWorkflowRequest, UnifiedWorkflow};
+use crate::workflow_generation::validation::fix_workflow;
 
 pub struct SaveWorkflowArtifactHandler;
 
@@ -57,7 +58,7 @@ impl StepHandler for SaveWorkflowArtifactHandler {
         };
 
         // Parse as UnifiedWorkflow
-        let workflow: UnifiedWorkflow = match serde_json::from_str(&content) {
+        let mut workflow: UnifiedWorkflow = match serde_json::from_str(&content) {
             Ok(w) => w,
             Err(e) => {
                 return StepHandlerResult::failure(format!(
@@ -66,6 +67,9 @@ impl StepHandler for SaveWorkflowArtifactHandler {
                 ));
             }
         };
+
+        // Apply deterministic fixes (UUIDs, timestamps, check-group stripping, etc.)
+        fix_workflow(&mut workflow);
 
         info!(
             "SaveWorkflowArtifact '{}': parsed workflow '{}' (category: {})",

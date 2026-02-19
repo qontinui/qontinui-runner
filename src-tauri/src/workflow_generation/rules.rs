@@ -147,7 +147,10 @@ pub fn load_rules_by_agent(conn: &Connection, agent: &str) -> HashMap<String, Ve
 }
 
 /// List rules with optional filters.
-pub fn list_rules(conn: &Connection, query: &ListRulesQuery) -> Result<Vec<GenerationRule>, String> {
+pub fn list_rules(
+    conn: &Connection,
+    query: &ListRulesQuery,
+) -> Result<Vec<GenerationRule>, String> {
     let mut sql = String::from(
         "SELECT id, agent, section, rule_number, title, content, condition, status, provenance, source_fix_id, created_at, updated_at
          FROM generation_rules WHERE 1=1",
@@ -172,7 +175,8 @@ pub fn list_rules(conn: &Connection, query: &ListRulesQuery) -> Result<Vec<Gener
     }
     sql.push_str(" ORDER BY agent, section, rule_number");
 
-    let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+    let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+        params_vec.iter().map(|p| p.as_ref()).collect();
 
     let mut stmt = conn
         .prepare(&sql)
@@ -299,7 +303,11 @@ pub fn insert_rule(conn: &Connection, input: &InsertRuleInput) -> Result<Generat
 }
 
 /// Update an existing generation rule.
-pub fn update_rule(conn: &Connection, id: &str, input: &UpdateRuleInput) -> Result<GenerationRule, String> {
+pub fn update_rule(
+    conn: &Connection,
+    id: &str,
+    input: &UpdateRuleInput,
+) -> Result<GenerationRule, String> {
     let now = Utc::now().to_rfc3339();
     let mut sets = vec!["updated_at = ?1".to_string()];
     let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(now.clone())];
@@ -334,12 +342,12 @@ pub fn update_rule(conn: &Connection, id: &str, input: &UpdateRuleInput) -> Resu
         id_param_idx
     );
 
-    let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+    let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+        params_vec.iter().map(|p| p.as_ref()).collect();
     conn.execute(&sql, params_refs.as_slice())
         .map_err(|e| format!("Failed to update generation rule: {}", e))?;
 
-    get_rule(conn, id)?
-        .ok_or_else(|| format!("Rule {} not found after update", id))
+    get_rule(conn, id)?.ok_or_else(|| format!("Rule {} not found after update", id))
 }
 
 /// Delete a generation rule (hard delete).
@@ -357,10 +365,13 @@ pub fn delete_rule(conn: &Connection, id: &str) -> Result<bool, String> {
 /// Infer which agent a reflection fix targets based on keywords in the description.
 pub fn infer_agent_from_fix(description: &str) -> String {
     let lower = description.to_lowercase();
-    if lower.contains("hardener") || lower.contains("convert") || lower.contains("sdk replacement") {
+    if lower.contains("hardener") || lower.contains("convert") || lower.contains("sdk replacement")
+    {
         "hardener".to_string()
-    } else if lower.contains("validation") || lower.contains("verify command")
-        || lower.contains("check step") || lower.contains("url validation")
+    } else if lower.contains("validation")
+        || lower.contains("verify command")
+        || lower.contains("check step")
+        || lower.contains("url validation")
     {
         "verification".to_string()
     } else {
@@ -374,7 +385,8 @@ pub fn infer_section_from_fix(description: &str, agent: &str) -> String {
     match agent {
         "hardener" => {
             let lower = description.to_lowercase();
-            if lower.contains("critical") || lower.contains("preserve") || lower.contains("do not") {
+            if lower.contains("critical") || lower.contains("preserve") || lower.contains("do not")
+            {
                 "critical_rules".to_string()
             } else {
                 "conversion_rules".to_string()
@@ -383,7 +395,11 @@ pub fn infer_section_from_fix(description: &str, agent: &str) -> String {
         "verification" => "check_rules".to_string(),
         _ => {
             let lower = description.to_lowercase();
-            if lower.contains("uuid") || lower.contains("phase") || lower.contains("json") || lower.contains("timestamp") {
+            if lower.contains("uuid")
+                || lower.contains("phase")
+                || lower.contains("json")
+                || lower.contains("timestamp")
+            {
                 "important_rules".to_string()
             } else {
                 "verification_quality".to_string()
@@ -408,18 +424,39 @@ mod tests {
 
     #[test]
     fn test_infer_agent_from_fix() {
-        assert_eq!(infer_agent_from_fix("hardener should convert prompts"), "hardener");
-        assert_eq!(infer_agent_from_fix("URL validation for check steps"), "verification");
+        assert_eq!(
+            infer_agent_from_fix("hardener should convert prompts"),
+            "hardener"
+        );
+        assert_eq!(
+            infer_agent_from_fix("URL validation for check steps"),
+            "verification"
+        );
         assert_eq!(infer_agent_from_fix("gate step required"), "schema_context");
     }
 
     #[test]
     fn test_infer_section_from_fix() {
-        assert_eq!(infer_section_from_fix("preserve step IDs", "hardener"), "critical_rules");
-        assert_eq!(infer_section_from_fix("convert prompts", "hardener"), "conversion_rules");
-        assert_eq!(infer_section_from_fix("anything", "verification"), "check_rules");
-        assert_eq!(infer_section_from_fix("UUID format rule", "schema_context"), "important_rules");
-        assert_eq!(infer_section_from_fix("gate step quality", "schema_context"), "verification_quality");
+        assert_eq!(
+            infer_section_from_fix("preserve step IDs", "hardener"),
+            "critical_rules"
+        );
+        assert_eq!(
+            infer_section_from_fix("convert prompts", "hardener"),
+            "conversion_rules"
+        );
+        assert_eq!(
+            infer_section_from_fix("anything", "verification"),
+            "check_rules"
+        );
+        assert_eq!(
+            infer_section_from_fix("UUID format rule", "schema_context"),
+            "important_rules"
+        );
+        assert_eq!(
+            infer_section_from_fix("gate step quality", "schema_context"),
+            "verification_quality"
+        );
     }
 
     #[test]

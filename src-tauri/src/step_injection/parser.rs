@@ -341,9 +341,7 @@ mod tests {
             r#"{"type": "prompt", "name": "Test", "phase": "agentic", "promptContent": "hi"}"#,
         );
 
-        let step = parser
-            .process_line("[/INJECT_STEP]")
-            .expect("Should parse");
+        let step = parser.process_line("[/INJECT_STEP]").expect("Should parse");
 
         assert_eq!(
             step.phase,
@@ -361,9 +359,7 @@ mod tests {
             r#"{"type": "prompt", "id": "my-custom-id", "name": "Test", "promptContent": "hi"}"#,
         );
 
-        let step = parser
-            .process_line("[/INJECT_STEP]")
-            .expect("Should parse");
+        let step = parser.process_line("[/INJECT_STEP]").expect("Should parse");
 
         assert_eq!(step.id, Some("my-custom-id".to_string()));
     }

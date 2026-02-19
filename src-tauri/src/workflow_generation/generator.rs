@@ -23,8 +23,8 @@ use crate::unified_workflows::UnifiedWorkflow;
 use crate::workflow_generation::hardener::{self, HardeningSummary};
 use crate::workflow_generation::rules;
 use crate::workflow_generation::schema_context::{build_schema_context, build_schema_context_full};
-use rusqlite::Connection;
 use crate::workflow_generation::validation::{fix_workflow, validate_workflow, ValidationError};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
@@ -79,6 +79,10 @@ pub struct GenerateWorkflowRequest {
     /// Generation mode: "standard" (default) or "plan"
     #[serde(default)]
     pub generation_mode: Option<String>,
+
+    /// Discovery mode: "auto" (default), "enabled" (always), "disabled" (never)
+    #[serde(default)]
+    pub discovery_mode: Option<String>,
 }
 
 /// One pass of the verification→fix loop.
@@ -114,6 +118,9 @@ pub struct GenerateWorkflowResponse {
     /// Summary of verification hardening (prompt → deterministic conversions)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hardening_summary: Option<HardeningSummary>,
+    /// Discovery tool calls made during generation
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discovery_calls: Vec<super::discovery_tools::DiscoveryCall>,
 }
 
 // ============================================================================
@@ -138,8 +145,33 @@ pub fn generate_workflow(
 
     let max_fix_iters = request.max_fix_iterations.unwrap_or(3);
 
+    // ── Discovery Phase ──────────────────────────────────────────────────
+    let discovery_mode = request.discovery_mode.as_deref().unwrap_or("auto");
+    let (discovery_context, discovery_calls) = if discovery_mode != "disabled" {
+        let config = super::discovery_tools::DiscoveryConfig::default();
+        let result =
+            super::discovery_tools::run_discovery(&request.description, &config, discovery_mode);
+        if !result.calls.is_empty() {
+            info!(
+                "Discovery: {} tools ran, {} succeeded",
+                result.calls.len(),
+                result.calls.iter().filter(|c| c.success).count()
+            );
+        }
+        (result.context, result.calls)
+    } else {
+        debug!("Discovery disabled by request");
+        (String::new(), vec![])
+    };
+
     // ── Step 1: Builder Agent ──────────────────────────────────────────────
-    let mut workflow = match run_builder_agent(&request, doctor_handle, conn, query_embedding) {
+    let mut workflow = match run_builder_agent(
+        &request,
+        &discovery_context,
+        doctor_handle,
+        conn,
+        query_embedding,
+    ) {
         Ok(w) => w,
         Err(resp) => return *resp,
     };
@@ -158,7 +190,13 @@ pub fn generate_workflow(
             info!("Verification iteration {}/{}", iter_num, max_fix_iters);
 
             // Run verification agent
-            let issues = run_verification_agent(&workflow, &request.description, doctor_handle, conn);
+            let issues = run_verification_agent(
+                &workflow,
+                &request.description,
+                &discovery_context,
+                doctor_handle,
+                conn,
+            );
 
             let issue_count = issues.len();
             info!("Verification found {} issues", issue_count);
@@ -222,8 +260,11 @@ pub fn generate_workflow(
     }
 
     // ── Hardener Agent ───────────────────────────────────────────────────
-    let (workflow, hardening_summary) =
+    let (mut workflow, hardening_summary) =
         hardener::run_hardener_agent(&workflow, &request.description, doctor_handle, conn);
+
+    // Re-apply deterministic fixes after hardener (e.g. strip check-group setup/completion)
+    fix_workflow(&mut workflow);
 
     // ── Final structural validation ────────────────────────────────────────
     let validation_errors: Vec<ValidationError> = validate_workflow(&workflow);
@@ -255,6 +296,7 @@ pub fn generate_workflow(
         model_used: None,
         verification_iterations: iterations,
         hardening_summary,
+        discovery_calls,
     }
 }
 
@@ -265,6 +307,7 @@ pub fn generate_workflow(
 /// Run the builder agent to generate the initial workflow JSON.
 fn run_builder_agent(
     request: &GenerateWorkflowRequest,
+    discovery_context: &str,
     doctor_handle: Option<&DoctorHandle>,
     conn: Option<&Connection>,
     query_embedding: Option<&[f32]>,
@@ -325,14 +368,16 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
             .unwrap_or_default()
     );
 
-    let full_prompt = if context_section.is_empty() {
-        format!("{}\n\n{}", schema_context, user_prompt)
-    } else {
-        format!(
-            "{}\n\n{}\n\n{}",
-            schema_context, context_section, user_prompt
-        )
-    };
+    // Combine all context sections: schema + discovery + user contexts + prompt
+    let mut sections = vec![schema_context];
+    if !discovery_context.is_empty() {
+        sections.push(discovery_context.to_string());
+    }
+    if !context_section.is_empty() {
+        sections.push(context_section.clone());
+    }
+    sections.push(user_prompt.clone());
+    let full_prompt = sections.join("\n\n");
 
     let task_context = TaskContext::from_prompt(&full_prompt);
     let ai_result: AiResponse = run_prompt_with_routing(&full_prompt, &task_context, doctor_handle);
@@ -355,6 +400,7 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
             model_used: None,
             verification_iterations: vec![],
             hardening_summary: None,
+            discovery_calls: vec![],
         }));
     }
 
@@ -375,6 +421,7 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
             model_used: None,
             verification_iterations: vec![],
             hardening_summary: None,
+            discovery_calls: vec![],
         })
     })
 }
@@ -390,6 +437,7 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
 fn run_verification_agent(
     workflow: &UnifiedWorkflow,
     user_description: &str,
+    discovery_context: &str,
     doctor_handle: Option<&DoctorHandle>,
     conn: Option<&Connection>,
 ) -> Vec<String> {
@@ -404,7 +452,8 @@ fn run_verification_agent(
         }
     };
 
-    let prompt = build_verification_prompt(&workflow_json, user_description, conn);
+    let prompt =
+        build_verification_prompt(&workflow_json, user_description, discovery_context, conn);
     let task_context = TaskContext::from_prompt(&prompt);
     let ai_result: AiResponse = run_prompt_with_routing(&prompt, &task_context, doctor_handle);
 
@@ -421,7 +470,12 @@ fn run_verification_agent(
 }
 
 /// Build the prompt for the verification agent.
-fn build_verification_prompt(workflow_json: &str, user_description: &str, conn: Option<&Connection>) -> String {
+fn build_verification_prompt(
+    workflow_json: &str,
+    user_description: &str,
+    discovery_context: &str,
+    conn: Option<&Connection>,
+) -> String {
     // Load check rules from DB if available
     let check_rules_section = if let Some(conn) = conn {
         let check_rules = rules::load_rules(conn, "verification", "check_rules");
@@ -440,6 +494,15 @@ fn build_verification_prompt(workflow_json: &str, user_description: &str, conn: 
 
     let checks = check_rules_section.unwrap_or_else(|| FALLBACK_VERIFICATION_CHECKS.to_string());
 
+    let discovery_section = if discovery_context.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n## System Discovery Context\n\nUse this real system information to verify step accuracy:\n\n{}\n",
+            discovery_context
+        )
+    };
+
     format!(
         r#"You are a workflow verification agent for Qontinui Runner.
 Your job is to review a generated UnifiedWorkflow JSON and find semantic errors in the deterministic steps — WITHOUT running anything.
@@ -447,7 +510,7 @@ Your job is to review a generated UnifiedWorkflow JSON and find semantic errors 
 {checks}
 
 Steps match the user's original request: "{user_description}"
-
+{discovery_section}
 ## Output format
 
 If you find issues, return a JSON array of strings, one per issue. Each issue should identify the step by name/index and describe the problem clearly.
@@ -465,6 +528,7 @@ Examples:
 {workflow_json}"#,
         checks = checks,
         user_description = user_description,
+        discovery_section = discovery_section,
         workflow_json = workflow_json,
     )
 }

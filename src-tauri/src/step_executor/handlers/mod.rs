@@ -583,8 +583,7 @@ impl StepHandler for PromptStepHandler {
                      Respond with EXACTLY: PASS: <reason> or FAIL: <reason>",
                     ai_response.output
                 );
-                let retry_task_context =
-                    crate::ai_router::TaskContext::from_prompt(&retry_prompt);
+                let retry_task_context = crate::ai_router::TaskContext::from_prompt(&retry_prompt);
                 let retry_prompt_clone = retry_prompt.clone();
                 let doctor_handle2 = context.app_state.doctor_handle.lock().await.clone();
                 let retry_result = tokio::task::spawn_blocking(move || {
@@ -604,10 +603,7 @@ impl StepHandler for PromptStepHandler {
                             "required_retry": true,
                         })),
                         _ => StepHandlerResult::failure_with_data(
-                            format!(
-                                "Verification failed: {}",
-                                extract_reasoning(&resp.output)
-                            ),
+                            format!("Verification failed: {}", extract_reasoning(&resp.output)),
                             serde_json::json!({
                                 "evaluation": "fail",
                                 "reasoning": extract_reasoning(&resp.output),
@@ -661,7 +657,7 @@ fn parse_pass_fail(response: &str) -> Option<bool> {
         }
 
         // Match "Result: PASS" or "Verdict: PASS" patterns
-        if let Some(after_colon) = line.split(':').last() {
+        if let Some(after_colon) = line.split(':').next_back() {
             let after = after_colon.trim().to_uppercase();
             if after.starts_with("PASS") {
                 return Some(true);
@@ -706,9 +702,8 @@ fn extract_reasoning(response: &str) -> String {
 
 /// Build the evaluation prompt for AI verification.
 fn format_evaluation_prompt(criteria: &str, ui_context: &Option<String>) -> String {
-    let mut prompt = String::from(
-        "You are evaluating a verification check during a workflow execution.\n\n",
-    );
+    let mut prompt =
+        String::from("You are evaluating a verification check during a workflow execution.\n\n");
 
     if let Some(ctx) = ui_context {
         prompt.push_str("## Current Page State\n\n");
@@ -863,10 +858,7 @@ mod tests {
     #[test]
     fn test_extract_reasoning_pass() {
         let reasoning = extract_reasoning("PASS: The button renders correctly and is clickable");
-        assert_eq!(
-            reasoning,
-            "The button renders correctly and is clickable"
-        );
+        assert_eq!(reasoning, "The button renders correctly and is clickable");
     }
 
     #[test]

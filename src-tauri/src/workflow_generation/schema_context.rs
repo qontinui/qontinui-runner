@@ -64,8 +64,7 @@ pub fn build_schema_context_full(
     // Load step type knowledge filtered to relevant step types
     let knowledge_section = if let Some(conn) = conn {
         let step_type_names: Vec<&str> = filtered.iter().map(|m| m.step_type).collect();
-        let entries =
-            step_type_knowledge::load_knowledge_for_step_types(conn, &step_type_names);
+        let entries = step_type_knowledge::load_knowledge_for_step_types(conn, &step_type_names);
         if !entries.is_empty() {
             step_type_knowledge::format_knowledge_as_markdown(&entries)
         } else {
@@ -105,7 +104,10 @@ pub fn generate_step_types_documentation(types: &[&StepTypeMetadata]) -> String 
         let phases_str = format_phases_for_header(meta.allowed_phases);
         output.push_str(&format!(
             "### {} ({})\n{}\n```json\n{{\n  \"type\": \"{}\",\n  \"phase\": {},\n",
-            meta.step_type, phases_str, meta.description, meta.step_type,
+            meta.step_type,
+            phases_str,
+            meta.description,
+            meta.step_type,
             format_phase_values(meta.allowed_phases),
         ));
 
@@ -181,7 +183,13 @@ pub fn generate_phase_constraint_table(types: &[&StepTypeMetadata]) -> String {
 // Prompt Assembly
 // ============================================================================
 
-fn assemble_prompt(step_types: &str, phase_table: &str, examples: &str, knowledge: &str, conn: Option<&Connection>) -> String {
+fn assemble_prompt(
+    step_types: &str,
+    phase_table: &str,
+    examples: &str,
+    knowledge: &str,
+    conn: Option<&Connection>,
+) -> String {
     let examples_section = if examples.is_empty() {
         String::new()
     } else {
@@ -387,6 +395,22 @@ This means workflows can **read page text without screenshots**:
   Works on ALL pages of an SDK-integrated app — no per-page setup required.
 - **Playwright**: Full browser testing, visual regression, complex multi-page flows,
   testing apps WITHOUT the SDK, screenshot-based verification, pixel-level checks
+
+### Retry Support for API Requests
+After page navigation, the WebSocket connection needs ~15 seconds to reconnect. Use `retry_count` and `retry_delay_ms` on verification steps that follow navigation:
+```json
+{{
+  "type": "api_request",
+  "phase": "verification",
+  "name": "Verify page loaded",
+  "method": "GET",
+  "url": "http://localhost:9876/ui-bridge/sdk/snapshot",
+  "assertions": [{{"type": "status_code", "expected": 200}}, {{"type": "body_contains", "expected": "expected-element-id"}}],
+  "retry_count": 5,
+  "retry_delay_ms": 3000
+}}
+```
+This retries up to 5 times with 3s delay between attempts — enough time for the WebSocket to reconnect after navigation.
 
 ### SDK in Verification Steps
 Use `api_request` steps to query SDK endpoints for verification:

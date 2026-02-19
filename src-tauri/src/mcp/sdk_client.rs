@@ -983,10 +983,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/ui-bridge/sdk/snapshot", get(handle_snapshot))
         .route("/ui-bridge/sdk/discover", post(handle_discover))
         // Console errors
-        .route(
-            "/ui-bridge/sdk/console-errors",
-            get(handle_console_errors),
-        )
+        .route("/ui-bridge/sdk/console-errors", get(handle_console_errors))
         .route(
             "/ui-bridge/sdk/console-errors/clear",
             post(handle_clear_console_errors),

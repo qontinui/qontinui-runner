@@ -34,9 +34,8 @@ static REFLECTION_FIX_START: OnceLock<Regex> = OnceLock::new();
 static REFLECTION_FIX_END: OnceLock<Regex> = OnceLock::new();
 
 fn get_start_pattern() -> &'static Regex {
-    REFLECTION_FIX_START.get_or_init(|| {
-        Regex::new(r"(?i)\[REFLECTION_FIX:([a-z_]+):([a-z]+)\]").unwrap()
-    })
+    REFLECTION_FIX_START
+        .get_or_init(|| Regex::new(r"(?i)\[REFLECTION_FIX:([a-z_]+):([a-z]+)\]").unwrap())
 }
 
 fn get_end_pattern() -> &'static Regex {
@@ -101,7 +100,10 @@ impl ReflectionFixParser {
         }
 
         if let Some(caps) = start_pattern.captures(line) {
-            let fix_type_raw = caps.get(1).map(|m| m.as_str()).unwrap_or("context_addition");
+            let fix_type_raw = caps
+                .get(1)
+                .map(|m| m.as_str())
+                .unwrap_or("context_addition");
             let confidence_raw = caps.get(2).map(|m| m.as_str()).unwrap_or("medium");
 
             self.current_fix_type = normalize_fix_type(fix_type_raw);
@@ -283,12 +285,8 @@ mod tests {
         assert!(parser
             .process_line("Description: Added missing workspace path to context")
             .is_none());
-        assert!(parser
-            .process_line("File: .claude/settings.json")
-            .is_none());
-        assert!(parser
-            .process_line("Old: no workspace path")
-            .is_none());
+        assert!(parser.process_line("File: .claude/settings.json").is_none());
+        assert!(parser.process_line("Old: no workspace path").is_none());
         assert!(parser
             .process_line("New: workspace_path = /home/user/project")
             .is_none());
@@ -299,14 +297,8 @@ mod tests {
 
         assert_eq!(fix.fix_type, "context_addition");
         assert_eq!(fix.confidence, "high");
-        assert_eq!(
-            fix.description,
-            "Added missing workspace path to context"
-        );
-        assert_eq!(
-            fix.file_changed,
-            Some(".claude/settings.json".to_string())
-        );
+        assert_eq!(fix.description, "Added missing workspace path to context");
+        assert_eq!(fix.file_changed, Some(".claude/settings.json".to_string()));
         assert_eq!(fix.old_value, Some("no workspace path".to_string()));
         assert_eq!(
             fix.new_value,
@@ -348,10 +340,7 @@ mod tests {
             .expect("Should parse fix");
 
         assert_eq!(fix.fix_type, "selector_fix");
-        assert_eq!(
-            fix.source_finding_id,
-            Some("abc-123-def".to_string())
-        );
+        assert_eq!(fix.source_finding_id, Some("abc-123-def".to_string()));
     }
 
     #[test]

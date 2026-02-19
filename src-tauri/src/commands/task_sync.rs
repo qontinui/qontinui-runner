@@ -692,7 +692,10 @@ impl AITaskSyncService {
                 "Sync verification result failed with status {}: {}",
                 status, error_text
             );
-            return Err(format!("Failed to sync verification result: {}", error_text));
+            return Err(format!(
+                "Failed to sync verification result: {}",
+                error_text
+            ));
         }
 
         info!(
