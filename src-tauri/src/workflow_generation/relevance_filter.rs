@@ -79,7 +79,8 @@ mod tests {
         let all = get_all_step_type_metadata();
         let filtered = filter_relevant_step_types("run pytest and fix errors", all);
         let names: Vec<&str> = filtered.iter().map(|m| m.step_type).collect();
-        assert!(names.contains(&"test"));
+        // "test" was merged into "command" — command is always included
+        assert!(names.contains(&"command"));
     }
 
     #[test]

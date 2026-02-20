@@ -14,12 +14,11 @@
 //!             └── handler.execute(step, context)
 //! ```
 //!
-//! ## Available Handlers (4 active)
+//! ## Available Handlers (3 active)
 //!
 //! | Category | Handlers |
 //! |----------|----------|
-//! | **Command** | command (dispatches to shell_command, check, check_group) |
-//! | **Verification** | test |
+//! | **Command** | command (dispatches to shell_command, check, check_group, test) |
 //! | **UI Bridge** | ui_bridge |
 //! | **AI** | prompt |
 //!
@@ -72,14 +71,13 @@ use super::executor::ExecutionStepConfig;
 pub(super) mod check;
 pub(super) mod check_group;
 pub(super) mod shell_command;
+pub(super) mod test;
 // Active handlers
 mod command;
-mod test;
 mod ui_bridge;
 
 // Re-export handlers for registration
 use command::CommandHandler;
-use test::TestHandler;
 use ui_bridge::UiBridgeHandler;
 
 /// Result of executing a step handler.
@@ -347,12 +345,11 @@ impl HandlerRegistry {
     /// Create a registry pre-populated with all standard handlers.
     ///
     /// This is the recommended way to create a registry for production use.
-    /// 4 active handlers: command, test, ui_bridge, prompt
+    /// 3 active handlers: command (incl. test dispatch), ui_bridge, prompt
     pub fn with_standard_handlers() -> Self {
         let mut registry = Self::new();
 
         registry.register(CommandHandler);
-        registry.register(TestHandler);
         registry.register(PromptStepHandler);
         registry.register(UiBridgeHandler);
 

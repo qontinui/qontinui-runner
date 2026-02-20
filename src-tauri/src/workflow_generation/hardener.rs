@@ -163,7 +163,7 @@ impl AppContext {
 ///
 /// Checks for:
 /// - `prompt` steps (should be deterministic where possible)
-/// - `test` steps with `playwright` test_type when SDK is connected (should use SDK)
+/// - `command`/`test` steps with `playwright` test_type when SDK is connected (should use SDK)
 /// - `api_request` steps hitting SDK endpoints with weak/missing assertions
 /// - Agentic steps that lack corresponding verification coverage
 pub fn should_harden_verification(workflow: &UnifiedWorkflow) -> bool {
@@ -179,8 +179,8 @@ pub fn should_harden_verification(workflow: &UnifiedWorkflow) -> bool {
             // Prompt steps are always candidates
             "prompt" => true,
 
-            // Playwright test steps are candidates when SDK is connected
-            "test" => {
+            // Test steps (legacy "test" or "command" with test_type) are candidates when SDK is connected
+            "test" | "command" if step.get("test_type").is_some() => {
                 if !has_sdk_connect {
                     return false;
                 }
@@ -356,7 +356,7 @@ fn count_candidates(workflow: &UnifiedWorkflow) -> usize {
             let t = step.get("type").and_then(|v| v.as_str()).unwrap_or("");
             match t {
                 "prompt" => true,
-                "test" if has_sdk => {
+                "test" | "command" if has_sdk && step.get("test_type").is_some() => {
                     let tt = step.get("test_type").and_then(|v| v.as_str()).unwrap_or("");
                     tt == "playwright" || is_ui_verification_test(step)
                 }

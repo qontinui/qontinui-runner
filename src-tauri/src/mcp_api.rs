@@ -292,7 +292,7 @@ pub fn create_router(
         .merge(crate::mcp::reflection_api::routes())
         .merge(crate::mcp::saved_api_requests::routes())
         .merge(crate::mcp::sdk_client::routes())
-        .merge(crate::mcp::scriptlets::routes())
+        .merge(crate::mcp::prompt_snippets::routes())
         .merge(crate::mcp::settings::routes())
         .merge(crate::mcp::shell_commands::routes())
         .merge(crate::mcp::state_explorer::routes())

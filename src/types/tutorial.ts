@@ -282,7 +282,7 @@ export type TutorialFocusPage =
   | "unified-workflow-builder"
   | "workflow-builder"
   | "macro-builder"
-  | "script-builder"
+  | "playwright-test-builder"
   | "check-builder"
   | "library"
   | "ai"

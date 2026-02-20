@@ -25,7 +25,7 @@ import { useFindingsData } from "./widgets/findings";
 import { useExecutionStatusWidgetData } from "./widgets/execution-status";
 import { useShellCommandData } from "./widgets/shell-command";
 import { useApiRequestData } from "./widgets/api-request";
-import { useScriptData } from "./widgets/script";
+import { usePlaywrightTestData } from "./widgets/playwright-test";
 import { useWorkflowRefData } from "./widgets/workflow-ref";
 import { useMcpCallData } from "./widgets/mcp-call";
 import { useExecutionTimelineData } from "./widgets/execution-timeline";
@@ -560,14 +560,14 @@ const ApiRequestRenderer = memo(function ApiRequestRenderer({
 });
 
 /**
- * Script widget renderer - calls useScriptData statically.
+ * Playwright Test widget renderer - calls usePlaywrightTestData statically.
  */
 const ScriptRenderer = memo(function ScriptRenderer({
   status,
   onNavigateToDetail,
 }: WidgetRendererProps) {
   const config = widgetRegistry.get("script")!;
-  const data = useScriptData();
+  const data = usePlaywrightTestData();
   const FullComponent = config.FullComponent;
   const borderClasses = getWidgetBorderClasses(config.accentColor, status, true);
 
@@ -962,11 +962,13 @@ const ApiRequestSummaryRenderer = memo(function ApiRequestSummaryRenderer(
 });
 
 /**
- * Script summary renderer.
+ * Playwright Test summary renderer.
  */
-const ScriptSummaryRenderer = memo(function ScriptSummaryRenderer(props: SummaryRendererProps) {
+const PlaywrightTestSummaryRenderer = memo(function PlaywrightTestSummaryRenderer(
+  props: SummaryRendererProps,
+) {
   const config = widgetRegistry.get("script")!;
-  const data = useScriptData();
+  const data = usePlaywrightTestData();
   return <SummaryContainer {...props} config={config} data={data} />;
 });
 
@@ -1094,7 +1096,7 @@ const SummaryWidget = memo(function SummaryWidget({
       );
     case "script":
       return (
-        <ScriptSummaryRenderer
+        <PlaywrightTestSummaryRenderer
           status={status}
           onClick={onClick}
           onNavigateToDetail={onNavigateToDetail}

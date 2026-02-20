@@ -49,7 +49,19 @@ pub fn get_icon_type(step_type: &str, step_name: &str) -> Option<String> {
         }
         "screenshot" => Some("screenshot".to_string()),
         "script" => Some("script".to_string()),
-        "command" => Some("command".to_string()),
+        "command" => {
+            // Command steps with test-related names get test icons
+            if name_lower.contains("playwright") {
+                Some("test_playwright".to_string())
+            } else if name_lower.contains("pytest")
+                || name_lower.contains("cargo test")
+                || name_lower.contains("npm test")
+            {
+                Some("test".to_string())
+            } else {
+                Some("command".to_string())
+            }
+        }
         "shell_command" => Some("shell_command".to_string()),
         "api_request" => Some("api_request".to_string()),
         "prompt" => Some("prompt".to_string()),

@@ -2816,7 +2816,7 @@ pub use crate::execution_context::AiSessionContext;
 use crate::runtime_env::{AiSessionContextExt, ExecutionContextExt};
 
 // Playwright CRUD types moved to crate::mcp::playwright
-// Scriptlet CRUD types moved to crate::mcp::scriptlets
+// Prompt snippet CRUD types moved to crate::mcp::prompt_snippets
 
 // ============================================================================
 // Inline Python Execution Types
@@ -4087,7 +4087,7 @@ If your task requires running visual automation, use the Runner API to execute w
 
 // Macro handlers moved to crate::mcp::macros
 // Playwright script handlers moved to crate::mcp::playwright
-// Scriptlet handlers moved to crate::mcp::scriptlets
+// Prompt snippet handlers moved to crate::mcp::prompt_snippets
 
 // ============================================================================
 // Inline Python Execution

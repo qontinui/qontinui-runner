@@ -313,7 +313,7 @@ fn build_stages_heuristic(task_run: &TaskRun, steps: &[RecapStep]) -> Vec<StageR
         let phase = step.phase.as_deref().unwrap_or_else(|| {
             // Heuristic fallback: infer phase from step_type and name (for legacy steps)
             match step.step_type.as_str() {
-                "check" | "test" => "verification",
+                "check" | "test" => "verification", // "test" kept for legacy compat
                 "ai_session" => "agentic",
                 "workflow" => {
                     let name_lower = step.name.to_lowercase();

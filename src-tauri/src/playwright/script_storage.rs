@@ -4,8 +4,7 @@
 
 use super::results::PlaywrightResult;
 use super::types::{
-    default_browser, default_timeout_seconds, default_version, DisplayMode, SyncStatus,
-    SCRIPTS_FILE,
+    default_browser, default_timeout_seconds, default_version, DisplayMode, SyncStatus, TESTS_FILE,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -181,9 +180,31 @@ fn get_playwright_dir() -> Result<PathBuf, String> {
     Ok(app_data_dir)
 }
 
-/// Get the scripts file path
+/// Get the tests file path.
+/// Includes migration logic: if old "playwright-scripts.json" exists and new
+/// "playwright-tests.json" doesn't, renames it automatically.
 fn get_scripts_path() -> Result<PathBuf, String> {
-    get_playwright_dir().map(|dir| dir.join(SCRIPTS_FILE))
+    let dir = get_playwright_dir()?;
+    let new_path = dir.join(TESTS_FILE);
+    let old_path = dir.join("playwright-scripts.json");
+
+    // Migration: rename old file to new if needed
+    if old_path.exists() && !new_path.exists() {
+        info!(
+            "Migrating playwright tests file: {:?} -> {:?}",
+            old_path, new_path
+        );
+        if let Err(e) = std::fs::rename(&old_path, &new_path) {
+            tracing::warn!(
+                "Failed to migrate playwright tests file (will try old path): {}",
+                e
+            );
+            // If rename fails, fall back to old path
+            return Ok(old_path);
+        }
+    }
+
+    Ok(new_path)
 }
 
 /// Get the results directory for test reports

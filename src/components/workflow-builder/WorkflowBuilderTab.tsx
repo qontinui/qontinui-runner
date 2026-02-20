@@ -1297,7 +1297,7 @@ function WorkflowBuilderContent({
 
       const step: UnifiedStep = {
         id: generateStepId(),
-        type: "test",
+        type: "command",
         phase: phase as "setup" | "verification" | "completion",
         name: test.name,
         test_type: testTypeMap[test.test_type] || "custom_command",

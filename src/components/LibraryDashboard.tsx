@@ -32,7 +32,7 @@ const API_BASE = "http://localhost:9876";
 // Item types that can appear in the dashboard
 type ItemType =
   | "task"
-  | "scriptlet"
+  | "prompt-snippet"
   | "context"
   | "verification"
   | "api-request"
@@ -101,11 +101,11 @@ const CATEGORY_CONFIG: Record<
     accentColor: "amber",
     builderTab: "task-builder",
   },
-  scriptlet: {
-    label: "Scriptlet",
+  "prompt-snippet": {
+    label: "Prompt Snippet",
     icon: Puzzle,
     accentColor: "cyan",
-    builderTab: "script-builder",
+    builderTab: "playwright-test-builder",
   },
   context: {
     label: "Context",
@@ -126,10 +126,10 @@ const CATEGORY_CONFIG: Record<
     builderTab: "api-request-builder",
   },
   script: {
-    label: "Script",
+    label: "Playwright Test",
     icon: TestTube,
     accentColor: "purple",
-    builderTab: "script-builder",
+    builderTab: "playwright-test-builder",
   },
   "unified-workflow": {
     label: "Workflow",
@@ -171,7 +171,7 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
       // Fetch all item types in parallel
       const [
         tasksRes,
-        scriptletsRes,
+        promptSnippetsRes,
         contextsRes,
         verificationsRes,
         apiRequestsRes,
@@ -181,7 +181,7 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
         checksRes,
       ] = await Promise.allSettled([
         fetch(`${API_BASE}/prompts`),
-        fetch(`${API_BASE}/scriptlets`),
+        fetch(`${API_BASE}/prompt-snippets`),
         fetch(`${API_BASE}/contexts`),
         fetch(`${API_BASE}/saved-verifications`),
         fetch(`${API_BASE}/saved-api-requests`),
@@ -211,14 +211,14 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
         });
       }
 
-      // Process scriptlets
-      if (scriptletsRes.status === "fulfilled" && scriptletsRes.value.ok) {
-        const result = await scriptletsRes.value.json();
+      // Process prompt snippets
+      if (promptSnippetsRes.status === "fulfilled" && promptSnippetsRes.value.ok) {
+        const result = await promptSnippetsRes.value.json();
         const data = result.success ? result.data : Array.isArray(result) ? result : [];
         data?.forEach((item: ApiResponseItem) => {
           allItems.push({
             id: item.id,
-            type: "scriptlet",
+            type: "prompt-snippet",
             name: item.name,
             description: item.content?.slice(0, 100),
             category: item.category,
@@ -406,7 +406,7 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
     const counts: Record<ItemType | "all", number> = {
       all: items.length,
       task: 0,
-      scriptlet: 0,
+      "prompt-snippet": 0,
       context: 0,
       verification: 0,
       "api-request": 0,

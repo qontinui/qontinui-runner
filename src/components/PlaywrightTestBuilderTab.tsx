@@ -30,14 +30,14 @@ import type {
   ScriptExecutionState,
   DisplayMode,
 } from "../types";
-import { ScriptletSelector, useScriptletMention } from "./ScriptletSelector";
+import { PromptSnippetSelector, usePromptSnippetMention } from "./PromptSnippetSelector";
 import { executeAiTask } from "../hooks";
 import { getAccentColors, getStatusColors } from "@/design-system";
 import { BuilderToolbar, toolbarActions } from "./ui/BuilderToolbar";
 
 type LogLevel = "info" | "warning" | "error" | "debug" | "success";
 
-interface ScriptBuilderTabProps {
+interface PlaywrightTestBuilderTabProps {
   onLog: (level: LogLevel, message: string) => void;
   /** Optional script ID to load for editing (from Library navigation) */
   editScriptId?: string | null;
@@ -58,11 +58,11 @@ test('example test', async ({ page }) => {
 });
 `;
 
-export function ScriptBuilderTab({
+export function PlaywrightTestBuilderTab({
   onLog,
   editScriptId,
   onNavigateToLibrary: _onNavigateToLibrary,
-}: ScriptBuilderTabProps) {
+}: PlaywrightTestBuilderTabProps) {
   // State
   const [scripts, setScripts] = useState<PlaywrightScript[]>([]);
   const [_loading, setLoading] = useState(false);
@@ -317,7 +317,7 @@ export function ScriptBuilderTab({
   // Track if description was manually changed (to trigger auto-save)
   const descriptionChangedByUser = useRef(false);
 
-  // Ref for description textarea (for scriptlet insertion)
+  // Ref for description textarea (for prompt snippet insertion)
   const descriptionTextareaRef = useRef<HTMLTextAreaElement>(null);
 
   // Track if name was manually changed (to trigger auto-save)
@@ -336,8 +336,8 @@ export function ScriptBuilderTab({
   const [coverageWarnings, setCoverageWarnings] = useState<string[]>([]);
   const [isValidatingCoverage, setIsValidatingCoverage] = useState(false);
 
-  // Scriptlet insertion - insert at cursor position
-  const insertScriptletAtCursor = useCallback(
+  // Prompt snippet insertion - insert at cursor position
+  const insertPromptSnippetAtCursor = useCallback(
     (content: string) => {
       const textarea = descriptionTextareaRef.current;
       if (!textarea) {
@@ -364,11 +364,11 @@ export function ScriptBuilderTab({
     [formDescription],
   );
 
-  // @-mention hook for scriptlet insertion
-  const scriptletMention = useScriptletMention(
+  // @-mention hook for prompt snippet insertion
+  const promptSnippetMention = usePromptSnippetMention(
     descriptionTextareaRef,
     (content, triggerStart, triggerEnd) => {
-      // Replace @query with the scriptlet content
+      // Replace @query with the prompt snippet content
       const currentValue = formDescription;
       const newValue =
         currentValue.slice(0, triggerStart) + content + currentValue.slice(triggerEnd);
@@ -395,7 +395,7 @@ export function ScriptBuilderTab({
 
     const timeoutId = setTimeout(async () => {
       try {
-        await fetch(`${API_BASE}/playwright/scripts/${editingScript.id}`, {
+        await fetch(`${API_BASE}/playwright/tests/${editingScript.id}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ description: formDescription }),
@@ -418,14 +418,14 @@ export function ScriptBuilderTab({
 
     const timeoutId = setTimeout(async () => {
       try {
-        const response = await fetch(`${API_BASE}/playwright/scripts/${editingScript.id}`, {
+        const response = await fetch(`${API_BASE}/playwright/tests/${editingScript.id}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ name: formName }),
         });
         if (response.ok) {
           // Reload scripts to update the list display
-          const scriptsResponse = await fetch(`${API_BASE}/playwright/scripts`);
+          const scriptsResponse = await fetch(`${API_BASE}/playwright/tests`);
           const result = await scriptsResponse.json();
           if (result.success) {
             setScripts(result.data || []);
@@ -448,7 +448,7 @@ export function ScriptBuilderTab({
 
     const timeoutId = setTimeout(async () => {
       try {
-        await fetch(`${API_BASE}/playwright/scripts/${editingScript.id}`, {
+        await fetch(`${API_BASE}/playwright/tests/${editingScript.id}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ ai_instructions: formAiInstructions || null }),
@@ -486,7 +486,7 @@ export function ScriptBuilderTab({
     if (editScriptId) {
       const loadScriptForEditing = async () => {
         try {
-          const response = await fetch(`${API_BASE}/playwright/scripts/${editScriptId}`);
+          const response = await fetch(`${API_BASE}/playwright/tests/${editScriptId}`);
           const result = await response.json();
           if (result.success && result.data) {
             const script = result.data;
@@ -550,7 +550,7 @@ export function ScriptBuilderTab({
   const loadScripts = useCallback(async () => {
     setLoading(true);
     try {
-      const response = await fetch(`${API_BASE}/playwright/scripts`);
+      const response = await fetch(`${API_BASE}/playwright/tests`);
       const result = await response.json();
       if (result.success) {
         setScripts(result.data || []);
@@ -588,7 +588,7 @@ export function ScriptBuilderTab({
     setIsBatchDeleting(true);
     try {
       for (const id of selectedIds) {
-        await fetch(`${API_BASE}/playwright/scripts/${id}`, { method: "DELETE" });
+        await fetch(`${API_BASE}/playwright/tests/${id}`, { method: "DELETE" });
       }
       exitSelectionMode();
       setShowBatchDeleteDialog(false);
@@ -608,7 +608,7 @@ export function ScriptBuilderTab({
 
   const loadCategories = async () => {
     try {
-      const response = await fetch(`${API_BASE}/playwright/scripts/categories`);
+      const response = await fetch(`${API_BASE}/playwright/tests/categories`);
       const result = await response.json();
       if (result.success) {
         setCategories(result.data || []);
@@ -649,7 +649,7 @@ export function ScriptBuilderTab({
     const scriptContent = options?.generatedContent || formScriptContent;
 
     try {
-      const response = await fetch(`${API_BASE}/playwright/scripts`, {
+      const response = await fetch(`${API_BASE}/playwright/tests`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -795,7 +795,7 @@ test('${formName || "test"}', async ({ page }) => {
   const _deleteScript = async (id: string) => {
     if (!confirm("Are you sure you want to delete this script?")) return;
     try {
-      const response = await fetch(`${API_BASE}/playwright/scripts/${id}`, {
+      const response = await fetch(`${API_BASE}/playwright/tests/${id}`, {
         method: "DELETE",
       });
       const result = await response.json();
@@ -812,7 +812,7 @@ test('${formName || "test"}', async ({ page }) => {
 
   const _duplicateScript = async (id: string) => {
     try {
-      const response = await fetch(`${API_BASE}/playwright/scripts/${id}/duplicate`, {
+      const response = await fetch(`${API_BASE}/playwright/tests/${id}/duplicate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({}),
@@ -835,7 +835,7 @@ test('${formName || "test"}', async ({ page }) => {
     setExecutionResult(null);
 
     try {
-      const response = await fetch(`${API_BASE}/playwright/scripts/${id}/run`, {
+      const response = await fetch(`${API_BASE}/playwright/tests/${id}/run`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -873,7 +873,7 @@ test('${formName || "test"}', async ({ page }) => {
       if (!file) return;
       const text = await file.text();
       try {
-        const response = await fetch(`${API_BASE}/playwright/scripts/import`, {
+        const response = await fetch(`${API_BASE}/playwright/tests/import`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ scripts_json: text }),
@@ -895,7 +895,7 @@ test('${formName || "test"}', async ({ page }) => {
 
   const exportScripts = async () => {
     try {
-      const response = await fetch(`${API_BASE}/playwright/scripts/export`);
+      const response = await fetch(`${API_BASE}/playwright/tests/export`);
       const result = await response.json();
       if (result.success) {
         const blob = new Blob([result.data], { type: "application/json" });
@@ -1390,7 +1390,7 @@ OR
     // This ensures the backend has the latest code (especially important after copying a script)
     try {
       log("Saving current script state...");
-      const preSaveResponse = await fetch(`${API_BASE}/playwright/scripts/${scriptId}`, {
+      const preSaveResponse = await fetch(`${API_BASE}/playwright/tests/${scriptId}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1427,7 +1427,7 @@ OR
 
         // Run the test
         setExecutionState("running");
-        const runResponse = await fetch(`${API_BASE}/playwright/scripts/${scriptId}/run`, {
+        const runResponse = await fetch(`${API_BASE}/playwright/tests/${scriptId}/run`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({}),
@@ -1716,7 +1716,7 @@ import { test, expect } from '@playwright/test';
         log("Saving updated script...");
 
         // Save the updated script
-        const saveResponse = await fetch(`${API_BASE}/playwright/scripts/${scriptId}`, {
+        const saveResponse = await fetch(`${API_BASE}/playwright/tests/${scriptId}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -1792,7 +1792,7 @@ import { test, expect } from '@playwright/test';
 
     // First save the current form state
     try {
-      const saveResponse = await fetch(`${API_BASE}/playwright/scripts/${id}`, {
+      const saveResponse = await fetch(`${API_BASE}/playwright/tests/${id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1900,7 +1900,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
     // Auto-save the updated description if editing
     if (editingScript) {
       try {
-        await fetch(`${API_BASE}/playwright/scripts/${editingScript.id}`, {
+        await fetch(`${API_BASE}/playwright/tests/${editingScript.id}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ description: descriptionPreview }),
@@ -2047,7 +2047,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
             className="mb-3"
             actions={[
               toolbarActions.aiPlaceholder(),
-              toolbarActions.editInWeb("/build/scripts"),
+              toolbarActions.editInWeb("/build/playwright-tests"),
               toolbarActions.delete(() => setIsSelectionMode(!isSelectionMode), isSelectionMode),
               toolbarActions.new(startCreate, "New"),
             ]}
@@ -2203,7 +2203,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
 
             {/* Scrollable Content */}
             <div className="flex-1 overflow-y-auto p-4 scrollbar-dark">
-              {/* Script Builder Form - Always visible */}
+              {/* Playwright Test Builder Form - Always visible */}
               {(isCreating || editingScript) && (
                 <div
                   className={`card p-4 space-y-4 border-2 ${getStatusColors("success").border} min-h-min`}
@@ -2285,7 +2285,10 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                           Description (Natural Language)
                         </label>
                         <div className="flex items-center gap-2">
-                          <ScriptletSelector mode="dropdown" onSelect={insertScriptletAtCursor} />
+                          <PromptSnippetSelector
+                            mode="dropdown"
+                            onSelect={insertPromptSnippetAtCursor}
+                          />
                           <button
                             onClick={generateScript}
                             disabled={isGenerating || !formDescription.trim()}
@@ -2310,20 +2313,20 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                           ref={descriptionTextareaRef}
                           value={formDescription}
                           onChange={(e) => setFormDescription(e.target.value)}
-                          onKeyDown={scriptletMention.handleKeyDown}
-                          onInput={scriptletMention.handleInput}
-                          placeholder="Describe what this test should do in plain English... (Type @ to insert a scriptlet)&#10;&#10;Example: There is a Capture Screen button on the Image Extraction page. Click it and select Capture Screen in the dialog box."
+                          onKeyDown={promptSnippetMention.handleKeyDown}
+                          onInput={promptSnippetMention.handleInput}
+                          placeholder="Describe what this test should do in plain English... (Type @ to insert a prompt snippet)&#10;&#10;Example: There is a Capture Screen button on the Image Extraction page. Click it and select Capture Screen in the dialog box."
                           rows={6}
                           className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
                         />
-                        {/* @-mention popup for scriptlet insertion */}
-                        {scriptletMention.isActive && (
-                          <ScriptletSelector
+                        {/* @-mention popup for prompt snippet insertion */}
+                        {promptSnippetMention.isActive && (
+                          <PromptSnippetSelector
                             mode="popup"
-                            onSelect={scriptletMention.handleSelect}
-                            onClose={scriptletMention.handleClose}
-                            searchQuery={scriptletMention.searchQuery}
-                            position={scriptletMention.position}
+                            onSelect={promptSnippetMention.handleSelect}
+                            onClose={promptSnippetMention.handleClose}
+                            searchQuery={promptSnippetMention.searchQuery}
+                            position={promptSnippetMention.position}
                           />
                         )}
                       </div>

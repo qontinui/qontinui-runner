@@ -3,7 +3,7 @@
 //! This module provides backup and restore capabilities for all user data:
 //! - Settings (settings.json)
 //! - Prompts (prompts.json)
-//! - Playwright Scripts (playwright-scripts.json)
+//! - Playwright Tests (playwright-tests.json)
 //!
 //! Backups are stored as ZIP files with a manifest for version tracking.
 
@@ -66,12 +66,12 @@ fn get_prompts_path() -> Option<PathBuf> {
     dirs::data_local_dir().map(|d| d.join("com.qontinui.runner").join("prompts.json"))
 }
 
-/// Get the path to playwright-scripts.json
-fn get_playwright_scripts_path() -> Option<PathBuf> {
+/// Get the path to playwright-tests.json
+fn get_playwright_tests_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| {
         d.join("com.qontinui.runner")
             .join("playwright")
-            .join("playwright-scripts.json")
+            .join("playwright-tests.json")
     })
 }
 
@@ -80,7 +80,7 @@ fn get_backup_files() -> Vec<(&'static str, Option<PathBuf>)> {
     vec![
         ("settings.json", get_settings_path()),
         ("prompts.json", get_prompts_path()),
-        ("playwright-scripts.json", get_playwright_scripts_path()),
+        ("playwright-tests.json", get_playwright_tests_path()),
     ]
 }
 
@@ -327,6 +327,6 @@ mod tests {
         // Just verify paths can be retrieved
         assert!(get_settings_path().is_some());
         assert!(get_prompts_path().is_some());
-        assert!(get_playwright_scripts_path().is_some());
+        assert!(get_playwright_tests_path().is_some());
     }
 }

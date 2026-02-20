@@ -547,8 +547,9 @@ mod tests {
         let context = build_schema_context();
         assert!(context.contains("### command"));
         assert!(context.contains("### prompt"));
-        assert!(context.contains("### test"));
         assert!(context.contains("### ui_bridge"));
+        // "test" was merged into "command" — no longer a separate heading
+        assert!(!context.contains("### test"));
     }
 
     #[test]
@@ -576,7 +577,6 @@ mod tests {
         let filtered = build_schema_context_for_description("run pytest and fix errors");
         assert!(filtered.contains("### command"));
         assert!(filtered.contains("### prompt"));
-        assert!(filtered.contains("### test"));
     }
 
     #[test]
@@ -611,7 +611,6 @@ mod tests {
         // Should work without DB — just no examples
         let context = build_schema_context_full("run pytest", None, None);
         assert!(context.contains("### command"));
-        assert!(context.contains("### test"));
     }
 
     #[test]

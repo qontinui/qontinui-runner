@@ -1,9 +1,9 @@
 /**
- * ScriptletBuilderTab.tsx
+ * PromptSnippetBuilderTab.tsx
  *
- * Builder for creating and editing scriptlets (reusable code snippets).
- * Scriptlets capture learnings from AI debugging sessions and can be
- * inserted into Playwright script descriptions.
+ * Builder for creating and editing prompt snippets (reusable text snippets).
+ * Prompt snippets capture learnings from AI debugging sessions and can be
+ * inserted into Playwright test descriptions.
  */
 
 import { useState, useEffect, useCallback } from "react";
@@ -21,30 +21,30 @@ import {
   Check,
   X,
 } from "lucide-react";
-import type { Scriptlet } from "../types";
+import type { PromptSnippet } from "../types";
 import { getAccentColors } from "@/design-system";
 import { BuilderToolbar, toolbarActions } from "./ui/BuilderToolbar";
 import { BatchDeleteDialog } from "./ui/BatchDeleteDialog";
 
 const API_BASE = "http://localhost:9876";
 
-interface ScriptletBuilderTabProps {
+interface PromptSnippetBuilderTabProps {
   onLog?: (level: string, message: string) => void;
-  editScriptletId?: string | null;
+  editPromptSnippetId?: string | null;
   onNavigateToLibrary?: () => void;
 }
 
-export function ScriptletBuilderTab({
+export function PromptSnippetBuilderTab({
   onLog,
-  editScriptletId,
+  editPromptSnippetId,
   onNavigateToLibrary: _onNavigateToLibrary,
-}: ScriptletBuilderTabProps) {
+}: PromptSnippetBuilderTabProps) {
   // State
-  const [scriptlets, setScriptlets] = useState<Scriptlet[]>([]);
+  const [promptSnippets, setPromptSnippets] = useState<PromptSnippet[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
-  const [selectedScriptlet, setSelectedScriptlet] = useState<Scriptlet | null>(null);
+  const [selectedSnippet, setSelectedSnippet] = useState<PromptSnippet | null>(null);
   const [isCreating, setIsCreating] = useState(false);
 
   // Form state
@@ -80,81 +80,81 @@ export function ScriptletBuilderTab({
     setSelectedIds(new Set());
   }, []);
 
-  // Delete selected scriptlets
-  const deleteSelectedScriptlets = useCallback(async () => {
+  // Delete selected prompt snippets
+  const deleteSelectedPromptSnippets = useCallback(async () => {
     setIsDeleting(true);
     try {
       for (const id of selectedIds) {
-        await fetch(`${API_BASE}/scriptlets/${id}`, { method: "DELETE" });
+        await fetch(`${API_BASE}/prompt-snippets/${id}`, { method: "DELETE" });
       }
       exitSelectionMode();
       setShowBatchDeleteDialog(false);
-      await fetchScriptlets();
-      onLog?.("success", `Deleted ${selectedIds.size} scriptlet(s)`);
+      await fetchPromptSnippets();
+      onLog?.("success", `Deleted ${selectedIds.size} prompt snippet(s)`);
     } catch (error) {
-      onLog?.("error", `Failed to delete scriptlets: ${error}`);
+      onLog?.("error", `Failed to delete prompt snippets: ${error}`);
     } finally {
       setIsDeleting(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedIds, exitSelectionMode, onLog]);
 
-  // Get names of selected scriptlets for dialog
+  // Get names of selected prompt snippets for dialog
   const getSelectedNames = useCallback(() => {
-    return scriptlets.filter((s) => selectedIds.has(s.id)).map((s) => s.name);
-  }, [scriptlets, selectedIds]);
+    return promptSnippets.filter((s) => selectedIds.has(s.id)).map((s) => s.name);
+  }, [promptSnippets, selectedIds]);
 
-  // Fetch scriptlets
-  const fetchScriptlets = useCallback(async () => {
+  // Fetch prompt snippets
+  const fetchPromptSnippets = useCallback(async () => {
     try {
       setLoading(true);
-      const response = await fetch(`${API_BASE}/scriptlets`);
+      const response = await fetch(`${API_BASE}/prompt-snippets`);
       if (response.ok) {
         const result = await response.json();
         if (result.success && result.data) {
-          setScriptlets(result.data);
+          setPromptSnippets(result.data);
         } else if (Array.isArray(result)) {
           // Some endpoints return array directly
-          setScriptlets(result);
+          setPromptSnippets(result);
         } else {
-          setScriptlets([]);
+          setPromptSnippets([]);
         }
       }
     } catch (error) {
-      console.error("Failed to fetch scriptlets:", error);
-      onLog?.("error", `Failed to fetch scriptlets: ${error}`);
+      console.error("Failed to fetch prompt snippets:", error);
+      onLog?.("error", `Failed to fetch prompt snippets: ${error}`);
     } finally {
       setLoading(false);
     }
   }, [onLog]);
 
   useEffect(() => {
-    fetchScriptlets();
-  }, [fetchScriptlets]);
+    fetchPromptSnippets();
+  }, [fetchPromptSnippets]);
 
-  // Load scriptlet for editing
+  // Load prompt snippet for editing
   useEffect(() => {
-    if (editScriptletId && scriptlets.length > 0) {
-      const scriptlet = scriptlets.find((s) => s.id === editScriptletId);
-      if (scriptlet) {
-        selectScriptlet(scriptlet);
+    if (editPromptSnippetId && promptSnippets.length > 0) {
+      const snippet = promptSnippets.find((s) => s.id === editPromptSnippetId);
+      if (snippet) {
+        selectSnippet(snippet);
       }
     }
-  }, [editScriptletId, scriptlets]);
+  }, [editPromptSnippetId, promptSnippets]);
 
-  // Select a scriptlet for editing
-  const selectScriptlet = (scriptlet: Scriptlet) => {
-    setSelectedScriptlet(scriptlet);
+  // Select a prompt snippet for editing
+  const selectSnippet = (snippet: PromptSnippet) => {
+    setSelectedSnippet(snippet);
     setIsCreating(false);
-    setFormName(scriptlet.name);
-    setFormContent(scriptlet.content);
-    setFormCategory(scriptlet.category);
-    setFormTags(scriptlet.tags.join(", "));
+    setFormName(snippet.name);
+    setFormContent(snippet.content);
+    setFormCategory(snippet.category);
+    setFormTags(snippet.tags.join(", "));
   };
 
-  // Start creating a new scriptlet
+  // Start creating a new prompt snippet
   const startCreate = () => {
-    setSelectedScriptlet(null);
+    setSelectedSnippet(null);
     setIsCreating(true);
     setFormName("");
     setFormContent("");
@@ -162,7 +162,7 @@ export function ScriptletBuilderTab({
     setFormTags("");
   };
 
-  // Save scriptlet
+  // Save prompt snippet
   const handleSave = async () => {
     if (!formName.trim() || !formContent.trim()) {
       onLog?.("warning", "Name and content are required");
@@ -182,16 +182,16 @@ export function ScriptletBuilderTab({
       };
 
       let response;
-      if (selectedScriptlet) {
+      if (selectedSnippet) {
         // Update existing
-        response = await fetch(`${API_BASE}/scriptlets/${selectedScriptlet.id}`, {
+        response = await fetch(`${API_BASE}/prompt-snippets/${selectedSnippet.id}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
         });
       } else {
         // Create new
-        response = await fetch(`${API_BASE}/scriptlets`, {
+        response = await fetch(`${API_BASE}/prompt-snippets`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
@@ -200,62 +200,62 @@ export function ScriptletBuilderTab({
 
       const result = await response.json();
       if (result.success && result.data) {
-        onLog?.("success", `Scriptlet "${formName}" saved successfully`);
-        await fetchScriptlets();
-        selectScriptlet(result.data);
+        onLog?.("success", `Prompt snippet "${formName}" saved successfully`);
+        await fetchPromptSnippets();
+        selectSnippet(result.data);
       } else if (response.ok && result.id) {
         // Direct object response
-        onLog?.("success", `Scriptlet "${formName}" saved successfully`);
-        await fetchScriptlets();
-        selectScriptlet(result);
+        onLog?.("success", `Prompt snippet "${formName}" saved successfully`);
+        await fetchPromptSnippets();
+        selectSnippet(result);
       } else {
-        onLog?.("error", `Failed to save scriptlet: ${result.error || "Unknown error"}`);
+        onLog?.("error", `Failed to save prompt snippet: ${result.error || "Unknown error"}`);
       }
     } catch (error) {
-      onLog?.("error", `Failed to save scriptlet: ${error}`);
+      onLog?.("error", `Failed to save prompt snippet: ${error}`);
     } finally {
       setSaving(false);
     }
   };
 
-  // Delete scriptlet
+  // Delete prompt snippet
   const handleDelete = async () => {
-    if (!selectedScriptlet) return;
+    if (!selectedSnippet) return;
 
-    if (!confirm(`Delete scriptlet "${selectedScriptlet.name}"?`)) return;
+    if (!confirm(`Delete prompt snippet "${selectedSnippet.name}"?`)) return;
 
     try {
-      const response = await fetch(`${API_BASE}/scriptlets/${selectedScriptlet.id}`, {
+      const response = await fetch(`${API_BASE}/prompt-snippets/${selectedSnippet.id}`, {
         method: "DELETE",
       });
 
       const result = await response.json();
       if (result.success || response.ok) {
-        onLog?.("success", `Scriptlet "${selectedScriptlet.name}" deleted`);
-        setSelectedScriptlet(null);
+        onLog?.("success", `Prompt snippet "${selectedSnippet.name}" deleted`);
+        setSelectedSnippet(null);
         setIsCreating(false);
-        await fetchScriptlets();
+        await fetchPromptSnippets();
       } else {
-        onLog?.("error", `Failed to delete scriptlet: ${result.error || "Unknown error"}`);
+        onLog?.("error", `Failed to delete prompt snippet: ${result.error || "Unknown error"}`);
       }
     } catch (error) {
-      onLog?.("error", `Failed to delete scriptlet: ${error}`);
+      onLog?.("error", `Failed to delete prompt snippet: ${error}`);
     }
   };
 
-  // Duplicate scriptlet
+  // Duplicate prompt snippet
   const handleDuplicate = async () => {
-    if (!selectedScriptlet) return;
+    if (!selectedSnippet) return;
 
     try {
       const payload = {
-        name: `${selectedScriptlet.name} (Copy)`,
-        content: selectedScriptlet.content,
-        category: selectedScriptlet.category,
-        tags: selectedScriptlet.tags,
+        name: `${selectedSnippet.name} (Copy)`,
+        content: selectedSnippet.content,
+        category: selectedSnippet.category,
+        tags: selectedSnippet.tags,
       };
 
-      const response = await fetch(`${API_BASE}/scriptlets`, {
+      const response = await fetch(`${API_BASE}/prompt-snippets`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
@@ -263,41 +263,41 @@ export function ScriptletBuilderTab({
 
       const result = await response.json();
       if (result.success && result.data) {
-        onLog?.("success", `Scriptlet duplicated as "${result.data.name}"`);
-        await fetchScriptlets();
-        selectScriptlet(result.data);
+        onLog?.("success", `Prompt snippet duplicated as "${result.data.name}"`);
+        await fetchPromptSnippets();
+        selectSnippet(result.data);
       } else if (response.ok && result.id) {
-        onLog?.("success", `Scriptlet duplicated as "${result.name}"`);
-        await fetchScriptlets();
-        selectScriptlet(result);
+        onLog?.("success", `Prompt snippet duplicated as "${result.name}"`);
+        await fetchPromptSnippets();
+        selectSnippet(result);
       }
     } catch (error) {
-      onLog?.("error", `Failed to duplicate scriptlet: ${error}`);
+      onLog?.("error", `Failed to duplicate prompt snippet: ${error}`);
     }
   };
 
-  // Filter scriptlets
-  const filteredScriptlets = scriptlets.filter((scriptlet) => {
+  // Filter prompt snippets
+  const filteredSnippets = promptSnippets.filter((snippet) => {
     if (!searchQuery) return true;
     const query = searchQuery.toLowerCase();
     return (
-      scriptlet.name.toLowerCase().includes(query) ||
-      scriptlet.content.toLowerCase().includes(query) ||
-      scriptlet.category.toLowerCase().includes(query) ||
-      scriptlet.tags.some((t) => t.toLowerCase().includes(query))
+      snippet.name.toLowerCase().includes(query) ||
+      snippet.content.toLowerCase().includes(query) ||
+      snippet.category.toLowerCase().includes(query) ||
+      snippet.tags.some((t) => t.toLowerCase().includes(query))
     );
   });
 
   return (
     <div className="h-full flex">
-      {/* Left Panel - Scriptlet List */}
+      {/* Left Panel - Prompt Snippet List */}
       <div className="w-80 border-r border-neutral-700 flex flex-col bg-neutral-900">
         {/* Header */}
         <div className="p-4 border-b border-neutral-700">
           <div className="flex items-center justify-between mb-2">
             <h2 className="text-lg font-semibold flex items-center gap-2">
               <Puzzle className="w-5 h-5" style={{ color: accentColors.bgSolid }} />
-              Scriptlets
+              Prompt Snippets
             </h2>
           </div>
 
@@ -306,7 +306,7 @@ export function ScriptletBuilderTab({
             className="mb-3"
             actions={[
               toolbarActions.aiPlaceholder(),
-              toolbarActions.editInWeb("/build/scriptlets"),
+              toolbarActions.editInWeb("/build/prompt-snippets"),
               toolbarActions.delete(() => setIsSelectionMode(!isSelectionMode), isSelectionMode),
               toolbarActions.new(startCreate, "New"),
             ]}
@@ -317,7 +317,7 @@ export function ScriptletBuilderTab({
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-neutral-400" />
             <input
               type="text"
-              placeholder="Search scriptlets..."
+              placeholder="Search prompt snippets..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               className="w-full pl-9 pr-3 py-2 bg-neutral-800 border border-neutral-700 rounded-lg text-sm focus:outline-none focus:border-neutral-600"
@@ -331,7 +331,7 @@ export function ScriptletBuilderTab({
             <span className="text-sm text-red-400">{selectedIds.size} selected</span>
             <div className="flex items-center gap-2">
               <button
-                onClick={() => setSelectedIds(new Set(filteredScriptlets.map((s) => s.id)))}
+                onClick={() => setSelectedIds(new Set(filteredSnippets.map((s) => s.id)))}
                 className="px-2 py-1 text-xs bg-neutral-700 hover:bg-neutral-600 text-neutral-200 rounded"
               >
                 Select All
@@ -361,52 +361,50 @@ export function ScriptletBuilderTab({
           </div>
         )}
 
-        {/* Scriptlet List */}
+        {/* Prompt Snippet List */}
         <div className="flex-1 overflow-y-auto p-2">
           {loading ? (
             <div className="flex items-center justify-center py-8">
               <Loader2 className="w-6 h-6 animate-spin text-neutral-400" />
             </div>
-          ) : filteredScriptlets.length === 0 ? (
+          ) : filteredSnippets.length === 0 ? (
             <div className="text-center py-8 text-neutral-400">
               <Puzzle className="w-8 h-8 mx-auto mb-2 opacity-50" />
-              <p className="text-sm">No scriptlets found</p>
+              <p className="text-sm">No prompt snippets found</p>
             </div>
           ) : (
             <div className="space-y-1">
-              {filteredScriptlets.map((scriptlet) => (
+              {filteredSnippets.map((snippet) => (
                 <button
-                  key={scriptlet.id}
+                  key={snippet.id}
                   onClick={() =>
-                    isSelectionMode ? toggleSelection(scriptlet.id) : selectScriptlet(scriptlet)
+                    isSelectionMode ? toggleSelection(snippet.id) : selectSnippet(snippet)
                   }
                   className={`w-full text-left p-3 rounded-lg transition-colors ${
-                    selectedScriptlet?.id === scriptlet.id
-                      ? "bg-neutral-700"
-                      : "hover:bg-neutral-800"
-                  } ${isSelectionMode && selectedIds.has(scriptlet.id) ? "bg-red-500/10" : ""}`}
+                    selectedSnippet?.id === snippet.id ? "bg-neutral-700" : "hover:bg-neutral-800"
+                  } ${isSelectionMode && selectedIds.has(snippet.id) ? "bg-red-500/10" : ""}`}
                 >
                   <div className="flex items-center gap-2">
                     {isSelectionMode && (
                       <div
                         className={`w-4 h-4 rounded border flex-shrink-0 flex items-center justify-center ${
-                          selectedIds.has(scriptlet.id)
+                          selectedIds.has(snippet.id)
                             ? "bg-red-500 border-red-500"
                             : "border-neutral-500 hover:border-red-400"
                         }`}
                       >
-                        {selectedIds.has(scriptlet.id) && <Check className="w-3 h-3 text-white" />}
+                        {selectedIds.has(snippet.id) && <Check className="w-3 h-3 text-white" />}
                       </div>
                     )}
                     <div className="flex-1 min-w-0">
-                      <div className="font-medium text-sm truncate">{scriptlet.name}</div>
+                      <div className="font-medium text-sm truncate">{snippet.name}</div>
                       <div className="text-xs text-neutral-400 truncate mt-0.5 font-mono">
-                        {scriptlet.content.slice(0, 50)}...
+                        {snippet.content.slice(0, 50)}...
                       </div>
                       <div className="flex items-center gap-2 mt-1.5">
-                        {scriptlet.category && (
+                        {snippet.category && (
                           <span className="text-xs px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400">
-                            {scriptlet.category}
+                            {snippet.category}
                           </span>
                         )}
                       </div>
@@ -421,19 +419,19 @@ export function ScriptletBuilderTab({
 
       {/* Right Panel - Editor */}
       <div className="flex-1 flex flex-col bg-neutral-900/50">
-        {!selectedScriptlet && !isCreating ? (
+        {!selectedSnippet && !isCreating ? (
           <div className="flex-1 flex items-center justify-center">
             <div className="text-center text-neutral-400">
               <Puzzle className="w-12 h-12 mx-auto mb-3 opacity-30" />
-              <p className="text-lg mb-2">No scriptlet selected</p>
-              <p className="text-sm mb-4">Select a scriptlet to edit or create a new one</p>
+              <p className="text-lg mb-2">No prompt snippet selected</p>
+              <p className="text-sm mb-4">Select a prompt snippet to edit or create a new one</p>
               <button
                 onClick={startCreate}
                 className="inline-flex items-center gap-2 px-4 py-2 rounded-lg transition-colors"
                 style={{ backgroundColor: accentColors.bgSolid, color: "#000" }}
               >
                 <Plus className="w-4 h-4" />
-                Create New Scriptlet
+                Create New Prompt Snippet
               </button>
             </div>
           </div>
@@ -442,10 +440,10 @@ export function ScriptletBuilderTab({
             {/* Toolbar */}
             <div className="flex items-center justify-between p-4 border-b border-neutral-700">
               <h3 className="font-medium">
-                {isCreating ? "New Scriptlet" : `Editing: ${selectedScriptlet?.name}`}
+                {isCreating ? "New Prompt Snippet" : `Editing: ${selectedSnippet?.name}`}
               </h3>
               <div className="flex items-center gap-2">
-                {selectedScriptlet && (
+                {selectedSnippet && (
                   <>
                     <button
                       onClick={handleDuplicate}
@@ -489,7 +487,7 @@ export function ScriptletBuilderTab({
                     type="text"
                     value={formName}
                     onChange={(e) => setFormName(e.target.value)}
-                    placeholder="Scriptlet name"
+                    placeholder="Prompt snippet name"
                     className="w-full px-3 py-2 bg-neutral-800 border border-neutral-700 rounded-lg focus:outline-none focus:border-neutral-600"
                   />
                 </div>
@@ -503,12 +501,12 @@ export function ScriptletBuilderTab({
                   <textarea
                     value={formContent}
                     onChange={(e) => setFormContent(e.target.value)}
-                    placeholder="Enter the reusable code snippet or text content..."
+                    placeholder="Enter the reusable text snippet content..."
                     rows={15}
                     className="w-full px-3 py-2 bg-neutral-800 border border-neutral-700 rounded-lg focus:outline-none focus:border-neutral-600 font-mono text-sm resize-y"
                   />
                   <p className="text-xs text-neutral-400 mt-1">
-                    This content can be inserted into Playwright script descriptions using @mention
+                    This content can be inserted into Playwright test descriptions using @mention
                   </p>
                 </div>
 
@@ -550,12 +548,12 @@ export function ScriptletBuilderTab({
       {/* Batch Delete Dialog */}
       <BatchDeleteDialog
         open={showBatchDeleteDialog}
-        title="Delete Scriptlets"
-        itemType="scriptlet"
+        title="Delete Prompt Snippets"
+        itemType="prompt snippet"
         itemNames={getSelectedNames()}
         isDeleting={isDeleting}
         onClose={() => setShowBatchDeleteDialog(false)}
-        onConfirm={deleteSelectedScriptlets}
+        onConfirm={deleteSelectedPromptSnippets}
       />
     </div>
   );

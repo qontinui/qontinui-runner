@@ -1,14 +1,14 @@
 /**
- * Scriptlet Types
+ * Prompt Snippet Types
  *
- * Scriptlets are reusable text snippets that capture learnings from AI debugging sessions.
- * They can be inserted into Playwright script descriptions to provide context and guidance.
+ * Prompt snippets are reusable text snippets that capture learnings from AI debugging sessions.
+ * They can be inserted into Playwright test descriptions to provide context and guidance.
  */
 
 /**
- * A reusable text snippet for script descriptions
+ * A reusable text snippet for test descriptions
  */
-export interface Scriptlet {
+export interface PromptSnippet {
   /** Unique identifier (UUID v4) */
   id: string;
 
@@ -24,7 +24,7 @@ export interface Scriptlet {
   /** Tags for flexible grouping */
   tags: string[];
 
-  /** AI loop IDs that were used to generate this scriptlet */
+  /** AI loop IDs that were used to generate this prompt snippet */
   source_log_ids?: string[];
 
   /** Creation timestamp (ISO 8601) */
@@ -35,9 +35,9 @@ export interface Scriptlet {
 }
 
 /**
- * Request to create a new scriptlet
+ * Request to create a new prompt snippet
  */
-export interface CreateScriptletRequest {
+export interface CreatePromptSnippetRequest {
   name: string;
   content: string;
   category?: string;
@@ -46,9 +46,9 @@ export interface CreateScriptletRequest {
 }
 
 /**
- * Request to update an existing scriptlet
+ * Request to update an existing prompt snippet
  */
-export interface UpdateScriptletRequest {
+export interface UpdatePromptSnippetRequest {
   name?: string;
   content?: string;
   category?: string;

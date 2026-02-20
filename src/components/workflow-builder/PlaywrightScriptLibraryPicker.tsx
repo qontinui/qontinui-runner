@@ -63,7 +63,7 @@ export function PlaywrightScriptLibraryPicker({
     const fetchScripts = async () => {
       setIsLoading(true);
       try {
-        const response = await fetch(`${API_BASE}/playwright/scripts`);
+        const response = await fetch(`${API_BASE}/playwright/tests`);
         if (response.ok) {
           const data = await response.json();
           setScripts(data.scripts || []);

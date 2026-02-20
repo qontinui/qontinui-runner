@@ -97,8 +97,12 @@ export type {
 
 export { DEFAULT_SCRIPT_VALUES } from "./playwright";
 
-// Scriptlet types
-export type { Scriptlet, CreateScriptletRequest, UpdateScriptletRequest } from "./scriptlet";
+// Prompt Snippet types
+export type {
+  PromptSnippet,
+  CreatePromptSnippetRequest,
+  UpdatePromptSnippetRequest,
+} from "./prompt-snippet";
 
 // Context types (AI task guidance)
 export type {
@@ -279,7 +283,6 @@ export type {
   LogSourceSelection,
   HealthCheckUrl,
   CommandStep,
-  TestStep,
   PromptStep,
   UnifiedStep,
   SetupStep,

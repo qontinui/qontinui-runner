@@ -10,8 +10,8 @@ use tracing::warn;
 ///
 /// Step types are categorized into groups:
 /// - **GUI Automation**: workflow, state, action, screenshot, gui_workflow
-/// - **Verification**: playwright, test, ui_bridge
-/// - **Command**: command (unified: shell command, check, or check group)
+/// - **Verification**: playwright, ui_bridge
+/// - **Command**: command (unified: shell command, check, check group, or test)
 /// - **AI**: prompt, ai_session
 /// - **Web Automation**: awas_discover, awas_execute, awas_check_support, awas_list_actions, awas_extract_elements
 /// - **Utility**: macro
@@ -39,8 +39,6 @@ pub enum StepType {
     // ========================================================================
     /// Execute a Playwright test script
     Playwright,
-    /// Execute a verification test by ID
-    Test,
     /// Watch logs for errors (runtime error detection)
     LogWatch,
 
@@ -105,7 +103,6 @@ impl StepType {
             self,
             StepType::Command
                 | StepType::Playwright
-                | StepType::Test
                 | StepType::LogWatch
                 | StepType::Screenshot
                 | StepType::UiBridge
@@ -168,7 +165,6 @@ impl StepType {
 
             // Verification - varies by test complexity
             StepType::Playwright => Some(60_000), // 60 seconds
-            StepType::Test => Some(30_000),       // 30 seconds
             StepType::LogWatch => Some(5_000),    // 5 seconds (quick log scan)
 
             // Command - varies widely, use conservative defaults
@@ -226,13 +222,12 @@ impl StepType {
 
             // Verification
             "playwright" => Some(StepType::Playwright),
-            "test" => Some(StepType::Test),
             "log_watch" | "logwatch" => Some(StepType::LogWatch),
 
-            // Command (includes legacy: shell_command, check, check_group, api_request, mcp_call)
-            "command" | "shell_command" | "shellcommand" | "shell" | "check" | "check_group"
-            | "checkgroup" | "api_request" | "apirequest" | "api" | "http" | "mcp_call"
-            | "mcpcall" | "mcp" => Some(StepType::Command),
+            // Command (includes legacy: shell_command, check, check_group, api_request, mcp_call, test)
+            "command" | "test" | "shell_command" | "shellcommand" | "shell" | "check"
+            | "check_group" | "checkgroup" | "api_request" | "apirequest" | "api" | "http"
+            | "mcp_call" | "mcpcall" | "mcp" => Some(StepType::Command),
             "ui_bridge" | "uibridge" => Some(StepType::UiBridge),
 
             // AI
@@ -273,7 +268,6 @@ impl StepType {
             StepType::Screenshot => "screenshot",
             StepType::GuiWorkflow => "gui_workflow",
             StepType::Playwright => "playwright",
-            StepType::Test => "test",
             StepType::LogWatch => "log_watch",
             StepType::Command => "command",
             StepType::UiBridge => "ui_bridge",
@@ -308,7 +302,7 @@ mod tests {
             Some(StepType::Command)
         );
         assert_eq!(StepType::from_str_compat("prompt"), Some(StepType::Prompt));
-        assert_eq!(StepType::from_str_compat("test"), Some(StepType::Test));
+        assert_eq!(StepType::from_str_compat("test"), Some(StepType::Command));
         assert_eq!(
             StepType::from_str_compat("ui_bridge"),
             Some(StepType::UiBridge)
@@ -365,7 +359,6 @@ mod tests {
     #[test]
     fn test_is_verification_type() {
         assert!(StepType::Playwright.is_verification_type());
-        assert!(StepType::Test.is_verification_type());
         assert!(StepType::Command.is_verification_type());
         assert!(!StepType::Workflow.is_verification_type());
         assert!(!StepType::Prompt.is_verification_type());
@@ -432,7 +425,6 @@ mod tests {
             StepType::Screenshot,
             StepType::GuiWorkflow,
             StepType::Playwright,
-            StepType::Test,
             StepType::Command,
             StepType::UiBridge,
             StepType::Prompt,

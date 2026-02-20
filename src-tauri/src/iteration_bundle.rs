@@ -1008,6 +1008,12 @@ impl IterationBundle {
                 if let Some(ref check_type) = config.check_type {
                     parts.push(format!("type={}", check_type));
                 }
+                if let Some(ref test_id) = config.test_id {
+                    parts.push(format!("test_id={}", test_id));
+                }
+                if let Some(ref test_type) = config.test_type {
+                    parts.push(format!("test_type={}", test_type));
+                }
                 if let Some(ref command) = config.command {
                     // Truncate long commands
                     let cmd_display = if command.len() > 50 {
@@ -1019,6 +1025,7 @@ impl IterationBundle {
                 }
             }
             "test" => {
+                // Legacy: "test" is now dispatched through "command", but old configs may still have it
                 if let Some(ref test_id) = config.test_id {
                     parts.push(format!("test_id={}", test_id));
                 }

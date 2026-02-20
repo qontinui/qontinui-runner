@@ -71,12 +71,13 @@ export function StepItem({
 
   // Get the appropriate icon and colors from shared config
   const getIconAndColors = () => {
-    // Handle sub-types that have their own icon mappings
-    if (step.type === "test" && step.test_type) {
-      const SubIcon = TEST_ICONS[step.test_type];
+    // Handle test sub-types within command steps
+    if (step.type === "command" && (step.test_type || step.test_id)) {
+      const testType = step.test_type || "custom_command";
+      const SubIcon = TEST_ICONS[testType];
       if (SubIcon) {
-        const config = getStepIconConfig("test");
-        return { Icon: SubIcon, bgClass: config.bgClass, textClass: config.textClass };
+        // Use a distinct color for test-mode commands
+        return { Icon: SubIcon, bgClass: "bg-green-500/10", textClass: "text-green-400" };
       }
     }
 
@@ -94,6 +95,14 @@ export function StepItem({
         if (step.check_group_id) return `Group: ${step.check_group_id}`;
         if (step.check_type)
           return step.command || step.tool || step.check_type || "Configure check...";
+        if (step.test_type || step.test_id) {
+          if (step.command) return step.command;
+          if (step.test_type === "playwright") return "Browser test";
+          if (step.test_type === "qontinui_vision") return "Vision test";
+          if (step.test_type === "python") return "Python test";
+          if (step.test_type === "repository") return "Repository test";
+          return "Custom test";
+        }
         return step.command
           ? step.command.substring(0, 50) + (step.command.length > 50 ? "..." : "")
           : "Enter command...";
@@ -101,13 +110,6 @@ export function StepItem({
         return step.content
           ? step.content.substring(0, 50) + (step.content.length > 50 ? "..." : "")
           : "Enter prompt...";
-      case "test":
-        if (step.command) return step.command;
-        if (step.test_type === "playwright") return "Browser test";
-        if (step.test_type === "qontinui_vision") return "Vision test";
-        if (step.test_type === "python") return "Python test";
-        if (step.test_type === "repository") return "Repository test";
-        return "Custom command";
       case "ui_bridge":
         if (step.action === "navigate") return step.url || "Enter URL...";
         if (step.action === "execute") return step.instruction || "Enter instruction...";
@@ -125,11 +127,11 @@ export function StepItem({
       case "command":
         if (step.check_group_id) return false; // check group ID is set
         if (step.check_type) return !step.command && !step.check_id;
+        if (step.test_type || step.test_id)
+          return !step.command && !step.code && !step.test_id && !step.script_id;
         return !step.command;
       case "prompt":
         return !step.content;
-      case "test":
-        return !step.command && !step.code && !step.test_id && !step.script_id;
       case "ui_bridge":
         if (step.action === "navigate") return !step.url;
         if (step.action === "execute") return !step.instruction;

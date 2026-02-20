@@ -4,7 +4,7 @@
  * Configuration panel for the selected workflow step.
  * Shows different options based on step type.
  *
- * Core step types: command, test, ui_bridge, prompt
+ * Core step types: command, ui_bridge, prompt
  */
 
 import { useState } from "react";
@@ -15,6 +15,7 @@ import type {
   PlaywrightExecutionMode,
   CheckType,
   BaseStep,
+  CommandStep,
 } from "../../types/unified-workflow";
 import { useWorkflowBuilder } from "./WorkflowBuilderContext";
 import { CHECK_TOOLS, CHECK_TYPE_INFO } from "../check-builder/types";
@@ -269,14 +270,14 @@ function DataFlowSection({
 }
 
 // =============================================================================
-// Test Step Config
+// Test Fields Config (used within CommandConfig when test_type or test_id is set)
 // =============================================================================
 
-function TestConfig({
+function TestFieldsConfig({
   step,
   onUpdate,
 }: {
-  step: UnifiedStep & { type: "test" };
+  step: UnifiedStep & { type: "command" };
   onUpdate: (updates: Partial<typeof step>) => void;
 }) {
   return (
@@ -661,6 +662,11 @@ function CommandConfig({
     return <CheckFieldsConfig step={step} onUpdate={onUpdate} />;
   }
 
+  // If test_type or test_id is set, show test-specific fields
+  if (step.test_type || step.test_id) {
+    return <TestFieldsConfig step={step} onUpdate={onUpdate} />;
+  }
+
   // Default: shell command config
   return (
     <div className="space-y-4">
@@ -1001,12 +1007,12 @@ export function StepConfigPanel({ onClose }: StepConfigPanelProps) {
   // Get step type label
   const stepTypeLabel = (() => {
     switch (selectedStep.type) {
-      case "command":
-        return "Command";
+      case "command": {
+        const cmd = selectedStep as CommandStep;
+        return cmd.test_type || cmd.test_id ? "Test" : "Command";
+      }
       case "prompt":
         return "AI Prompt";
-      case "test":
-        return "Test";
       case "ui_bridge":
         return "UI Bridge";
       default:
@@ -1063,7 +1069,7 @@ export function StepConfigPanel({ onClose }: StepConfigPanelProps) {
         {selectedStep.type === "prompt" && (
           <PromptConfig step={selectedStep} onUpdate={handleUpdate} />
         )}
-        {selectedStep.type === "test" && <TestConfig step={selectedStep} onUpdate={handleUpdate} />}
+        {/* TestConfig removed — test mode is now inside CommandConfig */}
         {selectedStep.type === "ui_bridge" && (
           <UiBridgeConfig step={selectedStep} onUpdate={handleUpdate} />
         )}

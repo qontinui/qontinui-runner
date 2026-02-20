@@ -74,9 +74,9 @@ pub struct GenerateMacroRequest {
     pub category: Option<String>,
 }
 
-/// Request body for POST /ai/generate-scriptlet
+/// Request body for POST /ai/generate-prompt-snippet
 #[derive(Debug, Deserialize)]
-pub struct GenerateScriptletRequest {
+pub struct GeneratePromptSnippetRequest {
     pub user_prompt: String,
     #[serde(default)]
     pub language: Option<String>,
@@ -423,17 +423,17 @@ pub async fn generate_macro_handler(
     handle_bridge_result(result, "Macro generated successfully")
 }
 
-/// POST /ai/generate-scriptlet
+/// POST /ai/generate-prompt-snippet
 ///
-/// Generate a code scriptlet using AI via the Python bridge.
-pub async fn generate_scriptlet_handler(
+/// Generate a prompt snippet using AI via the Python bridge.
+pub async fn generate_prompt_snippet_handler(
     State(state): State<Arc<ApiState>>,
-    Json(request): Json<GenerateScriptletRequest>,
+    Json(request): Json<GeneratePromptSnippetRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     use crate::settings;
 
     info!(
-        "HTTP: Generating scriptlet with AI: {}",
+        "HTTP: Generating prompt snippet with AI: {}",
         request.user_prompt.chars().take(50).collect::<String>()
     );
 
@@ -452,7 +452,7 @@ pub async fn generate_scriptlet_handler(
 
         with_default_bridge(&app_state, |bridge| {
             bridge.send_command_and_wait(
-                "generate_scriptlet_with_ai",
+                "generate_prompt_snippet_with_ai",
                 Some(params),
                 std::time::Duration::from_secs(120),
             )
@@ -460,14 +460,17 @@ pub async fn generate_scriptlet_handler(
     })
     .await
     .map_err(|e| {
-        error!("HTTP: spawn_blocking error for generate-scriptlet: {}", e);
+        error!(
+            "HTTP: spawn_blocking error for generate-prompt-snippet: {}",
+            e
+        );
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(api_error(format!("Internal error: {}", e))),
         )
     })?;
 
-    handle_bridge_result(result, "Scriptlet generated successfully")
+    handle_bridge_result(result, "Prompt snippet generated successfully")
 }
 
 /// POST /ai/suggest-check-groups
@@ -678,7 +681,10 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         .route("/ai/generate-context", post(generate_context_handler))
         .route("/ai/generate-prompt", post(generate_prompt_handler))
         .route("/ai/generate-macro", post(generate_macro_handler))
-        .route("/ai/generate-scriptlet", post(generate_scriptlet_handler))
+        .route(
+            "/ai/generate-prompt-snippet",
+            post(generate_prompt_snippet_handler),
+        )
         .route(
             "/ai/suggest-check-groups",
             post(suggest_check_groups_handler),

@@ -5007,6 +5007,54 @@ impl CheckpointDb {
             info!("Successfully migrated to version 63 (step_type_knowledge table with {} seed entries)", seed_entries.len());
         }
 
+        // Version 64: Add react-doctor knowledge entries for command step type
+        if current_version < 64 {
+            info!("Migrating to version 64 (react-doctor step_type_knowledge entries)...");
+
+            let now = chrono::Utc::now().to_rfc3339();
+
+            let react_doctor_entries: Vec<(&str, &str, &str, i32)> = vec![
+                (
+                    "command",
+                    "Use react-doctor for React project health analysis",
+                    "For React/Next.js projects, use `npx -y react-doctor@latest <path> --verbose --yes` as a command step to get a health score (0-100) and diagnostics across state/effects, performance, architecture, bundle size, security, correctness, and accessibility. Always include --yes to skip interactive prompts.",
+                    6,
+                ),
+                (
+                    "command",
+                    "Detect React projects before running react-doctor",
+                    "Only run react-doctor on directories that have a package.json containing a 'react' dependency. Non-React TypeScript projects will produce meaningless output.",
+                    4,
+                ),
+            ];
+
+            for (step_type, title, content, priority) in &react_doctor_entries {
+                let id = format!(
+                    "seed-stk-{}-{}",
+                    step_type,
+                    title
+                        .to_lowercase()
+                        .replace(' ', "-")
+                        .chars()
+                        .take(30)
+                        .collect::<String>()
+                );
+                conn.execute(
+                    "INSERT OR IGNORE INTO step_type_knowledge (id, step_type, layer, title, content, priority, status, provenance, created_at, updated_at)
+                     VALUES (?1, ?2, 'universal', ?3, ?4, ?5, 'active', 'seed', ?6, ?7)",
+                    params![id, step_type, title, content, priority, now, now],
+                )
+                .map_err(|e| format!("Failed to seed react-doctor knowledge: {}", e))?;
+            }
+
+            conn.execute_batch(
+                "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (64, datetime('now'));",
+            )
+            .map_err(|e| format!("Failed to update schema version to 64: {}", e))?;
+
+            info!("Successfully migrated to version 64 (react-doctor knowledge entries)");
+        }
+
         Ok(())
     }
 

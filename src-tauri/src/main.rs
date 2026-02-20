@@ -51,6 +51,7 @@ mod orchestrator;
 mod paths;
 mod plan_executor;
 mod playwright;
+mod prompt_snippets;
 mod prompts;
 mod rag;
 mod recording;
@@ -60,7 +61,6 @@ mod safe_lock;
 mod saved_api_requests;
 mod scheduler;
 mod scheduler_service;
-mod scriptlets;
 mod secure_storage;
 mod settings;
 mod state_explorer;
@@ -580,7 +580,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::library_sync::sync_api_requests_to_backend,
             commands::library_sync::sync_contexts_to_backend,
             commands::library_sync::sync_macros_to_backend,
-            commands::library_sync::sync_scriptlets_to_backend,
+            commands::library_sync::sync_prompt_snippets_to_backend,
             // Verification testing commands
             commands::testing::execute_verification_test,
             commands::testing::execute_verification_test_suite,

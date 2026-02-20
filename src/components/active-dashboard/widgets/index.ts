@@ -66,8 +66,13 @@ export {
   type ApiRequestData,
 } from "./api-request";
 
-// Script
-export { ScriptWidget, ScriptSummary, useScriptData, type ScriptData } from "./script";
+// Playwright Test
+export {
+  PlaywrightTestWidget,
+  PlaywrightTestSummary,
+  usePlaywrightTestData,
+  type PlaywrightTestData,
+} from "./playwright-test";
 
 // Workflow Ref
 export {

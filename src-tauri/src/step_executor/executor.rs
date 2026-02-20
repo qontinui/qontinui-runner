@@ -22,10 +22,9 @@
 //! All step types are implemented as separate handlers in the `handlers/` module.
 //! The `HandlerRegistry` maps step type strings to handler implementations.
 //!
-//! ## Core Step Types (4 handlers)
+//! ## Core Step Types (3 handlers)
 //!
-//! - **Command**: command (unified: shell command, check, check group)
-//! - **Verification**: test
+//! - **Command**: command (unified: shell command, check, check group, test)
 //! - **UI Bridge**: ui_bridge
 //! - **AI**: prompt
 
@@ -229,10 +228,11 @@ pub fn extract_input_dependencies(inputs: &HashMap<String, String>) -> HashSet<S
 
 /// Configuration for a single execution step.
 ///
-/// Supports 4 core step types: command, test, ui_bridge, prompt.
+/// Supports 3 core step types: command, ui_bridge, prompt.
+/// ("test" is dispatched through command handler when test_id/test_type fields are set)
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ExecutionStepConfig {
-    /// Step type: "command", "test", "ui_bridge", "prompt"
+    /// Step type: "command", "ui_bridge", "prompt" (legacy "test" maps to "command")
     #[serde(rename = "type")]
     pub step_type: String,
 
@@ -2274,7 +2274,13 @@ impl StepExecutor {
         // Try to use the handler registry for polymorphic dispatch.
         // This is the new modular approach - handlers are self-contained and testable.
         // If no handler is registered, fall back to the legacy match statement below.
-        if let Some(handler) = self.handler_registry.get(&step.step_type) {
+        // Normalize "test" → "command" for backward compatibility with saved workflows
+        let lookup_type = if step.step_type == "test" {
+            "command"
+        } else {
+            &step.step_type
+        };
+        if let Some(handler) = self.handler_registry.get(lookup_type) {
             let context = self.create_handler_context();
             let result = handler.execute(step, &context).await;
             return (
@@ -2292,6 +2298,8 @@ impl StepExecutor {
         let timeout = step.timeout_seconds;
 
         match step.step_type.as_str() {
+            // NOTE: "test" is no longer a separate step type — it's dispatched through CommandHandler
+            // via the lookup_type normalization above. This legacy arm is kept only as a safety net.
             "test" => {
                 // Execute verification test with tree event emission
                 use std::sync::atomic::{AtomicU32, Ordering};
@@ -2605,7 +2613,7 @@ impl StepExecutor {
         script_id: &str,
     ) -> (bool, Option<String>, Option<String>) {
         let client = reqwest::Client::new();
-        let url = format!("http://localhost:9876/playwright/scripts/{}/run", script_id);
+        let url = format!("http://localhost:9876/playwright/tests/{}/run", script_id);
 
         match client
             .post(&url)

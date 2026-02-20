@@ -136,7 +136,8 @@ fn validate_steps(steps: &[Value], expected_phase: &str, errors: &mut Vec<Valida
 /// This is the single source of truth for phase constraints, used by both
 /// validation and the metadata registry.
 ///
-/// The 4 core step types are: command, test, ui_bridge, prompt.
+/// The 3 core step types are: command, ui_bridge, prompt.
+/// ("test" is accepted in verification for backward compatibility but maps to command)
 pub fn allowed_types_for_phase(phase: &str) -> &'static [&'static str] {
     match phase {
         "setup" => &["command", "prompt", "ui_bridge"],

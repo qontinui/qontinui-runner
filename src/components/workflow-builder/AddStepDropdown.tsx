@@ -2,7 +2,7 @@
  * AddStepDropdown.tsx
  *
  * Flat dropdown menu for adding steps to a workflow.
- * Shows 4 core step types: command, test, ui_bridge, prompt.
+ * Shows 3 core step types: command, ui_bridge, prompt.
  */
 
 import React, { useRef, useEffect } from "react";
@@ -23,7 +23,7 @@ import { STEP_TYPES, generateStepId } from "../../types";
 // =============================================================================
 
 /**
- * Icon map for the 4 core step types.
+ * Icon map for the 3 core step types.
  * The actual items shown depend on the phase (from STEP_TYPES).
  */
 const STEP_ICON_MAP: Record<string, React.ElementType> = {
@@ -120,16 +120,6 @@ export function AddStepDropdown({ filterPhase, onAddStep, isOpen, onClose }: Add
           phase: phase as "setup" | "verification" | "agentic" | "completion",
           name: phase === "agentic" ? "Prompt" : "AI Task",
           content: "",
-        };
-        break;
-
-      case "test":
-        step = {
-          id,
-          type: "test",
-          phase: phase as "setup" | "verification" | "completion",
-          name: "Test",
-          test_type: "custom_command",
         };
         break;
 

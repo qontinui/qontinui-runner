@@ -1,6 +1,6 @@
-//! Playwright script library CRUD handlers for MCP API
+//! Playwright test library CRUD handlers for MCP API
 //!
-//! Provides HTTP handlers for managing Playwright test scripts:
+//! Provides HTTP handlers for managing Playwright tests:
 //! list, get, create, update, delete, run, search, import/export, duplicate.
 //!
 //! Note: The Playwright *collection* handlers (start/stop/status/results for
@@ -100,8 +100,8 @@ pub struct DuplicatePlaywrightScriptRequest {
 // Handlers
 // ============================================================================
 
-/// List all Playwright scripts
-pub async fn list_playwright_scripts(
+/// List all Playwright tests
+pub async fn list_playwright_tests(
     State(_state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<Vec<playwright::PlaywrightScript>>>, (StatusCode, Json<ApiResponse<()>>)>
 {
@@ -109,8 +109,8 @@ pub async fn list_playwright_scripts(
     Ok(Json(ApiResponse::success(scripts)))
 }
 
-/// Get a single Playwright script by ID
-pub async fn get_playwright_script(
+/// Get a single Playwright test by ID
+pub async fn get_playwright_test(
     State(_state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<ApiResponse<playwright::PlaywrightScript>>, (StatusCode, Json<ApiResponse<()>>)> {
@@ -118,13 +118,13 @@ pub async fn get_playwright_script(
         Some(script) => Ok(Json(ApiResponse::success(script))),
         None => Err((
             StatusCode::NOT_FOUND,
-            Json(api_error(format!("Playwright script not found: {}", id))),
+            Json(api_error(format!("Playwright test not found: {}", id))),
         )),
     }
 }
 
-/// Create a new Playwright script
-pub async fn create_playwright_script(
+/// Create a new Playwright test
+pub async fn create_playwright_test(
     State(_state): State<Arc<ApiState>>,
     Json(request): Json<CreatePlaywrightScriptRequest>,
 ) -> Result<Json<ApiResponse<playwright::PlaywrightScript>>, (StatusCode, Json<ApiResponse<()>>)> {
@@ -145,8 +145,8 @@ pub async fn create_playwright_script(
     }
 }
 
-/// Update an existing Playwright script
-pub async fn update_playwright_script(
+/// Update an existing Playwright test
+pub async fn update_playwright_test(
     State(_state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(request): Json<UpdatePlaywrightScriptRequest>,
@@ -169,8 +169,8 @@ pub async fn update_playwright_script(
     }
 }
 
-/// Delete a Playwright script
-pub async fn delete_playwright_script(
+/// Delete a Playwright test
+pub async fn delete_playwright_test(
     State(_state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
@@ -180,8 +180,8 @@ pub async fn delete_playwright_script(
     }
 }
 
-/// Run a Playwright script
-pub async fn run_playwright_script(
+/// Run a Playwright test
+pub async fn run_playwright_test(
     State(_state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(request): Json<RunPlaywrightScriptRequest>,
@@ -205,7 +205,7 @@ pub async fn run_playwright_script(
     }
 }
 
-/// Get Playwright script categories
+/// Get Playwright test categories
 pub async fn get_playwright_categories(
     State(_state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<Vec<String>>>, (StatusCode, Json<ApiResponse<()>>)> {
@@ -213,7 +213,7 @@ pub async fn get_playwright_categories(
     Ok(Json(ApiResponse::success(categories)))
 }
 
-/// Get Playwright script tags
+/// Get Playwright test tags
 pub async fn get_playwright_tags(
     State(_state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<Vec<String>>>, (StatusCode, Json<ApiResponse<()>>)> {
@@ -221,8 +221,8 @@ pub async fn get_playwright_tags(
     Ok(Json(ApiResponse::success(tags)))
 }
 
-/// Search Playwright scripts
-pub async fn search_playwright_scripts(
+/// Search Playwright tests
+pub async fn search_playwright_tests(
     State(_state): State<Arc<ApiState>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<ApiResponse<Vec<playwright::PlaywrightScript>>>, (StatusCode, Json<ApiResponse<()>>)>
@@ -232,8 +232,8 @@ pub async fn search_playwright_scripts(
     Ok(Json(ApiResponse::success(results)))
 }
 
-/// Import Playwright scripts
-pub async fn import_playwright_scripts(
+/// Import Playwright tests
+pub async fn import_playwright_tests(
     State(_state): State<Arc<ApiState>>,
     Json(request): Json<ImportPlaywrightScriptsRequest>,
 ) -> Result<Json<ApiResponse<Vec<playwright::PlaywrightScript>>>, (StatusCode, Json<ApiResponse<()>>)>
@@ -244,8 +244,8 @@ pub async fn import_playwright_scripts(
     }
 }
 
-/// Export all Playwright scripts
-pub async fn export_playwright_scripts(
+/// Export all Playwright tests
+pub async fn export_playwright_tests(
     State(_state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<()>>)> {
     match playwright::export_scripts() {
@@ -254,8 +254,8 @@ pub async fn export_playwright_scripts(
     }
 }
 
-/// Duplicate a Playwright script
-pub async fn duplicate_playwright_script(
+/// Duplicate a Playwright test
+pub async fn duplicate_playwright_test(
     State(_state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(request): Json<DuplicatePlaywrightScriptRequest>,
@@ -270,25 +270,22 @@ pub async fn duplicate_playwright_script(
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::{delete, get, post, put};
     axum::Router::new()
-        .route("/playwright/scripts", get(list_playwright_scripts))
-        .route("/playwright/scripts", post(create_playwright_script))
-        .route("/playwright/scripts/search", get(search_playwright_scripts))
+        .route("/playwright/tests", get(list_playwright_tests))
+        .route("/playwright/tests", post(create_playwright_test))
+        .route("/playwright/tests/search", get(search_playwright_tests))
         .route(
-            "/playwright/scripts/categories",
+            "/playwright/tests/categories",
             get(get_playwright_categories),
         )
-        .route("/playwright/scripts/tags", get(get_playwright_tags))
+        .route("/playwright/tests/tags", get(get_playwright_tags))
+        .route("/playwright/tests/import", post(import_playwright_tests))
+        .route("/playwright/tests/export", get(export_playwright_tests))
+        .route("/playwright/tests/:id", get(get_playwright_test))
+        .route("/playwright/tests/:id", put(update_playwright_test))
+        .route("/playwright/tests/:id", delete(delete_playwright_test))
+        .route("/playwright/tests/:id/run", post(run_playwright_test))
         .route(
-            "/playwright/scripts/import",
-            post(import_playwright_scripts),
-        )
-        .route("/playwright/scripts/export", get(export_playwright_scripts))
-        .route("/playwright/scripts/:id", get(get_playwright_script))
-        .route("/playwright/scripts/:id", put(update_playwright_script))
-        .route("/playwright/scripts/:id", delete(delete_playwright_script))
-        .route("/playwright/scripts/:id/run", post(run_playwright_script))
-        .route(
-            "/playwright/scripts/:id/duplicate",
-            post(duplicate_playwright_script),
+            "/playwright/tests/:id/duplicate",
+            post(duplicate_playwright_test),
         )
 }

@@ -88,11 +88,12 @@ pub struct StepTypeMetadata {
 // Field definitions for each step type
 // ============================================================================
 
-/// Unified command fields (union of shell_command + check + check_group fields).
+/// Unified command fields (union of shell_command + check + check_group + test fields).
 ///
 /// The `command` step type dispatches based on which fields are populated:
 /// - `check_group_id` set -> check group execution
 /// - `check_type` set -> check execution (lint, format, typecheck, etc.)
+/// - `test_id` or `test_type` set -> test execution
 /// - Otherwise -> plain shell command execution
 static COMMAND_FIELDS: &[StepTypeFieldDef] = &[
     // Shell command fields
@@ -186,14 +187,20 @@ static COMMAND_FIELDS: &[StepTypeFieldDef] = &[
         enum_values: &[],
         default: "",
     },
-];
-
-static TEST_FIELDS: &[StepTypeFieldDef] = &[
+    // Test fields (set test_id or test_type to activate test mode)
+    StepTypeFieldDef {
+        name: "test_id",
+        field_type: FieldType::String,
+        required: false,
+        description: "Saved test UUID. When set, executes a stored test definition from the database.",
+        enum_values: &[],
+        default: "",
+    },
     StepTypeFieldDef {
         name: "test_type",
         field_type: FieldType::String,
-        required: true,
-        description: "Type of test to run",
+        required: false,
+        description: "Type of test to run. When set (without test_id), activates inline test mode.",
         enum_values: &[
             "playwright",
             "qontinui_vision",
@@ -204,26 +211,10 @@ static TEST_FIELDS: &[StepTypeFieldDef] = &[
         default: "",
     },
     StepTypeFieldDef {
-        name: "command",
-        field_type: FieldType::String,
-        required: false,
-        description: "Command to run (for repository/custom_command)",
-        enum_values: &[],
-        default: "",
-    },
-    StepTypeFieldDef {
         name: "code",
         field_type: FieldType::String,
         required: false,
-        description: "Test code (for playwright/python)",
-        enum_values: &[],
-        default: "",
-    },
-    StepTypeFieldDef {
-        name: "description",
-        field_type: FieldType::String,
-        required: false,
-        description: "Test description",
+        description: "Test code (for playwright/python test types)",
         enum_values: &[],
         default: "",
     },
@@ -313,22 +304,12 @@ static ALL_METADATA: Lazy<Vec<StepTypeMetadata>> = Lazy::new(|| {
         StepTypeMetadata {
             step_type: "command",
             display_name: "Command",
-            description: "Execute a shell command, code quality check, or check group. Set check_type for checks, check_group_id for check groups, or just command for plain shell execution.",
+            description: "Execute a shell command, code quality check, check group, or test. Set check_type for checks, check_group_id for check groups, test_id/test_type for tests, or just command for plain shell execution.",
             category: StepCategory::Core,
             allowed_phases: &["setup", "verification", "completion"],
             icon: "Terminal",
             color: "gray",
             fields: COMMAND_FIELDS,
-        },
-        StepTypeMetadata {
-            step_type: "test",
-            display_name: "Test",
-            description: "Run verification tests (Playwright, pytest, custom)",
-            category: StepCategory::Verification,
-            allowed_phases: &["verification"],
-            icon: "FlaskConical",
-            color: "green",
-            fields: TEST_FIELDS,
         },
         StepTypeMetadata {
             step_type: "ui_bridge",
@@ -353,9 +334,9 @@ static ALL_METADATA: Lazy<Vec<StepTypeMetadata>> = Lazy::new(|| {
     ]
 });
 
-/// Returns metadata for all 4 core step types that AI can generate.
+/// Returns metadata for all 3 core step types that AI can generate.
 ///
-/// The core types are: command, test, ui_bridge, prompt.
+/// The core types are: command, ui_bridge, prompt.
 pub fn get_all_step_type_metadata() -> &'static [StepTypeMetadata] {
     &ALL_METADATA
 }
@@ -379,8 +360,8 @@ mod tests {
         let metadata = get_all_step_type_metadata();
         assert_eq!(
             metadata.len(),
-            4,
-            "Expected exactly 4 step types, got {}",
+            3,
+            "Expected exactly 3 step types, got {}",
             metadata.len()
         );
     }
@@ -436,8 +417,9 @@ mod tests {
     fn test_core_types_present() {
         assert!(get_step_type_metadata("command").is_some());
         assert!(get_step_type_metadata("prompt").is_some());
-        assert!(get_step_type_metadata("test").is_some());
         assert!(get_step_type_metadata("ui_bridge").is_some());
+        // "test" was merged into "command" — no longer a separate type
+        assert!(get_step_type_metadata("test").is_none());
     }
 
     #[test]
@@ -465,6 +447,10 @@ mod tests {
         assert!(field_names.contains(&"auto_fix"));
         // Check group fields
         assert!(field_names.contains(&"check_group_id"));
+        // Test fields (merged from former "test" type)
+        assert!(field_names.contains(&"test_id"));
+        assert!(field_names.contains(&"test_type"));
+        assert!(field_names.contains(&"code"));
     }
 
     #[test]

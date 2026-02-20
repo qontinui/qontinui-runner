@@ -39,8 +39,12 @@ import { ShellCommandWidget, ShellCommandSummary, useShellCommandData } from "./
 // Import API Request widget
 import { ApiRequestWidget, ApiRequestSummary, useApiRequestData } from "./api-request";
 
-// Import Script widget
-import { ScriptWidget, ScriptSummary, useScriptData } from "./script";
+// Import Playwright Test widget
+import {
+  PlaywrightTestWidget,
+  PlaywrightTestSummary,
+  usePlaywrightTestData,
+} from "./playwright-test";
 
 // Import Workflow Ref widget
 import { WorkflowRefWidget, WorkflowRefSummary, useWorkflowRefData } from "./workflow-ref";
@@ -208,15 +212,15 @@ export function registerAllWidgets(): void {
     detailRoute: "/logs/api",
   });
 
-  // Script - Script execution
+  // Playwright Test - Script execution
   widgetRegistry.register({
     id: "script",
-    displayName: "Script",
+    displayName: "Playwright Test",
     icon: "FileCode",
     accentColor: "indigo",
-    FullComponent: ScriptWidget,
-    SummaryComponent: ScriptSummary,
-    useData: useScriptData,
+    FullComponent: PlaywrightTestWidget,
+    SummaryComponent: PlaywrightTestSummary,
+    useData: usePlaywrightTestData,
     detectActivity: defaultDetectors.script,
     defaultPriority: 19,
     detailRoute: "/logs/scripts",

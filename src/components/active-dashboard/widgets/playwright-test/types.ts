@@ -1,14 +1,14 @@
 /**
- * Script Widget Types
+ * Playwright Test Widget Types
  */
 
 import type { BaseWidgetProps } from "../../../../types/dashboard/widget-props";
 import type { ScriptExecution, StepStats } from "../shared/types";
 
 /**
- * Data provided by the useScriptData hook.
+ * Data provided by the usePlaywrightTestData hook.
  */
-export interface ScriptData {
+export interface PlaywrightTestData {
   /** List of script executions */
   scripts: ScriptExecution[];
   /** Currently running script (if any) */
@@ -22,15 +22,15 @@ export interface ScriptData {
 }
 
 /**
- * Props for the full ScriptWidget component.
+ * Props for the full PlaywrightTestWidget component.
  */
-export interface ScriptWidgetProps extends BaseWidgetProps {
-  data: ScriptData;
+export interface PlaywrightTestWidgetProps extends BaseWidgetProps {
+  data: PlaywrightTestData;
 }
 
 /**
- * Props for the ScriptSummary component.
+ * Props for the PlaywrightTestSummary component.
  */
-export interface ScriptSummaryProps extends BaseWidgetProps {
-  data: ScriptData;
+export interface PlaywrightTestSummaryProps extends BaseWidgetProps {
+  data: PlaywrightTestData;
 }

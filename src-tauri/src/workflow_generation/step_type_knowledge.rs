@@ -386,6 +386,12 @@ pub fn infer_step_type_from_fix(description: &str) -> Option<String> {
                 "api_request",
                 "api request",
                 "curl",
+                "test_type",
+                "test step",
+                "pytest",
+                "jest",
+                "cargo test",
+                "test runner",
             ],
         ),
         (
@@ -398,17 +404,7 @@ pub fn infer_step_type_from_fix(description: &str) -> Option<String> {
                 "base_prompt",
             ],
         ),
-        (
-            "test",
-            &[
-                "test_type",
-                "test step",
-                "pytest",
-                "jest",
-                "cargo test",
-                "test runner",
-            ],
-        ),
+        // "test" merged into "command" — test keywords are now command aliases
         (
             "ui_bridge",
             &[
@@ -663,10 +659,10 @@ mod tests {
             },
             StepTypeKnowledge {
                 id: "2".into(),
-                step_type: "test".into(),
+                step_type: "command".into(),
                 layer: "universal".into(),
                 title: "Test type required".into(),
-                content: "Always specify test_type for test steps.".into(),
+                content: "Always specify test_type for command steps with test mode.".into(),
                 priority: 10,
                 status: "active".into(),
                 provenance: "seed".into(),
@@ -679,7 +675,6 @@ mod tests {
         let md = format_knowledge_as_markdown(&entries);
         assert!(md.contains("## Step Type Best Practices"));
         assert!(md.contains("### command"));
-        assert!(md.contains("### test"));
         assert!(md.contains("- **Set working_directory**: Always set working_directory"));
     }
 

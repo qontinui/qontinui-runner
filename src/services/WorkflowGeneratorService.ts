@@ -392,8 +392,8 @@ Fix any navigation issues to successfully reach all expected states.`;
    *
    * Creates multiple verification approaches based on the state's properties:
    * - PromptStep: AI-driven verification of the state
-   * - TestStep (qontinui_vision): Visual verification using state images
-   * - TestStep (playwright): Browser-based verification for web states
+   * - CommandStep (qontinui_vision): Visual verification using state images
+   * - CommandStep (playwright): Browser-based verification for web states
    *
    * @param state - The state to generate verification for
    * @param options - Generation options
@@ -421,7 +421,7 @@ Fix any navigation issues to successfully reach all expected states.`;
     if (includeVisionTest && state.stateImages && state.stateImages.length > 0) {
       steps.push({
         id: generateStepId(),
-        type: "test",
+        type: "command",
         phase: "verification",
         name: `Vision Test: ${state.name}`,
         test_type: "qontinui_vision",
@@ -434,7 +434,7 @@ Fix any navigation issues to successfully reach all expected states.`;
       const playwrightCode = this.generatePlaywrightTestForState(state);
       steps.push({
         id: generateStepId(),
-        type: "test",
+        type: "command",
         phase: "verification",
         name: `Playwright Test: ${state.name}`,
         test_type: "playwright",

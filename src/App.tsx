@@ -127,7 +127,7 @@ import { HelpTab } from "./components/HelpTab";
 import { SchedulerTab } from "./components/scheduler";
 import { Sidebar } from "./components/navigation";
 import { WorkflowBuilderTab } from "./components/workflow-builder";
-import { ScriptsPage } from "./components/ScriptsPage";
+import { PlaywrightTestsPage } from "./components/PlaywrightTestsPage";
 import { MacroBuilderTab } from "./components/macro-builder";
 import { TestBuilderTab } from "./components/test-builder";
 import { CheckBuilderTab } from "./components/check-builder";
@@ -224,7 +224,7 @@ type MainTabId =
   | "task-builder"
   | "unified-workflow-builder"
   | "macro-builder"
-  | "script-builder"
+  | "playwright-test-builder"
   | "context-builder"
   | "state-explorer-builder"
   | "api-request-builder"
@@ -296,7 +296,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "task-builder",
   "unified-workflow-builder",
   "macro-builder",
-  "script-builder",
+  "playwright-test-builder",
   "context-builder",
   "state-explorer-builder",
   "api-request-builder",
@@ -346,7 +346,8 @@ function migrateTabId(stored: string | null): MainTabId {
     "ai-builder": "unified-workflow-builder",
     builder: "unified-workflow-builder",
     prompts: "library",
-    scripts: "script-builder",
+    scripts: "playwright-test-builder", // Old "scripts" tab maps to new name
+    "script-builder": "playwright-test-builder", // Old "script-builder" tab maps to new name
     contexts: "library",
     scheduler: "tasks",
     dataset: "capture", // Dataset is now part of capture
@@ -429,7 +430,7 @@ function AppContent() {
         active: "active",
         "unified-workflow-builder": "unified-workflow-builder",
         "macro-builder": "macro-builder",
-        "script-builder": "script-builder",
+        "playwright-test-builder": "playwright-test-builder",
         "check-builder": "check-builder",
         library: "library",
         ai: "ai",
@@ -533,7 +534,7 @@ function AppContent() {
     };
   }, []);
 
-  // Script ID to edit (when navigating from Library to Script Builder)
+  // Script ID to edit (when navigating from Library to Playwright Test Builder)
   const [editScriptId, setEditScriptId] = useState<string | null>(null);
 
   // Workflow ID to edit (when navigating from Library to Workflow Builder)
@@ -544,7 +545,7 @@ function AppContent() {
 
   // Builder edit IDs (when navigating from Library Dashboard to builders)
   const [editTaskId, setEditTaskId] = useState<string | null>(null);
-  const [editScriptletId, setEditScriptletId] = useState<string | null>(null);
+  const [editPromptSnippetId, setEditPromptSnippetId] = useState<string | null>(null);
   const [editContextId, setEditContextId] = useState<string | null>(null);
   const [editExplorationId, setEditExplorationId] = useState<string | null>(null);
   const [editApiRequestId, setEditApiRequestId] = useState<string | null>(null);
@@ -553,7 +554,7 @@ function AppContent() {
   // Handle editing a script from Library
   const _handleEditScript = useCallback((scriptId: string) => {
     setEditScriptId(scriptId);
-    setActiveTab("script-builder");
+    setActiveTab("playwright-test-builder");
   }, []);
 
   // Handle editing a workflow from Library
@@ -576,8 +577,8 @@ function AppContent() {
         case "task":
           setEditTaskId(itemId);
           break;
-        case "scriptlet":
-          setEditScriptletId(itemId);
+        case "prompt-snippet":
+          setEditPromptSnippetId(itemId);
           break;
         case "context":
           setEditContextId(itemId);
@@ -751,7 +752,7 @@ function AppContent() {
 
   // Clear script ID when navigating away from script builder
   useEffect(() => {
-    if (activeTab !== "script-builder") {
+    if (activeTab !== "playwright-test-builder") {
       setEditScriptId(null);
     }
   }, [activeTab]);
@@ -773,7 +774,7 @@ function AppContent() {
   // Clear builder edit IDs when navigating away
   useEffect(() => {
     if (activeTab !== "task-builder") setEditTaskId(null);
-    if (activeTab !== "script-builder") setEditScriptletId(null);
+    if (activeTab !== "playwright-test-builder") setEditPromptSnippetId(null);
     if (activeTab !== "context-builder") setEditContextId(null);
     if (activeTab !== "state-explorer-builder") setEditExplorationId(null);
     if (activeTab !== "api-request-builder") setEditApiRequestId(null);
@@ -1374,13 +1375,13 @@ function AppContent() {
           </div>
         );
 
-      case "script-builder":
+      case "playwright-test-builder":
         return (
           <div className="h-full overflow-hidden">
-            <ScriptsPage
+            <PlaywrightTestsPage
               onLog={addLog}
               editScriptId={editScriptId}
-              editScriptletId={editScriptletId}
+              editPromptSnippetId={editPromptSnippetId}
               onNavigateToLibrary={() => setActiveTab("library")}
             />
           </div>

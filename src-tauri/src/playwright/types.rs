@@ -4,8 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
-/// File name for storing scripts
-pub const SCRIPTS_FILE: &str = "playwright-scripts.json";
+/// File name for storing tests
+pub const TESTS_FILE: &str = "playwright-tests.json";
 
 /// Sync status for cloud backup
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]

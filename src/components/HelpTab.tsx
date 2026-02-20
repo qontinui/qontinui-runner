@@ -64,33 +64,33 @@ interface ShortcutCategory {
 
 const SHORTCUTS: ShortcutCategory[] = [
   {
-    name: "Script Builder",
+    name: "Playwright Test Builder",
     shortcuts: [
       {
         keys: ["@"],
-        description: "Open scriptlet selector popup",
+        description: "Open prompt snippet selector popup",
         context:
-          "In the Description field, type @ to search and insert a scriptlet at the cursor position",
+          "In the Description field, type @ to search and insert a prompt snippet at the cursor position",
       },
     ],
   },
   {
-    name: "Scriptlet Selector",
+    name: "Prompt Snippet Selector",
     shortcuts: [
       {
         keys: ["\u2191", "\u2193"],
-        description: "Navigate through scriptlet list",
-        context: "When scriptlet selector popup is open",
+        description: "Navigate through prompt snippet list",
+        context: "When prompt snippet selector popup is open",
       },
       {
         keys: ["Enter"],
-        description: "Insert selected scriptlet",
-        context: "When scriptlet selector popup is open",
+        description: "Insert selected prompt snippet",
+        context: "When prompt snippet selector popup is open",
       },
       {
         keys: ["Escape"],
-        description: "Close scriptlet selector",
-        context: "When scriptlet selector popup is open",
+        description: "Close prompt snippet selector",
+        context: "When prompt snippet selector popup is open",
       },
     ],
   },
@@ -254,11 +254,13 @@ function ShortcutsPage() {
         <div className="flex items-start gap-3">
           <HelpCircle className={`w-5 h-5 ${getAccentColors("blue").text} flex-shrink-0 mt-0.5`} />
           <div>
-            <h4 className={`font-medium ${getAccentColors("blue").text}`}>Tip: Using Scriptlets</h4>
+            <h4 className={`font-medium ${getAccentColors("blue").text}`}>
+              Tip: Using Prompt Snippets
+            </h4>
             <p className="text-sm text-muted-foreground mt-1">
-              Scriptlets are reusable text snippets that capture learnings from AI debugging
-              sessions. Create them in the <strong>Scriptlets</strong> tab, then insert them into
-              script descriptions using the dropdown button or by typing{" "}
+              Prompt snippets are reusable text snippets that capture learnings from AI debugging
+              sessions. Create them in the <strong>Prompt Snippets</strong> tab, then insert them
+              into test descriptions using the dropdown button or by typing{" "}
               <kbd className="px-1.5 py-0.5 text-xs bg-muted border border-border rounded">@</kbd>{" "}
               in the description field.
             </p>

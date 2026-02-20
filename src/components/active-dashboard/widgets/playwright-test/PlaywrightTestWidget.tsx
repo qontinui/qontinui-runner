@@ -1,5 +1,5 @@
 /**
- * ScriptWidget Component
+ * PlaywrightTestWidget Component
  *
  * Full widget view for script execution activity.
  * Displays script list, code content, output, and exit codes.
@@ -11,7 +11,7 @@ import { cn } from "../../../../lib/utils";
 import { Badge, ScrollArea } from "../../../ui";
 import { StepStatsBar, StepStatusBadge, StepOutputPanel } from "../shared";
 import { getStatusColors } from "@/design-system";
-import type { ScriptWidgetProps } from "./types";
+import type { PlaywrightTestWidgetProps } from "./types";
 import type { ScriptExecution } from "../shared/types";
 
 /**
@@ -190,9 +190,9 @@ function ScriptDetail({ script }: { script: ScriptExecution | null }) {
 }
 
 /**
- * Full Script widget component.
+ * Full Playwright Test widget component.
  */
-export function ScriptWidget({ isSummary, data, className }: ScriptWidgetProps) {
+export function PlaywrightTestWidget({ isSummary, data, className }: PlaywrightTestWidgetProps) {
   const [selectedScriptId, setSelectedScriptId] = useState<string | null>(null);
 
   if (isSummary) {
@@ -244,4 +244,4 @@ export function ScriptWidget({ isSummary, data, className }: ScriptWidgetProps) 
   );
 }
 
-export default ScriptWidget;
+export default PlaywrightTestWidget;

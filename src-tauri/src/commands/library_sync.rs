@@ -1,7 +1,7 @@
 //! Library Sync commands for syncing library items to qontinui-web backend.
 //!
 //! This module syncs library items (checks, check groups, shell commands,
-//! saved API requests, contexts, macros, scriptlets) from the runner's local
+//! saved API requests, contexts, macros, prompt snippets) from the runner's local
 //! storage (SQLite + JSON files) to the web backend's PostgreSQL database.
 //!
 //! Follows the same patterns as task_sync.rs for consistency.
@@ -10,7 +10,7 @@ use crate::auth::AuthManager;
 use crate::context;
 use crate::database::CheckpointDb;
 use crate::macros as macro_lib;
-use crate::scriptlets;
+use crate::prompt_snippets;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -124,9 +124,9 @@ struct MacroSyncRequest {
     tags: Vec<String>,
 }
 
-/// Request to create/update a scriptlet on the backend.
+/// Request to create/update a prompt snippet on the backend.
 #[derive(Debug, Serialize)]
-struct ScriptletSyncRequest {
+struct PromptSnippetSyncRequest {
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
@@ -176,7 +176,7 @@ pub struct FullLibrarySyncResult {
 ///
 /// This service handles:
 /// - Reading library items from local storage (SQLite for checks, shell commands,
-///   check groups, saved API requests; JSON files for contexts, macros, scriptlets)
+///   check groups, saved API requests; JSON files for contexts, macros, prompt snippets)
 /// - Upserting them to the backend via POST endpoints
 /// - Tracking sync results per item type
 pub struct LibrarySyncService {
@@ -629,10 +629,10 @@ impl LibrarySyncService {
         result
     }
 
-    /// Sync all scriptlets from the runner's JSON file storage.
-    pub async fn sync_scriptlets(&self) -> LibrarySyncResult {
+    /// Sync all prompt snippets from the runner's JSON file storage.
+    pub async fn sync_prompt_snippets(&self) -> LibrarySyncResult {
         let mut result = LibrarySyncResult {
-            item_type: "scriptlets".to_string(),
+            item_type: "prompt_snippets".to_string(),
             synced: 0,
             failed: 0,
             errors: Vec::new(),
@@ -647,15 +647,15 @@ impl LibrarySyncService {
             }
         };
 
-        let all_scriptlets = scriptlets::get_all_scriptlets();
+        let all_snippets = prompt_snippets::get_all_prompt_snippets();
 
-        info!("Syncing {} scriptlets to backend", all_scriptlets.len());
+        info!("Syncing {} prompt snippets to backend", all_snippets.len());
 
-        for s in &all_scriptlets {
-            let payload = ScriptletSyncRequest {
+        for s in &all_snippets {
+            let payload = PromptSnippetSyncRequest {
                 name: s.name.clone(),
                 description: None,
-                language: "text".to_string(), // Scriptlets in runner are text snippets
+                language: "text".to_string(), // Prompt snippets in runner are text snippets
                 code: s.content.clone(),
                 category: if s.category.is_empty() {
                     None
@@ -665,18 +665,23 @@ impl LibrarySyncService {
                 tags: s.tags.clone(),
             };
 
-            match self.post_item(&access_token, "scriptlets", &payload).await {
+            match self
+                .post_item(&access_token, "prompt-snippets", &payload)
+                .await
+            {
                 Ok(()) => result.synced += 1,
                 Err(e) => {
-                    warn!("Failed to sync scriptlet '{}': {}", s.name, e);
+                    warn!("Failed to sync prompt snippet '{}': {}", s.name, e);
                     result.failed += 1;
-                    result.errors.push(format!("Scriptlet '{}': {}", s.name, e));
+                    result
+                        .errors
+                        .push(format!("PromptSnippet '{}': {}", s.name, e));
                 }
             }
         }
 
         info!(
-            "Scriptlets sync complete: {} synced, {} failed",
+            "Prompt snippets sync complete: {} synced, {} failed",
             result.synced, result.failed
         );
         result
@@ -697,7 +702,7 @@ impl LibrarySyncService {
         // Sync items stored in JSON files
         results.push(self.sync_contexts().await);
         results.push(self.sync_macros().await);
-        results.push(self.sync_scriptlets().await);
+        results.push(self.sync_prompt_snippets().await);
 
         let total_synced: u32 = results.iter().map(|r| r.synced).sum();
         let total_failed: u32 = results.iter().map(|r| r.failed).sum();
@@ -728,7 +733,7 @@ impl Default for LibrarySyncService {
 /// Sync all library items to the backend.
 ///
 /// Reads checks, check groups, shell commands, saved API requests, contexts,
-/// macros, and scriptlets from local storage and POSTs them to the backend.
+/// macros, and prompt snippets from local storage and POSTs them to the backend.
 #[tauri::command]
 pub async fn sync_library_to_backend(
     app_state: tauri::State<'_, Arc<crate::commands::AppState>>,
@@ -794,9 +799,9 @@ pub async fn sync_macros_to_backend() -> Result<LibrarySyncResult, String> {
     Ok(service.sync_macros().await)
 }
 
-/// Sync only scriptlets to the backend.
+/// Sync only prompt snippets to the backend.
 #[tauri::command]
-pub async fn sync_scriptlets_to_backend() -> Result<LibrarySyncResult, String> {
+pub async fn sync_prompt_snippets_to_backend() -> Result<LibrarySyncResult, String> {
     let service = LibrarySyncService::new();
-    Ok(service.sync_scriptlets().await)
+    Ok(service.sync_prompt_snippets().await)
 }

@@ -134,7 +134,7 @@ mod tests {
     fn make_success_result(index: usize, duration: u64) -> StepExecutionResult {
         StepExecutionResult {
             step_index: index,
-            step_type: "test".to_string(),
+            step_type: "command".to_string(),
             step_name: format!("Step {}", index),
             step_id: None,
             success: true,
@@ -155,7 +155,7 @@ mod tests {
     fn make_error_result(index: usize, error: &str, duration: u64) -> StepExecutionResult {
         StepExecutionResult {
             step_index: index,
-            step_type: "test".to_string(),
+            step_type: "command".to_string(),
             step_name: format!("Step {}", index),
             step_id: None,
             success: false,

@@ -1,19 +1,19 @@
 /**
- * ScriptletSelector.tsx
+ * PromptSnippetSelector.tsx
  *
- * A dropdown/popup component for selecting and inserting scriptlets.
+ * A dropdown/popup component for selecting and inserting prompt snippets.
  * Supports two modes:
- * - dropdown: Button that opens a popover with scriptlet list
+ * - dropdown: Button that opens a popover with prompt snippet list
  * - popup: Floating popup for @-mention style insertion
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Puzzle, Search, ChevronDown, X } from "lucide-react";
-import type { Scriptlet } from "../types";
+import type { PromptSnippet } from "../types";
 
 const API_BASE = "http://localhost:9876";
 
-interface ScriptletSelectorProps {
+interface PromptSnippetSelectorProps {
   onSelect: (content: string) => void;
   onClose?: () => void;
   searchQuery?: string;
@@ -21,39 +21,39 @@ interface ScriptletSelectorProps {
   mode: "dropdown" | "popup";
 }
 
-export function ScriptletSelector({
+export function PromptSnippetSelector({
   onSelect,
   onClose,
   searchQuery: initialSearchQuery = "",
   position,
   mode,
-}: ScriptletSelectorProps) {
+}: PromptSnippetSelectorProps) {
   const [isOpen, setIsOpen] = useState(mode === "popup");
-  const [scriptlets, setScriptlets] = useState<Scriptlet[]>([]);
+  const [snippets, setSnippets] = useState<PromptSnippet[]>([]);
   const [categories, setCategories] = useState<string[]>([]);
   const [searchQuery, setSearchQuery] = useState(initialSearchQuery);
   const [selectedCategory, setSelectedCategory] = useState<string>("");
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [loading, setLoading] = useState(false);
-  const [hoveredScriptlet, setHoveredScriptlet] = useState<Scriptlet | null>(null);
+  const [hoveredSnippet, setHoveredSnippet] = useState<PromptSnippet | null>(null);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
 
-  // Load scriptlets and categories
+  // Load prompt snippets and categories
   const loadData = useCallback(async () => {
     setLoading(true);
     try {
-      const [scriptletsRes, categoriesRes] = await Promise.all([
-        fetch(`${API_BASE}/scriptlets`),
-        fetch(`${API_BASE}/scriptlets/categories`),
+      const [snippetsRes, categoriesRes] = await Promise.all([
+        fetch(`${API_BASE}/prompt-snippets`),
+        fetch(`${API_BASE}/prompt-snippets/categories`),
       ]);
 
-      if (scriptletsRes.ok) {
-        const data = await scriptletsRes.json();
+      if (snippetsRes.ok) {
+        const data = await snippetsRes.json();
         if (data.success) {
-          setScriptlets(data.data);
+          setSnippets(data.data);
         }
       }
 
@@ -64,7 +64,7 @@ export function ScriptletSelector({
         }
       }
     } catch (error) {
-      console.error("Failed to load scriptlets:", error);
+      console.error("Failed to load prompt snippets:", error);
     } finally {
       setLoading(false);
     }
@@ -82,8 +82,8 @@ export function ScriptletSelector({
     setSearchQuery(initialSearchQuery);
   }, [initialSearchQuery]);
 
-  // Filter scriptlets by search and category
-  const filteredScriptlets = scriptlets.filter((s) => {
+  // Filter prompt snippets by search and category
+  const filteredSnippets = snippets.filter((s) => {
     const matchesSearch =
       !searchQuery ||
       s.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
@@ -108,7 +108,7 @@ export function ScriptletSelector({
       switch (e.key) {
         case "ArrowDown":
           e.preventDefault();
-          setSelectedIndex((prev) => Math.min(prev + 1, filteredScriptlets.length - 1));
+          setSelectedIndex((prev) => Math.min(prev + 1, filteredSnippets.length - 1));
           break;
         case "ArrowUp":
           e.preventDefault();
@@ -116,8 +116,8 @@ export function ScriptletSelector({
           break;
         case "Enter":
           e.preventDefault();
-          if (filteredScriptlets[selectedIndex]) {
-            handleSelect(filteredScriptlets[selectedIndex]);
+          if (filteredSnippets[selectedIndex]) {
+            handleSelect(filteredSnippets[selectedIndex]);
           }
           break;
         case "Escape":
@@ -130,17 +130,17 @@ export function ScriptletSelector({
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isOpen, filteredScriptlets, selectedIndex]);
+  }, [isOpen, filteredSnippets, selectedIndex]);
 
   // Scroll selected item into view
   useEffect(() => {
-    if (listRef.current && filteredScriptlets.length > 0) {
+    if (listRef.current && filteredSnippets.length > 0) {
       const selectedElement = listRef.current.children[selectedIndex] as HTMLElement;
       if (selectedElement) {
         selectedElement.scrollIntoView({ block: "nearest" });
       }
     }
-  }, [selectedIndex, filteredScriptlets.length]);
+  }, [selectedIndex, filteredSnippets.length]);
 
   // Focus search input when opened
   useEffect(() => {
@@ -164,8 +164,8 @@ export function ScriptletSelector({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);
 
-  const handleSelect = (scriptlet: Scriptlet) => {
-    onSelect(scriptlet.content);
+  const handleSelect = (snippet: PromptSnippet) => {
+    onSelect(snippet.content);
     handleClose();
   };
 
@@ -178,52 +178,52 @@ export function ScriptletSelector({
     setIsOpen(!isOpen);
   };
 
-  // Group scriptlets by category for display
-  const groupedScriptlets = filteredScriptlets.reduce(
-    (acc, scriptlet) => {
-      const category = scriptlet.category || "Uncategorized";
+  // Group prompt snippets by category for display
+  const groupedSnippets = filteredSnippets.reduce(
+    (acc, snippet) => {
+      const category = snippet.category || "Uncategorized";
       if (!acc[category]) {
         acc[category] = [];
       }
-      acc[category].push(scriptlet);
+      acc[category].push(snippet);
       return acc;
     },
-    {} as Record<string, Scriptlet[]>,
+    {} as Record<string, PromptSnippet[]>,
   );
 
-  const renderScriptletList = () => (
+  const renderSnippetList = () => (
     <div className="max-h-64 overflow-y-auto" ref={listRef}>
       {loading ? (
         <div className="p-4 text-center text-muted-foreground text-sm">Loading...</div>
-      ) : filteredScriptlets.length === 0 ? (
+      ) : filteredSnippets.length === 0 ? (
         <div className="p-4 text-center text-muted-foreground text-sm">
-          {scriptlets.length === 0 ? "No scriptlets yet" : "No matching scriptlets"}
+          {snippets.length === 0 ? "No prompt snippets yet" : "No matching prompt snippets"}
         </div>
       ) : (
-        Object.entries(groupedScriptlets).map(([category, items]) => (
+        Object.entries(groupedSnippets).map(([category, items]) => (
           <div key={category}>
             <div className="px-3 py-1.5 text-xs font-medium text-muted-foreground bg-muted/30 sticky top-0">
               {category}
             </div>
-            {items.map((scriptlet) => {
-              const globalIndex = filteredScriptlets.indexOf(scriptlet);
+            {items.map((snippet) => {
+              const globalIndex = filteredSnippets.indexOf(snippet);
               return (
                 <button
-                  key={scriptlet.id}
-                  onClick={() => handleSelect(scriptlet)}
+                  key={snippet.id}
+                  onClick={() => handleSelect(snippet)}
                   onMouseEnter={() => {
                     setSelectedIndex(globalIndex);
-                    setHoveredScriptlet(scriptlet);
+                    setHoveredSnippet(snippet);
                   }}
-                  onMouseLeave={() => setHoveredScriptlet(null)}
+                  onMouseLeave={() => setHoveredSnippet(null)}
                   className={`w-full px-3 py-2 text-left transition-colors ${
                     globalIndex === selectedIndex
                       ? "bg-primary/10 text-primary"
                       : "hover:bg-muted/50"
                   }`}
                 >
-                  <div className="font-medium text-sm">{scriptlet.name}</div>
-                  <div className="text-xs text-muted-foreground truncate">{scriptlet.content}</div>
+                  <div className="font-medium text-sm">{snippet.name}</div>
+                  <div className="text-xs text-muted-foreground truncate">{snippet.content}</div>
                 </button>
               );
             })}
@@ -234,17 +234,17 @@ export function ScriptletSelector({
   );
 
   const renderPreview = () => {
-    if (!hoveredScriptlet) return null;
+    if (!hoveredSnippet) return null;
 
     return (
       <div className="absolute right-full top-0 mr-2 w-64 bg-card border border-border rounded-lg shadow-lg p-3 z-50">
-        <div className="font-medium text-sm mb-1">{hoveredScriptlet.name}</div>
+        <div className="font-medium text-sm mb-1">{hoveredSnippet.name}</div>
         <div className="text-xs text-muted-foreground mb-2">
-          {hoveredScriptlet.category}
-          {hoveredScriptlet.tags.length > 0 && ` • ${hoveredScriptlet.tags.join(", ")}`}
+          {hoveredSnippet.category}
+          {hoveredSnippet.tags.length > 0 && ` \u2022 ${hoveredSnippet.tags.join(", ")}`}
         </div>
         <div className="text-sm bg-muted/30 p-2 rounded max-h-32 overflow-y-auto">
-          {hoveredScriptlet.content}
+          {hoveredSnippet.content}
         </div>
       </div>
     );
@@ -257,7 +257,7 @@ export function ScriptletSelector({
         <button
           onClick={toggleOpen}
           className="flex items-center gap-1.5 px-2 py-1.5 text-sm bg-card border border-border rounded-lg hover:bg-muted transition-colors"
-          title="Insert scriptlet"
+          title="Insert prompt snippet"
         >
           <Puzzle className="w-4 h-4" />
           <ChevronDown className={`w-3 h-3 transition-transform ${isOpen ? "rotate-180" : ""}`} />
@@ -274,7 +274,7 @@ export function ScriptletSelector({
                   type="text"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Search scriptlets..."
+                  placeholder="Search prompt snippets..."
                   className="w-full pl-8 pr-3 py-1.5 text-sm bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-primary"
                 />
               </div>
@@ -295,8 +295,8 @@ export function ScriptletSelector({
               )}
             </div>
 
-            {/* Scriptlet list */}
-            {renderScriptletList()}
+            {/* Prompt snippet list */}
+            {renderSnippetList()}
 
             {/* Preview on hover */}
             {renderPreview()}
@@ -317,7 +317,7 @@ export function ScriptletSelector({
       <div className="flex items-center justify-between px-3 py-2 border-b border-border">
         <div className="flex items-center gap-2 text-sm font-medium">
           <Puzzle className="w-4 h-4" />
-          Insert Scriptlet
+          Insert Prompt Snippet
         </div>
         <button onClick={handleClose} className="text-muted-foreground hover:text-foreground">
           <X className="w-4 h-4" />
@@ -339,16 +339,16 @@ export function ScriptletSelector({
         </div>
       </div>
 
-      {/* Scriptlet list */}
-      {renderScriptletList()}
+      {/* Prompt snippet list */}
+      {renderSnippetList()}
     </div>
   );
 }
 
 /**
- * Hook to manage @-mention style scriptlet insertion
+ * Hook to manage @-mention style prompt snippet insertion
  */
-export function useScriptletMention(
+export function usePromptSnippetMention(
   textareaRef: React.RefObject<HTMLTextAreaElement>,
   onInsert: (text: string, triggerStart: number, triggerEnd: number) => void,
 ) {

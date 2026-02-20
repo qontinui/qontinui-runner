@@ -1,12 +1,12 @@
 /**
- * useScriptData Hook
+ * usePlaywrightTestData Hook
  *
- * Fetches and manages data for the Script widget.
+ * Fetches and manages data for the Playwright Test widget.
  * Polls the step execution API for script data.
  */
 
 import { useState, useEffect, useCallback, useMemo } from "react";
-import type { ScriptData } from "./types";
+import type { PlaywrightTestData } from "./types";
 import type { ScriptExecution, StepStats } from "../shared/types";
 
 const API_BASE = "http://localhost:9876";
@@ -42,7 +42,7 @@ interface StepExecutionResponse {
 /**
  * Hook that provides script data for the widget.
  */
-export function useScriptData(): ScriptData {
+export function usePlaywrightTestData(): PlaywrightTestData {
   const [scripts, setScripts] = useState<ScriptExecution[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, _setError] = useState<string | null>(null);
@@ -150,4 +150,4 @@ export function useScriptData(): ScriptData {
   };
 }
 
-export default useScriptData;
+export default usePlaywrightTestData;

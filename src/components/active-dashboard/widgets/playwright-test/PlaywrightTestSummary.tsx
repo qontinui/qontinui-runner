@@ -1,7 +1,7 @@
 /**
- * ScriptSummary Component
+ * PlaywrightTestSummary Component
  *
- * Compact summary view for script widget.
+ * Compact summary view for playwright test widget.
  * Shows quick stats and the last few scripts with status.
  */
 
@@ -10,7 +10,7 @@ import { cn } from "../../../../lib/utils";
 import { Badge } from "../../../ui";
 import { StepStatsBar, StepStatusBadge } from "../shared";
 import { getStatusColors } from "@/design-system";
-import type { ScriptSummaryProps } from "./types";
+import type { PlaywrightTestSummaryProps } from "./types";
 import type { ScriptExecution } from "../shared/types";
 
 /**
@@ -62,7 +62,7 @@ function CompactScriptRow({ script }: { script: ScriptExecution }) {
 /**
  * Compact summary widget for scripts.
  */
-export function ScriptSummary({ status, data }: ScriptSummaryProps) {
+export function PlaywrightTestSummary({ status, data }: PlaywrightTestSummaryProps) {
   const { scripts, currentScript, stats } = data;
   const recentScripts = scripts.slice(0, 3);
   const pendingColors = getStatusColors("pending");
@@ -94,4 +94,4 @@ export function ScriptSummary({ status, data }: ScriptSummaryProps) {
   );
 }
 
-export default ScriptSummary;
+export default PlaywrightTestSummary;

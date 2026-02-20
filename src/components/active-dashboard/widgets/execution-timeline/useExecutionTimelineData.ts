@@ -594,7 +594,11 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
       // Count verification steps that are checks/tests
       const checkSteps = iterGroup.steps.filter(
         (s) =>
-          s.type === "check" || s.type === "test" || s.type === "playwright" || s.type === "shell",
+          s.type === "check" ||
+          s.type === "test" ||
+          s.type === "command" ||
+          s.type === "playwright" ||
+          s.type === "shell",
       );
       const passed = checkSteps.filter((s) => s.status === "success").length;
       const total = checkSteps.length;

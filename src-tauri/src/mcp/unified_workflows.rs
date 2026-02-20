@@ -1296,13 +1296,15 @@ pub async fn run_unified_workflow(
                         if config.shell_command.is_none() {
                             config.shell_command = Some(cmd);
                         }
+                        // Normalize "test" to "command" (test is now a command dispatch mode)
+                        config.step_type = "command".to_string();
                     }
                     _ => {}
                 }
             } else {
                 // Even without a "command" field, normalize legacy step types
                 match config.step_type.as_str() {
-                    "shell_command" | "check" | "check_group" => {
+                    "shell_command" | "check" | "check_group" | "test" => {
                         config.step_type = "command".to_string();
                     }
                     _ => {}
@@ -1977,12 +1979,13 @@ pub async fn execute_inline_workflow(
                         if config.shell_command.is_none() {
                             config.shell_command = Some(cmd);
                         }
+                        config.step_type = "command".to_string();
                     }
                     _ => {}
                 }
             } else {
                 match config.step_type.as_str() {
-                    "shell_command" | "check" | "check_group" => {
+                    "shell_command" | "check" | "check_group" | "test" => {
                         config.step_type = "command".to_string();
                     }
                     _ => {}

@@ -3,7 +3,7 @@
  *
  * Allows users to collect multiple analyses for AI test generation.
  * Supports three analysis methods:
- * - Playwright: Run a script from the Scripts library to analyze DOM
+ * - Playwright: Run a script from the Playwright Tests library to analyze DOM
  * - Vision: Capture monitor screenshot and analyze with OCR/segmentation
  * - API Request: Execute a saved API request from the Library
  *
@@ -130,7 +130,7 @@ export function PageAnalyzer({ onAnalysisComplete, initialAnalyses }: PageAnalyz
   const loadPlaywrightScripts = async () => {
     setLoadingScripts(true);
     try {
-      const response = await fetch(`${API_BASE}/playwright/scripts`);
+      const response = await fetch(`${API_BASE}/playwright/tests`);
       const result = await response.json();
       if (result.success && result.data) {
         setPlaywrightScripts(result.data);
@@ -580,7 +580,7 @@ export function PageAnalyzer({ onAnalysisComplete, initialAnalyses }: PageAnalyz
                 </div>
               ) : playwrightScripts.length === 0 ? (
                 <p className="text-sm text-neutral-400">
-                  No Playwright scripts found. Create one in the Script Builder first.
+                  No Playwright scripts found. Create one in the Playwright Test Builder first.
                 </p>
               ) : (
                 <select
