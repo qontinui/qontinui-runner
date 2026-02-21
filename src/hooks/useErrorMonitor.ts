@@ -295,7 +295,7 @@ interface UseFixWorkflowReturn {
   /** Check for fixable errors */
   check: (taskRunId?: string) => Promise<FixableErrorsSummary>;
   /** Generate fix workflow */
-  generateWorkflow: () => Promise<Record<string, unknown>>;
+  generateWorkflow: (taskRunId?: string) => Promise<Record<string, unknown>>;
   /** Generate workflow for single error */
   generateSingleErrorWorkflow: (errorId: number) => Promise<Record<string, unknown>>;
 }
@@ -321,11 +321,12 @@ export function useFixWorkflow(): UseFixWorkflowReturn {
     }
   }, []);
 
-  const generateWorkflow = useCallback(async () => {
+  const generateWorkflow = useCallback(async (taskRunId?: string) => {
     try {
       setLoading(true);
       setError(null);
-      const result = await errorMonitorService.generateErrorFixWorkflow();
+      const config = taskRunId ? { taskRunId } : undefined;
+      const result = await errorMonitorService.generateErrorFixWorkflow(config);
       return result.workflowJson;
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Failed to generate workflow";

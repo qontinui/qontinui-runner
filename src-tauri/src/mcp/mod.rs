@@ -44,6 +44,7 @@ pub mod rag;
 pub mod recordings;
 pub mod reflection_api;
 pub mod saved_api_requests;
+pub mod scheduler;
 pub mod sdk_client;
 pub mod server;
 pub mod settings;

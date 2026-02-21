@@ -17,7 +17,9 @@ import {
   Trash2,
   RotateCcw,
 } from "lucide-react";
+import { cn } from "../../lib/utils";
 import { useRunSelection } from "../../contexts/RunSelectionContext";
+import { useErrorBadge } from "../../hooks/useErrorMonitor";
 import type { TaskRun, TaskRunStatus } from "../../types/aiData";
 import { getStatusColors } from "@/design-system";
 
@@ -137,6 +139,7 @@ function RunItem({
   const StatusIcon = config.icon;
   const isRunning = run.status === "running";
   const duration = calculateDuration(run.created_at, run.completed_at);
+  const errorBadge = useErrorBadge(run.id);
 
   return (
     <button
@@ -192,6 +195,20 @@ function RunItem({
           )}
         </div>
       </div>
+
+      {/* Error Badge */}
+      {errorBadge.count > 0 && (
+        <span
+          className={cn(
+            "ml-auto px-1.5 py-0.5 text-[10px] rounded-full font-medium",
+            errorBadge.highestSeverity === "critical" || errorBadge.highestSeverity === "error"
+              ? "bg-red-500/20 text-red-400"
+              : "bg-yellow-500/20 text-yellow-400",
+          )}
+        >
+          {errorBadge.count}
+        </span>
+      )}
 
       {/* Selection Indicator */}
       {isSelected && <CheckCircle className="w-4 h-4 text-primary flex-shrink-0" />}

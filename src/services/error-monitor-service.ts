@@ -174,7 +174,9 @@ export const errorMonitorService = {
   /**
    * Generate an error fix workflow.
    */
-  async generateErrorFixWorkflow(config?: ErrorFixWorkflowConfig): Promise<GeneratedWorkflow> {
+  async generateErrorFixWorkflow(
+    config?: Partial<ErrorFixWorkflowConfig>,
+  ): Promise<GeneratedWorkflow> {
     return invoke("generate_error_fix_workflow", { config });
   },
 

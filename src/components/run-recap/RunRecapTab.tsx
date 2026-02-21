@@ -18,7 +18,17 @@
  */
 
 import { useState } from "react";
-import { Activity, XCircle, Users, FileText, Play, Loader2, Target } from "lucide-react";
+import {
+  Activity,
+  AlertCircle,
+  XCircle,
+  Users,
+  FileText,
+  Play,
+  Loader2,
+  Target,
+} from "lucide-react";
+import { cn } from "../../lib/utils";
 import { useRunSelectionOptional } from "../../contexts/RunSelectionContext";
 import { useTaskRunRecap } from "../../hooks/useTaskRunRecap";
 import { useReopenTaskRun } from "../../hooks/useAiData";
@@ -33,6 +43,8 @@ import { KnowledgeTab } from "./KnowledgeTab";
 // AutomationTab hidden for production - visual automation feature
 // import { AutomationTab } from "./AutomationTab";
 import { ContextTab } from "./ContextTab";
+import { ErrorMonitorTab } from "../error-monitor/ErrorMonitorTab";
+import { useErrorBadge } from "../../hooks/useErrorMonitor";
 import { getAccentColors, getStatusColors } from "@/design-system";
 
 // ============================================================================
@@ -50,6 +62,7 @@ export function RunRecapTab({ onNavigateToAiOutput }: RunRecapTabProps = {}) {
   const [activeTab, setActiveTab] = useState("timeline");
   const [additionalSessions, setAdditionalSessions] = useState(3);
   const reopenMutation = useReopenTaskRun();
+  const errorBadge = useErrorBadge(runSelection?.selectedRunId || undefined);
 
   // Check if run is finished (can be continued)
   const isFinished =
@@ -247,6 +260,27 @@ export function RunRecapTab({ onNavigateToAiOutput }: RunRecapTabProps = {}) {
           <TabsTrigger data-ui-id="recap-tab-context" value="context">
             Context
           </TabsTrigger>
+          <TabsTrigger
+            data-ui-id="recap-tab-errors"
+            value="errors"
+            className="flex items-center gap-1.5"
+          >
+            <AlertCircle className="w-3.5 h-3.5" />
+            Errors
+            {errorBadge.count > 0 && (
+              <span
+                className={cn(
+                  "px-1.5 py-0.5 text-xs rounded-full",
+                  errorBadge.highestSeverity === "critical" ||
+                    errorBadge.highestSeverity === "error"
+                    ? "bg-red-500/20 text-red-500"
+                    : "bg-yellow-500/20 text-yellow-500",
+                )}
+              >
+                {errorBadge.count}
+              </span>
+            )}
+          </TabsTrigger>
         </TabsList>
 
         {/* Timeline Tab */}
@@ -271,6 +305,14 @@ export function RunRecapTab({ onNavigateToAiOutput }: RunRecapTabProps = {}) {
         {/* Context Tab */}
         <TabsContent value="context">
           <ContextTab taskRunId={taskRunId} />
+        </TabsContent>
+
+        {/* Errors Tab */}
+        <TabsContent value="errors" className="h-full">
+          <ErrorMonitorTab
+            taskRunId={runSelection?.selectedRunId || undefined}
+            taskRunName={selectedRun?.task_name}
+          />
         </TabsContent>
       </Tabs>
     </div>

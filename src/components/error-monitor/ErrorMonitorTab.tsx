@@ -137,7 +137,18 @@ function ErrorItem({
       )}
     >
       {/* Header row */}
-      <div className="flex items-start gap-3 px-4 py-3 cursor-pointer" onClick={onToggleExpand}>
+      <div
+        role="button"
+        tabIndex={0}
+        className="flex items-start gap-3 px-4 py-3 cursor-pointer"
+        onClick={onToggleExpand}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            onToggleExpand();
+          }
+        }}
+      >
         {/* Severity icon */}
         <div className="flex-shrink-0 mt-0.5">
           <SeverityIcon severity={error.severity} />
@@ -268,7 +279,7 @@ function ErrorItem({
   );
 }
 
-function EmptyState() {
+function EmptyState({ isScoped }: { isScoped?: boolean }) {
   const successColors = getStatusColors("success");
   return (
     <div className="flex-1 flex flex-col items-center justify-center text-center p-8">
@@ -280,9 +291,13 @@ function EmptyState() {
       >
         <CheckCircle className={cn("w-8 h-8", successColors.text)} />
       </div>
-      <h3 className="text-lg font-medium mb-2">No Errors Detected</h3>
+      <h3 className="text-lg font-medium mb-2">
+        {isScoped ? "No Errors in This Run" : "No Errors Detected"}
+      </h3>
       <p className="text-sm text-muted-foreground max-w-xs">
-        Configure log sources to start monitoring your application for errors.
+        {isScoped
+          ? "This task run did not produce any errors matching the current filters."
+          : "Configure log sources to start monitoring your application for errors."}
       </p>
     </div>
   );
@@ -292,7 +307,20 @@ function EmptyState() {
 // Main Component
 // =============================================================================
 
-export function ErrorMonitorTab() {
+interface ErrorMonitorTabProps {
+  /** When set, show only errors from this task run */
+  taskRunId?: string;
+  /** Display name for the run (shown in scope indicator) */
+  taskRunName?: string;
+  /** Callback to clear the per-run filter */
+  onClearScope?: () => void;
+}
+
+export function ErrorMonitorTab({
+  taskRunId,
+  taskRunName,
+  onClearScope,
+}: ErrorMonitorTabProps = {}) {
   const [searchText, setSearchText] = useState("");
   const [selectedSeverities, setSelectedSeverities] = useState<ErrorSeverity[]>([]);
   const [selectedStatuses, setSelectedStatuses] = useState<ErrorStatus[]>([
@@ -313,12 +341,13 @@ export function ErrorMonitorTab() {
     resolve,
     ignore,
   } = useErrorEvents({
+    taskRunId,
     severities: selectedSeverities.length > 0 ? selectedSeverities : undefined,
     statuses: selectedStatuses.length > 0 ? selectedStatuses : undefined,
     refreshInterval: 30000, // Refresh every 30 seconds
   });
 
-  const { summary } = useErrorSummary({ refreshInterval: 30000 });
+  const { summary } = useErrorSummary({ taskRunId, refreshInterval: 30000 });
 
   // Filter errors by search text
   const filteredErrors = useMemo(() => {
@@ -382,7 +411,7 @@ export function ErrorMonitorTab() {
             )}
           </div>
           <div className="flex items-center gap-2">
-            <FixErrorsButton />
+            <FixErrorsButton taskRunId={taskRunId} />
             <span className="text-xs text-muted-foreground">
               Manage sources in Settings &gt; Log Sources
             </span>
@@ -406,6 +435,27 @@ export function ErrorMonitorTab() {
           </div>
         )}
       </div>
+
+      {/* Per-run scope indicator */}
+      {taskRunId && (
+        <div className="px-4 py-2 border-b border-border bg-blue-500/10 flex items-center justify-between">
+          <div className="flex items-center gap-2 text-sm">
+            <Info className="w-4 h-4 text-blue-500" />
+            <span className="text-blue-400">
+              Showing errors from: <span className="font-medium">{taskRunName || taskRunId}</span>
+            </span>
+          </div>
+          {onClearScope && (
+            <button
+              onClick={onClearScope}
+              className="text-xs text-blue-400 hover:text-blue-300 flex items-center gap-1"
+            >
+              <X className="w-3 h-3" />
+              Show all errors
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Search and filters */}
       <div className="px-4 py-2 border-b border-border bg-muted/30">
@@ -520,7 +570,7 @@ export function ErrorMonitorTab() {
             <p>Loading errors...</p>
           </div>
         ) : filteredErrors.length === 0 ? (
-          <EmptyState />
+          <EmptyState isScoped={!!taskRunId} />
         ) : (
           <div className="flex flex-col">
             {filteredErrors.map((error) => (

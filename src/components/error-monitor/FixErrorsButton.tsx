@@ -57,7 +57,7 @@ export function FixErrorsButton({
       setError(null);
       setShowDropdown(false);
 
-      const workflow = await generateWorkflow();
+      const workflow = await generateWorkflow(taskRunId);
 
       if (onWorkflowGenerated) {
         onWorkflowGenerated(workflow);
@@ -91,7 +91,7 @@ export function FixErrorsButton({
       setError(null);
       setShowDropdown(false);
 
-      const workflow = await generateWorkflow();
+      const workflow = await generateWorkflow(taskRunId);
 
       // Execute the workflow inline without saving to the library
       // This prevents cluttering the workflow library with auto-generated fix workflows
@@ -332,7 +332,16 @@ export function FixErrorsButton({
 
       {/* Backdrop to close dropdown */}
       {showDropdown && (
-        <div className="fixed inset-0 z-40" onClick={() => setShowDropdown(false)} />
+        <div
+          role="button"
+          tabIndex={0}
+          aria-label="Close dropdown"
+          className="fixed inset-0 z-40"
+          onClick={() => setShowDropdown(false)}
+          onKeyDown={(e) => {
+            if (e.key === "Escape") setShowDropdown(false);
+          }}
+        />
       )}
     </div>
   );
