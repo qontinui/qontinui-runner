@@ -383,10 +383,12 @@ pub fn launch_reflection(
     // which prevents a recursive type cycle (run → launch_reflection → run).
     let exec_id = reflection_id.clone();
     let wf_name = reflection_name.clone();
+    let url_lock = Some(deps.app_state.url_lock_manager.clone());
     crate::unified_workflow_executor::spawn_workflow_with_panic_guard(
         deps.app_state.checkpoint_db.clone(),
         exec_id,
         wf_name,
+        url_lock,
         Box::pin(async move {
             controller
                 .run(

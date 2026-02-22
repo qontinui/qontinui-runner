@@ -39,6 +39,18 @@ impl StepHandler for UiBridgeHandler {
 
         info!("UI Bridge step: action={}, url={}", action, base_url);
 
+        // Acquire per-URL lock if running inside a workflow (has task_run_id).
+        // The lock is held for the workflow's lifetime, not just this step,
+        // ensuring consecutive UI Bridge steps don't interleave with other workflows.
+        if let Some(ref task_run_id) = context.task_run_id {
+            let workflow_name = step.name.as_deref().unwrap_or("unnamed workflow");
+            context
+                .app_state
+                .url_lock_manager
+                .acquire(base_url, task_run_id, workflow_name)
+                .await;
+        }
+
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_millis(timeout_ms))
             .build()

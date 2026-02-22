@@ -2166,10 +2166,12 @@ pub async fn resume_interrupted_workflows(
                     let pid_tracker_for_spawn = pid_tracker.clone();
                     let wf_id_for_spawn = wf_id.clone();
 
+                    let url_lock = Some(app_state.url_lock_manager.clone());
                     super::spawn_workflow_with_panic_guard(
                         checkpoint_db_for_guard,
                         task_id.clone(),
                         task_name.clone(),
+                        url_lock,
                         async move {
                             let session_manager: Arc<crate::claude_session::SessionManager> =
                                 app_handle_for_spawn
@@ -2320,10 +2322,12 @@ pub async fn resume_interrupted_workflows(
                         starting_iteration + 1
                     );
 
+                    let url_lock2 = Some(app_state.url_lock_manager.clone());
                     super::spawn_workflow_with_panic_guard(
                         checkpoint_db_for_guard,
                         task_id.clone(),
                         task_name.clone(),
+                        url_lock2,
                         async move {
                             let session_manager: Arc<crate::claude_session::SessionManager> =
                                 app_handle_for_spawn

@@ -88,9 +88,10 @@ impl StepHandler for ShellCommandHandler {
         let fail_on_error = step.shell_command_fail_on_error.unwrap_or(true);
         let timeout_secs = step.timeout_seconds;
 
-        // Detect if command uses PowerShell syntax
+        // Detect shell type: PowerShell > bash > cmd (on Windows)
         let is_powershell = Self::is_powershell_command(&command);
-        let shell_type = Self::get_shell_type(is_powershell);
+        let is_bash = !is_powershell && Self::is_bash_command(&command);
+        let shell_type = Self::get_shell_type(is_powershell, is_bash);
 
         let timeout_str = timeout_secs
             .map(|t| format!("{}s", t))
@@ -128,6 +129,7 @@ impl StepHandler for ShellCommandHandler {
         let (success, exit_code, stdout, stderr) = Self::run_command(
             &command,
             is_powershell,
+            is_bash,
             working_directory.as_deref(),
             timeout_secs,
         )
@@ -275,10 +277,37 @@ impl ShellCommandHandler {
             || command.contains("| ?")
     }
 
+    /// Check if a command uses bash/Unix syntax that cmd.exe cannot handle.
+    fn is_bash_command(command: &str) -> bool {
+        let trimmed = command.trim();
+        let first_word = trimmed.split_whitespace().next().unwrap_or("");
+
+        // Bash builtins and common Unix commands not available in cmd.exe
+        let bash_commands = [
+            "test", "export", "source", "[", "[[", "unset", "eval", "which", "xargs", "wc", "tr",
+            "tee", "sort", "head", "tail", "grep", "sed", "awk", "cut", "basename", "dirname",
+        ];
+        if bash_commands.contains(&first_word) {
+            return true;
+        }
+
+        // Bash syntax patterns
+        trimmed.contains("$(")      // command substitution
+            || trimmed.contains("${")  // variable expansion
+            || trimmed.contains(">/dev/null")  // Unix null device
+            || trimmed.contains("2>&1")  // stderr redirect
+            || trimmed.contains("<<EOF")  // heredoc
+            || trimmed.contains("<<'EOF'")  // heredoc
+            || (trimmed.starts_with("if ") && trimmed.contains("; then"))  // bash if
+            || (trimmed.starts_with("for ") && trimmed.contains("; do")) // bash for
+    }
+
     /// Get the shell type string for logging.
-    fn get_shell_type(is_powershell: bool) -> &'static str {
+    fn get_shell_type(is_powershell: bool, is_bash: bool) -> &'static str {
         if cfg!(target_os = "windows") && is_powershell {
             "powershell"
+        } else if cfg!(target_os = "windows") && is_bash {
+            "bash"
         } else if cfg!(target_os = "windows") {
             "cmd"
         } else {
@@ -299,6 +328,7 @@ impl ShellCommandHandler {
     async fn run_command(
         command: &str,
         is_powershell: bool,
+        is_bash: bool,
         working_directory: Option<&str>,
         timeout_secs: Option<u64>,
     ) -> (bool, Option<i32>, String, String) {
@@ -307,6 +337,11 @@ impl ShellCommandHandler {
             if is_powershell {
                 let mut c = Command::new("powershell");
                 c.args(["-NoProfile", "-NonInteractive", "-Command", command]);
+                c
+            } else if is_bash {
+                // Use bash for Unix-style commands (available via Git for Windows)
+                let mut c = Command::new("bash");
+                c.args(["-c", command]);
                 c
             } else {
                 // cmd.exe doesn't understand single quotes as string delimiters —
@@ -401,6 +436,56 @@ mod tests {
         ));
         assert!(!ShellCommandHandler::is_powershell_command("echo hello"));
         assert!(!ShellCommandHandler::is_powershell_command("ls -la"));
+    }
+
+    #[test]
+    fn test_is_bash_command() {
+        // Unix builtins
+        assert!(ShellCommandHandler::is_bash_command("test -z \"output\""));
+        assert!(ShellCommandHandler::is_bash_command("export FOO=bar"));
+        assert!(ShellCommandHandler::is_bash_command("grep pattern file"));
+        assert!(ShellCommandHandler::is_bash_command("[ -f file.txt ]"));
+
+        // Bash syntax patterns
+        assert!(ShellCommandHandler::is_bash_command("echo $(git status)"));
+        assert!(ShellCommandHandler::is_bash_command("echo ${HOME}"));
+        assert!(ShellCommandHandler::is_bash_command("cmd >/dev/null 2>&1"));
+        assert!(ShellCommandHandler::is_bash_command(
+            "if test -z \"out\"; then echo ok; fi"
+        ));
+
+        // Not bash - regular commands
+        assert!(!ShellCommandHandler::is_bash_command("git status"));
+        assert!(!ShellCommandHandler::is_bash_command("npm test"));
+        assert!(!ShellCommandHandler::is_bash_command("cargo build"));
+    }
+
+    #[test]
+    fn test_get_shell_type() {
+        assert_eq!(
+            ShellCommandHandler::get_shell_type(true, false),
+            if cfg!(target_os = "windows") {
+                "powershell"
+            } else {
+                "sh"
+            }
+        );
+        assert_eq!(
+            ShellCommandHandler::get_shell_type(false, true),
+            if cfg!(target_os = "windows") {
+                "bash"
+            } else {
+                "sh"
+            }
+        );
+        assert_eq!(
+            ShellCommandHandler::get_shell_type(false, false),
+            if cfg!(target_os = "windows") {
+                "cmd"
+            } else {
+                "sh"
+            }
+        );
     }
 
     #[test]

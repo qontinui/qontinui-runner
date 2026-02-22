@@ -1071,10 +1071,12 @@ pub async fn resume_task_run(
         .clone();
 
     // Use panic-safe spawning to ensure task is marked as failed if workflow panics
+    let url_lock = Some(state.app_state.url_lock_manager.clone());
     crate::unified_workflow_executor::spawn_workflow_with_panic_guard(
         checkpoint_db,
         execution_id_for_guard,
         task_name.clone(),
+        url_lock,
         async move {
             let mut controller =
                 LoopController::new(app_state, config_storage, app_handle, pid_tracker)

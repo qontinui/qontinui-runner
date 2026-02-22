@@ -3100,6 +3100,30 @@ impl StepExecutor {
                         };
                         (success, error, Some(details), None)
                     }
+                    "log_watch" => {
+                        // Execute log watch step (scans dev logs for errors)
+                        let (success, error, output) = self.execute_log_watch_step(step).await;
+                        let details = VerificationStepDetails {
+                            step_id: step
+                                .name
+                                .clone()
+                                .unwrap_or_else(|| format!("step-{}", index)),
+                            phase: "verification".to_string(),
+                            stdout: output,
+                            ..Default::default()
+                        };
+                        (success, error, Some(details), None)
+                    }
+                    "gate" => {
+                        // Gate step is a semantic aggregation marker. Actual pass/fail
+                        // aggregation is handled by the verification phase result logic.
+                        // The gate step itself always succeeds at execution time.
+                        info!(
+                        "Gate step '{}' executed (aggregation handled by verification executor)",
+                        step.name.as_deref().unwrap_or("unnamed")
+                    );
+                        (true, None, None, None)
+                    }
                     _ => {
                         // Generic handler for all other step types in verification.
                         // Output is captured by the post-match normalization block below.
@@ -3487,6 +3511,31 @@ impl StepExecutor {
 
     /// Execute a shell command step
     ///
+    /// Check if a command uses bash/Unix syntax that cmd.exe cannot handle.
+    fn is_bash_command(command: &str) -> bool {
+        let trimmed = command.trim();
+        let first_word = trimmed.split_whitespace().next().unwrap_or("");
+
+        // Bash builtins and common Unix commands not available in cmd.exe
+        let bash_commands = [
+            "test", "export", "source", "[", "[[", "unset", "eval", "which", "xargs", "wc", "tr",
+            "tee", "sort", "head", "tail", "grep", "sed", "awk", "cut", "basename", "dirname",
+        ];
+        if bash_commands.contains(&first_word) {
+            return true;
+        }
+
+        // Bash syntax patterns
+        trimmed.contains("$(")      // command substitution
+            || trimmed.contains("${")  // variable expansion
+            || trimmed.contains(">/dev/null")  // Unix null device
+            || trimmed.contains("2>&1")  // stderr redirect
+            || trimmed.contains("<<EOF")  // heredoc
+            || trimmed.contains("<<'EOF'")  // heredoc
+            || (trimmed.starts_with("if ") && trimmed.contains("; then"))  // bash if
+            || (trimmed.starts_with("for ") && trimmed.contains("; do")) // bash for
+    }
+
     /// Supports variable expansion using `{{variable_name}}` syntax in the command.
     /// Variables are resolved from the runtime context.
     /// timeout_secs: None = no timeout (disabled by default), Some(n) = timeout after n seconds
@@ -3576,8 +3625,13 @@ impl StepExecutor {
             || command.contains("| %")
             || command.contains("| ?");
 
+        // Detect bash/Unix commands that cmd.exe cannot handle
+        let is_bash = !is_powershell && Self::is_bash_command(&command);
+
         let shell_type = if cfg!(target_os = "windows") && is_powershell {
             "powershell"
+        } else if cfg!(target_os = "windows") && is_bash {
+            "bash"
         } else if cfg!(target_os = "windows") {
             "cmd"
         } else {
@@ -3644,11 +3698,17 @@ impl StepExecutor {
         // (execute_steps_with_log_sources -> log_step_event) to avoid duplicates.
         // Tree events above are still emitted for the Session/Actions page.
 
-        // Build the command - use PowerShell for PowerShell syntax on Windows
+        // Build the command - use PowerShell for PowerShell syntax, bash for
+        // Unix-style commands, and cmd.exe as default on Windows
         let mut cmd = if cfg!(target_os = "windows") {
             if is_powershell {
                 let mut c = Command::new("powershell");
                 c.args(["-NoProfile", "-NonInteractive", "-Command", &command]);
+                c
+            } else if is_bash {
+                // Use bash for Unix-style commands (available via Git for Windows)
+                let mut c = Command::new("bash");
+                c.args(["-c", &command]);
                 c
             } else {
                 // cmd.exe doesn't understand single quotes — strip them.
@@ -4239,11 +4299,19 @@ impl StepExecutor {
             || final_command.contains("| %")
             || final_command.contains("| ?");
 
+        // Detect bash/Unix commands that cmd.exe cannot handle
+        let is_bash = !is_powershell && Self::is_bash_command(&final_command);
+
         // Build the command
         let mut cmd = if cfg!(target_os = "windows") {
             if is_powershell {
                 let mut c = Command::new("powershell");
                 c.args(["-NoProfile", "-NonInteractive", "-Command", &final_command]);
+                c
+            } else if is_bash {
+                // Use bash for Unix-style commands (available via Git for Windows)
+                let mut c = Command::new("bash");
+                c.args(["-c", &final_command]);
                 c
             } else {
                 // cmd.exe doesn't understand single quotes — strip them.

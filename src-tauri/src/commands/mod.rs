@@ -31,7 +31,7 @@ use crate::database::CheckpointDb;
 use crate::display::DisplayProcessor;
 use crate::doctor::DoctorHandle;
 use crate::error_monitor::ErrorMonitorHandle;
-use crate::executor::{BridgeManager, ExtractionExecutor};
+use crate::executor::{BridgeManager, ExtractionExecutor, UrlLockManager};
 use crate::mcp_client::McpClientManager;
 use crate::storage::LocalStorage;
 use crate::tiered_info::RunRecordingHandler;
@@ -147,6 +147,10 @@ pub struct AppState {
     /// The Doctor observes process health (CPU, memory, process tree, stdout activity)
     /// and emits events when processes appear stuck. It never kills processes.
     pub doctor_handle: TokioMutex<Option<DoctorHandle>>,
+    /// Per-URL lock manager for UI Bridge operations.
+    /// Ensures only one workflow at a time interacts with a given UI Bridge URL.
+    /// Workflows targeting different URLs run concurrently.
+    pub url_lock_manager: Arc<UrlLockManager>,
     /// Flag indicating the HTTP API server (port 9876) has bound and is ready.
     /// Set by `mcp_api::start_server` after successful bind, checked by the
     /// `is_api_ready` Tauri command so the frontend can gate HTTP calls.

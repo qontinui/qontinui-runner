@@ -1079,10 +1079,12 @@ pub async fn generate_unified_workflow_async_handler(
             .clone();
 
         // Spawn the workflow executor in the background with panic protection
+        let url_lock = Some(state.app_state.url_lock_manager.clone());
         crate::unified_workflow_executor::spawn_workflow_with_panic_guard(
             checkpoint_db,
             execution_id_for_guard,
             workflow_name,
+            url_lock,
             async move {
                 let mut controller =
                     LoopController::new(app_state, config_storage, app_handle, pid_tracker)
@@ -1689,11 +1691,13 @@ pub async fn run_unified_workflow(
         let config_storage = state.config_storage.clone();
         let app_handle = state.app_handle.clone();
         let pid_tracker = state.current_ai_pids.clone();
+        let url_lock = Some(state.app_state.url_lock_manager.clone());
 
         crate::unified_workflow_executor::spawn_workflow_with_panic_guard(
             checkpoint_db,
             execution_id_for_guard,
             workflow_name_for_guard,
+            url_lock,
             async move {
                 let session_manager: Arc<crate::claude_session::SessionManager> = app_handle
                     .state::<Arc<crate::claude_session::SessionManager>>()
@@ -1753,11 +1757,13 @@ pub async fn run_unified_workflow(
     let app_state = state.app_state.clone();
     let config_storage = state.config_storage.clone();
     let app_handle = state.app_handle.clone();
+    let url_lock = Some(state.app_state.url_lock_manager.clone());
 
     crate::unified_workflow_executor::spawn_sequence_with_panic_guard(
         checkpoint_db,
         execution_id_for_guard,
         workflow_name_for_guard,
+        url_lock,
         async move {
             let executor = crate::step_executor::StepExecutor::with_app_handle(
                 app_state.clone(),
@@ -2640,12 +2646,14 @@ pub async fn run_workflow_sequence(
     let checkpoint_db_for_guard = state.app_state.checkpoint_db.clone();
     let sequence_name_for_guard = format!("Workflow Sequence ({} workflows)", workflow_count);
     let execution_id_for_guard = execution_id.clone();
+    let url_lock_for_sequence = Some(state.app_state.url_lock_manager.clone());
 
     // Use panic-safe spawning to ensure task is marked as failed if sequence panics
     crate::unified_workflow_executor::spawn_sequence_with_panic_guard(
         checkpoint_db_for_guard,
         execution_id_for_guard,
         sequence_name_for_guard,
+        url_lock_for_sequence,
         async move {
             info!(
                 "Starting workflow sequence execution: {} workflows",

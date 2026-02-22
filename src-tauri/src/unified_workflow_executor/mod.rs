@@ -125,10 +125,17 @@ struct WorkflowDropGuard {
     execution_id: String,
     workflow_name: String,
     completed: Arc<AtomicBool>,
+    /// URL lock manager for releasing per-URL reservations on drop.
+    url_lock_manager: Option<Arc<crate::executor::UrlLockManager>>,
 }
 
 impl Drop for WorkflowDropGuard {
     fn drop(&mut self) {
+        // Always release URL locks on drop, whether completed or not
+        if let Some(ref mgr) = self.url_lock_manager {
+            mgr.release_all_sync(&self.execution_id);
+        }
+
         if !self.completed.load(Ordering::SeqCst) {
             error!(
                 "Workflow task '{}' (id: {}) was dropped without completing — \
@@ -190,6 +197,7 @@ pub fn spawn_workflow_with_panic_guard<F>(
     checkpoint_db: Arc<crate::database::CheckpointDb>,
     execution_id: String,
     workflow_name: String,
+    url_lock_manager: Option<Arc<crate::executor::UrlLockManager>>,
     fut: F,
 ) where
     F: std::future::Future<Output = loop_controller::WorkflowResult> + Send + 'static,
@@ -197,6 +205,7 @@ pub fn spawn_workflow_with_panic_guard<F>(
     let db_for_guard = checkpoint_db.clone();
     let id_for_guard = execution_id.clone();
     let name_for_guard = workflow_name.clone();
+    let url_lock_for_guard = url_lock_manager.clone();
 
     tokio::spawn(async move {
         // The drop guard ensures cleanup even if this task is cancelled/aborted.
@@ -208,6 +217,7 @@ pub fn spawn_workflow_with_panic_guard<F>(
             execution_id: id_for_guard,
             workflow_name: name_for_guard,
             completed: completed.clone(),
+            url_lock_manager: url_lock_for_guard.clone(),
         };
 
         // Wrap the future in AssertUnwindSafe and catch panics
@@ -216,6 +226,11 @@ pub fn spawn_workflow_with_panic_guard<F>(
         // If we reach here, the task was NOT cancelled — mark the guard as completed
         // so its Drop doesn't fire the failsafe.
         completed.store(true, Ordering::SeqCst);
+
+        // Explicitly release URL locks (async path — more reliable than sync Drop)
+        if let Some(ref mgr) = url_lock_manager {
+            mgr.release_all(&execution_id).await;
+        }
 
         match result {
             Ok(workflow_result) => {
@@ -271,6 +286,7 @@ pub fn spawn_sequence_with_panic_guard<F>(
     checkpoint_db: Arc<crate::database::CheckpointDb>,
     execution_id: String,
     sequence_name: String,
+    url_lock_manager: Option<Arc<crate::executor::UrlLockManager>>,
     fut: F,
 ) where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -278,6 +294,7 @@ pub fn spawn_sequence_with_panic_guard<F>(
     let db_for_guard = checkpoint_db.clone();
     let id_for_guard = execution_id.clone();
     let name_for_guard = sequence_name.clone();
+    let url_lock_for_guard = url_lock_manager.clone();
 
     tokio::spawn(async move {
         let completed = Arc::new(AtomicBool::new(false));
@@ -286,12 +303,18 @@ pub fn spawn_sequence_with_panic_guard<F>(
             execution_id: id_for_guard,
             workflow_name: name_for_guard,
             completed: completed.clone(),
+            url_lock_manager: url_lock_for_guard.clone(),
         };
 
         // Wrap the future in AssertUnwindSafe and catch panics
         let result = std::panic::AssertUnwindSafe(fut).catch_unwind().await;
 
         completed.store(true, Ordering::SeqCst);
+
+        // Explicitly release URL locks (async path — more reliable than sync Drop)
+        if let Some(ref mgr) = url_lock_manager {
+            mgr.release_all(&execution_id).await;
+        }
 
         match result {
             Ok(()) => {

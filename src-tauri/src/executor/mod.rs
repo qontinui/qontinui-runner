@@ -20,6 +20,7 @@ pub mod state;
 pub mod step_adapter;
 pub mod traits;
 pub mod unified_execution;
+pub mod url_lock;
 
 pub use bridge_helpers::{
     get_or_create_default_bridge, is_default_bridge_running, require_running_bridge,
@@ -35,6 +36,9 @@ pub use python_bridge::PythonBridge;
 pub use results::{ExecutionOutcome, IntoOutcome};
 pub use state::ExecutorState;
 pub use traits::{Executor, ExecutorError, FromContext};
+#[allow(unused_imports)]
+pub use url_lock::UrlLockInfo;
+pub use url_lock::UrlLockManager;
 // Re-export unified execution utilities (primary integration point for executor traits)
 // Note: These are public API exports used by external consumers (e.g., MCP API)
 #[allow(unused_imports)]
