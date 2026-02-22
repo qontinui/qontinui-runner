@@ -461,6 +461,31 @@ pub struct ExecutionStepConfig {
     #[serde(alias = "uiBridgeTimeoutMs", alias = "ui_bridge_timeout_ms")]
     pub ui_bridge_timeout_ms: Option<u64>,
 
+    /// UI Bridge: Comparison mode ("structural", "visual", "both") for compare action
+    #[serde(alias = "uiBridgeCompareMode", alias = "ui_bridge_compare_mode")]
+    pub ui_bridge_compare_mode: Option<String>,
+
+    /// UI Bridge: Reference snapshot data (JSON) for compare action
+    #[serde(
+        alias = "uiBridgeReferenceSnapshot",
+        alias = "ui_bridge_reference_snapshot"
+    )]
+    pub ui_bridge_reference_snapshot: Option<serde_json::Value>,
+
+    /// UI Bridge: Reference snapshot ID for compare action (loads from saved snapshots)
+    #[serde(
+        alias = "uiBridgeReferenceSnapshotId",
+        alias = "ui_bridge_reference_snapshot_id"
+    )]
+    pub ui_bridge_reference_snapshot_id: Option<String>,
+
+    /// UI Bridge: Severity threshold for compare action ("critical", "major", "minor", "info")
+    #[serde(
+        alias = "uiBridgeSeverityThreshold",
+        alias = "ui_bridge_severity_threshold"
+    )]
+    pub ui_bridge_severity_threshold: Option<String>,
+
     // ========================================================================
     // Console Error Handling
     // ========================================================================
@@ -2587,6 +2612,27 @@ impl StepExecutor {
                 // Return output as the third element for potential logging
                 (success, error, output, None)
             }
+            // ================================================================
+            // Log Watch Step Type (scan dev logs for errors)
+            // ================================================================
+            "log_watch" => {
+                let (success, error, output) = self.execute_log_watch_step(step).await;
+                (success, error, output, None)
+            }
+            // ================================================================
+            // Gate Step Type (aggregate verification results)
+            // ================================================================
+            "gate" => {
+                // The gate step is a semantic aggregation marker used by workflow
+                // generation. Actual pass/fail aggregation is handled by
+                // execute_verification_steps_with_events which checks all required
+                // steps. The gate step itself always succeeds at execution time.
+                info!(
+                    "Gate step '{}' executed (aggregation handled by verification executor)",
+                    step.name.as_deref().unwrap_or("unnamed")
+                );
+                (true, None, None, None)
+            }
             _ => {
                 // Delegate to handler registry for any unrecognized step type
                 warn!("Unknown step type: {}", step.step_type);
@@ -3309,6 +3355,130 @@ impl StepExecutor {
 
         info!("{}", result.summary());
         result
+    }
+
+    // =========================================================================
+    // Log Watch Step Execution
+    // =========================================================================
+
+    /// Execute a log_watch step: scan .dev-logs/ for error patterns.
+    ///
+    /// Reads configured log sources and scans the tail of each file for
+    /// error patterns (ERROR, Exception, Traceback, etc.). Returns success
+    /// with any detected errors in the output string. The log_watch step is
+    /// typically non-critical (required=false), so errors are informational.
+    async fn execute_log_watch_step(
+        &self,
+        _step: &ExecutionStepConfig,
+    ) -> (bool, Option<String>, Option<String>) {
+        use std::io::{BufRead, BufReader};
+
+        let dev_logs = Self::get_dev_logs_dir();
+        let source_names = get_default_log_source_names();
+
+        let mut all_errors: Vec<LogError> = Vec::new();
+        let mut scanned_sources = 0;
+
+        for source_name in &source_names {
+            let log_path = dev_logs.join(source_name);
+            if !log_path.exists() {
+                continue;
+            }
+
+            let file = match std::fs::File::open(&log_path) {
+                Ok(f) => f,
+                Err(e) => {
+                    warn!("log_watch: Could not open {}: {}", source_name, e);
+                    continue;
+                }
+            };
+
+            scanned_sources += 1;
+
+            // Read all lines and scan from the end for efficiency.
+            // Only scan the last 500 lines to avoid processing huge log files.
+            let reader = BufReader::new(file);
+            let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
+
+            let start_line = lines.len().saturating_sub(500);
+            for (idx, line) in lines.iter().enumerate().skip(start_line) {
+                for pattern in DEFAULT_ERROR_PATTERNS {
+                    if line.contains(pattern) {
+                        // Collect context lines
+                        let ctx_start = idx.saturating_sub(CONTEXT_LINES);
+                        let ctx_end = (idx + CONTEXT_LINES + 1).min(lines.len());
+
+                        let context_before: Vec<String> = lines[ctx_start..idx].to_vec();
+                        let context_after: Vec<String> = if idx + 1 < ctx_end {
+                            lines[idx + 1..ctx_end].to_vec()
+                        } else {
+                            Vec::new()
+                        };
+
+                        all_errors.push(LogError {
+                            source: source_name.clone(),
+                            line_number: idx + 1,
+                            timestamp: None,
+                            message: line.clone(),
+                            context_before,
+                            context_after,
+                            error_type: pattern.to_string(),
+                        });
+                        break; // Only match first pattern per line
+                    }
+                }
+            }
+        }
+
+        let output = if all_errors.is_empty() {
+            format!(
+                "Log watch: scanned {} source(s), no errors detected.",
+                scanned_sources
+            )
+        } else {
+            // Deduplicate and limit output
+            let error_count = all_errors.len();
+            let display_limit = 10;
+            let mut summary = format!(
+                "Log watch: scanned {} source(s), {} error(s) detected.\n",
+                scanned_sources, error_count
+            );
+            for (i, err) in all_errors.iter().take(display_limit).enumerate() {
+                summary.push_str(&format!(
+                    "\n[{}] {}:{} — {}\n  {}\n",
+                    i + 1,
+                    err.source,
+                    err.line_number,
+                    err.error_type,
+                    // Truncate long lines
+                    if err.message.len() > 200 {
+                        format!("{}...", &err.message[..200])
+                    } else {
+                        err.message.clone()
+                    }
+                ));
+            }
+            if error_count > display_limit {
+                summary.push_str(&format!(
+                    "\n... and {} more error(s)\n",
+                    error_count - display_limit
+                ));
+            }
+            summary
+        };
+
+        info!(
+            "log_watch: {}",
+            if all_errors.is_empty() {
+                "clean"
+            } else {
+                "errors found"
+            }
+        );
+
+        // log_watch always returns success — it's informational.
+        // The step is typically marked required=false so it won't fail the workflow.
+        (true, None, Some(output))
     }
 
     // =========================================================================

@@ -20,6 +20,7 @@ pub mod awas;
 pub mod awas_bridge;
 pub mod checkpoints;
 pub mod checks;
+pub mod comparison_snapshots;
 pub mod configs;
 pub mod contexts;
 pub mod dom_capture;

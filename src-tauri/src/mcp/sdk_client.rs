@@ -653,9 +653,27 @@ async fn handle_ai_summary(State(state): State<Arc<ApiState>>) -> Json<serde_jso
 // Page Navigation Relay Handlers
 // =============================================================================
 
+/// GET /ui-bridge/sdk/tabs — List connected browser tabs
+async fn handle_tabs(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/tabs", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
 /// POST /ui-bridge/sdk/page/refresh — Refresh the page
-async fn handle_page_refresh(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
-    match sdk_request(&state, Method::POST, "/control/page/refresh", None).await {
+async fn handle_page_refresh(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Json<serde_json::Value> {
+    match sdk_request(
+        &state,
+        Method::POST,
+        "/control/page/refresh",
+        body.map(|b| b.0),
+    )
+    .await
+    {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
     }
@@ -673,16 +691,36 @@ async fn handle_page_navigate(
 }
 
 /// POST /ui-bridge/sdk/page/back — Go back in history
-async fn handle_page_go_back(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
-    match sdk_request(&state, Method::POST, "/control/page/back", None).await {
+async fn handle_page_go_back(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Json<serde_json::Value> {
+    match sdk_request(
+        &state,
+        Method::POST,
+        "/control/page/back",
+        body.map(|b| b.0),
+    )
+    .await
+    {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
     }
 }
 
 /// POST /ui-bridge/sdk/page/forward — Go forward in history
-async fn handle_page_go_forward(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
-    match sdk_request(&state, Method::POST, "/control/page/forward", None).await {
+async fn handle_page_go_forward(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Json<serde_json::Value> {
+    match sdk_request(
+        &state,
+        Method::POST,
+        "/control/page/forward",
+        body.map(|b| b.0),
+    )
+    .await
+    {
         Ok(data) => Json(data),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
     }
@@ -1016,6 +1054,8 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/ui-bridge/sdk/ai/analyze/cross-app-compare",
             post(handle_ai_analyze_cross_app_compare),
         )
+        // Tab registry
+        .route("/ui-bridge/sdk/tabs", get(handle_tabs))
         // Page navigation
         .route("/ui-bridge/sdk/page/refresh", post(handle_page_refresh))
         .route("/ui-bridge/sdk/page/navigate", post(handle_page_navigate))

@@ -41,6 +41,8 @@ pub enum StepType {
     Playwright,
     /// Watch logs for errors (runtime error detection)
     LogWatch,
+    /// Gate step: aggregates required step results (pass/fail)
+    Gate,
 
     // ========================================================================
     // Command Steps
@@ -104,6 +106,7 @@ impl StepType {
             StepType::Command
                 | StepType::Playwright
                 | StepType::LogWatch
+                | StepType::Gate
                 | StepType::Screenshot
                 | StepType::UiBridge
         )
@@ -166,6 +169,7 @@ impl StepType {
             // Verification - varies by test complexity
             StepType::Playwright => Some(60_000), // 60 seconds
             StepType::LogWatch => Some(5_000),    // 5 seconds (quick log scan)
+            StepType::Gate => Some(100),          // Near-instant (aggregation only)
 
             // Command - varies widely, use conservative defaults
             StepType::Command => Some(30_000),  // 30 seconds
@@ -223,6 +227,7 @@ impl StepType {
             // Verification
             "playwright" => Some(StepType::Playwright),
             "log_watch" | "logwatch" => Some(StepType::LogWatch),
+            "gate" => Some(StepType::Gate),
 
             // Command (includes legacy: shell_command, check, check_group, api_request, mcp_call, test)
             "command" | "test" | "shell_command" | "shellcommand" | "shell" | "check"
@@ -269,6 +274,7 @@ impl StepType {
             StepType::GuiWorkflow => "gui_workflow",
             StepType::Playwright => "playwright",
             StepType::LogWatch => "log_watch",
+            StepType::Gate => "gate",
             StepType::Command => "command",
             StepType::UiBridge => "ui_bridge",
             StepType::Prompt => "prompt",
@@ -425,6 +431,8 @@ mod tests {
             StepType::Screenshot,
             StepType::GuiWorkflow,
             StepType::Playwright,
+            StepType::LogWatch,
+            StepType::Gate,
             StepType::Command,
             StepType::UiBridge,
             StepType::Prompt,

@@ -269,6 +269,7 @@ pub fn create_router(
         .merge(crate::mcp::automation_runs::routes())
         .merge(crate::mcp::checkpoints::routes())
         .merge(crate::mcp::checks::routes())
+        .merge(crate::mcp::comparison_snapshots::routes())
         .merge(crate::mcp::configs::routes())
         .merge(crate::mcp::contexts::routes())
         .merge(crate::mcp::dom_capture::routes())
