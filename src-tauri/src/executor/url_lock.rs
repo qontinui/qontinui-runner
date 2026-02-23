@@ -238,6 +238,61 @@ impl UrlLockManager {
         }
     }
 
+    /// Clean up stale locks whose holding task runs are no longer running.
+    ///
+    /// Reads the lock state, checks each holder's task run status in the DB,
+    /// and removes entries whose task run is no longer "running".
+    pub async fn cleanup_stale_locks(&self, db: &crate::database::CheckpointDb) {
+        // First pass: identify stale entries under a read lock
+        let stale_ids: Vec<(String, String)> = {
+            let state = self.state.read().await;
+            let mut stale = Vec::new();
+            for (url, entry) in state.iter() {
+                match db.get_task_run(&entry.holder_task_run_id) {
+                    Ok(Some(task_run)) if task_run.status == "running" => {
+                        // Still running — not stale
+                    }
+                    Ok(_) => {
+                        // Not running (completed, failed, stopped, or not found)
+                        stale.push((url.clone(), entry.holder_task_run_id.clone()));
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to check task run status for lock cleanup ({}): {}",
+                            entry.holder_task_run_id, e
+                        );
+                    }
+                }
+            }
+            stale
+        };
+
+        if stale_ids.is_empty() {
+            return;
+        }
+
+        // Second pass: remove stale entries under a write lock
+        {
+            let mut state = self.state.write().await;
+            for (url, task_run_id) in &stale_ids {
+                // Re-check that the entry still belongs to the same task (avoid race)
+                if let Some(entry) = state.get(url) {
+                    if entry.holder_task_run_id == *task_run_id {
+                        info!(
+                            "Cleaning up stale URL lock: {} (task {} no longer running)",
+                            url, task_run_id
+                        );
+                        state.remove(url);
+                    }
+                }
+            }
+        }
+
+        // Notify waiters so they can re-acquire
+        self.notify.notify_waiters();
+        info!("Cleaned up {} stale URL lock(s)", stale_ids.len());
+    }
+
     /// Check if a specific URL is currently locked.
     pub async fn is_locked(&self, url: &str) -> bool {
         let normalized = normalize_url(url);

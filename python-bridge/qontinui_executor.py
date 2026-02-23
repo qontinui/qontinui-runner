@@ -1458,15 +1458,28 @@ class QontinuiExecutor:
 
         elif cmd_type == "ws_connect":
             import sys
+            import threading
 
             print("[info    ] WS_DEBUG: ws_connect received!", file=sys.stderr, flush=True)
-            success = self.websocket_handler.connect()
-            print(
-                f"[info    ] WS_DEBUG: ws_connect result: success={success}",
-                file=sys.stderr,
-                flush=True,
-            )
-            return {"success": success}
+
+            # Run connection in background thread to avoid blocking the command loop.
+            # A blocking ws_connect prevents the executor from responding to health
+            # check pings, causing Rust to declare the executor unresponsive.
+            def _connect_in_background():
+                success = self.websocket_handler.connect()
+                print(
+                    f"[info    ] WS_DEBUG: ws_connect result: success={success}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self.event_manager.emit_log(
+                    "info" if success else "error",
+                    f"[WS_CONNECT] Background connect result: success={success}",
+                )
+
+            thread = threading.Thread(target=_connect_in_background, daemon=True)
+            thread.start()
+            return {"success": True}
 
         elif cmd_type == "ws_disconnect":
             self.websocket_handler.disconnect()

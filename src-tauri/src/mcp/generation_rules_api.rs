@@ -154,12 +154,17 @@ pub async fn delete_rule_handler(
 
 /// Register generation rules API routes.
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
-    use axum::routing::{delete, get, post, put};
+    use axum::routing::get;
 
     axum::Router::new()
-        .route("/generation-rules", get(list_rules_handler))
-        .route("/generation-rules", post(create_rule_handler))
-        .route("/generation-rules/{id}", get(get_rule_handler))
-        .route("/generation-rules/{id}", put(update_rule_handler))
-        .route("/generation-rules/{id}", delete(delete_rule_handler))
+        .route(
+            "/generation-rules",
+            get(list_rules_handler).post(create_rule_handler),
+        )
+        .route(
+            "/generation-rules/:id",
+            get(get_rule_handler)
+                .put(update_rule_handler)
+                .delete(delete_rule_handler),
+        )
 }

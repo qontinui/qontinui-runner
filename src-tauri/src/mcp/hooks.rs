@@ -893,10 +893,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/hooks", get(list_hooks).post(create_hook))
         .route(
-            "/hooks/{id}",
+            "/hooks/:id",
             get(get_hook).put(update_hook).delete(delete_hook_handler),
         )
-        .route("/hooks/{id}/enabled", put(set_hook_enabled))
-        .route("/hooks/{id}/test", post(test_hook))
+        .route("/hooks/:id/enabled", put(set_hook_enabled))
+        .route("/hooks/:id/test", post(test_hook))
         .route("/hooks/reorder", put(reorder_hooks))
 }

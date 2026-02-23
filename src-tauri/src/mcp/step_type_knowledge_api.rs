@@ -160,15 +160,17 @@ pub async fn delete_knowledge_handler(
 
 /// Register step type knowledge API routes.
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
-    use axum::routing::{delete, get, post, put};
+    use axum::routing::get;
 
     axum::Router::new()
-        .route("/step-type-knowledge", get(list_knowledge_handler))
-        .route("/step-type-knowledge", post(create_knowledge_handler))
-        .route("/step-type-knowledge/{id}", get(get_knowledge_handler))
-        .route("/step-type-knowledge/{id}", put(update_knowledge_handler))
         .route(
-            "/step-type-knowledge/{id}",
-            delete(delete_knowledge_handler),
+            "/step-type-knowledge",
+            get(list_knowledge_handler).post(create_knowledge_handler),
+        )
+        .route(
+            "/step-type-knowledge/:id",
+            get(get_knowledge_handler)
+                .put(update_knowledge_handler)
+                .delete(delete_knowledge_handler),
         )
 }

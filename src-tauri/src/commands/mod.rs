@@ -33,6 +33,7 @@ use crate::doctor::DoctorHandle;
 use crate::error_monitor::ErrorMonitorHandle;
 use crate::executor::{BridgeManager, ExtractionExecutor, UrlLockManager};
 use crate::mcp_client::McpClientManager;
+use crate::step_executor::handlers::ui_bridge::UiBridgeFailureTracker;
 use crate::storage::LocalStorage;
 use crate::tiered_info::RunRecordingHandler;
 use crate::video_recorder::VideoRecordingService;
@@ -151,6 +152,9 @@ pub struct AppState {
     /// Ensures only one workflow at a time interacts with a given UI Bridge URL.
     /// Workflows targeting different URLs run concurrently.
     pub url_lock_manager: Arc<UrlLockManager>,
+    /// Tracks consecutive UI Bridge failures per URL.
+    /// After 3+ consecutive failures to the same URL, triggers an AI diagnostic.
+    pub ui_bridge_failure_tracker: UiBridgeFailureTracker,
     /// Flag indicating the HTTP API server (port 9876) has bound and is ready.
     /// Set by `mcp_api::start_server` after successful bind, checked by the
     /// `is_api_ready` Tauri command so the frontend can gate HTTP calls.

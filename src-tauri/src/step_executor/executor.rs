@@ -236,6 +236,12 @@ pub struct ExecutionStepConfig {
     #[serde(rename = "type")]
     pub step_type: String,
 
+    /// Explicit command mode: "shell", "check", "check_group", or "test".
+    /// When set, the command handler uses this directly instead of inferring
+    /// from which optional fields are populated.
+    #[serde(alias = "mode", default)]
+    pub command_mode: Option<String>,
+
     /// Step ID from the workflow definition (UUID)
     #[serde(default)]
     pub id: Option<String>,
@@ -485,6 +491,13 @@ pub struct ExecutionStepConfig {
         alias = "ui_bridge_severity_threshold"
     )]
     pub ui_bridge_severity_threshold: Option<String>,
+
+    // ========================================================================
+    // Artifact Step Fields
+    // ========================================================================
+    /// Path to a workflow JSON file to save (used by save_workflow_artifact)
+    #[serde(alias = "artifactInputPath", alias = "artifact_input_path")]
+    pub artifact_input_path: Option<String>,
 
     // ========================================================================
     // Console Error Handling

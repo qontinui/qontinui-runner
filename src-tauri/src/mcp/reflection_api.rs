@@ -478,10 +478,14 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
 
     axum::Router::new()
         // CRUD for reflection fixes
-        .route("/reflection-fixes", post(create_fix_handler))
-        .route("/reflection-fixes", get(list_fixes_handler))
-        .route("/reflection-fixes/:id", get(get_fix_handler))
-        .route("/reflection-fixes/:id", put(update_fix_status_handler))
+        .route(
+            "/reflection-fixes",
+            post(create_fix_handler).get(list_fixes_handler),
+        )
+        .route(
+            "/reflection-fixes/:id",
+            get(get_fix_handler).put(update_fix_status_handler),
+        )
         .route(
             "/reflection-fixes/:id/effectiveness",
             put(update_fix_effectiveness_handler),
@@ -503,9 +507,8 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         )
         .route("/reflection/evaluate", post(evaluate_fixes_handler))
         // Reflection settings
-        .route("/reflection/settings", get(get_reflection_settings_handler))
         .route(
             "/reflection/settings",
-            put(update_reflection_settings_handler),
+            get(get_reflection_settings_handler).put(update_reflection_settings_handler),
         )
 }

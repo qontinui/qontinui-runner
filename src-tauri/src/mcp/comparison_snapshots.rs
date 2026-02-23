@@ -7,7 +7,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::Json,
-    routing::{delete, get, post},
+    routing::get,
     Router,
 };
 use serde::{Deserialize, Serialize};
@@ -272,8 +272,12 @@ async fn handle_delete(
 
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
-        .route("/comparison-snapshots", get(handle_list))
-        .route("/comparison-snapshots", post(handle_create))
-        .route("/comparison-snapshots/{id}", get(handle_get))
-        .route("/comparison-snapshots/{id}", delete(handle_delete))
+        .route(
+            "/comparison-snapshots",
+            get(handle_list).post(handle_create),
+        )
+        .route(
+            "/comparison-snapshots/:id",
+            get(handle_get).delete(handle_delete),
+        )
 }

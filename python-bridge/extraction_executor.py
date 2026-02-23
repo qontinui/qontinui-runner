@@ -424,13 +424,20 @@ class ExtractionExecutor:
             return {"success": False, "error": str(e)}
 
     def _handle_ws_connect(self) -> dict[str, Any]:
-        """Handle ws_connect command."""
-        try:
-            self.websocket_handler.connect()
-            return {"success": True}
-        except Exception as e:
-            logger.error(f"Failed to connect WebSocket: {e}")
-            return {"success": False, "error": str(e)}
+        """Handle ws_connect command - runs in background to avoid blocking pings."""
+        import threading
+
+        def _connect_in_background():
+            try:
+                success = self.websocket_handler.connect()
+                if not success:
+                    logger.error("WebSocket background connect failed")
+            except Exception as e:
+                logger.error(f"Failed to connect WebSocket: {e}")
+
+        thread = threading.Thread(target=_connect_in_background, daemon=True)
+        thread.start()
+        return {"success": True}
 
     def _handle_ws_disconnect(self) -> dict[str, Any]:
         """Handle ws_disconnect command."""

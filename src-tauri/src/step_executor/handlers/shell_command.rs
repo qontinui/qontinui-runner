@@ -260,6 +260,42 @@ impl ShellCommandHandler {
         (envs, remaining.to_string())
     }
 
+    /// Find Git for Windows bash.exe, preferring it over WSL's bash.
+    ///
+    /// Checks common Git install locations. Returns None if not found,
+    /// in which case the caller falls back to bare "bash" (PATH lookup).
+    fn find_git_bash() -> Option<String> {
+        let candidates = [
+            r"C:\Program Files\Git\usr\bin\bash.exe",
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\bin\bash.exe",
+        ];
+        for path in &candidates {
+            if std::path::Path::new(path).exists() {
+                return Some(path.to_string());
+            }
+        }
+        // Try to find via `where.exe git` and derive bash path
+        if let Ok(output) = std::process::Command::new("where.exe").arg("git").output() {
+            if let Ok(stdout) = String::from_utf8(output.stdout) {
+                if let Some(git_path) = stdout.lines().next() {
+                    // git.exe is typically at Git/cmd/git.exe; bash is at Git/usr/bin/bash.exe
+                    let git_dir = std::path::Path::new(git_path)
+                        .parent()
+                        .and_then(|p| p.parent());
+                    if let Some(dir) = git_dir {
+                        let bash = dir.join("usr").join("bin").join("bash.exe");
+                        if bash.exists() {
+                            return Some(bash.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Check if a command uses PowerShell syntax.
     fn is_powershell_command(command: &str) -> bool {
         command.contains("Get-")
@@ -286,6 +322,7 @@ impl ShellCommandHandler {
         let bash_commands = [
             "test", "export", "source", "[", "[[", "unset", "eval", "which", "xargs", "wc", "tr",
             "tee", "sort", "head", "tail", "grep", "sed", "awk", "cut", "basename", "dirname",
+            "curl",
         ];
         if bash_commands.contains(&first_word) {
             return true;
@@ -338,8 +375,12 @@ impl ShellCommandHandler {
                 c.args(["-NoProfile", "-NonInteractive", "-Command", command]);
                 c
             } else if is_bash {
-                // Use bash for Unix-style commands (available via Git for Windows)
-                let mut c = Command::new("bash");
+                // Use Git Bash for Unix-style commands on Windows.
+                // Resolve the full path to avoid accidentally picking up WSL's
+                // bash.exe (C:\Windows\System32\bash.exe) which can fail with
+                // "execvpe(/bin/bash) failed" when WSL has no distro installed.
+                let bash_path = Self::find_git_bash().unwrap_or_else(|| "bash".to_string());
+                let mut c = Command::new(&bash_path);
                 c.args(["-c", command]);
                 c
             } else {
@@ -444,6 +485,9 @@ mod tests {
         assert!(ShellCommandHandler::is_bash_command("export FOO=bar"));
         assert!(ShellCommandHandler::is_bash_command("grep pattern file"));
         assert!(ShellCommandHandler::is_bash_command("[ -f file.txt ]"));
+        assert!(ShellCommandHandler::is_bash_command(
+            "curl -sf -X GET 'http://localhost:9876/reflection-fixes?workflow_name=test&status=applied'"
+        ));
 
         // Bash syntax patterns
         assert!(ShellCommandHandler::is_bash_command("echo $(git status)"));

@@ -3,12 +3,12 @@
 //! Post-processes generated workflows to strengthen verification steps:
 //!
 //! 1. Converts `prompt` verification steps to deterministic equivalents
-//!    (`api_request`, `spec`, `check`) where possible.
-//! 2. Converts Playwright/test-based UI checks to UI Bridge SDK `api_request`
-//!    steps when the SDK is connected — SDK checks are faster, more reliable,
-//!    and don't require Playwright browser installation.
-//! 3. Upgrades weak assertions (e.g., status_code-only on SDK endpoints) to
-//!    include `body_contains` for meaningful content verification.
+//!    (`command` with check_type/curl, `ui_bridge` with assert) where possible.
+//! 2. Converts Playwright-based UI checks to `command` steps using curl to
+//!    UI Bridge SDK endpoints when the SDK is connected — SDK checks are
+//!    faster, more reliable, and don't require Playwright browser installation.
+//! 3. Strengthens weak SDK verification commands (e.g., curl without grep)
+//!    to include content checks for meaningful verification.
 //!
 //! ## Pipeline placement
 //!
@@ -91,12 +91,28 @@ impl AppContext {
 
         // Extract navigation URL from setup steps
         let setup_navigate_url = workflow.setup_steps.iter().find_map(|step| {
-            let url = step.get("url").and_then(|v| v.as_str()).unwrap_or("");
-            if url.contains("ui-bridge/sdk/page/navigate") {
-                step.get("body")
-                    .and_then(|v| v.as_str())
-                    .and_then(|body| serde_json::from_str::<Value>(body).ok())
-                    .and_then(|parsed| parsed.get("url").and_then(|u| u.as_str()).map(String::from))
+            // Check command field for curl to navigate endpoint
+            let cmd = step.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            if cmd.contains("ui-bridge/sdk/page/navigate") {
+                // Try to extract the URL from the -d JSON body in the curl command
+                if let Some(d_pos) = cmd.find("-d") {
+                    let after_d = &cmd[d_pos + 2..].trim_start();
+                    // Find JSON body (single-quoted or double-quoted)
+                    let body_str = if let Some(stripped) = after_d.strip_prefix('\'') {
+                        stripped.split('\'').next()
+                    } else if let Some(stripped) = after_d.strip_prefix('"') {
+                        stripped.split('"').next()
+                    } else {
+                        after_d.split_whitespace().next()
+                    };
+                    body_str
+                        .and_then(|body| serde_json::from_str::<Value>(body).ok())
+                        .and_then(|parsed| {
+                            parsed.get("url").and_then(|u| u.as_str()).map(String::from)
+                        })
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -163,8 +179,8 @@ impl AppContext {
 ///
 /// Checks for:
 /// - `prompt` steps (should be deterministic where possible)
-/// - `command`/`test` steps with `playwright` test_type when SDK is connected (should use SDK)
-/// - `api_request` steps hitting SDK endpoints with weak/missing assertions
+/// - `command` steps with mode "test" and `playwright` test_type when SDK is connected
+/// - `command` steps with mode "shell" hitting SDK endpoints without content validation
 /// - Agentic steps that lack corresponding verification coverage
 pub fn should_harden_verification(workflow: &UnifiedWorkflow) -> bool {
     let has_sdk_connect = {
@@ -174,13 +190,14 @@ pub fn should_harden_verification(workflow: &UnifiedWorkflow) -> bool {
 
     let has_hardenable_steps = workflow.verification_steps.iter().any(|step| {
         let step_type = step.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let mode = step.get("mode").and_then(|v| v.as_str()).unwrap_or("");
 
         match step_type {
             // Prompt steps are always candidates
             "prompt" => true,
 
-            // Test steps (legacy "test" or "command" with test_type) are candidates when SDK is connected
-            "test" | "command" if step.get("test_type").is_some() => {
+            // Command steps with mode "test" are candidates when SDK is connected
+            "command" if mode == "test" || step.get("test_type").is_some() => {
                 if !has_sdk_connect {
                     return false;
                 }
@@ -189,32 +206,14 @@ pub fn should_harden_verification(workflow: &UnifiedWorkflow) -> bool {
                 test_type == "playwright" || is_ui_verification_test(step)
             }
 
-            // API requests to SDK with weak assertions are candidates
-            "api_request" if has_sdk_connect => {
-                let url = step.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                if !url.contains("ui-bridge/sdk") {
+            // Command steps with mode "shell" that call SDK with weak assertions
+            "command" if mode == "shell" && has_sdk_connect => {
+                let cmd = step.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                if !cmd.contains("ui-bridge/sdk") {
                     return false;
                 }
-                // Check if assertions are weak (status_code only, no body_contains)
-                let assertions = step
-                    .get("assertions")
-                    .and_then(|v| v.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0);
-                let has_body_check = step
-                    .get("assertions")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter().any(|a| {
-                            a.get("type")
-                                .and_then(|t| t.as_str())
-                                .map(|t| t == "body_contains")
-                                .unwrap_or(false)
-                        })
-                    })
-                    .unwrap_or(false);
-                // Only status_code assertion, no content validation
-                assertions > 0 && !has_body_check
+                // If using curl to SDK but not grepping for specific content, it's weak
+                !cmd.contains("grep") && !cmd.contains("jq")
             }
 
             _ => false,
@@ -234,7 +233,7 @@ pub fn should_harden_verification(workflow: &UnifiedWorkflow) -> bool {
             .iter()
             .filter(|s| {
                 let t = s.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                t != "gate" && t != "prompt"
+                t != "prompt"
             })
             .count();
 
@@ -354,15 +353,16 @@ fn count_candidates(workflow: &UnifiedWorkflow) -> usize {
         .iter()
         .filter(|step| {
             let t = step.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let mode = step.get("mode").and_then(|v| v.as_str()).unwrap_or("");
             match t {
                 "prompt" => true,
-                "test" | "command" if has_sdk && step.get("test_type").is_some() => {
+                "command" if (mode == "test" || step.get("test_type").is_some()) && has_sdk => {
                     let tt = step.get("test_type").and_then(|v| v.as_str()).unwrap_or("");
                     tt == "playwright" || is_ui_verification_test(step)
                 }
-                "api_request" if has_sdk => {
-                    let url = step.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                    url.contains("ui-bridge/sdk")
+                "command" if mode == "shell" && has_sdk => {
+                    let cmd = step.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                    cmd.contains("ui-bridge/sdk") && !cmd.contains("grep") && !cmd.contains("jq")
                 }
                 _ => false,
             }
@@ -426,15 +426,18 @@ approach. The workflow below was generated for this task: "{description}"
             r#"
 ### Rule 1: Convert `prompt` steps to deterministic equivalents
 
+Only 3 step types are valid: `command`, `ui_bridge`, and `prompt`. Convert prompt steps to the appropriate type.
+
 | Prompt check type | Convert to | Method |
 |---|---|---|
-| UI element presence/structure | `api_request` | UI Bridge SDK endpoint with assertions |
-| Content/text on page | `api_request` | UI Bridge SDK `/ai/search` with `body_contains` assertion |
-| File existence | `check` | `custom_command` with `test -f <path>` |
-| File content | `check` | `custom_command` with `grep -q <pattern> <file>` |
-| Code quality (lint) | `check` | `check_type: "lint"` with appropriate command |
-| Code quality (typecheck) | `check` | `check_type: "typecheck"` with appropriate command |
-| API health/response | `api_request` | Direct HTTP with `status_code` assertion |
+| UI element presence/structure | `command` | curl to UI Bridge SDK endpoint, pipe to grep for content check |
+| Content/text on page | `command` | curl to UI Bridge SDK `/ai/search`, pipe to grep for expected text |
+| File existence | `command` | `check_type: "custom_command"` with `test -f <path>` |
+| File content | `command` | `check_type: "custom_command"` with `grep -q <pattern> <file>` |
+| Code quality (lint) | `command` | `check_type: "lint"` with appropriate command |
+| Code quality (typecheck) | `command` | `check_type: "typecheck"` with appropriate command |
+| API health/response | `command` | curl to endpoint, check exit code |
+| UI assertion | `ui_bridge` | Use assert action with target and expected value |
 | Subjective/qualitative | Keep as `prompt` | Cannot be made deterministic |
 "#,
         );
@@ -444,33 +447,32 @@ approach. The workflow below was generated for this task: "{description}"
 ### Rule 2: Replace Playwright UI tests with UI Bridge SDK checks
 
 When the UI Bridge SDK is connected (it IS connected in this workflow's setup), Playwright-based UI
-verification tests should be converted to `api_request` steps using SDK endpoints. The SDK provides
+verification tests should be converted to `command` steps (using curl) or `ui_bridge` steps. The SDK provides
 direct programmatic access to registered UI elements without requiring a Playwright browser instance.
 
 **Why:** Playwright tests require browser binaries (often missing), are slow, flaky, and test through
 the browser rendering layer. The UI Bridge SDK communicates directly with the app's element registry,
 making checks faster, more reliable, and always available.
 
-**How to convert a Playwright test step to SDK-based api_request steps:**
+**How to convert a Playwright test step to SDK-based steps:**
 
 If a single Playwright test checks multiple things (e.g., "verify tabs exist AND thumbnails render AND
-buttons work"), split it into multiple `api_request` steps — one per distinct verification concern.
+buttons work"), split it into multiple `command` or `ui_bridge` steps — one per distinct verification concern.
 Each step should check one thing well rather than trying to replicate the entire test.
 
 Common conversions:
-| Playwright test checks... | SDK `api_request` equivalent |
+| Playwright test checks... | SDK equivalent |
 |---|---|
-| Element exists on page | `GET /ui-bridge/sdk/elements?contentOnly=true` with `body_contains: "elementId"` |
-| Text content visible | `POST /ui-bridge/sdk/ai/search` with body `{"text":"..."}` and `body_contains` assertion |
-| Tab/section present | `GET /ui-bridge/sdk/elements?contentOnly=true` with `body_contains: "tab-name"` |
-| Page loads without errors | `GET /ui-bridge/sdk/snapshot` with `status_code: 200` and `body_contains: "elements"` |
-| Click interaction works | `POST /ui-bridge/sdk/ai/execute` with body `{"action":"click","elementId":"..."}` |
-| Element count/state | `GET /ui-bridge/sdk/elements` with `body_contains` for expected elements |
+| Element exists on page | `command`: `curl -sf http://localhost:9876/ui-bridge/sdk/elements?contentOnly=true \| grep "elementId"` |
+| Text content visible | `command`: `curl -sf -X POST http://localhost:9876/ui-bridge/sdk/ai/search -H "Content-Type: application/json" -d '{"text":"..."}' \| grep "expected-text"` |
+| Tab/section present | `command`: `curl -sf http://localhost:9876/ui-bridge/sdk/elements?contentOnly=true \| grep "tab-name"` |
+| Page loads without errors | `command`: `curl -sf http://localhost:9876/ui-bridge/sdk/snapshot \| grep "elements"` |
+| Element state assertion | `ui_bridge`: Use assert action with target element and expected value |
+| Element count/state | `command`: `curl -sf http://localhost:9876/ui-bridge/sdk/elements \| grep "expected-element"` |
 
 **URL base for all SDK endpoints:** `http://localhost:9876/ui-bridge/sdk/`
 
-Keep the original `test` step's `id` on ONE of the replacement `api_request` steps, and generate new
-UUIDs for additional steps. If you add steps, update the step count accordingly.
+Keep the original step's `id` on ONE of the replacement steps, and generate new UUIDs for additional steps.
 
 **IMPORTANT — SDK capability limits.** Do NOT convert Playwright tests that involve any of these
 interactions, because the UI Bridge SDK cannot perform them:
@@ -480,7 +482,7 @@ interactions, because the UI Bridge SDK cannot perform them:
 - **Multi-tab or multi-window** interactions
 - **Screenshot pixel comparisons**
 
-These tests MUST remain as Playwright `test` steps.
+These tests MUST remain as `command` steps with `test_type: "playwright"`.
 
 Note: **Drag-and-drop CAN be converted** to SDK. Use `POST /ui-bridge/sdk/ai/execute` with
 `{"action":"drag","elementId":"<source>","params":{"target":{"elementId":"<target>"}}}` or
@@ -490,30 +492,28 @@ with `{"action":"drag","elementId":"<source>","params":{"targetPosition":{"x":N,
 
         if app_context.has_sdk_connect {
             prompt.push_str(r#"
-### Rule 3: Strengthen weak SDK api_request assertions
+### Rule 3: Strengthen weak SDK verification commands
 
-If an existing `api_request` step targets a UI Bridge SDK endpoint but only has a `status_code` assertion,
-add a `body_contains` assertion to verify meaningful content. A 200 response from the SDK just means the
+If an existing `command` step calls a UI Bridge SDK endpoint via curl but only checks exit code (no grep),
+add a pipe to `grep` to verify meaningful content. A successful curl to the SDK just means the
 endpoint is reachable — it doesn't verify the UI state. SDK endpoints return 200 even for EMPTY results.
 
 **Specific endpoint guidance:**
 
-- **`POST /ui-bridge/sdk/ai/search`**: This is the most common weak assertion. The response is `{"results": [...], "total": N}`.
-  When `total` is 0, the search found NOTHING — but status is still 200!
-  **FIX:** Look at the step's `body` field to find the search text (e.g., `{"text": "Settings tab"}`).
-  Extract the key term and add `body_contains` with that term (e.g., `"expected": "Settings"`).
-  If the search text references a specific UI element, use a distinctive keyword from the element's expected text content.
+- **`POST /ui-bridge/sdk/ai/search`**: The response is `{"results": [...], "total": N}`.
+  When `total` is 0, the search found NOTHING — but curl still succeeds!
+  **FIX:** Pipe to `grep` with the expected element text (e.g., `| grep "Settings"`).
 
 - **`GET /ui-bridge/sdk/elements`** or **`GET /ui-bridge/sdk/elements?contentOnly=true`**:
-  Add `body_contains: "id"` at minimum (verifies elements exist). Better: add the expected element ID or text.
+  Pipe to `grep "id"` at minimum (verifies elements exist). Better: grep for the expected element ID or text.
 
-- **`GET /ui-bridge/sdk/snapshot`**: Add `body_contains: "elements"` (verifies snapshot has data).
-  Better: add the expected page title or a known element's text content.
+- **`GET /ui-bridge/sdk/snapshot`**: Pipe to `grep "elements"` (verifies snapshot has data).
+  Better: grep for the expected page title or a known element's text content.
 
-- **`POST /ui-bridge/sdk/discover`**: Add `body_contains` with expected element attributes or text.
+- **`POST /ui-bridge/sdk/discover`**: Pipe to `grep` with expected element attributes or text.
 
 - **`GET /ui-bridge/sdk/ai/summary`** or **`GET /ui-bridge/sdk/ai/snapshot`**:
-  Add `body_contains` with a keyword from the expected page content.
+  Pipe to `grep` with a keyword from the expected page content.
 "#);
         }
 
@@ -521,29 +521,28 @@ endpoint is reachable — it doesn't verify the UI state. SDK endpoints return 2
             prompt.push_str(r#"
 ### Rule 4: Inject page navigation before SDK verification checks
 
-If the workflow's setup_steps include a page navigation step (`POST /ui-bridge/sdk/page/navigate` with a target URL),
-the verification phase MUST also navigate to that same URL before any SDK element checks. This is because the
-agentic phase may navigate the browser away from the target page (e.g., to documentation, error pages, or other
-app routes), and verification needs to be on the correct page to check UI state.
+If the workflow's setup_steps include a page navigation step (curl POST to `/ui-bridge/sdk/page/navigate` or
+a `ui_bridge` step with `action: "navigate"`), the verification phase MUST also navigate to that same URL
+before any SDK element checks. This is because the agentic phase may navigate the browser away from the
+target page (e.g., to documentation, error pages, or other app routes), and verification needs to be on the
+correct page to check UI state.
 
 **How to apply:**
-1. Look in `setup_steps` for any `api_request` step with URL containing `/ui-bridge/sdk/page/navigate`
-2. Extract the target URL from that step's `body` field (e.g., `{"url": "http://localhost:3001/management"}`)
-3. If the FIRST SDK-related step in `verification_steps` is NOT a navigation step, INSERT a new `api_request`
+1. Look in `setup_steps` for any step that navigates to a URL (curl to `/ui-bridge/sdk/page/navigate` or `ui_bridge` navigate action)
+2. Extract the target URL
+3. If the FIRST SDK-related step in `verification_steps` is NOT a navigation step, INSERT a new `command`
    step at the beginning of verification_steps:
    ```json
    {
      "id": "<new-uuid>",
-     "type": "api_request",
+     "type": "command",
      "phase": "verification",
      "name": "Navigate to target page",
-     "method": "POST",
-     "url": "http://localhost:9876/ui-bridge/sdk/page/navigate",
-     "body": "{\"url\": \"<extracted-url>\"}",
-     "content_type": "application/json",
-     "assertions": [{"type": "status_code", "expected": 200}]
+     "command": "curl -sf -X POST http://localhost:9876/ui-bridge/sdk/page/navigate -H \"Content-Type: application/json\" -d \"{\\\"url\\\": \\\"<extracted-url>\\\"}\"",
+     "fail_on_error": true
    }
    ```
+   Or use a `ui_bridge` step with `action: "navigate"` and the target URL.
 4. If verification already starts with a navigate step to the same URL, skip this rule.
 "#);
         }
@@ -552,7 +551,7 @@ app routes), and verification needs to be on the correct page to check UI state.
 ### Rule 5: Ensure every agentic step has corresponding verification coverage
 
 Examine EACH prompt step in `agentic_steps` and identify the distinct goals/features it describes.
-Then check whether `verification_steps` has at least one deterministic step (check, test, api_request, spec)
+Then check whether `verification_steps` has at least one deterministic step (`command` or `ui_bridge`)
 that would FAIL if that specific goal was NOT implemented.
 
 **Common gaps:**
@@ -561,11 +560,10 @@ that would FAIL if that specific goal was NOT implemented.
 - Agentic step says "add keyboard shortcuts" but no verification for keyboard functionality
 
 **How to fix gaps:**
-1. For each uncovered agentic goal, ADD a new `api_request` verification step that checks for the
-   feature's artifacts (e.g., search for specific component names, element types, or content text)
+1. For each uncovered agentic goal, ADD a new `command` verification step (e.g., curl to SDK endpoint
+   piped to grep for expected content) or `ui_bridge` step with assert action
 2. Generate new UUIDs for added steps
-3. Add the new step IDs to the gate's `required_steps` array
-4. If an agentic step has multiple distinct goals (e.g., "implement thumbnails AND drag-and-drop"),
+3. If an agentic step has multiple distinct goals (e.g., "implement thumbnails AND drag-and-drop"),
    add one verification step per goal
 
 **Tab/section existence is NOT adequate coverage.** Checking that a tab named "State View" exists does NOT
@@ -633,13 +631,14 @@ verify that the tab has spatial visualization content. Add content-specific chec
 1. **Only modify verification_steps**: Do NOT change setup_steps, agentic_steps, or completion_steps
 2. **Preserve step IDs**: Every step must keep its original `id` field (unless splitting a step, in which case keep the original ID on one and generate new UUIDs for additions)
 3. **Preserve step order**: Steps must remain in the same relative position
-4. **Adding steps is allowed**: If a Playwright test step checks multiple things, you MAY replace it with multiple `api_request` steps. You MAY also add NEW verification steps to cover uncovered agentic goals. Keep original `id`s on existing steps and generate new UUIDs for additions. Update `gate` required_steps if you add new step IDs.
+4. **Adding steps is allowed**: If a Playwright test step checks multiple things, you MAY replace it with multiple `command` or `ui_bridge` steps. You MAY also add NEW verification steps to cover uncovered agentic goals. Keep original `id`s on existing steps and generate new UUIDs for additions.
 5. **Keep subjective prompts**: If a prompt step is genuinely subjective (e.g., "Is the UX intuitive?"), keep it as `prompt`
 6. **Complete required fields**: Every converted step must have all required fields for its new type
-7. **API request assertions required**: For `api_request` steps, ALWAYS include `assertions` with at least `status_code` AND `body_contains`
-8. **Check conversion fields**: For `check` conversions, include `check_type`, `command`, and `working_directory`
-9. **Do not convert check steps**: Do NOT convert `check` steps (lint, typecheck, etc.) — they are already deterministic
-10. **Do not convert gate steps**: Do NOT convert `gate` steps — they are structural"#);
+7. **Only 3 step types**: All steps must use `command`, `ui_bridge`, or `prompt`. Do NOT output `api_request`, `check`, `test`, `gate`, or `spec` types.
+8. **Command with check_type fields**: For check conversions, include `mode: "check"`, `check_type`, `command`, and `working_directory` on the `command` step
+9. **Do not convert existing command+check_type steps**: Do NOT convert `command` steps that already have `check_type` set (lint, typecheck, etc.) — they are already deterministic
+10. **SDK verification uses command+curl**: Use `command` steps with `mode: "shell"` and curl piped to grep for SDK-based verification, not `api_request`
+11. **Always set mode on command steps**: Every `command` step must include a `mode` field (`shell`, `check`, `check_group`, or `test`) matching the fields present"#);
     }
 
     prompt.push_str(&format!(
@@ -721,15 +720,16 @@ fn build_summary(original: &UnifiedWorkflow, hardened: &UnifiedWorkflow) -> Hard
     let mut converted_count = 0;
     let mut kept_as_prompt_count = 0;
 
-    // Build a map of original step IDs to their types/names for comparison
-    let orig_map: std::collections::HashMap<&str, (&str, &str)> = original
+    // Build a map of original step IDs to their types/modes/names for comparison
+    let orig_map: std::collections::HashMap<&str, (&str, &str, &str)> = original
         .verification_steps
         .iter()
         .filter_map(|s| {
             let id = s.get("id").and_then(|v| v.as_str())?;
             let t = s.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let m = s.get("mode").and_then(|v| v.as_str()).unwrap_or("");
             let n = s.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            Some((id, (t, n)))
+            Some((id, (t, m, n)))
         })
         .collect();
 
@@ -740,17 +740,35 @@ fn build_summary(original: &UnifiedWorkflow, hardened: &UnifiedWorkflow) -> Hard
             .get("type")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
+        let hard_mode = hard_step.get("mode").and_then(|v| v.as_str()).unwrap_or("");
 
-        if let Some(&(orig_type, orig_name)) = orig_map.get(hard_id) {
-            // This step existed in the original — check if type changed
-            if orig_type != hard_type {
+        if let Some(&(orig_type, orig_mode, orig_name)) = orig_map.get(hard_id) {
+            // This step existed in the original — check if type or mode changed
+            let type_changed = orig_type != hard_type;
+            let mode_changed = orig_type == "command"
+                && hard_type == "command"
+                && !orig_mode.is_empty()
+                && !hard_mode.is_empty()
+                && orig_mode != hard_mode;
+
+            if type_changed || mode_changed {
+                let orig_label = if orig_mode.is_empty() {
+                    orig_type.to_string()
+                } else {
+                    format!("{}:{}", orig_type, orig_mode)
+                };
+                let new_label = if hard_mode.is_empty() {
+                    hard_type.to_string()
+                } else {
+                    format!("{}:{}", hard_type, hard_mode)
+                };
                 converted_count += 1;
                 conversions.push(HardeningConversion {
                     step_id: hard_id.to_string(),
                     original_name: orig_name.to_string(),
-                    original_type: orig_type.to_string(),
-                    new_type: hard_type.to_string(),
-                    explanation: format!("Converted from {} to {}", orig_type, hard_type),
+                    original_type: orig_label.clone(),
+                    new_type: new_label.clone(),
+                    explanation: format!("Converted from {} to {}", orig_label, new_label),
                 });
             } else if orig_type == "prompt" {
                 kept_as_prompt_count += 1;
@@ -758,13 +776,21 @@ fn build_summary(original: &UnifiedWorkflow, hardened: &UnifiedWorkflow) -> Hard
         } else {
             // New step (from splitting) — count as a conversion
             let hard_name = hard_step.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let hard_label = if hard_mode.is_empty() {
+                hard_type.to_string()
+            } else {
+                format!("{}:{}", hard_type, hard_mode)
+            };
             converted_count += 1;
             conversions.push(HardeningConversion {
                 step_id: hard_id.to_string(),
                 original_name: format!("(split from parent) {}", hard_name),
                 original_type: "split".to_string(),
-                new_type: hard_type.to_string(),
-                explanation: format!("New {} step from splitting a multi-concern step", hard_type),
+                new_type: hard_label.clone(),
+                explanation: format!(
+                    "New {} step from splitting a multi-concern step",
+                    hard_label
+                ),
             });
         }
     }
@@ -823,10 +849,9 @@ mod tests {
         let mut w = make_test_workflow(verification_steps);
         w.setup_steps = vec![json!({
             "id": "setup-sdk",
-            "type": "api_request",
-            "method": "POST",
-            "url": "http://localhost:9876/ui-bridge/sdk/connect",
-            "body": "{\"url\": \"http://localhost:3001\"}"
+            "type": "command",
+            "mode": "shell",
+            "command": "curl -X POST http://localhost:9876/ui-bridge/sdk/connect -H 'Content-Type: application/json' -d '{\"url\": \"http://localhost:3001\"}'"
         })];
         w
     }
@@ -836,8 +861,8 @@ mod tests {
     #[test]
     fn test_should_harden_returns_false_for_all_deterministic() {
         let workflow = make_test_workflow(vec![
-            json!({"id": "s1", "type": "check", "check_type": "typecheck", "command": "npx tsc --noEmit"}),
-            json!({"id": "s2", "type": "api_request", "method": "GET", "url": "http://localhost:3001/health"}),
+            json!({"id": "s1", "type": "command", "mode": "check", "check_type": "typecheck", "command": "npx tsc --noEmit"}),
+            json!({"id": "s2", "type": "command", "mode": "shell", "command": "curl http://localhost:3001/health | grep ok"}),
         ]);
         assert!(!should_harden_verification(&workflow));
     }
@@ -845,7 +870,7 @@ mod tests {
     #[test]
     fn test_should_harden_returns_true_for_prompt_verification() {
         let workflow = make_test_workflow(vec![
-            json!({"id": "s1", "type": "check", "check_type": "typecheck", "command": "npx tsc --noEmit"}),
+            json!({"id": "s1", "type": "command", "mode": "check", "check_type": "typecheck", "command": "npx tsc --noEmit"}),
             json!({"id": "s2", "type": "prompt", "phase": "verification", "content": "Check if the button exists"}),
         ]);
         assert!(should_harden_verification(&workflow));
@@ -860,7 +885,7 @@ mod tests {
     #[test]
     fn test_should_harden_detects_playwright_with_sdk() {
         let workflow = make_sdk_workflow(vec![
-            json!({"id": "s1", "type": "test", "test_type": "playwright", "command": "npx playwright test ui-check"}),
+            json!({"id": "s1", "type": "command", "mode": "test", "test_type": "playwright", "command": "npx playwright test ui-check"}),
         ]);
         assert!(should_harden_verification(&workflow));
     }
@@ -868,7 +893,7 @@ mod tests {
     #[test]
     fn test_should_harden_ignores_playwright_without_sdk() {
         let workflow = make_test_workflow(vec![
-            json!({"id": "s1", "type": "test", "test_type": "playwright", "command": "npx playwright test"}),
+            json!({"id": "s1", "type": "command", "mode": "test", "test_type": "playwright", "command": "npx playwright test"}),
         ]);
         assert!(!should_harden_verification(&workflow));
     }
@@ -876,30 +901,25 @@ mod tests {
     #[test]
     fn test_should_harden_detects_ui_test_with_sdk() {
         let workflow = make_sdk_workflow(vec![
-            json!({"id": "s1", "type": "test", "test_type": "custom_command", "name": "Verify page renders correctly", "command": "check-ui"}),
+            json!({"id": "s1", "type": "command", "mode": "test", "test_type": "custom_command", "name": "Verify page renders correctly", "command": "check-ui"}),
         ]);
         assert!(should_harden_verification(&workflow));
     }
 
     #[test]
-    fn test_should_harden_detects_weak_sdk_assertions() {
+    fn test_should_harden_detects_weak_sdk_shell_command() {
         let workflow = make_sdk_workflow(vec![json!({
-            "id": "s1", "type": "api_request",
-            "url": "http://localhost:9876/ui-bridge/sdk/elements",
-            "assertions": [{"type": "status_code", "expected": 200}]
+            "id": "s1", "type": "command", "mode": "shell",
+            "command": "curl http://localhost:9876/ui-bridge/sdk/elements"
         })]);
         assert!(should_harden_verification(&workflow));
     }
 
     #[test]
-    fn test_should_harden_ignores_strong_sdk_assertions() {
+    fn test_should_harden_ignores_strong_sdk_shell_command() {
         let workflow = make_sdk_workflow(vec![json!({
-            "id": "s1", "type": "api_request",
-            "url": "http://localhost:9876/ui-bridge/sdk/elements",
-            "assertions": [
-                {"type": "status_code", "expected": 200},
-                {"type": "body_contains", "expected": "button-submit"}
-            ]
+            "id": "s1", "type": "command", "mode": "shell",
+            "command": "curl http://localhost:9876/ui-bridge/sdk/elements | grep button-submit"
         })]);
         assert!(!should_harden_verification(&workflow));
     }
@@ -934,7 +954,9 @@ mod tests {
             json!({"id": "a", "type": "prompt"}),
             json!({"id": "b", "type": "prompt"}),
         ]);
-        let hardened = make_test_workflow(vec![json!({"id": "a", "type": "check"})]);
+        let hardened = make_test_workflow(vec![
+            json!({"id": "a", "type": "command", "mode": "check", "check_type": "lint"}),
+        ]);
 
         let error = validate_hardened_output(&original, &hardened);
         assert!(error.is_some());
@@ -944,11 +966,11 @@ mod tests {
     #[test]
     fn test_validate_allows_step_count_increase_from_splitting() {
         let original = make_test_workflow(vec![
-            json!({"id": "a", "type": "test", "test_type": "playwright"}),
+            json!({"id": "a", "type": "command", "mode": "test", "test_type": "playwright"}),
         ]);
         let hardened = make_test_workflow(vec![
-            json!({"id": "a", "type": "api_request", "url": "http://localhost:9876/ui-bridge/sdk/elements"}),
-            json!({"id": "new-1", "type": "api_request", "url": "http://localhost:9876/ui-bridge/sdk/ai/search"}),
+            json!({"id": "a", "type": "command", "mode": "shell", "command": "curl http://localhost:9876/ui-bridge/sdk/elements | grep button"}),
+            json!({"id": "new-1", "type": "command", "mode": "shell", "command": "curl http://localhost:9876/ui-bridge/sdk/ai/search | grep nav"}),
         ]);
 
         let error = validate_hardened_output(&original, &hardened);
@@ -958,7 +980,9 @@ mod tests {
     #[test]
     fn test_validate_rejects_missing_original_id() {
         let original = make_test_workflow(vec![json!({"id": "step-1", "type": "prompt"})]);
-        let hardened = make_test_workflow(vec![json!({"id": "step-2", "type": "check"})]);
+        let hardened = make_test_workflow(vec![
+            json!({"id": "step-2", "type": "command", "mode": "check", "check_type": "lint"}),
+        ]);
 
         let error = validate_hardened_output(&original, &hardened);
         assert!(error.is_some());
@@ -968,10 +992,14 @@ mod tests {
     #[test]
     fn test_validate_rejects_setup_modification() {
         let mut original = make_test_workflow(vec![json!({"id": "a", "type": "prompt"})]);
-        original.setup_steps = vec![json!({"id": "setup-1", "type": "shell_command"})];
+        original.setup_steps = vec![json!({"id": "setup-1", "type": "command", "mode": "shell"})];
 
-        let mut hardened = make_test_workflow(vec![json!({"id": "a", "type": "check"})]);
-        hardened.setup_steps = vec![json!({"id": "setup-1", "type": "api_request"})];
+        let mut hardened = make_test_workflow(vec![
+            json!({"id": "a", "type": "command", "mode": "check", "check_type": "lint"}),
+        ]);
+        hardened.setup_steps = vec![
+            json!({"id": "setup-1", "type": "command", "mode": "shell", "command": "curl http://example.com"}),
+        ];
 
         let error = validate_hardened_output(&original, &hardened);
         assert!(error.is_some());
@@ -984,7 +1012,7 @@ mod tests {
             json!({"id": "step-1", "type": "prompt", "content": "Check button"}),
         ]);
         let hardened = make_test_workflow(vec![
-            json!({"id": "step-1", "type": "api_request", "method": "GET", "url": "http://localhost:9876/ui-bridge/sdk/elements"}),
+            json!({"id": "step-1", "type": "command", "mode": "shell", "command": "curl http://localhost:9876/ui-bridge/sdk/elements | grep button"}),
         ]);
 
         let error = validate_hardened_output(&original, &hardened);
@@ -998,12 +1026,12 @@ mod tests {
         let original = make_test_workflow(vec![
             json!({"id": "s1", "name": "Check code", "type": "prompt"}),
             json!({"id": "s2", "name": "Check UI", "type": "prompt"}),
-            json!({"id": "s3", "name": "Lint check", "type": "check"}),
+            json!({"id": "s3", "name": "Lint check", "type": "command", "mode": "check", "check_type": "lint"}),
         ]);
         let hardened = make_test_workflow(vec![
-            json!({"id": "s1", "name": "Check code", "type": "check"}),
+            json!({"id": "s1", "name": "Check code", "type": "command", "mode": "check", "check_type": "lint"}),
             json!({"id": "s2", "name": "Check UI", "type": "prompt"}),
-            json!({"id": "s3", "name": "Lint check", "type": "check"}),
+            json!({"id": "s3", "name": "Lint check", "type": "command", "mode": "check", "check_type": "lint"}),
         ]);
 
         let summary = build_summary(&original, &hardened);
@@ -1012,37 +1040,37 @@ mod tests {
         assert_eq!(summary.conversions.len(), 1);
         assert_eq!(summary.conversions[0].step_id, "s1");
         assert_eq!(summary.conversions[0].original_type, "prompt");
-        assert_eq!(summary.conversions[0].new_type, "check");
+        assert!(summary.conversions[0].new_type.contains("command"));
     }
 
     #[test]
-    fn test_summary_tracks_test_to_api_request_conversion() {
+    fn test_summary_tracks_mode_conversion() {
         let original = make_test_workflow(vec![
-            json!({"id": "s1", "name": "Playwright UI test", "type": "test", "test_type": "playwright"}),
+            json!({"id": "s1", "name": "Playwright UI test", "type": "command", "mode": "test", "test_type": "playwright"}),
         ]);
         let hardened = make_test_workflow(vec![
-            json!({"id": "s1", "name": "Verify elements via SDK", "type": "api_request"}),
+            json!({"id": "s1", "name": "Verify elements via SDK", "type": "command", "mode": "shell", "command": "curl http://localhost:9876/ui-bridge/sdk/elements | grep button"}),
         ]);
 
         let summary = build_summary(&original, &hardened);
         assert_eq!(summary.converted_count, 1);
-        assert_eq!(summary.conversions[0].original_type, "test");
-        assert_eq!(summary.conversions[0].new_type, "api_request");
+        assert!(summary.conversions[0].original_type.contains("test"));
+        assert!(summary.conversions[0].new_type.contains("shell"));
     }
 
     #[test]
     fn test_summary_tracks_split_steps() {
         let original = make_test_workflow(vec![
-            json!({"id": "s1", "name": "Big Playwright test", "type": "test"}),
+            json!({"id": "s1", "name": "Big Playwright test", "type": "command", "mode": "test", "test_type": "playwright"}),
         ]);
         let hardened = make_test_workflow(vec![
-            json!({"id": "s1", "name": "Check elements", "type": "api_request"}),
-            json!({"id": "new-1", "name": "Check tabs", "type": "api_request"}),
-            json!({"id": "new-2", "name": "Check content", "type": "api_request"}),
+            json!({"id": "s1", "name": "Check elements", "type": "command", "mode": "shell", "command": "curl http://localhost:9876/ui-bridge/sdk/elements | grep button"}),
+            json!({"id": "new-1", "name": "Check tabs", "type": "command", "mode": "shell", "command": "curl http://localhost:9876/ui-bridge/sdk/elements | grep tab"}),
+            json!({"id": "new-2", "name": "Check content", "type": "command", "mode": "shell", "command": "curl http://localhost:9876/ui-bridge/sdk/elements | grep content"}),
         ]);
 
         let summary = build_summary(&original, &hardened);
-        assert_eq!(summary.converted_count, 3); // 1 type change + 2 new splits
+        assert_eq!(summary.converted_count, 3); // 1 mode change + 2 new splits
         assert_eq!(summary.conversions.len(), 3);
     }
 
@@ -1052,7 +1080,8 @@ mod tests {
     fn test_app_context_detects_web_app() {
         let mut workflow = make_test_workflow(vec![]);
         workflow.setup_steps = vec![json!({
-            "id": "s1", "type": "api_request", "url": "http://localhost:3001/api/test"
+            "id": "s1", "type": "command", "mode": "shell",
+            "command": "curl http://localhost:3001/api/test"
         })];
         let ctx = AppContext::from_workflow(&workflow, "test");
         assert!(ctx.targets_web_app);
@@ -1070,11 +1099,9 @@ mod tests {
         let mut workflow = make_sdk_workflow(vec![]);
         workflow.setup_steps.push(json!({
             "id": "nav-1",
-            "type": "api_request",
-            "method": "POST",
-            "url": "http://localhost:9876/ui-bridge/sdk/page/navigate",
-            "body": "{\"url\": \"http://localhost:3001/management\"}",
-            "content_type": "application/json"
+            "type": "command",
+            "mode": "shell",
+            "command": "curl -X POST http://localhost:9876/ui-bridge/sdk/page/navigate -H 'Content-Type: application/json' -d '{\"url\": \"http://localhost:3001/management\"}'"
         }));
         let ctx = AppContext::from_workflow(&workflow, "test");
         assert_eq!(
@@ -1104,22 +1131,21 @@ mod tests {
     #[test]
     fn test_hardener_prompt_includes_sdk_response_guidance() {
         let workflow = make_sdk_workflow(vec![
-            json!({"id": "s1", "type": "api_request", "url": "http://localhost:9876/ui-bridge/sdk/ai/search", "assertions": [{"type": "status_code", "expected": 200}]}),
+            json!({"id": "s1", "type": "command", "command": "curl -s http://localhost:9876/ui-bridge/sdk/ai/search", "mode": "shell"}),
         ]);
         let ctx = AppContext::from_workflow(&workflow, "test");
         let prompt = build_hardener_prompt("{}", "test", &ctx, None);
         assert!(prompt.contains("ai/search"));
         assert!(prompt.contains("total"));
-        assert!(prompt.contains("body_contains"));
+        assert!(prompt.contains("grep"));
     }
 
     #[test]
     fn test_should_harden_detects_agentic_verification_gap() {
-        // 5 agentic steps but only 2 deterministic verification steps → gap
+        // 3 agentic steps but only 2 deterministic verification steps → gap
         let mut workflow = make_test_workflow(vec![
-            json!({"id": "s1", "type": "check", "check_type": "typecheck", "command": "npx tsc --noEmit"}),
-            json!({"id": "s2", "type": "check", "check_type": "lint", "command": "npx eslint ."}),
-            json!({"id": "s3", "type": "gate", "required_steps": ["s1", "s2"]}),
+            json!({"id": "s1", "type": "command", "mode": "check", "check_type": "typecheck", "command": "npx tsc --noEmit"}),
+            json!({"id": "s2", "type": "command", "mode": "check", "check_type": "lint", "command": "npx eslint ."}),
         ]);
         workflow.agentic_steps = vec![
             json!({"id": "a1", "type": "prompt", "content": "Implement feature A"}),
@@ -1133,10 +1159,9 @@ mod tests {
     fn test_should_harden_no_gap_when_sufficient_coverage() {
         // 2 agentic steps with 3 deterministic verification steps → sufficient
         let mut workflow = make_test_workflow(vec![
-            json!({"id": "s1", "type": "check", "check_type": "typecheck", "command": "npx tsc --noEmit"}),
-            json!({"id": "s2", "type": "api_request", "url": "http://localhost:3001/health"}),
-            json!({"id": "s3", "type": "api_request", "url": "http://localhost:3001/api/test"}),
-            json!({"id": "s4", "type": "gate", "required_steps": ["s1", "s2", "s3"]}),
+            json!({"id": "s1", "type": "command", "mode": "check", "check_type": "typecheck", "command": "npx tsc --noEmit"}),
+            json!({"id": "s2", "type": "command", "mode": "shell", "command": "curl http://localhost:3001/health | grep ok"}),
+            json!({"id": "s3", "type": "command", "mode": "shell", "command": "curl http://localhost:3001/api/test | grep pass"}),
         ]);
         workflow.agentic_steps = vec![
             json!({"id": "a1", "type": "prompt", "content": "Fix feature A"}),
@@ -1148,7 +1173,7 @@ mod tests {
     #[test]
     fn test_hardener_prompt_includes_rule_5() {
         let mut workflow = make_sdk_workflow(vec![
-            json!({"id": "s1", "type": "check", "check_type": "typecheck", "command": "npx tsc --noEmit"}),
+            json!({"id": "s1", "type": "command", "mode": "check", "check_type": "typecheck", "command": "npx tsc --noEmit"}),
         ]);
         workflow.agentic_steps =
             vec![json!({"id": "a1", "type": "prompt", "content": "Implement thumbnails"})];

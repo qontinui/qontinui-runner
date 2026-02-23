@@ -1195,6 +1195,7 @@ function WorkflowBuilderContent({
         type: "command",
         phase: phase as "setup" | "verification" | "completion",
         name: command.name || (phase === "setup" ? "Setup Command" : "Completion Command"),
+        mode: "shell",
         command: command.command,
         shell_command_id: command.id,
         working_directory: command.working_directory ?? undefined,
@@ -1240,6 +1241,7 @@ function WorkflowBuilderContent({
         type: "command",
         phase: phase as "setup" | "verification" | "completion",
         name: check.name,
+        mode: "check",
         check_type: check.check_type as
           | "lint"
           | "format"
@@ -1300,6 +1302,7 @@ function WorkflowBuilderContent({
         type: "command",
         phase: phase as "setup" | "verification" | "completion",
         name: test.name,
+        mode: "test",
         test_type: testTypeMap[test.test_type] || "custom_command",
         test_id: test.id,
         timeout_seconds: test.timeout_seconds,
@@ -1337,6 +1340,7 @@ function WorkflowBuilderContent({
         type: "command",
         phase: phase as "setup" | "verification" | "completion",
         name: group.name,
+        mode: "check_group",
         check_group_id: group.id,
       };
 
@@ -1379,6 +1383,7 @@ function WorkflowBuilderContent({
         type: "command",
         phase: phase as "setup" | "verification" | "completion",
         name: `${server.name}: ${tool.name}`,
+        mode: "shell",
         command: `# MCP tool: ${tool.name} from ${server.name}`,
       };
 

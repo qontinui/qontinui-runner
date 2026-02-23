@@ -4630,19 +4630,19 @@ impl CheckpointDb {
                 // schema_context / verification_quality (rules 6-16)
                 ("seed-schema_context-verification_quality-6", "schema_context", "verification_quality", 6,
                  "Deterministic verification step required",
-                 "verification_steps MUST include at least one deterministic, automated step — one of: `check`, `test`, `spec`, or `api_request` with assertions. Do NOT use only `prompt` type steps for verification. Prompts provide AI judgment, not deterministic pass/fail results. A verification phase with ONLY prompt steps is INVALID.",
+                 "verification_steps MUST include at least one deterministic, automated step — a `command` step (with check_type, test_type, or a shell command) or a `ui_bridge` step (with assert action). Do NOT use only `prompt` type steps for verification. Prompts provide AI judgment, not deterministic pass/fail results. A verification phase with ONLY prompt steps is INVALID.",
                  None),
                 ("seed-schema_context-verification_quality-7", "schema_context", "verification_quality", 7,
                  "Code modification requires typecheck",
-                 "When the workflow creates or modifies source code files (TypeScript, Python, Rust, etc.), verification MUST include a `check` step with the appropriate type checker:\n   - TypeScript/TSX/JSX: `{\"type\": \"check\", \"check_type\": \"typecheck\", \"command\": \"npx tsc --noEmit\", \"working_directory\": \"...\"}`\n   - Python: `{\"type\": \"check\", \"check_type\": \"typecheck\", \"command\": \"mypy .\", \"working_directory\": \"...\"}`\n   - Rust: `{\"type\": \"check\", \"check_type\": \"typecheck\", \"command\": \"cargo check\", \"working_directory\": \"...\"}`",
+                 "When the workflow creates or modifies source code files (TypeScript, Python, Rust, etc.), verification MUST include a `command` step with `check_type` set to the appropriate type checker:\n   - TypeScript/TSX/JSX: `{\"type\": \"command\", \"check_type\": \"typecheck\", \"command\": \"npx tsc --noEmit\", \"working_directory\": \"...\"}`\n   - Python: `{\"type\": \"command\", \"check_type\": \"typecheck\", \"command\": \"mypy .\", \"working_directory\": \"...\"}`\n   - Rust: `{\"type\": \"command\", \"check_type\": \"typecheck\", \"command\": \"cargo check\", \"working_directory\": \"...\"}`",
                  None),
                 ("seed-schema_context-verification_quality-8", "schema_context", "verification_quality", 8,
                  "Web app verification requires SDK or Playwright",
-                 "When the workflow targets a web application (localhost:3001, localhost:1420), verification MUST include at least one of:\n   - An `api_request` step querying UI Bridge SDK endpoints (preferred) to verify UI state programmatically\n   - A `test` step with `test_type: \"playwright\"` for browser-based verification\n   - A `spec` step with UI Bridge assertions",
+                 "When the workflow targets a web application (localhost:3001, localhost:1420), verification MUST include at least one of:\n   - A `command` step using curl to query UI Bridge SDK endpoints (preferred) to verify UI state\n   - A `command` step with `test_type: \"playwright\"` for browser-based verification\n   - A `ui_bridge` step with an `assert` action for direct element assertions",
                  None),
                 ("seed-schema_context-verification_quality-9", "schema_context", "verification_quality", 9,
-                 "Gate step required with ALL non-prompt steps",
-                 "Every workflow with 2+ verification steps MUST include a `gate` step whose `required_steps` array lists the IDs of ALL non-gate, non-prompt verification steps. The gate passes only when every required step passes — there is NO threshold. If a step is worth including in verification, it MUST be in the gate's `required_steps`. Omitting a step from the gate makes its failure invisible to the verification loop.",
+                 "Verification must be deterministic",
+                 "Every workflow with 2+ verification steps should ensure ALL non-prompt verification steps are meaningful and required. If a step is worth including in verification, its failure should be visible to the verification loop. Do NOT include verification steps whose failures would be silently ignored.",
                  None),
                 ("seed-schema_context-verification_quality-10", "schema_context", "verification_quality", 10,
                  "Prompts are supplementary",
@@ -4650,11 +4650,11 @@ impl CheckpointDb {
                  None),
                 ("seed-schema_context-verification_quality-11", "schema_context", "verification_quality", 11,
                  "Test steps with inline commands use repository",
-                 "When a `test` step runs a shell command (e.g., `npx playwright test ...`, `cargo test ...`), set `test_type: \"repository\"`. The `test_type: \"playwright\"` value is ONLY for steps that provide `code` with Playwright assertions to be executed via CDP. Using `\"playwright\"` for shell commands causes a \"No test_id specified\" error.",
+                 "When a `command` step with `test_type` runs a shell command (e.g., `npx playwright test ...`, `cargo test ...`), set `test_type: \"repository\"`. The `test_type: \"playwright\"` value is ONLY for steps that provide `code` with Playwright assertions to be executed via CDP. Using `\"playwright\"` for shell commands causes a \"No test_id specified\" error.",
                  None),
                 ("seed-schema_context-verification_quality-12", "schema_context", "verification_quality", 12,
                  "Next.js App Router path conventions",
-                 "For Next.js projects using the App Router (`src/app/`), components are organized under route groups like `src/app/(app)/`. When creating ESLint `check` steps, use the correct paths — e.g., `src/app/(app)/management/` not `src/components/`. Always verify path patterns match the actual project structure.",
+                 "For Next.js projects using the App Router (`src/app/`), components are organized under route groups like `src/app/(app)/`. When creating `command` steps with `check_type`, use the correct working directory paths — e.g., the frontend directory, not `src/components/`. Always verify path patterns match the actual project structure.",
                  None),
                 ("seed-schema_context-verification_quality-13", "schema_context", "verification_quality", 13,
                  "Verification step caching",
@@ -4665,34 +4665,34 @@ impl CheckpointDb {
                  "Verification plans for feature-implementation workflows MUST include feature-specific checks (element presence, tab visibility, component rendering) in addition to compilation/lint gates. Compilation-only verification causes premature completion when the AI fixes pre-existing errors without implementing the actual feature.",
                  None),
                 ("seed-schema_context-verification_quality-15", "schema_context", "verification_quality", 15,
-                 "SDK assertions must verify content",
-                 "When an `api_request` step targets a UI Bridge SDK endpoint (`/ui-bridge/sdk/...`), a `status_code: 200` assertion alone is INSUFFICIENT. SDK endpoints return 200 even for empty results (e.g., `ai/search` returns `{\"results\": [], \"total\": 0}`). Every SDK `api_request` MUST include at least one of: `body_contains` (with expected text/element), `json_path` (with expected value), or `header_contains`.",
+                 "SDK verification must verify content",
+                 "When a `command` step calls a UI Bridge SDK endpoint via curl (`/ui-bridge/sdk/...`), checking only the exit code is INSUFFICIENT. SDK endpoints return 200 even for empty results (e.g., `ai/search` returns `{\"results\": [], \"total\": 0}`). Every SDK verification command MUST pipe to `grep` with expected text/element content to verify meaningful results.",
                  None),
                 ("seed-schema_context-verification_quality-16", "schema_context", "verification_quality", 16,
                  "Agentic-verification correspondence",
-                 "Each `prompt` step in `agentic_steps` describes a specific piece of work (e.g., \"implement drag-and-drop\", \"add thumbnails\"). For EACH agentic step, `verification_steps` MUST contain at least one deterministic step (`check`, `test`, `api_request`, or `spec`) that verifies the output of that work. The gate's `required_steps` must include these verification steps so their failure triggers the agentic loop.",
+                 "Each `prompt` step in `agentic_steps` describes a specific piece of work (e.g., \"implement drag-and-drop\", \"add thumbnails\"). For EACH agentic step, `verification_steps` MUST contain at least one deterministic `command` or `ui_bridge` step that verifies the output of that work.",
                  None),
 
                 // hardener / conversion_rules
                 ("seed-hardener-conversion_rules-1", "hardener", "conversion_rules", 1,
                  "Convert prompt steps to deterministic",
-                 "Convert `prompt` steps to deterministic equivalents:\n| Prompt check type | Convert to | Method |\n|---|---|---|\n| UI element presence/structure | `api_request` | UI Bridge SDK endpoint with assertions |\n| Content/text on page | `api_request` | UI Bridge SDK `/ai/search` with `body_contains` assertion |\n| File existence | `check` | `custom_command` with `test -f <path>` |\n| File content | `check` | `custom_command` with `grep -q <pattern> <file>` |\n| Code quality (lint) | `check` | `check_type: \"lint\"` with appropriate command |\n| Code quality (typecheck) | `check` | `check_type: \"typecheck\"` with appropriate command |\n| API health/response | `api_request` | Direct HTTP with `status_code` assertion |\n| Subjective/qualitative | Keep as `prompt` | Cannot be made deterministic |",
+                 "Convert `prompt` steps to deterministic equivalents. Only 3 step types are valid: `command`, `ui_bridge`, `prompt`.\n| Prompt check type | Convert to | Method |\n|---|---|---|\n| UI element presence/structure | `command` | curl to UI Bridge SDK endpoint, pipe to grep for content check |\n| Content/text on page | `command` | curl to UI Bridge SDK `/ai/search`, pipe to grep for expected text |\n| File existence | `command` | `check_type: \"custom_command\"` with `test -f <path>` |\n| File content | `command` | `check_type: \"custom_command\"` with `grep -q <pattern> <file>` |\n| Code quality (lint) | `command` | `check_type: \"lint\"` with appropriate command |\n| Code quality (typecheck) | `command` | `check_type: \"typecheck\"` with appropriate command |\n| API health/response | `command` | curl to endpoint, check exit code |\n| UI assertion | `ui_bridge` | Use assert action with target and expected value |\n| Subjective/qualitative | Keep as `prompt` | Cannot be made deterministic |",
                  None),
                 ("seed-hardener-conversion_rules-2", "hardener", "conversion_rules", 2,
                  "Replace Playwright with SDK checks",
-                 "When the UI Bridge SDK is connected, Playwright-based UI verification tests should be converted to `api_request` steps using SDK endpoints. The SDK provides direct programmatic access to registered UI elements without requiring a Playwright browser instance. If a single Playwright test checks multiple things, split it into multiple `api_request` steps — one per distinct verification concern.",
+                 "When the UI Bridge SDK is connected, Playwright-based UI verification tests should be converted to `command` steps (using curl to SDK endpoints piped to grep) or `ui_bridge` steps. The SDK provides direct programmatic access to registered UI elements without requiring a Playwright browser instance. If a single Playwright test checks multiple things, split it into multiple `command` or `ui_bridge` steps — one per distinct verification concern. Tests that require keyboard shortcuts, file uploads, or screenshot comparisons MUST remain as `command` steps with `test_type: \"playwright\"`.",
                  Some("has_sdk_connect")),
                 ("seed-hardener-conversion_rules-3", "hardener", "conversion_rules", 3,
-                 "Strengthen weak SDK assertions",
-                 "If an existing `api_request` step targets a UI Bridge SDK endpoint but only has a `status_code` assertion, add a `body_contains` assertion to verify meaningful content. A 200 response from the SDK just means the endpoint is reachable — it doesn't verify the UI state. SDK endpoints return 200 even for EMPTY results.",
+                 "Strengthen weak SDK verification commands",
+                 "If an existing `command` step calls a UI Bridge SDK endpoint via curl but only checks exit code (no grep), add a pipe to `grep` to verify meaningful content. A successful curl to the SDK just means the endpoint is reachable — it doesn't verify the UI state. SDK endpoints return 200 even for EMPTY results.",
                  Some("has_sdk_connect")),
                 ("seed-hardener-conversion_rules-4", "hardener", "conversion_rules", 4,
                  "Inject page navigation before SDK checks",
-                 "If the workflow's setup_steps include a page navigation step (`POST /ui-bridge/sdk/page/navigate` with a target URL), the verification phase MUST also navigate to that same URL before any SDK element checks. This is because the agentic phase may navigate the browser away from the target page.",
+                 "If the workflow's setup_steps include a page navigation step (curl POST to `/ui-bridge/sdk/page/navigate` or a `ui_bridge` step with `action: \"navigate\"`), the verification phase MUST also navigate to that same URL before any SDK element checks. Use a `command` step with curl or a `ui_bridge` navigate step.",
                  Some("has_sdk_connect")),
                 ("seed-hardener-conversion_rules-5", "hardener", "conversion_rules", 5,
                  "Agentic-verification correspondence",
-                 "Examine EACH prompt step in `agentic_steps` and identify the distinct goals/features it describes. Then check whether `verification_steps` has at least one deterministic step (check, test, api_request, spec) that would FAIL if that specific goal was NOT implemented. For each uncovered agentic goal, ADD a new `api_request` verification step and add its ID to the gate's `required_steps` array.",
+                 "Examine EACH prompt step in `agentic_steps` and identify the distinct goals/features it describes. Then check whether `verification_steps` has at least one deterministic `command` or `ui_bridge` step that would FAIL if that specific goal was NOT implemented. For each uncovered agentic goal, ADD a new `command` verification step (e.g., curl to SDK endpoint piped to grep for expected content).",
                  None),
 
                 // hardener / critical_rules
@@ -4710,7 +4710,7 @@ impl CheckpointDb {
                  None),
                 ("seed-hardener-critical_rules-4", "hardener", "critical_rules", 4,
                  "Adding steps is allowed",
-                 "If a Playwright test step checks multiple things, you MAY replace it with multiple `api_request` steps. You MAY also add NEW verification steps to cover uncovered agentic goals. Keep original `id`s on existing steps and generate new UUIDs for additions. Update `gate` required_steps if you add new step IDs.",
+                 "If a Playwright test step checks multiple things, you MAY replace it with multiple `command` or `ui_bridge` steps. You MAY also add NEW verification steps to cover uncovered agentic goals. Keep original `id`s on existing steps and generate new UUIDs for additions.",
                  None),
                 ("seed-hardener-critical_rules-5", "hardener", "critical_rules", 5,
                  "Keep subjective prompts",
@@ -4721,50 +4721,50 @@ impl CheckpointDb {
                  "Every converted step must have all required fields for its new type",
                  None),
                 ("seed-hardener-critical_rules-7", "hardener", "critical_rules", 7,
-                 "API request assertions required",
-                 "For `api_request` steps, ALWAYS include `assertions` with at least `status_code` AND `body_contains`",
+                 "Only 3 step types",
+                 "All steps must use `command`, `ui_bridge`, or `prompt`. Do NOT output `api_request`, `check`, `test`, `gate`, or `spec` types.",
                  None),
                 ("seed-hardener-critical_rules-8", "hardener", "critical_rules", 8,
-                 "Check conversion fields",
-                 "For `check` conversions, include `check_type`, `command`, and `working_directory`",
+                 "Command with check_type fields",
+                 "For check conversions, use `command` type with `check_type`, `command`, and `working_directory` fields.",
                  None),
                 ("seed-hardener-critical_rules-9", "hardener", "critical_rules", 9,
-                 "Do not convert check steps",
-                 "Do NOT convert `check` steps (lint, typecheck, etc.) — they are already deterministic",
+                 "Do not convert existing command+check_type steps",
+                 "Do NOT convert `command` steps that already have `check_type` set (lint, typecheck, etc.) — they are already deterministic.",
                  None),
                 ("seed-hardener-critical_rules-10", "hardener", "critical_rules", 10,
-                 "Do not convert gate steps",
-                 "Do NOT convert `gate` steps — they are structural",
+                 "SDK verification uses command+curl",
+                 "Use `command` steps with curl piped to grep for SDK-based verification, not `api_request`.",
                  None),
 
                 // verification / check_rules
                 ("seed-verification-check_rules-1", "verification", "check_rules", 1,
-                 "shell_command validation",
-                 "`command` is a real, syntactically valid shell command (not a placeholder like \"echo TODO\" or \"/path/to/script\"). `working_directory`, if present, looks like a real path. `timeout_seconds` is reasonable. `fail_on_error` is appropriate.",
+                 "command step validation (plain shell mode)",
+                 "`command` is a real, syntactically valid shell command (not a placeholder like \"echo TODO\" or \"/path/to/script\"). `working_directory`, if present, looks like a real path. `timeout_seconds` is reasonable. `fail_on_error` is appropriate. Step type MUST be `command` (not `shell_command`).",
                  None),
                 ("seed-verification-check_rules-2", "verification", "check_rules", 2,
-                 "check step consistency",
-                 "`check_type` and `command` are consistent: \"lint\" → linter, \"typecheck\" → type checker, \"format\" → formatter check, \"analyze\" → static analysis, \"security\" → security scanner, \"custom_command\" → any command. `command` is non-empty and syntactically valid.",
+                 "command step validation (check mode — check_type set)",
+                 "`check_type` and `command` are consistent: \"lint\" → linter, \"typecheck\" → type checker, \"format\" → formatter check, \"analyze\" → static analysis, \"security\" → security scanner, \"custom_command\" → any command. `command` is non-empty and syntactically valid. Step type MUST be `command` (not `check`).",
                  None),
                 ("seed-verification-check_rules-3", "verification", "check_rules", 3,
-                 "test step validation",
-                 "Has either `command` (for repository/custom_command) or `code` (for playwright/python). `test_type` is one of: playwright, qontinui_vision, python, repository, custom_command. The command/code looks substantive (not a placeholder).",
+                 "command step validation (test mode — test_type set)",
+                 "Has either `command` (for repository/custom_command) or `code` (for playwright/python). `test_type` is one of: playwright, qontinui_vision, python, repository, custom_command. The command/code looks substantive (not a placeholder). Step type MUST be `command` (not `test`).",
                  None),
                 ("seed-verification-check_rules-4", "verification", "check_rules", 4,
-                 "api_request validation and weak SDK assertion check",
-                 "`url` starts with \"http://\" or \"https://\" and is a plausible URL. `method` is a valid HTTP method. If `body` is provided, `content_type` is consistent. `assertions` reference valid types. WEAK SDK ASSERTION CHECK: If the `url` contains `/ui-bridge/sdk/` AND the only assertion is `status_code: 200`, flag it.",
+                 "ui_bridge step validation",
+                 "`action` is one of: navigate, execute, assert, snapshot. Required fields vary by action: navigate needs `url`, execute needs `instruction`, assert needs `target` and `assert_type`. `timeout_ms` is reasonable if set.",
                  None),
                 ("seed-verification-check_rules-5", "verification", "check_rules", 5,
                  "prompt step quality",
                  "Content is substantive — at least 2 sentences with specific instructions. Agentic prompts reference verification results and describe what to fix. Not a generic placeholder like \"Fix the errors\" or \"Do the task\".",
                  None),
                 ("seed-verification-check_rules-6", "verification", "check_rules", 6,
-                 "spec step validation",
-                 "`spec_group` has a `name` and non-empty `assertions` array. `element_source` is \"control\" or \"external\". Each assertion has `assertionType`, `target` with search criteria.",
+                 "Invalid step type detection",
+                 "If any step uses a type other than `command`, `ui_bridge`, or `prompt`, flag it immediately. Common mistakes: using `check` (should be `command` with `check_type`), `test` (should be `command` with `test_type`), `api_request` (should be `command` with curl), `shell_command` (should be `command`), `gate` or `spec` (removed).",
                  None),
                 ("seed-verification-check_rules-7", "verification", "check_rules", 7,
-                 "gate step validation",
-                 "`required_steps` references step IDs that actually exist in the same verification_steps array.",
+                 "Step type consistency",
+                 "All step types must be one of: `command`, `ui_bridge`, `prompt`. No other types are valid. Verify that the `type` field of every step matches this constraint.",
                  None),
                 ("seed-verification-check_rules-8", "verification", "check_rules", 8,
                  "UI Bridge SDK usage",
@@ -5053,6 +5053,151 @@ impl CheckpointDb {
             .map_err(|e| format!("Failed to update schema version to 64: {}", e))?;
 
             info!("Successfully migrated to version 64 (react-doctor knowledge entries)");
+        }
+
+        // Version 65: Update seed generation rules for 3-type step system
+        //
+        // The original v60 seeds referenced old step types (api_request, check, test,
+        // gate, spec). This migration updates existing seed rules to use only the 3
+        // valid types: command, ui_bridge, prompt. Only updates provenance='seed' rules
+        // to avoid touching reflection-learned rules.
+        if current_version < 65 {
+            info!("Migrating to version 65 (update seed rules for 3-type system)...");
+
+            let rule_updates: Vec<(&str, &str, &str)> = vec![
+                // schema_context / verification_quality
+                ("seed-schema_context-verification_quality-6",
+                 "Deterministic verification step required",
+                 "verification_steps MUST include at least one deterministic, automated step — a `command` step (with check_type, test_type, or a shell command) or a `ui_bridge` step (with assert action). Do NOT use only `prompt` type steps for verification. Prompts provide AI judgment, not deterministic pass/fail results. A verification phase with ONLY prompt steps is INVALID."),
+                ("seed-schema_context-verification_quality-7",
+                 "Code modification requires typecheck",
+                 "When the workflow creates or modifies source code files (TypeScript, Python, Rust, etc.), verification MUST include a `command` step with `check_type` set to the appropriate type checker:\n   - TypeScript/TSX/JSX: `{\"type\": \"command\", \"check_type\": \"typecheck\", \"command\": \"npx tsc --noEmit\", \"working_directory\": \"...\"}`\n   - Python: `{\"type\": \"command\", \"check_type\": \"typecheck\", \"command\": \"mypy .\", \"working_directory\": \"...\"}`\n   - Rust: `{\"type\": \"command\", \"check_type\": \"typecheck\", \"command\": \"cargo check\", \"working_directory\": \"...\"}`"),
+                ("seed-schema_context-verification_quality-8",
+                 "Web app verification requires SDK or Playwright",
+                 "When the workflow targets a web application (localhost:3001, localhost:1420), verification MUST include at least one of:\n   - A `command` step using curl to query UI Bridge SDK endpoints (preferred) to verify UI state\n   - A `command` step with `test_type: \"playwright\"` for browser-based verification\n   - A `ui_bridge` step with an `assert` action for direct element assertions"),
+                ("seed-schema_context-verification_quality-9",
+                 "Verification must be deterministic",
+                 "Every workflow with 2+ verification steps should ensure ALL non-prompt verification steps are meaningful and required. If a step is worth including in verification, its failure should be visible to the verification loop. Do NOT include verification steps whose failures would be silently ignored."),
+                ("seed-schema_context-verification_quality-11",
+                 "Test steps with inline commands use repository",
+                 "When a `command` step with `test_type` runs a shell command (e.g., `npx playwright test ...`, `cargo test ...`), set `test_type: \"repository\"`. The `test_type: \"playwright\"` value is ONLY for steps that provide `code` with Playwright assertions to be executed via CDP. Using `\"playwright\"` for shell commands causes a \"No test_id specified\" error."),
+                ("seed-schema_context-verification_quality-12",
+                 "Next.js App Router path conventions",
+                 "For Next.js projects using the App Router (`src/app/`), components are organized under route groups like `src/app/(app)/`. When creating `command` steps with `check_type`, use the correct working directory paths — e.g., the frontend directory, not `src/components/`. Always verify path patterns match the actual project structure."),
+                ("seed-schema_context-verification_quality-15",
+                 "SDK verification must verify content",
+                 "When a `command` step calls a UI Bridge SDK endpoint via curl (`/ui-bridge/sdk/...`), checking only the exit code is INSUFFICIENT. SDK endpoints return 200 even for empty results (e.g., `ai/search` returns `{\"results\": [], \"total\": 0}`). Every SDK verification command MUST pipe to `grep` with expected text/element content to verify meaningful results."),
+                ("seed-schema_context-verification_quality-16",
+                 "Agentic-verification correspondence",
+                 "Each `prompt` step in `agentic_steps` describes a specific piece of work (e.g., \"implement drag-and-drop\", \"add thumbnails\"). For EACH agentic step, `verification_steps` MUST contain at least one deterministic `command` or `ui_bridge` step that verifies the output of that work."),
+
+                // hardener / conversion_rules
+                ("seed-hardener-conversion_rules-1",
+                 "Convert prompt steps to deterministic",
+                 "Convert `prompt` steps to deterministic equivalents. Only 3 step types are valid: `command`, `ui_bridge`, `prompt`.\n| Prompt check type | Convert to | Method |\n|---|---|---|\n| UI element presence/structure | `command` | curl to UI Bridge SDK endpoint, pipe to grep for content check |\n| Content/text on page | `command` | curl to UI Bridge SDK `/ai/search`, pipe to grep for expected text |\n| File existence | `command` | `check_type: \"custom_command\"` with `test -f <path>` |\n| File content | `command` | `check_type: \"custom_command\"` with `grep -q <pattern> <file>` |\n| Code quality (lint) | `command` | `check_type: \"lint\"` with appropriate command |\n| Code quality (typecheck) | `command` | `check_type: \"typecheck\"` with appropriate command |\n| API health/response | `command` | curl to endpoint, check exit code |\n| UI assertion | `ui_bridge` | Use assert action with target and expected value |\n| Subjective/qualitative | Keep as `prompt` | Cannot be made deterministic |"),
+                ("seed-hardener-conversion_rules-2",
+                 "Replace Playwright with SDK checks",
+                 "When the UI Bridge SDK is connected, Playwright-based UI verification tests should be converted to `command` steps (using curl to SDK endpoints piped to grep) or `ui_bridge` steps. The SDK provides direct programmatic access to registered UI elements without requiring a Playwright browser instance. If a single Playwright test checks multiple things, split it into multiple `command` or `ui_bridge` steps — one per distinct verification concern. Tests that require keyboard shortcuts, file uploads, or screenshot comparisons MUST remain as `command` steps with `test_type: \"playwright\"`."),
+                ("seed-hardener-conversion_rules-3",
+                 "Strengthen weak SDK verification commands",
+                 "If an existing `command` step calls a UI Bridge SDK endpoint via curl but only checks exit code (no grep), add a pipe to `grep` to verify meaningful content. A successful curl to the SDK just means the endpoint is reachable — it doesn't verify the UI state. SDK endpoints return 200 even for EMPTY results."),
+                ("seed-hardener-conversion_rules-4",
+                 "Inject page navigation before SDK checks",
+                 "If the workflow's setup_steps include a page navigation step (curl POST to `/ui-bridge/sdk/page/navigate` or a `ui_bridge` step with `action: \"navigate\"`), the verification phase MUST also navigate to that same URL before any SDK element checks. Use a `command` step with curl or a `ui_bridge` navigate step."),
+                ("seed-hardener-conversion_rules-5",
+                 "Agentic-verification correspondence",
+                 "Examine EACH prompt step in `agentic_steps` and identify the distinct goals/features it describes. Then check whether `verification_steps` has at least one deterministic `command` or `ui_bridge` step that would FAIL if that specific goal was NOT implemented. For each uncovered agentic goal, ADD a new `command` verification step (e.g., curl to SDK endpoint piped to grep for expected content)."),
+
+                // hardener / critical_rules
+                ("seed-hardener-critical_rules-4",
+                 "Adding steps is allowed",
+                 "If a Playwright test step checks multiple things, you MAY replace it with multiple `command` or `ui_bridge` steps. You MAY also add NEW verification steps to cover uncovered agentic goals. Keep original `id`s on existing steps and generate new UUIDs for additions."),
+                ("seed-hardener-critical_rules-7",
+                 "Only 3 step types",
+                 "All steps must use `command`, `ui_bridge`, or `prompt`. Do NOT output `api_request`, `check`, `test`, `gate`, or `spec` types."),
+                ("seed-hardener-critical_rules-8",
+                 "Command with check_type fields",
+                 "For check conversions, use `command` type with `check_type`, `command`, and `working_directory` fields."),
+                ("seed-hardener-critical_rules-9",
+                 "Do not convert existing command+check_type steps",
+                 "Do NOT convert `command` steps that already have `check_type` set (lint, typecheck, etc.) — they are already deterministic."),
+                ("seed-hardener-critical_rules-10",
+                 "SDK verification uses command+curl",
+                 "Use `command` steps with curl piped to grep for SDK-based verification, not `api_request`."),
+
+                // verification / check_rules
+                ("seed-verification-check_rules-1",
+                 "command step validation (plain shell mode)",
+                 "`command` is a real, syntactically valid shell command (not a placeholder like \"echo TODO\" or \"/path/to/script\"). `working_directory`, if present, looks like a real path. `timeout_seconds` is reasonable. `fail_on_error` is appropriate. Step type MUST be `command` (not `shell_command`)."),
+                ("seed-verification-check_rules-2",
+                 "command step validation (check mode — check_type set)",
+                 "`check_type` and `command` are consistent: \"lint\" → linter, \"typecheck\" → type checker, \"format\" → formatter check, \"analyze\" → static analysis, \"security\" → security scanner, \"custom_command\" → any command. `command` is non-empty and syntactically valid. Step type MUST be `command` (not `check`)."),
+                ("seed-verification-check_rules-3",
+                 "command step validation (test mode — test_type set)",
+                 "Has either `command` (for repository/custom_command) or `code` (for playwright/python). `test_type` is one of: playwright, qontinui_vision, python, repository, custom_command. The command/code looks substantive (not a placeholder). Step type MUST be `command` (not `test`)."),
+                ("seed-verification-check_rules-4",
+                 "ui_bridge step validation",
+                 "`action` is one of: navigate, execute, assert, snapshot. Required fields vary by action: navigate needs `url`, execute needs `instruction`, assert needs `target` and `assert_type`. `timeout_ms` is reasonable if set."),
+                ("seed-verification-check_rules-6",
+                 "Invalid step type detection",
+                 "If any step uses a type other than `command`, `ui_bridge`, or `prompt`, flag it immediately. Common mistakes: using `check` (should be `command` with `check_type`), `test` (should be `command` with `test_type`), `api_request` (should be `command` with curl), `shell_command` (should be `command`), `gate` or `spec` (removed)."),
+                ("seed-verification-check_rules-7",
+                 "Step type consistency",
+                 "All step types must be one of: `command`, `ui_bridge`, `prompt`. No other types are valid. Verify that the `type` field of every step matches this constraint."),
+            ];
+
+            let mut updated = 0;
+            for (rule_id, new_title, new_content) in &rule_updates {
+                let rows = conn.execute(
+                    "UPDATE generation_rules SET title = ?1, content = ?2, updated_at = datetime('now') WHERE id = ?3 AND provenance = 'seed'",
+                    params![new_title, new_content, rule_id],
+                )
+                .map_err(|e| format!("Failed to update seed rule {}: {}", rule_id, e))?;
+                if rows > 0 {
+                    updated += 1;
+                }
+            }
+
+            // Insert new rules that didn't exist in the original v60 seeds
+            let now = chrono::Utc::now().to_rfc3339();
+
+            // Rule 17: Only 3 step types
+            conn.execute(
+                "INSERT OR IGNORE INTO generation_rules (id, agent, section, rule_number, title, content, condition, status, provenance, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', 'seed', ?8, ?9)",
+                params![
+                    "seed-schema_context-verification_quality-17",
+                    "schema_context", "verification_quality", 17,
+                    "Only 3 step types exist",
+                    "The only valid step types are `command`, `ui_bridge`, and `prompt`. Do NOT use `shell_command`, `api_request`, `mcp_call`, `check`, `check_group`, `test`, `gate`, or `spec` — these are not valid types. Tests are run via `command` with `test_type` set. Checks are run via `command` with `check_type` set.",
+                    Option::<&str>::None, now, now
+                ],
+            )
+            .map_err(|e| format!("Failed to insert rule 17: {}", e))?;
+
+            // Rule for explicit mode field on command steps
+            conn.execute(
+                "INSERT OR IGNORE INTO generation_rules (id, agent, section, rule_number, title, content, condition, status, provenance, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', 'seed', ?8, ?9)",
+                params![
+                    "seed-schema_context-important_rules-6",
+                    "schema_context", "important_rules", 6,
+                    "Every command step MUST include a mode field",
+                    "Every `command` step MUST include a `mode` field set to one of: `shell`, `check`, `check_group`, `test`. The mode must match the fields present: `check` requires `check_type`, `check_group` requires `check_group_id`, `test` requires `test_type` or `test_id`, `shell` is the default for plain commands.",
+                    Option::<&str>::None, now, now
+                ],
+            )
+            .map_err(|e| format!("Failed to insert mode rule: {}", e))?;
+
+            conn.execute_batch(
+                "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (65, datetime('now'));",
+            )
+            .map_err(|e| format!("Failed to update schema version to 65: {}", e))?;
+
+            info!(
+                "Successfully migrated to version 65 ({} seed rules updated for 3-type system)",
+                updated
+            );
         }
 
         Ok(())

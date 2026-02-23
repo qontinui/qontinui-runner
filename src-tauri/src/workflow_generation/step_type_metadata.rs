@@ -66,7 +66,7 @@ pub struct StepTypeFieldDef {
 /// Metadata for a single step type.
 #[derive(Debug, Clone)]
 pub struct StepTypeMetadata {
-    /// Serde name (e.g. "shell_command")
+    /// Serde name (e.g. "command", "ui_bridge", "prompt")
     pub step_type: &'static str,
     /// Human-readable label (e.g. "Shell Command")
     pub display_name: &'static str,
@@ -90,12 +90,22 @@ pub struct StepTypeMetadata {
 
 /// Unified command fields (union of shell_command + check + check_group + test fields).
 ///
-/// The `command` step type dispatches based on which fields are populated:
-/// - `check_group_id` set -> check group execution
-/// - `check_type` set -> check execution (lint, format, typecheck, etc.)
-/// - `test_id` or `test_type` set -> test execution
-/// - Otherwise -> plain shell command execution
+/// The `command` step type dispatches based on the `mode` field (preferred) or
+/// which fields are populated:
+/// - `mode: "check_group"` or `check_group_id` set -> check group execution
+/// - `mode: "check"` or `check_type` set -> check execution (lint, format, typecheck, etc.)
+/// - `mode: "test"` or `test_id`/`test_type` set -> test execution
+/// - `mode: "shell"` or no mode fields -> plain shell command execution
 static COMMAND_FIELDS: &[StepTypeFieldDef] = &[
+    // Mode field (required dispatch signal)
+    StepTypeFieldDef {
+        name: "mode",
+        field_type: FieldType::String,
+        required: true,
+        description: "Command mode. Determines which sub-handler executes this step.",
+        enum_values: &["shell", "check", "check_group", "test"],
+        default: "shell",
+    },
     // Shell command fields
     StepTypeFieldDef {
         name: "command",
@@ -438,6 +448,8 @@ mod tests {
         let meta = get_step_type_metadata("command").expect("command metadata should exist");
         assert_eq!(meta.category, StepCategory::Core);
         let field_names: Vec<&str> = meta.fields.iter().map(|f| f.name).collect();
+        // Mode field (explicit dispatch signal)
+        assert!(field_names.contains(&"mode"));
         // Shell command fields
         assert!(field_names.contains(&"command"));
         assert!(field_names.contains(&"working_directory"));
@@ -451,6 +463,19 @@ mod tests {
         assert!(field_names.contains(&"test_id"));
         assert!(field_names.contains(&"test_type"));
         assert!(field_names.contains(&"code"));
+    }
+
+    #[test]
+    fn test_mode_field_is_first_in_command() {
+        let meta = get_step_type_metadata("command").expect("command metadata should exist");
+        assert_eq!(
+            meta.fields[0].name, "mode",
+            "mode should be the first field in command step"
+        );
+        assert_eq!(
+            meta.fields[0].enum_values,
+            &["shell", "check", "check_group", "test"]
+        );
     }
 
     #[test]

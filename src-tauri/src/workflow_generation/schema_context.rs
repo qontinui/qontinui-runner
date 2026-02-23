@@ -91,10 +91,10 @@ pub fn build_schema_context_full(
 ///
 /// Produces markdown blocks like:
 /// ```text
-/// ### shell_command (Setup or Completion)
-/// Execute a shell command.
+/// ### command (Setup, Verification, or Completion)
+/// Execute a shell command, code quality check, or test.
 /// Fields:
-/// - `command`: string (required) — Shell command to execute
+/// - `command`: string — Shell command to execute
 /// ```
 pub fn generate_step_types_documentation(types: &[&StepTypeMetadata]) -> String {
     let mut output = String::with_capacity(4096);
@@ -498,7 +498,8 @@ These rules are NON-NEGOTIABLE. Workflows that violate them will be rejected.
 13. **Verification step caching**: Running tasks cache verification steps at startup; API updates don't affect current task.
 14. **Feature-specific verification required**: Must include feature-specific checks, not just compilation/lint checks.
 15. **Agentic-verification correspondence**: Each agentic step must have a corresponding deterministic verification step.
-16. **Only 4 step types exist**: The only valid step types are `command`, `test`, `ui_bridge`, and `prompt`. Do NOT use `shell_command`, `api_request`, `mcp_call`, `check`, or `check_group` — these are not valid types."#;
+16. **Only 3 step types exist**: The only valid step types are `command`, `ui_bridge`, and `prompt`. Do NOT use `shell_command`, `api_request`, `mcp_call`, `check`, `check_group`, `test`, `gate`, or `spec` — these are not valid types. Tests are run via `command` with `test_type` set. Checks are run via `command` with `check_type` set.
+17. **Every command step MUST include a mode field**: Valid modes are `shell`, `check`, `check_group`, `test`. The mode must match the fields present: `check` requires `check_type`, `check_group` requires `check_group_id`, `test` requires `test_type` or `test_id`, `shell` is for plain commands."#;
 
 // ============================================================================
 

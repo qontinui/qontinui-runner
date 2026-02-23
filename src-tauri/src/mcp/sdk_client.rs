@@ -1012,9 +1012,9 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/ui-bridge/sdk/health", get(handle_health))
         // Elements
         .route("/ui-bridge/sdk/elements", get(handle_elements))
-        .route("/ui-bridge/sdk/element/{id}", get(handle_element))
+        .route("/ui-bridge/sdk/element/:id", get(handle_element))
         .route(
-            "/ui-bridge/sdk/element/{id}/action",
+            "/ui-bridge/sdk/element/:id/action",
             post(handle_element_action),
         )
         // Snapshot & discovery
@@ -1030,7 +1030,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/ui-bridge/sdk/screenshot", get(handle_screenshot))
         // Components
         .route("/ui-bridge/sdk/components", get(handle_components))
-        .route("/ui-bridge/sdk/component/{id}", get(handle_component))
+        .route("/ui-bridge/sdk/component/:id", get(handle_component))
         // AI endpoints
         .route("/ui-bridge/sdk/ai/search", post(handle_ai_search))
         .route("/ui-bridge/sdk/ai/execute", post(handle_ai_execute))
@@ -1064,7 +1064,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         // Debug
         .route("/ui-bridge/sdk/debug/metrics", get(handle_debug_metrics))
         .route(
-            "/ui-bridge/sdk/debug/highlight/{id}",
+            "/ui-bridge/sdk/debug/highlight/:id",
             post(handle_debug_highlight),
         )
 }

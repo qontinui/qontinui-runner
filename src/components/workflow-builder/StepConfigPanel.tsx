@@ -629,10 +629,50 @@ function CommandConfig({
   step: UnifiedStep & { type: "command" };
   onUpdate: (updates: Partial<typeof step>) => void;
 }) {
-  // If check_group_id is set, show check group config
-  if (step.check_group_id) {
+  const effectiveMode = step.mode;
+
+  const handleModeChange = (newMode: string) => {
+    // Clear fields that belong to other modes, set mode
+    const cleared: Partial<typeof step> = {
+      mode: newMode as "shell" | "check" | "check_group" | "test",
+    };
+    if (newMode !== "check") {
+      cleared.check_type = undefined;
+    }
+    if (newMode !== "check_group") {
+      cleared.check_group_id = undefined;
+    }
+    if (newMode !== "test") {
+      cleared.test_type = undefined;
+      cleared.test_id = undefined;
+      cleared.code = undefined;
+    }
+    onUpdate(cleared);
+  };
+
+  // Mode selector
+  const modeSelector = (
+    <div className="mb-4">
+      <label className="block text-sm font-medium text-zinc-400 mb-1">Command Mode</label>
+      <select
+        value={effectiveMode}
+        onChange={(e) => handleModeChange(e.target.value)}
+        className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+        data-ui-id="workflow-builder-step-config-command-mode-select"
+      >
+        <option value="shell">Shell Command</option>
+        <option value="check">Check (lint, typecheck, etc.)</option>
+        <option value="check_group">Check Group</option>
+        <option value="test">Test</option>
+      </select>
+    </div>
+  );
+
+  // Check group mode
+  if (effectiveMode === "check_group") {
     return (
       <div className="space-y-4">
+        {modeSelector}
         <div>
           <label className="block text-sm font-medium text-zinc-400 mb-1">Check Group ID</label>
           <input
@@ -657,19 +697,30 @@ function CommandConfig({
     );
   }
 
-  // If check_type is set, show check-specific fields
-  if (step.check_type) {
-    return <CheckFieldsConfig step={step} onUpdate={onUpdate} />;
+  // Check mode
+  if (effectiveMode === "check") {
+    return (
+      <div className="space-y-4">
+        {modeSelector}
+        <CheckFieldsConfig step={step} onUpdate={onUpdate} />
+      </div>
+    );
   }
 
-  // If test_type or test_id is set, show test-specific fields
-  if (step.test_type || step.test_id) {
-    return <TestFieldsConfig step={step} onUpdate={onUpdate} />;
+  // Test mode
+  if (effectiveMode === "test") {
+    return (
+      <div className="space-y-4">
+        {modeSelector}
+        <TestFieldsConfig step={step} onUpdate={onUpdate} />
+      </div>
+    );
   }
 
   // Default: shell command config
   return (
     <div className="space-y-4">
+      {modeSelector}
       {/* Command */}
       <div>
         <label className="block text-sm font-medium text-zinc-400 mb-1">Command</label>

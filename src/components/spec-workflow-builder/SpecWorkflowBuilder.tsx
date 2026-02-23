@@ -112,6 +112,7 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
           type: "command",
           phase: "setup",
           name: `Navigate to ${pageUrl}`,
+          mode: "shell",
           command: `playwright test --headed -g 'navigate' -- --base-url='${pageUrl}'`,
         } satisfies SetupStep);
       }

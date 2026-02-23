@@ -23,7 +23,7 @@ use crate::unified_workflows::UnifiedWorkflow;
 use crate::workflow_generation::hardener::{self, HardeningSummary};
 use crate::workflow_generation::rules;
 use crate::workflow_generation::schema_context::{build_schema_context, build_schema_context_full};
-use crate::workflow_generation::validation::{fix_workflow, validate_workflow, ValidationError};
+use crate::workflow_generation::validation::{fix_workflow, validate_workflow};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
@@ -76,10 +76,6 @@ pub struct GenerateWorkflowRequest {
     #[serde(default)]
     pub max_fix_iterations: Option<u32>,
 
-    /// Generation mode: "standard" (default) or "plan"
-    #[serde(default)]
-    pub generation_mode: Option<String>,
-
     /// Discovery mode: "auto" (default), "enabled" (always), "disabled" (never)
     #[serde(default)]
     pub discovery_mode: Option<String>,
@@ -105,7 +101,7 @@ pub struct GenerateWorkflowResponse {
     /// The generated workflow (if successful)
     pub workflow: Option<UnifiedWorkflow>,
     /// Structural validation errors (from deterministic validator)
-    pub validation_errors: Vec<String>,
+    pub validation_errors: Vec<super::validation::ValidationError>,
     /// Whether the generation was successful
     pub success: bool,
     /// Error message if generation failed
@@ -267,9 +263,7 @@ pub fn generate_workflow(
     fix_workflow(&mut workflow);
 
     // ── Final structural validation ────────────────────────────────────────
-    let validation_errors: Vec<ValidationError> = validate_workflow(&workflow);
-    let validation_error_strings: Vec<String> =
-        validation_errors.iter().map(|e| e.to_string()).collect();
+    let validation_errors = validate_workflow(&workflow);
 
     if !validation_errors.is_empty() {
         warn!(
@@ -290,7 +284,7 @@ pub fn generate_workflow(
 
     GenerateWorkflowResponse {
         workflow: Some(workflow),
-        validation_errors: validation_error_strings,
+        validation_errors,
         success: true,
         error: None,
         model_used: None,
@@ -346,13 +340,12 @@ fn run_builder_agent(
 Generate a complete UnifiedWorkflow JSON that accomplishes this task.
 
 ### Quality checklist — ensure your output meets ALL of these:
-- Every `shell_command` has a real, syntactically-valid command (no placeholders).
-- Every `check` step has a `command` that matches its `check_type` (e.g. lint → eslint/ruff, typecheck → tsc/mypy, format → prettier/black).
-- Every `api_request` has a well-formed URL starting with http:// or https://.
-- Every `test` step has a valid `test_type` and either a `command` or `code` field.
+- Every `command` step (plain shell) has a real, syntactically-valid `command` (no placeholders).
+- Every `command` step with `check_type` has a `command` that matches its check (e.g. lint → eslint/ruff, typecheck → tsc/mypy, format → prettier/black).
+- Every `command` step with `test_type` has a valid `test_type` and either a `command` or `code` field.
+- Only 3 step types exist: `command`, `ui_bridge`, and `prompt`. Do NOT use `shell_command`, `api_request`, `check`, `test`, `gate`, or `spec`.
 - Every `prompt` in the agentic phase has substantive, multi-sentence instructions that reference the verification results and explain exactly what to fix.
 - If verification steps exist there MUST be at least one agentic `prompt` step.
-- `gate` steps only reference `required_steps` IDs that exist in the same phase.
 - Step names are descriptive (not "Step 1", "Test", etc.).
 - `working_directory` paths look like real absolute or project-relative paths (no placeholders like "/path/to/project").
 - If the workflow targets a web application (localhost:3001, localhost:1420, or similar), include a setup step to connect via UI Bridge SDK (POST /ui-bridge/sdk/connect). Use SDK endpoints for element inspection and state checking instead of Playwright when possible.
@@ -536,28 +529,24 @@ Examples:
 /// Hardcoded fallback verification checks, used when no DB connection is available.
 const FALLBACK_VERIFICATION_CHECKS: &str = r#"## What to check
 
+Only 3 step types are valid: `command`, `ui_bridge`, and `prompt`. If any step uses a different type (e.g. `shell_command`, `api_request`, `check`, `test`, `gate`, `spec`), flag it immediately.
+
 For EVERY step in setup_steps, verification_steps, and completion_steps, verify:
 
-### shell_command validation
+### command step validation (plain shell mode — no check_type, no test_type)
 `command` is a real, syntactically valid shell command (not a placeholder like "echo TODO" or "/path/to/script"). `working_directory`, if present, looks like a real path. `timeout_seconds` is reasonable. `fail_on_error` is appropriate.
 
-### check step consistency
-`check_type` and `command` are consistent: "lint" → linter, "typecheck" → type checker, "format" → formatter check, "analyze" → static analysis, "security" → security scanner, "custom_command" → any command. `command` is non-empty and syntactically valid.
+### command step validation (check mode — check_type is set)
+`check_type` and `command` are consistent: "lint" → linter, "typecheck" → type checker, "format" → formatter check, "analyze" → static analysis, "security" → security scanner, "custom_command" → any command. `command` is non-empty and syntactically valid. Step type MUST be `command` (not `check`).
 
-### test step validation
-Has either `command` (for repository/custom_command) or `code` (for playwright/python). `test_type` is one of: playwright, qontinui_vision, python, repository, custom_command. The command/code looks substantive (not a placeholder).
+### command step validation (test mode — test_type is set)
+Has either `command` (for repository/custom_command) or `code` (for playwright/python). `test_type` is one of: playwright, qontinui_vision, python, repository, custom_command. The command/code looks substantive (not a placeholder). Step type MUST be `command` (not `test`).
 
-### api_request validation and weak SDK assertion check
-`url` starts with "http://" or "https://" and is a plausible URL. `method` is a valid HTTP method. If `body` is provided, `content_type` is consistent. `assertions` reference valid types. WEAK SDK ASSERTION CHECK: If the `url` contains `/ui-bridge/sdk/` AND the only assertion is `status_code: 200`, flag it.
+### ui_bridge step validation
+`action` is one of: navigate, execute, assert, snapshot. Required fields vary by action: navigate needs `url`, execute needs `instruction`, assert needs `target` and `assert_type`. `timeout_ms` is reasonable if set.
 
 ### prompt step quality
 Content is substantive — at least 2 sentences with specific instructions. Agentic prompts reference verification results and describe what to fix. Not a generic placeholder like "Fix the errors" or "Do the task".
-
-### spec step validation
-`spec_group` has a `name` and non-empty `assertions` array. `element_source` is "control" or "external". Each assertion has `assertionType`, `target` with search criteria.
-
-### gate step validation
-`required_steps` references step IDs that actually exist in the same verification_steps array.
 
 ### UI Bridge SDK usage
 If the workflow targets a web app but does NOT include a setup step to connect via UI Bridge SDK (POST to /ui-bridge/sdk/connect), flag it. If the workflow uses Playwright for simple element inspection when SDK endpoints could be used instead, flag it. If agentic prompt steps mention web UI interaction but don't reference SDK tools, flag it.

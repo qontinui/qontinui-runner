@@ -2539,6 +2539,7 @@ fn substitute_step_vars(step: &mut ExecutionStepConfig, artifact_dir: &str, exec
     sub(&mut step.shell_command_working_directory);
     sub(&mut step.check_command);
     sub(&mut step.check_working_directory);
+    sub(&mut step.artifact_input_path);
 
     // Also substitute in prompt content (may reference artifact paths)
     if let Some(ref mut content) = step.prompt_content {

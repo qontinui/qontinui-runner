@@ -6,6 +6,50 @@
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+/// Explicit mode for command steps, indicating which sub-handler to use.
+///
+/// When set, the `CommandHandler` uses this field to dispatch directly instead
+/// of inferring the mode from which optional fields are populated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandMode {
+    /// Plain shell command execution
+    Shell,
+    /// Code quality check (check_type determines the checker)
+    Check,
+    /// Execute all checks in a saved check group
+    CheckGroup,
+    /// Run a test (test_type/test_id determines the runner)
+    Test,
+}
+
+impl CommandMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Shell => "shell",
+            Self::Check => "check",
+            Self::CheckGroup => "check_group",
+            Self::Test => "test",
+        }
+    }
+
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s {
+            "shell" => Some(Self::Shell),
+            "check" => Some(Self::Check),
+            "check_group" => Some(Self::CheckGroup),
+            "test" => Some(Self::Test),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for CommandMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 /// Enumeration of all step types supported by the runner.
 ///
 /// Step types are categorized into groups:

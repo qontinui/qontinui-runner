@@ -108,6 +108,7 @@ export function AddStepDropdown({ filterPhase, onAddStep, isOpen, onClose }: Add
           type: "command",
           phase: phase as "setup" | "verification" | "completion",
           name: "Command",
+          mode: "shell",
           command: "",
           fail_on_error: true,
         };

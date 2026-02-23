@@ -42,9 +42,16 @@ interface DiscoveryCall {
   duration_ms: number;
 }
 
+interface ValidationError {
+  kind: string;
+  field: string;
+  message: string;
+  step_name?: string;
+}
+
 interface GenerateWorkflowResponse {
   workflow: UnifiedWorkflow | null;
-  validation_errors: string[];
+  validation_errors: ValidationError[];
   success: boolean;
   error: string | null;
   model_used: string | null;
@@ -150,7 +157,9 @@ export function AiGenerateWorkflowModal({
 
       if (data.success && data.workflow) {
         setGeneratedWorkflow(data.workflow);
-        setValidationErrors(data.validation_errors || []);
+        setValidationErrors(
+          (data.validation_errors || []).map((e) => `[${e.kind}] ${e.field}: ${e.message}`),
+        );
         setDiscoveryCalls(data.discovery_calls || []);
         setShowPreview(true);
       } else {

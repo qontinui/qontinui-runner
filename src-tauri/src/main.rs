@@ -271,6 +271,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         error_monitor_handle: TokioMutex::new(None), // Initialized in setup()
         doctor_handle: TokioMutex::new(None),        // Initialized in setup()
         url_lock_manager: Arc::new(crate::executor::UrlLockManager::new()),
+        ui_bridge_failure_tracker:
+            crate::step_executor::handlers::ui_bridge::UiBridgeFailureTracker::new(),
         api_ready: AtomicBool::new(false), // Set when MCP API server binds
     });
     let mcp_app_state = shared_app_state.clone();

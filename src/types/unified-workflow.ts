@@ -179,15 +179,14 @@ export type CheckType =
  * Command Step (Setup, Verification, or Completion)
  *
  * Unified command step that can run shell commands, code quality checks,
- * check groups, or tests. The behavior is determined by which fields are set:
- * - check_group_id set -> runs all checks in a saved check group
- * - check_type set -> runs a code quality check
- * - test_id or test_type set -> runs a verification test
- * - Otherwise -> runs a shell command
+ * check groups, or tests. The `mode` field determines which sub-handler
+ * executes the step.
  */
 export interface CommandStep extends BaseStep {
   type: "command";
   phase: "setup" | "verification" | "completion";
+  /** Command mode — determines which sub-handler executes the step */
+  mode: "shell" | "check" | "check_group" | "test";
   /** The shell command to execute */
   command?: string;
   /** Working directory (relative to project root) */
@@ -711,6 +710,7 @@ export function createDefaultStep(type: UnifiedStep["type"], phase: WorkflowPhas
         type: "command",
         phase: phase as "setup" | "verification" | "completion",
         name: "Command",
+        mode: "shell",
         command: "",
       };
     case "ui_bridge":

@@ -5,10 +5,12 @@
 
 use axum::{response::Json, routing::get, Router};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::mcp::types::{ApiResponse, ApiState};
 use crate::workflow_generation::step_type_metadata::get_all_step_type_metadata;
+use crate::workflow_generation::validation::allowed_types_for_phase;
 
 #[derive(Serialize)]
 struct StepTypeMetadataResponse {
@@ -34,10 +36,18 @@ struct FieldDefResponse {
     default: &'static str,
 }
 
-async fn get_step_types_metadata() -> Json<ApiResponse<Vec<StepTypeMetadataResponse>>> {
+/// Full response wrapping step types with phase constraint mappings.
+#[derive(Serialize)]
+struct StepTypeMetadataFullResponse {
+    step_types: Vec<StepTypeMetadataResponse>,
+    /// Maps each phase to its list of allowed step type names.
+    phase_constraints: HashMap<&'static str, Vec<&'static str>>,
+}
+
+async fn get_step_types_metadata() -> Json<ApiResponse<StepTypeMetadataFullResponse>> {
     let metadata = get_all_step_type_metadata();
 
-    let response: Vec<StepTypeMetadataResponse> = metadata
+    let step_types: Vec<StepTypeMetadataResponse> = metadata
         .iter()
         .map(|meta| StepTypeMetadataResponse {
             step_type: meta.step_type,
@@ -62,7 +72,16 @@ async fn get_step_types_metadata() -> Json<ApiResponse<Vec<StepTypeMetadataRespo
         })
         .collect();
 
-    Json(ApiResponse::success(response))
+    // Build phase constraint map from the validation module's source of truth
+    let mut phase_constraints = HashMap::new();
+    for phase in &["setup", "verification", "agentic", "completion"] {
+        phase_constraints.insert(*phase, allowed_types_for_phase(phase).to_vec());
+    }
+
+    Json(ApiResponse::success(StepTypeMetadataFullResponse {
+        step_types,
+        phase_constraints,
+    }))
 }
 
 pub fn routes() -> Router<Arc<ApiState>> {
