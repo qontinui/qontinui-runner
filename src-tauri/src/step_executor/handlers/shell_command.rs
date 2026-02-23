@@ -278,7 +278,7 @@ impl ShellCommandHandler {
     }
 
     /// Check if a command uses bash/Unix syntax that cmd.exe cannot handle.
-    fn is_bash_command(command: &str) -> bool {
+    pub(crate) fn is_bash_command(command: &str) -> bool {
         let trimmed = command.trim();
         let first_word = trimmed.split_whitespace().next().unwrap_or("");
 
@@ -295,7 +295,6 @@ impl ShellCommandHandler {
         trimmed.contains("$(")      // command substitution
             || trimmed.contains("${")  // variable expansion
             || trimmed.contains(">/dev/null")  // Unix null device
-            || trimmed.contains("2>&1")  // stderr redirect
             || trimmed.contains("<<EOF")  // heredoc
             || trimmed.contains("<<'EOF'")  // heredoc
             || (trimmed.starts_with("if ") && trimmed.contains("; then"))  // bash if
@@ -458,6 +457,12 @@ mod tests {
         assert!(!ShellCommandHandler::is_bash_command("git status"));
         assert!(!ShellCommandHandler::is_bash_command("npm test"));
         assert!(!ShellCommandHandler::is_bash_command("cargo build"));
+
+        // 2>&1 is valid in PowerShell and cmd.exe too, so it should NOT trigger bash detection
+        assert!(!ShellCommandHandler::is_bash_command("cmd 2>&1"));
+        assert!(!ShellCommandHandler::is_bash_command(
+            "some-tool --flag 2>&1"
+        ));
     }
 
     #[test]

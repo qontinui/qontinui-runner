@@ -3,6 +3,25 @@ use tracing::{error, info, warn};
 
 use super::{ExecutionStepConfig, HandlerContext, StepHandler, StepHandlerResult};
 
+/// Extract the origin (scheme + host + port) from a URL.
+///
+/// Given `http://localhost:9876/ui-bridge`, returns `http://localhost:9876`.
+/// Falls back to the default `http://localhost:9876` if parsing fails.
+fn extract_origin(url: &str) -> String {
+    // Find the start of the path after "scheme://host[:port]"
+    if let Some(scheme_end) = url.find("://") {
+        let after_scheme = &url[scheme_end + 3..];
+        // The origin ends at the first '/' after the host (or end of string)
+        if let Some(path_start) = after_scheme.find('/') {
+            return url[..scheme_end + 3 + path_start].to_string();
+        }
+        // No path — the entire URL is the origin
+        return url.to_string();
+    }
+    // Fallback
+    "http://localhost:9876".to_string()
+}
+
 /// Handler for UI Bridge steps.
 ///
 /// Performs UI Bridge SDK operations:
@@ -209,7 +228,8 @@ impl UiBridgeHandler {
         } else if let Some(ref snap_id) = step.ui_bridge_reference_snapshot_id {
             // Load from saved snapshots via runner API
             info!("Compare: loading saved reference snapshot {}...", snap_id);
-            let snap_endpoint = format!("http://localhost:9876/comparison-snapshots/{}", snap_id);
+            let origin = extract_origin(base_url);
+            let snap_endpoint = format!("{}/comparison-snapshots/{}", origin, snap_id);
             match client.get(&snap_endpoint).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     let body = resp.text().await.unwrap_or_default();
@@ -242,7 +262,8 @@ impl UiBridgeHandler {
             "Compare: running AI comparison (mode={})...",
             comparison_mode
         );
-        let compare_endpoint = "http://localhost:9876/ai/compare-snapshots";
+        let origin = extract_origin(base_url);
+        let compare_endpoint = format!("{}/ai/compare-snapshots", origin);
         let compare_body = serde_json::json!({
             "reference_snapshot": reference_snapshot,
             "target_snapshot": target_snapshot,

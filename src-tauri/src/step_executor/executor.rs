@@ -3419,29 +3419,48 @@ impl StepExecutor {
 
             scanned_sources += 1;
 
-            // Read all lines and scan from the end for efficiency.
-            // Only scan the last 500 lines to avoid processing huge log files.
+            // Keep only the last 500 + CONTEXT_LINES lines in a ring buffer
+            // to avoid reading entire large log files into memory.
             let reader = BufReader::new(file);
-            let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
+            let window_size = 500 + CONTEXT_LINES;
+            let mut ring: VecDeque<String> = VecDeque::with_capacity(window_size + 1);
+            let mut total_lines: usize = 0;
 
-            let start_line = lines.len().saturating_sub(500);
-            for (idx, line) in lines.iter().enumerate().skip(start_line) {
+            for line in reader.lines().map_while(Result::ok) {
+                if ring.len() >= window_size {
+                    ring.pop_front();
+                }
+                ring.push_back(line);
+                total_lines += 1;
+            }
+
+            // The ring now holds the last `window_size` lines of the file.
+            // We scan only the last 500 of those (skipping the CONTEXT_LINES prefix
+            // which exist solely to provide context_before for the first matches).
+            let ring_len = ring.len();
+            let scan_start = ring_len.saturating_sub(500);
+            // Offset to convert ring index to original file line number
+            let ring_offset = total_lines.saturating_sub(ring_len);
+
+            for ring_idx in scan_start..ring_len {
+                let line = &ring[ring_idx];
                 for pattern in DEFAULT_ERROR_PATTERNS {
                     if line.contains(pattern) {
-                        // Collect context lines
-                        let ctx_start = idx.saturating_sub(CONTEXT_LINES);
-                        let ctx_end = (idx + CONTEXT_LINES + 1).min(lines.len());
+                        // Collect context lines from the ring buffer
+                        let ctx_start = ring_idx.saturating_sub(CONTEXT_LINES);
+                        let ctx_end = (ring_idx + CONTEXT_LINES + 1).min(ring_len);
 
-                        let context_before: Vec<String> = lines[ctx_start..idx].to_vec();
-                        let context_after: Vec<String> = if idx + 1 < ctx_end {
-                            lines[idx + 1..ctx_end].to_vec()
+                        let context_before: Vec<String> =
+                            ring.range(ctx_start..ring_idx).cloned().collect();
+                        let context_after: Vec<String> = if ring_idx + 1 < ctx_end {
+                            ring.range(ring_idx + 1..ctx_end).cloned().collect()
                         } else {
                             Vec::new()
                         };
 
                         all_errors.push(LogError {
                             source: source_name.clone(),
-                            line_number: idx + 1,
+                            line_number: ring_offset + ring_idx + 1,
                             timestamp: None,
                             message: line.clone(),
                             context_before,
@@ -3512,28 +3531,9 @@ impl StepExecutor {
     /// Execute a shell command step
     ///
     /// Check if a command uses bash/Unix syntax that cmd.exe cannot handle.
+    /// Delegates to `ShellCommandHandler::is_bash_command()`.
     fn is_bash_command(command: &str) -> bool {
-        let trimmed = command.trim();
-        let first_word = trimmed.split_whitespace().next().unwrap_or("");
-
-        // Bash builtins and common Unix commands not available in cmd.exe
-        let bash_commands = [
-            "test", "export", "source", "[", "[[", "unset", "eval", "which", "xargs", "wc", "tr",
-            "tee", "sort", "head", "tail", "grep", "sed", "awk", "cut", "basename", "dirname",
-        ];
-        if bash_commands.contains(&first_word) {
-            return true;
-        }
-
-        // Bash syntax patterns
-        trimmed.contains("$(")      // command substitution
-            || trimmed.contains("${")  // variable expansion
-            || trimmed.contains(">/dev/null")  // Unix null device
-            || trimmed.contains("2>&1")  // stderr redirect
-            || trimmed.contains("<<EOF")  // heredoc
-            || trimmed.contains("<<'EOF'")  // heredoc
-            || (trimmed.starts_with("if ") && trimmed.contains("; then"))  // bash if
-            || (trimmed.starts_with("for ") && trimmed.contains("; do")) // bash for
+        super::handlers::shell_command::ShellCommandHandler::is_bash_command(command)
     }
 
     /// Supports variable expansion using `{{variable_name}}` syntax in the command.
