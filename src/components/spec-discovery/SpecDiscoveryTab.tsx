@@ -14,7 +14,6 @@
 
 import { useState, useCallback, useEffect, useMemo } from "react";
 import {
-  RefreshCw,
   Play,
   Zap,
   Layers,
@@ -113,7 +112,7 @@ export function SpecDiscoveryTab({
     connectionStatus,
     connectedApp,
     elements: sdkElements,
-    selectedElementId,
+    selectedElementId: _selectedElementId,
     selectedElement,
     selectElement,
     highlightElement,

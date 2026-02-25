@@ -49,7 +49,17 @@ impl UrlLockManager {
     /// If the same `task_run_id` already holds this URL, returns immediately
     /// (idempotent). If another workflow holds it, blocks until the URL is
     /// released, then acquires it.
-    pub async fn acquire(&self, url: &str, task_run_id: &str, holder_name: &str) {
+    ///
+    /// When a `db` reference is provided, periodically checks whether the
+    /// holding task is still running and cleans up stale locks automatically.
+    /// This prevents indefinite hangs when `release_all_sync()` fails.
+    pub async fn acquire(
+        &self,
+        url: &str,
+        task_run_id: &str,
+        holder_name: &str,
+        db: Option<&crate::database::CheckpointDb>,
+    ) {
         let normalized = normalize_url(url);
 
         loop {
@@ -65,6 +75,33 @@ impl UrlLockManager {
                         );
                         return;
                     }
+
+                    // Check if the holder is still running (stale lock detection)
+                    if let Some(db) = db {
+                        let holder_id = entry.holder_task_run_id.clone();
+                        match db.get_task_run(&holder_id) {
+                            Ok(Some(task_run)) if task_run.status == "running" => {
+                                // Still running — legitimate lock, wait
+                            }
+                            Ok(_) => {
+                                // Not running — stale lock, remove it and retry
+                                info!(
+                                    "Cleaning up stale URL lock in acquire(): {} (task {} no longer running)",
+                                    normalized, holder_id
+                                );
+                                state.remove(&normalized);
+                                // Don't return — loop back to acquire
+                                continue;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to check task run status for {} during acquire: {}",
+                                    holder_id, e
+                                );
+                            }
+                        }
+                    }
+
                     // Held by someone else — drop the write lock and wait
                     info!(
                         "UI Bridge URL {} is reserved by '{}' (task {}), waiting...",
@@ -93,8 +130,11 @@ impl UrlLockManager {
                     return;
                 }
             }
-            // Write lock dropped here — wait for notification, then retry
-            self.notify.notified().await;
+            // Write lock dropped here — wait with timeout, then retry.
+            // The 5-second timeout ensures we periodically re-check for stale
+            // locks even if the notification was missed.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), self.notify.notified())
+                .await;
         }
     }
 
@@ -198,44 +238,51 @@ impl UrlLockManager {
 
     /// Synchronous version of `release_all` for use in `Drop` impls.
     ///
-    /// Uses `try_write()` which may fail if the lock is contended.
-    /// In that case, logs a warning — the stale lock will be cleaned up
-    /// on next acquire attempt or by the next workflow release.
+    /// Retries `try_write()` up to 10 times with short sleeps to handle
+    /// transient RwLock contention. Falls back to logging a warning if
+    /// all attempts fail — the stale lock will be cleaned up by the
+    /// timeout-based cleanup in `acquire()`.
     pub fn release_all_sync(&self, task_run_id: &str) {
-        match self.state.try_write() {
-            Ok(mut state) => {
-                let before = state.len();
+        for attempt in 0..10 {
+            match self.state.try_write() {
+                Ok(mut state) => {
+                    let before = state.len();
 
-                state.retain(|url, entry| {
-                    if entry.holder_task_run_id == task_run_id {
+                    state.retain(|url, entry| {
+                        if entry.holder_task_run_id == task_run_id {
+                            info!(
+                                "UI Bridge URL {} released (sync cleanup for task {})",
+                                url, task_run_id
+                            );
+                            false
+                        } else {
+                            true
+                        }
+                    });
+
+                    let released = before - state.len();
+                    if released > 0 {
                         info!(
-                            "UI Bridge URL {} released (sync cleanup for task {})",
-                            url, task_run_id
+                            "Sync-released {} URL lock(s) for task {}",
+                            released, task_run_id
                         );
-                        false
-                    } else {
-                        true
+                        drop(state);
+                        self.notify.notify_waiters();
                     }
-                });
-
-                let released = before - state.len();
-                if released > 0 {
-                    info!(
-                        "Sync-released {} URL lock(s) for task {}",
-                        released, task_run_id
-                    );
-                    drop(state);
-                    self.notify.notify_waiters();
+                    return;
+                }
+                Err(_) => {
+                    if attempt < 9 {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
                 }
             }
-            Err(_) => {
-                warn!(
-                    "Could not acquire URL lock state for sync release (task {}). \
-                     Lock will be cleaned up on next access.",
-                    task_run_id
-                );
-            }
         }
+        warn!(
+            "Could not acquire URL lock state after 10 retries for sync release (task {}). \
+             Lock will be cleaned up by acquire() timeout.",
+            task_run_id
+        );
     }
 
     /// Clean up stale locks whose holding task runs are no longer running.
@@ -364,6 +411,7 @@ mod tests {
             "http://localhost:3001/api/ui-bridge",
             "task-1",
             "Workflow A",
+            None,
         )
         .await;
 
@@ -384,6 +432,7 @@ mod tests {
             "http://localhost:3001/api/ui-bridge",
             "task-1",
             "Workflow A",
+            None,
         )
         .await;
 
@@ -392,6 +441,7 @@ mod tests {
             "http://localhost:3001/api/ui-bridge",
             "task-1",
             "Workflow A",
+            None,
         )
         .await;
 
@@ -408,6 +458,7 @@ mod tests {
             "http://localhost:3001/api/ui-bridge",
             "task-1",
             "Workflow A",
+            None,
         )
         .await;
 
@@ -422,6 +473,7 @@ mod tests {
                     "http://localhost:3001/api/ui-bridge",
                     "task-2",
                     "Workflow B",
+                    None,
                 )
                 .await;
             acquired_clone.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -463,10 +515,16 @@ mod tests {
             "http://localhost:3001/api/ui-bridge",
             "task-1",
             "Workflow A",
+            None,
         )
         .await;
-        mgr.acquire("http://localhost:9876/ui-bridge", "task-2", "Workflow B")
-            .await;
+        mgr.acquire(
+            "http://localhost:9876/ui-bridge",
+            "task-2",
+            "Workflow B",
+            None,
+        )
+        .await;
 
         let locks = mgr.info().await;
         assert_eq!(locks.len(), 2);
@@ -481,13 +539,19 @@ mod tests {
             "http://localhost:3001/api/ui-bridge",
             "task-1",
             "Workflow A",
+            None,
         )
         .await;
-        mgr.acquire("http://localhost:9876/ui-bridge", "task-1", "Workflow A")
-            .await;
+        mgr.acquire(
+            "http://localhost:9876/ui-bridge",
+            "task-1",
+            "Workflow A",
+            None,
+        )
+        .await;
 
         // Task 2 holds one URL
-        mgr.acquire("http://example.com/ui-bridge", "task-2", "Workflow B")
+        mgr.acquire("http://example.com/ui-bridge", "task-2", "Workflow B", None)
             .await;
 
         assert_eq!(mgr.info().await.len(), 3);
@@ -508,6 +572,7 @@ mod tests {
             "http://localhost:3001/api/ui-bridge",
             "task-1",
             "Workflow A",
+            None,
         )
         .await;
 
@@ -521,6 +586,7 @@ mod tests {
                     "http://localhost:3001/api/ui-bridge",
                     "task-2",
                     "Workflow B",
+                    None,
                 )
                 .await;
             acquired_clone.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -548,6 +614,7 @@ mod tests {
             "http://localhost:3001/api/ui-bridge",
             "task-1",
             "Workflow A",
+            None,
         )
         .await;
 
@@ -573,6 +640,7 @@ mod tests {
             "http://localhost:3001/api/ui-bridge",
             "task-1",
             "Workflow A",
+            None,
         )
         .await;
 
@@ -595,6 +663,7 @@ mod tests {
             "http://localhost:3001/api/ui-bridge/sdk/execute",
             "task-1",
             "Workflow A",
+            None,
         )
         .await;
 
@@ -618,6 +687,7 @@ mod tests {
             "http://localhost:3001/api/ui-bridge",
             "task-1",
             "Workflow A",
+            None,
         )
         .await;
 
@@ -641,6 +711,7 @@ mod tests {
                 "http://localhost:3001/api/ui-bridge",
                 "task-1",
                 "Workflow A",
+                None,
             )
             .await;
         });

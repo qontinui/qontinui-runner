@@ -131,9 +131,20 @@ struct WorkflowDropGuard {
 
 impl Drop for WorkflowDropGuard {
     fn drop(&mut self) {
-        // Always release URL locks on drop, whether completed or not
+        // Always release URL locks on drop, whether completed or not.
+        // Spawn an async task for reliable release — this guard always lives
+        // inside a tokio::spawn, so a runtime handle is available.
         if let Some(ref mgr) = self.url_lock_manager {
-            mgr.release_all_sync(&self.execution_id);
+            let mgr = mgr.clone();
+            let id = self.execution_id.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    mgr.release_all(&id).await;
+                });
+            } else {
+                // Fallback to sync if no runtime (shouldn't happen in practice)
+                mgr.release_all_sync(&self.execution_id);
+            }
         }
 
         if !self.completed.load(Ordering::SeqCst) {

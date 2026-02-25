@@ -5,7 +5,7 @@
  * Shows overall pass/fail status, check step counts, and progress.
  */
 
-import { CheckCircle, XCircle, Clock, Loader2, SkipForward, CheckCircle2 } from "lucide-react";
+import { CheckCircle, XCircle, Clock, Loader2, SkipForward } from "lucide-react";
 import { cn } from "../../../../lib/utils";
 import { Badge } from "../../../ui";
 import { StepStatsBar } from "../shared";
@@ -96,7 +96,6 @@ export function VerificationSummary({
 
   const statusConfig = getStatusConfig(data.status);
   const StatusIcon = statusConfig.icon;
-  const successColors = getStatusColors("success");
   const errorColors = getStatusColors("error");
 
   return (

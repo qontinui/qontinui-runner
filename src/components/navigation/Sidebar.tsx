@@ -91,7 +91,6 @@ import {
   type NavigationAction as _NavigationAction,
   getRunnerNavigation,
   getChildrenForPlatform,
-  CHILDREN_MAP,
   STORAGE_KEYS,
   createInitialState,
   navigationReducer,

@@ -304,9 +304,6 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
     .map(Number)
     .sort((a, b) => a - b);
 
-  // Finding categories for the findings panel
-  const categories = ["all", ...new Set(findings.map((f) => f.categoryId))];
-
   return (
     <div className="space-y-4">
       {/* Findings Panel */}

@@ -12,7 +12,6 @@ import {
   Play,
   Square,
   Settings,
-  FileText,
   Loader2,
   Search,
   Sparkles,
@@ -48,6 +47,7 @@ import { CheckGroupLibraryPicker } from "./CheckGroupLibraryPicker";
 import { TestLibraryPicker } from "./TestLibraryPicker";
 import { McpServerToolPicker } from "./McpServerToolPicker";
 import { AiGenerateWorkflowModal } from "./AiGenerateWorkflowModal";
+import { AiGeneratePanel } from "./AiGeneratePanel";
 import { GenerateFromStatesModal } from "./GenerateFromStatesModal";
 import { AddStateStepsModal } from "./AddStateStepsModal";
 import { PromptTemplateEditor } from "./PromptTemplateEditor";
@@ -100,61 +100,7 @@ const MODELS_BY_PROVIDER: Record<string, { value: string; label: string }[]> = {
   ],
 };
 
-// =============================================================================
-// Empty State Component
-// =============================================================================
-
-function EmptyState({ onAddStep }: { onAddStep: (phase: WorkflowPhase) => void }) {
-  return (
-    <div className="flex flex-col items-center justify-center py-12 px-4 text-center">
-      <FileText className="w-12 h-12 text-zinc-600 mb-4" />
-      <h3 className="text-lg font-medium text-zinc-300 mb-2">Start Building</h3>
-      <p className="text-sm text-zinc-500 mb-6 max-w-md">
-        Add steps to build your workflow. Execution order:
-        <br />
-        <span className="text-blue-400">Setup</span> (once) {"->"} [
-        <span className="text-green-400">Verification</span> {"<->"}{" "}
-        <span className="text-amber-400">Agentic</span>] (loop) {"->"}{" "}
-        <span className="text-purple-400">Completion</span> (once)
-      </p>
-
-      <div className="flex flex-wrap gap-3 justify-center">
-        <button
-          data-tutorial-id="setup-phase"
-          onClick={() => onAddStep("setup")}
-          className="flex items-center gap-2 px-4 py-2 rounded-md bg-blue-500/20 hover:bg-blue-500/30 text-blue-400 transition-colors"
-        >
-          <Plus className="w-4 h-4" />
-          <span>Setup</span>
-        </button>
-        <button
-          data-tutorial-id="verification-phase"
-          onClick={() => onAddStep("verification")}
-          className="flex items-center gap-2 px-4 py-2 rounded-md bg-green-500/20 hover:bg-green-500/30 text-green-400 transition-colors"
-        >
-          <Plus className="w-4 h-4" />
-          <span>Verification</span>
-        </button>
-        <button
-          data-tutorial-id="agentic-phase"
-          onClick={() => onAddStep("agentic")}
-          className="flex items-center gap-2 px-4 py-2 rounded-md bg-amber-500/20 hover:bg-amber-500/30 text-amber-400 transition-colors"
-        >
-          <Plus className="w-4 h-4" />
-          <span>Agentic</span>
-        </button>
-        <button
-          data-tutorial-id="completion-phase"
-          onClick={() => onAddStep("completion")}
-          className="flex items-center gap-2 px-4 py-2 rounded-md bg-purple-500/20 hover:bg-purple-500/30 text-purple-400 transition-colors"
-        >
-          <Plus className="w-4 h-4" />
-          <span>Completion</span>
-        </button>
-      </div>
-    </div>
-  );
-}
+// EmptyState removed — replaced by AiGeneratePanel as the default empty view
 
 // =============================================================================
 // Settings Panel Component
@@ -1739,13 +1685,18 @@ function WorkflowBuilderContent({
 
         {/* Main Content with Split Layout */}
         <div className="flex-1 flex overflow-hidden">
-          {/* Left: Workflow Steps */}
-          <div
-            className={`flex-1 overflow-y-auto p-4 ${selectedStep ? "border-r border-zinc-700" : ""}`}
-          >
-            {isEmpty ? (
-              <EmptyState onAddStep={handleAddStep} />
-            ) : (
+          {/* Left: Workflow Steps or AI Generate Panel */}
+          {isEmpty ? (
+            <div className="flex-1 overflow-hidden">
+              <AiGeneratePanel
+                onCreateManually={() => handleAddStep("setup")}
+                onNavigateToActiveRuns={() => onNavigateToActive?.()}
+              />
+            </div>
+          ) : (
+            <div
+              className={`flex-1 overflow-y-auto p-4 ${selectedStep ? "border-r border-zinc-700" : ""}`}
+            >
               <div className="space-y-4 max-w-3xl mx-auto">
                 {/* Setup Phase */}
                 <PhaseSection
@@ -1825,133 +1776,133 @@ function WorkflowBuilderContent({
                   <AddStepButton onClick={() => handleAddStep("setup")} />
                 </div>
               </div>
-            )}
 
-            {/* Add Step Dropdown */}
-            {dropdownOpen && (
-              <div className="fixed inset-0 z-40" onClick={() => setDropdownOpen(false)}>
-                <div
-                  className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2"
-                  onClick={(e) => e.stopPropagation()}
-                >
-                  <AddStepDropdown
-                    filterPhase={dropdownPhase ?? undefined}
-                    onAddStep={handleStepAdded}
-                    isOpen={dropdownOpen}
-                    onClose={() => setDropdownOpen(false)}
-                    onOpenPromptLibrary={handleOpenPromptLibrary}
-                    onOpenShellCommandLibrary={handleOpenShellCommandLibrary}
-                    onOpenCheckLibrary={handleOpenCheckLibrary}
-                    onOpenCheckGroupLibrary={handleOpenCheckGroupLibrary}
-                    onOpenTestLibrary={handleOpenTestLibrary}
-                    onOpenMcpServerToolPicker={handleOpenMcpServerToolPicker}
-                  />
+              {/* Add Step Dropdown */}
+              {dropdownOpen && (
+                <div className="fixed inset-0 z-40" onClick={() => setDropdownOpen(false)}>
+                  <div
+                    className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <AddStepDropdown
+                      filterPhase={dropdownPhase ?? undefined}
+                      onAddStep={handleStepAdded}
+                      isOpen={dropdownOpen}
+                      onClose={() => setDropdownOpen(false)}
+                      onOpenPromptLibrary={handleOpenPromptLibrary}
+                      onOpenShellCommandLibrary={handleOpenShellCommandLibrary}
+                      onOpenCheckLibrary={handleOpenCheckLibrary}
+                      onOpenCheckGroupLibrary={handleOpenCheckGroupLibrary}
+                      onOpenTestLibrary={handleOpenTestLibrary}
+                      onOpenMcpServerToolPicker={handleOpenMcpServerToolPicker}
+                    />
+                  </div>
                 </div>
-              </div>
-            )}
+              )}
 
-            {/* Prompt Library Picker */}
-            <PromptLibraryPicker
-              isOpen={promptPickerOpen}
-              onClose={() => setPromptPickerOpen(false)}
-              onSelect={handlePromptSelected}
-              phase={promptPickerPhase}
-            />
+              {/* Prompt Library Picker */}
+              <PromptLibraryPicker
+                isOpen={promptPickerOpen}
+                onClose={() => setPromptPickerOpen(false)}
+                onSelect={handlePromptSelected}
+                phase={promptPickerPhase}
+              />
 
-            {/* Shell Command Library Picker */}
-            <ShellCommandLibraryPicker
-              isOpen={shellCommandPickerOpen}
-              onClose={() => setShellCommandPickerOpen(false)}
-              onSelect={handleShellCommandSelected}
-              phase={shellCommandPickerPhase}
-            />
+              {/* Shell Command Library Picker */}
+              <ShellCommandLibraryPicker
+                isOpen={shellCommandPickerOpen}
+                onClose={() => setShellCommandPickerOpen(false)}
+                onSelect={handleShellCommandSelected}
+                phase={shellCommandPickerPhase}
+              />
 
-            {/* Check Library Picker */}
-            <CheckLibraryPicker
-              isOpen={checkPickerOpen}
-              onClose={() => setCheckPickerOpen(false)}
-              onSelect={handleCheckSelected}
-              phase={checkPickerPhase}
-            />
+              {/* Check Library Picker */}
+              <CheckLibraryPicker
+                isOpen={checkPickerOpen}
+                onClose={() => setCheckPickerOpen(false)}
+                onSelect={handleCheckSelected}
+                phase={checkPickerPhase}
+              />
 
-            {/* Test Library Picker */}
-            <TestLibraryPicker
-              isOpen={testPickerOpen}
-              onClose={() => setTestPickerOpen(false)}
-              onSelect={handleTestSelected}
-              phase={testPickerPhase}
-            />
+              {/* Test Library Picker */}
+              <TestLibraryPicker
+                isOpen={testPickerOpen}
+                onClose={() => setTestPickerOpen(false)}
+                onSelect={handleTestSelected}
+                phase={testPickerPhase}
+              />
 
-            {/* Check Group Library Picker */}
-            <CheckGroupLibraryPicker
-              isOpen={checkGroupPickerOpen}
-              onClose={() => setCheckGroupPickerOpen(false)}
-              onSelect={handleCheckGroupSelected}
-              phase={checkGroupPickerPhase}
-            />
+              {/* Check Group Library Picker */}
+              <CheckGroupLibraryPicker
+                isOpen={checkGroupPickerOpen}
+                onClose={() => setCheckGroupPickerOpen(false)}
+                onSelect={handleCheckGroupSelected}
+                phase={checkGroupPickerPhase}
+              />
 
-            {/* MCP Server Tool Picker */}
-            <McpServerToolPicker
-              isOpen={mcpPickerOpen}
-              onClose={() => setMcpPickerOpen(false)}
-              onSelect={handleMcpToolSelected}
-              phase={mcpPickerPhase}
-            />
+              {/* MCP Server Tool Picker */}
+              <McpServerToolPicker
+                isOpen={mcpPickerOpen}
+                onClose={() => setMcpPickerOpen(false)}
+                onSelect={handleMcpToolSelected}
+                phase={mcpPickerPhase}
+              />
 
-            {/* AI Generate Workflow Modal */}
-            <AiGenerateWorkflowModal
-              isOpen={aiGenerateModalOpen}
-              onClose={() => setAiGenerateModalOpen(false)}
-              onWorkflowGenerated={handleAiWorkflowGenerated}
-            />
+              {/* AI Generate Workflow Modal */}
+              <AiGenerateWorkflowModal
+                isOpen={aiGenerateModalOpen}
+                onClose={() => setAiGenerateModalOpen(false)}
+                onWorkflowGenerated={handleAiWorkflowGenerated}
+              />
 
-            {/* Generate from State Machine Modal */}
-            <GenerateFromStatesModal
-              isOpen={generateFromStatesModalOpen}
-              onClose={() => setGenerateFromStatesModalOpen(false)}
-              onWorkflowGenerated={handleAiWorkflowGenerated}
-            />
+              {/* Generate from State Machine Modal */}
+              <GenerateFromStatesModal
+                isOpen={generateFromStatesModalOpen}
+                onClose={() => setGenerateFromStatesModalOpen(false)}
+                onWorkflowGenerated={handleAiWorkflowGenerated}
+              />
 
-            {/* Add Steps from State Modal */}
-            <AddStateStepsModal
-              isOpen={addStateStepsModalOpen}
-              onClose={() => setAddStateStepsModalOpen(false)}
-              addStep={addStep}
-              onStepsAdded={(result) => {
-                console.log(
-                  "[WorkflowBuilder] Added steps from state:",
-                  result.verificationSteps.length,
-                  "verification,",
-                  result.agenticStep ? "1 agentic" : "0 agentic",
-                );
-              }}
-            />
+              {/* Add Steps from State Modal */}
+              <AddStateStepsModal
+                isOpen={addStateStepsModalOpen}
+                onClose={() => setAddStateStepsModalOpen(false)}
+                addStep={addStep}
+                onStepsAdded={(result) => {
+                  console.log(
+                    "[WorkflowBuilder] Added steps from state:",
+                    result.verificationSteps.length,
+                    "verification,",
+                    result.agenticStep ? "1 agentic" : "0 agentic",
+                  );
+                }}
+              />
 
-            {/* Batch Delete Workflows Dialog */}
-            <BatchDeleteDialog
-              open={showBatchDeleteDialog}
-              title="Delete Workflows"
-              itemType="workflow"
-              itemNames={getSelectedWorkflowNames()}
-              isDeleting={isDeletingWorkflows}
-              onClose={() => setShowBatchDeleteDialog(false)}
-              onConfirm={deleteSelectedWorkflows}
-            />
+              {/* Batch Delete Workflows Dialog */}
+              <BatchDeleteDialog
+                open={showBatchDeleteDialog}
+                title="Delete Workflows"
+                itemType="workflow"
+                itemNames={getSelectedWorkflowNames()}
+                isDeleting={isDeletingWorkflows}
+                onClose={() => setShowBatchDeleteDialog(false)}
+                onConfirm={deleteSelectedWorkflows}
+              />
 
-            {/* Save Before Run Confirmation Dialog */}
-            <ConfirmDialog
-              open={showSaveBeforeRunDialog}
-              title="Save Required"
-              message="To run a workflow, you need to save it first."
-              description="Would you like to save the workflow now and then run it?"
-              variant="info"
-              confirmText="Save & Run"
-              cancelText="Cancel"
-              isLoading={isSavingBeforeRun}
-              onClose={() => setShowSaveBeforeRunDialog(false)}
-              onConfirm={handleSaveAndRun}
-            />
-          </div>
+              {/* Save Before Run Confirmation Dialog */}
+              <ConfirmDialog
+                open={showSaveBeforeRunDialog}
+                title="Save Required"
+                message="To run a workflow, you need to save it first."
+                description="Would you like to save the workflow now and then run it?"
+                variant="info"
+                confirmText="Save & Run"
+                cancelText="Cancel"
+                isLoading={isSavingBeforeRun}
+                onClose={() => setShowSaveBeforeRunDialog(false)}
+                onConfirm={handleSaveAndRun}
+              />
+            </div>
+          )}
 
           {/* Right: Step Configuration Panel */}
           {selectedStep && (

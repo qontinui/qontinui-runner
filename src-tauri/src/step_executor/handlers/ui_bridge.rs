@@ -235,7 +235,12 @@ impl StepHandler for UiBridgeHandler {
             context
                 .app_state
                 .url_lock_manager
-                .acquire(base_url, task_run_id, workflow_name)
+                .acquire(
+                    base_url,
+                    task_run_id,
+                    workflow_name,
+                    Some(&context.app_state.checkpoint_db),
+                )
                 .await;
         }
 

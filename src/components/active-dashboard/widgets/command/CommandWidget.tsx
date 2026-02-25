@@ -328,12 +328,6 @@ export function CommandWidget({ isSummary, data, className }: CommandWidgetProps
   const [expandedCommandId, setExpandedCommandId] = useState<string | null>(null);
   const [modeFilter, setModeFilter] = useState<ModeFilter>("all");
 
-  if (isSummary) return null;
-
-  const handleToggle = (commandId: string) => {
-    setExpandedCommandId((prev) => (prev === commandId ? null : commandId));
-  };
-
   const filteredCommands = useMemo(() => {
     if (modeFilter === "all") return data.commands;
     return data.commands.filter((c) => c.mode === modeFilter);
@@ -344,6 +338,12 @@ export function CommandWidget({ isSummary, data, className }: CommandWidgetProps
     const modes = new Set(data.commands.map((c) => c.mode).filter(Boolean));
     return modes.size > 1 ? (Array.from(modes) as CommandMode[]) : [];
   }, [data.commands]);
+
+  if (isSummary) return null;
+
+  const handleToggle = (commandId: string) => {
+    setExpandedCommandId((prev) => (prev === commandId ? null : commandId));
+  };
 
   return (
     <div className={cn("flex flex-col h-full overflow-hidden", className)}>

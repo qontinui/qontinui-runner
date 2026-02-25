@@ -5,8 +5,20 @@
  * Enables multi-run dashboard view with run selection and GUI lock awareness.
  */
 
-import { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from "react";
+import {
+  createContext,
+  useContext,
+  useState,
+  useEffect,
+  useCallback,
+  useRef,
+  type ReactNode,
+} from "react";
 import type { TaskActivityInfo } from "../types/dashboard/widget-registry";
+import {
+  AUTO_RUN_AFTER_GENERATE_KEY,
+  type AutoRunAfterGenerate,
+} from "../components/workflow-builder/AiGeneratePanel";
 
 const API_BASE = "http://localhost:9876";
 const POLL_INTERVAL_MS = 2000;
@@ -184,6 +196,81 @@ export function ActiveRunsProvider({ children }: ActiveRunsProviderProps) {
   // Track previously seen run IDs to detect new runs
   const [previousRunIds, setPreviousRunIds] = useState<Set<string>>(new Set());
 
+  // Auto-run signal: tracks a "Generate & Run" request pending completion
+  const autoRunSignalRef = useRef<AutoRunAfterGenerate | null>(null);
+  const autoRunProcessedRef = useRef(false);
+
+  // Read auto-run signal from localStorage on mount
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(AUTO_RUN_AFTER_GENERATE_KEY);
+      if (!raw) return;
+      const signal: AutoRunAfterGenerate = JSON.parse(raw);
+      // Ignore stale signals (older than 30 minutes)
+      if (Date.now() - signal.timestamp > 30 * 60 * 1000) {
+        localStorage.removeItem(AUTO_RUN_AFTER_GENERATE_KEY);
+        return;
+      }
+      autoRunSignalRef.current = signal;
+      autoRunProcessedRef.current = false;
+    } catch {
+      localStorage.removeItem(AUTO_RUN_AFTER_GENERATE_KEY);
+    }
+  }, []);
+
+  /**
+   * Check if the auto-run signal's meta-workflow has completed and start the generated workflow.
+   */
+  const checkAutoRunSignal = useCallback(async (runningTaskIds: Set<string>) => {
+    const signal = autoRunSignalRef.current;
+    if (!signal || autoRunProcessedRef.current) return;
+
+    // If the meta-workflow task run is still running, wait
+    if (runningTaskIds.has(signal.taskRunId)) return;
+
+    // Mark as processed so we don't re-check
+    autoRunProcessedRef.current = true;
+    localStorage.removeItem(AUTO_RUN_AFTER_GENERATE_KEY);
+    autoRunSignalRef.current = null;
+
+    try {
+      // Fetch the completed task run to get result_data
+      const resp = await fetch(`${API_BASE}/task-runs/${signal.taskRunId}`);
+      if (!resp.ok) return;
+      const json = await resp.json();
+      const taskRun = json.data ?? json;
+
+      // Extract generated workflow ID from result_data
+      let resultData = taskRun.result_data;
+      if (typeof resultData === "string") {
+        try {
+          resultData = JSON.parse(resultData);
+        } catch {
+          return;
+        }
+      }
+      if (!resultData || typeof resultData !== "object") return;
+      const workflowId = resultData.generated_workflow_id;
+      if (!workflowId) return;
+
+      console.log("[AutoRun] Meta-workflow completed. Starting generated workflow:", workflowId);
+
+      // Start the generated workflow
+      const runResp = await fetch(`${API_BASE}/unified-workflows/${workflowId}/run`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      if (runResp.ok) {
+        console.log("[AutoRun] Generated workflow started successfully");
+      } else {
+        console.error("[AutoRun] Failed to start generated workflow:", runResp.status);
+      }
+    } catch (err) {
+      console.error("[AutoRun] Error processing auto-run signal:", err);
+    }
+  }, []);
+
   /**
    * Fetch active runs and GUI lock info.
    */
@@ -270,6 +357,9 @@ export function ActiveRunsProvider({ children }: ActiveRunsProviderProps) {
       setActiveRuns(runs);
       setPreviousRunIds(currentRunIds);
 
+      // Check auto-run signal (Generate & Run flow)
+      checkAutoRunSignal(currentRunIds);
+
       // Auto-select logic:
       // 1. If no run is selected, select the newest running task
       // 2. If a new run appears, optionally auto-select it (if current selection is completed)
@@ -303,7 +393,7 @@ export function ActiveRunsProvider({ children }: ActiveRunsProviderProps) {
     } finally {
       setIsLoading(false);
     }
-  }, [selectedRunId, previousRunIds]);
+  }, [selectedRunId, previousRunIds, checkAutoRunSignal]);
 
   // Initial fetch and polling
   useEffect(() => {

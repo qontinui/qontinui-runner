@@ -131,15 +131,65 @@ export function useDashboardLayout(
     }
   }, [initialTaskInfo, resetLayoutForTask]);
 
+  // Track previous activities map reference to detect status transitions
+  const prevActivitiesRef = useRef<Map<ActivityType, ActivityState>>(new Map());
+
   /**
-   * Auto-switch is DISABLED to prevent flickering.
-   * Users can manually click on widgets to switch between them.
-   * The first detected widget (by priority) is shown by default.
+   * Auto-switch to a running activity when:
+   * 1. The user has NOT manually selected a widget
+   * 2. An activity transitions from non-running to "running"
+   * 3. The transition persists for AUTO_SWITCH_DEBOUNCE_MS (prevents flickering)
    *
-   * Previously, auto-switching would occur when an activity's status changed to "running",
-   * but this caused rapid flickering as different activities toggled status.
+   * The debounce ensures that rapid status toggling (e.g., polling artifacts)
+   * doesn't cause the active widget to flicker between activities.
    */
-  const _autoSwitchDisabled = { autoSwitchTimeoutRef, userSelectedRef, AUTO_SWITCH_DEBOUNCE_MS };
+  useEffect(() => {
+    // Skip auto-switch if user has manually selected a widget
+    if (userSelectedRef.current) {
+      prevActivitiesRef.current = activities;
+      return;
+    }
+
+    // Find activities that just transitioned to "running"
+    const prevActivities = prevActivitiesRef.current;
+    let newlyRunning: ActivityType | null = null;
+
+    for (const [type, state] of activities) {
+      if (state.status === "running") {
+        const prevState = prevActivities.get(type);
+        if (!prevState || prevState.status !== "running") {
+          // This activity just started running
+          newlyRunning = type;
+          break;
+        }
+      }
+    }
+
+    prevActivitiesRef.current = activities;
+
+    if (newlyRunning) {
+      // Clear any pending auto-switch
+      if (autoSwitchTimeoutRef.current) {
+        clearTimeout(autoSwitchTimeoutRef.current);
+      }
+
+      const targetWidget = newlyRunning;
+      autoSwitchTimeoutRef.current = setTimeout(() => {
+        // Re-check: only switch if the activity is still running and user hasn't selected
+        if (!userSelectedRef.current) {
+          setActiveWidgetState(targetWidget);
+        }
+        autoSwitchTimeoutRef.current = null;
+      }, AUTO_SWITCH_DEBOUNCE_MS);
+    }
+
+    return () => {
+      if (autoSwitchTimeoutRef.current) {
+        clearTimeout(autoSwitchTimeoutRef.current);
+        autoSwitchTimeoutRef.current = null;
+      }
+    };
+  }, [activities]);
 
   /**
    * Effective widgets to use - prefer derivedWidgets for synchronous rendering.

@@ -782,6 +782,10 @@ pub async fn stop_task_run(
         .stop_task_run(&id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
+    // Explicitly release URL locks for this task (don't rely solely on
+    // WorkflowDropGuard's sync release, which can fail under contention)
+    state.app_state.url_lock_manager.release_all(&id).await;
+
     // Emit status to frontend
     emit_ai_output(
         &state.app_handle,
