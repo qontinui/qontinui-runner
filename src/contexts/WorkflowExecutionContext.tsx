@@ -100,6 +100,27 @@ export interface ResumePoint {
 }
 
 /**
+ * Workflow state response from the /task-runs/{id}/workflow-state endpoint.
+ * Contains workflow-level metadata like max_iterations and has_verification_plan.
+ */
+interface WorkflowStateResponse {
+  task_run_id: string;
+  workflow_type: string;
+  current_state: string;
+  phase: string | null;
+  iteration: number | null;
+  max_iterations: number | null;
+  is_complete: boolean;
+  is_stopped: boolean;
+  is_paused: boolean;
+  has_verification_plan: boolean;
+  workflow_start_time: string;
+  state_data: unknown | null;
+  workflow_stage: string | null;
+  workflow_stage_display: string | null;
+}
+
+/**
  * Full state response from the backend.
  */
 interface FullStateResponse {
@@ -630,11 +651,36 @@ function calculateTimelineStats(phaseGroups: PhaseGroup[], elapsedTime: number):
     }
   }
 
+  // Calculate average iteration duration from completed iterations.
+  // Each iteration's duration is the span from its earliest step start to its latest step end.
+  let avgIterationDurationMs: number | null = null;
+  const completedIterations = verificationIterations.filter((iter) => {
+    const allDone = iter.steps.every(
+      (s) => s.status === "success" || s.status === "failed" || s.status === "skipped",
+    );
+    return allDone && iter.steps.length > 0;
+  });
+  if (completedIterations.length > 0) {
+    let totalDurationMs = 0;
+    let countedIterations = 0;
+    for (const iter of completedIterations) {
+      // Sum step durations as a simpler approach (steps may not overlap)
+      const iterDuration = iter.steps.reduce((sum, s) => sum + (s.durationMs ?? 0), 0);
+      if (iterDuration > 0) {
+        totalDurationMs += iterDuration;
+        countedIterations++;
+      }
+    }
+    if (countedIterations > 0) {
+      avgIterationDurationMs = Math.round(totalDurationMs / countedIterations);
+    }
+  }
+
   return {
     elapsedTime,
     currentIteration,
     maxIteration,
-    avgIterationDurationMs: null, // TODO: Calculate from step durations
+    avgIterationDurationMs,
     verificationResults,
     improvement,
   };
@@ -689,15 +735,24 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
     abortControllerRef.current = controller;
 
     try {
-      const response = await fetch(`${API_BASE}/task-runs/${taskId}/full-state`, {
-        signal: controller.signal,
-      });
+      // Fetch full state and workflow state in parallel
+      const [fullStateResponse, workflowStateResponse] = await Promise.all([
+        fetch(`${API_BASE}/task-runs/${taskId}/full-state`, {
+          signal: controller.signal,
+        }),
+        fetch(`${API_BASE}/task-runs/${taskId}/workflow-state`, {
+          signal: controller.signal,
+        }).catch(() => null), // workflow-state is supplementary; don't fail if unavailable
+      ]);
       if (controller.signal.aborted) return;
-      if (!response.ok) {
-        throw new Error(`Failed to fetch full state: ${response.statusText}`);
+      if (!fullStateResponse.ok) {
+        throw new Error(`Failed to fetch full state: ${fullStateResponse.statusText}`);
       }
 
-      const data: FullStateResponse = await response.json();
+      const data: FullStateResponse = await fullStateResponse.json();
+      const workflowStateData: WorkflowStateResponse | null = workflowStateResponse?.ok
+        ? await workflowStateResponse.json()
+        : null;
       if (controller.signal.aborted) return;
 
       // Convert checkpoints
@@ -834,8 +889,8 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
         isOrchestrated:
           data.task_run.workflow_type === "unified" || data.task_run.workflow_type === "plan",
         iteration: data.orchestrator_state?.iteration ?? 1,
-        maxIterations: 10, // TODO: Get from workflow definition
-        hasVerificationPlan: false, // TODO: Get from orchestrator state
+        maxIterations: workflowStateData?.max_iterations ?? 10,
+        hasVerificationPlan: workflowStateData?.has_verification_plan ?? false,
         isComplete,
         isPaused: false,
         isStopped,

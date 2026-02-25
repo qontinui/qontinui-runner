@@ -30,6 +30,21 @@ interface TauriResult<T> {
   message?: string;
 }
 
+/** Snake_case response from Rust's ExecutionVariablesSettings via serde serialization. */
+interface RustExecutionVariablesData {
+  auth_source: string;
+  auth_header_name?: string;
+  auth_token?: string;
+  auth_env_var?: string;
+  custom_variables?: Array<{
+    name: string;
+    source: string;
+    value?: string;
+    env_var?: string;
+    description?: string;
+  }>;
+}
+
 interface ExecutionVariablesSettingsProps {
   onLog: LogFunction;
 }
@@ -78,22 +93,20 @@ export function ExecutionVariablesSettings({ onLog }: ExecutionVariablesSettings
       setLoading(true);
       setError(null);
 
-      const result = await invoke<TauriResult<ExecutionVariablesSettingsType>>(
+      const result = await invoke<TauriResult<RustExecutionVariablesData>>(
         "get_execution_variables_settings",
       );
 
       if (result && result.success && result.data) {
         // Map snake_case from Rust to camelCase
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const rustData = result.data as any;
+        const rustData = result.data;
         setSettings({
           authSource: rustData.auth_source as AuthSource,
           authHeaderName: rustData.auth_header_name || "Authorization",
           authToken: rustData.auth_token,
           authEnvVar: rustData.auth_env_var || "API_AUTH_TOKEN",
           customVariables:
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            rustData.custom_variables?.map((v: any) => ({
+            rustData.custom_variables?.map((v) => ({
               name: v.name,
               source: v.source as VariableSource,
               value: v.value,

@@ -87,62 +87,8 @@ pub mod typed_channels;
 pub mod types;
 pub mod verification;
 
-// Re-exports for public API - some may be unused internally but needed for external access
-#[allow(unused_imports)]
-pub use agent_roles::*;
-#[allow(unused_imports)]
-pub use agent_tool::*;
-#[allow(unused_imports)]
-pub use checkpoint::*;
+// Re-exports for public API (only items actually used by other modules)
 pub use compression::*;
-#[allow(unused_imports)]
-pub use config::*;
-#[allow(unused_imports)]
-pub use context_propagation::*;
-#[allow(unused_imports)]
-pub use context_strategies::*;
-#[allow(unused_imports)]
-pub use event_bus::*;
-#[allow(unused_imports)]
-pub use flow::*;
-#[allow(unused_imports)]
-pub use flow_executor::*;
-#[allow(unused_imports)]
-pub use hooks::*;
-#[allow(unused_imports)]
-pub use integration::*;
-#[allow(unused_imports)]
-pub use interrupt::*;
-#[allow(unused_imports)]
-pub use knowledge::*;
-#[allow(unused_imports)]
-pub use layers::*;
-#[allow(unused_imports)]
-pub use learning::*;
-#[allow(unused_imports)]
-pub use ledger::*;
-#[allow(unused_imports)]
-pub use memory::*;
-#[allow(unused_imports)]
-pub use output::*;
-#[allow(unused_imports)]
-pub use parallel::*;
-#[allow(unused_imports)]
-pub use planning::*;
-#[allow(unused_imports)]
-pub use realtime_events::*;
 pub use retry::*;
-#[allow(unused_imports)]
-pub use runtime::*;
-#[allow(unused_imports)]
-pub use state::*;
-#[allow(unused_imports)]
-pub use status_events::*;
-#[allow(unused_imports)]
-pub use structured_output::*;
-#[allow(unused_imports)]
-pub use subflows::*;
-#[allow(unused_imports)]
-pub use typed_channels::*;
 pub use types::*;
 pub use verification::*;

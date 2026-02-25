@@ -103,8 +103,7 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
     // Setup steps
     const setupSteps: SetupStep[] = [];
     if (isNavigation && transitions.length > 0) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const explorationMeta = (genMeta as any)?.explorationMetadata;
+      const explorationMeta = genMeta?.explorationMetadata as { targetUrl?: string } | undefined;
       const pageUrl = explorationMeta?.targetUrl || states[0]?.pageUrl || "";
       if (pageUrl) {
         setupSteps.push({
