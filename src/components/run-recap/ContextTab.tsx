@@ -40,10 +40,9 @@ export function ContextTab({ taskRunId }: ContextTabProps) {
       if (!taskRunId) return;
 
       try {
-        const result = await invoke<AiDataResponse<RuntimeContextResult>>(
-          "get_task_run_context",
-          { taskRunId }
-        );
+        const result = await invoke<AiDataResponse<RuntimeContextResult>>("get_task_run_context", {
+          taskRunId,
+        });
         if (result.success && result.data) {
           setVariables(result.data.variables);
         }
@@ -95,19 +94,24 @@ export function ContextTab({ taskRunId }: ContextTabProps) {
                 {variables.map((variable, i) => (
                   <tr key={i} className="hover:bg-muted/30">
                     <td className="px-4 py-2 font-mono text-primary">{variable.name}</td>
-                    <td className="px-4 py-2 font-mono text-foreground/80 max-w-xs truncate" title={variable.value}>
+                    <td
+                      className="px-4 py-2 font-mono text-foreground/80 max-w-xs truncate"
+                      title={variable.value}
+                    >
                       {variable.value}
                     </td>
                     <td className="px-4 py-2">
-                      <span className={`text-xs px-1.5 py-0.5 rounded ${
-                        variable.source === "system"
-                          ? "bg-blue-500/10 text-blue-400"
-                          : variable.source === "step"
-                            ? "bg-green-500/10 text-green-400"
-                            : variable.source === "user"
-                              ? "bg-purple-500/10 text-purple-400"
-                              : "bg-gray-500/10 text-gray-400"
-                      }`}>
+                      <span
+                        className={`text-xs px-1.5 py-0.5 rounded ${
+                          variable.source === "system"
+                            ? "bg-blue-500/10 text-blue-400"
+                            : variable.source === "step"
+                              ? "bg-green-500/10 text-green-400"
+                              : variable.source === "user"
+                                ? "bg-purple-500/10 text-purple-400"
+                                : "bg-gray-500/10 text-gray-400"
+                        }`}
+                      >
                         {variable.source}
                       </span>
                     </td>

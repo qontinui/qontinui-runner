@@ -6,7 +6,16 @@
  */
 
 import { useRef } from "react";
-import { Sparkles, Plus, Upload, Download, Trash2, GitBranch, Layers, ExternalLink } from "lucide-react";
+import {
+  Sparkles,
+  Plus,
+  Upload,
+  Download,
+  Trash2,
+  GitBranch,
+  Layers,
+  ExternalLink,
+} from "lucide-react";
 
 export interface BuilderToolbarAction {
   /** Unique key for the action */

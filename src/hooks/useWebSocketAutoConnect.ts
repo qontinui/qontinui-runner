@@ -226,21 +226,20 @@ export function useWebSocketAutoConnect({
 
     const sendHeartbeat = async () => {
       try {
-        const response = await invoke<{ has_active_connection: boolean }>(
-          "send_device_heartbeat",
-          { projectId: selectedProjectId }
-        );
+        const response = await invoke<{ has_active_connection: boolean }>("send_device_heartbeat", {
+          projectId: selectedProjectId,
+        });
         console.log(
           "[WS_AUTO_CONNECT] Heartbeat sent (has_active_connection:",
           response.has_active_connection,
-          ")"
+          ")",
         );
 
         // If backend says no active connection but we think we're connected,
         // the WebSocket has silently dropped — trigger reconnection
         if (!response.has_active_connection) {
           console.warn(
-            "[WS_AUTO_CONNECT] Backend reports no active connection — triggering reconnect"
+            "[WS_AUTO_CONNECT] Backend reports no active connection — triggering reconnect",
           );
           setConnected(false);
           autoConnectAttemptedRef.current = null;

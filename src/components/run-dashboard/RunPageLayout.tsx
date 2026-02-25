@@ -13,15 +13,15 @@ import { getStatusColors } from "@/design-system";
 
 /** Maps runner page titles to web run-detail tab names */
 const TAB_MAPPING: Record<string, string> = {
-  "Recap": "summary",
-  "Actions": "summary",
+  Recap: "summary",
+  Actions: "summary",
   "Image Recognition": "summary",
-  "Findings": "findings",
+  Findings: "findings",
   "State Explorer": "summary",
   "Test Results": "tests",
   "AI Output": "ai-conversation",
   "AI Data Viewer": "data-logs",
-  "Statistics": "summary",
+  Statistics: "summary",
 };
 
 interface RunPageLayoutProps {

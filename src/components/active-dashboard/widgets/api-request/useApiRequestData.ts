@@ -53,7 +53,9 @@ export function useApiRequestData(): ApiRequestData {
         if (data.success && data.executions) {
           const apiRequests: ApiRequestExecution[] = data.executions.map((exec) => {
             // Try to parse method/url from step_name (often formatted as "METHOD URL")
-            const nameMatch = exec.step_name?.match(/^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(.+)/i);
+            const nameMatch = exec.step_name?.match(
+              /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(.+)/i,
+            );
             const method = nameMatch?.[1]?.toUpperCase() || "GET";
             const url = nameMatch?.[2] || "";
 
