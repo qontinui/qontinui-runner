@@ -23,6 +23,8 @@ function PhaseProgress({
   phaseGroups: ExecutionTimelineSummaryProps["data"]["phaseGroups"];
   currentPhase: ExecutionTimelineSummaryProps["data"]["currentPhase"];
 }) {
+  const completeColors = getAccentColors("green");
+
   return (
     <div className="flex items-center gap-1 mt-2">
       {phaseGroups.map((group) => {
@@ -33,16 +35,16 @@ function PhaseProgress({
 
         return (
           <div
-            key={group.phase}
+            key={`${group.stageIndex}:${group.phase}`}
             className={cn(
               "flex-1 h-1.5 rounded-full transition-all",
               isComplete
-                ? "bg-green-500"
+                ? completeColors.bgSolid
                 : isCurrent
                   ? cn(colors.bg, "animate-phase-fade")
                   : "bg-muted",
             )}
-            title={`${config.label}: ${group.stats.completed}/${group.stats.total}`}
+            title={`${group.displayLabel || config.label}: ${group.stats.completed}/${group.stats.total}`}
           />
         );
       })}

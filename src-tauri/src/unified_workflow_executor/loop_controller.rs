@@ -167,7 +167,7 @@ impl LoopController {
         mut completion_prompt_steps: Vec<ExecutionStepConfig>,
     ) -> WorkflowResult {
         let start = std::time::Instant::now();
-        let mut all_step_results = Vec::new();
+        let all_step_results = Vec::new();
 
         // =====================================================================
         // PROPAGATE TASK RUN ID to phase executors
@@ -216,6 +216,17 @@ impl LoopController {
             substitute(&mut agentic_steps);
             substitute(&mut completion_automation_steps);
             substitute(&mut completion_prompt_steps);
+
+            // Also apply substitution to steps within stages
+            for stage in &mut config.stages {
+                substitute(&mut stage.setup_automation_steps);
+                substitute(&mut stage.setup_prompt_steps);
+                substitute(&mut stage.verification_steps);
+                substitute(&mut stage.agentic_steps);
+                substitute(&mut stage.completion_automation_steps);
+                substitute(&mut stage.completion_prompt_steps);
+            }
+
             info!(
                 "Applied variable substitution (artifact_dir={}, execution_id={})",
                 artifact_dir_str, exec_id
@@ -240,28 +251,24 @@ impl LoopController {
 
         // Stage transition tracking for recap timeline
         // Load existing transitions when resuming to preserve prior phase history
-        let (mut transitions, mut current_stage) =
-            if !matches!(resume_point, ResumePoint::FromStart) {
-                // Try to load existing transition history from database
-                if let Ok(Some(task_run)) = self.checkpoint_db.get_task_run(&config.execution_id) {
-                    if let Some(ref history_json) = task_run.transition_history_json {
-                        if let Ok(loaded_transitions) =
-                            serde_json::from_str::<Vec<StageTransition>>(history_json)
-                        {
-                            // Get the last stage from transitions, or default to "init"
-                            let last_stage = loaded_transitions
-                                .last()
-                                .map(|t| t.to.clone())
-                                .unwrap_or_else(|| "init".to_string());
-                            info!(
-                                "Loaded {} existing transitions, current stage: {}",
-                                loaded_transitions.len(),
-                                last_stage
-                            );
-                            (loaded_transitions, last_stage)
-                        } else {
-                            (Vec::new(), "init".to_string())
-                        }
+        let (transitions, current_stage) = if !matches!(resume_point, ResumePoint::FromStart) {
+            // Try to load existing transition history from database
+            if let Ok(Some(task_run)) = self.checkpoint_db.get_task_run(&config.execution_id) {
+                if let Some(ref history_json) = task_run.transition_history_json {
+                    if let Ok(loaded_transitions) =
+                        serde_json::from_str::<Vec<StageTransition>>(history_json)
+                    {
+                        // Get the last stage from transitions, or default to "init"
+                        let last_stage = loaded_transitions
+                            .last()
+                            .map(|t| t.to.clone())
+                            .unwrap_or_else(|| "init".to_string());
+                        info!(
+                            "Loaded {} existing transitions, current stage: {}",
+                            loaded_transitions.len(),
+                            last_stage
+                        );
+                        (loaded_transitions, last_stage)
                     } else {
                         (Vec::new(), "init".to_string())
                     }
@@ -269,23 +276,27 @@ impl LoopController {
                     (Vec::new(), "init".to_string())
                 }
             } else {
-                // Fresh run - start with empty transitions
                 (Vec::new(), "init".to_string())
-            };
+            }
+        } else {
+            // Fresh run - start with empty transitions
+            (Vec::new(), "init".to_string())
+        };
 
         info!(
             "=== UNIFIED WORKFLOW START: {} (id: {}) ===",
             config.workflow_name, config.execution_id
         );
-        info!("Configuration: max_iterations={}", config.max_iterations);
         info!(
-            "Steps: setup_auto={}, setup_prompt={}, verification={}, agentic={}, completion_auto={}, completion_prompt={}",
-            setup_automation_steps.len(),
-            setup_prompt_steps.len(),
-            verification_steps.len(),
-            agentic_steps.len(),
-            completion_automation_steps.len(),
-            completion_prompt_steps.len()
+            "Configuration: max_iterations={}, stages={}, top_level_steps={}",
+            config.max_iterations,
+            config.stages.len(),
+            setup_automation_steps.len()
+                + setup_prompt_steps.len()
+                + verification_steps.len()
+                + agentic_steps.len()
+                + completion_automation_steps.len()
+                + completion_prompt_steps.len()
         );
 
         // Create centralized step event logger for this execution
@@ -295,48 +306,6 @@ impl LoopController {
             &config.execution_id,
             &config.workflow_name,
         );
-
-        // Calculate effective starting iteration based on resume point
-        let (
-            skip_setup,
-            effective_starting_iteration,
-            run_agentic_first_from_resume,
-            skip_to_completion,
-        ) = match &resume_point {
-            ResumePoint::FromStart => (false, 0, false, false),
-            ResumePoint::SetupPhase { .. } => {
-                // Resume in setup - re-run setup (could be smarter about partial resume)
-                (false, 0, false, false)
-            }
-            ResumePoint::VerificationPhase { iteration, .. } => {
-                // Skip setup, start verification at the given iteration
-                // iteration is 1-indexed, starting_iteration is 0-indexed (number of completed iterations)
-                (true, iteration.saturating_sub(1), false, false)
-            }
-            ResumePoint::AgenticPhase { iteration, .. } => {
-                // Skip setup, run agentic phase first, then continue verification loop
-                // The agentic phase is at the given iteration, so we'll run it and then
-                // continue with verification at iteration + 1
-                (true, iteration.saturating_sub(1), true, false)
-            }
-            ResumePoint::CompletionPhase { .. } => {
-                // Skip directly to completion - verification already passed
-                (true, 0, false, true)
-            }
-            ResumePoint::StageStart { .. } => {
-                // Multi-stage resume: skip to the correct stage in run_multi_stage
-                // Don't skip setup/verification here; run_multi_stage handles stage skipping
-                (false, 0, false, false)
-            }
-        };
-
-        // Determine if we should run agentic first:
-        // - From resume: if we were interrupted during agentic phase
-        // - From config: if this is an error-fix workflow (run_agentic_first=true in config)
-        //   This ensures AI attempts to fix errors before verification runs, since log_watch
-        //   verification may pass immediately if logs are currently clean.
-        let run_agentic_first = run_agentic_first_from_resume
-            || (matches!(resume_point, ResumePoint::FromStart) && config.run_agentic_first);
 
         // =====================================================================
         // CLEAR OLD DATA FOR FRESH RUNS
@@ -390,648 +359,61 @@ impl LoopController {
         }
 
         // =====================================================================
-        // MULTI-STAGE EXECUTION (if stages are defined)
+        // NORMALIZE: All workflows are phased (multi-stage)
         // =====================================================================
-        // When a workflow has stages, each stage runs its own
-        // setup → verification-agentic loop → stage completion cycle.
-        // After all stages, the top-level completion phase runs.
-        if !config.stages.is_empty() {
-            return self
-                .run_multi_stage(
-                    config,
-                    all_step_results,
-                    transitions,
-                    current_stage,
-                    &logger,
-                    start,
-                    &resume_point,
-                )
-                .await;
-        }
+        // If no explicit stages are defined, wrap the top-level steps into a
+        // single stage. This means ALL execution goes through run_multi_stage().
+        if config.stages.is_empty() {
+            let has_any_steps = !setup_automation_steps.is_empty()
+                || !setup_prompt_steps.is_empty()
+                || !verification_steps.is_empty()
+                || !agentic_steps.is_empty()
+                || !completion_automation_steps.is_empty()
+                || !completion_prompt_steps.is_empty();
 
-        // =====================================================================
-        // PHASE 1: SETUP (runs once, unless resuming from later phase)
-        // =====================================================================
-        if !skip_setup {
-            info!("=== PHASE 1: SETUP ===");
-
-            // Persist workflow state: SetupRunning
-            self.persist_workflow_state(
-                &config.execution_id,
-                &UnifiedWorkflowState::setup_running(),
-            );
-
-            self.record_stage_transition(
-                &config.execution_id,
-                &mut transitions,
-                &mut current_stage,
-                "setup",
-                0,
-            );
-
-            let (setup_success, setup_results) = self
-                .setup_executor
-                .run_setup(
-                    &setup_automation_steps,
-                    &setup_prompt_steps,
-                    &config.execution_id,
-                    &config.workflow_name,
-                    &logger,
-                )
-                .await;
-
-            // Append setup phase results to output_log so output is visible immediately
-            {
-                let mut setup_output = format!(
-                    "\n=== Setup Phase ===\nSteps: {}\nSuccess: {}\n",
-                    setup_results.len(),
-                    setup_success,
-                );
-                for sr in &setup_results {
-                    setup_output.push_str(&format!(
-                        "  [{}] {} - {} ({}ms)\n",
-                        if sr.success { "OK" } else { "FAIL" },
-                        sr.step_type,
-                        sr.step_name,
-                        sr.duration_ms,
-                    ));
-                    if let Some(ref details) = sr.verification_details {
-                        if let Some(ref stdout) = details.stdout {
-                            if !stdout.is_empty() {
-                                setup_output.push_str(&format!("    stdout: {}\n", stdout));
-                            }
-                        }
-                        if let Some(ref stderr) = details.stderr {
-                            if !stderr.is_empty() {
-                                setup_output.push_str(&format!("    stderr: {}\n", stderr));
-                            }
-                        }
-                    }
-                    if let Some(ref err) = sr.error {
-                        setup_output.push_str(&format!("    error: {}\n", err));
-                    }
-                }
-                let _ = self.checkpoint_db.append_task_output_ex(
-                    &config.execution_id,
-                    &setup_output,
-                    false, // don't increment session count for setup
-                    false,
-                );
-            }
-
-            all_step_results.extend(setup_results);
-
-            if !setup_success {
-                error!("Setup phase failed - aborting workflow");
-                // Persist workflow state: Failed
-                self.persist_workflow_state(
-                    &config.execution_id,
-                    &UnifiedWorkflowState::failed_in_phase("Setup phase failed", "setup", None),
-                );
-                self.mark_task_failed(&config.execution_id, "Setup phase failed")
-                    .await;
-
-                // Fire-and-forget summary generation for the failed task
-                let db = self.checkpoint_db.clone();
-                let exec_id = config.execution_id.clone();
-                let doctor_handle = self.doctor_handle.clone();
-                tokio::spawn(async move {
-                    match generate_task_summary_async(db, exec_id.clone(), doctor_handle).await {
-                        Ok(_) => info!("Generated summary for failed task {}", exec_id),
-                        Err(e) => warn!(
-                            "Failed to generate summary for failed task {}: {}",
-                            exec_id, e
-                        ),
-                    }
-                });
-
-                return WorkflowResult {
-                    success: false,
-                    verification_passed: false,
-                    step_results: all_step_results,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    loop_result: None,
+            if has_any_steps {
+                info!("Normalizing single-phase workflow into stages");
+                let single_stage = super::StageConfig {
+                    id: format!("{}-phase-1", config.workflow_id),
+                    name: config.workflow_name.clone(),
+                    index: 0,
+                    total_stages: 1,
+                    setup_automation_steps: std::mem::take(&mut setup_automation_steps),
+                    setup_prompt_steps: std::mem::take(&mut setup_prompt_steps),
+                    verification_steps: std::mem::take(&mut verification_steps),
+                    agentic_steps: std::mem::take(&mut agentic_steps),
+                    completion_automation_steps: std::mem::take(&mut completion_automation_steps),
+                    completion_prompt_steps: std::mem::take(&mut completion_prompt_steps),
+                    max_iterations: config.max_iterations,
+                    provider: config.provider_override.clone(),
+                    model: config.model_override.clone(),
+                    timeout_seconds: None,
                 };
-            }
-
-            // Persist workflow state: SetupComplete
-            self.persist_workflow_state(
-                &config.execution_id,
-                &UnifiedWorkflowState::setup_complete(),
-            );
-        } else {
-            info!("=== PHASE 1: SETUP SKIPPED (resuming from later phase) ===");
-        }
-
-        // =====================================================================
-        // EXPAND RUNTIME VARIABLES in prompts from setup phase outputs
-        // =====================================================================
-        // Setup API steps store their outputs in the setup executor's SharedVariableStore.
-        // These need to be substituted into {{variable_name}} patterns in:
-        // - config.base_prompt (agentic phase prompt)
-        // - completion prompt step content
-        {
-            let shared_vars = self.setup_executor.shared_variables().get_all();
-            if !shared_vars.is_empty() {
-                info!(
-                    "Expanding {} runtime variables from setup phase into prompts",
-                    shared_vars.len()
-                );
-                for (name, value) in &shared_vars {
-                    let pattern = format!("{{{{{}}}}}", name);
-                    if config.base_prompt.contains(&pattern) {
-                        info!(
-                            "  Substituting {{{{{}}}}} ({} chars) into base_prompt",
-                            name,
-                            value.len()
-                        );
-                        config.base_prompt = config.base_prompt.replace(&pattern, value);
-                    }
-                }
-                // Also substitute into completion prompt step content
-                for step in completion_prompt_steps.iter_mut() {
-                    if let Some(ref mut content) = step.prompt_content {
-                        for (name, value) in &shared_vars {
-                            let pattern = format!("{{{{{}}}}}", name);
-                            if content.contains(&pattern) {
-                                *content = content.replace(&pattern, value);
-                            }
-                        }
-                    }
-                }
+                config.stages = vec![single_stage];
             }
         }
 
-        // =====================================================================
-        // HANDLE AGENTIC PHASE RESUME (if we're resuming mid-agentic)
-        // =====================================================================
-        let loop_result = if run_agentic_first {
-            // We're resuming in the middle of an agentic phase
-            // Run the agentic phase first, then continue with verification loop
-            let agentic_iteration = effective_starting_iteration + 1;
-            info!(
-                "=== RESUMING AGENTIC PHASE (iteration {}) ===",
-                agentic_iteration
-            );
-
-            // Persist workflow state: AgenticRunning
-            self.persist_workflow_state(
-                &config.execution_id,
-                &UnifiedWorkflowState::agentic_running(agentic_iteration),
-            );
-
-            self.record_stage_transition(
-                &config.execution_id,
-                &mut transitions,
-                &mut current_stage,
-                "agentic",
-                agentic_iteration,
-            );
-
-            // Build context for agentic phase from stored verification data
-            let agentic_context = build_resume_agentic_context(
-                &self.checkpoint_db,
-                &config.execution_id,
-                agentic_iteration,
-            );
-
-            let (agentic_outcome, pre_loop_injected_steps) = self
-                .agentic_executor
-                .run_agentic(
-                    &config,
-                    agentic_iteration,
-                    &agentic_context,
-                    !agentic_steps.is_empty() || !config.base_prompt.is_empty(),
-                    &agentic_steps,
-                    &logger,
-                )
-                .await;
-
-            if !pre_loop_injected_steps.is_empty() {
-                info!(
-                    "Pre-loop agentic phase injected {} dynamic verification step(s)",
-                    pre_loop_injected_steps.len()
-                );
-            }
-
-            // Persist workflow state: AgenticComplete
-            self.persist_workflow_state(
-                &config.execution_id,
-                &UnifiedWorkflowState::agentic_complete(agentic_iteration),
-            );
-
-            // Log agentic output to database and increment session count
-            {
-                let output_text = match &agentic_outcome {
-                    AgenticOutcome::Success { output } => {
-                        info!("Resumed agentic phase completed successfully");
-                        format!(
-                            "\n=== Agentic Phase (iteration {}) ===\n{}",
-                            agentic_iteration, output
-                        )
-                    }
-                    AgenticOutcome::Failed { output, error } => {
-                        warn!(
-                            "Resumed agentic phase failed: {}, but continuing with verification loop",
-                            error
-                        );
-                        format!(
-                            "\n=== Agentic Phase (iteration {}, FAILED: {}) ===\n{}",
-                            agentic_iteration, error, output
-                        )
-                    }
-                    AgenticOutcome::Error { error } => {
-                        warn!(
-                            "Resumed agentic phase errored: {}, but continuing with verification loop",
-                            error
-                        );
-                        format!(
-                            "\n=== Agentic Phase (iteration {}, ERROR: {}) ===\n",
-                            agentic_iteration, error
-                        )
-                    }
-                    AgenticOutcome::Skipped => {
-                        info!("Resumed agentic phase was skipped (no agentic steps)");
-                        String::new()
-                    }
-                };
-                if !output_text.is_empty() {
-                    let _ = self.checkpoint_db.append_task_output_ex(
-                        &config.execution_id,
-                        &output_text,
-                        true,  // increment session count
-                        false, // Don't check for completion marker
-                    );
-                }
-            }
-
-            // Now continue with the verification loop from the next iteration
-            let mut resumed_config = config.clone();
-            resumed_config.starting_iteration = agentic_iteration; // Start from after the agentic phase
-
-            info!("=== PHASE 2: VERIFICATION-AGENTIC LOOP (continuing after resumed agentic) ===");
-            self.run_verification_agentic_loop(
-                &resumed_config,
-                &verification_steps,
-                !agentic_steps.is_empty() || !resumed_config.base_prompt.is_empty(),
-                &agentic_steps,
-                &mut all_step_results,
-                &mut transitions,
-                &mut current_stage,
+        // All workflows go through the multi-stage path.
+        // A single-phase workflow runs as stages: [single_phase].
+        return self
+            .run_multi_stage(
+                config,
+                all_step_results,
+                transitions,
+                current_stage,
                 &logger,
-                pre_loop_injected_steps,
+                start,
+                &resume_point,
             )
-            .await
-        } else if skip_to_completion {
-            // Skip directly to completion - return a synthetic loop result indicating success
-            info!("=== PHASE 2: VERIFICATION-AGENTIC LOOP SKIPPED (resuming to completion) ===");
-            LoopResult {
-                iterations_run: 0,         // We don't know how many iterations ran before
-                verification_passed: true, // Must have passed if we're in completion phase
-                max_iterations_reached: false,
-                critical_failure: false,
-                was_stopped: false,
-                unfixable_errors: false,
-                iteration_results: Vec::new(),
-            }
-        } else {
-            // Normal flow - run the verification-agentic loop
-            // Use effective_starting_iteration to resume from the right point
-            let mut adjusted_config = config.clone();
-            if effective_starting_iteration > 0 {
-                adjusted_config.starting_iteration = effective_starting_iteration;
-                info!(
-                    "=== PHASE 2: VERIFICATION-AGENTIC LOOP (resuming from iteration {}) ===",
-                    effective_starting_iteration + 1
-                );
-            } else {
-                info!("=== PHASE 2: VERIFICATION-AGENTIC LOOP ===");
-            }
+            .await;
 
-            self.run_verification_agentic_loop(
-                &adjusted_config,
-                &verification_steps,
-                !agentic_steps.is_empty() || !adjusted_config.base_prompt.is_empty(),
-                &agentic_steps,
-                &mut all_step_results,
-                &mut transitions,
-                &mut current_stage,
-                &logger,
-                Vec::new(), // No initial dynamic steps for normal flow
-            )
-            .await
-        };
-
-        info!("Loop completed: {}", loop_result.summary());
-
-        // =====================================================================
-        // PHASE 2.5: COMPLETION SWEEP (optional, runs after verification passes)
-        // =====================================================================
-        if config.enable_sweep
-            && loop_result.verification_passed
-            && !self.is_task_stopped(&config.execution_id)
-        {
-            info!(
-                "=== PHASE 2.5: COMPLETION SWEEP (max {} iterations) ===",
-                config.max_sweep_iterations
-            );
-
-            let sweep_result = self
-                .run_sweep_loop(
-                    &config,
-                    &mut all_step_results,
-                    &logger,
-                    loop_result.iterations_run,
-                )
-                .await;
-
-            info!(
-                "Sweep completed: {} iteration(s), no_more_steps={}",
-                sweep_result.iterations_run, sweep_result.no_more_steps
-            );
-        }
-
-        // =====================================================================
-        // PHASE 3: COMPLETION (only if verification passed!)
-        // =====================================================================
-        if loop_result.should_run_completion() {
-            // Check if stopped before running completion phase
-            if self.is_task_stopped(&config.execution_id) {
-                warn!("Task was stopped before completion phase - aborting");
-                // Persist workflow state: Stopped
-                self.persist_workflow_state(
-                    &config.execution_id,
-                    &UnifiedWorkflowState::stopped_in_phase(
-                        "verification",
-                        Some(loop_result.iterations_run),
-                    ),
-                );
-                return WorkflowResult {
-                    success: false,
-                    verification_passed: loop_result.verification_passed,
-                    step_results: all_step_results,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    loop_result: Some(loop_result),
-                };
-            }
-
-            info!("=== PHASE 3: COMPLETION (verification PASSED) ===");
-
-            // Persist workflow state: CompletionRunning
-            self.persist_workflow_state(
-                &config.execution_id,
-                &UnifiedWorkflowState::completion_running(),
-            );
-
-            self.record_stage_transition(
-                &config.execution_id,
-                &mut transitions,
-                &mut current_stage,
-                "completion",
-                loop_result.iterations_run,
-            );
-
-            let (completion_success, completion_results) = self
-                .completion_executor
-                .run_completion(
-                    &completion_automation_steps,
-                    &completion_prompt_steps,
-                    &config.execution_id,
-                    &config.workflow_name,
-                    loop_result.iterations_run,
-                    &logger,
-                )
-                .await;
-
-            // Append completion phase results to output_log
-            {
-                let mut completion_output = format!(
-                    "\n=== Completion Phase ===\nSteps: {}\nSuccess: {}\n",
-                    completion_results.len(),
-                    completion_success,
-                );
-                for sr in &completion_results {
-                    completion_output.push_str(&format!(
-                        "  [{}] {} - {} ({}ms)\n",
-                        if sr.success { "OK" } else { "FAIL" },
-                        sr.step_type,
-                        sr.step_name,
-                        sr.duration_ms,
-                    ));
-                    if let Some(ref details) = sr.verification_details {
-                        if let Some(ref stdout) = details.stdout {
-                            if !stdout.is_empty() {
-                                completion_output.push_str(&format!("    stdout: {}\n", stdout));
-                            }
-                        }
-                        if let Some(ref stderr) = details.stderr {
-                            if !stderr.is_empty() {
-                                completion_output.push_str(&format!("    stderr: {}\n", stderr));
-                            }
-                        }
-                    }
-                    if let Some(ref err) = sr.error {
-                        completion_output.push_str(&format!("    error: {}\n", err));
-                    }
-                }
-                let _ = self.checkpoint_db.append_task_output_ex(
-                    &config.execution_id,
-                    &completion_output,
-                    false, // don't increment session count for completion
-                    false,
-                );
-            }
-
-            all_step_results.extend(completion_results);
-
-            if !completion_success {
-                warn!("Completion phase had failures, but verification passed so task is complete");
-            }
-
-            // Persist workflow state: CompletionComplete
-            self.persist_workflow_state(
-                &config.execution_id,
-                &UnifiedWorkflowState::completion_complete(),
-            );
-
-            // Mark task as completed
-            // Note: We mark as completed even for unfixable errors because the AI
-            // did its job and determined the errors cannot be fixed automatically.
-            self.mark_task_completed(&config.execution_id, Some(&config.workflow_id))
-                .await;
-
-            // Fire-and-forget summary generation for the completed task
-            let db = self.checkpoint_db.clone();
-            let exec_id = config.execution_id.clone();
-            let doctor_handle = self.doctor_handle.clone();
-            tokio::spawn(async move {
-                match generate_task_summary_async(db, exec_id.clone(), doctor_handle).await {
-                    Ok(_) => info!("Generated summary for completed task {}", exec_id),
-                    Err(e) => warn!(
-                        "Failed to generate summary for completed task {}: {}",
-                        exec_id, e
-                    ),
-                }
-            });
-
-            // Resolve targeted errors on successful completion (verification passed)
-            // Do NOT resolve errors if the AI signaled unfixable - they're still unresolved
-            if loop_result.verification_passed && !config.targeted_error_ids.is_empty() {
-                self.resolve_targeted_errors(&config.execution_id, &config.targeted_error_ids)
-                    .await;
-            }
-
-            if loop_result.unfixable_errors {
-                info!("=== WORKFLOW COMPLETED WITH UNFIXABLE ERRORS ===");
-            } else {
-                info!("=== WORKFLOW COMPLETED SUCCESSFULLY ===");
-            }
-        } else {
-            info!("=== PHASE 3: COMPLETION SKIPPED (verification did not pass) ===");
-            info!(
-                "Reason: verification_passed={}, critical_failure={}, max_iterations_reached={}, was_stopped={}, unfixable_errors={}",
-                loop_result.verification_passed,
-                loop_result.critical_failure,
-                loop_result.max_iterations_reached,
-                loop_result.was_stopped,
-                loop_result.unfixable_errors
-            );
-
-            // Mark task as failed (unless it was stopped - stop_ai_analysis already handled that)
-            if loop_result.was_stopped {
-                info!("=== WORKFLOW STOPPED BY USER ===");
-                // Persist workflow state: Stopped
-                self.persist_workflow_state(
-                    &config.execution_id,
-                    &UnifiedWorkflowState::stopped_in_phase(
-                        "verification",
-                        Some(loop_result.iterations_run),
-                    ),
-                );
-                // Don't mark as failed - stop_ai_analysis already marked it as "stopped"
-
-                // Fire-and-forget summary generation for stopped task
-                let db = self.checkpoint_db.clone();
-                let exec_id = config.execution_id.clone();
-                let doctor_handle = self.doctor_handle.clone();
-                tokio::spawn(async move {
-                    match generate_task_summary_async(db, exec_id.clone(), doctor_handle).await {
-                        Ok(_) => info!("Generated summary for stopped task {}", exec_id),
-                        Err(e) => warn!(
-                            "Failed to generate summary for stopped task {}: {}",
-                            exec_id, e
-                        ),
-                    }
-                });
-            } else {
-                let reason = if loop_result.critical_failure {
-                    "Critical verification failure"
-                } else {
-                    "Verification failed after max iterations"
-                };
-                // Persist workflow state: Failed
-                self.persist_workflow_state(
-                    &config.execution_id,
-                    &UnifiedWorkflowState::failed_in_phase(
-                        reason,
-                        "verification",
-                        Some(loop_result.iterations_run),
-                    ),
-                );
-                self.mark_task_failed(&config.execution_id, reason).await;
-
-                // Fire-and-forget summary generation for failed task
-                let db = self.checkpoint_db.clone();
-                let exec_id = config.execution_id.clone();
-                let doctor_handle = self.doctor_handle.clone();
-                tokio::spawn(async move {
-                    match generate_task_summary_async(db, exec_id.clone(), doctor_handle).await {
-                        Ok(_) => info!("Generated summary for failed task {}", exec_id),
-                        Err(e) => warn!(
-                            "Failed to generate summary for failed task {}: {}",
-                            exec_id, e
-                        ),
-                    }
-                });
-
-                info!("=== WORKFLOW FAILED ===");
-            }
-        }
-
-        // Record learning outcome for meta-workflows (fire-and-forget)
-        if config.workflow_name.starts_with("AI Generate:") || config.is_dev_mode {
-            let db = self.checkpoint_db.clone();
-            let outcome = crate::orchestrator::learning_recorder::WorkflowOutcome {
-                task_run_id: config.execution_id.clone(),
-                workflow_name: config.workflow_name.clone(),
-                category: "meta".to_string(),
-                status: if loop_result.verification_passed {
-                    "complete".to_string()
-                } else {
-                    "failed".to_string()
-                },
-                duration_secs: start.elapsed().as_secs_f64(),
-                iterations: loop_result.iterations_run,
-                verification_passed: loop_result.verification_passed,
-                max_iterations_reached: loop_result.max_iterations_reached,
-                was_stopped: loop_result.was_stopped,
-                tools_used: Vec::new(),
-                files_modified: Vec::new(),
-                error_type: None,
-                error_message: None,
-            };
-            tokio::spawn(async move {
-                if let Err(e) = db.with_conn(|conn| {
-                    crate::orchestrator::learning_recorder::record_workflow_learning(conn, &outcome)
-                }) {
-                    warn!("Failed to record learning outcome: {}", e);
-                }
-            });
-        }
-
-        // Trigger reflection workflow (dev mode only, non-reflection runs only)
-        if config.is_dev_mode {
-            let deps = crate::reflection::trigger::ReflectionDeps {
-                app_state: self.app_state.clone(),
-                config_storage: self.config_storage.clone(),
-                app_handle: self.app_handle.clone(),
-                pid_tracker: self.pid_tracker.clone(),
-            };
-            let source_task_run_id = config.execution_id.clone();
-            tokio::spawn(async move {
-                // Delay to allow summary generation to finish
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                // launch_reflection is sync — it spawns the workflow internally
-                match crate::reflection::trigger::launch_reflection(
-                    deps,
-                    source_task_run_id.clone(),
-                ) {
-                    Ok(id) if id == "skipped" => {
-                        debug!("Reflection skipped for {}", source_task_run_id);
-                    }
-                    Ok(id) => {
-                        info!(
-                            "Launched reflection {} for completed run {}",
-                            id, source_task_run_id
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to launch reflection for {}: {}",
-                            source_task_run_id, e
-                        );
-                    }
-                }
-            });
-        }
-
-        WorkflowResult {
-            success: loop_result.verification_passed,
-            verification_passed: loop_result.verification_passed,
-            step_results: all_step_results,
-            duration_ms: start.elapsed().as_millis() as u64,
-            loop_result: Some(loop_result),
-        }
+        // NOTE: The single-stage execution path that was previously here has been removed.
+        // All execution now goes through run_multi_stage(), which handles:
+        // - Per-stage setup, verification-agentic loop, and completion
+        // - Agentic-first for error-fix workflows
+        // - Variable substitution from setup outputs
+        // - Completion sweep
+        // - Learning recording and reflection triggering
     }
 
     /// Run a multi-stage workflow where each stage has its own
@@ -1041,7 +423,7 @@ impl LoopController {
     /// Context accumulates across stages: each stage's output is visible to later stages.
     async fn run_multi_stage(
         &mut self,
-        config: LoopConfig,
+        mut config: LoopConfig,
         mut all_step_results: Vec<crate::step_executor::StepExecutionResult>,
         mut transitions: Vec<StageTransition>,
         mut current_stage: String,
@@ -1084,7 +466,8 @@ impl LoopController {
         let mut any_stage_passed = false;
         let mut last_loop_result: Option<LoopResult> = None;
 
-        for (stage_idx, stage) in config.stages.iter().enumerate() {
+        for stage_idx in 0..config.stages.len() {
+            let stage = &config.stages[stage_idx];
             // Skip stages that have already completed (resume support)
             if stage_idx < start_from_stage {
                 info!(
@@ -1156,6 +539,7 @@ impl LoopController {
                             config.workflow_name, stage_num, stage.name
                         ),
                         logger,
+                        Some(stage_idx as u32),
                     )
                     .await;
 
@@ -1219,7 +603,64 @@ impl LoopController {
                     );
                     continue;
                 }
+
+                // Expand runtime variables from setup phase outputs into prompts
+                let shared_vars = self.setup_executor.shared_variables().get_all();
+                if !shared_vars.is_empty() {
+                    info!(
+                        "  Stage {}: Expanding {} runtime variables from setup into prompts",
+                        stage_num,
+                        shared_vars.len()
+                    );
+                    for (name, value) in &shared_vars {
+                        let pattern = format!("{{{{{}}}}}", name);
+                        if config.base_prompt.contains(&pattern) {
+                            info!(
+                                "    Substituting {{{{{}}}}} ({} chars) into base_prompt",
+                                name,
+                                value.len()
+                            );
+                            config.base_prompt = config.base_prompt.replace(&pattern, value);
+                        }
+                    }
+
+                    // Also substitute runtime variables into steps within current and remaining stages
+                    for si in stage_idx..config.stages.len() {
+                        let s = &mut config.stages[si];
+                        for step in s
+                            .setup_automation_steps
+                            .iter_mut()
+                            .chain(s.setup_prompt_steps.iter_mut())
+                            .chain(s.verification_steps.iter_mut())
+                            .chain(s.agentic_steps.iter_mut())
+                            .chain(s.completion_automation_steps.iter_mut())
+                            .chain(s.completion_prompt_steps.iter_mut())
+                        {
+                            for (name, value) in &shared_vars {
+                                let pattern = format!("{{{{{}}}}}", name);
+                                if let Some(ref mut content) = step.prompt_content {
+                                    if content.contains(&pattern) {
+                                        *content = content.replace(&pattern, value);
+                                    }
+                                }
+                                if let Some(ref mut cmd) = step.shell_command {
+                                    if cmd.contains(&pattern) {
+                                        *cmd = cmd.replace(&pattern, value);
+                                    }
+                                }
+                                if let Some(ref mut cmd) = step.check_command {
+                                    if cmd.contains(&pattern) {
+                                        *cmd = cmd.replace(&pattern, value);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
+
+            // Reborrow stage after mutable substitution
+            let stage = &config.stages[stage_idx];
 
             // ─── Stage Verification-Agentic Loop ───
             let has_agentic = !stage.agentic_steps.is_empty();
@@ -1231,6 +672,8 @@ impl LoopController {
 
                 // Build a per-stage LoopConfig with provider/model overrides from stage config.
                 // If resuming into this specific stage, set starting_iteration from the resume point.
+                // Also check config.run_agentic_first for the first stage on fresh starts
+                // (e.g. error-fix workflows that need AI analysis before verification).
                 let (stage_starting_iter, stage_agentic_first) = if stage_idx == start_from_stage {
                     match resume_point {
                         ResumePoint::VerificationPhase { iteration, .. } => {
@@ -1239,12 +682,12 @@ impl LoopController {
                         ResumePoint::AgenticPhase { iteration, .. } => {
                             (iteration.saturating_sub(1), true)
                         }
-                        _ => (0, false),
+                        _ => (0, config.run_agentic_first && stage_idx == 0),
                     }
                 } else {
                     (0, false)
                 };
-                let stage_loop_config = LoopConfig {
+                let mut stage_loop_config = LoopConfig {
                     max_iterations: stage.max_iterations,
                     base_prompt: config.base_prompt.clone(),
                     workflow_name: format!(
@@ -1267,6 +710,106 @@ impl LoopController {
                     stage_index: Some(stage_idx as u32),
                 };
 
+                // Handle agentic-first: run the agentic phase before the verification loop.
+                // This is needed for error-fix workflows (run AI analysis before verification)
+                // and for resume scenarios where execution was interrupted during agentic phase.
+                let initial_dynamic_steps = if stage_agentic_first {
+                    let agentic_iteration = stage_starting_iter + 1;
+                    info!(
+                        "  Stage {}: Running agentic-first (iteration {})",
+                        stage_num, agentic_iteration
+                    );
+
+                    self.persist_workflow_state(
+                        &config.execution_id,
+                        &UnifiedWorkflowState::agentic_running(agentic_iteration),
+                    );
+                    self.record_stage_transition(
+                        &config.execution_id,
+                        &mut transitions,
+                        &mut current_stage,
+                        &format!("stage_{}_agentic", stage_num),
+                        agentic_iteration,
+                    );
+
+                    let agentic_context = build_resume_agentic_context(
+                        &self.checkpoint_db,
+                        &config.execution_id,
+                        agentic_iteration,
+                    );
+
+                    let (outcome, injected_steps) = self
+                        .agentic_executor
+                        .run_agentic(
+                            &stage_loop_config,
+                            agentic_iteration,
+                            &agentic_context,
+                            has_agentic,
+                            &stage.agentic_steps,
+                            logger,
+                        )
+                        .await;
+
+                    // Log agentic output
+                    let output_text = match &outcome {
+                        AgenticOutcome::Success { output } => {
+                            format!(
+                                "\n=== Agentic Phase (iteration {}) ===\n{}",
+                                agentic_iteration, output
+                            )
+                        }
+                        AgenticOutcome::Failed { output, error } => {
+                            warn!(
+                                "Stage {} agentic-first failed: {}, continuing with verification",
+                                stage_num, error
+                            );
+                            format!(
+                                "\n=== Agentic Phase (iteration {}, FAILED: {}) ===\n{}",
+                                agentic_iteration, error, output
+                            )
+                        }
+                        AgenticOutcome::Error { error } => {
+                            warn!(
+                                "Stage {} agentic-first errored: {}, continuing with verification",
+                                stage_num, error
+                            );
+                            format!(
+                                "\n=== Agentic Phase (iteration {}, ERROR: {}) ===\n",
+                                agentic_iteration, error
+                            )
+                        }
+                        AgenticOutcome::Skipped => String::new(),
+                    };
+                    if !output_text.is_empty() {
+                        let _ = self.checkpoint_db.append_task_output_ex(
+                            &config.execution_id,
+                            &output_text,
+                            true,
+                            false,
+                        );
+                    }
+
+                    self.persist_workflow_state(
+                        &config.execution_id,
+                        &UnifiedWorkflowState::agentic_complete(agentic_iteration),
+                    );
+
+                    // Adjust starting_iteration so the loop continues after this agentic phase
+                    stage_loop_config.starting_iteration = agentic_iteration;
+
+                    if !injected_steps.is_empty() {
+                        info!(
+                            "  Stage {}: Agentic-first injected {} dynamic verification step(s)",
+                            stage_num,
+                            injected_steps.len()
+                        );
+                    }
+
+                    injected_steps
+                } else {
+                    Vec::new()
+                };
+
                 self.record_stage_transition(
                     &config.execution_id,
                     &mut transitions,
@@ -1285,7 +828,7 @@ impl LoopController {
                         &mut transitions,
                         &mut current_stage,
                         logger,
-                        Vec::new(),
+                        initial_dynamic_steps,
                     )
                     .await;
 
@@ -1317,6 +860,7 @@ impl LoopController {
                             ),
                             loop_result.iterations_run,
                             logger,
+                            Some(stage_idx as u32),
                         )
                         .await;
                     all_step_results.extend(completion_results);
@@ -1365,14 +909,33 @@ impl LoopController {
         }
 
         // ─── Workflow-level Completion ───
-        // Run top-level completion steps (from the workflow, not from stages)
         // Use the last loop result for determining success
-        let overall_passed = any_stage_passed || !config.stop_on_failure;
+        let overall_passed =
+            any_stage_passed || (!config.stop_on_failure && last_loop_result.is_some());
+        let total_iterations = last_loop_result
+            .as_ref()
+            .map(|r| r.iterations_run)
+            .unwrap_or(0);
+
+        // ─── Completion Sweep (optional, runs after verification passes) ───
+        if config.enable_sweep && overall_passed && !self.is_task_stopped(&config.execution_id) {
+            info!(
+                "=== COMPLETION SWEEP (max {} iterations) ===",
+                config.max_sweep_iterations
+            );
+
+            let sweep_result = self
+                .run_sweep_loop(&config, &mut all_step_results, logger, total_iterations)
+                .await;
+
+            info!(
+                "Sweep completed: {} iteration(s), no_more_steps={}",
+                sweep_result.iterations_run, sweep_result.no_more_steps
+            );
+        }
 
         if overall_passed {
-            info!(
-                "=== MULTI-STAGE WORKFLOW: All stages processed, running workflow completion ==="
-            );
+            info!("=== WORKFLOW COMPLETED: All stages processed ===");
             self.persist_workflow_state(
                 &config.execution_id,
                 &UnifiedWorkflowState::completion_running(),
@@ -1384,11 +947,6 @@ impl LoopController {
                 "completion",
                 0,
             );
-
-            // Note: Top-level completion steps are not passed to run_multi_stage.
-            // They should be handled at the top-level run() call.
-            // For multi-stage workflows, the top-level steps arrays are typically empty
-            // (all content is in stages). Mark as complete.
 
             self.persist_workflow_state(
                 &config.execution_id,
@@ -1409,20 +967,14 @@ impl LoopController {
             let doctor_handle = self.doctor_handle.clone();
             tokio::spawn(async move {
                 match generate_task_summary_async(db, exec_id.clone(), doctor_handle).await {
-                    Ok(_) => info!(
-                        "Generated summary for completed multi-stage task {}",
-                        exec_id
-                    ),
-                    Err(e) => warn!(
-                        "Failed to generate summary for multi-stage task {}: {}",
-                        exec_id, e
-                    ),
+                    Ok(_) => info!("Generated summary for completed task {}", exec_id),
+                    Err(e) => warn!("Failed to generate summary for task {}: {}", exec_id, e),
                 }
             });
 
-            info!("=== MULTI-STAGE WORKFLOW COMPLETED ===");
+            info!("=== WORKFLOW COMPLETED SUCCESSFULLY ===");
         } else {
-            info!("=== MULTI-STAGE WORKFLOW: No stages passed verification ===");
+            info!("=== WORKFLOW: No stages passed verification ===");
             self.persist_workflow_state(
                 &config.execution_id,
                 &UnifiedWorkflowState::failed_in_phase(
@@ -1440,18 +992,92 @@ impl LoopController {
             let doctor_handle = self.doctor_handle.clone();
             tokio::spawn(async move {
                 match generate_task_summary_async(db, exec_id.clone(), doctor_handle).await {
-                    Ok(_) => info!("Generated summary for failed multi-stage task {}", exec_id),
+                    Ok(_) => info!("Generated summary for failed task {}", exec_id),
                     Err(e) => warn!(
-                        "Failed to generate summary for failed multi-stage task {}: {}",
+                        "Failed to generate summary for failed task {}: {}",
                         exec_id, e
                     ),
+                }
+            });
+
+            info!("=== WORKFLOW FAILED ===");
+        }
+
+        // Record learning outcome for meta-workflows (fire-and-forget)
+        if config.workflow_name.starts_with("AI Generate:") || config.is_dev_mode {
+            let db = self.checkpoint_db.clone();
+            let outcome = crate::orchestrator::learning_recorder::WorkflowOutcome {
+                task_run_id: config.execution_id.clone(),
+                workflow_name: config.workflow_name.clone(),
+                category: "meta".to_string(),
+                status: if overall_passed {
+                    "complete".to_string()
+                } else {
+                    "failed".to_string()
+                },
+                duration_secs: start.elapsed().as_secs_f64(),
+                iterations: total_iterations,
+                verification_passed: overall_passed,
+                max_iterations_reached: last_loop_result
+                    .as_ref()
+                    .map(|r| r.max_iterations_reached)
+                    .unwrap_or(false),
+                was_stopped: last_loop_result
+                    .as_ref()
+                    .map(|r| r.was_stopped)
+                    .unwrap_or(false),
+                tools_used: Vec::new(),
+                files_modified: Vec::new(),
+                error_type: None,
+                error_message: None,
+            };
+            tokio::spawn(async move {
+                if let Err(e) = db.with_conn(|conn| {
+                    crate::orchestrator::learning_recorder::record_workflow_learning(conn, &outcome)
+                }) {
+                    warn!("Failed to record learning outcome: {}", e);
+                }
+            });
+        }
+
+        // Trigger reflection workflow (dev mode only, non-reflection runs only)
+        if config.is_dev_mode {
+            let deps = crate::reflection::trigger::ReflectionDeps {
+                app_state: self.app_state.clone(),
+                config_storage: self.config_storage.clone(),
+                app_handle: self.app_handle.clone(),
+                pid_tracker: self.pid_tracker.clone(),
+            };
+            let source_task_run_id = config.execution_id.clone();
+            tokio::spawn(async move {
+                // Delay to allow summary generation to finish
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                match crate::reflection::trigger::launch_reflection(
+                    deps,
+                    source_task_run_id.clone(),
+                ) {
+                    Ok(id) if id == "skipped" => {
+                        debug!("Reflection skipped for {}", source_task_run_id);
+                    }
+                    Ok(id) => {
+                        info!(
+                            "Launched reflection {} for completed run {}",
+                            id, source_task_run_id
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to launch reflection for {}: {}",
+                            source_task_run_id, e
+                        );
+                    }
                 }
             });
         }
 
         WorkflowResult {
-            success: any_stage_passed,
-            verification_passed: any_stage_passed,
+            success: overall_passed,
+            verification_passed: overall_passed,
             step_results: all_step_results,
             duration_ms: start.elapsed().as_millis() as u64,
             loop_result: last_loop_result,
@@ -1618,6 +1244,7 @@ impl LoopController {
                     iteration,
                     &config.workflow_name,
                     logger,
+                    config.stage_index,
                 )
                 .await;
 
@@ -1830,7 +1457,7 @@ impl LoopController {
             let failure_context = if iteration > 1 {
                 match detect_regression(
                     &self.checkpoint_db,
-                    &config.execution_id,
+                    &get_parent_task_id(&config.execution_id),
                     iteration,
                     &verification_result,
                 ) {
@@ -2304,6 +1931,9 @@ impl LoopController {
     /// - Max sweep iterations are reached
     /// - The task is stopped externally
     /// - An AI session fails
+    // Note: Sweep results are intentionally not added to all_step_results.
+    // The sweep is a best-effort cleanup pass after the main workflow completes,
+    // and its results should not affect the overall step counts or workflow outcome.
     async fn run_sweep_loop(
         &self,
         config: &LoopConfig,
@@ -2641,57 +2271,34 @@ pub async fn resume_interrupted_workflows(
                                 starting_iteration + 1
                             );
 
-                            // Build execution steps from workflow definition with explicit phase assignment
-                            let setup_automation_steps = convert_json_steps_with_phase(
-                                &workflow.setup_steps,
-                                0,
-                                Some("setup"),
-                            );
-                            // Prepend pre-flight check if enabled (default: true)
-                            // Pre-flight checks run FIRST to catch environment issues early
-                            let setup_automation_steps =
-                                crate::unified_workflows::prepend_preflight_check_step(
-                                    setup_automation_steps,
-                                    workflow.preflight_check_enabled,
-                                );
-                            let setup_prompt_steps = extract_prompt_steps_with_phase(
-                                &workflow.setup_steps,
-                                Some("setup"),
-                            );
-                            let verification_steps = convert_all_json_steps_with_phase(
-                                &workflow.verification_steps,
-                                0,
-                                Some("verification"),
-                            );
-                            // Prepend health check steps if enabled (default: true)
-                            // Health checks run BEFORE log_watch to catch server down before scanning logs
-                            let verification_steps =
-                                crate::unified_workflows::prepend_health_check_steps(
-                                    verification_steps,
-                                    workflow.health_check_enabled,
-                                    &workflow.health_check_urls,
-                                );
-                            // Prepend log_watch step if enabled (default: true)
-                            let verification_steps =
-                                crate::unified_workflows::prepend_log_watch_step(
-                                    verification_steps,
-                                    workflow.log_watch_enabled,
-                                );
-                            // Agentic steps are prompt-type steps, use extract_prompt_steps_with_phase
-                            // (convert_json_steps_with_phase filters out prompt steps)
-                            let agentic_steps = extract_prompt_steps_with_phase(
-                                &workflow.agentic_steps,
-                                Some("agentic"),
-                            );
-                            let completion_automation_steps = convert_json_steps_with_phase(
-                                &workflow.completion_steps,
-                                0,
-                                Some("completion"),
-                            );
-                            let completion_prompt_steps = extract_prompt_steps_with_phase(
-                                &workflow.completion_steps,
-                                Some("completion"),
-                            );
+                            // Normalize to stages — all workflows are now multi-stage
+                            let normalized_stages = workflow.normalize_to_stages();
+                            let total_stages = normalized_stages.len();
+
+                            // Convert each stage to StageConfig
+                            let stages: Vec<super::StageConfig> = normalized_stages
+                                .iter()
+                                .enumerate()
+                                .map(|(idx, stage)| {
+                                    crate::unified_workflows::stage_to_stage_config(
+                                        stage,
+                                        idx,
+                                        total_stages,
+                                        workflow.preflight_check_enabled,
+                                        workflow.log_watch_enabled,
+                                        workflow.health_check_enabled,
+                                        &workflow.health_check_urls,
+                                    )
+                                })
+                                .collect();
+
+                            // Build combined prompt from all agentic steps across all stages
+                            let combined_prompt = normalized_stages
+                                .iter()
+                                .flat_map(|stage| stage.agentic_steps.iter())
+                                .filter_map(|step| step.get("content").and_then(|v| v.as_str()))
+                                .collect::<Vec<_>>()
+                                .join("\n\n---\n\n");
 
                             // For error-fix workflows, run agentic first (only if starting fresh)
                             let run_agentic_first =
@@ -2699,7 +2306,7 @@ pub async fn resume_interrupted_workflows(
 
                             let loop_config = super::types::LoopConfig {
                                 max_iterations: workflow.max_iterations,
-                                base_prompt: String::new(), // Not used for resume
+                                base_prompt: combined_prompt,
                                 workflow_name: task_name.clone(),
                                 workflow_id: wf_id_for_spawn.to_string(),
                                 execution_id: task_id.clone(),
@@ -2710,8 +2317,8 @@ pub async fn resume_interrupted_workflows(
                                 is_dev_mode: cfg!(debug_assertions),
                                 enable_sweep: workflow.enable_sweep,
                                 max_sweep_iterations: workflow.max_sweep_iterations,
-                                stages: Vec::new(),
-                                stop_on_failure: false,
+                                stages,
+                                stop_on_failure: workflow.stop_on_failure,
                                 provider_override: None,
                                 model_override: None,
                                 stage_index: None,
@@ -2720,12 +2327,12 @@ pub async fn resume_interrupted_workflows(
                             controller
                                 .run(
                                     loop_config,
-                                    setup_automation_steps,
-                                    setup_prompt_steps,
-                                    verification_steps,
-                                    agentic_steps,
-                                    completion_automation_steps,
-                                    completion_prompt_steps,
+                                    Vec::new(),
+                                    Vec::new(),
+                                    Vec::new(),
+                                    Vec::new(),
+                                    Vec::new(),
+                                    Vec::new(),
                                 )
                                 .await
                         },
@@ -2796,51 +2403,34 @@ pub async fn resume_interrupted_workflows(
                             )
                             .with_session_manager(session_manager);
 
-                            // Build execution steps from workflow definition with explicit phase assignment
-                            let setup_automation_steps = convert_json_steps_with_phase(
-                                &workflow.setup_steps,
-                                0,
-                                Some("setup"),
-                            );
-                            // Prepend pre-flight check if enabled (default: true)
-                            let setup_automation_steps =
-                                crate::unified_workflows::prepend_preflight_check_step(
-                                    setup_automation_steps,
-                                    workflow.preflight_check_enabled,
-                                );
-                            let setup_prompt_steps = extract_prompt_steps_with_phase(
-                                &workflow.setup_steps,
-                                Some("setup"),
-                            );
-                            let verification_steps = convert_all_json_steps_with_phase(
-                                &workflow.verification_steps,
-                                0,
-                                Some("verification"),
-                            );
-                            let verification_steps =
-                                crate::unified_workflows::prepend_health_check_steps(
-                                    verification_steps,
-                                    workflow.health_check_enabled,
-                                    &workflow.health_check_urls,
-                                );
-                            let verification_steps =
-                                crate::unified_workflows::prepend_log_watch_step(
-                                    verification_steps,
-                                    workflow.log_watch_enabled,
-                                );
-                            let agentic_steps = extract_prompt_steps_with_phase(
-                                &workflow.agentic_steps,
-                                Some("agentic"),
-                            );
-                            let completion_automation_steps = convert_json_steps_with_phase(
-                                &workflow.completion_steps,
-                                0,
-                                Some("completion"),
-                            );
-                            let completion_prompt_steps = extract_prompt_steps_with_phase(
-                                &workflow.completion_steps,
-                                Some("completion"),
-                            );
+                            // Normalize to stages — all workflows are now multi-stage
+                            let normalized_stages = workflow.normalize_to_stages();
+                            let total_stages = normalized_stages.len();
+
+                            // Convert each stage to StageConfig
+                            let stages: Vec<super::StageConfig> = normalized_stages
+                                .iter()
+                                .enumerate()
+                                .map(|(idx, stage)| {
+                                    crate::unified_workflows::stage_to_stage_config(
+                                        stage,
+                                        idx,
+                                        total_stages,
+                                        workflow.preflight_check_enabled,
+                                        workflow.log_watch_enabled,
+                                        workflow.health_check_enabled,
+                                        &workflow.health_check_urls,
+                                    )
+                                })
+                                .collect();
+
+                            // Build combined prompt from all agentic steps across all stages
+                            let combined_prompt = normalized_stages
+                                .iter()
+                                .flat_map(|stage| stage.agentic_steps.iter())
+                                .filter_map(|step| step.get("content").and_then(|v| v.as_str()))
+                                .collect::<Vec<_>>()
+                                .join("\n\n---\n\n");
 
                             // For error-fix workflows, run agentic first (only if starting fresh)
                             let run_agentic_first =
@@ -2848,7 +2438,7 @@ pub async fn resume_interrupted_workflows(
 
                             let loop_config = super::types::LoopConfig {
                                 max_iterations: workflow.max_iterations,
-                                base_prompt: String::new(),
+                                base_prompt: combined_prompt,
                                 workflow_name: task_name.clone(),
                                 workflow_id: wf_id.to_string(),
                                 execution_id: task_id.clone(),
@@ -2859,8 +2449,8 @@ pub async fn resume_interrupted_workflows(
                                 is_dev_mode: cfg!(debug_assertions),
                                 enable_sweep: workflow.enable_sweep,
                                 max_sweep_iterations: workflow.max_sweep_iterations,
-                                stages: Vec::new(),
-                                stop_on_failure: false,
+                                stages,
+                                stop_on_failure: workflow.stop_on_failure,
                                 provider_override: None,
                                 model_override: None,
                                 stage_index: None,
@@ -2869,12 +2459,12 @@ pub async fn resume_interrupted_workflows(
                             controller
                                 .run(
                                     loop_config,
-                                    setup_automation_steps,
-                                    setup_prompt_steps,
-                                    verification_steps,
-                                    agentic_steps,
-                                    completion_automation_steps,
-                                    completion_prompt_steps,
+                                    Vec::new(),
+                                    Vec::new(),
+                                    Vec::new(),
+                                    Vec::new(),
+                                    Vec::new(),
+                                    Vec::new(),
                                 )
                                 .await
                         },

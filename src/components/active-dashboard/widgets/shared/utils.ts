@@ -18,6 +18,35 @@ import {
 } from "../../../../design-system/colors";
 
 // ---------------------------------------------------------------------------
+// Duration Formatting
+// ---------------------------------------------------------------------------
+
+/**
+ * Format a duration in milliseconds to a human-readable string.
+ *
+ * Handles the full range from milliseconds to hours.
+ * Returns an empty string for null/undefined inputs.
+ * Returns "0ms" for a zero value (not an empty string).
+ *
+ * Extracted from ExecutionTimelineWidget and TimelineStatsBar to
+ * eliminate duplication.
+ *
+ * @param ms - Duration in milliseconds (may be null/undefined)
+ * @returns Formatted string like "150ms", "3.2s", "2m 15s", or "1h 30m"
+ */
+export function formatDuration(ms: number | null | undefined): string {
+  if (ms == null) return "";
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
+  const mins = Math.floor(ms / 60000);
+  const secs = Math.floor((ms % 60000) / 1000);
+  if (mins < 60) return `${mins}m ${secs}s`;
+  const hours = Math.floor(mins / 60);
+  const remainingMins = mins % 60;
+  return `${hours}h ${remainingMins}m`;
+}
+
+// ---------------------------------------------------------------------------
 // Step Status to Design System Mapping
 // ---------------------------------------------------------------------------
 
@@ -74,6 +103,8 @@ export interface CurrentExecutionStepsResponse {
     phase?: string;
     step_index?: number;
     iteration?: number;
+    /** Stage index for multi-stage workflows (0-based). Null/undefined for single-stage. */
+    stage_index?: number;
     start_time?: number;
     end_time?: number;
     duration_ms?: number;
@@ -93,6 +124,10 @@ export interface CurrentExecutionStepsResponse {
   has_setup?: boolean;
   has_verification?: boolean;
   has_agentic?: boolean;
+  /** Multi-stage workflow fields */
+  current_stage_index?: number;
+  total_stages?: number;
+  stage_names?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -159,7 +194,7 @@ export function detectStartTime(
   if (times.length === 0) return null;
 
   const earliest = Math.min(...times);
-  return earliest !== Infinity ? earliest : null;
+  return Number.isFinite(earliest) ? earliest : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -248,6 +283,15 @@ export function mapStepType(apiType: string): StepType {
  * @param execution - Object with optional timestamps and a status string
  * @returns The inferred StepExecutionStatus
  */
+const KNOWN_STATUSES: Set<string> = new Set([
+  "success",
+  "failed",
+  "skipped",
+  "running",
+  "pending",
+  "unknown",
+]);
+
 export function inferStepStatus(execution: {
   start_time?: number;
   end_time?: number;
@@ -263,7 +307,8 @@ export function inferStepStatus(execution: {
     return "running";
   }
 
-  return status;
+  // Fall back to "unknown" for unrecognized status values
+  return KNOWN_STATUSES.has(status) ? status : "unknown";
 }
 
 // ---------------------------------------------------------------------------

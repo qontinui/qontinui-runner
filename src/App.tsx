@@ -201,6 +201,7 @@ type MainTabId =
   | "settings-self-healing"
   | "settings-playwright"
   | "settings-mobile"
+  | "settings-cloud-relay"
   | "settings-mcp"
   | "settings-log-sources"
   | "settings-execution-variables"
@@ -254,6 +255,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "settings-self-healing",
   "settings-playwright",
   "settings-mobile",
+  "settings-cloud-relay",
   "settings-mcp",
   "settings-log-sources",
   "settings-execution-variables",
@@ -1251,6 +1253,7 @@ function AppContent() {
       case "settings-self-healing":
       case "settings-playwright":
       case "settings-mobile":
+      case "settings-cloud-relay":
       case "settings-mcp":
       case "settings-log-sources":
       case "settings-execution-variables":
@@ -1268,6 +1271,7 @@ function AppContent() {
           "settings-self-healing": "self-healing",
           "settings-playwright": "playwright",
           "settings-mobile": "mobile",
+          "settings-cloud-relay": "cloud-relay",
           "settings-mcp": "mcp",
           "settings-log-sources": "log-sources",
           "settings-execution-variables": "execution-variables",

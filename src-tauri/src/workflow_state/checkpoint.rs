@@ -69,6 +69,8 @@ pub struct StepCheckpoint {
     pub iteration: Option<u32>,
     /// Step index within the phase.
     pub step_index: usize,
+    /// Stage index for multi-stage phased workflows (0-indexed).
+    pub stage_index: Option<u32>,
     /// Step type (e.g., "playwright", "automation", "ai").
     pub step_type: String,
     /// Step name for display.
@@ -107,6 +109,7 @@ impl StepCheckpoint {
             phase: phase.into(),
             iteration,
             step_index,
+            stage_index: None,
             step_type: step_type.into(),
             step_name: None,
             status: StepCheckpointStatus::Pending,
@@ -122,6 +125,12 @@ impl StepCheckpoint {
     /// Set the step name.
     pub fn with_step_name(mut self, name: impl Into<String>) -> Self {
         self.step_name = Some(name.into());
+        self
+    }
+
+    /// Set the stage index for multi-stage workflows.
+    pub fn with_stage_index(mut self, stage_index: Option<u32>) -> Self {
+        self.stage_index = stage_index;
         self
     }
 

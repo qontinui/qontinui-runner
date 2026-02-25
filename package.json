@@ -48,6 +48,9 @@
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",
     "@qontinui/design-tokens": "^1.0.0",
+    "@qontinui/shared-types": "file:../qontinui-schemas/ts",
+    "@qontinui/workflow-ui": "file:../qontinui-workflow-ui",
+    "@qontinui/workflow-utils": "file:../qontinui-workflow-utils",
     "@qontinui/ui-bridge": "file:../ui-bridge/packages/ui-bridge",
     "@radix-ui/react-dialog": "^1.1.15",
     "@radix-ui/react-dropdown-menu": "^2.1.16",

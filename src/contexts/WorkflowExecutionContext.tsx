@@ -65,6 +65,8 @@ export interface StepCheckpoint {
   phase: WorkflowStage;
   iteration: number | null;
   stepIndex: number;
+  /** Stage index for multi-stage workflows (0-based). Null for single-stage. */
+  stageIndex: number | null;
   stepType: string;
   stepName: string | null;
   status: StepExecutionStatus;
@@ -128,6 +130,7 @@ interface FullStateResponse {
     phase: string;
     iteration: number | null;
     step_index: number;
+    stage_index?: number | null;
     step_type: string;
     step_name: string | null;
     status: string;
@@ -380,6 +383,7 @@ function convertCheckpoint(cp: FullStateResponse["checkpoints"][0]): StepCheckpo
     phase: mapPhase(cp.phase),
     iteration: cp.iteration,
     stepIndex: cp.step_index,
+    stageIndex: cp.stage_index ?? null,
     stepType: cp.step_type,
     stepName: cp.step_name,
     status: (cp.status as StepExecutionStatus) || "pending",
@@ -401,6 +405,7 @@ function checkpointToStep(cp: StepCheckpoint): TimelineStep {
     name: cp.stepName || `Step ${cp.stepIndex + 1}`,
     status: cp.status,
     phase: cp.phase,
+    stageIndex: cp.stageIndex ?? 0,
     stepIndex: cp.stepIndex,
     iteration: cp.iteration ?? undefined,
     startTime: cp.startedAt ? new Date(cp.startedAt).getTime() : undefined,
@@ -417,39 +422,87 @@ function buildPhaseGroups(
   steps: TimelineStep[],
   currentStage: WorkflowStage | null,
   definedPhases?: WorkflowStage[],
+  currentStageIndex?: number | null,
 ): PhaseGroup[] {
-  const groups = new Map<WorkflowStage, TimelineStep[]>();
+  const PHASE_ORDER: WorkflowStage[] = ["setup", "verification", "agentic", "completion"];
+  const maxStageIndex = steps.reduce((max, s) => Math.max(max, s.stageIndex), 0);
+  const isMultiStage = maxStageIndex > 0;
+
+  // Group by composite key (stageIndex:phase) for multi-stage support
+  const groupKey = (step: TimelineStep) => `${step.stageIndex}:${step.phase}`;
+  const groups = new Map<string, TimelineStep[]>();
 
   for (const step of steps) {
-    const existing = groups.get(step.phase) || [];
+    const key = groupKey(step);
+    const existing = groups.get(key) || [];
     existing.push(step);
-    groups.set(step.phase, existing);
+    groups.set(key, existing);
   }
 
-  const PHASE_ORDER: WorkflowStage[] = ["setup", "verification", "agentic", "completion"];
+  // For single-stage, also add defined phases that have no steps yet
+  if (!isMultiStage && definedPhases) {
+    for (const phase of definedPhases) {
+      const key = `0:${phase}`;
+      if (!groups.has(key)) {
+        groups.set(key, []);
+      }
+    }
+  }
 
-  // Show phases that have steps OR are defined in the workflow
-  const phasesToShow = PHASE_ORDER.filter(
-    (phase) => groups.has(phase) || (definedPhases && definedPhases.includes(phase)),
-  );
+  // Sort keys: by earliest startTime, then stageIndex, then phase order
+  const keysToShow = Array.from(groups.keys());
 
-  return phasesToShow.map((phase) => {
-    const phaseSteps = groups.get(phase) || [];
+  const groupEarliestTime = new Map<string, number>();
+  for (const [key, gSteps] of groups) {
+    const times = gSteps.filter((s) => s.startTime).map((s) => s.startTime!);
+    if (times.length > 0) groupEarliestTime.set(key, Math.min(...times));
+  }
+
+  keysToShow.sort((a, b) => {
+    const timeA = groupEarliestTime.get(a);
+    const timeB = groupEarliestTime.get(b);
+    if (timeA !== undefined && timeB !== undefined) return timeA - timeB;
+    if (timeA !== undefined) return -1;
+    if (timeB !== undefined) return 1;
+    const [stageA, phaseA] = a.split(":") as [string, WorkflowStage];
+    const [stageB, phaseB] = b.split(":") as [string, WorkflowStage];
+    if (stageA !== stageB) return parseInt(stageA) - parseInt(stageB);
+    return PHASE_ORDER.indexOf(phaseA) - PHASE_ORDER.indexOf(phaseB);
+  });
+
+  const phaseLabels: Record<string, string> = {
+    setup: "Setup",
+    agentic: "Agentic",
+    verification: "Verification",
+    completion: "Completion",
+  };
+
+  return keysToShow.map((key) => {
+    const [stageIdxStr, phaseStr] = key.split(":") as [string, WorkflowStage];
+    const stageIdx = parseInt(stageIdxStr);
+    const phase = phaseStr;
+    const phaseSteps = groups.get(key) || [];
     const completed = phaseSteps.filter(
       (s) => s.status === "success" || s.status === "failed",
     ).length;
     const successful = phaseSteps.filter((s) => s.status === "success").length;
     const failed = phaseSteps.filter((s) => s.status === "failed").length;
-    const isActive = phase === currentStage;
+    const isActive = isMultiStage
+      ? phase === currentStage && stageIdx === (currentStageIndex ?? 0)
+      : phase === currentStage;
     const isComplete = phaseSteps.length > 0 && completed === phaseSteps.length;
     const isUpcoming = phaseSteps.length === 0 && !isActive;
 
-    // Group by iteration for verification/agentic phases
     const hasIterations = phase === "verification" || phase === "agentic";
     const iterationGroups = hasIterations ? buildIterationGroups(phaseSteps, isActive) : [];
 
+    const phaseLabel = phaseLabels[phase] ?? phase;
+    const displayLabel = isMultiStage ? `Stage ${stageIdx + 1} — ${phaseLabel}` : phaseLabel;
+
     return {
       phase,
+      stageIndex: stageIdx,
+      displayLabel,
       steps: phaseSteps.sort((a, b) => (a.startTime ?? 0) - (b.startTime ?? 0)),
       iterationGroups,
       hasIterations,
@@ -460,12 +513,7 @@ function buildPhaseGroups(
       isActive,
       isComplete,
       isUpcoming,
-      stats: {
-        total: phaseSteps.length,
-        completed,
-        successful,
-        failed,
-      },
+      stats: { total: phaseSteps.length, completed, successful, failed },
     };
   });
 }
@@ -555,11 +603,7 @@ function calculateTimelineStats(phaseGroups: PhaseGroup[], elapsedTime: number):
   const verificationResults = verificationIterations.map((iter) => {
     const checkSteps = iter.steps.filter(
       (s) =>
-        s.type === "check" ||
-        s.type === "test" ||
-        s.type === "command" ||
-        s.type === "playwright" ||
-        s.type === "shell",
+        s.type === "check" || s.type === "test" || s.type === "playwright" || s.type === "shell",
     );
     const passed = checkSteps.filter((s) => s.status === "success").length;
     const total = checkSteps.length;
@@ -623,25 +667,38 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
 
   const [selectedRunIdOverride, setSelectedRunIdOverride] = useState<string | null>(null);
   const wasConnectedRef = useRef(false);
-  const fetchInProgressRef = useRef(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const debouncedFetchRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Determine the effective selected run ID
   const effectiveSelectedRunId = selectedRunIdOverride ?? selectedRunIdFromContext;
+
+  // Ref for effectiveSelectedRunId to avoid stale closures in event handlers (Issue 1)
+  const effectiveSelectedRunIdRef = useRef(effectiveSelectedRunId);
+  useEffect(() => {
+    effectiveSelectedRunIdRef.current = effectiveSelectedRunId;
+  }, [effectiveSelectedRunId]);
 
   /**
    * Fetch full state from the backend.
    */
   const fetchFullState = useCallback(async (taskId: string) => {
-    if (fetchInProgressRef.current) return;
-    fetchInProgressRef.current = true;
+    // Cancel any in-flight fetch to prevent stale data on task switch (Issue 2)
+    abortControllerRef.current?.abort();
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
 
     try {
-      const response = await fetch(`${API_BASE}/task-runs/${taskId}/full-state`);
+      const response = await fetch(`${API_BASE}/task-runs/${taskId}/full-state`, {
+        signal: controller.signal,
+      });
+      if (controller.signal.aborted) return;
       if (!response.ok) {
         throw new Error(`Failed to fetch full state: ${response.statusText}`);
       }
 
       const data: FullStateResponse = await response.json();
+      if (controller.signal.aborted) return;
 
       // Convert checkpoints
       const checkpoints = data.checkpoints.map(convertCheckpoint);
@@ -654,16 +711,24 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
       // Map defined phases from backend
       const definedPhases = data.defined_phases?.map((p) => mapPhase(p));
 
+      // Extract stage index early for buildPhaseGroups (Issue 3)
+      const currentStageIdx = data.orchestrator_state?.stage_index ?? null;
+
       // Build phase groups (including upcoming phases from workflow definition)
-      const phaseGroups = buildPhaseGroups(steps, workflowStage, definedPhases);
+      const phaseGroups = buildPhaseGroups(steps, workflowStage, definedPhases, currentStageIdx);
 
       // Calculate elapsed time
       const startTime = new Date(data.task_run.started_at).getTime();
 
       // Find last completed checkpoint (used for elapsed time freeze)
-      const completedCheckpoints = checkpoints.filter(
-        (cp) => cp.status === "success" || cp.status === "failed",
-      );
+      // Sort by completedAt to ensure correct ordering regardless of backend response order (Issue 6)
+      const completedCheckpoints = checkpoints
+        .filter((cp) => cp.status === "success" || cp.status === "failed")
+        .sort((a, b) => {
+          const aTime = a.completedAt ? new Date(a.completedAt).getTime() : 0;
+          const bTime = b.completedAt ? new Date(b.completedAt).getTime() : 0;
+          return aTime - bTime;
+        });
 
       // Calculate step stats first (needed to detect all-steps-done)
       const rawElapsedTime = Math.floor((Date.now() - startTime) / 1000);
@@ -728,8 +793,11 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
       // Detect "effectively complete" — all steps finished but backend still
       // doing post-step work (e.g., summary generation). Freeze the timer and
       // mark as completed so the UI stops showing running animations.
-      if (status === "running" && allStepsFinished) {
+      // Only override to completed if no steps failed (Issue 5).
+      if (status === "running" && allStepsFinished && stepStats.failed === 0) {
         status = "completed";
+      } else if (status === "running" && allStepsFinished && stepStats.failed > 0) {
+        status = "failed";
       }
 
       // Extract plan phase details from state_data for plan workflows
@@ -750,8 +818,8 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
         isPlan && planInner ? ((planInner.phase_index as number) ?? null) : null;
       const planTotalPhases = isPlan ? (data.task_run.max_sessions ?? null) : null;
 
-      // Extract multi-stage workflow info
-      const stageIndex = data.orchestrator_state?.stage_index ?? null;
+      // Extract multi-stage workflow info (stageIndex already extracted above as currentStageIdx)
+      const stageIndex = currentStageIdx;
       const stageNames: string[] = data.stage_names ?? [];
       const totalStages = stageNames.length > 0 ? stageNames.length : null;
       const stageName =
@@ -807,6 +875,8 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
         });
       }
     } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") return;
+      if (controller.signal.aborted) return;
       setState((prev) => ({
         ...prev,
         isLoading: false,
@@ -814,7 +884,9 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
         isReconnecting: false,
       }));
     } finally {
-      fetchInProgressRef.current = false;
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null;
+      }
     }
   }, []);
 
@@ -834,56 +906,70 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
     setSelectedRunIdOverride(runId);
   }, []);
 
+  /**
+   * Debounced fetch to coalesce rapid event-triggered fetches (Issue 7).
+   * Multiple events firing in quick succession will only trigger one fetch.
+   */
+  const debouncedFetch = useCallback(
+    (taskId: string) => {
+      if (debouncedFetchRef.current) clearTimeout(debouncedFetchRef.current);
+      debouncedFetchRef.current = setTimeout(() => {
+        fetchFullState(taskId);
+      }, 200);
+    },
+    [fetchFullState],
+  );
+
   // Handle real-time events
   const handleOrchestratorStateChange = useCallback(
     (payload: OrchestratorStateChangePayload) => {
-      if (payload.data?.task_run_id === effectiveSelectedRunId) {
-        // Trigger full fetch to get complete state
-        fetchFullState(effectiveSelectedRunId);
+      const currentRunId = effectiveSelectedRunIdRef.current;
+      if (payload.data?.task_run_id === currentRunId && currentRunId) {
+        // Trigger debounced fetch to get complete state
+        debouncedFetch(currentRunId);
         setState((prev) => ({
           ...prev,
           lastEventTimestamp: Date.now(),
         }));
       }
     },
-    [effectiveSelectedRunId, fetchFullState],
+    [debouncedFetch],
   );
 
-  const handleStepProgress = useCallback(
-    (payload: StepProgressPayload) => {
-      if (payload.data?.task_run_id === effectiveSelectedRunId) {
-        // Update progress marker from event data
-        const data = payload.data;
-        setState((prev) => ({
-          ...prev,
-          currentStepProgress: {
-            checkpointId: "",
-            markerType: "step_progress",
-            currentValue: data.step_index ?? 0,
-            totalValue: null,
-            description: data.step_name ?? null,
-            dataJson: data.details ?? null,
-            createdAt: new Date().toISOString(),
-          },
-          lastEventTimestamp: Date.now(),
-        }));
-      }
-    },
-    [effectiveSelectedRunId],
-  );
+  const handleStepProgress = useCallback((payload: StepProgressPayload) => {
+    const currentRunId = effectiveSelectedRunIdRef.current;
+    if (payload.data?.task_run_id === currentRunId) {
+      // Update progress marker from event data
+      const data = payload.data;
+      setState((prev) => ({
+        ...prev,
+        currentStepProgress: {
+          checkpointId: "",
+          markerType: "step_progress",
+          currentValue: data.step_index ?? 0,
+          totalValue: null,
+          description: data.step_name ?? null,
+          dataJson: data.details ?? null,
+          createdAt: new Date().toISOString(),
+        },
+        lastEventTimestamp: Date.now(),
+      }));
+    }
+  }, []);
 
   const handleTaskRunUpdate = useCallback(
     (payload: TaskRunUpdatePayload) => {
-      if (payload.data?.task_run_id === effectiveSelectedRunId) {
-        // Trigger full fetch on status changes
-        fetchFullState(effectiveSelectedRunId);
+      const currentRunId = effectiveSelectedRunIdRef.current;
+      if (payload.data?.task_run_id === currentRunId && currentRunId) {
+        // Trigger debounced fetch on status changes
+        debouncedFetch(currentRunId);
         setState((prev) => ({
           ...prev,
           lastEventTimestamp: Date.now(),
         }));
       }
     },
-    [effectiveSelectedRunId, fetchFullState],
+    [debouncedFetch],
   );
 
   const handleConnected = useCallback(() => {
@@ -894,11 +980,12 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
     }));
 
     // If we were previously connected and lost connection, fetch full state on reconnect
-    if (wasConnectedRef.current && effectiveSelectedRunId) {
-      fetchFullState(effectiveSelectedRunId);
+    const currentRunId = effectiveSelectedRunIdRef.current;
+    if (wasConnectedRef.current && currentRunId) {
+      fetchFullState(currentRunId);
     }
     wasConnectedRef.current = true;
-  }, [effectiveSelectedRunId, fetchFullState]);
+  }, [fetchFullState]);
 
   const handleDisconnected = useCallback(() => {
     setState((prev) => ({
@@ -934,8 +1021,9 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
       if (!eventData?.node) return;
 
       // Check if this event is for our task
+      const currentRunId = effectiveSelectedRunIdRef.current;
       const taskRunId = eventData.node.metadata?.task_run_id;
-      if (taskRunId && taskRunId !== effectiveSelectedRunId) return;
+      if (taskRunId && taskRunId !== currentRunId) return;
 
       const eventType = eventData.event_type;
 
@@ -945,10 +1033,10 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
         eventType === "action_completed" ||
         eventType === "action_failed"
       ) {
-        // Trigger full fetch to get updated checkpoint data
+        // Trigger debounced fetch to get updated checkpoint data
         // This ensures the timeline reflects the latest step status
-        if (effectiveSelectedRunId) {
-          fetchFullState(effectiveSelectedRunId);
+        if (currentRunId) {
+          debouncedFetch(currentRunId);
         }
 
         setState((prev) => ({
@@ -957,7 +1045,7 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
         }));
       }
     },
-    [effectiveSelectedRunId, fetchFullState],
+    [debouncedFetch],
   );
 
   // Subscribe to unified events
@@ -994,13 +1082,18 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
     // Initial fetch
     fetchFullState(effectiveSelectedRunId);
 
+    // Don't poll terminal runs — no further updates expected (Issue 4)
+    const isTerminal =
+      state.status === "completed" || state.status === "failed" || state.status === "stopped";
+    if (isTerminal) return;
+
     // Polling fallback (reduced frequency since we have real-time events)
     const interval = setInterval(() => {
       fetchFullState(effectiveSelectedRunId);
     }, POLL_INTERVAL_MS);
 
     return () => clearInterval(interval);
-  }, [effectiveSelectedRunId, fetchFullState]);
+  }, [effectiveSelectedRunId, fetchFullState, state.status]);
 
   // Update elapsed time
   useEffect(() => {
@@ -1027,6 +1120,14 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
       selectedRunId: effectiveSelectedRunId,
     }));
   }, [effectiveSelectedRunId]);
+
+  // Clean up debounced fetch timer and abort controller on unmount (Issue 7)
+  useEffect(() => {
+    return () => {
+      if (debouncedFetchRef.current) clearTimeout(debouncedFetchRef.current);
+      abortControllerRef.current?.abort();
+    };
+  }, []);
 
   const value: WorkflowExecutionContextValue = useMemo(
     () => ({

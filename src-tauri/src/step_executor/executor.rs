@@ -3438,7 +3438,8 @@ impl StepExecutor {
                     index,
                     cp_step_type.as_str(),
                 )
-                .with_step_name(&result.step_name);
+                .with_step_name(&result.step_name)
+                .with_stage_index(None);
 
                 let result_json_str = serde_json::to_string(&result).ok();
                 if result.success {

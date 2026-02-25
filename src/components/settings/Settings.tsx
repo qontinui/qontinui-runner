@@ -17,6 +17,7 @@ import { BackupSettings } from "./BackupSettings";
 import { PlaywrightSettings } from "./PlaywrightSettings";
 import { SelfHealingSettings } from "./SelfHealingSettings";
 import { MobileSettings } from "./MobileSettings";
+import { CloudRelaySettings } from "./CloudRelaySettings";
 import { LogSourcesSettings } from "./LogSourcesSettings";
 import { McpSettings } from "./McpSettings";
 import { ExecutionVariablesSettings } from "./ExecutionVariablesSettings";
@@ -50,6 +51,7 @@ type SettingsTab =
   | "self-healing"
   | "playwright"
   | "mobile"
+  | "cloud-relay"
   | "mcp"
   | "log-sources"
   | "execution-variables"
@@ -68,6 +70,7 @@ const VALID_TABS = [
   "self-healing",
   "playwright",
   "mobile",
+  "cloud-relay",
   "mcp",
   "log-sources",
   "execution-variables",
@@ -140,6 +143,8 @@ export function Settings({
         return <PlaywrightSettings onLog={onLog} />;
       case "mobile":
         return <MobileSettings onLog={onLog} />;
+      case "cloud-relay":
+        return <CloudRelaySettings onLog={onLog} />;
       case "mcp":
         return <McpSettings onLog={onLog} />;
       case "log-sources":

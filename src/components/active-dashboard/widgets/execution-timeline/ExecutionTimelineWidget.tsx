@@ -15,7 +15,6 @@ import {
   Globe2,
   FileCode,
   GitBranch,
-  Plug,
   Monitor,
   FlaskConical,
   ChevronRight,
@@ -31,8 +30,8 @@ import {
   RotateCcw,
 } from "lucide-react";
 import { cn } from "../../../../lib/utils";
-import { Badge, ScrollArea } from "../../../ui";
-import { StepStatusBadge, StepProgressMarker } from "../shared";
+import { Badge, ScrollArea, ProgressErrorBoundary } from "../../../ui";
+import { StepStatusBadge, StepProgressMarker, formatDuration } from "../shared";
 import { TimelineStatsBar } from "./TimelineStatsBar";
 import { getAccentColors, getStatusColors } from "@/design-system";
 import {
@@ -63,12 +62,8 @@ function getStepIcon(type: StepType) {
     playwright: Globe2,
     test: FlaskConical,
     check: CheckCircle,
-    check_group: FlaskConical, // Legacy
     // Command (unified)
     shell: Terminal,
-    command: Terminal,
-    api_request: Globe2, // Legacy
-    mcp_call: Plug, // Legacy
     // AI
     prompt: Bot,
     ai_session: Bot,
@@ -92,19 +87,15 @@ function getStepAccentColor(type: StepType): string {
     workflow: "blue",
     state: "blue",
     action: "blue",
-    screenshot: "sky",
+    screenshot: "cyan",
     gui_action: "blue",
-    workflow_ref: "pink",
+    workflow_ref: "red",
     // Verification
     playwright: "purple",
-    test: "teal",
-    check: "teal",
-    check_group: "teal", // Legacy
+    test: "emerald",
+    check: "emerald",
     // Command (unified)
     shell: "slate",
-    command: "slate",
-    api_request: "orange", // Legacy
-    mcp_call: "violet", // Legacy
     // AI
     prompt: "green",
     ai_session: "green",
@@ -112,23 +103,11 @@ function getStepAccentColor(type: StepType): string {
     awas: "cyan",
     // Utility
     macro: "amber",
-    script: "indigo",
+    script: "blue",
     // Unknown
-    unknown: "zinc",
+    unknown: "slate",
   };
-  return colorMap[type] || "zinc";
-}
-
-/**
- * Format duration for display.
- */
-function formatDuration(ms: number | undefined): string {
-  if (!ms) return "";
-  if (ms < 1000) return `${ms}ms`;
-  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
-  const mins = Math.floor(ms / 60000);
-  const secs = Math.floor((ms % 60000) / 1000);
-  return `${mins}m ${secs}s`;
+  return colorMap[type] || "slate";
 }
 
 /**
@@ -145,8 +124,12 @@ function StepRow({ step, taskRunId }: { step: TimelineStep; taskRunId: string | 
 
   // Show progress for running steps or completed steps that have progress data
   const showProgress = isActive && step.checkpointId && taskRunId;
-  // Show inline progress for completed steps that had progress
-  const showCompletedProgress = !isActive && step.progress && step.progress.total !== null;
+  // Show inline progress for terminal steps that had progress (not pending/skipped)
+  const showCompletedProgress =
+    (step.status === "success" || step.status === "failed") &&
+    !isActive &&
+    step.progress &&
+    step.progress.total !== null;
 
   return (
     <div
@@ -176,7 +159,9 @@ function StepRow({ step, taskRunId }: { step: TimelineStep; taskRunId: string | 
         </Badge>
 
         {/* Step name */}
-        <span className="flex-1 text-sm truncate text-foreground">{step.name}</span>
+        <span className="flex-1 text-sm truncate text-foreground" title={step.name}>
+          {step.name}
+        </span>
 
         {/* Completed progress summary */}
         {showCompletedProgress && step.progress && (
@@ -227,15 +212,24 @@ function IterationSection({
   phaseColor,
   phase,
   defaultExpanded = true,
+  onIterationToggle,
+  iterationKey,
   taskRunId,
 }: {
   iterationGroup: IterationGroup;
   phaseColor: string;
   phase: WorkflowStage;
   defaultExpanded?: boolean;
+  onIterationToggle?: (key: string, expanded: boolean) => void;
+  iterationKey?: string;
   taskRunId: string | null;
 }) {
   const [expanded, setExpanded] = useState(defaultExpanded);
+
+  // Sync local state when parent changes defaultExpanded
+  useEffect(() => {
+    setExpanded(defaultExpanded);
+  }, [defaultExpanded]);
   const colors = getAccentColors(phaseColor as Parameters<typeof getAccentColors>[0]);
   const successColors = getStatusColors("success");
   const errorColors = getStatusColors("error");
@@ -247,7 +241,15 @@ function IterationSection({
     <div className="border-l border-border/30 ml-4">
       {/* Iteration header */}
       <button
-        onClick={() => setExpanded(!expanded)}
+        onClick={() => {
+          const newExpanded = !expanded;
+          setExpanded(newExpanded);
+          if (onIterationToggle && iterationKey) {
+            onIterationToggle(iterationKey, newExpanded);
+          }
+        }}
+        aria-expanded={expanded}
+        aria-label={`Iteration ${iterationGroup.iteration} section, ${expanded ? "collapse" : "expand"}`}
         className={cn(
           "w-full flex items-center gap-2 px-3 py-1.5 transition-colors",
           "hover:bg-muted/20",
@@ -315,7 +317,7 @@ function PhaseSection({
   group,
   defaultExpanded = true,
   expandedIterations,
-  onIterationToggle: _onIterationToggle,
+  onIterationToggle,
   taskRunId,
 }: {
   group: PhaseGroup;
@@ -345,6 +347,9 @@ function PhaseSection({
       {/* Phase header */}
       <button
         onClick={() => !group.isUpcoming && setExpanded(!expanded)}
+        aria-expanded={group.isUpcoming ? undefined : expanded}
+        aria-label={`${group.displayLabel} section, ${expanded ? "collapse" : "expand"}`}
+        {...(group.isUpcoming ? { tabIndex: -1, "aria-disabled": "true" as const } : {})}
         className={cn(
           "w-full flex items-center gap-3 px-4 py-2.5 transition-colors",
           group.isUpcoming ? "cursor-default" : "hover:bg-muted/30",
@@ -373,7 +378,7 @@ function PhaseSection({
                   : "bg-muted/20 text-muted-foreground/50 border-transparent",
           )}
         >
-          {config.label}
+          {group.displayLabel}
         </Badge>
 
         {/* Running indicator - only show if a step is actually running */}
@@ -434,7 +439,7 @@ function PhaseSection({
             // Iteration groups for verification/agentic phases
             <>
               {group.iterationGroups.map((iterGroup) => {
-                const iterKey = `${group.phase}-${iterGroup.iteration}`;
+                const iterKey = `${group.stageIndex}:${group.phase}-${iterGroup.iteration}`;
                 const isIterExpanded = expandedIterations.has(iterKey);
                 return (
                   <IterationSection
@@ -443,6 +448,8 @@ function PhaseSection({
                     phaseColor={config.color}
                     phase={group.phase}
                     defaultExpanded={isIterExpanded}
+                    onIterationToggle={onIterationToggle}
+                    iterationKey={iterKey}
                     taskRunId={taskRunId}
                   />
                 );
@@ -472,6 +479,11 @@ export function ExecutionTimelineWidget({
   // Track the previous iteration counts to detect new iterations
   const prevIterationCounts = useRef<Map<string, number>>(new Map());
 
+  // Derive a stable key from phaseGroups to avoid re-running every render
+  const phaseGroupsKey = phaseGroups
+    .map((g) => `${g.stageIndex}:${g.phase}:${g.iterationGroups.length}`)
+    .join(",");
+
   // Update expanded iterations when new iterations are detected
   useEffect(() => {
     setExpandedIterations((prevExpanded) => {
@@ -480,38 +492,40 @@ export function ExecutionTimelineWidget({
       for (const group of phaseGroups) {
         if (!group.hasIterations || group.iterationGroups.length === 0) continue;
 
-        const prevCount = prevIterationCounts.current.get(group.phase) ?? 0;
+        const groupId = `${group.stageIndex}:${group.phase}`;
+        const prevCount = prevIterationCounts.current.get(groupId) ?? 0;
         const currentCount = group.iterationGroups.length;
         const maxIteration = Math.max(...group.iterationGroups.map((g) => g.iteration));
 
         // If new iteration started, only expand the latest one
         if (currentCount > prevCount) {
           // Collapse all previous iterations, expand only the latest
-          const latestKey = `${group.phase}-${maxIteration}`;
+          const latestKey = `${groupId}-${maxIteration}`;
           newExpandedSet.add(latestKey);
         } else {
           // Preserve existing expanded state for this phase
           for (const iterGroup of group.iterationGroups) {
-            const key = `${group.phase}-${iterGroup.iteration}`;
+            const key = `${groupId}-${iterGroup.iteration}`;
             if (prevExpanded.has(key)) {
               newExpandedSet.add(key);
             }
           }
           // If nothing was expanded, expand the latest
           const phaseHasExpanded = group.iterationGroups.some((g) =>
-            newExpandedSet.has(`${group.phase}-${g.iteration}`),
+            newExpandedSet.has(`${groupId}-${g.iteration}`),
           );
           if (!phaseHasExpanded) {
-            newExpandedSet.add(`${group.phase}-${maxIteration}`);
+            newExpandedSet.add(`${groupId}-${maxIteration}`);
           }
         }
 
-        prevIterationCounts.current.set(group.phase, currentCount);
+        prevIterationCounts.current.set(groupId, currentCount);
       }
 
       return newExpandedSet;
     });
-  }, [phaseGroups]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phaseGroupsKey]);
 
   const handleIterationToggle = useCallback((key: string, expanded: boolean) => {
     setExpandedIterations((prev) => {
@@ -560,24 +574,26 @@ export function ExecutionTimelineWidget({
 
       {/* Phase groups */}
       <ScrollArea className="flex-1">
-        <div className="flex flex-col">
-          {phaseGroups.map((group) => (
-            <PhaseSection
-              key={group.phase}
-              group={group}
-              defaultExpanded={group.isActive || group.steps.length < 10}
-              expandedIterations={expandedIterations}
-              onIterationToggle={handleIterationToggle}
-              taskRunId={taskRunId}
-            />
-          ))}
-          {phaseGroups.length === 0 && (
-            <div className="flex flex-col items-center justify-center h-32 text-muted-foreground">
-              <Clock className="h-8 w-8 mb-2 opacity-50" />
-              <span className="text-sm">Waiting for steps to execute...</span>
-            </div>
-          )}
-        </div>
+        <ProgressErrorBoundary componentName="ExecutionTimelineWidget">
+          <div className="flex flex-col">
+            {phaseGroups.map((group) => (
+              <PhaseSection
+                key={`${group.stageIndex}:${group.phase}`}
+                group={group}
+                defaultExpanded={group.isActive || group.steps.length < 10}
+                expandedIterations={expandedIterations}
+                onIterationToggle={handleIterationToggle}
+                taskRunId={taskRunId}
+              />
+            ))}
+            {phaseGroups.length === 0 && (
+              <div className="flex flex-col items-center justify-center h-32 text-muted-foreground">
+                <Clock className="h-8 w-8 mb-2 opacity-50" />
+                <span className="text-sm">Waiting for steps to execute...</span>
+              </div>
+            )}
+          </div>
+        </ProgressErrorBoundary>
       </ScrollArea>
     </div>
   );

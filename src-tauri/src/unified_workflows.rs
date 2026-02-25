@@ -247,6 +247,17 @@ impl UnifiedWorkflow {
     /// If stages is empty, wrap top-level steps into a single stage.
     pub fn normalize_to_stages(&self) -> Vec<WorkflowStage> {
         if !self.stages.is_empty() {
+            // Warn if top-level steps also exist — they'll be ignored
+            let has_top_level = !self.setup_steps.is_empty()
+                || !self.verification_steps.is_empty()
+                || !self.agentic_steps.is_empty()
+                || !self.completion_steps.is_empty();
+            if has_top_level {
+                tracing::warn!(
+                    workflow_name = %self.name,
+                    "Workflow has both stages and top-level steps; top-level steps will be ignored"
+                );
+            }
             return self.stages.clone();
         }
         // Wrap top-level steps as a single stage
@@ -563,15 +574,18 @@ pub fn prepend_preflight_check_step(
     steps
 }
 
-/// Convert a `UnifiedWorkflow` into a `StageConfig` for execution.
+/// Convert a `UnifiedWorkflow` into a single `StageConfig` for execution.
 ///
-/// This is the canonical conversion used by both:
-/// - The compose endpoint (running multiple workflows in sequence)
+/// This is used by:
 /// - The WorkflowStepHandler (running a nested workflow inline)
 ///
 /// Set `include_preflight` to true to prepend a preflight check step
 /// (used by the compose endpoint; nested workflows skip it since the
 /// parent workflow already ran preflight).
+///
+/// NOTE: This function does NOT prepend health check or log_watch steps.
+/// For full step injection (including health checks and log watch),
+/// use `stage_to_stage_config()` instead.
 pub fn workflow_to_stage_config(
     workflow: &UnifiedWorkflow,
     index: usize,
@@ -579,7 +593,8 @@ pub fn workflow_to_stage_config(
     include_preflight: bool,
 ) -> crate::unified_workflow_executor::StageConfig {
     use crate::unified_workflow_executor::{
-        convert_json_steps_with_phase, extract_prompt_steps_with_phase,
+        convert_all_json_steps_with_phase, convert_json_steps_with_phase,
+        extract_prompt_steps_with_phase,
     };
 
     let setup_auto = convert_json_steps_with_phase(&workflow.setup_steps, 0, Some("setup"));
@@ -590,7 +605,7 @@ pub fn workflow_to_stage_config(
     };
     let setup_prompt = extract_prompt_steps_with_phase(&workflow.setup_steps, Some("setup"));
     let verif =
-        convert_json_steps_with_phase(&workflow.verification_steps, 0, Some("verification"));
+        convert_all_json_steps_with_phase(&workflow.verification_steps, 0, Some("verification"));
     let agentic = extract_prompt_steps_with_phase(&workflow.agentic_steps, Some("agentic"));
     let comp_auto =
         convert_json_steps_with_phase(&workflow.completion_steps, 0, Some("completion"));
@@ -630,7 +645,8 @@ pub fn stage_to_stage_config(
     health_check_urls: &[HealthCheckUrl],
 ) -> crate::unified_workflow_executor::StageConfig {
     use crate::unified_workflow_executor::{
-        convert_json_steps_with_phase, extract_prompt_steps_with_phase,
+        convert_all_json_steps_with_phase, convert_json_steps_with_phase,
+        extract_prompt_steps_with_phase,
     };
 
     let setup_auto = convert_json_steps_with_phase(&stage.setup_steps, 0, Some("setup"));
@@ -641,7 +657,8 @@ pub fn stage_to_stage_config(
         setup_auto
     };
     let setup_prompt = extract_prompt_steps_with_phase(&stage.setup_steps, Some("setup"));
-    let verif = convert_json_steps_with_phase(&stage.verification_steps, 0, Some("verification"));
+    let verif =
+        convert_all_json_steps_with_phase(&stage.verification_steps, 0, Some("verification"));
     let verif = prepend_health_check_steps(verif, health_check_enabled, health_check_urls);
     let verif = prepend_log_watch_step(verif, log_watch_enabled);
     let agentic = extract_prompt_steps_with_phase(&stage.agentic_steps, Some("agentic"));

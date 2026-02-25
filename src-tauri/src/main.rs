@@ -862,6 +862,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Cloud relay commands (remote mobile access via backend WebSocket)
             mcp::backend_relay::commands::start_cloud_relay,
             mcp::backend_relay::commands::stop_cloud_relay,
+            mcp::backend_relay::commands::get_cloud_relay_status,
+            mcp::backend_relay::commands::save_cloud_relay_settings,
+            mcp::backend_relay::commands::get_cloud_relay_settings,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");

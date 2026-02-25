@@ -3,6 +3,12 @@
  *
  * State management for the unified Workflow Builder.
  * Handles workflow state, step management, and feature detection.
+ *
+ * Internally uses @qontinui/workflow-ui's shared WorkflowBuilderProvider
+ * and WorkflowDataProvider to make the shared context available for
+ * headless components, while preserving the runner's own rich API layer
+ * that includes Tauri-specific features, loading/saving state,
+ * localStorage persistence, and export/import operations.
  */
 
 import React, {
@@ -14,6 +20,16 @@ import React, {
   useEffect,
 } from "react";
 import { emit } from "@tauri-apps/api/event";
+import {
+  WorkflowBuilderProvider as SharedBuilderProvider,
+  WorkflowDataProvider,
+} from "@qontinui/workflow-ui";
+import type {
+  WorkflowBuilderState as SharedBuilderState,
+  WorkflowBuilderAction as SharedBuilderAction,
+  WorkflowBuilderContextValue as SharedBuilderContextValue,
+} from "@qontinui/workflow-ui";
+import { createRunnerDataAdapter } from "../../lib/workflow-builder/runner-data-adapter";
 import type {
   UnifiedWorkflow,
   UnifiedStep,
@@ -35,6 +51,9 @@ import {
   isWorkflowEmpty,
 } from "../../types";
 
+// Re-export shared types for consumers that may need them
+export type { SharedBuilderState, SharedBuilderAction, SharedBuilderContextValue };
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -42,6 +61,9 @@ import {
 const STORAGE_KEY = "qontinui-workflow-builder-draft";
 const STORAGE_KEY_ORIGINAL = "qontinui-workflow-builder-original";
 const API_BASE = "http://localhost:9876";
+
+// Singleton data adapter instance
+const runnerDataAdapter = createRunnerDataAdapter();
 
 // =============================================================================
 // State Types
@@ -635,10 +657,11 @@ function saveOriginalToStorage(workflow: UnifiedWorkflow | null): void {
   }
 }
 
-export function WorkflowBuilderProvider({
-  children,
-  initialWorkflow,
-}: WorkflowBuilderProviderProps) {
+/**
+ * Inner provider that manages the runner-specific state.
+ * Wrapped by SharedBuilderProvider and WorkflowDataProvider.
+ */
+function RunnerWorkflowBuilderInner({ children, initialWorkflow }: WorkflowBuilderProviderProps) {
   // Try to load from localStorage if no initial workflow provided
   const storedWorkflow = !initialWorkflow ? loadFromStorage() : null;
   // Also load the original workflow to preserve update vs create state
@@ -1005,6 +1028,26 @@ export function WorkflowBuilderProvider({
 
   return (
     <WorkflowBuilderContext.Provider value={value}>{children}</WorkflowBuilderContext.Provider>
+  );
+}
+
+/**
+ * WorkflowBuilderProvider wraps the runner-specific context
+ * with the shared @qontinui/workflow-ui providers, making both
+ * the runner's rich API and the shared headless context available.
+ */
+export function WorkflowBuilderProvider({
+  children,
+  initialWorkflow,
+}: WorkflowBuilderProviderProps) {
+  return (
+    <WorkflowDataProvider adapter={runnerDataAdapter}>
+      <SharedBuilderProvider initialWorkflow={initialWorkflow}>
+        <RunnerWorkflowBuilderInner initialWorkflow={initialWorkflow}>
+          {children}
+        </RunnerWorkflowBuilderInner>
+      </SharedBuilderProvider>
+    </WorkflowDataProvider>
   );
 }
 

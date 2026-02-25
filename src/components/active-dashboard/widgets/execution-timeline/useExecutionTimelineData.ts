@@ -16,13 +16,13 @@ import type {
   TimelineStep,
   PhaseGroup,
   IterationGroup,
-  StepType,
   TimelineStats,
   VerificationResult,
 } from "./types";
 import type { StepExecutionStatus, StepStats } from "../shared/types";
 import type { WorkflowStage } from "../../../../types/dashboard/activity-types";
 import { useWorkflowExecutionOptional } from "../../../../contexts/WorkflowExecutionContext";
+import { mapStepType, mapPhase } from "../shared/utils";
 
 const API_BASE = "http://localhost:9876";
 const POLL_INTERVAL_MS = 1000; // Poll every 1 second to catch running steps
@@ -44,6 +44,8 @@ interface CurrentExecutionStepsResponse {
     step_index?: number;
     phase?: string;
     iteration?: number;
+    /** Stage index for multi-stage workflows (0-based). Null/undefined for single-stage. */
+    stage_index?: number;
     status: string;
     start_time?: number;
     end_time?: number;
@@ -53,6 +55,10 @@ interface CurrentExecutionStepsResponse {
     stdout?: string;
   }>;
   count: number;
+  /** Multi-stage workflow fields */
+  current_stage_index?: number;
+  total_stages?: number;
+  stage_names?: string[];
 }
 
 /**
@@ -69,114 +75,6 @@ interface OrchestratorStateResponse {
   is_complete: boolean;
   is_paused: boolean;
   is_stopped: boolean;
-}
-
-/**
- * Response from the recap API (Tauri command via HTTP proxy).
- */
-interface RecapStageStep {
-  name: string;
-  step_type: string;
-  status: string;
-  phase?: WorkflowStage;
-  duration_ms?: number;
-  error?: string;
-}
-
-interface RecapStage {
-  stage: WorkflowStage;
-  display_name: string;
-  status: string;
-  steps: RecapStageStep[];
-  iteration?: number;
-}
-
-// RecapDataResponse type is defined but reserved for future recap API integration
-interface _RecapDataResponse {
-  success: boolean;
-  data?: {
-    task_run_id: string;
-    task_name: string;
-    status: string;
-    stages: RecapStage[];
-  };
-}
-
-/**
- * Map API step_type to our StepType.
- * Aligned with backend StepType enum in src-tauri/src/step_types.rs
- */
-function mapStepType(apiType: string): StepType {
-  const typeMap: Record<string, StepType> = {
-    // GUI Automation
-    workflow: "workflow",
-    gui_workflow: "workflow",
-    state: "state",
-    action: "action",
-    screenshot: "screenshot",
-    gui_action: "gui_action",
-    gui_automation: "gui_action",
-    workflow_ref: "workflow_ref",
-
-    // Verification
-    playwright: "playwright",
-    test: "test",
-    check: "check",
-    check_group: "check",
-    error_check: "check",
-    log_check: "check",
-
-    // Command (unified: shell commands, API requests, MCP calls)
-    shell: "shell",
-    shell_command: "shell",
-    command: "shell",
-    api_request: "shell",
-    api: "shell",
-    http: "shell",
-    mcp_call: "shell",
-    mcp: "shell",
-
-    // AI
-    prompt: "prompt",
-    ai_prompt: "prompt",
-    ai_session: "ai_session",
-    ai_analysis: "ai_session",
-    agentic: "ai_session",
-
-    // AWAS (Web Automation)
-    awas_discover: "awas",
-    awas_execute: "awas",
-    awas_check_support: "awas",
-    awas_list_actions: "awas",
-    awas_extract_elements: "awas",
-
-    // Utility
-    macro: "macro",
-    script: "script",
-  };
-  return typeMap[apiType.toLowerCase()] || "unknown";
-}
-
-/**
- * Map API phase to WorkflowStage.
- * If no phase is provided, uses the current orchestrator stage or defaults to "setup".
- */
-function mapPhase(
-  apiPhase: string | undefined,
-  fallbackStage: WorkflowStage = "setup",
-): WorkflowStage {
-  if (!apiPhase) return fallbackStage;
-  const phaseMap: Record<string, WorkflowStage> = {
-    setup: "setup",
-    setup_steps: "setup",
-    agentic: "agentic",
-    agentic_steps: "agentic",
-    verification: "verification",
-    verification_steps: "verification",
-    completion: "completion",
-    completion_steps: "completion",
-  };
-  return phaseMap[apiPhase.toLowerCase()] || fallbackStage;
 }
 
 /**
@@ -208,6 +106,7 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
   const [workflowName, setWorkflowName] = useState<string | null>(null);
   const [taskRunId, setTaskRunId] = useState<string | null>(null);
   const [currentStage, setCurrentStage] = useState<WorkflowStage | null>(null);
+  const [currentStageIndex, setCurrentStageIndex] = useState<number>(0);
 
   // Ref to track the current orchestrator stage for phase mapping
   const orchestratorStageRef = useRef<WorkflowStage>("setup");
@@ -227,6 +126,7 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
             currentWorkflowStage = data.current_stage;
             orchestratorStageRef.current = data.current_stage;
             setCurrentStage(data.current_stage);
+            setCurrentStageIndex(data.current_stage_index ?? 0);
           } else if (data.task_run_id) {
             // Fetch orchestrator state to get the current workflow stage
             try {
@@ -266,6 +166,7 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
               name: exec.step_name || `Step ${index + 1}`,
               status,
               phase: mapPhase(exec.phase, currentWorkflowStage),
+              stageIndex: exec.stage_index ?? 0,
               stepIndex: exec.step_index ?? index,
               iteration: exec.iteration,
               startTime: exec.start_time,
@@ -365,6 +266,7 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
         name: phaseName,
         status: "running" as StepExecutionStatus,
         phase: currentStage,
+        stageIndex: lastCompleted?.stageIndex ?? 0,
         stepIndex: -1,
         startTime: lastCompleted?.endTime ?? Date.now(),
       };
@@ -390,70 +292,59 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
     return null;
   }, [allSteps, currentStep, currentStage]);
 
-  // Group steps by phase
+  // Group steps by (stageIndex, phase) composite key for multi-stage support.
+  // For single-stage workflows (all stageIndex=0), this behaves identically.
   const phaseGroups = useMemo((): PhaseGroup[] => {
-    const groups = new Map<WorkflowStage, TimelineStep[]>();
+    // Detect if multi-stage by checking if any step has stageIndex > 0
+    const maxStageIndex = allSteps.reduce((max, s) => Math.max(max, s.stageIndex), 0);
+    const isMultiStage = maxStageIndex > 0;
 
-    // Group steps by phase
+    // Composite key: "stageIndex:phase"
+    const groupKey = (step: TimelineStep) => `${step.stageIndex}:${step.phase}`;
+    const groups = new Map<string, TimelineStep[]>();
+
     for (const step of allSteps) {
-      const existing = groups.get(step.phase) || [];
+      const key = groupKey(step);
+      const existing = groups.get(key) || [];
       existing.push(step);
-      groups.set(step.phase, existing);
+      groups.set(key, existing);
     }
 
-    // Calculate earliest startTime for each phase (for chronological ordering)
-    const phaseEarliestTime = new Map<WorkflowStage, number>();
-    for (const [phase, steps] of groups) {
+    // Calculate earliest startTime for each group
+    const groupEarliestTime = new Map<string, number>();
+    for (const [key, steps] of groups) {
       const timesWithValues = steps
         .filter((s) => s.startTime !== undefined)
         .map((s) => s.startTime!);
       if (timesWithValues.length > 0) {
-        phaseEarliestTime.set(phase, Math.min(...timesWithValues));
+        groupEarliestTime.set(key, Math.min(...timesWithValues));
       }
     }
 
-    // Get phases that have steps and sort them chronologically
-    const phasesWithSteps = Array.from(groups.keys()).filter(
-      (phase) => groups.get(phase)!.length > 0,
-    );
+    const keysWithSteps = Array.from(groups.keys()).filter((k) => (groups.get(k)?.length ?? 0) > 0);
 
-    // Sort phases by earliest startTime (chronological order)
-    // Phases without timestamps fall back to PHASE_ORDER position
-    phasesWithSteps.sort((a, b) => {
-      const timeA = phaseEarliestTime.get(a);
-      const timeB = phaseEarliestTime.get(b);
-
-      // Both have timestamps: sort chronologically
-      if (timeA !== undefined && timeB !== undefined) {
-        return timeA - timeB;
-      }
-      // Only one has timestamp: the one with timestamp comes first
+    // Sort by earliest startTime, falling back to stage index then phase order
+    keysWithSteps.sort((a, b) => {
+      const timeA = groupEarliestTime.get(a);
+      const timeB = groupEarliestTime.get(b);
+      if (timeA !== undefined && timeB !== undefined) return timeA - timeB;
       if (timeA !== undefined) return -1;
       if (timeB !== undefined) return 1;
-      // Neither has timestamp: fall back to PHASE_ORDER
-      return PHASE_ORDER.indexOf(a) - PHASE_ORDER.indexOf(b);
+      const [stageA, phaseA] = a.split(":") as [string, WorkflowStage];
+      const [stageB, phaseB] = b.split(":") as [string, WorkflowStage];
+      if (stageA !== stageB) return parseInt(stageA) - parseInt(stageB);
+      return PHASE_ORDER.indexOf(phaseA) - PHASE_ORDER.indexOf(phaseB);
     });
 
     // Helper function to sort steps by start time with stable tiebreakers
     const sortByStartTime = (steps: TimelineStep[]): TimelineStep[] => {
       return [...steps].sort((a, b) => {
-        // Primary: Sort by start time (chronological order)
         if (a.startTime !== undefined && b.startTime !== undefined) {
-          if (a.startTime !== b.startTime) {
-            return a.startTime - b.startTime;
-          }
-          // Same start time: use secondary sort
+          if (a.startTime !== b.startTime) return a.startTime - b.startTime;
         }
-        // Steps with timestamps come before steps without
         if (a.startTime !== undefined && b.startTime === undefined) return -1;
         if (a.startTime === undefined && b.startTime !== undefined) return 1;
-
-        // Secondary: Sort by step index
-        if (a.stepIndex !== b.stepIndex) {
-          return a.stepIndex - b.stepIndex;
-        }
-
-        // Tertiary: Sort by ID for stability (IDs are unique)
+        if (a.stepIndex !== b.stepIndex) return a.stepIndex - b.stepIndex;
         return a.id.localeCompare(b.id);
       });
     };
@@ -464,8 +355,6 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
       activePhase: boolean,
     ): IterationGroup[] => {
       const iterationMap = new Map<number, TimelineStep[]>();
-
-      // Group steps by iteration (use iteration 1 for steps without iteration)
       for (const step of steps) {
         const iter = step.iteration ?? 1;
         const existing = iterationMap.get(iter) || [];
@@ -473,16 +362,11 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
         iterationMap.set(iter, existing);
       }
 
-      // Convert to array and sort by iteration number
       const iterations = Array.from(iterationMap.keys()).sort((a, b) => a - b);
       const maxIteration = Math.max(...iterations, 0);
 
-      // Determine which SINGLE iteration should be marked as active
-      // Priority: highest iteration with running steps, else max iteration
-      // This prevents multiple iterations from being marked active simultaneously
       let activeIteration: number | null = null;
       if (activePhase) {
-        // Find the highest iteration that has running steps
         for (let i = iterations.length - 1; i >= 0; i--) {
           const iter = iterations[i];
           const iterSteps = iterationMap.get(iter) || [];
@@ -491,10 +375,7 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
             break;
           }
         }
-        // If no running steps found, the max iteration is active
-        if (activeIteration === null) {
-          activeIteration = maxIteration;
-        }
+        if (activeIteration === null && maxIteration > 0) activeIteration = maxIteration;
       }
 
       return iterations.map((iteration): IterationGroup => {
@@ -504,35 +385,28 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
         ).length;
         const successful = iterSteps.filter((s) => s.status === "success").length;
         const failed = iterSteps.filter((s) => s.status === "failed").length;
-        // Only mark ONE iteration as active (the determined activeIteration)
-        const isIterActive = iteration === activeIteration;
-        const isIterComplete = iterSteps.length > 0 && completed === iterSteps.length;
-
         return {
           iteration,
           steps: iterSteps,
-          isActive: isIterActive,
-          isComplete: isIterComplete,
-          stats: {
-            total: iterSteps.length,
-            completed,
-            successful,
-            failed,
-          },
+          isActive: iteration === activeIteration,
+          isComplete: iterSteps.length > 0 && completed === iterSteps.length,
+          stats: { total: iterSteps.length, completed, successful, failed },
         };
       });
     };
 
     // Convert to PhaseGroup array in chronological order
-    return phasesWithSteps.map((phase) => {
-      const steps = groups.get(phase) || [];
+    return keysWithSteps.map((key) => {
+      const steps = groups.get(key) || [];
+      const [stageIdxStr, phaseStr] = key.split(":") as [string, WorkflowStage];
+      const stageIdx = parseInt(stageIdxStr);
+      const phase = phaseStr;
       const completed = steps.filter((s) => s.status === "success" || s.status === "failed").length;
       const successful = steps.filter((s) => s.status === "success").length;
       const failed = steps.filter((s) => s.status === "failed").length;
-      const isActive = phase === currentPhase;
+      const isActive = phase === currentPhase && (!isMultiStage || stageIdx === currentStageIndex);
       const isComplete = steps.length > 0 && completed === steps.length;
 
-      // Phases that have iterations: verification and agentic
       const hasIterations = phase === "verification" || phase === "agentic";
       const iterationGroups = hasIterations ? createIterationGroups(steps, isActive) : [];
       const currentIteration =
@@ -540,8 +414,20 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
           ? Math.max(...iterationGroups.map((g) => g.iteration))
           : undefined;
 
+      // Import WORKFLOW_STAGE_CONFIG labels
+      const phaseLabels: Record<string, string> = {
+        setup: "Setup",
+        agentic: "Agentic",
+        verification: "Verification",
+        completion: "Completion",
+      };
+      const phaseLabel = phaseLabels[phase] ?? phase;
+      const displayLabel = isMultiStage ? `Stage ${stageIdx + 1} — ${phaseLabel}` : phaseLabel;
+
       return {
         phase,
+        stageIndex: stageIdx,
+        displayLabel,
         steps: sortByStartTime(steps),
         iterationGroups,
         hasIterations,
@@ -549,15 +435,10 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
         isActive,
         isComplete,
         isUpcoming: false,
-        stats: {
-          total: steps.length,
-          completed,
-          successful,
-          failed,
-        },
+        stats: { total: steps.length, completed, successful, failed },
       };
     });
-  }, [allSteps, currentPhase]);
+  }, [allSteps, currentPhase, currentStageIndex]);
 
   // Calculate timeline-specific statistics
   const stats: TimelineStats = useMemo(() => {
@@ -583,7 +464,7 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
       const activeVerification = verificationIterations.find((g) => g.isActive);
       const activeAgentic = agenticIterations.find((g) => g.isActive);
       currentIteration =
-        activeVerification?.iteration || activeAgentic?.iteration || maxIteration || null;
+        activeVerification?.iteration ?? activeAgentic?.iteration ?? maxIteration ?? null;
     } else if (maxIteration > 0) {
       currentIteration = maxIteration;
     }
@@ -594,11 +475,7 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
       // Count verification steps that are checks/tests
       const checkSteps = iterGroup.steps.filter(
         (s) =>
-          s.type === "check" ||
-          s.type === "test" ||
-          s.type === "command" ||
-          s.type === "playwright" ||
-          s.type === "shell",
+          s.type === "check" || s.type === "test" || s.type === "playwright" || s.type === "shell",
       );
       const passed = checkSteps.filter((s) => s.status === "success").length;
       const total = checkSteps.length;

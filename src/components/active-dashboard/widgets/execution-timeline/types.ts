@@ -19,18 +19,14 @@ export type StepType =
   | "state"
   | "action"
   | "screenshot"
-  | "gui_action" // Alias for backward compatibility
-  | "workflow_ref" // Alias for backward compatibility
+  | "gui_action"
+  | "workflow_ref"
   // Verification
   | "playwright"
   | "test"
   | "check"
-  | "check_group" // Legacy: now mapped to "check" (kept for historical data)
   // Command (unified: shell commands, API requests, MCP calls, checks)
   | "shell"
-  | "command" // New canonical command type
-  | "api_request" // Legacy: now part of "command" (kept for historical data)
-  | "mcp_call" // Legacy: now part of "command" (kept for historical data)
   // AI
   | "prompt"
   | "ai_session"
@@ -38,7 +34,7 @@ export type StepType =
   | "awas"
   // Utility
   | "macro"
-  | "script" // Alias for backward compatibility
+  | "script"
   // Unknown fallback
   | "unknown";
 
@@ -58,6 +54,8 @@ export interface TimelineStep {
   status: StepExecutionStatus;
   /** Phase this step belongs to */
   phase: WorkflowStage;
+  /** Stage index for multi-stage workflows (0-based). Defaults to 0 for single-stage. */
+  stageIndex: number;
   /** Step index within the phase */
   stepIndex: number;
   /** Iteration number for verification/agentic phases (1-indexed) */
@@ -116,7 +114,7 @@ export interface VerificationResult {
   /** Duration of the verification phase in ms */
   durationMs?: number;
   /** Whether all check steps in this iteration have completed (success or failed) */
-  isComplete?: boolean;
+  isComplete: boolean;
 }
 
 /**
@@ -151,6 +149,10 @@ export interface TimelineStats {
 export interface PhaseGroup {
   /** Phase name */
   phase: WorkflowStage;
+  /** Stage index for multi-stage workflows (0-based). Defaults to 0. */
+  stageIndex: number;
+  /** Display label (includes stage prefix for multi-stage workflows) */
+  displayLabel: string;
   /** Steps in this phase (flat list, sorted by start time) */
   steps: TimelineStep[];
   /** Steps grouped by iteration (for verification/agentic phases) */

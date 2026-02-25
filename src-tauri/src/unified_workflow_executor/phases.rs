@@ -715,7 +715,15 @@ fn build_unified_iteration_context(
 /// Truncate a string to max_len characters, appending "..." if truncated.
 fn truncate_str(s: &str, max_len: usize) -> String {
     if s.len() > max_len {
-        format!("{}...", &s[..max_len])
+        // Find the last char boundary at or before max_len to avoid
+        // panicking on multi-byte UTF-8 characters.
+        let end = s
+            .char_indices()
+            .take_while(|(i, _)| *i <= max_len)
+            .last()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        format!("{}...", &s[..end])
     } else {
         s.to_string()
     }
@@ -800,6 +808,7 @@ impl SetupExecutor {
         execution_id: &str,
         workflow_name: &str,
         logger: &StepEventLogger,
+        stage_index: Option<u32>,
     ) -> (bool, Vec<StepExecutionResult>) {
         let mut all_results = Vec::new();
         let mut overall_success = true;
@@ -848,7 +857,8 @@ impl SetupExecutor {
                     idx,
                     step_type.as_str(),
                 )
-                .with_step_name(step_name);
+                .with_step_name(step_name)
+                .with_stage_index(stage_index);
                 checkpoint.mark_started();
                 if let Err(e) = checkpoint_mgr.save_step(&checkpoint) {
                     warn!("Failed to save setup step checkpoint: {}", e);
@@ -877,7 +887,8 @@ impl SetupExecutor {
                     idx,
                     step_type.as_str(),
                 )
-                .with_step_name(step_name);
+                .with_step_name(step_name)
+                .with_stage_index(stage_index);
 
                 let duration_ms = step_result.duration_ms as i64;
                 if step_result.success {
@@ -937,7 +948,8 @@ impl SetupExecutor {
                         step_idx,
                         "prompt",
                     )
-                    .with_step_name(step_name);
+                    .with_step_name(step_name)
+                    .with_stage_index(stage_index);
                     resp_checkpoint.mark_started();
                     if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
                         warn!("Failed to save setup response-mode step checkpoint: {}", e);
@@ -959,7 +971,7 @@ impl SetupExecutor {
                     match execute_prompt_response_mode(
                         step,
                         &self.checkpoint_db,
-                        None,
+                        Some(execution_id),
                         doctor_handle,
                     )
                     .await
@@ -980,7 +992,8 @@ impl SetupExecutor {
                                 step_idx,
                                 "prompt",
                             )
-                            .with_step_name(step_name);
+                            .with_step_name(step_name)
+                            .with_stage_index(stage_index);
                             resp_checkpoint.mark_success(Some(output.clone()), duration_ms as i64);
                             if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
                                 warn!("Failed to save setup response-mode step completion checkpoint: {}", e);
@@ -1036,7 +1049,8 @@ impl SetupExecutor {
                                 step_idx,
                                 "prompt",
                             )
-                            .with_step_name(step_name);
+                            .with_step_name(step_name)
+                            .with_stage_index(stage_index);
                             resp_checkpoint.mark_failed(&e, duration_ms as i64);
                             if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
                                 warn!("Failed to save setup response-mode step failure checkpoint: {}", e);
@@ -1104,7 +1118,8 @@ impl SetupExecutor {
                     ai_step_idx,
                     "ai_session",
                 )
-                .with_step_name(&step_name);
+                .with_step_name(&step_name)
+                .with_stage_index(stage_index);
                 ai_checkpoint.mark_started();
                 if let Err(e) = checkpoint_mgr.save_step(&ai_checkpoint) {
                     warn!("Failed to save setup AI step checkpoint: {}", e);
@@ -1153,7 +1168,8 @@ impl SetupExecutor {
                         ai_step_idx,
                         "ai_session",
                     )
-                    .with_step_name(&step_name);
+                    .with_step_name(&step_name)
+                    .with_stage_index(stage_index);
 
                     if result.success {
                         ai_checkpoint.mark_success(Some(result.output.clone()), duration_ms);
@@ -1234,6 +1250,7 @@ impl SetupExecutor {
                 &config.execution_id,
                 &config.workflow_name,
                 logger,
+                None,
             )
             .await;
 
@@ -1301,6 +1318,7 @@ impl VerificationExecutor {
         iteration: u32,
         workflow_name: &str,
         logger: &StepEventLogger,
+        stage_index: Option<u32>,
     ) -> (VerificationPhaseResult, Vec<StepExecutionResult>) {
         // Filter out dev_mode_only steps when not in dev mode
         let steps: Vec<ExecutionStepConfig> = steps
@@ -1380,7 +1398,8 @@ impl VerificationExecutor {
                 idx,
                 step_type.as_str(),
             )
-            .with_step_name(step_name);
+            .with_step_name(step_name)
+            .with_stage_index(stage_index);
             checkpoint.mark_started();
             if let Err(e) = checkpoint_mgr.save_step(&checkpoint) {
                 warn!("Failed to save verification step checkpoint: {}", e);
@@ -1424,7 +1443,8 @@ impl VerificationExecutor {
                 idx,
                 step_type.as_str(),
             )
-            .with_step_name(step_name);
+            .with_step_name(step_name)
+            .with_stage_index(stage_index);
 
             let duration_ms = step_result.duration_ms as i64;
             if step_result.success {
@@ -1493,6 +1513,7 @@ impl VerificationExecutor {
                 config.iteration,
                 &config.workflow_name,
                 logger,
+                None,
             )
             .await;
 
@@ -1679,7 +1700,8 @@ impl AgenticExecutor {
                     0,
                     "prompt",
                 )
-                .with_step_name(step_name);
+                .with_step_name(step_name)
+                .with_stage_index(config.stage_index);
                 resp_checkpoint.mark_started();
                 if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
                     warn!(
@@ -1728,7 +1750,8 @@ impl AgenticExecutor {
                             0,
                             "prompt",
                         )
-                        .with_step_name(step_name);
+                        .with_step_name(step_name)
+                        .with_stage_index(config.stage_index);
                         resp_checkpoint.mark_success(Some(output.clone()), duration_ms as i64);
                         if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
                             warn!("Failed to save agentic response-mode step completion checkpoint: {}", e);
@@ -1783,7 +1806,8 @@ impl AgenticExecutor {
                             0,
                             "prompt",
                         )
-                        .with_step_name(step_name);
+                        .with_step_name(step_name)
+                        .with_stage_index(config.stage_index);
                         resp_checkpoint.mark_failed(&e, duration_ms as i64);
                         if let Err(e2) = checkpoint_mgr.save_step(&resp_checkpoint) {
                             warn!(
@@ -1846,7 +1870,8 @@ impl AgenticExecutor {
             0, // Agentic is a single-step phase
             "ai_session",
         )
-        .with_step_name("AI Fixing Issues");
+        .with_step_name("AI Fixing Issues")
+        .with_stage_index(config.stage_index);
         checkpoint.mark_started();
         if let Err(e) = checkpoint_mgr.save_step(&checkpoint) {
             warn!("Failed to save agentic step checkpoint: {}", e);
@@ -2003,7 +2028,8 @@ impl AgenticExecutor {
             0,
             "ai_session",
         )
-        .with_step_name("AI Fixing Issues");
+        .with_step_name("AI Fixing Issues")
+        .with_stage_index(config.stage_index);
 
         let injected_steps = result.injected_steps;
         let outcome = if result.success {
@@ -2235,6 +2261,7 @@ impl CompletionExecutor {
         workflow_name: &str,
         iterations_run: u32,
         logger: &StepEventLogger,
+        stage_index: Option<u32>,
     ) -> (bool, Vec<StepExecutionResult>) {
         let mut all_results = Vec::new();
         let mut overall_success = true;
@@ -2283,7 +2310,8 @@ impl CompletionExecutor {
                     idx,
                     step_type.as_str(),
                 )
-                .with_step_name(step_name);
+                .with_step_name(step_name)
+                .with_stage_index(stage_index);
                 checkpoint.mark_started();
                 if let Err(e) = checkpoint_mgr.save_step(&checkpoint) {
                     warn!("Failed to save completion step checkpoint: {}", e);
@@ -2312,7 +2340,8 @@ impl CompletionExecutor {
                     idx,
                     step_type.as_str(),
                 )
-                .with_step_name(step_name);
+                .with_step_name(step_name)
+                .with_stage_index(stage_index);
 
                 let duration_ms = step_result.duration_ms as i64;
                 if step_result.success {
@@ -2401,7 +2430,8 @@ impl CompletionExecutor {
                         step_idx,
                         "prompt",
                     )
-                    .with_step_name(step_name);
+                    .with_step_name(step_name)
+                    .with_stage_index(stage_index);
                     resp_checkpoint.mark_started();
                     if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
                         warn!(
@@ -2430,7 +2460,7 @@ impl CompletionExecutor {
                     match execute_prompt_response_mode(
                         step,
                         &self.checkpoint_db,
-                        None,
+                        Some(execution_id),
                         doctor_handle,
                     )
                     .await
@@ -2451,7 +2481,8 @@ impl CompletionExecutor {
                                 step_idx,
                                 "prompt",
                             )
-                            .with_step_name(step_name);
+                            .with_step_name(step_name)
+                            .with_stage_index(stage_index);
                             resp_checkpoint.mark_success(Some(output.clone()), duration_ms as i64);
                             if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
                                 warn!("Failed to save completion response-mode step completion checkpoint: {}", e);
@@ -2507,7 +2538,8 @@ impl CompletionExecutor {
                                 step_idx,
                                 "prompt",
                             )
-                            .with_step_name(step_name);
+                            .with_step_name(step_name)
+                            .with_stage_index(stage_index);
                             resp_checkpoint.mark_failed(&e, duration_ms as i64);
                             if let Err(e) = checkpoint_mgr.save_step(&resp_checkpoint) {
                                 warn!("Failed to save completion response-mode step failure checkpoint: {}", e);
@@ -2577,7 +2609,8 @@ impl CompletionExecutor {
                     ai_step_idx,
                     "ai_session",
                 )
-                .with_step_name(&step_name);
+                .with_step_name(&step_name)
+                .with_stage_index(stage_index);
                 ai_checkpoint.mark_started();
                 if let Err(e) = checkpoint_mgr.save_step(&ai_checkpoint) {
                     warn!("Failed to save completion AI step checkpoint: {}", e);
@@ -2644,7 +2677,8 @@ impl CompletionExecutor {
                         ai_step_idx,
                         "ai_session",
                     )
-                    .with_step_name(&step_name);
+                    .with_step_name(&step_name)
+                    .with_stage_index(stage_index);
 
                     if result.success {
                         ai_completion_checkpoint
@@ -2726,6 +2760,7 @@ impl CompletionExecutor {
                 &config.workflow_name,
                 config.iterations_run,
                 logger,
+                None,
             )
             .await;
 
@@ -2970,6 +3005,7 @@ impl Executor for SetupExecutor {
                 &config.execution_id,
                 &config.workflow_name,
                 &StepEventLogger::noop(),
+                None,
             )
             .await;
 
@@ -2997,6 +3033,7 @@ impl Executor for VerificationExecutor {
                 config.iteration,
                 &config.workflow_name,
                 &StepEventLogger::noop(),
+                None,
             )
             .await;
 
@@ -3071,6 +3108,7 @@ impl Executor for CompletionExecutor {
                 &config.workflow_name,
                 config.iterations_run,
                 &StepEventLogger::noop(),
+                None,
             )
             .await;
 

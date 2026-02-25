@@ -173,6 +173,12 @@ pub struct WorkflowStateResponse {
     plan_phase_index: Option<usize>,
     /// Total number of plan phases (only for plan workflows)
     plan_total_phases: Option<usize>,
+    /// Stage index for multi-stage workflows (0-indexed)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stage_index: Option<u32>,
+    /// Total number of stages in a multi-stage workflow
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_stages: Option<usize>,
 }
 
 /// Map a workflow state name to a stage for UI display.
@@ -293,6 +299,13 @@ pub async fn get_workflow_state(
             (None, None, None)
         };
 
+        // Extract stage_index from state_data for multi-stage workflows
+        let stage_index = extract_stage_index(&state_data);
+        let total_stages = workflow_def
+            .as_ref()
+            .map(|w| w.stages.len())
+            .filter(|&n| n > 0);
+
         Ok(Json(WorkflowStateResponse {
             task_run_id: id,
             workflow_type: ws.workflow_type,
@@ -311,6 +324,8 @@ pub async fn get_workflow_state(
             plan_phase_name,
             plan_phase_index,
             plan_total_phases,
+            stage_index,
+            total_stages,
         }))
     } else {
         // Fallback: Infer state from task_run for backward compatibility
@@ -346,6 +361,8 @@ pub async fn get_workflow_state(
             plan_phase_name: None,
             plan_phase_index: None,
             plan_total_phases: None,
+            stage_index: None,
+            total_stages: None,
         }))
     }
 }
@@ -445,6 +462,7 @@ pub struct StepCheckpointData {
     phase: String,
     iteration: Option<u32>,
     step_index: usize,
+    stage_index: Option<u32>,
     step_type: String,
     step_name: Option<String>,
     status: String,
@@ -482,21 +500,14 @@ pub struct ResumePointData {
 
 /// Extract stage_index from the state_data JSON.
 ///
-/// The state_data is an enum-like JSON object where the key is the variant name
-/// and the value may contain a `stage_index` field. For example:
-/// `{ "VerificationRunning": { "iteration": 1, "stage_index": 2 } }`
+/// The state_data is a serde internally-tagged enum (tag = "type", rename_all = "snake_case"),
+/// so the JSON looks like: `{ "type": "verification_running", "iteration": 1, "stage_index": 2 }`
+/// The stage_index field is at the top level of the object, not nested inside a variant key.
 fn extract_stage_index(state_data: &Option<serde_json::Value>) -> Option<u32> {
     let data = state_data.as_ref()?;
-    let obj = data.as_object()?;
-    // Try each variant that might contain stage_index
-    for (_variant_name, inner) in obj.iter() {
-        if let Some(inner_obj) = inner.as_object() {
-            if let Some(idx) = inner_obj.get("stage_index").and_then(|v| v.as_u64()) {
-                return Some(idx as u32);
-            }
-        }
-    }
-    None
+    data.get("stage_index")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
 }
 
 /// Get full workflow state for restart recovery.
@@ -561,6 +572,7 @@ pub async fn get_full_workflow_state(
             phase: cp.phase.clone(),
             iteration: cp.iteration,
             step_index: cp.step_index,
+            stage_index: cp.stage_index,
             step_type: cp.step_type.clone(),
             step_name: cp.step_name.clone(),
             status: cp.status.to_string(),
@@ -999,9 +1011,7 @@ pub async fn resume_task_run(
     Json(request): Json<ResumeTaskRunRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     use crate::unified_workflow_executor::{
-        convert_all_json_steps_with_phase, convert_json_steps_with_phase,
-        extract_prompt_steps_with_phase, extract_workflow_id_from_task_id, LoopConfig,
-        LoopController,
+        extract_workflow_id_from_task_id, LoopConfig, LoopController,
     };
 
     info!("Resume task run request: {}", id);
@@ -1074,34 +1084,34 @@ pub async fn resume_task_run(
         task_run.sessions_count + 1
     );
 
-    // Convert steps for LoopController with explicit phase assignment
-    let setup_automation_steps =
-        convert_json_steps_with_phase(&workflow.setup_steps, 0, Some("setup"));
-    // Prepend pre-flight check if enabled (default: true)
-    let setup_automation_steps = crate::unified_workflows::prepend_preflight_check_step(
-        setup_automation_steps,
-        workflow.preflight_check_enabled,
-    );
-    let setup_prompt_steps = extract_prompt_steps_with_phase(&workflow.setup_steps, Some("setup"));
-    let verification_steps =
-        convert_all_json_steps_with_phase(&workflow.verification_steps, 0, Some("verification"));
-    // Prepend health check steps if enabled and URLs configured
-    // Health checks run BEFORE log_watch to catch server down before scanning logs
-    let verification_steps = crate::unified_workflows::prepend_health_check_steps(
-        verification_steps,
-        workflow.health_check_enabled,
-        &workflow.health_check_urls,
-    );
-    // Prepend log_watch step if enabled (default: true)
-    let verification_steps = crate::unified_workflows::prepend_log_watch_step(
-        verification_steps,
-        workflow.log_watch_enabled,
-    );
-    let agentic_steps = extract_prompt_steps_with_phase(&workflow.agentic_steps, Some("agentic"));
-    let completion_automation_steps =
-        convert_json_steps_with_phase(&workflow.completion_steps, 0, Some("completion"));
-    let completion_prompt_steps =
-        extract_prompt_steps_with_phase(&workflow.completion_steps, Some("completion"));
+    // Normalize to stages — all workflows are now multi-stage
+    let normalized_stages = workflow.normalize_to_stages();
+    let total_stages = normalized_stages.len();
+
+    // Convert each stage to StageConfig
+    let stages: Vec<crate::unified_workflow_executor::StageConfig> = normalized_stages
+        .iter()
+        .enumerate()
+        .map(|(idx, stage)| {
+            crate::unified_workflows::stage_to_stage_config(
+                stage,
+                idx,
+                total_stages,
+                workflow.preflight_check_enabled,
+                workflow.log_watch_enabled,
+                workflow.health_check_enabled,
+                &workflow.health_check_urls,
+            )
+        })
+        .collect();
+
+    // Build combined prompt from all agentic steps across all stages
+    let combined_prompt = normalized_stages
+        .iter()
+        .flat_map(|stage| stage.agentic_steps.iter())
+        .filter_map(|step| step.get("content").and_then(|v| v.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n");
 
     // Calculate starting iteration for resume (sessions_count is the number of completed iterations)
     let starting_iteration = task_run.sessions_count;
@@ -1111,7 +1121,7 @@ pub async fn resume_task_run(
 
     let loop_config = LoopConfig {
         max_iterations: workflow.max_iterations,
-        base_prompt: String::new(),
+        base_prompt: combined_prompt,
         workflow_name: task_run.task_name.clone(),
         workflow_id: workflow_id.clone(),
         execution_id: id.clone(),
@@ -1122,8 +1132,8 @@ pub async fn resume_task_run(
         is_dev_mode: cfg!(debug_assertions),
         enable_sweep: workflow.enable_sweep,
         max_sweep_iterations: workflow.max_sweep_iterations,
-        stages: Vec::new(),
-        stop_on_failure: false,
+        stages,
+        stop_on_failure: workflow.stop_on_failure,
         provider_override: None,
         model_override: None,
         stage_index: None,
@@ -1160,12 +1170,12 @@ pub async fn resume_task_run(
             controller
                 .run(
                     loop_config,
-                    setup_automation_steps,
-                    setup_prompt_steps,
-                    verification_steps,
-                    agentic_steps,
-                    completion_automation_steps,
-                    completion_prompt_steps,
+                    Vec::new(), // No top-level steps — all in stages
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
                 )
                 .await
         },
@@ -1753,6 +1763,8 @@ pub struct StepExecutionData {
     phase: Option<String>,
     /// Step index within the phase
     step_index: Option<i64>,
+    /// Stage index for multi-stage workflows (0-indexed)
+    stage_index: Option<u32>,
     /// Iteration number for verification/agentic phases (1-indexed)
     iteration: Option<i64>,
     start_time: Option<i64>,
@@ -1934,6 +1946,12 @@ pub async fn get_current_execution_steps(
                         existing.iteration = Some(v);
                     }
                 }
+                // Update stage_index if not already set
+                if existing.stage_index.is_none() {
+                    if let Some(v) = d.get("stage_index").and_then(|v| v.as_u64()) {
+                        existing.stage_index = Some(v as u32);
+                    }
+                }
                 // Try JSON data first, then fall back to event's top-level duration_ms
                 if let Some(v) = d.get("duration_ms").and_then(|v| v.as_i64()) {
                     existing.duration_ms = Some(v);
@@ -1974,6 +1992,13 @@ pub async fn get_current_execution_steps(
                 .and_then(|d| d.get("iteration"))
                 .and_then(|v| v.as_i64());
 
+            // Extract stage_index from event data (for multi-stage workflows)
+            let stage_index = data
+                .as_ref()
+                .and_then(|d| d.get("stage_index"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+
             // Create new entry
             let step_data = StepExecutionData {
                 id: event.id.to_string(),
@@ -1986,6 +2011,7 @@ pub async fn get_current_execution_steps(
                 } else {
                     None
                 },
+                stage_index,
                 iteration,
                 start_time: event_timestamp,
                 end_time: data
@@ -2596,6 +2622,12 @@ pub fn aggregate_step_events(events: &[crate::database::TaskRunEvent]) -> Aggreg
                         existing.iteration = Some(v);
                     }
                 }
+                // Update stage_index if not already set
+                if existing.stage_index.is_none() {
+                    if let Some(v) = d.get("stage_index").and_then(|v| v.as_u64()) {
+                        existing.stage_index = Some(v as u32);
+                    }
+                }
                 if let Some(v) = d.get("duration_ms").and_then(|v| v.as_i64()) {
                     existing.duration_ms = Some(v);
                 } else if existing.duration_ms.is_none() {
@@ -2632,6 +2664,13 @@ pub fn aggregate_step_events(events: &[crate::database::TaskRunEvent]) -> Aggreg
                 .and_then(|d| d.get("iteration"))
                 .and_then(|v| v.as_i64());
 
+            // Extract stage_index from event data (for multi-stage workflows)
+            let stage_index = data
+                .as_ref()
+                .and_then(|d| d.get("stage_index"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+
             let step_data = StepExecutionData {
                 id: event.id.to_string(),
                 step_type: step_type_str,
@@ -2643,6 +2682,7 @@ pub fn aggregate_step_events(events: &[crate::database::TaskRunEvent]) -> Aggreg
                 } else {
                     None
                 },
+                stage_index,
                 iteration,
                 start_time: event_timestamp,
                 end_time: data
@@ -2838,7 +2878,12 @@ pub async fn sse_ai_output_for_task_run(
         let output = &task_run.output_log;
         if !output.is_empty() {
             let tail = if output.len() > 5000 {
-                &output[output.len() - 5000..]
+                let mut start = output.len() - 5000;
+                // Find the nearest char boundary to avoid panic on multi-byte UTF-8
+                while start < output.len() && !output.is_char_boundary(start) {
+                    start += 1;
+                }
+                &output[start..]
             } else {
                 output.as_str()
             };
@@ -3029,6 +3074,145 @@ pub async fn create_chat_session(
     }
 }
 
+/// Generate a workflow from a chat session's conversation context
+pub async fn generate_workflow_from_chat(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Get output log from DB
+    let db = state.app_state.checkpoint_db.clone();
+    let id_clone = id.clone();
+    let output_log = tokio::task::spawn_blocking(move || db.get_task_run_output(&id_clone))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Task failed: {}", e),
+            )
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("DB error: {}", e),
+            )
+        })?
+        .unwrap_or_default();
+
+    if output_log.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "No conversation history available".to_string(),
+        ));
+    }
+
+    let description = req
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Generate workflow from chat conversation")
+        .to_string();
+
+    let request = crate::workflow_generation::GenerateWorkflowRequest {
+        description,
+        inline_context: Some(format!(
+            "The following is a conversation between a user and an AI assistant. \
+             Use this conversation context to generate an appropriate workflow:\n\n{}",
+            output_log
+        )),
+        category: None,
+        tags: None,
+        max_iterations: None,
+        provider: None,
+        model: None,
+        skip_ai_summary: None,
+        log_source_selection: None,
+        prompt_template: None,
+        auto_include_contexts: Some(true),
+        context_ids: None,
+        max_fix_iterations: Some(3),
+        discovery_mode: None,
+    };
+
+    let doctor_handle = state.doctor_handle.clone();
+    let db2 = state.app_state.checkpoint_db.clone();
+
+    let gen_result = tokio::task::spawn_blocking(move || {
+        let gen_result = db2.with_conn(|conn| {
+            Ok(crate::workflow_generation::generate_workflow(
+                request,
+                doctor_handle.as_ref(),
+                Some(conn),
+                None,
+            ))
+        });
+        match gen_result {
+            Ok(response) => response,
+            Err(e) => crate::workflow_generation::GenerateWorkflowResponse {
+                workflow: None,
+                validation_errors: vec![],
+                success: false,
+                error: Some(format!("Database error during generation: {}", e)),
+                model_used: None,
+                verification_iterations: vec![],
+                hardening_summary: None,
+                discovery_calls: vec![],
+            },
+        }
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Generation task failed: {}", e),
+        )
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "success": gen_result.success,
+        "workflow": gen_result.workflow,
+        "error": gen_result.error,
+        "validation_errors": gen_result.validation_errors,
+        "model_used": gen_result.model_used
+    })))
+}
+
+/// Rename a task run
+pub async fn rename_task_run(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let new_name = req
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing 'name' field".to_string()))?
+        .to_string();
+
+    let db = state.app_state.checkpoint_db.clone();
+    let id_clone = id.clone();
+    let name_clone = new_name.clone();
+    tokio::task::spawn_blocking(move || db.update_task_run_name(&id_clone, &name_clone))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Task failed: {}", e),
+            )
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("DB error: {}", e),
+            )
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "id": id,
+        "task_name": new_name
+    })))
+}
+
 // ============================================================================
 // End Task Run HTTP API Handlers
 // ============================================================================
@@ -3086,6 +3270,11 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         )
         .route("/task-runs/:id/message", post(send_message_to_session))
         .route("/task-runs/:id/session-state", get(get_session_state))
+        .route(
+            "/task-runs/:id/generate-workflow",
+            post(generate_workflow_from_chat),
+        )
+        .route("/task-runs/:id/rename", post(rename_task_run))
         .route(
             "/task-runs/:id/stream/ai-output",
             get(sse_ai_output_for_task_run),

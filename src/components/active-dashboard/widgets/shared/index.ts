@@ -19,6 +19,7 @@ export type { StepExecution, StepExecutionStatus, StepStats } from "./types";
 
 // Shared utilities
 export {
+  formatDuration,
   calculateStepStats,
   detectStartTime,
   mapStepType,

@@ -5224,6 +5224,70 @@ impl CheckpointDb {
             info!("Successfully migrated to version 66 (stage_index, stages, stop_on_failure)");
         }
 
+        // Migration to version 67: Fix UNIQUE constraint to include stage_index
+        // The original UNIQUE(execution_id, phase, iteration, step_index) from v48 causes
+        // multi-stage workflows to silently overwrite checkpoints when two stages have
+        // steps with the same (phase, iteration, step_index). Recreate table with
+        // UNIQUE(execution_id, phase, iteration, step_index, stage_index).
+        if current_version < 67 {
+            info!("Migrating to version 67 (fix UNIQUE constraint to include stage_index)...");
+
+            conn.execute_batch(
+                r#"
+                -- Recreate workflow_step_checkpoints with corrected UNIQUE constraint
+                CREATE TABLE IF NOT EXISTS workflow_step_checkpoints_new (
+                    id TEXT PRIMARY KEY,
+                    execution_id TEXT NOT NULL,
+                    workflow_type TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    iteration INTEGER,
+                    step_index INTEGER NOT NULL,
+                    step_type TEXT NOT NULL,
+                    step_name TEXT,
+                    status TEXT NOT NULL,
+                    result_json TEXT,
+                    step_config_json TEXT,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    duration_ms INTEGER,
+                    error TEXT,
+                    stage_index INTEGER DEFAULT 0,
+                    FOREIGN KEY (execution_id) REFERENCES task_runs(id) ON DELETE CASCADE,
+                    UNIQUE(execution_id, phase, iteration, step_index, stage_index)
+                );
+
+                -- Copy all existing data
+                INSERT OR IGNORE INTO workflow_step_checkpoints_new
+                    (id, execution_id, workflow_type, phase, iteration, step_index,
+                     step_type, step_name, status, result_json, step_config_json,
+                     started_at, completed_at, duration_ms, error, stage_index)
+                SELECT
+                    id, execution_id, workflow_type, phase, iteration, step_index,
+                    step_type, step_name, status, result_json, step_config_json,
+                    started_at, completed_at, duration_ms, error,
+                    COALESCE(stage_index, 0)
+                FROM workflow_step_checkpoints;
+
+                -- Drop old table and rename new one
+                DROP TABLE workflow_step_checkpoints;
+                ALTER TABLE workflow_step_checkpoints_new RENAME TO workflow_step_checkpoints;
+
+                -- Recreate indexes
+                CREATE INDEX IF NOT EXISTS idx_step_checkpoints_execution ON workflow_step_checkpoints(execution_id);
+                CREATE INDEX IF NOT EXISTS idx_step_checkpoints_lookup ON workflow_step_checkpoints(execution_id, phase, iteration);
+                CREATE INDEX IF NOT EXISTS idx_step_checkpoints_status ON workflow_step_checkpoints(status);
+                CREATE INDEX IF NOT EXISTS idx_step_checkpoints_cursor ON workflow_step_checkpoints(execution_id, step_index);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (67, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 67: {}", e))?;
+
+            info!(
+                "Successfully migrated to version 67 (UNIQUE constraint now includes stage_index)"
+            );
+        }
+
         Ok(())
     }
 
@@ -6349,6 +6413,39 @@ impl CheckpointDb {
         Ok(())
     }
 
+    /// Get the output_log for a task run (from chunks table).
+    ///
+    /// Returns `Ok(Some(output))` if the task run exists and has output,
+    /// `Ok(None)` if the task run has no output, or an error string.
+    pub fn get_task_run_output(&self, id: &str) -> Result<Option<String>, String> {
+        let output = self.get_full_task_output(id)?;
+        if output.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(output))
+        }
+    }
+
+    /// Update the task_name for a task run.
+    pub fn update_task_run_name(&self, id: &str, name: &str) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        conn.execute(
+            r#"
+            UPDATE task_runs SET
+                task_name = ?1,
+                updated_at = ?2
+            WHERE id = ?3
+            "#,
+            params![name, now, id],
+        )
+        .map_err(|e| format!("Failed to update task run name: {}", e))?;
+
+        info!("Task run {} renamed to '{}'", id, name);
+        Ok(())
+    }
+
     /// Update the result_data JSON field on a task run.
     ///
     /// Used by meta-workflow steps (e.g. save_workflow_artifact) to store
@@ -6998,7 +7095,12 @@ impl CheckpointDb {
         if output.len() <= chars {
             Ok(output.clone())
         } else {
-            Ok(output[output.len() - chars..].to_string())
+            let mut start = output.len() - chars;
+            // Find the nearest char boundary to avoid panic on multi-byte UTF-8
+            while start < output.len() && !output.is_char_boundary(start) {
+                start += 1;
+            }
+            Ok(output[start..].to_string())
         }
     }
 
@@ -16267,17 +16369,17 @@ impl CheckpointDb {
             r#"
             INSERT INTO workflow_step_checkpoints (
                 id, execution_id, workflow_type, phase, iteration, step_index,
-                step_type, step_name, status, result_json, step_config_json, started_at,
-                completed_at, duration_ms, error
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
-            ON CONFLICT(execution_id, phase, iteration, step_index) DO UPDATE SET
-                status = ?9,
-                result_json = ?10,
-                step_config_json = COALESCE(?11, step_config_json),
-                started_at = COALESCE(?12, started_at),
-                completed_at = ?13,
-                duration_ms = ?14,
-                error = ?15
+                stage_index, step_type, step_name, status, result_json, step_config_json,
+                started_at, completed_at, duration_ms, error
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, COALESCE(?7, 0), ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+            ON CONFLICT(execution_id, phase, iteration, step_index, stage_index) DO UPDATE SET
+                status = ?10,
+                result_json = ?11,
+                step_config_json = COALESCE(?12, step_config_json),
+                started_at = COALESCE(?13, started_at),
+                completed_at = ?14,
+                duration_ms = ?15,
+                error = ?16
             "#,
             params![
                 checkpoint.id,
@@ -16286,6 +16388,7 @@ impl CheckpointDb {
                 checkpoint.phase,
                 checkpoint.iteration.map(|i| i as i64),
                 checkpoint.step_index as i64,
+                checkpoint.stage_index.map(|i| i as i64),
                 checkpoint.step_type,
                 checkpoint.step_name,
                 checkpoint.status.to_string(),
@@ -16358,17 +16461,17 @@ impl CheckpointDb {
                 r#"
                 INSERT INTO workflow_step_checkpoints (
                     id, execution_id, workflow_type, phase, iteration, step_index,
-                    step_type, step_name, status, result_json, step_config_json, started_at,
-                    completed_at, duration_ms, error
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
-                ON CONFLICT(execution_id, phase, iteration, step_index) DO UPDATE SET
-                    status = ?9,
-                    result_json = ?10,
-                    step_config_json = COALESCE(?11, step_config_json),
-                    started_at = COALESCE(?12, started_at),
-                    completed_at = ?13,
-                    duration_ms = ?14,
-                    error = ?15
+                    stage_index, step_type, step_name, status, result_json, step_config_json,
+                    started_at, completed_at, duration_ms, error
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, COALESCE(?7, 0), ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                ON CONFLICT(execution_id, phase, iteration, step_index, stage_index) DO UPDATE SET
+                    status = ?10,
+                    result_json = ?11,
+                    step_config_json = COALESCE(?12, step_config_json),
+                    started_at = COALESCE(?13, started_at),
+                    completed_at = ?14,
+                    duration_ms = ?15,
+                    error = ?16
                 "#,
                 params![
                     checkpoint.id,
@@ -16377,6 +16480,7 @@ impl CheckpointDb {
                     checkpoint.phase,
                     checkpoint.iteration.map(|i| i as i64),
                     checkpoint.step_index as i64,
+                    checkpoint.stage_index.map(|i| i as i64),
                     checkpoint.step_type,
                     checkpoint.step_name,
                     checkpoint.status.to_string(),
@@ -16405,8 +16509,8 @@ impl CheckpointDb {
         let query = if iteration.is_some() {
             r#"
             SELECT id, execution_id, workflow_type, phase, iteration, step_index,
-                   step_type, step_name, status, result_json, step_config_json, started_at,
-                   completed_at, duration_ms, error
+                   stage_index, step_type, step_name, status, result_json, step_config_json,
+                   started_at, completed_at, duration_ms, error
             FROM workflow_step_checkpoints
             WHERE execution_id = ?1 AND phase = ?2 AND iteration = ?3
             ORDER BY step_index ASC
@@ -16414,8 +16518,8 @@ impl CheckpointDb {
         } else {
             r#"
             SELECT id, execution_id, workflow_type, phase, iteration, step_index,
-                   step_type, step_name, status, result_json, step_config_json, started_at,
-                   completed_at, duration_ms, error
+                   stage_index, step_type, step_name, status, result_json, step_config_json,
+                   started_at, completed_at, duration_ms, error
             FROM workflow_step_checkpoints
             WHERE execution_id = ?1 AND phase = ?2 AND iteration IS NULL
             ORDER BY step_index ASC
@@ -16428,7 +16532,7 @@ impl CheckpointDb {
 
         let row_mapper =
             |row: &rusqlite::Row| -> rusqlite::Result<crate::workflow_state::StepCheckpoint> {
-                let status_str: String = row.get(8)?;
+                let status_str: String = row.get(9)?;
                 let status = status_str
                     .parse()
                     .unwrap_or(crate::workflow_state::StepCheckpointStatus::Pending);
@@ -16440,15 +16544,16 @@ impl CheckpointDb {
                     phase: row.get(3)?,
                     iteration: row.get::<_, Option<i64>>(4)?.map(|i| i as u32),
                     step_index: row.get::<_, i64>(5)? as usize,
-                    step_type: row.get(6)?,
-                    step_name: row.get(7)?,
+                    stage_index: row.get::<_, Option<i64>>(6)?.map(|i| i as u32),
+                    step_type: row.get(7)?,
+                    step_name: row.get(8)?,
                     status,
-                    result_json: row.get(9)?,
-                    step_config_json: row.get(10)?,
-                    started_at: row.get(11)?,
-                    completed_at: row.get(12)?,
-                    duration_ms: row.get(13)?,
-                    error: row.get(14)?,
+                    result_json: row.get(10)?,
+                    step_config_json: row.get(11)?,
+                    started_at: row.get(12)?,
+                    completed_at: row.get(13)?,
+                    duration_ms: row.get(14)?,
+                    error: row.get(15)?,
                 })
             };
 
@@ -16493,8 +16598,8 @@ impl CheckpointDb {
         let query = if cursor.is_some() {
             r#"
             SELECT id, execution_id, workflow_type, phase, iteration, step_index,
-                   step_type, step_name, status, result_json, step_config_json, started_at,
-                   completed_at, duration_ms, error
+                   stage_index, step_type, step_name, status, result_json, step_config_json,
+                   started_at, completed_at, duration_ms, error
             FROM workflow_step_checkpoints
             WHERE execution_id = ?1 AND step_index > ?2
             ORDER BY step_index ASC
@@ -16503,8 +16608,8 @@ impl CheckpointDb {
         } else {
             r#"
             SELECT id, execution_id, workflow_type, phase, iteration, step_index,
-                   step_type, step_name, status, result_json, step_config_json, started_at,
-                   completed_at, duration_ms, error
+                   stage_index, step_type, step_name, status, result_json, step_config_json,
+                   started_at, completed_at, duration_ms, error
             FROM workflow_step_checkpoints
             WHERE execution_id = ?1
             ORDER BY step_index ASC
@@ -16518,7 +16623,7 @@ impl CheckpointDb {
 
         let row_mapper =
             |row: &rusqlite::Row| -> rusqlite::Result<crate::workflow_state::StepCheckpoint> {
-                let status_str: String = row.get(8)?;
+                let status_str: String = row.get(9)?;
                 let status = status_str
                     .parse()
                     .unwrap_or(crate::workflow_state::StepCheckpointStatus::Pending);
@@ -16530,15 +16635,16 @@ impl CheckpointDb {
                     phase: row.get(3)?,
                     iteration: row.get::<_, Option<i64>>(4)?.map(|i| i as u32),
                     step_index: row.get::<_, i64>(5)? as usize,
-                    step_type: row.get(6)?,
-                    step_name: row.get(7)?,
+                    stage_index: row.get::<_, Option<i64>>(6)?.map(|i| i as u32),
+                    step_type: row.get(7)?,
+                    step_name: row.get(8)?,
                     status,
-                    result_json: row.get(9)?,
-                    step_config_json: row.get(10)?,
-                    started_at: row.get(11)?,
-                    completed_at: row.get(12)?,
-                    duration_ms: row.get(13)?,
-                    error: row.get(14)?,
+                    result_json: row.get(10)?,
+                    step_config_json: row.get(11)?,
+                    started_at: row.get(12)?,
+                    completed_at: row.get(13)?,
+                    duration_ms: row.get(14)?,
+                    error: row.get(15)?,
                 })
             };
 
@@ -16763,18 +16869,18 @@ impl CheckpointDb {
             .prepare(
                 r#"
                 SELECT id, execution_id, workflow_type, phase, iteration, step_index,
-                       step_type, step_name, status, result_json, step_config_json, started_at,
-                       completed_at, duration_ms, error
+                       stage_index, step_type, step_name, status, result_json, step_config_json,
+                       started_at, completed_at, duration_ms, error
                 FROM workflow_step_checkpoints
                 WHERE execution_id = ?1
-                ORDER BY phase, COALESCE(iteration, 0), step_index ASC
+                ORDER BY COALESCE(stage_index, 0), phase, COALESCE(iteration, 0), step_index ASC
                 "#,
             )
             .map_err(|e| format!("Failed to prepare statement: {}", e))?;
 
         let row_mapper =
             |row: &rusqlite::Row| -> rusqlite::Result<crate::workflow_state::StepCheckpoint> {
-                let status_str: String = row.get(8)?;
+                let status_str: String = row.get(9)?;
                 let status = status_str
                     .parse()
                     .unwrap_or(crate::workflow_state::StepCheckpointStatus::Pending);
@@ -16786,15 +16892,16 @@ impl CheckpointDb {
                     phase: row.get(3)?,
                     iteration: row.get::<_, Option<i64>>(4)?.map(|i| i as u32),
                     step_index: row.get::<_, i64>(5)? as usize,
-                    step_type: row.get(6)?,
-                    step_name: row.get(7)?,
+                    stage_index: row.get::<_, Option<i64>>(6)?.map(|i| i as u32),
+                    step_type: row.get(7)?,
+                    step_name: row.get(8)?,
                     status,
-                    result_json: row.get(9)?,
-                    step_config_json: row.get(10)?,
-                    started_at: row.get(11)?,
-                    completed_at: row.get(12)?,
-                    duration_ms: row.get(13)?,
-                    error: row.get(14)?,
+                    result_json: row.get(10)?,
+                    step_config_json: row.get(11)?,
+                    started_at: row.get(12)?,
+                    completed_at: row.get(13)?,
+                    duration_ms: row.get(14)?,
+                    error: row.get(15)?,
                 })
             };
 

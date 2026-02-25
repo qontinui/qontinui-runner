@@ -1,0 +1,167 @@
+/**
+ * Runner Data Adapter
+ *
+ * Implements WorkflowDataAdapter from @qontinui/workflow-ui
+ * using the runner's local HTTP API at localhost:9876.
+ */
+
+import type { WorkflowDataAdapter } from "@qontinui/workflow-ui";
+import type { UnifiedWorkflow } from "@qontinui/shared-types/workflow";
+import type { LibraryItem } from "@qontinui/shared-types/library";
+
+const RUNNER_API = "http://localhost:9876";
+
+export function createRunnerDataAdapter(): WorkflowDataAdapter {
+  return {
+    async fetchPrompts(): Promise<LibraryItem[]> {
+      try {
+        const res = await fetch(`${RUNNER_API}/prompts`);
+        if (!res.ok) return [];
+        const data = await res.json();
+        const prompts = data.prompts ?? data ?? [];
+        return prompts.map((p: Record<string, unknown>) => ({
+          id: (p.id as string) ?? (p.name as string),
+          name: p.name as string,
+          description: p.description as string | undefined,
+        }));
+      } catch {
+        return [];
+      }
+    },
+
+    async fetchChecks(): Promise<LibraryItem[]> {
+      try {
+        const res = await fetch(`${RUNNER_API}/checks`);
+        if (!res.ok) return [];
+        const data = await res.json();
+        const checks = data.checks ?? data ?? [];
+        return checks.map((c: Record<string, unknown>) => ({
+          id: (c.id as string) ?? (c.name as string),
+          name: c.name as string,
+          description: c.description as string | undefined,
+        }));
+      } catch {
+        return [];
+      }
+    },
+
+    async fetchCheckGroups(): Promise<LibraryItem[]> {
+      try {
+        const res = await fetch(`${RUNNER_API}/check-groups`);
+        if (!res.ok) return [];
+        const data = await res.json();
+        const groups = data.check_groups ?? data ?? [];
+        return groups.map((g: Record<string, unknown>) => ({
+          id: (g.id as string) ?? (g.name as string),
+          name: g.name as string,
+          description: g.description as string | undefined,
+        }));
+      } catch {
+        return [];
+      }
+    },
+
+    async fetchShellCommands(): Promise<LibraryItem[]> {
+      try {
+        const res = await fetch(`${RUNNER_API}/shell-commands`);
+        if (!res.ok) return [];
+        const data = await res.json();
+        const commands = data.shell_commands ?? data ?? [];
+        return commands.map((c: Record<string, unknown>) => ({
+          id: (c.id as string) ?? (c.name as string),
+          name: c.name as string,
+          description: c.description as string | undefined,
+        }));
+      } catch {
+        return [];
+      }
+    },
+
+    async fetchWorkflows(): Promise<UnifiedWorkflow[]> {
+      try {
+        const res = await fetch(`${RUNNER_API}/unified-workflows`);
+        if (!res.ok) return [];
+        const data = await res.json();
+        if (data.success && data.data) {
+          return data.data as UnifiedWorkflow[];
+        }
+        return data.workflows ?? data ?? [];
+      } catch {
+        return [];
+      }
+    },
+
+    async fetchPlaywrightScripts(): Promise<LibraryItem[]> {
+      try {
+        const res = await fetch(`${RUNNER_API}/playwright-scripts`);
+        if (!res.ok) return [];
+        const data = await res.json();
+        const scripts = data.scripts ?? data ?? [];
+        return scripts.map((s: Record<string, unknown>) => ({
+          id: (s.id as string) ?? (s.name as string),
+          name: s.name as string,
+          description: s.description as string | undefined,
+        }));
+      } catch {
+        return [];
+      }
+    },
+
+    async fetchContexts(): Promise<LibraryItem[]> {
+      try {
+        const res = await fetch(`${RUNNER_API}/contexts`);
+        if (!res.ok) return [];
+        const data = await res.json();
+        const contexts = data.contexts ?? data ?? [];
+        return contexts.map((c: Record<string, unknown>) => ({
+          id: (c.id as string) ?? (c.name as string),
+          name: c.name as string,
+          description: c.description as string | undefined,
+        }));
+      } catch {
+        return [];
+      }
+    },
+
+    async saveWorkflow(workflow: UnifiedWorkflow): Promise<UnifiedWorkflow> {
+      const res = await fetch(`${RUNNER_API}/unified-workflows`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(workflow),
+      });
+      if (!res.ok) throw new Error("Failed to save workflow");
+      const data = await res.json();
+      if (data.success && data.data) return data.data as UnifiedWorkflow;
+      return data as UnifiedWorkflow;
+    },
+
+    async loadWorkflow(id: string): Promise<UnifiedWorkflow> {
+      const res = await fetch(`${RUNNER_API}/unified-workflows/${id}`);
+      if (!res.ok) throw new Error("Failed to load workflow");
+      const data = await res.json();
+      if (data.success && data.data) return data.data as UnifiedWorkflow;
+      return data as UnifiedWorkflow;
+    },
+
+    async deleteWorkflow(id: string): Promise<void> {
+      const res = await fetch(`${RUNNER_API}/unified-workflows/${id}`, {
+        method: "DELETE",
+      });
+      if (!res.ok) throw new Error("Failed to delete workflow");
+    },
+
+    async listWorkflows(): Promise<UnifiedWorkflow[]> {
+      try {
+        const res = await fetch(`${RUNNER_API}/unified-workflows`);
+        if (!res.ok) return [];
+        const data = await res.json();
+        if (data.success && data.data) {
+          return data.data as UnifiedWorkflow[];
+        }
+        return data.workflows ?? data ?? [];
+      } catch {
+        return [];
+      }
+    },
+  };
+}

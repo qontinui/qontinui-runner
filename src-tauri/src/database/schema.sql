@@ -2206,4 +2206,4 @@ CREATE INDEX IF NOT EXISTS idx_stk_composite ON step_type_knowledge(step_type, l
 -- Initialize singleton tables
 INSERT OR IGNORE INTO gui_lock (id, holder_session_id, acquired_at) VALUES (1, NULL, NULL);
 INSERT OR IGNORE INTO scheduler_settings (id) VALUES (1);
-INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (66, datetime('now'));
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (67, datetime('now'));

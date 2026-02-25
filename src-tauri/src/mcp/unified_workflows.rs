@@ -1008,7 +1008,15 @@ pub async fn generate_unified_workflow_async_handler(
 
     // Create a task run for this workflow
     let task_run_id = uuid::Uuid::new_v4().to_string();
+    let simple_prompt: String = saved_workflow
+        .agentic_steps
+        .iter()
+        .filter_map(|step| step.get("content").and_then(|v| v.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n");
     let task_run_input = CreateTaskRunInput::new(&task_run_id, &saved_workflow.name)
+        .with_task_type("ai")
+        .with_prompt(&simple_prompt)
         .with_workflow_type("unified")
         .with_workflow_name(&saved_workflow.name)
         .with_max_sessions(saved_workflow.max_iterations)
@@ -1045,48 +1053,44 @@ pub async fn generate_unified_workflow_async_handler(
         });
     }
 
-    // Convert workflow steps for LoopController with explicit phase assignment
+    // Normalize to stages — all workflows are now multi-stage
     {
-        use crate::unified_workflow_executor::{
-            convert_json_steps_with_phase, extract_prompt_steps_with_phase, LoopConfig,
-            LoopController,
-        };
+        use crate::unified_workflow_executor::{LoopConfig, LoopController};
 
-        let setup_automation_steps =
-            convert_json_steps_with_phase(&saved_workflow.setup_steps, 0, Some("setup"));
-        let setup_automation_steps = crate::unified_workflows::prepend_preflight_check_step(
-            setup_automation_steps,
-            saved_workflow.preflight_check_enabled,
-        );
-        let setup_prompt_steps =
-            extract_prompt_steps_with_phase(&saved_workflow.setup_steps, Some("setup"));
-        let verification_steps = convert_json_steps_with_phase(
-            &saved_workflow.verification_steps,
-            0,
-            Some("verification"),
-        );
-        let verification_steps = crate::unified_workflows::prepend_health_check_steps(
-            verification_steps,
-            saved_workflow.health_check_enabled,
-            &saved_workflow.health_check_urls,
-        );
-        let verification_steps = crate::unified_workflows::prepend_log_watch_step(
-            verification_steps,
-            saved_workflow.log_watch_enabled,
-        );
-        let agentic_steps =
-            extract_prompt_steps_with_phase(&saved_workflow.agentic_steps, Some("agentic"));
-        let completion_automation_steps =
-            convert_json_steps_with_phase(&saved_workflow.completion_steps, 0, Some("completion"));
-        let completion_prompt_steps =
-            extract_prompt_steps_with_phase(&saved_workflow.completion_steps, Some("completion"));
+        let normalized_stages = saved_workflow.normalize_to_stages();
+        let total_stages = normalized_stages.len();
+
+        // Convert each stage to StageConfig
+        let stages: Vec<crate::unified_workflow_executor::StageConfig> = normalized_stages
+            .iter()
+            .enumerate()
+            .map(|(idx, stage)| {
+                crate::unified_workflows::stage_to_stage_config(
+                    stage,
+                    idx,
+                    total_stages,
+                    saved_workflow.preflight_check_enabled,
+                    saved_workflow.log_watch_enabled,
+                    saved_workflow.health_check_enabled,
+                    &saved_workflow.health_check_urls,
+                )
+            })
+            .collect();
+
+        // Build combined prompt from all agentic steps across all stages
+        let combined_prompt = normalized_stages
+            .iter()
+            .flat_map(|stage| stage.agentic_steps.iter())
+            .filter_map(|step| step.get("content").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n");
 
         // For meta-workflows, run agentic first if there are targeted errors
         let run_agentic_first = !saved_workflow.targeted_error_ids.is_empty();
 
         let loop_config = LoopConfig {
             max_iterations: saved_workflow.max_iterations,
-            base_prompt: String::new(),
+            base_prompt: combined_prompt,
             workflow_name: saved_workflow.name.clone(),
             workflow_id: saved_workflow.id.clone(),
             execution_id: task_run_id.clone(),
@@ -1097,54 +1101,7 @@ pub async fn generate_unified_workflow_async_handler(
             is_dev_mode: cfg!(debug_assertions),
             enable_sweep: saved_workflow.enable_sweep,
             max_sweep_iterations: saved_workflow.max_sweep_iterations,
-            stages: {
-                use crate::unified_workflow_executor::{
-                    convert_json_steps_with_phase, extract_prompt_steps_with_phase, StageConfig,
-                };
-                saved_workflow
-                    .stages
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, stage)| {
-                        let setup_auto =
-                            convert_json_steps_with_phase(&stage.setup_steps, 0, Some("setup"));
-                        let setup_prompt =
-                            extract_prompt_steps_with_phase(&stage.setup_steps, Some("setup"));
-                        let verif = convert_json_steps_with_phase(
-                            &stage.verification_steps,
-                            0,
-                            Some("verification"),
-                        );
-                        let agentic =
-                            extract_prompt_steps_with_phase(&stage.agentic_steps, Some("agentic"));
-                        let comp_auto = convert_json_steps_with_phase(
-                            &stage.completion_steps,
-                            0,
-                            Some("completion"),
-                        );
-                        let comp_prompt = extract_prompt_steps_with_phase(
-                            &stage.completion_steps,
-                            Some("completion"),
-                        );
-                        StageConfig {
-                            id: stage.id.clone(),
-                            name: stage.name.clone(),
-                            index: idx,
-                            total_stages: saved_workflow.stages.len(),
-                            setup_automation_steps: setup_auto,
-                            setup_prompt_steps: setup_prompt,
-                            verification_steps: verif,
-                            agentic_steps: agentic,
-                            completion_automation_steps: comp_auto,
-                            completion_prompt_steps: comp_prompt,
-                            max_iterations: stage.max_iterations,
-                            provider: stage.provider.clone(),
-                            model: stage.model.clone(),
-                            timeout_seconds: stage.timeout_seconds,
-                        }
-                    })
-                    .collect()
-            },
+            stages,
             stop_on_failure: saved_workflow.stop_on_failure,
             provider_override: None,
             model_override: None,
@@ -1182,12 +1139,12 @@ pub async fn generate_unified_workflow_async_handler(
                 controller
                     .run(
                         loop_config,
-                        setup_automation_steps,
-                        setup_prompt_steps,
-                        verification_steps,
-                        agentic_steps,
-                        completion_automation_steps,
-                        completion_prompt_steps,
+                        Vec::new(), // No top-level steps — all in stages
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
                     )
                     .await
             },

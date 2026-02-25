@@ -15,6 +15,7 @@ import { Clock, RotateCcw, Timer, TrendingUp, TrendingDown, Minus } from "lucide
 import { cn } from "../../../../lib/utils";
 import { ProgressBar, ProgressErrorBoundary } from "../../../ui";
 import { getStatusColors } from "@/design-system";
+import { formatDuration } from "../shared";
 import type { TimelineStats } from "./types";
 import type { StepStats } from "../shared/types";
 
@@ -26,44 +27,6 @@ interface TimelineStatsBarProps {
   className?: string;
   /** Show compact version without progress bar */
   compact?: boolean;
-}
-
-/**
- * Format elapsed time as "Xm Ys" or "Xh Ym" string.
- */
-function formatTime(seconds: number): string {
-  if (seconds < 60) {
-    return `${seconds}s`;
-  }
-  const mins = Math.floor(seconds / 60);
-  const secs = seconds % 60;
-  if (mins < 60) {
-    return `${mins}m ${secs}s`;
-  }
-  const hours = Math.floor(mins / 60);
-  const remainingMins = mins % 60;
-  return `${hours}h ${remainingMins}m`;
-}
-
-/**
- * Format duration in ms to a readable string.
- */
-function formatDuration(ms: number): string {
-  if (ms < 1000) {
-    return `${ms}ms`;
-  }
-  const seconds = Math.floor(ms / 1000);
-  if (seconds < 60) {
-    return `${seconds}s`;
-  }
-  const mins = Math.floor(seconds / 60);
-  const secs = seconds % 60;
-  if (mins < 60) {
-    return `${mins}m ${secs}s`;
-  }
-  const hours = Math.floor(mins / 60);
-  const remainingMins = mins % 60;
-  return `${hours}h ${remainingMins}m`;
 }
 
 /**
@@ -125,7 +88,9 @@ export function TimelineStatsBar({
           <Clock className="h-4 w-4 text-muted-foreground" />
           <div>
             <p className="text-xs text-muted-foreground">Elapsed</p>
-            <p className="font-mono text-sm text-foreground">{formatTime(stats.elapsedTime)}</p>
+            <p className="font-mono text-sm text-foreground">
+              {formatDuration(stats.elapsedTime * 1000)}
+            </p>
           </div>
         </div>
 
