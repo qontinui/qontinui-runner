@@ -5,7 +5,7 @@
  * Displays discovered states as nodes and transitions as edges.
  */
 
-import { useCallback, useMemo, useEffect } from "react";
+import { useCallback, useMemo, useEffect, useRef } from "react";
 import {
   ReactFlow,
   MiniMap,
@@ -359,6 +359,19 @@ export function StateGraphView({
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
 
+  // Sync nodes/edges when discovery result changes (derived state, no useEffect)
+  const prevInitialNodesRef = useRef(initialNodes);
+  const prevInitialEdgesRef = useRef(initialEdges);
+  if (
+    prevInitialNodesRef.current !== initialNodes ||
+    prevInitialEdgesRef.current !== initialEdges
+  ) {
+    prevInitialNodesRef.current = initialNodes;
+    prevInitialEdgesRef.current = initialEdges;
+    setNodes(initialNodes);
+    setEdges(initialEdges);
+  }
+
   // Update nodes when selection changes
   useEffect(() => {
     setNodes((nds) =>
@@ -400,12 +413,6 @@ export function StateGraphView({
       }),
     );
   }, [selectedTransitionId, setEdges]);
-
-  // Sync nodes/edges when discovery result changes
-  useEffect(() => {
-    setNodes(initialNodes);
-    setEdges(initialEdges);
-  }, [initialNodes, initialEdges, setNodes, setEdges]);
 
   const handleNodeClick: NodeMouseHandler = useCallback(
     (_event, node) => {

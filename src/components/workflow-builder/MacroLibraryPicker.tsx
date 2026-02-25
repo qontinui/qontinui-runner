@@ -48,22 +48,36 @@ export function MacroLibraryPicker({ isOpen, onClose, onSelect, phase }: MacroLi
   useEffect(() => {
     if (!isOpen) return;
 
+    const controller = new AbortController();
+    let cancelled = false;
+
     const fetchMacros = async () => {
       setIsLoading(true);
       try {
-        const response = await fetch(`${API_BASE}/macros`);
+        const response = await fetch(`${API_BASE}/macros`, { signal: controller.signal });
         if (response.ok) {
           const data = await response.json();
-          setMacros(data.macros || []);
+          if (!cancelled) {
+            setMacros(data.macros || []);
+          }
         }
       } catch (err) {
-        console.error("Failed to fetch macros:", err);
+        if (!cancelled) {
+          console.error("Failed to fetch macros:", err);
+        }
       } finally {
-        setIsLoading(false);
+        if (!cancelled) {
+          setIsLoading(false);
+        }
       }
     };
 
     fetchMacros();
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
   }, [isOpen]);
 
   // Reset selection when modal opens

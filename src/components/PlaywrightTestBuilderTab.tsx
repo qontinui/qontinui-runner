@@ -393,20 +393,27 @@ export function PlaywrightTestBuilderTab({
       return;
     }
 
+    const controller = new AbortController();
     const timeoutId = setTimeout(async () => {
       try {
         await fetch(`${API_BASE}/playwright/tests/${editingScript.id}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ description: formDescription }),
+          signal: controller.signal,
         });
         // Don't show a log message for auto-save to avoid noise
       } catch (error) {
-        console.error("Failed to auto-save description:", error);
+        if (!controller.signal.aborted) {
+          console.error("Failed to auto-save description:", error);
+        }
       }
     }, 500); // 500ms debounce
 
-    return () => clearTimeout(timeoutId);
+    return () => {
+      clearTimeout(timeoutId);
+      controller.abort();
+    };
   }, [formDescription, editingScript]);
 
   // Auto-save name when editing an existing script
@@ -416,27 +423,38 @@ export function PlaywrightTestBuilderTab({
       return;
     }
 
+    const controller = new AbortController();
+    let cancelled = false;
     const timeoutId = setTimeout(async () => {
       try {
         const response = await fetch(`${API_BASE}/playwright/tests/${editingScript.id}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ name: formName }),
+          signal: controller.signal,
         });
-        if (response.ok) {
+        if (response.ok && !cancelled) {
           // Reload scripts to update the list display
-          const scriptsResponse = await fetch(`${API_BASE}/playwright/tests`);
+          const scriptsResponse = await fetch(`${API_BASE}/playwright/tests`, {
+            signal: controller.signal,
+          });
           const result = await scriptsResponse.json();
-          if (result.success) {
+          if (!cancelled && result.success) {
             setScripts(result.data || []);
           }
         }
       } catch (error) {
-        console.error("Failed to auto-save name:", error);
+        if (!cancelled) {
+          console.error("Failed to auto-save name:", error);
+        }
       }
     }, 500); // 500ms debounce
 
-    return () => clearTimeout(timeoutId);
+    return () => {
+      cancelled = true;
+      clearTimeout(timeoutId);
+      controller.abort();
+    };
   }, [formName, editingScript]);
 
   // Auto-save AI instructions when editing an existing script
@@ -446,20 +464,27 @@ export function PlaywrightTestBuilderTab({
       return;
     }
 
+    const controller = new AbortController();
     const timeoutId = setTimeout(async () => {
       try {
         await fetch(`${API_BASE}/playwright/tests/${editingScript.id}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ ai_instructions: formAiInstructions || null }),
+          signal: controller.signal,
         });
         // Don't show a log message for auto-save to avoid noise
       } catch (error) {
-        console.error("Failed to auto-save AI instructions:", error);
+        if (!controller.signal.aborted) {
+          console.error("Failed to auto-save AI instructions:", error);
+        }
       }
     }, 500); // 500ms debounce
 
-    return () => clearTimeout(timeoutId);
+    return () => {
+      clearTimeout(timeoutId);
+      controller.abort();
+    };
   }, [formAiInstructions, editingScript]);
 
   // Expanded sections in execution result
@@ -483,39 +508,50 @@ export function PlaywrightTestBuilderTab({
 
   // Load script for editing when editScriptId is provided
   useEffect(() => {
-    if (editScriptId) {
-      const loadScriptForEditing = async () => {
-        try {
-          const response = await fetch(`${API_BASE}/playwright/tests/${editScriptId}`);
-          const result = await response.json();
-          if (result.success && result.data) {
-            const script = result.data;
-            setEditingScript(script);
-            setIsCreating(true);
-            setFormName(script.name || "");
-            setFormDescription(script.description || "");
-            setFormAiInstructions(script.ai_instructions || "");
-            setFormTargetUrl(script.target_url || "");
-            setFormScriptContent(script.script_content || DEFAULT_SCRIPT_CONTENT);
-            setFormCategory(script.category || "");
-            setFormTags(script.tags?.join(", ") || "");
-            setFormTimeoutSeconds(script.timeout_seconds || 60);
-            setFormDisplayMode(script.display_mode || "headless");
-            setFormBrowser(script.browser || "chromium");
-            setFormWorkflowObjective(script.workflow_objective || "");
-            setFormSuccessCriteria(script.success_criteria || []);
-            setFormIsWorkflowAutomation(script.is_workflow_automation || false);
-            setViewMode(script.description ? "natural_language" : "code");
-            onLog("info", `Loaded script for editing: ${script.name}`);
-          } else {
-            onLog("error", `Failed to load script: ${result.error || "Script not found"}`);
-          }
-        } catch (error) {
+    if (!editScriptId) return;
+
+    const controller = new AbortController();
+    let cancelled = false;
+
+    const loadScriptForEditing = async () => {
+      try {
+        const response = await fetch(`${API_BASE}/playwright/tests/${editScriptId}`, {
+          signal: controller.signal,
+        });
+        const result = await response.json();
+        if (!cancelled && result.success && result.data) {
+          const script = result.data;
+          setEditingScript(script);
+          setIsCreating(true);
+          setFormName(script.name || "");
+          setFormDescription(script.description || "");
+          setFormAiInstructions(script.ai_instructions || "");
+          setFormTargetUrl(script.target_url || "");
+          setFormScriptContent(script.script_content || DEFAULT_SCRIPT_CONTENT);
+          setFormCategory(script.category || "");
+          setFormTags(script.tags?.join(", ") || "");
+          setFormTimeoutSeconds(script.timeout_seconds || 60);
+          setFormDisplayMode(script.display_mode || "headless");
+          setFormBrowser(script.browser || "chromium");
+          setFormWorkflowObjective(script.workflow_objective || "");
+          setFormSuccessCriteria(script.success_criteria || []);
+          setFormIsWorkflowAutomation(script.is_workflow_automation || false);
+          setViewMode(script.description ? "natural_language" : "code");
+          onLog("info", `Loaded script for editing: ${script.name}`);
+        } else if (!cancelled) {
+          onLog("error", `Failed to load script: ${result.error || "Script not found"}`);
+        }
+      } catch (error) {
+        if (!cancelled) {
           onLog("error", `Failed to load script: ${error}`);
         }
-      };
-      loadScriptForEditing();
-    }
+      }
+    };
+    loadScriptForEditing();
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editScriptId]);
 

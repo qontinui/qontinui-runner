@@ -102,19 +102,29 @@ export function SpecSourceSection({ onSpecsChanged }: SpecSourceSectionProps) {
 
   // Check existing SDK connection on mount
   useEffect(() => {
+    const controller = new AbortController();
+    let cancelled = false;
+
     (async () => {
       try {
-        const resp = await fetch(`${API_BASE}/ui-bridge/sdk/status`);
+        const resp = await fetch(`${API_BASE}/ui-bridge/sdk/status`, {
+          signal: controller.signal,
+        });
         const json = await resp.json();
-        if (json.success && json.data?.connected) {
+        if (!cancelled && json.success && json.data?.connected) {
           setIsConnected(true);
           setConnectedAppName(json.data.app?.appName || json.data.url || "SDK App");
           setSdkUrl(json.data.url || "");
         }
       } catch {
-        // Runner may not be available
+        // Runner may not be available or request was aborted
       }
     })();
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
   }, []);
 
   // Load persisted specs from localStorage on mount

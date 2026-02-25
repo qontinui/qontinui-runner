@@ -156,12 +156,17 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
 
   // Fetch prompts from library
   useEffect(() => {
+    const controller = new AbortController();
+    let cancelled = false;
+
     const fetchPrompts = async () => {
       setLoadingPrompts(true);
       try {
-        const response = await fetch("http://localhost:9876/prompts");
+        const response = await fetch("http://localhost:9876/prompts", {
+          signal: controller.signal,
+        });
         const result = await response.json();
-        if (result.success && result.data) {
+        if (!cancelled && result.success && result.data) {
           const promptOptions: PromptOption[] = result.data.map(
             (p: { id: string; name: string; description?: string }) => ({
               id: p.id,
@@ -172,12 +177,18 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
           setPrompts(promptOptions);
         }
       } catch (error) {
-        console.error("Failed to fetch prompts:", error);
+        if (!cancelled) {
+          console.error("Failed to fetch prompts:", error);
+        }
       } finally {
-        setLoadingPrompts(false);
+        if (!cancelled) setLoadingPrompts(false);
       }
     };
     fetchPrompts();
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
   }, []);
 
   // Build the schedule expression

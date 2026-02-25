@@ -31,6 +31,30 @@ interface ChartData {
   count: number;
 }
 
+function CustomTooltip({
+  active,
+  payload,
+}: {
+  active?: boolean;
+  payload?: { payload: ChartData }[];
+}) {
+  if (active && payload && payload.length) {
+    const data = payload[0].payload;
+    return (
+      <div className="bg-popover border border-border rounded-lg p-3 shadow-lg">
+        <p className="font-semibold text-sm">{data.displayTime}</p>
+        <div className="text-xs text-muted-foreground mt-1">
+          <p>
+            Success rate: <span className="font-medium">{data.value.toFixed(1)}%</span>
+          </p>
+          <p>Runs: {data.count}</p>
+        </div>
+      </div>
+    );
+  }
+  return null;
+}
+
 export function SuccessRateTrend({ data, timeRange }: SuccessRateTrendProps) {
   // Transform data for chart
   const chartData: ChartData[] = data.map((point) => ({
@@ -54,30 +78,6 @@ export function SuccessRateTrend({ data, timeRange }: SuccessRateTrendProps) {
       </div>
     );
   }
-
-  const CustomTooltip = ({
-    active,
-    payload,
-  }: {
-    active?: boolean;
-    payload?: { payload: ChartData }[];
-  }) => {
-    if (active && payload && payload.length) {
-      const data = payload[0].payload;
-      return (
-        <div className="bg-popover border border-border rounded-lg p-3 shadow-lg">
-          <p className="font-semibold text-sm">{data.displayTime}</p>
-          <div className="text-xs text-muted-foreground mt-1">
-            <p>
-              Success rate: <span className="font-medium">{data.value.toFixed(1)}%</span>
-            </p>
-            <p>Runs: {data.count}</p>
-          </div>
-        </div>
-      );
-    }
-    return null;
-  };
 
   // Calculate average for reference line
   const avgValue =

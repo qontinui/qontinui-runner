@@ -90,6 +90,11 @@ const actionTypes: { value: ActionType; label: string; description: string }[] =
   { value: "informational", label: "Informational", description: "No action needed" },
 ];
 
+/** Resolve an icon name to its Lucide component, defaulting to Info. */
+function getIconComponent(iconName: string): React.ComponentType<{ className?: string }> {
+  return iconMap[iconName] || Info;
+}
+
 interface CategoryManagerProps {
   onLog?: (level: "info" | "warning" | "error" | "success", message: string) => void;
 }
@@ -288,8 +293,6 @@ export function CategoryManager({ onLog }: CategoryManagerProps) {
     setIsCreating(false);
   }, []);
 
-  const IconComponent = (iconName: string) => iconMap[iconName] || Info;
-
   return (
     <div data-ui-id="findings-category-manager" className="h-full flex flex-col p-4">
       {/* Header */}
@@ -364,7 +367,7 @@ export function CategoryManager({ onLog }: CategoryManagerProps) {
             const isBuiltIn = category.isBuiltIn;
             const isEditing = editingId === category.id;
             const colorClasses = getCategoryColorClasses(category.color);
-            const Icon = IconComponent(category.icon);
+            const Icon = getIconComponent(category.icon);
 
             return (
               <div

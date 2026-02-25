@@ -298,18 +298,29 @@ export function AiTab({
 
   // Load auto-fix setting on mount
   useEffect(() => {
+    const controller = new AbortController();
+    let cancelled = false;
+
     const loadAutoFixSetting = async () => {
       try {
-        const response = await fetch("http://localhost:9876/session/auto-fix");
+        const response = await fetch("http://localhost:9876/session/auto-fix", {
+          signal: controller.signal,
+        });
         const result = await response.json();
-        if (result.success) {
+        if (!cancelled && result.success) {
           setAutoFixEnabled(result.data?.enabled ?? false);
         }
       } catch (error) {
-        console.error("Failed to load auto-fix setting:", error);
+        if (!cancelled) {
+          console.error("Failed to load auto-fix setting:", error);
+        }
       }
     };
     loadAutoFixSetting();
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
   }, []);
 
   // Toggle auto-fix setting
@@ -341,21 +352,31 @@ export function AiTab({
       return;
     }
 
+    const controller = new AbortController();
+    let cancelled = false;
+
     const loadRunAutoContinue = async () => {
       try {
         const response = await fetch(
           `http://localhost:9876/task-runs/${selectedSessionId}/auto-continue`,
+          { signal: controller.signal },
         );
         const result = await response.json();
-        if (result.auto_continue !== undefined) {
+        if (!cancelled && result.auto_continue !== undefined) {
           setRunAutoContinue(result.auto_continue);
         }
       } catch (error) {
-        console.error("Failed to load per-run auto-continue setting:", error);
-        setRunAutoContinue(null);
+        if (!cancelled) {
+          console.error("Failed to load per-run auto-continue setting:", error);
+          setRunAutoContinue(null);
+        }
       }
     };
     loadRunAutoContinue();
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
   }, [selectedSessionId]);
 
   // Toggle per-run auto-continue setting
@@ -391,11 +412,16 @@ export function AiTab({
 
   // Check for resumable tasks and running state periodically
   useEffect(() => {
+    const controller = new AbortController();
+    let cancelled = false;
+
     const checkStatus = async () => {
       try {
-        const response = await fetch("http://localhost:9876/workflow/resumable");
+        const response = await fetch("http://localhost:9876/workflow/resumable", {
+          signal: controller.signal,
+        });
         const result = await response.json();
-        if (result.success) {
+        if (!cancelled && result.success) {
           if (result.data?.is_running !== undefined) {
             setIsRunning(result.data.is_running);
           }
@@ -428,13 +454,19 @@ export function AiTab({
           }
         }
       } catch (error) {
-        console.error("Failed to check workflow status:", error);
+        if (!cancelled) {
+          console.error("Failed to check workflow status:", error);
+        }
       }
     };
 
     checkStatus();
     const interval = setInterval(checkStatus, 2000);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      controller.abort();
+      clearInterval(interval);
+    };
   }, []);
 
   // Handler to resume a workflow

@@ -3191,30 +3191,47 @@ function ExecutionSpansSection() {
       setAllSpans([]);
       return;
     }
+    const controller = new AbortController();
+    let cancelled = false;
     setIsLoading(true);
     setError(null);
 
-    fetch(
-      `http://localhost:9876/execution-spans?execution_id=${encodeURIComponent(selectedRunId)}&limit=200`,
-    )
-      .then((res) => res.json())
-      .then((data) => {
+    (async () => {
+      try {
+        const res = await fetch(
+          `http://localhost:9876/execution-spans?execution_id=${encodeURIComponent(selectedRunId)}&limit=200`,
+          { signal: controller.signal },
+        );
+        const data = await res.json();
+        if (cancelled) return;
         const runSpans = data.spans ?? [];
         setSpans(runSpans);
         setIsLoading(false);
 
         // If no run-specific spans, fetch recent spans from all executions
         if (runSpans.length === 0) {
-          fetch(`http://localhost:9876/execution-spans?limit=50`)
-            .then((res) => res.json())
-            .then((data) => setAllSpans(data.spans ?? []))
-            .catch(() => {});
+          try {
+            const allRes = await fetch(`http://localhost:9876/execution-spans?limit=50`, {
+              signal: controller.signal,
+            });
+            const allData = await allRes.json();
+            if (!cancelled) setAllSpans(allData.spans ?? []);
+          } catch {
+            // ignore - may be aborted
+          }
         }
-      })
-      .catch((err) => {
-        setError(String(err));
-        setIsLoading(false);
-      });
+      } catch (err) {
+        if (!cancelled) {
+          setError(String(err));
+          setIsLoading(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
   }, [selectedRunId]);
 
   const showingAll = spans.length === 0 && allSpans.length > 0;

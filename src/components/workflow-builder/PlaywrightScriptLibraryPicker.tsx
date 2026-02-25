@@ -60,22 +60,38 @@ export function PlaywrightScriptLibraryPicker({
   useEffect(() => {
     if (!isOpen) return;
 
+    const controller = new AbortController();
+    let cancelled = false;
+
     const fetchScripts = async () => {
       setIsLoading(true);
       try {
-        const response = await fetch(`${API_BASE}/playwright/tests`);
+        const response = await fetch(`${API_BASE}/playwright/tests`, {
+          signal: controller.signal,
+        });
         if (response.ok) {
           const data = await response.json();
-          setScripts(data.scripts || []);
+          if (!cancelled) {
+            setScripts(data.scripts || []);
+          }
         }
       } catch (err) {
-        console.error("Failed to fetch Playwright scripts:", err);
+        if (!cancelled) {
+          console.error("Failed to fetch Playwright scripts:", err);
+        }
       } finally {
-        setIsLoading(false);
+        if (!cancelled) {
+          setIsLoading(false);
+        }
       }
     };
 
     fetchScripts();
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
   }, [isOpen]);
 
   // Reset selection when modal opens

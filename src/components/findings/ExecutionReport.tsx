@@ -95,18 +95,29 @@ export function ExecutionReport({
 
   // Load auto-fix setting on mount
   useEffect(() => {
+    const controller = new AbortController();
+    let cancelled = false;
+
     const loadAutoFixSetting = async () => {
       try {
-        const response = await fetch("http://localhost:9876/session/auto-fix");
+        const response = await fetch("http://localhost:9876/session/auto-fix", {
+          signal: controller.signal,
+        });
         const result = await response.json();
-        if (result.success) {
+        if (!cancelled && result.success) {
           setAutoFixEnabled(result.data?.enabled ?? false);
         }
       } catch (error) {
-        console.error("Failed to load auto-fix setting:", error);
+        if (!cancelled) {
+          console.error("Failed to load auto-fix setting:", error);
+        }
       }
     };
     loadAutoFixSetting();
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
   }, []);
 
   // Toggle auto-fix setting

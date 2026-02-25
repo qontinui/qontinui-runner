@@ -97,11 +97,16 @@ export function ReflectionDashboard() {
 
   // Load available workflow names from recent task runs
   useEffect(() => {
+    const controller = new AbortController();
+    let cancelled = false;
+
     async function loadWorkflows() {
       try {
-        const resp = await fetch("http://localhost:9876/task-runs?limit=100");
+        const resp = await fetch("http://localhost:9876/task-runs?limit=100", {
+          signal: controller.signal,
+        });
         const json = await resp.json();
-        if (json.success && json.data) {
+        if (!cancelled && json.success && json.data) {
           const names = new Set<string>();
           for (const run of json.data) {
             if (run.workflow_name) names.add(run.workflow_name);
@@ -113,10 +118,14 @@ export function ReflectionDashboard() {
           }
         }
       } catch {
-        // ignore - runner may not be available
+        // ignore - runner may not be available or request was aborted
       }
     }
     loadWorkflows();
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

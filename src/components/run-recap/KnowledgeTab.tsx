@@ -187,30 +187,40 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
 
   // Fetch reflection fixes
   useEffect(() => {
+    const controller = new AbortController();
+    let cancelled = false;
+
     const fetchReflectionFixes = async () => {
       if (!taskRunId) return;
 
       try {
         const response = await fetch(
           `http://localhost:9876/task-runs/${taskRunId}/reflection-fixes`,
+          { signal: controller.signal },
         );
         if (response.ok) {
           const result = await response.json();
-          if (result.success && result.data) {
+          if (!cancelled && result.success && result.data) {
             setReflectionFixes(result.data);
           }
         }
       } catch (error) {
-        console.error("Failed to fetch reflection fixes:", error);
-        setReflectionFixes([]);
+        if (!cancelled) {
+          console.error("Failed to fetch reflection fixes:", error);
+          setReflectionFixes([]);
+        }
       } finally {
-        setReflectionLoading(false);
+        if (!cancelled) setReflectionLoading(false);
       }
     };
 
     fetchReflectionFixes();
     const interval = setInterval(fetchReflectionFixes, 10000);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      controller.abort();
+      clearInterval(interval);
+    };
   }, [taskRunId]);
 
   const triggerReflection = async () => {

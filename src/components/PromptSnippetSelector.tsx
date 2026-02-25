@@ -41,6 +41,25 @@ export function PromptSnippetSelector({
   const searchInputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
 
+  // Sync search query from props during render (derived state, no useEffect)
+  const prevInitialSearchQueryRef = useRef(initialSearchQuery);
+  if (prevInitialSearchQueryRef.current !== initialSearchQuery) {
+    prevInitialSearchQueryRef.current = initialSearchQuery;
+    setSearchQuery(initialSearchQuery);
+  }
+
+  // Reset selected index when filter changes (derived state, no useEffect)
+  const prevSearchQueryRef = useRef(searchQuery);
+  const prevSelectedCategoryRef = useRef(selectedCategory);
+  if (
+    prevSearchQueryRef.current !== searchQuery ||
+    prevSelectedCategoryRef.current !== selectedCategory
+  ) {
+    prevSearchQueryRef.current = searchQuery;
+    prevSelectedCategoryRef.current = selectedCategory;
+    setSelectedIndex(0);
+  }
+
   // Load prompt snippets and categories
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -77,11 +96,6 @@ export function PromptSnippetSelector({
     }
   }, [isOpen, loadData]);
 
-  // Update search query from props (for @-mention)
-  useEffect(() => {
-    setSearchQuery(initialSearchQuery);
-  }, [initialSearchQuery]);
-
   // Filter prompt snippets by search and category
   const filteredSnippets = snippets.filter((s) => {
     const matchesSearch =
@@ -94,11 +108,6 @@ export function PromptSnippetSelector({
 
     return matchesSearch && matchesCategory;
   });
-
-  // Reset selected index when filter changes
-  useEffect(() => {
-    setSelectedIndex(0);
-  }, [searchQuery, selectedCategory]);
 
   // Handle keyboard navigation
   useEffect(() => {

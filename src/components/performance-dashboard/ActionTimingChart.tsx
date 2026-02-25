@@ -26,6 +26,34 @@ interface ChartData {
   total: number;
 }
 
+function CustomTooltip({
+  active,
+  payload,
+}: {
+  active?: boolean;
+  payload?: { payload: ChartData }[];
+}) {
+  if (active && payload && payload.length) {
+    const data = payload[0].payload;
+    return (
+      <div className="bg-popover border border-border rounded-lg p-3 shadow-lg">
+        <p className="font-semibold text-sm">{data.name}</p>
+        <div className="text-xs text-muted-foreground mt-1 space-y-1">
+          <p>Total executions: {data.total}</p>
+          <p>Success rate: {(data.successRate * 100).toFixed(1)}%</p>
+          <div className="border-t border-border pt-1 mt-1">
+            <p>Average: {formatDurationMs(data.avg)}</p>
+            <p>P50 (median): {formatDurationMs(data.p50)}</p>
+            <p>P95: {formatDurationMs(data.p95)}</p>
+            <p>P99: {formatDurationMs(data.p99)}</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+  return null;
+}
+
 export function ActionTimingChart({ data, maxItems = 10 }: ActionTimingChartProps) {
   // Transform and limit data
   const chartData: ChartData[] = data.slice(0, maxItems).map((item) => ({
@@ -59,34 +87,6 @@ export function ActionTimingChart({ data, maxItems = 10 }: ActionTimingChartProp
     if (successRate >= 0.8) return "#eab308"; // yellow-500
     if (successRate >= 0.5) return "#f97316"; // orange-500
     return "#ef4444"; // red-500
-  };
-
-  const CustomTooltip = ({
-    active,
-    payload,
-  }: {
-    active?: boolean;
-    payload?: { payload: ChartData }[];
-  }) => {
-    if (active && payload && payload.length) {
-      const data = payload[0].payload;
-      return (
-        <div className="bg-popover border border-border rounded-lg p-3 shadow-lg">
-          <p className="font-semibold text-sm">{data.name}</p>
-          <div className="text-xs text-muted-foreground mt-1 space-y-1">
-            <p>Total executions: {data.total}</p>
-            <p>Success rate: {(data.successRate * 100).toFixed(1)}%</p>
-            <div className="border-t border-border pt-1 mt-1">
-              <p>Average: {formatDurationMs(data.avg)}</p>
-              <p>P50 (median): {formatDurationMs(data.p50)}</p>
-              <p>P95: {formatDurationMs(data.p95)}</p>
-              <p>P99: {formatDurationMs(data.p99)}</p>
-            </div>
-          </div>
-        </div>
-      );
-    }
-    return null;
   };
 
   return (

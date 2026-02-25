@@ -39,18 +39,25 @@ export function PromptLibraryPicker({
   useEffect(() => {
     if (!isOpen) return;
 
+    const controller = new AbortController();
+    let cancelled = false;
+
     const fetchPrompts = async () => {
       setIsLoading(true);
       try {
-        const response = await fetch(`${API_BASE}/prompts`);
+        const response = await fetch(`${API_BASE}/prompts`, { signal: controller.signal });
         const data = await response.json();
-        if (data.success && data.data) {
+        if (!cancelled && data.success && data.data) {
           setSavedPrompts(data.data);
         }
       } catch (error) {
-        console.error("Failed to fetch saved prompts:", error);
+        if (!cancelled) {
+          console.error("Failed to fetch saved prompts:", error);
+        }
       } finally {
-        setIsLoading(false);
+        if (!cancelled) {
+          setIsLoading(false);
+        }
       }
     };
 
@@ -58,6 +65,11 @@ export function PromptLibraryPicker({
     setSearchQuery("");
     setSelectedId(null);
     setCategoryFilter("");
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
   }, [isOpen]);
 
   // Get unique categories

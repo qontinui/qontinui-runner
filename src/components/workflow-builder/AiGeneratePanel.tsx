@@ -25,6 +25,7 @@ import {
   Activity,
   Monitor,
   Rocket,
+  ListOrdered,
   X,
   Save,
   AlertCircle,
@@ -49,6 +50,7 @@ const TEMPLATE_ICONS: Record<string, LucideIcon> = {
   Activity,
   Monitor,
   Rocket,
+  ListOrdered,
 };
 
 // Provider and model constants
@@ -229,38 +231,54 @@ export function AiGeneratePanel({
 
   // Fetch prompts and contexts on mount
   useEffect(() => {
+    const controller = new AbortController();
+    let cancelled = false;
+
     (async () => {
       try {
-        const resp = await fetch(`${API_BASE}/prompts`);
+        const resp = await fetch(`${API_BASE}/prompts`, { signal: controller.signal });
         const json = await resp.json();
-        setSavedPrompts(json.data ?? []);
+        if (!cancelled) setSavedPrompts(json.data ?? []);
       } catch {
-        // Runner may not be running
+        // Runner may not be running or request was aborted
       }
     })();
     (async () => {
       try {
-        const resp = await fetch(`${API_BASE}/contexts`);
+        const resp = await fetch(`${API_BASE}/contexts`, { signal: controller.signal });
         const json = await resp.json();
-        setSavedContexts(json.data ?? []);
+        if (!cancelled) setSavedContexts(json.data ?? []);
       } catch {
-        // Runner may not be running
+        // Runner may not be running or request was aborted
       }
     })();
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
   }, []);
 
   // AI settings (for provider/model defaults)
   const [aiSettings, setAiSettings] = useState<Record<string, unknown> | null>(null);
   useEffect(() => {
+    const controller = new AbortController();
+    let cancelled = false;
+
     (async () => {
       try {
-        const resp = await fetch(`${API_BASE}/settings/ai`);
+        const resp = await fetch(`${API_BASE}/settings/ai`, { signal: controller.signal });
         const json = await resp.json();
-        setAiSettings(json.data ?? null);
+        if (!cancelled) setAiSettings(json.data ?? null);
       } catch {
-        // Runner may not be running
+        // Runner may not be running or request was aborted
       }
     })();
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
   }, []);
 
   // Initialize provider/model from settings when loaded

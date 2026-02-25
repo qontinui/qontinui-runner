@@ -37,26 +37,42 @@ export function WorkflowLibraryPicker({
   useEffect(() => {
     if (!isOpen) return;
 
+    const controller = new AbortController();
+    let cancelled = false;
+
     const fetchWorkflows = async () => {
       setIsLoading(true);
       try {
-        const response = await fetch(`${API_BASE}/unified-workflows`);
+        const response = await fetch(`${API_BASE}/unified-workflows`, {
+          signal: controller.signal,
+        });
         const result = await response.json();
-        if (result.success && result.data) {
-          setWorkflows(result.data);
-        } else if (Array.isArray(result)) {
-          setWorkflows(result);
-        } else {
-          setWorkflows([]);
+        if (!cancelled) {
+          if (result.success && result.data) {
+            setWorkflows(result.data);
+          } else if (Array.isArray(result)) {
+            setWorkflows(result);
+          } else {
+            setWorkflows([]);
+          }
         }
       } catch (err) {
-        console.error("Failed to fetch workflows:", err);
+        if (!cancelled) {
+          console.error("Failed to fetch workflows:", err);
+        }
       } finally {
-        setIsLoading(false);
+        if (!cancelled) {
+          setIsLoading(false);
+        }
       }
     };
 
     fetchWorkflows();
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
   }, [isOpen]);
 
   // Reset selection when modal opens

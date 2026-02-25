@@ -39,33 +39,49 @@ export function StateLibraryPicker({ isOpen, onClose, onSelect, phase }: StateLi
   useEffect(() => {
     if (!isOpen) return;
 
+    const controller = new AbortController();
+    let cancelled = false;
+
     const fetchStates = async () => {
       setIsLoading(true);
       setError(null);
       try {
-        const response = await fetch(`${API_BASE}/testing/states`);
+        const response = await fetch(`${API_BASE}/testing/states`, {
+          signal: controller.signal,
+        });
         const result = await response.json();
-        if (result.success && result.data?.states) {
-          setStates(result.data.states);
-        } else if (result.states) {
-          setStates(result.states);
-        } else if (Array.isArray(result)) {
-          setStates(result);
-        } else {
-          setStates([]);
-          if (!result.success) {
-            setError(result.error || "Failed to load states");
+        if (!cancelled) {
+          if (result.success && result.data?.states) {
+            setStates(result.data.states);
+          } else if (result.states) {
+            setStates(result.states);
+          } else if (Array.isArray(result)) {
+            setStates(result);
+          } else {
+            setStates([]);
+            if (!result.success) {
+              setError(result.error || "Failed to load states");
+            }
           }
         }
       } catch (err) {
-        console.error("Failed to fetch states:", err);
-        setError("Failed to connect to the runner. Make sure a config is loaded.");
+        if (!cancelled) {
+          console.error("Failed to fetch states:", err);
+          setError("Failed to connect to the runner. Make sure a config is loaded.");
+        }
       } finally {
-        setIsLoading(false);
+        if (!cancelled) {
+          setIsLoading(false);
+        }
       }
     };
 
     fetchStates();
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
   }, [isOpen]);
 
   // Reset selection when modal opens
