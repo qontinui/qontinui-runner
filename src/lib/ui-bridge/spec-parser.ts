@@ -1,8 +1,8 @@
 /**
  * spec-parser.ts
  *
- * Pure spec parsing functions extracted from page-sweep/page.tsx,
- * SpecSourceSection.tsx, and use-inspector.ts.
+ * Pure spec parsing functions extracted from SpecSourceSection.tsx
+ * and use-inspector.ts.
  *
  * Converts raw SDK discover responses into typed DiscoveredSpec objects.
  */

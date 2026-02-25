@@ -1334,229 +1334,56 @@ pub async fn run_unified_workflow(
         crate::executor::file_logger::save_unified_workflow_config(&workflow_json, &workflow.name);
     }
 
-    let monitor_index = request.monitor_index.unwrap_or(0);
+    // Normalize to stages — all workflows are now multi-stage
+    let normalized_stages = workflow.normalize_to_stages();
+    let total_stages = normalized_stages.len();
 
-    // Convert JSON steps to ExecutionStepConfig
-    // For now, we run phases sequentially: setup -> (verification + agentic) -> completion
-    let mut all_steps: Vec<crate::step_executor::ExecutionStepConfig> = Vec::new();
-
-    // Helper to convert Value steps to ExecutionStepConfig
-    let convert_step = |step: &serde_json::Value,
-                        _monitor: i32|
-     -> Option<crate::step_executor::ExecutionStepConfig> {
-        // Try to deserialize the step directly
-        if let Ok(mut config) =
-            serde_json::from_value::<crate::step_executor::ExecutionStepConfig>(step.clone())
-        {
-            // Fix ambiguous "command" field mapping based on step_type
-            // Both shell_command and check_command have alias "command", so serde picks one arbitrarily.
-            // We need to ensure the command goes to the right field based on step_type.
-            if let Some(command) = step.get("command").and_then(|v| v.as_str()) {
-                let cmd = command.to_string();
-                match config.step_type.as_str() {
-                    "command" | "shell_command" | "check" | "check_group" => {
-                        // Route "command" field to the right struct field based on check_type
-                        if config.check_type.is_some() {
-                            if config.check_command.is_none() {
-                                config.check_command = Some(cmd);
-                            }
-                        } else if config.shell_command.is_none() {
-                            config.shell_command = Some(cmd);
-                        }
-                        // Normalize legacy step types to "command"
-                        config.step_type = "command".to_string();
-                    }
-                    "test" => {
-                        // Test steps may also use command field
-                        if config.shell_command.is_none() {
-                            config.shell_command = Some(cmd);
-                        }
-                        // Normalize "test" to "command" (test is now a command dispatch mode)
-                        config.step_type = "command".to_string();
-                    }
-                    _ => {}
-                }
-            } else {
-                // Even without a "command" field, normalize legacy step types
-                match config.step_type.as_str() {
-                    "shell_command" | "check" | "check_group" | "test" => {
-                        config.step_type = "command".to_string();
-                    }
-                    _ => {}
-                }
-            }
-
-            // Fix prompt content mapping - "content" field maps to prompt_content for prompt steps
-            if config.step_type == "prompt" && config.prompt_content.is_none() {
-                if let Some(content) = step.get("content").and_then(|v| v.as_str()) {
-                    config.prompt_content = Some(content.to_string());
-                }
-            }
-
-            // Normalize nested retry format: {"retry": {"count": N, "delay_ms": M}}
-            if config.retry_count.is_none() {
-                if let Some(retry_obj) = step.get("retry") {
-                    if let Some(c) = retry_obj.get("count").and_then(|v| v.as_u64()) {
-                        config.retry_count = Some(c as u32);
-                    }
-                    if let Some(d) = retry_obj.get("delay_ms").and_then(|v| v.as_u64()) {
-                        config.retry_delay_ms = Some(d);
-                    }
-                }
-            }
-
-            return Some(config);
-        }
-
-        // Fall back to extracting type and creating manually
-        let step_type = step.get("type").and_then(|t| t.as_str())?;
-        let name = step
-            .get("name")
-            .and_then(|n| n.as_str())
-            .map(|s| s.to_string());
-
-        Some(crate::step_executor::ExecutionStepConfig {
-            step_type: step_type.to_string(),
-            name,
-            prompt_content: step
-                .get("content")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            timeout_seconds: step.get("timeoutSeconds").and_then(|v| v.as_u64()),
-            phase: step
-                .get("phase")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            run_on_subsequent_iterations: None,
-            test_id: step
-                .get("test_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            test_type: step
-                .get("test_type")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            test_is_critical: step.get("is_critical").and_then(|v| v.as_bool()),
-            sub_step_id: step
-                .get("subStepId")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            // Shell command fields
-            shell_command: step
-                .get("command")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            shell_command_id: step
-                .get("shell_command_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            shell_command_working_directory: step
-                .get("working_directory")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            shell_command_fail_on_error: step.get("fail_on_error").and_then(|v| v.as_bool()),
-            // Check fields - support both snake_case and camelCase
-            check_type: step
-                .get("check_type")
-                .or_else(|| step.get("checkType"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            check_command: step
-                .get("command")
-                .or_else(|| step.get("check_command"))
-                .or_else(|| step.get("checkCommand"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            check_working_directory: step
-                .get("working_directory")
-                .or_else(|| step.get("workingDirectory"))
-                .or_else(|| step.get("check_working_directory"))
-                .or_else(|| step.get("checkWorkingDirectory"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            check_auto_fix: step
-                .get("auto_fix")
-                .or_else(|| step.get("autoFix"))
-                .or_else(|| step.get("check_auto_fix"))
-                .or_else(|| step.get("checkAutoFix"))
-                .and_then(|v| v.as_bool()),
-            check_url: step
-                .get("check_url")
-                .or_else(|| step.get("checkUrl"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            expected_status: step
-                .get("expected_status")
-                .or_else(|| step.get("expectedStatus"))
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u16),
-            // Check group fields
-            check_group_id: step
-                .get("check_group_id")
-                .or_else(|| step.get("checkGroupId"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            ..Default::default()
-        })
-    };
-
-    // Add setup steps (mark as setup phase)
-    for step in &workflow.setup_steps {
-        if let Some(mut config) = convert_step(step, monitor_index) {
-            config.phase = Some("setup".to_string());
-            all_steps.push(config);
-        }
-    }
-
-    // Add verification steps
-    for step in &workflow.verification_steps {
-        if let Some(mut config) = convert_step(step, monitor_index) {
-            config.phase = Some("verification".to_string());
-            all_steps.push(config);
-        }
-    }
-
-    // Add agentic steps
-    for step in &workflow.agentic_steps {
-        if let Some(mut config) = convert_step(step, monitor_index) {
-            config.phase = Some("agentic".to_string());
-            all_steps.push(config);
-        }
-    }
-
-    // Add completion steps (mark as completion phase)
-    for step in &workflow.completion_steps {
-        if let Some(mut config) = convert_step(step, monitor_index) {
-            config.phase = Some("completion".to_string());
-            all_steps.push(config);
-        }
-    }
-
-    if all_steps.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(api_error("Workflow has no steps to execute".to_string())),
-        ));
-    }
-
-    // Extract verification-phase steps BEFORE categorize_steps consumes all_steps.
-    // This preserves the original step ordering (e.g., prompt checks before gates)
-    // which is critical for gate steps that depend on prompt step results.
-    let ordered_verification_steps: Vec<_> = all_steps
+    // Convert each stage to StageConfig
+    let stages: Vec<crate::unified_workflow_executor::StageConfig> = normalized_stages
         .iter()
-        .filter(|s| s.phase.as_deref() == Some("verification"))
-        .cloned()
+        .enumerate()
+        .map(|(idx, stage)| {
+            crate::unified_workflows::stage_to_stage_config(
+                stage,
+                idx,
+                total_stages,
+                workflow.preflight_check_enabled,
+                workflow.log_watch_enabled,
+                workflow.health_check_enabled,
+                &workflow.health_check_urls,
+            )
+        })
         .collect();
 
-    // Separate automation steps from AI steps using the robust categorize_steps helper.
-    // This replaces the fragile string-based partition logic.
-    let (automation_steps, prompt_steps) = categorize_steps(all_steps, |s| &s.step_type);
-    let has_prompt_steps = !prompt_steps.is_empty();
+    // Build combined prompt from all agentic steps across all stages
+    let combined_prompt = normalized_stages
+        .iter()
+        .flat_map(|stage| stage.agentic_steps.iter())
+        .filter_map(|step| step.get("content").and_then(|v| v.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n");
 
-    // Determine execution_id for resume support:
-    // 1. If task_run_id is explicitly provided, use it (explicit resume)
-    // 2. If force_fresh_start is false, check for incomplete task_run (auto-resume)
-    // 3. Otherwise, generate a new execution_id
+    // Check if any stage has prompt-based steps
+    let has_prompt_steps = normalized_stages.iter().any(|stage| {
+        stage
+            .agentic_steps
+            .iter()
+            .any(|s| s.get("type").and_then(|t| t.as_str()) == Some("prompt"))
+            || stage
+                .setup_steps
+                .iter()
+                .any(|s| s.get("type").and_then(|t| t.as_str()) == Some("prompt"))
+            || stage
+                .verification_steps
+                .iter()
+                .any(|s| s.get("type").and_then(|t| t.as_str()) == Some("prompt"))
+            || stage
+                .completion_steps
+                .iter()
+                .any(|s| s.get("type").and_then(|t| t.as_str()) == Some("prompt"))
+    });
+
+    // Determine execution_id for resume support
     let execution_id = if let Some(ref provided_id) = request.task_run_id {
         info!(
             "Using provided task_run_id for explicit resume: {}",
@@ -1564,7 +1391,6 @@ pub async fn run_unified_workflow(
         );
         provided_id.clone()
     } else if !request.force_fresh_start {
-        // Check for incomplete task_run to auto-resume
         match state
             .app_state
             .checkpoint_db
@@ -1578,7 +1404,6 @@ pub async fn run_unified_workflow(
                 existing_id
             }
             Ok(None) => {
-                // No incomplete run found, generate new execution_id
                 let new_id = format!(
                     "unified-workflow-{}-{}",
                     id,
@@ -1600,7 +1425,6 @@ pub async fn run_unified_workflow(
             }
         }
     } else {
-        // force_fresh_start = true
         let new_id = format!(
             "unified-workflow-{}-{}",
             id,
@@ -1610,144 +1434,27 @@ pub async fn run_unified_workflow(
         new_id
     };
 
-    // If workflow has prompt steps, use AI-based execution
     if has_prompt_steps {
+        // AI-based execution with verification-agentic loop
         info!(
-            "Workflow '{}' has {} prompt steps - using AI-based execution",
-            workflow.name,
-            prompt_steps.len()
+            "Workflow '{}' has prompt steps - using AI-based multi-stage execution ({} stages)",
+            workflow.name, total_stages
         );
 
-        // Combine all prompt contents into a single prompt
-        let combined_prompt = prompt_steps
-            .iter()
-            .filter_map(|s| s.prompt_content.as_ref())
-            .map(|content| content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n---\n\n");
-
-        if combined_prompt.is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(api_error(
-                    "Workflow has prompt steps but no prompt content".to_string(),
-                )),
-            ));
-        }
-
-        // =====================================================================
-        // UNIFIED VERIFICATION-AGENTIC LOOP (required for all AI workflows)
-        // =====================================================================
-        // All AI workflows must have verification steps. The loop:
-        // 1. Runs verification FIRST to tell the agentic phase what to work on
-        // 2. Builds failure context from verification results
-        // 3. Loops: verification -> agentic until pass or max_iterations
-        // 4. Cannot be bypassed by AI claiming [TASK_COMPLETE]
-        //
-        // Verification steps can be:
-        // - Automated tests (Playwright, shell commands)
-        // - AI-based verification (prompt steps that check work quality)
-        //
-        // If you want a simple AI task, add a verification step like:
-        // "Review the changes and verify the task was completed correctly"
-        if workflow.verification_steps.is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(api_error(
-                    "AI workflows require at least one verification step. \
-                     Verification can be automated (tests) or AI-based (a prompt that checks work quality). \
-                     This ensures the AI's work is verified before marking the task complete.".to_string(),
-                )),
-            ));
-        }
-
-        info!(
-            "Unified workflow '{}' has {} verification steps - using verification-agentic loop",
-            workflow.name,
-            workflow.verification_steps.len()
-        );
-
-        // Separate steps by phase for the new loop function
-        // Setup automation steps (shell commands, workflows, etc.)
-        let setup_automation_steps: Vec<_> = automation_steps
-            .iter()
-            .filter(|s| s.phase.as_deref() == Some("setup"))
-            .cloned()
-            .collect();
-        // Prepend pre-flight check if enabled (default: true)
-        let setup_automation_steps = crate::unified_workflows::prepend_preflight_check_step(
-            setup_automation_steps,
-            workflow.preflight_check_enabled,
-        );
-        // Setup prompt steps (AI tasks during setup)
-        let setup_prompt_steps: Vec<_> = prompt_steps
-            .iter()
-            .filter(|s| s.phase.as_deref() == Some("setup"))
-            .cloned()
-            .collect();
-        // Use ordered_verification_steps (extracted before categorize_steps) to preserve
-        // the original step ordering from the workflow definition. This is critical because
-        // gate steps must come AFTER the prompt/automation steps they reference.
-        // The previous approach of automation-first-then-prompt broke gate evaluation.
-        let verification_steps = ordered_verification_steps;
-
-        // Prepend health check steps if enabled and URLs configured
-        // Health checks run BEFORE log_watch to catch server down before scanning logs
-        let verification_steps = crate::unified_workflows::prepend_health_check_steps(
-            verification_steps,
-            workflow.health_check_enabled,
-            &workflow.health_check_urls,
-        );
-
-        // Prepend log_watch step if enabled (default: true)
-        let verification_steps = crate::unified_workflows::prepend_log_watch_step(
-            verification_steps,
-            workflow.log_watch_enabled,
-        );
-
-        // Filter prompt_steps by phase - agentic prompts only
-        let agentic_steps: Vec<_> = prompt_steps
-            .iter()
-            .filter(|s| s.phase.as_deref() == Some("agentic"))
-            .cloned()
-            .collect();
-        // Completion steps: combine non-prompt completion steps with prompt completion steps
-        let mut completion_steps: Vec<_> = automation_steps
-            .iter()
-            .filter(|s| s.phase.as_deref() == Some("completion"))
-            .cloned()
-            .collect();
-        // Add completion prompts (e.g., AI summary) to completion_steps
-        completion_steps.extend(
-            prompt_steps
-                .iter()
-                .filter(|s| s.phase.as_deref() == Some("completion"))
-                .cloned(),
-        );
-
-        // Create task_run for tracking with workflow_type="unified"
-        // This prevents TaskMonitor and legacy session code from modifying status
-        let execution_steps_json = serde_json::to_string(&automation_steps).ok();
-        let mut input = CreateTaskRunInput::new(&execution_id, &workflow.name)
+        // Create task_run for tracking
+        let input = CreateTaskRunInput::new(&execution_id, &workflow.name)
             .with_prompt(&combined_prompt)
             .with_task_type("ai")
             .with_workflow_name(&workflow.name)
             .with_max_sessions(workflow.max_iterations)
             .with_auto_continue(true)
-            .with_workflow_type("unified"); // LoopController is sole authority on status
-        if let Some(esj) = execution_steps_json {
-            input = input.with_execution_steps_json(esj);
-        }
+            .with_workflow_type("unified");
         if let Err(e) = state.app_state.checkpoint_db.create_task_run(&input) {
             warn!(
                 "Failed to create task_run for unified workflow {}: {}",
                 execution_id, e
             );
         }
-
-        // Separate completion steps into automation and prompt steps
-        let (completion_automation_steps, completion_prompt_steps) =
-            categorize_steps(completion_steps, |s| &s.step_type);
 
         // For error-fix workflows, run agentic first
         let run_agentic_first = !workflow.targeted_error_ids.is_empty();
@@ -1759,21 +1466,19 @@ pub async fn run_unified_workflow(
             workflow_id: workflow.id.clone(),
             execution_id: execution_id.clone(),
             targeted_error_ids: workflow.targeted_error_ids.clone(),
-            starting_iteration: 0, // Fresh start
+            starting_iteration: 0,
             run_agentic_first,
             artifact_dir: None,
             is_dev_mode: cfg!(debug_assertions),
             enable_sweep: workflow.enable_sweep,
             max_sweep_iterations: workflow.max_sweep_iterations,
-            stages: Vec::new(),
-            stop_on_failure: false,
+            stages,
+            stop_on_failure: workflow.stop_on_failure,
             provider_override: None,
             model_override: None,
             stage_index: None,
         };
 
-        // Spawn execution in background (non-blocking) — same pattern as
-        // generate_unified_workflow_async_handler
         let checkpoint_db = state.app_state.checkpoint_db.clone();
         let execution_id_for_guard = execution_id.clone();
         let workflow_name_for_guard = workflow.name.clone();
@@ -1804,12 +1509,12 @@ pub async fn run_unified_workflow(
                 controller
                     .run(
                         loop_config,
-                        setup_automation_steps,
-                        setup_prompt_steps,
-                        verification_steps,
-                        agentic_steps,
-                        completion_automation_steps,
-                        completion_prompt_steps,
+                        Vec::new(), // No top-level steps — all in stages
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
                     )
                     .await
             },
@@ -1820,15 +1525,25 @@ pub async fn run_unified_workflow(
         })));
     }
 
-    // No prompt steps - use step_executor for automation-only workflow
-    // Create a task_run record so the workflow shows in the Active page
-    // Serialize full step configuration so re-execution on resume has all fields
-    let execution_steps_json = serde_json::to_string(&automation_steps).ok();
+    // No prompt steps - automation-only workflow
+    // Still normalize to stages, but use step executor for simple execution
+    let execution_steps_json = {
+        let all_auto_steps: Vec<_> = stages
+            .iter()
+            .flat_map(|s| {
+                s.setup_automation_steps
+                    .iter()
+                    .chain(s.verification_steps.iter())
+                    .chain(s.completion_automation_steps.iter())
+            })
+            .cloned()
+            .collect();
+        serde_json::to_string(&all_auto_steps).ok()
+    };
 
-    // Create task_run to track this execution (enables Active page monitoring)
     let mut input = CreateTaskRunInput::new(&execution_id, &workflow.name)
-        .with_task_type("automation") // identifies as automation task
-        .with_workflow_name(&workflow.name); // helps identify this in the dashboard
+        .with_task_type("automation")
+        .with_workflow_name(&workflow.name);
     if let Some(esj) = execution_steps_json {
         input = input.with_execution_steps_json(esj);
     }
@@ -1839,7 +1554,6 @@ pub async fn run_unified_workflow(
         );
     }
 
-    // Spawn automation execution in background (non-blocking)
     let response_task_run_id = execution_id.clone();
     let checkpoint_db = state.app_state.checkpoint_db.clone();
     let execution_id_for_guard = execution_id.clone();
@@ -1861,6 +1575,17 @@ pub async fn run_unified_workflow(
                 app_handle,
             );
 
+            // Collect all automation steps from stages
+            let automation_steps: Vec<_> = stages
+                .into_iter()
+                .flat_map(|s| {
+                    s.setup_automation_steps
+                        .into_iter()
+                        .chain(s.verification_steps.into_iter())
+                        .chain(s.completion_automation_steps.into_iter())
+                })
+                .collect();
+
             let result = executor
                 .execute_steps_with_log_sources(&automation_steps, &execution_id, &[])
                 .await;
@@ -1870,7 +1595,6 @@ pub async fn run_unified_workflow(
                 result.successful_steps, result.total_steps
             );
 
-            // Update task_run status based on result
             if result.success {
                 if let Err(e) = app_state.checkpoint_db.complete_task_run(&execution_id) {
                     warn!(
@@ -2549,13 +2273,29 @@ pub async fn run_composed_workflow(
     // Create a single task run for the composed workflow
     let execution_id = format!("composed-run-{}", chrono::Utc::now().timestamp_millis());
 
-    // Build StageConfig entries from the fetched workflows
-    let total = workflows.len();
-    let stages: Vec<crate::unified_workflow_executor::StageConfig> = workflows
+    // Build StageConfig entries — normalize each workflow to its stages first,
+    // then flatten. A 2-stage workflow + a 3-stage workflow = 5 stages total.
+    let all_normalized_stages: Vec<(
+        crate::unified_workflows::WorkflowStage,
+        &crate::unified_workflows::UnifiedWorkflow,
+    )> = workflows
+        .iter()
+        .flat_map(|w| w.normalize_to_stages().into_iter().map(move |s| (s, w)))
+        .collect();
+    let total = all_normalized_stages.len();
+    let stages: Vec<crate::unified_workflow_executor::StageConfig> = all_normalized_stages
         .iter()
         .enumerate()
-        .map(|(idx, workflow)| {
-            crate::unified_workflows::workflow_to_stage_config(workflow, idx, total, true)
+        .map(|(idx, (stage, workflow))| {
+            crate::unified_workflows::stage_to_stage_config(
+                stage,
+                idx,
+                total,
+                workflow.preflight_check_enabled,
+                workflow.log_watch_enabled,
+                workflow.health_check_enabled,
+                &workflow.health_check_urls,
+            )
         })
         .collect();
 

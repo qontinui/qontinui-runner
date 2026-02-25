@@ -47,6 +47,7 @@ import type {
   UnifiedWorkflow,
   PromptStep,
   WorkflowStep,
+  WorkflowStage,
 } from "@qontinui/schemas/unified_workflow";
 
 // =============================================================================
@@ -470,4 +471,35 @@ export function canStepExistInPhase(stepType: UnifiedStep["type"], phase: Workfl
     default:
       return false;
   }
+}
+
+// =============================================================================
+// Phase Normalization Helpers
+// =============================================================================
+
+/** Convert any workflow to its phases (stages) representation */
+export function normalizeToPhases(workflow: UnifiedWorkflow): WorkflowStage[] {
+  if (workflow.stages && workflow.stages.length > 0) {
+    return workflow.stages;
+  }
+  return [
+    {
+      id: workflow.id + "-phase-1",
+      name: workflow.name,
+      description: workflow.description,
+      setup_steps: workflow.setup_steps,
+      verification_steps: workflow.verification_steps,
+      agentic_steps: workflow.agentic_steps,
+      completion_steps: workflow.completion_steps ?? [],
+      max_iterations: workflow.max_iterations,
+      timeout_seconds: workflow.timeout_seconds,
+      provider: workflow.provider,
+      model: workflow.model,
+    },
+  ];
+}
+
+/** Get the number of phases in a workflow */
+export function getPhaseCount(workflow: UnifiedWorkflow): number {
+  return normalizeToPhases(workflow).length;
 }

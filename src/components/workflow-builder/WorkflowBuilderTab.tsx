@@ -1104,7 +1104,7 @@ function WorkflowBuilderContent({
   );
 
   // Handler to open the prompt library picker
-  const handleOpenPromptLibrary = useCallback((phase: WorkflowPhase) => {
+  const _handleOpenPromptLibrary = useCallback((phase: WorkflowPhase) => {
     setPromptPickerPhase(phase);
     setPromptPickerOpen(true);
   }, []);
@@ -1137,7 +1137,7 @@ function WorkflowBuilderContent({
   );
 
   // Handler to open the shell command library picker
-  const handleOpenShellCommandLibrary = useCallback((phase: WorkflowPhase) => {
+  const _handleOpenShellCommandLibrary = useCallback((phase: WorkflowPhase) => {
     setShellCommandPickerPhase(phase);
     setShellCommandPickerOpen(true);
   }, []);
@@ -1165,7 +1165,7 @@ function WorkflowBuilderContent({
   );
 
   // Handler to open the check library picker
-  const handleOpenCheckLibrary = useCallback((phase: WorkflowPhase) => {
+  const _handleOpenCheckLibrary = useCallback((phase: WorkflowPhase) => {
     setCheckPickerPhase(phase);
     setCheckPickerOpen(true);
   }, []);
@@ -1220,7 +1220,7 @@ function WorkflowBuilderContent({
   );
 
   // Handler to open the test library picker
-  const handleOpenTestLibrary = useCallback((phase: WorkflowPhase) => {
+  const _handleOpenTestLibrary = useCallback((phase: WorkflowPhase) => {
     setTestPickerPhase(phase);
     setTestPickerOpen(true);
   }, []);
@@ -1270,7 +1270,7 @@ function WorkflowBuilderContent({
   );
 
   // Handler to open the check group library picker
-  const handleOpenCheckGroupLibrary = useCallback((phase: WorkflowPhase) => {
+  const _handleOpenCheckGroupLibrary = useCallback((phase: WorkflowPhase) => {
     setCheckGroupPickerPhase(phase);
     setCheckGroupPickerOpen(true);
   }, []);
@@ -1306,7 +1306,7 @@ function WorkflowBuilderContent({
   );
 
   // Handler to open the MCP server tool picker
-  const handleOpenMcpServerToolPicker = useCallback((phase: WorkflowPhase) => {
+  const _handleOpenMcpServerToolPicker = useCallback((phase: WorkflowPhase) => {
     setMcpPickerPhase(phase);
     setMcpPickerOpen(true);
   }, []);

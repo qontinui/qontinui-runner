@@ -859,6 +859,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Doctor health monitoring commands
             doctor::commands::doctor_get_status,
             doctor::commands::stop_process_by_pid,
+            // Cloud relay commands (remote mobile access via backend WebSocket)
+            mcp::backend_relay::commands::start_cloud_relay,
+            mcp::backend_relay::commands::stop_cloud_relay,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");
@@ -1059,6 +1062,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 embedding_db,
                 database::embedding_jobs::EmbeddingJobConfig::default(),
             );
+
+            // Auto-start cloud relay if configured
+            {
+                let relay_settings = crate::settings::load_settings().cloud_relay;
+                if relay_settings.enabled && relay_settings.auto_connect {
+                    info!("Cloud relay enabled and auto-connect configured, but auth token not yet available at startup");
+                    // The relay will be started via the start_cloud_relay Tauri command after user authentication
+                }
+            }
 
             info!("Tauri application setup complete");
             Ok(())

@@ -18,6 +18,7 @@ pub mod app_discovery;
 pub mod automation_runs;
 pub mod awas;
 pub mod awas_bridge;
+pub mod backend_relay;
 pub mod checkpoints;
 pub mod checks;
 pub mod configs;

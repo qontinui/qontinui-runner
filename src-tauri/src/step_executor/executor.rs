@@ -3669,23 +3669,32 @@ impl StepExecutor {
         use tokio::process::Command;
         use tokio::time::{timeout, Duration};
 
-        // Get the command template - either directly or from shell_command_id (not implemented yet)
+        // Get the command template - either directly or by looking up shell_command_id from database
         let template_command = match &step.shell_command {
             Some(cmd) => cmd.clone(),
             None => {
                 // If no direct command, check for shell_command_id
-                if let Some(_id) = &step.shell_command_id {
-                    // TODO: Look up saved shell command by ID from database
-                    return (
-                        false,
-                        Some(
-                            "Shell command lookup by ID not yet implemented in step executor"
-                                .to_string(),
-                        ),
-                        None,
-                    );
+                if let Some(id) = &step.shell_command_id {
+                    match self.app_state.checkpoint_db.get_shell_command(id) {
+                        Ok(Some(cmd)) => cmd.command,
+                        Ok(None) => {
+                            return (
+                                false,
+                                Some(format!("Shell command not found: {}", id)),
+                                None,
+                            );
+                        }
+                        Err(e) => {
+                            return (
+                                false,
+                                Some(format!("Failed to look up shell command {}: {}", id, e)),
+                                None,
+                            );
+                        }
+                    }
+                } else {
+                    return (false, Some("No shell command specified".to_string()), None);
                 }
-                return (false, Some("No shell command specified".to_string()), None);
             }
         };
 

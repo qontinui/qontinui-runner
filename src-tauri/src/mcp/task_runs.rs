@@ -4,7 +4,7 @@
 //! CRUD, workflow state, execution control, event queries,
 //! verification results, knowledge, screenshots, and more.
 
-use axum::{extract::State, http::StatusCode, response::Json};
+use axum::{extract::State, http::StatusCode, response::sse::Sse, response::Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -224,18 +224,33 @@ pub async fn get_workflow_state(
         .get_workflow_execution_state(&id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    // Try to get max_iterations from the workflow definition
-    let max_iterations = if let Some(ref workflow_name) = task_run.workflow_name {
+    // Try to get workflow definition for max_iterations and verification info
+    let workflow_def = if let Some(ref workflow_name) = task_run.workflow_name {
         state
             .app_state
             .checkpoint_db
             .get_unified_workflow_by_name(workflow_name)
             .ok()
             .flatten()
-            .map(|w| w.max_iterations)
     } else {
         None
     };
+    let max_iterations = workflow_def.as_ref().map(|w| w.max_iterations);
+
+    // Check if a verification plan exists:
+    // 1. Unified workflows: check if verification_steps is non-empty
+    // 2. Orchestrator workflows: check if a verification_plan record exists
+    let has_verification_plan = workflow_def
+        .as_ref()
+        .map(|w| !w.verification_steps.is_empty())
+        .unwrap_or(false)
+        || state
+            .app_state
+            .checkpoint_db
+            .get_latest_verification_plan(&id)
+            .ok()
+            .flatten()
+            .is_some();
 
     if let Some(ws) = explicit_state {
         // Return explicit state
@@ -249,6 +264,7 @@ pub async fn get_workflow_state(
             "completion_complete" | "failed" | "stopped"
         );
         let is_stopped = ws.state_name == "stopped";
+        let is_paused = ws.state_name == "paused";
 
         // Map state name to stage for UI
         let (workflow_stage, workflow_stage_display) = state_name_to_stage(&ws.state_name);
@@ -286,8 +302,8 @@ pub async fn get_workflow_state(
             max_iterations,
             is_complete: is_terminal,
             is_stopped,
-            is_paused: false,             // TODO: Track paused state
-            has_verification_plan: false, // TODO: Check if verification plan exists
+            is_paused,
+            has_verification_plan,
             workflow_start_time: task_run.created_at,
             state_data,
             workflow_stage,
@@ -303,12 +319,13 @@ pub async fn get_workflow_state(
             .clone()
             .unwrap_or_else(|| "legacy_session".to_string());
 
-        let (current_state, is_complete, is_stopped) = match task_run.status.as_str() {
-            "running" => ("running".to_string(), false, false),
-            "complete" => ("complete".to_string(), true, false),
-            "failed" => ("failed".to_string(), true, false),
-            "stopped" => ("stopped".to_string(), true, true),
-            other => (other.to_string(), false, false),
+        let (current_state, is_complete, is_stopped, is_paused) = match task_run.status.as_str() {
+            "running" => ("running".to_string(), false, false, false),
+            "complete" => ("complete".to_string(), true, false, false),
+            "failed" => ("failed".to_string(), true, false, false),
+            "stopped" => ("stopped".to_string(), true, true, false),
+            "paused" => ("paused".to_string(), false, false, true),
+            other => (other.to_string(), false, false, false),
         };
 
         Ok(Json(WorkflowStateResponse {
@@ -320,8 +337,8 @@ pub async fn get_workflow_state(
             max_iterations,
             is_complete,
             is_stopped,
-            is_paused: false,
-            has_verification_plan: false,
+            is_paused,
+            has_verification_plan,
             workflow_start_time: task_run.created_at,
             state_data: None,
             workflow_stage: None,
@@ -2761,6 +2778,258 @@ pub async fn get_current_execution_batch(
 }
 
 // ============================================================================
+// Remote Control / Mobile Chat Endpoints
+// ============================================================================
+
+/// SSE stream of AI output scoped to a specific task run.
+///
+/// Provides real-time AI conversation output for mobile/remote clients.
+/// Includes initial catchup (current session state + recent output).
+pub async fn sse_ai_output_for_task_run(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Sse<
+    impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+> {
+    use axum::response::sse::{Event, KeepAlive};
+    use futures_util::StreamExt as FuturesStreamExt;
+    use tokio_stream::wrappers::BroadcastStream;
+
+    let task_run_id = id.clone();
+    info!(
+        "SSE ai-output client connected for task_run_id={}",
+        task_run_id
+    );
+
+    // Send initial catchup as first events
+    let mut catchup_events: Vec<Result<Event, std::convert::Infallible>> = Vec::new();
+
+    // 1. Current session state
+    let session_manager: Option<Arc<crate::claude_session::SessionManager>> = state
+        .app_handle
+        .try_state::<Arc<crate::claude_session::SessionManager>>()
+        .map(|s| s.inner().clone());
+
+    if let Some(sm) = &session_manager {
+        if let Some(session) = sm.get(&task_run_id) {
+            let state_data = serde_json::json!({
+                "type": "session_state",
+                "taskRunId": task_run_id,
+                "state": session.state().as_event_str(),
+                "canSend": session.state().can_send_message(),
+                "canInterrupt": session.state().can_interrupt(),
+                "userInteracted": session.has_user_interacted(),
+            });
+            if let Ok(json_str) = serde_json::to_string(&state_data) {
+                catchup_events.push(Ok(Event::default()
+                    .event("catchup/session_state")
+                    .data(json_str)));
+            }
+        }
+    }
+
+    // 2. Recent output text
+    let db = state.app_state.checkpoint_db.clone();
+    let id_for_output = task_run_id.clone();
+    if let Ok(Some(task_run)) = tokio::task::spawn_blocking(move || db.get_task_run(&id_for_output))
+        .await
+        .unwrap_or(Ok(None))
+    {
+        let output = &task_run.output_log;
+        if !output.is_empty() {
+            let tail = if output.len() > 5000 {
+                &output[output.len() - 5000..]
+            } else {
+                output.as_str()
+            };
+            let output_data = serde_json::json!({
+                "type": "output_catchup",
+                "taskRunId": task_run_id,
+                "text": tail,
+            });
+            if let Ok(json_str) = serde_json::to_string(&output_data) {
+                catchup_events.push(Ok(Event::default().event("catchup/output").data(json_str)));
+            }
+        }
+    }
+
+    // Subscribe to broadcast channel
+    let event_rx = state.app_state.event_broadcast.subscribe();
+    let filter_id = task_run_id.clone();
+
+    // Filter broadcast events to only this task run's ai-output and session-state
+    let live_stream = FuturesStreamExt::filter_map(BroadcastStream::new(event_rx), move |result| {
+        let filter_id = filter_id.clone();
+        async move {
+            match result {
+                Ok(event) => {
+                    let channel = event.get("channel").and_then(|v| v.as_str()).unwrap_or("");
+                    if channel != "ai-output" && channel != "session-state" {
+                        return None;
+                    }
+
+                    // Check taskRunId in payload matches
+                    let payload = event.get("payload")?;
+                    let event_task_run_id = payload
+                        .get("taskRunId")
+                        .or_else(|| payload.get("task_run_id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    if event_task_run_id != filter_id {
+                        return None;
+                    }
+
+                    match serde_json::to_string(payload) {
+                        Ok(json_str) => {
+                            let event_name = format!("chat/{}", channel);
+                            Some(Ok(Event::default().event(event_name).data(json_str)))
+                        }
+                        Err(_) => None,
+                    }
+                }
+                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                    Some(Ok(Event::default().event("chat/warning").data(format!(
+                        "{{\"message\":\"Skipped {} events due to lag\"}}",
+                        n
+                    ))))
+                }
+            }
+        }
+    });
+
+    // Combine catchup events with live stream
+    let catchup_stream = futures_util::stream::iter(catchup_events);
+    let combined = catchup_stream.chain(live_stream);
+
+    Sse::new(combined).keep_alive(KeepAlive::default())
+}
+
+/// Request body for creating an ad-hoc chat session.
+#[derive(Debug, Deserialize)]
+pub struct CreateChatRequest {
+    /// Name for the chat session
+    #[serde(default = "default_chat_name")]
+    task_name: String,
+}
+
+fn default_chat_name() -> String {
+    "Ad-hoc Chat".to_string()
+}
+
+/// Create an ad-hoc chat session not tied to a workflow.
+///
+/// Creates a task_run record and spawns a new AI session.
+pub async fn create_chat_session(
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<CreateChatRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    info!("Creating ad-hoc chat session: {}", req.task_name);
+
+    let task_run_id = uuid::Uuid::new_v4().to_string();
+
+    // Create task run record using builder pattern
+    let db = state.app_state.checkpoint_db.clone();
+    let id_clone = task_run_id.clone();
+    let name_clone = req.task_name.clone();
+    tokio::task::spawn_blocking(move || {
+        let input = CreateTaskRunInput::new(id_clone, name_clone)
+            .with_prompt("Ad-hoc chat session")
+            .with_workflow_type("chat");
+        db.create_task_run(&input)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Get SessionManager and spawn a new session
+    let session_manager: Arc<crate::claude_session::SessionManager> = state
+        .app_handle
+        .state::<Arc<crate::claude_session::SessionManager>>()
+        .inner()
+        .clone();
+
+    // Determine working directory (use parent of runner project)
+    let working_dir = std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+
+    let system_prompt = "You are an AI assistant in a chat session initiated from the qontinui \
+        mobile app. Respond helpfully and conversationally. The user may ask about anything — \
+        workflows, automation, code questions, or general topics."
+        .to_string();
+
+    // Spawn the Claude session
+    match crate::claude_session::ClaudeSession::spawn(
+        &working_dir,
+        &task_run_id,
+        &state.app_handle,
+        None, // session_ctx
+        None, // finding_ctx
+        None, // progress_ctx
+        None, // pid_tracker
+    ) {
+        Ok(session) => {
+            let session = Arc::new(session);
+
+            // Register with session manager
+            if let Err(e) = session_manager.register(&task_run_id, session.clone()) {
+                warn!("Failed to register chat session: {}", e);
+                return Ok(Json(serde_json::json!({
+                    "id": task_run_id,
+                    "task_name": req.task_name,
+                    "state": "error",
+                    "error": format!("Session registration failed: {}", e)
+                })));
+            }
+
+            // Emit initial ready state
+            crate::commands::ai_chat::emit_session_state(
+                &state.app_handle,
+                &task_run_id,
+                &task_run_id,
+                session.state(),
+            );
+
+            // Send the system prompt as initial prompt
+            if let Err(e) = session.send_initial_prompt(&system_prompt) {
+                warn!("Failed to send initial prompt for chat session: {}", e);
+                return Ok(Json(serde_json::json!({
+                    "id": task_run_id,
+                    "task_name": req.task_name,
+                    "state": "error",
+                    "error": format!("Failed to send initial prompt: {}", e)
+                })));
+            }
+
+            // Emit processing state
+            crate::commands::ai_chat::emit_session_state(
+                &state.app_handle,
+                &task_run_id,
+                &task_run_id,
+                session.state(),
+            );
+
+            info!("Chat session created: task_run_id={}", task_run_id);
+            Ok(Json(serde_json::json!({
+                "id": task_run_id,
+                "task_name": req.task_name,
+                "state": "ready"
+            })))
+        }
+        Err(e) => {
+            warn!("Failed to create chat session: {}", e);
+            Ok(Json(serde_json::json!({
+                "id": task_run_id,
+                "task_name": req.task_name,
+                "state": "error",
+                "error": format!("Session creation failed: {}", e)
+            })))
+        }
+    }
+}
+
+// ============================================================================
 // End Task Run HTTP API Handlers
 // ============================================================================
 
@@ -2770,6 +3039,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     axum::Router::new()
         .route("/task-runs", get(list_task_runs).post(create_task_run))
         .route("/task-runs/running", get(list_running_task_runs))
+        .route("/task-runs/chat", post(create_chat_session))
         .route("/task-runs/:id", get(get_task_run).delete(delete_task_run))
         .route("/task-runs/:id/output", get(get_task_output))
         .route("/task-runs/:id/workflow-state", get(get_workflow_state))
@@ -2816,6 +3086,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         )
         .route("/task-runs/:id/message", post(send_message_to_session))
         .route("/task-runs/:id/session-state", get(get_session_state))
+        .route(
+            "/task-runs/:id/stream/ai-output",
+            get(sse_ai_output_for_task_run),
+        )
         .route("/current-execution/steps", get(get_current_execution_steps))
         .route("/current-execution/batch", get(get_current_execution_batch))
 }

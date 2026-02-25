@@ -199,6 +199,8 @@ export function AiGeneratePanel({
   const [specState, setSpecState] = useState<SpecSourceState>({
     discoveredSpecs: [],
     selectedGroupIds: new Set(),
+    discoveredPages: [],
+    selectedPageUrls: new Set(),
   });
   const hasSpecs = specState.discoveredSpecs.length > 0 && specState.selectedGroupIds.size > 0;
 
@@ -389,33 +391,22 @@ export function AiGeneratePanel({
     }
   };
 
-  const buildGenerateRequest = useCallback(() => {
+  // Batch mode: multiple pages selected
+  const isBatchMode = specState.selectedPageUrls.size > 1;
+  const batchPageCount = specState.selectedPageUrls.size;
+
+  /** Build the base request (everything except description). */
+  const buildBaseRequest = useCallback(() => {
     const tags = tagsInput
       .split(",")
       .map((t) => t.trim())
       .filter(Boolean);
 
-    // Build combined description: spec prompt + user description
-    let fullDescription = "";
-    if (specState.discoveredSpecs.length > 0 && specState.selectedGroupIds.size > 0) {
-      const specResult = buildSemanticSpecPrompt({
-        discoveredSpecs: specState.discoveredSpecs,
-        selectedGroupIds: specState.selectedGroupIds,
-      });
-      fullDescription = specResult.prompt;
-      if (description.trim()) {
-        fullDescription += `\n\n## Additional Instructions\n${description.trim()}`;
-      }
-      if (!tags.includes("spec-generated")) {
-        tags.push("spec-generated");
-      }
-    } else {
-      fullDescription = description.trim();
+    if (hasSpecs && !tags.includes("spec-generated")) {
+      tags.push("spec-generated");
     }
 
-    const request: Record<string, unknown> = {
-      description: fullDescription,
-    };
+    const request: Record<string, unknown> = {};
     if (category.trim()) request.category = category.trim();
     if (tags.length > 0) request.tags = tags;
     if (selectedContextIds.length > 0) request.context_ids = selectedContextIds;
@@ -429,7 +420,6 @@ export function AiGeneratePanel({
 
     return request;
   }, [
-    description,
     tagsInput,
     category,
     selectedContextIds,
@@ -440,30 +430,102 @@ export function AiGeneratePanel({
     maxFixIterations,
     autoIncludeContexts,
     discoveryMode,
-    specState,
+    hasSpecs,
   ]);
 
+  /** Build a single request (non-batch or fallback). */
+  const buildGenerateRequest = useCallback(() => {
+    const base = buildBaseRequest();
+
+    let fullDescription = "";
+    if (specState.discoveredSpecs.length > 0 && specState.selectedGroupIds.size > 0) {
+      const specResult = buildSemanticSpecPrompt({
+        discoveredSpecs: specState.discoveredSpecs,
+        selectedGroupIds: specState.selectedGroupIds,
+      });
+      fullDescription = specResult.prompt;
+      if (description.trim()) {
+        fullDescription += `\n\n## Additional Instructions\n${description.trim()}`;
+      }
+    } else {
+      fullDescription = description.trim();
+    }
+
+    return { ...base, description: fullDescription };
+  }, [buildBaseRequest, description, specState]);
+
+  /** Build one request per selected page (batch mode). */
+  const buildBatchRequests = useCallback(() => {
+    const base = buildBaseRequest();
+    const requests: Record<string, unknown>[] = [];
+
+    for (const pageUrl of specState.selectedPageUrls) {
+      // Filter specs belonging to this page
+      const pageSpecs = specState.discoveredSpecs.filter(
+        (s) => (s.config.metadata?.pageUrl || s.specId) === pageUrl,
+      );
+      if (pageSpecs.length === 0) continue;
+
+      // Filter selectedGroupIds to only groups in this page's specs
+      const pageGroupIds = new Set<string>();
+      for (const spec of pageSpecs) {
+        for (const group of spec.config.groups) {
+          if (specState.selectedGroupIds.has(group.id)) {
+            pageGroupIds.add(group.id);
+          }
+        }
+      }
+      if (pageGroupIds.size === 0) continue;
+
+      const specResult = buildSemanticSpecPrompt({
+        discoveredSpecs: pageSpecs,
+        selectedGroupIds: pageGroupIds,
+      });
+
+      let fullDescription = specResult.prompt;
+      if (description.trim()) {
+        fullDescription += `\n\n## Additional Instructions\n${description.trim()}`;
+      }
+
+      requests.push({ ...base, description: fullDescription });
+    }
+
+    return requests;
+  }, [buildBaseRequest, description, specState]);
+
   const canGenerate = description.trim() || hasSpecs;
+
+  /** Fire a single generate-async request and return the task_run_id. */
+  const fireGenerateRequest = async (request: Record<string, unknown>): Promise<string> => {
+    const resp = await fetch(`${API_BASE}/unified-workflows/generate-async`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(request),
+    });
+    const json = await resp.json();
+    if (!resp.ok) {
+      throw new Error(json.error || `HTTP ${resp.status}`);
+    }
+    const data = json.data ?? json;
+    return data.task_run_id as string;
+  };
 
   const handleGenerate = async () => {
     if (!canGenerate) return;
     setSubmittingAction("generate");
     setError(null);
     try {
-      const resp = await fetch(`${API_BASE}/unified-workflows/generate-async`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(buildGenerateRequest()),
-      });
-      const json = await resp.json();
-      if (!resp.ok) {
-        throw new Error(json.error || `HTTP ${resp.status}`);
+      if (isBatchMode) {
+        const requests = buildBatchRequests();
+        const results = await Promise.all(requests.map(fireGenerateRequest));
+        console.log(`[AiGeneratePanel] Batch generation started: ${results.length} pages`);
+      } else {
+        const taskRunId = await fireGenerateRequest(buildGenerateRequest());
+        console.log("[AiGeneratePanel] Generation started:", taskRunId);
       }
-      const data = json.data ?? json;
       if (description.trim()) {
         autoSaveGenerationPrompt(description); // fire-and-forget
       }
-      console.log("[AiGeneratePanel] Generation started:", data.task_run_id);
       onNavigateToActiveRuns();
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Failed to start workflow generation";
@@ -479,27 +541,34 @@ export function AiGeneratePanel({
     setSubmittingAction("generate-and-run");
     setError(null);
     try {
-      const resp = await fetch(`${API_BASE}/unified-workflows/generate-async`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(buildGenerateRequest()),
-      });
-      const json = await resp.json();
-      if (!resp.ok) {
-        throw new Error(json.error || `HTTP ${resp.status}`);
+      if (isBatchMode) {
+        const requests = buildBatchRequests();
+        const results = await Promise.all(requests.map(fireGenerateRequest));
+        // Signal auto-run for the first workflow; others are generate-only
+        if (results.length > 0) {
+          localStorage.setItem(
+            AUTO_RUN_AFTER_GENERATE_KEY,
+            JSON.stringify({
+              taskRunId: results[0],
+              timestamp: Date.now(),
+            } satisfies AutoRunAfterGenerate),
+          );
+        }
+        console.log(`[AiGeneratePanel] Batch Generate & Run started: ${results.length} pages`);
+      } else {
+        const taskRunId = await fireGenerateRequest(buildGenerateRequest());
+        localStorage.setItem(
+          AUTO_RUN_AFTER_GENERATE_KEY,
+          JSON.stringify({
+            taskRunId,
+            timestamp: Date.now(),
+          } satisfies AutoRunAfterGenerate),
+        );
+        console.log("[AiGeneratePanel] Generate & Run started:", taskRunId);
       }
-      const data = json.data ?? json;
       if (description.trim()) {
         autoSaveGenerationPrompt(description); // fire-and-forget
       }
-      localStorage.setItem(
-        AUTO_RUN_AFTER_GENERATE_KEY,
-        JSON.stringify({
-          taskRunId: data.task_run_id,
-          timestamp: Date.now(),
-        } satisfies AutoRunAfterGenerate),
-      );
-      console.log("[AiGeneratePanel] Generate & Run started:", data.task_run_id);
       onNavigateToActiveRuns();
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Failed to start workflow generation";
@@ -973,7 +1042,11 @@ export function AiGeneratePanel({
             ) : (
               <Sparkles className="w-4 h-4" />
             )}
-            {submittingAction === "generate" ? "Starting..." : "Generate"}
+            {submittingAction === "generate"
+              ? "Starting..."
+              : isBatchMode
+                ? `Generate (${batchPageCount} pages)`
+                : "Generate"}
           </button>
           <button
             onClick={handleGenerateAndRun}
@@ -985,7 +1058,11 @@ export function AiGeneratePanel({
             ) : (
               <Play className="w-4 h-4" />
             )}
-            {submittingAction === "generate-and-run" ? "Starting..." : "Generate & Run"}
+            {submittingAction === "generate-and-run"
+              ? "Starting..."
+              : isBatchMode
+                ? `Generate & Run (${batchPageCount} pages)`
+                : "Generate & Run"}
           </button>
         </div>
       </div>

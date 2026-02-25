@@ -695,6 +695,38 @@ impl Default for DebugSettings {
     }
 }
 
+// ============================================================================
+// Cloud Relay Settings
+// ============================================================================
+
+/// Cloud relay settings for remote mobile access via backend WebSocket
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudRelaySettings {
+    /// Whether cloud relay is enabled
+    #[serde(default)]
+    pub enabled: bool,
+    /// Backend URL to connect to
+    #[serde(default = "default_backend_url")]
+    pub backend_url: String,
+    /// Auto-connect on app startup
+    #[serde(default)]
+    pub auto_connect: bool,
+}
+
+fn default_backend_url() -> String {
+    "https://qontinui.io".to_string()
+}
+
+impl Default for CloudRelaySettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backend_url: default_backend_url(),
+            auto_connect: false,
+        }
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -742,6 +774,9 @@ pub struct Settings {
     /// App mode: "simple" or "advanced" — synced across runner and web apps
     #[serde(default = "default_app_mode")]
     pub app_mode: String,
+    /// Cloud relay settings for remote mobile access via backend WebSocket
+    #[serde(default)]
+    pub cloud_relay: CloudRelaySettings,
 }
 
 fn default_auto_load_last_config() -> bool {

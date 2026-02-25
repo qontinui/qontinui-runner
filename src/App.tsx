@@ -142,7 +142,6 @@ import { AiDataViewerTab } from "./components/run-logs/AiDataViewerTab";
 import { RunRecapTab } from "./components/run-recap";
 import { useTaskRuns } from "./hooks/useAiData";
 // Page Sweep builder
-import { PageSweepTab } from "./components/page-sweep";
 // Configure components
 import { ExternalLogsTab as _ExternalLogsTab } from "./components/ExternalLogsTab";
 import { CategoryManager } from "./components/findings/CategoryManager";
@@ -190,7 +189,6 @@ type MainTabId =
   | "monitor-discoveries"
   | "library"
   | "unified-workflow-builder"
-  | "page-sweep"
   | "capture"
   | "config-log-sources"
   | "config-findings"
@@ -292,6 +290,7 @@ function migrateTabId(stored: string | null): MainTabId {
     extract: "capture",
     "live-page-generator": "unified-workflow-builder", // Spec discovery now in AI Generate panel
     "spec-discovery": "unified-workflow-builder", // Spec discovery now in AI Generate panel
+    "page-sweep": "unified-workflow-builder", // Page Sweep removed, multi-page now in SpecSourceSection
     // Old observe tab migrations to new structure
     logs: "run-recap",
     "run-dashboard": "run-recap", // Dashboard merged into Summary (formerly Recap)
@@ -1096,13 +1095,6 @@ function AppContent() {
               editWorkflowId={editWorkflowId}
               onNavigateToActive={() => setActiveTab("active")}
             />
-          </div>
-        );
-
-      case "page-sweep":
-        return (
-          <div className="h-full overflow-hidden">
-            <PageSweepTab onLog={addLog} />
           </div>
         );
 

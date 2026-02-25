@@ -100,9 +100,7 @@ type WorkflowBuilderAction =
   | {
       type: "MOVE_STAGE";
       payload: { stageIndex: number; direction: "up" | "down" };
-    }
-  | { type: "ENABLE_STAGES" }
-  | { type: "DISABLE_STAGES" };
+    };
 
 // =============================================================================
 // Stage-Aware Helpers
@@ -188,6 +186,7 @@ function workflowBuilderReducer(
         workflow: action.payload,
         originalWorkflow: action.payload,
         selectedStepId: null,
+        currentStageIndex: action.payload.stages && action.payload.stages.length > 0 ? 0 : null,
       };
 
     case "UPDATE_WORKFLOW":
@@ -364,6 +363,41 @@ function workflowBuilderReducer(
 
     case "ADD_STAGE": {
       const existingStages = state.workflow.stages ?? [];
+      if (existingStages.length === 0) {
+        // Moving from single-phase to multi-phase: wrap top-level steps as Phase 1
+        const phase1: WorkflowStage = {
+          id: generateStepId(),
+          name: state.workflow.name || "Phase 1",
+          description: "",
+          setup_steps: state.workflow.setup_steps,
+          verification_steps: state.workflow.verification_steps,
+          agentic_steps: state.workflow.agentic_steps,
+          completion_steps: state.workflow.completion_steps ?? [],
+          max_iterations: state.workflow.max_iterations ?? 10,
+        };
+        const newStage: WorkflowStage = {
+          id: generateStepId(),
+          name: action.payload.name,
+          description: "",
+          setup_steps: [],
+          verification_steps: [],
+          agentic_steps: [],
+          completion_steps: [],
+          max_iterations: state.workflow.max_iterations ?? 10,
+        };
+        return {
+          ...state,
+          workflow: {
+            ...state.workflow,
+            stages: [phase1, newStage],
+            setup_steps: [],
+            verification_steps: [],
+            agentic_steps: [],
+            completion_steps: [],
+          },
+          currentStageIndex: 1, // Select the newly added phase
+        };
+      }
       const newStage: WorkflowStage = {
         id: generateStepId(),
         name: action.payload.name,
@@ -388,18 +422,37 @@ function workflowBuilderReducer(
       const { stageIndex } = action.payload;
       const stages = state.workflow.stages ?? [];
       if (stageIndex < 0 || stageIndex >= stages.length) return state;
+      if (stages.length <= 1) {
+        // Can't remove the last phase — this shouldn't happen with UI guard
+        return state;
+      }
       const newStages = stages.filter((_, i) => i !== stageIndex);
       let newCurrentStage = state.currentStageIndex;
-      if (newStages.length === 0) {
-        newCurrentStage = null;
-      } else if (newCurrentStage !== null && newCurrentStage >= newStages.length) {
+      if (newStages.length === 1) {
+        // Down to 1 phase — move steps back to top-level
+        const sole = newStages[0];
+        return {
+          ...state,
+          workflow: {
+            ...state.workflow,
+            stages: undefined,
+            setup_steps: sole.setup_steps ?? [],
+            verification_steps: sole.verification_steps ?? [],
+            agentic_steps: sole.agentic_steps ?? [],
+            completion_steps: sole.completion_steps ?? [],
+          },
+          currentStageIndex: null,
+          selectedStepId: null,
+        };
+      }
+      if (newCurrentStage !== null && newCurrentStage >= newStages.length) {
         newCurrentStage = newStages.length - 1;
       }
       return {
         ...state,
         workflow: {
           ...state.workflow,
-          stages: newStages.length > 0 ? newStages : undefined,
+          stages: newStages,
         },
         currentStageIndex: newCurrentStage,
         selectedStepId: null,
@@ -440,52 +493,6 @@ function workflowBuilderReducer(
         ...state,
         workflow: { ...state.workflow, stages: newStages },
         currentStageIndex: targetIndex,
-      };
-    }
-
-    case "ENABLE_STAGES": {
-      if (state.workflow.stages && state.workflow.stages.length > 0) return state;
-      // Move top-level steps into Stage 1
-      const stage1: WorkflowStage = {
-        id: generateStepId(),
-        name: "Stage 1",
-        setup_steps: state.workflow.setup_steps,
-        verification_steps: state.workflow.verification_steps,
-        agentic_steps: state.workflow.agentic_steps,
-        completion_steps: state.workflow.completion_steps ?? [],
-        max_iterations: state.workflow.max_iterations ?? 10,
-      };
-      return {
-        ...state,
-        workflow: {
-          ...state.workflow,
-          stages: [stage1],
-          setup_steps: [],
-          verification_steps: [],
-          agentic_steps: [],
-          completion_steps: [],
-        },
-        currentStageIndex: 0,
-      };
-    }
-
-    case "DISABLE_STAGES": {
-      const stages = state.workflow.stages ?? [];
-      if (stages.length === 0) return state;
-      // Move first stage's steps back to top level
-      const first = stages[0];
-      return {
-        ...state,
-        workflow: {
-          ...state.workflow,
-          stages: undefined,
-          setup_steps: first.setup_steps ?? [],
-          verification_steps: first.verification_steps ?? [],
-          agentic_steps: first.agentic_steps ?? [],
-          completion_steps: first.completion_steps ?? [],
-        },
-        currentStageIndex: null,
-        selectedStepId: null,
       };
     }
 
@@ -555,8 +562,6 @@ interface WorkflowBuilderContextValue {
   selectStage: (stageIndex: number | null) => void;
   updateStage: (stageIndex: number, updates: Partial<WorkflowStage>) => void;
   moveStage: (stageIndex: number, direction: "up" | "down") => void;
-  enableStages: () => void;
-  disableStages: () => void;
   getActiveSteps: (phase: WorkflowPhase) => UnifiedStep[];
 }
 
@@ -651,7 +656,10 @@ export function WorkflowBuilderProvider({
     // Restore originalWorkflow from storage to preserve update vs create state after app reload
     originalWorkflow: initialWorkflow ?? storedOriginalWorkflow ?? null,
     selectedStepId: null,
-    currentStageIndex: null,
+    currentStageIndex: (() => {
+      const wf = initialWorkflow ?? storedWorkflow ?? emptyWorkflow;
+      return wf.stages && wf.stages.length > 0 ? 0 : null;
+    })(),
     expandedPhases: {
       setup: true,
       verification: true,
@@ -795,14 +803,6 @@ export function WorkflowBuilderProvider({
 
   const moveStage = useCallback((stageIndex: number, direction: "up" | "down") => {
     dispatch({ type: "MOVE_STAGE", payload: { stageIndex, direction } });
-  }, []);
-
-  const enableStages = useCallback(() => {
-    dispatch({ type: "ENABLE_STAGES" });
-  }, []);
-
-  const disableStages = useCallback(() => {
-    dispatch({ type: "DISABLE_STAGES" });
   }, []);
 
   const getActiveSteps = useCallback(
@@ -997,8 +997,6 @@ export function WorkflowBuilderProvider({
     selectStage,
     updateStage,
     moveStage,
-    enableStages,
-    disableStages,
     getActiveSteps,
   };
 

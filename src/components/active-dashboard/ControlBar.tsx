@@ -6,16 +6,7 @@
  * and execution statistics.
  */
 
-import {
-  Play,
-  Pause,
-  Square,
-  Settings,
-  RotateCcw,
-  ToggleRight,
-  ToggleLeft,
-  Loader2,
-} from "lucide-react";
+import { Play, Pause, Square, RotateCcw, ToggleRight, ToggleLeft, Loader2 } from "lucide-react";
 import { useAutoContinue } from "../../contexts";
 import { Button, Badge } from "../ui";
 import type { ExecutionStatus } from "./types";
@@ -303,11 +294,11 @@ function StageIndicator({
   return (
     <div
       data-content-role="badge"
-      data-content-label={`Stage ${displayIndex}/${totalStages}${stageName ? `: ${stageName}` : ""}`}
+      data-content-label={`Phase ${displayIndex}/${totalStages}${stageName ? `: ${stageName}` : ""}`}
       className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md ${colors.bg} ${colors.text} ${colors.border} border ${isRunning ? "animate-phase-glow" : ""}`}
-      title={`Stage ${displayIndex} of ${totalStages}${stageName ? `: ${stageName}` : ""}`}
+      title={`Phase ${displayIndex} of ${totalStages}${stageName ? `: ${stageName}` : ""}`}
     >
-      <span className="opacity-60">Stage</span>
+      <span className="opacity-60">Phase</span>
       <span className="font-mono">{displayIndex}</span>
       <span className="opacity-60">/</span>
       <span className="font-mono opacity-80">{totalStages}</span>
@@ -467,15 +458,6 @@ export function ControlBar({
             className="border-border bg-muted hover:bg-muted/80"
           >
             <Square className="h-4 w-4" />
-          </Button>
-
-          <Button
-            data-ui-id="dashboard-settings-btn"
-            size="sm"
-            variant="outline"
-            className="ml-2 border-border bg-muted hover:bg-muted/80"
-          >
-            <Settings className="h-4 w-4" />
           </Button>
 
           {/* Auto-Continue Toggle */}

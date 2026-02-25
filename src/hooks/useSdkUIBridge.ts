@@ -308,6 +308,7 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
         return false;
       }
     },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
   );
 
@@ -412,6 +413,7 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
       setError(e instanceof Error ? e.message : "Switch failed");
       return false;
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // =========================================================================

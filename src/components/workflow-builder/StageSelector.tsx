@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from "react";
-import { Plus, Trash2, ChevronUp, ChevronDown, Layers, Settings2 } from "lucide-react";
+import { Plus, Trash2, ChevronUp, ChevronDown, Settings2 } from "lucide-react";
 import { Button } from "../ui/Button";
 import { Badge } from "../ui/Badge";
 import { useWorkflowBuilder } from "./WorkflowBuilderContext";
@@ -18,33 +18,45 @@ export function StageSelector() {
     selectStage,
     updateStage,
     moveStage,
-    enableStages,
-    disableStages,
     updateWorkflow,
   } = useWorkflowBuilder();
 
-  const stages = state.workflow.stages;
-  const hasStages = stages && stages.length > 0;
+  const stages = state.workflow.stages ?? [];
+  const hasStages = stages.length > 0;
+
+  // Always select first phase if nothing is selected and stages exist
+  React.useEffect(() => {
+    if (hasStages && currentStageIndex === null) {
+      selectStage(0);
+    }
+  }, [hasStages, currentStageIndex, selectStage]);
 
   if (!hasStages) {
+    // Single-phase workflow — show a single "Phase 1" tab
     return (
-      <div className="flex items-center gap-2 px-3 py-1.5 border-b border-zinc-800">
-        <Button
-          variant="ghost"
-          size="sm"
-          className="h-7 text-xs text-zinc-400 hover:text-zinc-200"
-          onClick={enableStages}
-        >
-          <Layers className="size-3 mr-1" />
-          Enable Multi-Stage
-        </Button>
+      <div className="border-b border-zinc-800">
+        <div className="flex items-center gap-1 px-2 py-1.5">
+          <button className="flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-medium bg-zinc-700 text-zinc-100 ring-1 ring-zinc-600">
+            <span className="text-[10px] text-zinc-500">1.</span>
+            <span className="max-w-[120px] truncate">{state.workflow.name || "Phase 1"}</span>
+          </button>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-7 px-2 text-xs text-zinc-400 hover:text-zinc-200 shrink-0"
+            onClick={() => addStage("Phase 2")}
+            title="Add phase"
+          >
+            <Plus className="size-3" />
+          </Button>
+        </div>
       </div>
     );
   }
 
   return (
     <div className="border-b border-zinc-800">
-      {/* Stage tabs */}
+      {/* Phase tabs */}
       <div className="flex items-center gap-1 px-2 py-1.5 overflow-x-auto">
         {stages.map((stage, index) => (
           <StageTab
@@ -60,7 +72,7 @@ export function StageSelector() {
             }
             onSelect={() => selectStage(index)}
             onRename={(name) => updateStage(index, { name })}
-            onRemove={() => removeStage(index)}
+            onRemove={stages.length > 1 ? () => removeStage(index) : undefined}
             onMoveUp={index > 0 ? () => moveStage(index, "up") : undefined}
             onMoveDown={index < stages.length - 1 ? () => moveStage(index, "down") : undefined}
           />
@@ -70,34 +82,27 @@ export function StageSelector() {
           variant="ghost"
           size="sm"
           className="h-7 px-2 text-xs text-zinc-400 hover:text-zinc-200 shrink-0"
-          onClick={() => addStage(`Stage ${stages.length + 1}`)}
+          onClick={() => addStage(`Phase ${stages.length + 1}`)}
         >
           <Plus className="size-3" />
         </Button>
 
-        <div className="ml-auto flex items-center gap-1.5 shrink-0">
-          <label className="flex items-center gap-1.5 text-[10px] text-zinc-500">
-            Stop on failure
-            <input
-              type="checkbox"
-              checked={state.workflow.stop_on_failure ?? false}
-              onChange={(e) => updateWorkflow({ stop_on_failure: e.target.checked })}
-              className="size-3"
-            />
-          </label>
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-6 px-1.5 text-[10px] text-zinc-500 hover:text-red-400"
-            onClick={disableStages}
-            title="Disable multi-stage (keeps Stage 1 steps)"
-          >
-            <Trash2 className="size-3" />
-          </Button>
-        </div>
+        {stages.length > 1 && (
+          <div className="ml-auto flex items-center gap-1.5 shrink-0">
+            <label className="flex items-center gap-1.5 text-[10px] text-zinc-500">
+              Stop on failure
+              <input
+                type="checkbox"
+                checked={state.workflow.stop_on_failure ?? false}
+                onChange={(e) => updateWorkflow({ stop_on_failure: e.target.checked })}
+                className="size-3"
+              />
+            </label>
+          </div>
+        )}
       </div>
 
-      {/* Active stage settings */}
+      {/* Active phase settings */}
       {currentStage && currentStageIndex !== null && (
         <StageSettings
           stage={currentStage}
@@ -166,7 +171,7 @@ function StageTab({
   stepCount: number;
   onSelect: () => void;
   onRename: (name: string) => void;
-  onRemove: () => void;
+  onRemove?: () => void;
   onMoveUp?: () => void;
   onMoveDown?: () => void;
 }) {
@@ -213,7 +218,7 @@ function StageTabMenu({
 }: {
   name: string;
   onRename: (name: string) => void;
-  onRemove: () => void;
+  onRemove?: () => void;
   onMoveUp?: () => void;
   onMoveDown?: () => void;
 }) {
@@ -233,7 +238,7 @@ function StageTabMenu({
           }
         }}
         className="w-full h-7 px-2 text-xs bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder:text-zinc-500 focus:outline-none focus:ring-1 focus:ring-zinc-600"
-        placeholder="Stage name"
+        placeholder="Phase name"
       />
       <div className="flex gap-1">
         {onMoveUp && (
@@ -256,14 +261,16 @@ function StageTabMenu({
             <ChevronDown className="size-3" />
           </Button>
         )}
-        <Button
-          variant="ghost"
-          size="sm"
-          className="h-6 px-1.5 text-xs text-red-400 hover:text-red-300 flex-1"
-          onClick={onRemove}
-        >
-          <Trash2 className="size-3" />
-        </Button>
+        {onRemove && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-6 px-1.5 text-xs text-red-400 hover:text-red-300 flex-1"
+            onClick={onRemove}
+          >
+            <Trash2 className="size-3" />
+          </Button>
+        )}
       </div>
     </div>
   );
@@ -289,7 +296,7 @@ function StageSettings({
         onClick={() => setExpanded(!expanded)}
       >
         <Settings2 className="size-2.5" />
-        Stage settings
+        Phase settings
       </button>
       {expanded && (
         <div className="mt-1.5 grid grid-cols-2 gap-2">
@@ -297,7 +304,7 @@ function StageSettings({
             <input
               value={stage.description ?? ""}
               onChange={(e) => onUpdate({ description: e.target.value })}
-              placeholder="Stage description"
+              placeholder="Phase description"
               className="w-full h-7 px-2 text-xs bg-zinc-800/50 border border-zinc-700 rounded-md text-zinc-200 placeholder:text-zinc-500 focus:outline-none focus:ring-1 focus:ring-zinc-600"
             />
           </div>

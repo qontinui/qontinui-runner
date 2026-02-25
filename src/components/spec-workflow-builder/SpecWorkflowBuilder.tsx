@@ -172,7 +172,6 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
     selectedSpecIds,
     agenticPrompt,
     maxIterations,
-    elementSource,
     generatorType,
     genMeta,
     states,

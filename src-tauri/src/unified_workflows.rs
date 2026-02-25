@@ -241,6 +241,31 @@ pub struct UnifiedWorkflow {
     pub updated_at: String,
 }
 
+impl UnifiedWorkflow {
+    /// Normalize any workflow to its stages representation.
+    /// If stages is non-empty, return them as-is.
+    /// If stages is empty, wrap top-level steps into a single stage.
+    pub fn normalize_to_stages(&self) -> Vec<WorkflowStage> {
+        if !self.stages.is_empty() {
+            return self.stages.clone();
+        }
+        // Wrap top-level steps as a single stage
+        vec![WorkflowStage {
+            id: format!("{}-phase-1", self.id),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            setup_steps: self.setup_steps.clone(),
+            verification_steps: self.verification_steps.clone(),
+            agentic_steps: self.agentic_steps.clone(),
+            completion_steps: self.completion_steps.clone(),
+            max_iterations: self.max_iterations,
+            timeout_seconds: self.timeout_seconds,
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+        }]
+    }
+}
+
 fn default_auto_include_contexts() -> bool {
     true
 }
@@ -587,5 +612,56 @@ pub fn workflow_to_stage_config(
         provider: workflow.provider.clone(),
         model: workflow.model.clone(),
         timeout_seconds: workflow.timeout_seconds,
+    }
+}
+
+/// Convert a `WorkflowStage` into a `StageConfig` for execution.
+///
+/// This is used when normalizing all workflows to multi-stage execution.
+/// The workflow-level settings (health checks, log watch, preflight) are passed in
+/// since stages don't have their own settings for these.
+pub fn stage_to_stage_config(
+    stage: &WorkflowStage,
+    index: usize,
+    total_stages: usize,
+    include_preflight: bool,
+    log_watch_enabled: bool,
+    health_check_enabled: bool,
+    health_check_urls: &[HealthCheckUrl],
+) -> crate::unified_workflow_executor::StageConfig {
+    use crate::unified_workflow_executor::{
+        convert_json_steps_with_phase, extract_prompt_steps_with_phase,
+    };
+
+    let setup_auto = convert_json_steps_with_phase(&stage.setup_steps, 0, Some("setup"));
+    let setup_auto = if include_preflight && index == 0 {
+        // Only prepend preflight to the first stage
+        prepend_preflight_check_step(setup_auto, true)
+    } else {
+        setup_auto
+    };
+    let setup_prompt = extract_prompt_steps_with_phase(&stage.setup_steps, Some("setup"));
+    let verif = convert_json_steps_with_phase(&stage.verification_steps, 0, Some("verification"));
+    let verif = prepend_health_check_steps(verif, health_check_enabled, health_check_urls);
+    let verif = prepend_log_watch_step(verif, log_watch_enabled);
+    let agentic = extract_prompt_steps_with_phase(&stage.agentic_steps, Some("agentic"));
+    let comp_auto = convert_json_steps_with_phase(&stage.completion_steps, 0, Some("completion"));
+    let comp_prompt = extract_prompt_steps_with_phase(&stage.completion_steps, Some("completion"));
+
+    crate::unified_workflow_executor::StageConfig {
+        id: stage.id.clone(),
+        name: stage.name.clone(),
+        index,
+        total_stages,
+        setup_automation_steps: setup_auto,
+        setup_prompt_steps: setup_prompt,
+        verification_steps: verif,
+        agentic_steps: agentic,
+        completion_automation_steps: comp_auto,
+        completion_prompt_steps: comp_prompt,
+        max_iterations: stage.max_iterations,
+        provider: stage.provider.clone(),
+        model: stage.model.clone(),
+        timeout_seconds: stage.timeout_seconds,
     }
 }
