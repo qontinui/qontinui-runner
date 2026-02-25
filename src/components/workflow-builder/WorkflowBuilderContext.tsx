@@ -842,6 +842,9 @@ export function WorkflowBuilderProvider({
         prompt_template: workflow.prompt_template,
         log_watch_enabled: workflow.log_watch_enabled,
         health_check_enabled: workflow.health_check_enabled,
+        health_check_urls: workflow.health_check_urls,
+        stages: workflow.stages,
+        stop_on_failure: workflow.stop_on_failure,
       };
 
       const url = isNew
