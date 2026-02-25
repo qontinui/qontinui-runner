@@ -4,20 +4,25 @@
  * Main page component for the Active Dashboard.
  * Orchestrates the dynamic widget-based layout based on task activities.
  * Supports multi-run view with ActiveRunsBar for concurrent workflows.
+ * Includes keyboard shortcuts and workflow completion summary overlay.
  */
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { useDashboardState } from "../../hooks/dashboard";
-import { TaskProvider, useActiveRunsOptional } from "../../contexts";
+import { useDashboardState, useWidgetPreferences } from "../../hooks/dashboard";
+import { TaskProvider, SharedStepDataProvider, useActiveRunsOptional } from "../../contexts";
 import { DashboardLayout } from "./DashboardLayout";
 import { ControlBar } from "./ControlBar";
 import { BottomBar } from "./BottomBar";
 import { ActiveRunsBar } from "./ActiveRunsBar";
+import { ShortcutsModal } from "./ShortcutsModal";
+import { CompletionSummary } from "./CompletionSummary";
 import { registerAllWidgets } from "./widgets";
 import { useFlowExecutionData } from "./widgets/flow-execution";
 import { windowManager } from "../../managers";
 import type { ActivityType } from "../../types/dashboard/activity-types";
+import type { DashboardStatus } from "../../hooks/dashboard/useDashboardState";
+import type { StepStats } from "./widgets/shared/types";
 import type { CommandResponse } from "../../types/displayProfile";
 
 // Register widgets at module load time (before any component renders)
@@ -43,6 +48,44 @@ export interface DashboardPageProps {
 }
 
 /**
+ * Compute basic step stats from dashboard activity states.
+ * Used for the completion summary when SharedStepDataContext is not available.
+ */
+function computeStatsFromActivities(activities: Map<ActivityType, { status: string }>): StepStats {
+  const total = activities.size;
+  let successful = 0;
+  let failed = 0;
+  let pending = 0;
+
+  for (const [, activity] of activities) {
+    if (activity.status === "completed" || activity.status === "success") {
+      successful++;
+    } else if (activity.status === "failed") {
+      failed++;
+    } else if (
+      activity.status === "idle" ||
+      activity.status === "pending" ||
+      activity.status === "running"
+    ) {
+      pending++;
+    }
+  }
+
+  const completed = successful + failed;
+  const successRate = completed > 0 ? (successful / completed) * 100 : 100;
+
+  return {
+    total,
+    completed,
+    successful,
+    failed,
+    pending,
+    elapsedTime: 0,
+    successRate,
+  };
+}
+
+/**
  * DashboardPage - The new Active Dashboard.
  *
  * Features:
@@ -51,6 +94,8 @@ export interface DashboardPageProps {
  * - Summary widgets stack on the right (35%)
  * - Phase tracking and iteration display
  * - Links to detail pages
+ * - Keyboard shortcuts for quick navigation
+ * - Completion summary overlay when workflow finishes
  */
 export function DashboardPage({
   onGoToExecute,
@@ -61,13 +106,70 @@ export function DashboardPage({
   lastRunWorkflowId,
 }: DashboardPageProps) {
   // Get dashboard state
-  const { state, setActiveWidget, navigateToDetail } = useDashboardState();
+  const { state, setActiveWidget, navigateToDetail, refresh } = useDashboardState();
+
+  // Widget pin/hide preferences
+  const widgetPreferences = useWidgetPreferences();
 
   // Get flow execution data for flow-specific controls
   const flowExecutionData = useFlowExecutionData();
 
   // Track paused state locally (for GUI automation)
   const [isPaused, setIsPaused] = useState(false);
+
+  // --- Shortcuts modal state ---
+  const [showShortcuts, setShowShortcuts] = useState(false);
+
+  // --- Completion summary state ---
+  const [showCompletion, setShowCompletion] = useState(false);
+  const [completionStatus, setCompletionStatus] = useState<DashboardStatus>("idle");
+  const [completionStats, setCompletionStats] = useState<StepStats>({
+    total: 0,
+    completed: 0,
+    successful: 0,
+    failed: 0,
+    pending: 0,
+    elapsedTime: 0,
+    successRate: 100,
+  });
+  const [completionDuration, setCompletionDuration] = useState(0);
+  const prevIsRunningRef = useRef(state.isRunning);
+  const taskStartTimeRef = useRef<number | null>(null);
+
+  // Track task start time when a task begins running
+  useEffect(() => {
+    if (state.isRunning && !prevIsRunningRef.current) {
+      taskStartTimeRef.current = Date.now();
+    }
+  }, [state.isRunning]);
+
+  // Detect running -> not-running transition to show completion summary
+  useEffect(() => {
+    const wasRunning = prevIsRunningRef.current;
+    prevIsRunningRef.current = state.isRunning;
+
+    if (wasRunning && !state.isRunning) {
+      // Workflow just finished
+      const finalStatus =
+        state.status === "completed" || state.status === "failed" ? state.status : "completed";
+      setCompletionStatus(finalStatus);
+      setCompletionStats(computeStatsFromActivities(state.layout.activities));
+
+      // Calculate duration from tracked start time
+      const startTime = taskStartTimeRef.current;
+      if (startTime) {
+        setCompletionDuration(Math.round((Date.now() - startTime) / 1000));
+      } else {
+        setCompletionDuration(0);
+      }
+
+      setShowCompletion(true);
+    }
+  }, [state.isRunning, state.status, state.layout.activities]);
+
+  const handleDismissCompletion = useCallback(() => {
+    setShowCompletion(false);
+  }, []);
 
   // Determine if a flow is currently active and should receive control commands
   const isFlowActive =
@@ -247,59 +349,115 @@ export function DashboardPage({
     return state.status;
   })();
 
+  // --- Keyboard shortcuts ---
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Ignore shortcuts when typing in an input element
+      const target = e.target as HTMLElement;
+      if (
+        target.tagName === "INPUT" ||
+        target.tagName === "TEXTAREA" ||
+        target.tagName === "SELECT" ||
+        target.isContentEditable
+      ) {
+        return;
+      }
+
+      // ? key (no modifiers) -> toggle shortcuts modal
+      if (e.key === "?" && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        e.preventDefault();
+        setShowShortcuts((prev) => !prev);
+        return;
+      }
+
+      // Ctrl+1..8 -> switch widget by position
+      if ((e.ctrlKey || e.metaKey) && e.key >= "1" && e.key <= "8") {
+        e.preventDefault();
+        const index = parseInt(e.key) - 1;
+        const widgets = state.layout.detectedWidgets;
+        if (index < widgets.length) {
+          setActiveWidget(widgets[index]);
+        }
+        return;
+      }
+
+      // Ctrl+R -> refresh data
+      if ((e.ctrlKey || e.metaKey) && e.key === "r") {
+        e.preventDefault();
+        refresh();
+        return;
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [state.layout.detectedWidgets, setActiveWidget, refresh]);
+
   return (
     <TaskProvider taskInfo={state.taskInfo} isRunning={state.isRunning}>
-      <div className="flex h-full flex-col bg-background">
-        {/* Control Bar - always visible */}
-        <ControlBar
-          taskName={
-            isFlowActive
-              ? (flowExecutionData.flowName ?? state.taskInfo?.taskName ?? null)
-              : (state.taskInfo?.taskName ?? null)
-          }
-          phase={state.currentPhase}
-          showPhaseBadge={state.showPhaseBadge}
-          status={displayStatus}
-          workflowStage={state.workflowStage}
-          isOrchestrated={state.isOrchestrated}
-          iteration={state.isOrchestrated ? state.iteration : undefined}
-          maxIterations={state.isOrchestrated ? state.maxIterations : undefined}
-          isPlan={state.planPhaseName != null || state.planPhaseIndex != null}
-          planPhaseName={state.planPhaseName}
-          planPhaseIndex={state.planPhaseIndex}
-          planTotalPhases={state.planTotalPhases}
-          onPlayPause={handlePlayPause}
-          onStop={handleStop}
-        />
+      <SharedStepDataProvider>
+        <div className="flex h-full flex-col bg-background">
+          {/* Control Bar - always visible */}
+          <ControlBar
+            taskName={
+              isFlowActive
+                ? (flowExecutionData.flowName ?? state.taskInfo?.taskName ?? null)
+                : (state.taskInfo?.taskName ?? null)
+            }
+            phase={state.currentPhase}
+            showPhaseBadge={state.showPhaseBadge}
+            status={displayStatus}
+            workflowStage={state.workflowStage}
+            isOrchestrated={state.isOrchestrated}
+            iteration={state.isOrchestrated ? state.iteration : undefined}
+            maxIterations={state.isOrchestrated ? state.maxIterations : undefined}
+            isPlan={state.planPhaseName != null || state.planPhaseIndex != null}
+            planPhaseName={state.planPhaseName}
+            planPhaseIndex={state.planPhaseIndex}
+            planTotalPhases={state.planTotalPhases}
+            onPlayPause={handlePlayPause}
+            onStop={handleStop}
+          />
 
-        {/* Main Content Area */}
-        <div className="flex-1 overflow-hidden">
-          <DashboardLayout
-            layout={state.layout}
-            onWidgetClick={handleWidgetClick}
-            onNavigateToDetail={handleNavigateToDetail}
-            onGoToRecap={onGoToRecap}
-            onRunLastWorkflow={onRunLastWorkflow}
-            isRunningLastWorkflow={isRunningLastWorkflow}
-            lastRunWorkflowName={lastRunWorkflowName}
-            lastRunWorkflowId={lastRunWorkflowId}
+          {/* Main Content Area */}
+          <div className="flex-1 overflow-hidden">
+            <DashboardLayout
+              layout={state.layout}
+              onWidgetClick={handleWidgetClick}
+              onNavigateToDetail={handleNavigateToDetail}
+              onGoToRecap={onGoToRecap}
+              onRunLastWorkflow={onRunLastWorkflow}
+              isRunningLastWorkflow={isRunningLastWorkflow}
+              lastRunWorkflowName={lastRunWorkflowName}
+              lastRunWorkflowId={lastRunWorkflowId}
+              widgetPreferences={widgetPreferences}
+            />
+          </div>
+
+          {/* Active Runs Bar - shown when multiple runs are active */}
+          {hasMultipleRuns && <ActiveRunsBar onNewRun={handleNewRun} />}
+
+          {/* Bottom Bar - always visible */}
+          <BottomBar
+            activeActivity={state.layout.activeWidget}
+            isRunning={state.isRunning}
+            currentOrchestratorAgent={state.currentOrchestratorAgent}
+            taskStartTime={state.taskInfo?.startTime ?? null}
+          />
+
+          {/* Shortcuts Modal */}
+          <ShortcutsModal isOpen={showShortcuts} onClose={() => setShowShortcuts(false)} />
+
+          {/* Completion Summary Overlay */}
+          <CompletionSummary
+            isOpen={showCompletion}
+            onDismiss={handleDismissCompletion}
+            status={completionStatus}
+            stats={completionStats}
+            durationSeconds={completionDuration}
           />
         </div>
-
-        {/* Active Runs Bar - shown when multiple runs are active */}
-        {hasMultipleRuns && <ActiveRunsBar onNewRun={handleNewRun} />}
-
-        {/* Bottom Bar - always visible */}
-        <BottomBar
-          iteration={state.isOrchestrated ? state.iteration : (state.taskInfo?.iteration ?? 1)}
-          maxIterations={
-            state.isOrchestrated ? state.maxIterations : (state.taskInfo?.maxIterations ?? 1)
-          }
-          activeActivity={state.layout.activeWidget}
-          isRunning={state.isRunning}
-          currentOrchestratorAgent={state.currentOrchestratorAgent}
-        />
-      </div>
+      </SharedStepDataProvider>
     </TaskProvider>
   );
 }

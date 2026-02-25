@@ -11,8 +11,8 @@ import type {
   CollectedAnalysisSet,
   PageAnalysis,
   ApiRequestAnalysis,
-} from "../../components/test-builder/types";
-import { getStepOutputFromAnalysis } from "../../components/test-builder/types";
+} from "../../types/test-builder";
+import { getStepOutputFromAnalysis } from "../../types/test-builder";
 import type { StepOutput } from "../../types/step-output";
 import {
   summarizeOutputsForAI,

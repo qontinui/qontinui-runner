@@ -136,26 +136,39 @@ export function VerificationSummary({
 
           {/* Check Stats (if we have steps) */}
           {data.checkSteps.length > 0 ? (
-            <div className="flex items-center gap-3 text-xs">
-              {data.stats.successful > 0 && (
-                <div className="flex items-center gap-1">
-                  <CheckCircle2 className={cn("h-3 w-3", successColors.text)} />
-                  <span className={successColors.text}>{data.stats.successful}</span>
-                </div>
-              )}
-              {data.stats.failed > 0 && (
-                <div className="flex items-center gap-1">
-                  <XCircle className={cn("h-3 w-3", errorColors.text)} />
-                  <span className={errorColors.text}>{data.stats.failed}</span>
-                </div>
-              )}
-              {data.stats.pending > 0 && (
-                <div className="flex items-center gap-1 text-muted-foreground">
-                  <Clock className="h-3 w-3" />
-                  <span>{data.stats.pending} pending</span>
-                </div>
-              )}
-            </div>
+            <>
+              {/* Pass/fail text + counts */}
+              <div className="flex items-center gap-3 text-xs">
+                <span className="font-medium text-foreground">
+                  {data.stats.successful}/{data.stats.total} passed
+                </span>
+                {data.stats.failed > 0 && (
+                  <div className="flex items-center gap-1">
+                    <XCircle className={cn("h-3 w-3", errorColors.text)} />
+                    <span className={errorColors.text}>{data.stats.failed} failed</span>
+                  </div>
+                )}
+                {data.stats.pending > 0 && (
+                  <div className="flex items-center gap-1 text-muted-foreground">
+                    <Clock className="h-3 w-3" />
+                    <span>{data.stats.pending}</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Mini progress bar */}
+              <div className="h-1 rounded-full bg-muted overflow-hidden">
+                <div
+                  className={cn(
+                    "h-full rounded-full transition-all",
+                    data.stats.failed > 0 ? "bg-red-500" : "bg-emerald-500",
+                  )}
+                  style={{
+                    width: `${data.stats.total > 0 ? (data.stats.successful / data.stats.total) * 100 : 0}%`,
+                  }}
+                />
+              </div>
+            </>
           ) : (
             /* Legacy: Test name or description */
             <>

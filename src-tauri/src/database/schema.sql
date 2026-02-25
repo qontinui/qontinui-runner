@@ -2043,6 +2043,35 @@ CREATE TABLE IF NOT EXISTS step_progress_markers (
 
 CREATE INDEX IF NOT EXISTS idx_progress_markers_checkpoint ON step_progress_markers(checkpoint_id);
 
+-- Workflow Verification Phase Results (Version 36/37)
+-- Stores results from execute_verification_steps in unified workflow execution
+CREATE TABLE IF NOT EXISTS workflow_verification_phase_results (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    iteration INTEGER NOT NULL,
+
+    -- Summary fields
+    all_passed BOOLEAN NOT NULL,
+    total_steps INTEGER NOT NULL,
+    passed_steps INTEGER NOT NULL,
+    failed_steps INTEGER NOT NULL,
+    skipped_steps INTEGER NOT NULL,
+    total_duration_ms INTEGER NOT NULL,
+    critical_failure BOOLEAN NOT NULL DEFAULT 0,
+
+    -- Full result as JSON (for detailed access)
+    result_json TEXT NOT NULL,
+
+    created_at TEXT NOT NULL,
+
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_wf_ver_phase_task_run_id ON workflow_verification_phase_results(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_wf_ver_phase_iteration ON workflow_verification_phase_results(iteration);
+CREATE INDEX IF NOT EXISTS idx_wf_ver_phase_all_passed ON workflow_verification_phase_results(all_passed);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_wf_ver_phase_unique ON workflow_verification_phase_results(task_run_id, iteration);
+
 -- =============================================================================
 -- Execution Spans (Version 52)
 -- =============================================================================

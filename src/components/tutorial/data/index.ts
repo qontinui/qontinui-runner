@@ -9,7 +9,6 @@ import { gettingStartedTutorial } from "./getting-started";
 import { workflowExecutionTutorial } from "./workflow-execution";
 import { aiAnalysisTutorial } from "./ai-analysis";
 import { promptWorkflowTutorial } from "./prompt-workflow";
-import { checkBuilderTutorial } from "./check-builder";
 
 /**
  * All available tutorials
@@ -18,7 +17,6 @@ import { checkBuilderTutorial } from "./check-builder";
 export const tutorials: Tutorial[] = [
   gettingStartedTutorial,
   promptWorkflowTutorial, // Featured - AI prompt workflows
-  checkBuilderTutorial, // Code quality checks
   workflowExecutionTutorial,
   aiAnalysisTutorial,
 ];
@@ -88,6 +86,5 @@ export function getRecommendedNextTutorial(completedId: string): Tutorial | unde
 // Re-export individual tutorials
 export { gettingStartedTutorial } from "./getting-started";
 export { promptWorkflowTutorial } from "./prompt-workflow";
-export { checkBuilderTutorial } from "./check-builder";
 export { workflowExecutionTutorial } from "./workflow-execution";
 export { aiAnalysisTutorial } from "./ai-analysis";

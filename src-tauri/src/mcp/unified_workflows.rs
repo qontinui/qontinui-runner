@@ -129,6 +129,39 @@ pub fn refetch_unified_workflow_steps(
                         "shellCommandFailOnError",
                     ]),
                     prompt_content: get_str(&["content", "prompt_content", "promptContent"]),
+                    // UI Bridge fields
+                    ui_bridge_action: get_str(&["ui_bridge_action", "uiBridgeAction"]),
+                    ui_bridge_url: get_str(&["ui_bridge_url", "uiBridgeUrl"]),
+                    ui_bridge_instruction: get_str(&[
+                        "ui_bridge_instruction",
+                        "uiBridgeInstruction",
+                    ]),
+                    ui_bridge_target: get_str(&["ui_bridge_target", "uiBridgeTarget"]),
+                    ui_bridge_assert_type: get_str(&[
+                        "ui_bridge_assert_type",
+                        "uiBridgeAssertType",
+                    ]),
+                    ui_bridge_expected: get_str(&["ui_bridge_expected", "uiBridgeExpected"]),
+                    ui_bridge_timeout_ms: step
+                        .get("ui_bridge_timeout_ms")
+                        .or_else(|| step.get("uiBridgeTimeoutMs"))
+                        .and_then(|v| v.as_u64()),
+                    ui_bridge_compare_mode: get_str(&[
+                        "ui_bridge_compare_mode",
+                        "uiBridgeCompareMode",
+                    ]),
+                    ui_bridge_reference_snapshot: step
+                        .get("ui_bridge_reference_snapshot")
+                        .or_else(|| step.get("uiBridgeReferenceSnapshot"))
+                        .cloned(),
+                    ui_bridge_reference_snapshot_id: get_str(&[
+                        "ui_bridge_reference_snapshot_id",
+                        "uiBridgeReferenceSnapshotId",
+                    ]),
+                    ui_bridge_severity_threshold: get_str(&[
+                        "ui_bridge_severity_threshold",
+                        "uiBridgeSeverityThreshold",
+                    ]),
                     ..Default::default()
                 })
             };
@@ -1229,7 +1262,7 @@ pub async fn run_unified_workflow(
     info!("Running unified workflow: {}", id);
 
     // Fetch the workflow
-    let workflow = match state.app_state.checkpoint_db.get_unified_workflow(&id) {
+    let mut workflow = match state.app_state.checkpoint_db.get_unified_workflow(&id) {
         Ok(Some(w)) => w,
         Ok(None) => {
             return Err((
@@ -1245,6 +1278,21 @@ pub async fn run_unified_workflow(
             ));
         }
     };
+
+    // Apply deterministic command sanitization (fixes jq→python, nested retry, etc.)
+    {
+        use crate::workflow_generation::hardener::sanitize_commands_in_steps;
+        let mut fix_count = 0;
+        fix_count += sanitize_commands_in_steps(&mut workflow.setup_steps);
+        fix_count += sanitize_commands_in_steps(&mut workflow.verification_steps);
+        fix_count += sanitize_commands_in_steps(&mut workflow.completion_steps);
+        if fix_count > 0 {
+            info!(
+                "Runtime sanitizer: fixed {} steps with command/retry issues",
+                fix_count
+            );
+        }
+    }
 
     info!(
         "Executing unified workflow '{}' with {} setup, {} verification, {} agentic, {} completion steps",
@@ -1317,6 +1365,18 @@ pub async fn run_unified_workflow(
             if config.step_type == "prompt" && config.prompt_content.is_none() {
                 if let Some(content) = step.get("content").and_then(|v| v.as_str()) {
                     config.prompt_content = Some(content.to_string());
+                }
+            }
+
+            // Normalize nested retry format: {"retry": {"count": N, "delay_ms": M}}
+            if config.retry_count.is_none() {
+                if let Some(retry_obj) = step.get("retry") {
+                    if let Some(c) = retry_obj.get("count").and_then(|v| v.as_u64()) {
+                        config.retry_count = Some(c as u32);
+                    }
+                    if let Some(d) = retry_obj.get("delay_ms").and_then(|v| v.as_u64()) {
+                        config.retry_delay_ms = Some(d);
+                    }
                 }
             }
 

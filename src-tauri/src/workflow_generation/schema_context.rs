@@ -366,19 +366,21 @@ Always add `body_contains` or `json_path` assertions to verify the response has 
 
 **`GET /ui-bridge/sdk/elements`** — Returns element list:
 ```json
-{{"elements": [{{"id": "...", "type": "button", "tagName": "BUTTON", "state": {{"textContent": "Save"}}}}], "total": 42}}
+{{"data": [{{"id": "...", "type": "button", "tagName": "BUTTON", "state": {{"textContent": "Save"}}}}], "success": true, "timestamp": 123456}}
 ```
-- Good assertion: `body_contains` with a known element ID or text content
+- Elements are in the `data` array (NOT `elements` or `total` fields)
+- Good assertion: `body_contains` with a known element ID or text content, or pipe to `python -c "import sys,json; d=json.load(sys.stdin); assert len(d.get('data',[]))>0"`
 
 **`GET /ui-bridge/sdk/snapshot`** — Returns full page state:
 ```json
-{{"elements": [...], "metadata": {{"url": "http://...", "title": "Page Title"}}, "timestamp": "..."}}
+{{"data": {{"elements": [...], "components": [...], "timestamp": 123456, "workflows": [...]}}, "success": true, "timestamp": 123456}}
 ```
+- Elements are nested under `data.elements`
 - Good assertion: `body_contains` with expected page title or element content
 
 **`POST /ui-bridge/sdk/discover`** — Returns discovered elements:
 ```json
-{{"elements": [...], "total": 5}}
+{{"data": {{"elements": [...]}}, "success": true, "timestamp": 123456}}
 ```
 - Good assertion: `body_contains` with expected element attributes
 
@@ -499,7 +501,9 @@ These rules are NON-NEGOTIABLE. Workflows that violate them will be rejected.
 14. **Feature-specific verification required**: Must include feature-specific checks, not just compilation/lint checks.
 15. **Agentic-verification correspondence**: Each agentic step must have a corresponding deterministic verification step.
 16. **Only 3 step types exist**: The only valid step types are `command`, `ui_bridge`, and `prompt`. Do NOT use `shell_command`, `api_request`, `mcp_call`, `check`, `check_group`, `test`, `gate`, or `spec` — these are not valid types. Tests are run via `command` with `test_type` set. Checks are run via `command` with `check_type` set.
-17. **Every command step MUST include a mode field**: Valid modes are `shell`, `check`, `check_group`, `test`. The mode must match the fields present: `check` requires `check_type`, `check_group` requires `check_group_id`, `test` requires `test_type` or `test_id`, `shell` is for plain commands."#;
+17. **Every command step MUST include a mode field**: Valid modes are `shell`, `check`, `check_group`, `test`. The mode must match the fields present: `check` requires `check_type`, `check_group` requires `check_group_id`, `test` requires `test_type` or `test_id`, `shell` is for plain commands.
+18. **No Python f-strings or jq in shell commands**: When piping curl output to `python -c`, NEVER use f-strings (`f'...'`). Use string concatenation instead: `'Expected >2, got ' + str(len(elems))`. F-strings with nested quotes create unresolvable JSON escaping issues. Do NOT use `jq` — it is not available on Windows. For JSON assertions, pipe to `python -c \"import sys,json; d=json.load(sys.stdin); assert len(d.get('elements',[]))>0\"`. For checking fields exist, use `grep` (e.g., `curl ... | grep 'elements'`).
+19. **Retry format**: Use flat `retry_count` and `retry_delay_ms` fields directly on step objects. Do NOT use a nested `retry` object (e.g., `\"retry\": {\"count\": 5}` is WRONG, use `\"retry_count\": 5`)."#;
 
 // ============================================================================
 

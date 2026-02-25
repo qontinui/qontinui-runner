@@ -553,6 +553,7 @@ impl ExecutionStepConfig {
 
         Self {
             step_type: "command".to_string(),
+            command_mode: Some("check".to_string()),
             name: Some("Pre-flight Environment Check".to_string()),
             phase: Some("setup".to_string()),
             check_type: Some("custom_command".to_string()),
@@ -579,6 +580,7 @@ impl ExecutionStepConfig {
     ) -> Self {
         Self {
             step_type: "command".to_string(),
+            command_mode: Some("check".to_string()),
             name: Some(name.to_string()),
             phase: Some("verification".to_string()),
             check_type: Some("http_status".to_string()),
@@ -2935,6 +2937,10 @@ impl StepExecutor {
             iteration
         );
 
+        // Track whether a navigation step has been seen, so we can auto-inject
+        // retries for subsequent SDK steps (WebSocket reconnection takes ~15s).
+        let mut after_navigation = false;
+
         for (index, step) in verification_steps.iter().enumerate() {
             // Skip remaining steps if we had a critical failure
             if critical_failure {
@@ -2980,74 +2986,166 @@ impl StepExecutor {
                 .clone()
                 .unwrap_or_else(|| format!("Step {}", index + 1));
 
-            // Execute based on step type
-            let (mut success, mut error, mut verification_details, step_output_data) =
-                match step.step_type.as_str() {
-                    "test" => {
-                        if let Some(ref test_id) = step.test_id {
-                            match self.execute_verification_test_with_details(test_id).await {
-                                Ok(test_result) => {
-                                    let passed = test_result.status == TestStatus::Passed;
-                                    let details = VerificationStepDetails {
-                                        step_id: step
-                                            .name
-                                            .clone()
-                                            .unwrap_or_else(|| format!("step-{}", index)),
-                                        phase: "verification".to_string(),
-                                        stdout: Some(test_result.output.clone()),
-                                        stderr: None,
-                                        assertions_passed: Some(test_result.assertions_passed),
-                                        assertions_total: Some(
-                                            test_result.assertions_passed
-                                                + test_result.assertions_failed,
-                                        ),
-                                        console_output: test_result
-                                            .structured_output
-                                            .as_ref()
-                                            .and_then(|v| v.get("console_output"))
-                                            .and_then(|v| v.as_str())
-                                            .map(|s| s.to_string()),
-                                        page_snapshot: test_result
-                                            .structured_output
-                                            .as_ref()
-                                            .and_then(|v| v.get("page_snapshot"))
-                                            .and_then(|v| v.as_str())
-                                            .map(|s| s.to_string()),
-                                        exit_code: test_result.exit_code,
-                                        check_results: None,
-                                        console_errors: None,
-                                    };
-                                    (
-                                        passed,
-                                        if passed {
-                                            None
-                                        } else {
-                                            test_result.error.clone()
-                                        },
-                                        Some(details),
-                                        None,
-                                    )
-                                }
-                                Err(e) => (
-                                    false,
-                                    Some(format!("Test execution error: {}", e)),
-                                    Some(VerificationStepDetails {
-                                        step_id: step
-                                            .name
-                                            .clone()
-                                            .unwrap_or_else(|| format!("step-{}", index)),
-                                        phase: "verification".to_string(),
-                                        stderr: Some(e),
-                                        ..Default::default()
-                                    }),
-                                    None,
-                                ),
-                            }
+            // Runtime command sanitization: replace jq with python (jq unavailable on Windows MSYS)
+            // This is a safety net in case the hardener didn't process the workflow at generation time.
+            let step = if step.step_type == "command" || step.step_type == "shell" {
+                if let Some(ref cmd) = step.shell_command {
+                    if cmd.contains("| jq ") {
+                        let sanitized = super::handlers::shell_command::ShellCommandHandler::replace_jq_with_python_static(cmd);
+                        if sanitized != *cmd {
+                            info!("Verification executor: jq→python replacement applied for step '{}'", step_name);
+                            let mut patched = (*step).clone();
+                            patched.shell_command = Some(sanitized);
+                            std::borrow::Cow::Owned(patched)
                         } else {
-                            // No test_id — delegate to handler system which supports
-                            // repository tests, inline commands (check_command/shell_command),
-                            // and auto-detection fallbacks.
-                            let (success, handler_error, _screenshot, handler_output_data) =
+                            std::borrow::Cow::Borrowed(*step)
+                        }
+                    } else {
+                        std::borrow::Cow::Borrowed(*step)
+                    }
+                } else {
+                    std::borrow::Cow::Borrowed(*step)
+                }
+            } else {
+                std::borrow::Cow::Borrowed(*step)
+            };
+            let step = step.as_ref();
+
+            // Track navigation steps for auto-retry injection
+            let cmd_str = step.shell_command.as_deref().unwrap_or("");
+            if cmd_str.contains("sdk/page/navigate") {
+                after_navigation = true;
+            }
+
+            // Determine retry configuration: explicit from step config, or auto-inject
+            // for SDK steps that follow a navigation step (WebSocket reconnection delay).
+            let (max_retries, retry_delay) = if step.retry_count.is_some() {
+                // Explicit retry config takes precedence
+                (
+                    step.retry_count.unwrap_or(0),
+                    step.retry_delay_ms.unwrap_or(2000),
+                )
+            } else if after_navigation
+                && cmd_str.contains("ui-bridge/sdk/")
+                && !cmd_str.contains("sdk/page/navigate")
+            {
+                // Auto-inject retries for SDK verification steps after page navigation.
+                // After navigation, the WebSocket connection needs time to reconnect (~15s).
+                info!(
+                    "Auto-injecting retries for SDK step '{}' after navigation",
+                    step_name
+                );
+                (3_u32, 3000_u64)
+            } else {
+                (0, 2000)
+            };
+
+            // Stop auto-retry injection after hitting a non-SDK step
+            if after_navigation
+                && !cmd_str.is_empty()
+                && !cmd_str.contains("ui-bridge/sdk/")
+                && !cmd_str.contains("sdk/page/navigate")
+            {
+                after_navigation = false;
+            }
+
+            // Execute with retry loop
+            let (mut success, mut error, mut verification_details, step_output_data) = {
+                let mut last_result = (false, Some("not executed".to_string()), None, None);
+                for attempt in 0..=max_retries {
+                    if attempt > 0 {
+                        info!(
+                            "Retrying verification step '{}' (attempt {}/{}, delay {}ms)",
+                            step_name,
+                            attempt + 1,
+                            max_retries + 1,
+                            retry_delay
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(retry_delay)).await;
+                    }
+
+                    last_result = match step.step_type.as_str() {
+                        "test" => {
+                            if let Some(ref test_id) = step.test_id {
+                                match self.execute_verification_test_with_details(test_id).await {
+                                    Ok(test_result) => {
+                                        let passed = test_result.status == TestStatus::Passed;
+                                        let details = VerificationStepDetails {
+                                            step_id: step
+                                                .name
+                                                .clone()
+                                                .unwrap_or_else(|| format!("step-{}", index)),
+                                            phase: "verification".to_string(),
+                                            stdout: Some(test_result.output.clone()),
+                                            stderr: None,
+                                            assertions_passed: Some(test_result.assertions_passed),
+                                            assertions_total: Some(
+                                                test_result.assertions_passed
+                                                    + test_result.assertions_failed,
+                                            ),
+                                            console_output: test_result
+                                                .structured_output
+                                                .as_ref()
+                                                .and_then(|v| v.get("console_output"))
+                                                .and_then(|v| v.as_str())
+                                                .map(|s| s.to_string()),
+                                            page_snapshot: test_result
+                                                .structured_output
+                                                .as_ref()
+                                                .and_then(|v| v.get("page_snapshot"))
+                                                .and_then(|v| v.as_str())
+                                                .map(|s| s.to_string()),
+                                            exit_code: test_result.exit_code,
+                                            check_results: None,
+                                            console_errors: None,
+                                        };
+                                        (
+                                            passed,
+                                            if passed {
+                                                None
+                                            } else {
+                                                test_result.error.clone()
+                                            },
+                                            Some(details),
+                                            None,
+                                        )
+                                    }
+                                    Err(e) => (
+                                        false,
+                                        Some(format!("Test execution error: {}", e)),
+                                        Some(VerificationStepDetails {
+                                            step_id: step
+                                                .name
+                                                .clone()
+                                                .unwrap_or_else(|| format!("step-{}", index)),
+                                            phase: "verification".to_string(),
+                                            stderr: Some(e),
+                                            ..Default::default()
+                                        }),
+                                        None,
+                                    ),
+                                }
+                            } else {
+                                // No test_id — delegate to handler system which supports
+                                // repository tests, inline commands (check_command/shell_command),
+                                // and auto-detection fallbacks.
+                                let (success, handler_error, _screenshot, handler_output_data) =
+                                    self.execute_single_step(step).await;
+                                let details = VerificationStepDetails {
+                                    step_id: step
+                                        .name
+                                        .clone()
+                                        .unwrap_or_else(|| format!("step-{}", index)),
+                                    phase: "verification".to_string(),
+                                    ..Default::default()
+                                };
+                                (success, handler_error, Some(details), handler_output_data)
+                            }
+                        }
+                        "check" => {
+                            // Execute check step (shell command for checks like lint, typecheck, etc.)
+                            // Output is extracted by post-match normalization from handler_output_data.
+                            let (success, error, _screenshot, handler_output_data) =
                                 self.execute_single_step(step).await;
                             let details = VerificationStepDetails {
                                 step_id: step
@@ -3055,105 +3153,97 @@ impl StepExecutor {
                                     .clone()
                                     .unwrap_or_else(|| format!("step-{}", index)),
                                 phase: "verification".to_string(),
+                                // stdout filled by post-match normalization from handler_output_data
                                 ..Default::default()
                             };
-                            (success, handler_error, Some(details), handler_output_data)
+                            (success, error, Some(details), handler_output_data)
                         }
-                    }
-                    "check" => {
-                        // Execute check step (shell command for checks like lint, typecheck, etc.)
-                        // Output is extracted by post-match normalization from handler_output_data.
-                        let (success, error, _screenshot, handler_output_data) =
-                            self.execute_single_step(step).await;
-                        let details = VerificationStepDetails {
-                            step_id: step
-                                .name
-                                .clone()
-                                .unwrap_or_else(|| format!("step-{}", index)),
-                            phase: "verification".to_string(),
-                            // stdout filled by post-match normalization from handler_output_data
-                            ..Default::default()
-                        };
-                        (success, error, Some(details), handler_output_data)
-                    }
-                    "shell" => {
-                        // Execute shell command step
-                        // Timeouts are disabled by default
-                        let timeout = step.timeout_seconds;
-                        let (success, error, output) =
-                            self.execute_shell_command_step(step, timeout).await;
-                        let details = VerificationStepDetails {
-                            step_id: step
-                                .name
-                                .clone()
-                                .unwrap_or_else(|| format!("step-{}", index)),
-                            phase: "verification".to_string(),
-                            stdout: output, // Capture output for AI context
-                            ..Default::default()
-                        };
-                        (success, error, Some(details), None)
-                    }
-                    "check_group" => {
-                        // Execute check group - runs all checks in the group
-                        // Timeouts are disabled by default
-                        let timeout = step.timeout_seconds;
-                        let (success, error, summary, check_results) =
-                            self.execute_check_group_step(step, timeout).await;
-                        let details = VerificationStepDetails {
-                            step_id: step
-                                .name
-                                .clone()
-                                .unwrap_or_else(|| format!("step-{}", index)),
-                            phase: "verification".to_string(),
-                            // Capture the detailed summary with all check results for AI context
-                            stdout: summary,
-                            // Include structured check results for UI display
-                            check_results,
-                            ..Default::default()
-                        };
-                        (success, error, Some(details), None)
-                    }
-                    "log_watch" => {
-                        // Execute log watch step (scans dev logs for errors)
-                        let (success, error, output) = self.execute_log_watch_step(step).await;
-                        let details = VerificationStepDetails {
-                            step_id: step
-                                .name
-                                .clone()
-                                .unwrap_or_else(|| format!("step-{}", index)),
-                            phase: "verification".to_string(),
-                            stdout: output,
-                            ..Default::default()
-                        };
-                        (success, error, Some(details), None)
-                    }
-                    "gate" => {
-                        // Gate step is a semantic aggregation marker. Actual pass/fail
-                        // aggregation is handled by the verification phase result logic.
-                        // The gate step itself always succeeds at execution time.
-                        info!(
+                        "shell" => {
+                            // Execute shell command step
+                            // Timeouts are disabled by default
+                            let timeout = step.timeout_seconds;
+                            let (success, error, output) =
+                                self.execute_shell_command_step(step, timeout).await;
+                            let details = VerificationStepDetails {
+                                step_id: step
+                                    .name
+                                    .clone()
+                                    .unwrap_or_else(|| format!("step-{}", index)),
+                                phase: "verification".to_string(),
+                                stdout: output, // Capture output for AI context
+                                ..Default::default()
+                            };
+                            (success, error, Some(details), None)
+                        }
+                        "check_group" => {
+                            // Execute check group - runs all checks in the group
+                            // Timeouts are disabled by default
+                            let timeout = step.timeout_seconds;
+                            let (success, error, summary, check_results) =
+                                self.execute_check_group_step(step, timeout).await;
+                            let details = VerificationStepDetails {
+                                step_id: step
+                                    .name
+                                    .clone()
+                                    .unwrap_or_else(|| format!("step-{}", index)),
+                                phase: "verification".to_string(),
+                                // Capture the detailed summary with all check results for AI context
+                                stdout: summary,
+                                // Include structured check results for UI display
+                                check_results,
+                                ..Default::default()
+                            };
+                            (success, error, Some(details), None)
+                        }
+                        "log_watch" => {
+                            // Execute log watch step (scans dev logs for errors)
+                            let (success, error, output) = self.execute_log_watch_step(step).await;
+                            let details = VerificationStepDetails {
+                                step_id: step
+                                    .name
+                                    .clone()
+                                    .unwrap_or_else(|| format!("step-{}", index)),
+                                phase: "verification".to_string(),
+                                stdout: output,
+                                ..Default::default()
+                            };
+                            (success, error, Some(details), None)
+                        }
+                        "gate" => {
+                            // Gate step is a semantic aggregation marker. Actual pass/fail
+                            // aggregation is handled by the verification phase result logic.
+                            // The gate step itself always succeeds at execution time.
+                            info!(
                         "Gate step '{}' executed (aggregation handled by verification executor)",
                         step.name.as_deref().unwrap_or("unnamed")
                     );
-                        (true, None, None, None)
+                            (true, None, None, None)
+                        }
+                        _ => {
+                            // Generic handler for all other step types in verification.
+                            // Output is captured by the post-match normalization block below.
+                            let (success, error, screenshot, handler_output_data) =
+                                self.execute_single_step(step).await;
+                            let details = screenshot.map(|s| VerificationStepDetails {
+                                step_id: step
+                                    .name
+                                    .clone()
+                                    .unwrap_or_else(|| format!("step-{}", index)),
+                                phase: "verification".to_string(),
+                                stdout: Some(s),
+                                ..Default::default()
+                            });
+                            (success, error, details, handler_output_data)
+                        }
+                    };
+
+                    // If step succeeded or no retries left, break out
+                    if last_result.0 || attempt >= max_retries {
+                        break;
                     }
-                    _ => {
-                        // Generic handler for all other step types in verification.
-                        // Output is captured by the post-match normalization block below.
-                        let (success, error, screenshot, handler_output_data) =
-                            self.execute_single_step(step).await;
-                        let details = screenshot.map(|s| VerificationStepDetails {
-                            step_id: step
-                                .name
-                                .clone()
-                                .unwrap_or_else(|| format!("step-{}", index)),
-                            phase: "verification".to_string(),
-                            stdout: Some(s),
-                            ..Default::default()
-                        });
-                        (success, error, details, handler_output_data)
-                    }
-                };
+                }
+                last_result
+            };
 
             // === Post-match normalization ===
             // Ensure every verification step has VerificationStepDetails with stdout
@@ -3618,6 +3708,23 @@ impl StepExecutor {
                 info!("Resolved variables: {:?}", vars);
             }
         }
+
+        // Runtime sanitization: replace jq with python since jq is unavailable on Windows MSYS
+        let command = if command.contains("| jq ") {
+            let sanitized =
+                super::handlers::shell_command::ShellCommandHandler::replace_jq_with_python_static(
+                    &command,
+                );
+            if sanitized != command {
+                info!(
+                    "Legacy executor: jq→python replacement applied: {}",
+                    &sanitized[..sanitized.len().min(100)]
+                );
+            }
+            sanitized
+        } else {
+            command
+        };
 
         let step_name = step.name.as_deref().unwrap_or("Shell Command");
         let working_directory = step.shell_command_working_directory.clone();

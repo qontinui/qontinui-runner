@@ -176,6 +176,89 @@ pub fn get_dev_logs_dir_string() -> String {
     path_to_string(&get_dev_logs_dir())
 }
 
+/// Resolve a working directory path, converting relative paths to absolute.
+///
+/// If the path is already absolute, returns it unchanged.
+/// If relative, resolves against the workspace root (the parent directory of qontinui-runner).
+/// Falls back to the current working directory if workspace detection fails.
+///
+/// Always returns an absolute path with normalized separators. On Windows,
+/// returning a relative path to `Command::current_dir()` causes OS error 267
+/// (ERROR_DIRECTORY) when the process CWD is invalid or the relative path
+/// can't be resolved by CreateProcessW. Mixed path separators (forward and
+/// back slashes) can also cause issues with some Windows process APIs.
+pub fn resolve_working_directory(wd: &str) -> PathBuf {
+    let path = PathBuf::from(wd);
+    if path.is_absolute() {
+        return normalize_path_separators(path);
+    }
+
+    // Cache workspace root (used in multiple fallback stages)
+    let workspace_root = crate::mcp::shared::get_workspace_paths_internal()
+        .ok()
+        .map(|(root, _, _)| root);
+
+    // Try to resolve relative to workspace root (most reliable for project-relative paths)
+    if let Some(ref root) = workspace_root {
+        let resolved = root.join(&path);
+        if resolved.exists() {
+            return normalize_path_separators(resolved);
+        }
+    }
+
+    // Fall back to CWD resolution
+    if let Ok(cwd) = std::env::current_dir() {
+        let resolved = cwd.join(&path);
+        if resolved.exists() {
+            return normalize_path_separators(resolved);
+        }
+    }
+
+    // Neither resolved to an existing path, but we MUST return an absolute path.
+    // Prefer workspace-root-based path (even unverified) over a relative path,
+    // since relative paths cause OS error 267 on Windows.
+    if let Some(root) = workspace_root {
+        let absolute = root.join(&path);
+        tracing::warn!(
+            "resolve_working_directory: '{}' not found at '{}', returning unverified absolute path",
+            wd,
+            absolute.display()
+        );
+        return normalize_path_separators(absolute);
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        let absolute = cwd.join(&path);
+        tracing::warn!(
+            "resolve_working_directory: '{}' not found, using CWD-relative: {}",
+            wd,
+            absolute.display()
+        );
+        return normalize_path_separators(absolute);
+    }
+
+    tracing::error!(
+        "resolve_working_directory: could not resolve '{}' to an absolute path — \
+         no workspace root or CWD available",
+        wd
+    );
+    path
+}
+
+/// Normalize path separators to the platform-native separator.
+/// On Windows, converts forward slashes to backslashes to avoid mixed-separator
+/// paths that can cause issues with CreateProcessW and cmd.exe.
+fn normalize_path_separators(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(path.to_string_lossy().replace('/', "\\"))
+    }
+    #[cfg(not(windows))]
+    {
+        path
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

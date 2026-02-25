@@ -25,4 +25,3 @@ export { ElementTreeView } from "./ElementTreeView";
 export { EventTimelineView } from "./EventTimelineView";
 export { ActionExecutorView } from "./ActionExecutorView";
 export { LazyThumbnail } from "./LazyThumbnail";
-export { SdkUIBridgeInspector } from "./SdkUIBridgeInspector";

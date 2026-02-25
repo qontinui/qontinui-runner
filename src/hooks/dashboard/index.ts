@@ -26,3 +26,4 @@ export {
   type OrchestratorStateResponse,
   type OrchestratorStateResult,
 } from "./useOrchestratorState";
+export { useWidgetPreferences, type UseWidgetPreferencesResult } from "./useWidgetPreferences";

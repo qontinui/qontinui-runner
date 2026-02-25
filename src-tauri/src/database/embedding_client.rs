@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 /// Default URL for the qontinui-api embedding service.
-const DEFAULT_EMBEDDING_URL: &str = "http://localhost:8001/api/embeddings/compute-text";
+// Use 127.0.0.1 to avoid IPv6 resolution delays on Windows
+const DEFAULT_EMBEDDING_URL: &str = "http://127.0.0.1:8001/api/embeddings/compute-text";
 
 /// Request payload for the embedding API.
 #[derive(Serialize)]

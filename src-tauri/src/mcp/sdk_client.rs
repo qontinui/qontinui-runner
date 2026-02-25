@@ -11,7 +11,8 @@
 
 use axum::{
     extract::{Path, Query, State},
-    response::Json,
+    http::StatusCode,
+    response::{IntoResponse, Json},
     routing::{get, post},
     Router,
 };
@@ -219,12 +220,22 @@ pub async fn sdk_request(
 // Handlers
 // =============================================================================
 
+/// Normalize localhost to 127.0.0.1 to avoid IPv6 resolution issues on Windows.
+/// Windows often resolves `localhost` to `::1` (IPv6) first, but many dev servers
+/// (Next.js, FastAPI, etc.) only bind to IPv4 `0.0.0.0`. This causes reqwest to
+/// hang on the IPv6 connect attempt before falling back to IPv4, exceeding timeouts.
+fn normalize_localhost_url(url: &str) -> String {
+    url.replace("://localhost:", "://127.0.0.1:")
+        .replace("://localhost/", "://127.0.0.1/")
+        .replace("://localhost", "://127.0.0.1") // handle bare localhost without port
+}
+
 /// POST /ui-bridge/sdk/connect — Connect to an SDK app
 async fn handle_connect(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<ConnectRequest>,
 ) -> Json<ApiResponse<ConnectResponse>> {
-    let url = req.url.trim_end_matches('/').to_string();
+    let url = normalize_localhost_url(req.url.trim_end_matches('/'));
     info!(url = %url, "Connecting to SDK app");
 
     // Check if we're already connected to this URL
@@ -248,8 +259,10 @@ async fn handle_connect(
     }
 
     // Create HTTP client with timeout
+    // 30s request timeout matches the UI Bridge IPC timeout — the app's snapshot/elements
+    // endpoints proxy through the IPC layer and can take >10s on cold pages.
     let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .connect_timeout(std::time::Duration::from_secs(5))
         .build()
     {
@@ -471,7 +484,18 @@ async fn handle_health(State(state): State<Arc<ApiState>>) -> Json<serde_json::V
 }
 
 /// GET /ui-bridge/sdk/elements — List all elements
-async fn handle_elements(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+///
+/// Supports optional query parameters for filtering:
+/// - `contentOnly=true` — return only content elements (exclude interactive)
+/// - `contentTypes=heading` — filter to specific element types (comma-separated)
+/// - `includeContent=false` — exclude content elements
+/// - `contentRole=metric` — filter to a specific content role
+///
+/// Filtering is applied proxy-side since the frontend `/control/elements` returns all elements.
+async fn handle_elements(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
     match sdk_request(&state, Method::GET, "/control/elements", None).await {
         Ok(mut data) => {
             // Add helpful note if no elements found
@@ -485,9 +509,92 @@ async fn handle_elements(State(state): State<Arc<ApiState>>) -> Json<serde_json:
                     }
                 }
             }
-            Json(data)
+
+            // Always add a `total` field for easier verification (e.g. jq -e '.total > 0')
+            if let Some(arr) = data.get("data").and_then(|d| d.as_array()) {
+                let total = arr.len();
+                if let Some(obj) = data.as_object_mut() {
+                    obj.insert("total".to_string(), serde_json::json!(total));
+                }
+            }
+
+            // Apply proxy-side filters if query parameters are present.
+            // The backend /control/elements endpoint doesn't support filtering,
+            // so we fetch all elements and filter here.
+            if !query.is_empty() {
+                if let Some(elements) = data.get("data").and_then(|d| d.as_array()).cloned() {
+                    let content_only = query
+                        .get("contentOnly")
+                        .map(|v| v == "true")
+                        .unwrap_or(false);
+                    let content_types: Option<Vec<&str>> = query
+                        .get("contentTypes")
+                        .map(|v| v.split(',').map(|s| s.trim()).collect());
+                    let include_content = query
+                        .get("includeContent")
+                        .map(|v| v != "false")
+                        .unwrap_or(true);
+                    let content_role = query.get("contentRole");
+
+                    let filtered: Vec<_> = elements
+                        .into_iter()
+                        .filter(|el| {
+                            let category = el
+                                .get("category")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("interactive");
+                            let el_type = el.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                            let el_role = el.get("contentRole").and_then(|v| v.as_str());
+
+                            // contentOnly: keep only content category elements,
+                            // but also include elements matching explicit contentTypes
+                            if content_only && category != "content" {
+                                if let Some(ref types) = content_types {
+                                    if !types.contains(&el_type) {
+                                        return false;
+                                    }
+                                } else {
+                                    return false;
+                                }
+                            }
+
+                            // includeContent=false: exclude content elements
+                            if !include_content && category == "content" {
+                                return false;
+                            }
+
+                            // contentTypes: filter by element type
+                            if let Some(ref types) = content_types {
+                                if !types.contains(&el_type) {
+                                    return false;
+                                }
+                            }
+
+                            // contentRole: filter by content role
+                            if let Some(role) = content_role {
+                                if el_role != Some(role.as_str()) {
+                                    return false;
+                                }
+                            }
+
+                            true
+                        })
+                        .collect();
+
+                    if let Some(obj) = data.as_object_mut() {
+                        let total = filtered.len();
+                        obj.insert("data".to_string(), serde_json::json!(filtered));
+                        obj.insert("total".to_string(), serde_json::json!(total));
+                    }
+                }
+            }
+
+            (StatusCode::OK, Json(data))
         }
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "success": false, "error": e })),
+        ),
     }
 }
 
@@ -517,10 +624,13 @@ async fn handle_element_action(
 }
 
 /// GET /ui-bridge/sdk/snapshot — Full UI snapshot
-async fn handle_snapshot(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+async fn handle_snapshot(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
     match sdk_request(&state, Method::GET, "/control/snapshot", None).await {
-        Ok(data) => Json(data),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+        Ok(data) => (StatusCode::OK, Json(data)),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "success": false, "error": e })),
+        ),
     }
 }
 

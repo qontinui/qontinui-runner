@@ -83,6 +83,20 @@ impl StepHandler for ShellCommandHandler {
             }
         }
 
+        // Runtime sanitization: replace jq with python since jq is unavailable on Windows MSYS
+        let command = if command.contains("| jq ") {
+            let sanitized = Self::replace_jq_with_python(&command);
+            if sanitized != command {
+                info!(
+                    "Runtime jq→python replacement applied: {}",
+                    &sanitized[..sanitized.len().min(100)]
+                );
+            }
+            sanitized
+        } else {
+            command
+        };
+
         let step_name = step.name.as_deref().unwrap_or("Shell Command");
         let working_directory = step.shell_command_working_directory.clone();
         let fail_on_error = step.shell_command_fail_on_error.unwrap_or(true);
@@ -264,7 +278,7 @@ impl ShellCommandHandler {
     ///
     /// Checks common Git install locations. Returns None if not found,
     /// in which case the caller falls back to bare "bash" (PATH lookup).
-    fn find_git_bash() -> Option<String> {
+    pub(crate) fn find_git_bash() -> Option<String> {
         let candidates = [
             r"C:\Program Files\Git\usr\bin\bash.exe",
             r"C:\Program Files\Git\bin\bash.exe",
@@ -351,6 +365,92 @@ impl ShellCommandHandler {
         }
     }
 
+    /// Replace `jq` commands with Python equivalents at runtime.
+    /// jq is not available on Windows MSYS/Git Bash, so we convert common patterns.
+    /// Note: UI Bridge SDK `/elements` returns `{"data": [...]}` not `{"elements": [...], "total": N}`.
+    pub fn replace_jq_with_python_static(cmd: &str) -> String {
+        Self::replace_jq_with_python(cmd)
+    }
+
+    fn replace_jq_with_python(cmd: &str) -> String {
+        if let Some(pipe_idx) = cmd.find("| jq ") {
+            let curl_part = cmd[..pipe_idx].trim();
+            let jq_part = &cmd[pipe_idx + 5..]; // skip "| jq "
+
+            let jq_expr = jq_part
+                .trim()
+                .trim_start_matches("-e ")
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'');
+
+            let is_sdk_elements = curl_part.contains("ui-bridge/sdk/elements");
+
+            // Pattern: .data | length > N
+            if jq_expr.contains("data") && jq_expr.contains("length") {
+                let threshold = Self::extract_threshold(jq_expr);
+                return format!(
+                    "{} | python -c \"import sys,json; d=json.load(sys.stdin); items=d.get('data',[]); assert len(items)>{}, 'Expected >{} items, got '+str(len(items))\"",
+                    curl_part, threshold, threshold
+                );
+            }
+
+            // Pattern: .elements | length > N
+            if jq_expr.contains("elements") && jq_expr.contains("length") {
+                let threshold = Self::extract_threshold(jq_expr);
+                // SDK /elements returns {data: [...]} not {elements: [...]}
+                let key = if is_sdk_elements { "data" } else { "elements" };
+                return format!(
+                    "{} | python -c \"import sys,json; d=json.load(sys.stdin); elems=d.get('{}',d.get('data',[])); assert len(elems)>{}, 'Expected >{} elements, got '+str(len(elems))\"",
+                    curl_part, key, threshold, threshold
+                );
+            }
+
+            // Pattern: .total > N
+            if jq_expr.contains("total") {
+                let threshold = Self::extract_threshold(jq_expr);
+                if is_sdk_elements {
+                    // SDK /elements has no total field — use len(data) instead
+                    return format!(
+                        "{} | python -c \"import sys,json; d=json.load(sys.stdin); items=d.get('data',[]); assert len(items)>{}, 'Expected >{} elements, got '+str(len(items))\"",
+                        curl_part, threshold, threshold
+                    );
+                }
+                return format!(
+                    "{} | python -c \"import sys,json; d=json.load(sys.stdin); t=d.get('total',len(d.get('data',[]))); assert t>{}, 'Expected total>{}, got '+str(t)\"",
+                    curl_part, threshold, threshold
+                );
+            }
+
+            // Pattern: .results | length > N
+            if jq_expr.contains("results") && jq_expr.contains("length") {
+                let threshold = Self::extract_threshold(jq_expr);
+                return format!(
+                    "{} | python -c \"import sys,json; d=json.load(sys.stdin); r=d.get('results',[]); assert len(r)>{}, 'Expected >{} results, got '+str(len(r))\"",
+                    curl_part, threshold, threshold
+                );
+            }
+        }
+        cmd.to_string()
+    }
+
+    /// Extract a numeric threshold from an expression like "> 0" or "length > 2"
+    fn extract_threshold(s: &str) -> u32 {
+        for (i, b) in s.bytes().enumerate() {
+            if b == b'>' && i + 1 < s.len() {
+                let rest = s[i + 1..].trim_start();
+                if let Some(end) = rest.find(|c: char| !c.is_ascii_digit()) {
+                    if let Ok(n) = rest[..end].parse() {
+                        return n;
+                    }
+                } else if let Ok(n) = rest.parse() {
+                    return n;
+                }
+            }
+        }
+        0
+    }
+
     /// Truncate a string for display purposes.
     fn truncate_for_display(s: &str, max_len: usize) -> String {
         if s.len() > max_len {
@@ -402,9 +502,17 @@ impl ShellCommandHandler {
             c
         };
 
-        // Set working directory if specified
+        // Set working directory if specified (resolve relative paths against workspace root)
         if let Some(wd) = working_directory {
-            cmd.current_dir(wd);
+            let resolved = crate::paths::resolve_working_directory(wd);
+            if !resolved.exists() {
+                warn!(
+                    "Shell command: working directory does not exist: {} (resolved from '{}')",
+                    resolved.display(),
+                    wd
+                );
+            }
+            cmd.current_dir(&resolved);
         }
 
         // Capture stdout and stderr
@@ -547,5 +655,57 @@ mod tests {
             ShellCommandHandler::truncate_for_display("this is a long string", 10),
             "this is a ..."
         );
+    }
+
+    #[test]
+    fn test_replace_jq_with_python_total() {
+        let cmd = r#"curl -sf http://localhost:9876/ui-bridge/sdk/elements | jq -e ".total > 0""#;
+        let result = ShellCommandHandler::replace_jq_with_python(cmd);
+        assert!(!result.contains("jq"), "Should not contain jq: {}", result);
+        assert!(
+            result.contains("python -c"),
+            "Should contain python: {}",
+            result
+        );
+        // SDK /elements has no total field — should use len(data) instead
+        assert!(
+            result.contains("data"),
+            "Should use 'data' key for SDK elements: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_replace_jq_with_python_elements() {
+        let cmd = r#"curl -sf http://localhost:9876/ui-bridge/sdk/elements | jq -e '.elements | length > 2'"#;
+        let result = ShellCommandHandler::replace_jq_with_python(cmd);
+        assert!(!result.contains("jq"), "Should not contain jq: {}", result);
+        assert!(
+            result.contains("python -c"),
+            "Should contain python: {}",
+            result
+        );
+        assert!(
+            result.contains("elements"),
+            "Should check elements: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_replace_jq_noop_for_non_jq() {
+        let cmd = "curl -sf http://localhost:9876/ui-bridge/sdk/snapshot | grep elements";
+        let result = ShellCommandHandler::replace_jq_with_python(cmd);
+        assert_eq!(result, cmd, "Non-jq commands should be unchanged");
+    }
+
+    #[test]
+    fn test_extract_threshold() {
+        assert_eq!(ShellCommandHandler::extract_threshold(".total > 0"), 0);
+        assert_eq!(
+            ShellCommandHandler::extract_threshold(".elements | length > 2"),
+            2
+        );
+        assert_eq!(ShellCommandHandler::extract_threshold("length > 10"), 10);
     }
 }

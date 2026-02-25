@@ -92,7 +92,11 @@ impl AppContext {
         // Extract navigation URL from setup steps
         let setup_navigate_url = workflow.setup_steps.iter().find_map(|step| {
             // Check command field for curl to navigate endpoint
-            let cmd = step.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            let cmd = step
+                .get("command")
+                .or_else(|| step.get("shell_command"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if cmd.contains("ui-bridge/sdk/page/navigate") {
                 // Try to extract the URL from the -d JSON body in the curl command
                 if let Some(d_pos) = cmd.find("-d") {
@@ -282,23 +286,38 @@ pub fn run_hardener_agent(
     doctor_handle: Option<&DoctorHandle>,
     conn: Option<&Connection>,
 ) -> (UnifiedWorkflow, Option<HardeningSummary>) {
-    if !should_harden_verification(workflow) {
-        debug!("No hardenable verification steps found, skipping");
-        return (workflow.clone(), None);
+    // Step 0: Apply deterministic fixups before AI hardening
+    let mut workflow = fix_sdk_urls(workflow);
+
+    // Step 0b: Sanitize Python commands (fix f-string escaping issues)
+    let mut sanitize_total = 0;
+    sanitize_total += sanitize_commands_in_steps(&mut workflow.setup_steps);
+    sanitize_total += sanitize_commands_in_steps(&mut workflow.verification_steps);
+    sanitize_total += sanitize_commands_in_steps(&mut workflow.completion_steps);
+    if sanitize_total > 0 {
+        info!(
+            "Command sanitizer: fixed {} steps with Python escaping issues",
+            sanitize_total
+        );
     }
 
-    let candidate_count = count_candidates(workflow);
+    if !should_harden_verification(&workflow) {
+        debug!("No hardenable verification steps found, skipping");
+        return (workflow, None);
+    }
+
+    let candidate_count = count_candidates(&workflow);
     info!(
         "Running hardener agent on {} candidate verification steps",
         candidate_count
     );
 
-    let app_context = AppContext::from_workflow(workflow, description);
-    let workflow_json = match serde_json::to_string_pretty(workflow) {
+    let app_context = AppContext::from_workflow(&workflow, description);
+    let workflow_json = match serde_json::to_string_pretty(&workflow) {
         Ok(j) => j,
         Err(e) => {
             warn!("Failed to serialize workflow for hardening: {}", e);
-            return (workflow.clone(), None);
+            return (workflow, None);
         }
     };
 
@@ -311,27 +330,43 @@ pub fn run_hardener_agent(
             "Hardener agent failed: {}",
             ai_result.error.as_deref().unwrap_or("unknown")
         );
-        return (workflow.clone(), None);
+        return (workflow, None);
     }
 
     // Parse the response
     let json_text = extract_json_from_response(&ai_result.output);
-    let hardened: UnifiedWorkflow = match serde_json::from_str(&json_text) {
+    let mut hardened: UnifiedWorkflow = match serde_json::from_str(&json_text) {
         Ok(w) => w,
         Err(e) => {
             warn!("Hardener produced invalid JSON: {}", e);
-            return (workflow.clone(), None);
+            return (workflow, None);
         }
     };
 
     // Safety checks
-    if let Some(error) = validate_hardened_output(workflow, &hardened) {
+    if let Some(error) = validate_hardened_output(&workflow, &hardened) {
         warn!("Hardener safety check failed: {}", error);
-        return (workflow.clone(), None);
+        return (workflow, None);
     }
 
+    // Post-hardener sanitize: the AI may re-introduce jq commands or other
+    // platform-incompatible patterns in its output. Re-apply sanitization.
+    let post_sanitize = sanitize_commands_in_steps(&mut hardened.setup_steps)
+        + sanitize_commands_in_steps(&mut hardened.verification_steps)
+        + sanitize_commands_in_steps(&mut hardened.completion_steps);
+    if post_sanitize > 0 {
+        info!(
+            "Post-hardener sanitize: fixed {} steps with jq/escaping issues in AI output",
+            post_sanitize
+        );
+    }
+
+    // Post-hardener SDK URL fix: the AI may also re-introduce /control/ URLs
+    // or drop the SDK connect step
+    let hardened = fix_sdk_urls(&hardened);
+
     // Build summary by comparing original and hardened verification steps
-    let summary = build_summary(workflow, &hardened);
+    let summary = build_summary(&workflow, &hardened);
 
     info!(
         "Hardener converted {} steps, kept {} as prompt",
@@ -339,6 +374,441 @@ pub fn run_hardener_agent(
     );
 
     (hardened, Some(summary))
+}
+
+/// Deterministic fixup: replace `/ui-bridge/control/` with `/ui-bridge/sdk/` in command steps
+/// when an SDK connect step is present. Also injects a missing SDK connect step if the workflow
+/// targets a web app but doesn't have one.
+///
+/// This catches a common AI generation mistake where the builder agent uses the runner's
+/// own control endpoint instead of the SDK proxy endpoint.
+fn fix_sdk_urls(workflow: &UnifiedWorkflow) -> UnifiedWorkflow {
+    let workflow_json = serde_json::to_string(workflow).unwrap_or_default();
+    let has_sdk_connect = workflow_json.contains("ui-bridge/sdk/connect");
+    let targets_web =
+        workflow_json.contains("localhost:3001") || workflow_json.contains("localhost:1420");
+    let has_control_urls = workflow_json.contains("ui-bridge/control/");
+    // Also detect SDK URLs that need a connect step (AI may generate /sdk/ directly)
+    let has_sdk_urls = workflow_json.contains("ui-bridge/sdk/snapshot")
+        || workflow_json.contains("ui-bridge/sdk/elements")
+        || workflow_json.contains("ui-bridge/sdk/ai/")
+        || workflow_json.contains("ui-bridge/sdk/discover")
+        || workflow_json.contains("ui-bridge/sdk/page/navigate");
+
+    // Nothing to fix
+    if !has_control_urls && !has_sdk_urls && !targets_web {
+        return workflow.clone();
+    }
+    if !has_control_urls && has_sdk_connect {
+        return workflow.clone();
+    }
+
+    let mut fixed = workflow.clone();
+    let mut fixup_count = 0;
+
+    // If targeting web app but missing SDK connect, inject one at the start of setup.
+    // This handles both cases: AI generated /control/ URLs (to be fixed below) or
+    // AI correctly generated /sdk/ URLs but forgot the connect step.
+    if targets_web && !has_sdk_connect && (has_control_urls || has_sdk_urls) {
+        // Determine target URL from the workflow
+        let target_url = if workflow_json.contains("localhost:3001") {
+            "http://localhost:3001"
+        } else {
+            "http://localhost:1420"
+        };
+
+        let connect_step = serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "type": "command",
+            "phase": "setup",
+            "mode": "shell",
+            "name": "Connect UI Bridge SDK",
+            "command": format!(
+                "curl -s -X POST http://localhost:9876/ui-bridge/sdk/connect -H \"Content-Type: application/json\" -d '{{\"url\": \"{}\"}}'",
+                target_url
+            ),
+            "fail_on_error": true
+        });
+        fixed.setup_steps.insert(0, connect_step);
+        fixup_count += 1;
+        info!(
+            "SDK URL fixup: injected missing SDK connect step for {}",
+            target_url
+        );
+    }
+
+    // Replace /ui-bridge/control/ with /ui-bridge/sdk/ in all command steps
+    let fix_steps = |steps: &mut Vec<Value>| -> usize {
+        let mut count = 0;
+        for step in steps.iter_mut() {
+            let changed = fix_control_urls_in_step(step);
+            if changed {
+                count += 1;
+            }
+        }
+        count
+    };
+
+    fixup_count += fix_steps(&mut fixed.setup_steps);
+    fixup_count += fix_steps(&mut fixed.verification_steps);
+    fixup_count += fix_steps(&mut fixed.completion_steps);
+
+    // Add retry parameters to SDK verification steps after navigation
+    let retry_count = inject_retries_after_navigation(&mut fixed.verification_steps);
+    if retry_count > 0 {
+        info!(
+            "SDK URL fixup: added retries to {} verification steps after navigation",
+            retry_count
+        );
+    }
+
+    if fixup_count > 0 {
+        info!(
+            "SDK URL fixup: corrected {} steps from /control/ to /sdk/ paths",
+            fixup_count
+        );
+    }
+
+    fixed
+}
+
+/// Fix `/ui-bridge/control/` URLs to `/ui-bridge/sdk/` in a single step's command fields.
+/// Returns true if any changes were made.
+fn fix_control_urls_in_step(step: &mut Value) -> bool {
+    let mut changed = false;
+
+    // Fields that may contain URLs (check both "command" and "shell_command" variants)
+    for field in &["command", "shell_command", "check_url", "check_command"] {
+        if let Some(val) = step.get_mut(*field) {
+            if let Some(s) = val.as_str() {
+                if s.contains("ui-bridge/control/") {
+                    let fixed = s.replace("ui-bridge/control/", "ui-bridge/sdk/");
+                    *val = Value::String(fixed);
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    changed
+}
+
+/// Add retry parameters to SDK verification steps that follow a navigation step.
+///
+/// After page navigation, the WebSocket connection needs ~15s to reconnect.
+/// This function adds `retry_count: 5` and `retry_delay_ms: 3000` to SDK-related
+/// command steps that come after a navigation step in verification.
+fn inject_retries_after_navigation(steps: &mut [Value]) -> usize {
+    let mut count = 0;
+    let mut after_nav = false;
+
+    for step in steps.iter_mut() {
+        let cmd = step
+            .get("command")
+            .or_else(|| step.get("shell_command"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        // Detect navigation steps
+        if cmd.contains("sdk/page/navigate") {
+            after_nav = true;
+            continue;
+        }
+
+        // Add retries to SDK steps after navigation (if they don't already have them)
+        if after_nav && cmd.contains("ui-bridge/sdk/") && step.get("retry_count").is_none() {
+            if let Some(obj) = step.as_object_mut() {
+                obj.insert("retry_count".to_string(), Value::Number(5.into()));
+                obj.insert("retry_delay_ms".to_string(), Value::Number(3000.into()));
+            }
+            count += 1;
+        }
+
+        // Stop adding retries after we hit a non-SDK step (like a typecheck)
+        if after_nav && !cmd.contains("ui-bridge/sdk/") && !cmd.is_empty() {
+            after_nav = false;
+        }
+    }
+
+    count
+}
+
+/// Sanitize commands in workflow steps to fix common issues:
+/// 1. Replaces `jq` commands with Python equivalents (jq unavailable on Windows)
+/// 2. Fixes Python f-string escaping issues
+/// 3. Normalizes nested `retry` objects to flat `retry_count`/`retry_delay_ms` fields
+pub fn sanitize_commands_in_steps(steps: &mut [Value]) -> usize {
+    let mut count = 0;
+
+    for step in steps.iter_mut() {
+        // Fix nested retry format: {"retry": {"count": N, "delay_ms": M}} -> retry_count/retry_delay_ms
+        if let Some(retry_obj) = step.get("retry").cloned() {
+            if let Some(obj) = step.as_object_mut() {
+                if let Some(c) = retry_obj.get("count").and_then(|v| v.as_u64()) {
+                    obj.insert("retry_count".to_string(), Value::Number(c.into()));
+                }
+                if let Some(d) = retry_obj.get("delay_ms").and_then(|v| v.as_u64()) {
+                    obj.insert("retry_delay_ms".to_string(), Value::Number(d.into()));
+                }
+                obj.remove("retry");
+                count += 1;
+            }
+        }
+
+        // Check both "command" and "shell_command" keys — workflows use "command" during
+        // generation but "shell_command" after deserialization through ExecutionStepConfig.
+        let (cmd_key, cmd) = match step.get("command").and_then(|v| v.as_str()) {
+            Some(c) => ("command", c.to_string()),
+            None => match step.get("shell_command").and_then(|v| v.as_str()) {
+                Some(c) => ("shell_command", c.to_string()),
+                None => continue,
+            },
+        };
+
+        // Replace jq commands with python -c equivalents (jq unavailable on Windows MSYS)
+        if cmd.contains("| jq ") {
+            if let Some(fixed) = replace_jq_with_python(&cmd) {
+                if let Some(obj) = step.as_object_mut() {
+                    obj.insert(cmd_key.to_string(), Value::String(fixed));
+                    count += 1;
+                }
+                continue;
+            }
+        }
+
+        // Fix f-string escaping issues in python commands → replace with clean python
+        if cmd.contains("python -c")
+            && cmd.contains("json.load")
+            && (cmd.contains("f'") || cmd.contains("f\""))
+        {
+            if let Some(fixed) = replace_python_fstring_with_clean(&cmd) {
+                if let Some(obj) = step.as_object_mut() {
+                    obj.insert(cmd_key.to_string(), Value::String(fixed));
+                    count += 1;
+                }
+            }
+        }
+
+        // Quote URLs containing & in curl commands — unquoted & is misinterpreted
+        // as a shell command separator by bash, e.g.:
+        //   curl http://host/api?a=1&b=2 | grep x
+        // bash parses as: (curl http://host/api?a=1) & (b=2 | grep x)
+        // Fix: wrap the URL in double quotes so & is treated as literal
+        let current_cmd = step.get(cmd_key).and_then(|v| v.as_str()).unwrap_or(&cmd);
+        if let Some(fixed) = quote_curl_urls_with_ampersand(current_cmd) {
+            if let Some(obj) = step.as_object_mut() {
+                obj.insert(cmd_key.to_string(), Value::String(fixed));
+                count += 1;
+            }
+        }
+    }
+
+    count
+}
+
+/// Replace `jq` commands with Python equivalents since jq is not available on Windows MSYS.
+///
+/// Handles patterns like:
+/// - `curl ... | jq -e '.elements | length > N'` → `curl ... | python -c "import sys,json; ..."`
+/// - `curl ... | jq -e '.total > N'` → `curl ... | python -c "import sys,json; ..."`
+/// - `curl ... | jq -e '.data | length > N'` → `curl ... | python -c "import sys,json; ..."`
+///
+/// Note: UI Bridge SDK `/elements` endpoint returns `{"data": [...]}` (not `{"elements": [...], "total": N}`).
+/// The `.total` pattern is mapped to `len(data)` for SDK element endpoints.
+fn replace_jq_with_python(cmd: &str) -> Option<String> {
+    let pipe_idx = cmd.find("| jq ")?;
+    let curl_part = cmd[..pipe_idx].trim();
+    let jq_part = &cmd[pipe_idx + 5..]; // skip "| jq "
+
+    // Extract the jq expression (may be quoted with -e flag)
+    let jq_expr = jq_part
+        .trim()
+        .trim_start_matches("-e ")
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'');
+
+    // Detect if this is an SDK elements endpoint (returns {data: [...]} not {elements: [...]})
+    let is_sdk_elements = curl_part.contains("ui-bridge/sdk/elements");
+
+    // Pattern: .data | length > N (SDK elements response format)
+    if jq_expr.contains("data") && jq_expr.contains("length") {
+        let threshold = extract_number_threshold(jq_expr).unwrap_or(0);
+        return Some(format!(
+            "{} | python -c \"import sys,json; d=json.load(sys.stdin); items=d.get('data',[]); assert len(items)>{}, 'Expected >{} items, got '+str(len(items))\"",
+            curl_part, threshold, threshold
+        ));
+    }
+
+    // Pattern: .elements | length > N
+    if jq_expr.contains("elements") && jq_expr.contains("length") {
+        let threshold = extract_number_threshold(jq_expr).unwrap_or(0);
+        if is_sdk_elements {
+            // SDK /elements returns {data: [...]} not {elements: [...]}
+            return Some(format!(
+                "{} | python -c \"import sys,json; d=json.load(sys.stdin); elems=d.get('data',[]); assert len(elems)>{}, 'Expected >{} elements, got '+str(len(elems))\"",
+                curl_part, threshold, threshold
+            ));
+        }
+        return Some(format!(
+            "{} | python -c \"import sys,json; d=json.load(sys.stdin); elems=d.get('elements',d.get('data',[])); assert len(elems)>{}, 'Expected >{} elements, got '+str(len(elems))\"",
+            curl_part, threshold, threshold
+        ));
+    }
+
+    // Pattern: .total > N
+    if jq_expr.contains("total") {
+        let threshold = extract_number_threshold(jq_expr).unwrap_or(0);
+        if is_sdk_elements {
+            // SDK /elements returns {data: [...]} — use len(data) instead of nonexistent total field
+            return Some(format!(
+                "{} | python -c \"import sys,json; d=json.load(sys.stdin); items=d.get('data',[]); assert len(items)>{}, 'Expected >{} elements, got '+str(len(items))\"",
+                curl_part, threshold, threshold
+            ));
+        }
+        return Some(format!(
+            "{} | python -c \"import sys,json; d=json.load(sys.stdin); t=d.get('total',len(d.get('data',[]))); assert t>{}, 'Expected total>{}, got '+str(t)\"",
+            curl_part, threshold, threshold
+        ));
+    }
+
+    // Pattern: .results | length > N
+    if jq_expr.contains("results") && jq_expr.contains("length") {
+        let threshold = extract_number_threshold(jq_expr).unwrap_or(0);
+        return Some(format!(
+            "{} | python -c \"import sys,json; d=json.load(sys.stdin); r=d.get('results',[]); assert len(r)>{}, 'Expected >{} results, got '+str(len(r))\"",
+            curl_part, threshold, threshold
+        ));
+    }
+
+    None
+}
+
+/// Replace a `python -c` command with f-strings with a clean version without f-strings.
+fn replace_python_fstring_with_clean(cmd: &str) -> Option<String> {
+    let pipe_idx = cmd.find("| python")?;
+    let curl_part = cmd[..pipe_idx].trim();
+    let python_part = &cmd[pipe_idx..];
+
+    // Detect if this is an SDK elements endpoint (returns {data: [...]} not {elements: [...]})
+    let is_sdk_elements = curl_part.contains("ui-bridge/sdk/elements");
+
+    // Detect element count assertions
+    if python_part.contains("elements") && python_part.contains("len(") {
+        let threshold = extract_number_threshold(python_part).unwrap_or(0);
+        let key = if is_sdk_elements { "data" } else { "elements" };
+        return Some(format!(
+            "{} | python -c \"import sys,json; d=json.load(sys.stdin); elems=d.get('{}',d.get('data',[])); assert len(elems)>{}, 'Expected >{} elements, got '+str(len(elems))\"",
+            curl_part, key, threshold, threshold
+        ));
+    }
+
+    // Detect total assertions
+    if python_part.contains("total") {
+        let threshold = extract_number_threshold(python_part).unwrap_or(0);
+        if is_sdk_elements {
+            // SDK /elements returns {data: [...]} — use len(data) instead of nonexistent total
+            return Some(format!(
+                "{} | python -c \"import sys,json; d=json.load(sys.stdin); items=d.get('data',[]); assert len(items)>{}, 'Expected >{} elements, got '+str(len(items))\"",
+                curl_part, threshold, threshold
+            ));
+        }
+        return Some(format!(
+            "{} | python -c \"import sys,json; d=json.load(sys.stdin); t=d.get('total',len(d.get('data',[]))); assert t>{}, 'Expected total>{}, got '+str(t)\"",
+            curl_part, threshold, threshold
+        ));
+    }
+
+    None
+}
+
+/// Quote URLs containing `&` in curl commands so bash doesn't interpret `&` as a
+/// background operator / command separator.
+///
+/// For example:
+/// ```text
+/// curl -sf http://host/api?a=1&b=2 | grep x
+/// ```
+/// becomes:
+/// ```text
+/// curl -sf "http://host/api?a=1&b=2" | grep x
+/// ```
+///
+/// Returns `None` if no fix is needed (no unquoted URLs with `&`).
+fn quote_curl_urls_with_ampersand(cmd: &str) -> Option<String> {
+    if !cmd.contains("curl ") || !cmd.contains('&') {
+        return None;
+    }
+
+    // Find URL-like tokens in the command: http:// or https:// followed by non-whitespace
+    // that contain both ? and & (multi-param query strings)
+    let mut result = cmd.to_string();
+    let mut changed = false;
+
+    // Scan for http(s):// URLs that are NOT already quoted
+    let url_prefixes = ["http://", "https://"];
+    for prefix in &url_prefixes {
+        let mut search_from = 0;
+        loop {
+            let Some(url_start) = result[search_from..].find(prefix).map(|i| i + search_from)
+            else {
+                break;
+            };
+
+            // Check if URL is already quoted (preceded by " or ')
+            if url_start > 0 {
+                let prev_char = result.as_bytes()[url_start - 1];
+                if prev_char == b'"' || prev_char == b'\'' {
+                    search_from = url_start + prefix.len();
+                    continue;
+                }
+            }
+
+            // Find end of URL (next whitespace, pipe, or end of string)
+            let url_end = result[url_start..]
+                .find(|c: char| c.is_whitespace() || c == '|' || c == ';' || c == ')' || c == '\'')
+                .map(|i| i + url_start)
+                .unwrap_or(result.len());
+
+            let url = &result[url_start..url_end];
+
+            // Only fix if URL has query params with & (the problematic case)
+            if url.contains('?') && url.contains('&') {
+                let quoted = format!("\"{}\"", url);
+                result = format!("{}{}{}", &result[..url_start], quoted, &result[url_end..]);
+                changed = true;
+                search_from = url_start + quoted.len();
+            } else {
+                search_from = url_end;
+            }
+        }
+    }
+
+    if changed {
+        Some(result)
+    } else {
+        None
+    }
+}
+
+/// Extract a numeric threshold from an assertion string like "len(...)>2" or "... > 0"
+fn extract_number_threshold(s: &str) -> Option<u32> {
+    // Look for patterns like ">2", "> 2", ">0", "> 0"
+    let bytes = s.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] == b'>' && i + 1 < bytes.len() {
+            let rest = &s[i + 1..].trim_start();
+            if let Some(end) = rest.find(|c: char| !c.is_ascii_digit()) {
+                if let Ok(n) = rest[..end].parse() {
+                    return Some(n);
+                }
+            } else if let Ok(n) = rest.parse() {
+                return Some(n);
+            }
+        }
+    }
+    None
 }
 
 /// Count verification steps that are candidates for hardening.
@@ -1182,5 +1652,417 @@ mod tests {
         assert!(prompt.contains("Rule 5"));
         assert!(prompt.contains("agentic step"));
         assert!(prompt.contains("verification coverage"));
+    }
+
+    // === fix_sdk_urls tests ===
+
+    #[test]
+    fn test_fix_sdk_urls_replaces_control_with_sdk() {
+        let mut workflow = make_test_workflow(vec![json!({
+            "id": "s1", "type": "command", "mode": "shell",
+            "command": "curl -sf http://localhost:9876/ui-bridge/control/snapshot | grep elements"
+        })]);
+        // Add a setup step that references localhost:3001 (targets web)
+        workflow.setup_steps = vec![json!({
+            "id": "setup-sdk", "type": "command", "mode": "shell",
+            "command": "curl -X POST http://localhost:9876/ui-bridge/sdk/connect -H 'Content-Type: application/json' -d '{\"url\": \"http://localhost:3001\"}'"
+        })];
+
+        let fixed = fix_sdk_urls(&workflow);
+        let cmd = fixed.verification_steps[0]
+            .get("command")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert!(
+            cmd.contains("ui-bridge/sdk/snapshot"),
+            "Should replace /control/ with /sdk/: {}",
+            cmd
+        );
+        assert!(
+            !cmd.contains("ui-bridge/control/"),
+            "Should not contain /control/: {}",
+            cmd
+        );
+    }
+
+    #[test]
+    fn test_fix_sdk_urls_injects_connect_step_when_missing() {
+        let mut workflow = make_test_workflow(vec![json!({
+            "id": "s1", "type": "command", "mode": "shell",
+            "command": "curl -sf http://localhost:9876/ui-bridge/control/snapshot"
+        })]);
+        // Setup references localhost:3001 but has no SDK connect
+        workflow.setup_steps = vec![json!({
+            "id": "nav-1", "type": "command", "mode": "shell",
+            "command": "curl -X POST http://localhost:9876/ui-bridge/control/page/navigate -H 'Content-Type: application/json' -d '{\"url\": \"http://localhost:3001/build\"}'"
+        })];
+
+        let fixed = fix_sdk_urls(&workflow);
+        // Should have injected a connect step at position 0
+        assert!(
+            fixed.setup_steps.len() > workflow.setup_steps.len(),
+            "Should inject connect step"
+        );
+        let first_cmd = fixed.setup_steps[0]
+            .get("command")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert!(
+            first_cmd.contains("ui-bridge/sdk/connect"),
+            "First setup step should be SDK connect: {}",
+            first_cmd
+        );
+        // The original nav step should also have /control/ replaced with /sdk/
+        let nav_cmd = fixed.setup_steps[1]
+            .get("command")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert!(
+            nav_cmd.contains("ui-bridge/sdk/page/navigate"),
+            "Nav step should use /sdk/: {}",
+            nav_cmd
+        );
+    }
+
+    #[test]
+    fn test_fix_sdk_urls_noop_when_already_correct() {
+        let workflow = make_sdk_workflow(vec![json!({
+            "id": "s1", "type": "command", "mode": "shell",
+            "command": "curl -sf http://localhost:9876/ui-bridge/sdk/snapshot | grep elements"
+        })]);
+        let fixed = fix_sdk_urls(&workflow);
+        assert_eq!(fixed.setup_steps.len(), workflow.setup_steps.len());
+        assert_eq!(
+            fixed.verification_steps.len(),
+            workflow.verification_steps.len()
+        );
+    }
+
+    #[test]
+    fn test_fix_sdk_urls_injects_connect_when_sdk_urls_without_connect() {
+        // AI generates /sdk/ URLs directly but forgets the connect step
+        let mut workflow = make_test_workflow(vec![
+            json!({
+                "id": "s1", "type": "command", "mode": "shell",
+                "command": "curl -sf http://localhost:9876/ui-bridge/sdk/snapshot | grep elements"
+            }),
+            json!({
+                "id": "s2", "type": "command", "mode": "shell",
+                "command": "curl -sf http://localhost:9876/ui-bridge/sdk/elements | python -c \"import sys,json; d=json.load(sys.stdin); assert d.get('total',0)>0\""
+            }),
+        ]);
+        // Setup navigates to localhost:3001 but has no SDK connect
+        workflow.setup_steps = vec![json!({
+            "id": "nav-1", "type": "command", "mode": "shell",
+            "command": "curl -X POST http://localhost:9876/ui-bridge/sdk/page/navigate -H 'Content-Type: application/json' -d '{\"url\": \"http://localhost:3001/build/page-sweep\"}'"
+        })];
+
+        let fixed = fix_sdk_urls(&workflow);
+        // Should have injected a connect step at position 0
+        assert!(
+            fixed.setup_steps.len() > workflow.setup_steps.len(),
+            "Should inject connect step"
+        );
+        let first_cmd = fixed.setup_steps[0]
+            .get("command")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert!(
+            first_cmd.contains("ui-bridge/sdk/connect"),
+            "First setup step should be SDK connect: {}",
+            first_cmd
+        );
+        assert!(
+            first_cmd.contains("localhost:3001"),
+            "Connect step should target localhost:3001: {}",
+            first_cmd
+        );
+    }
+
+    #[test]
+    fn test_fix_sdk_urls_fixes_check_url_field() {
+        let workflow = make_sdk_workflow(vec![json!({
+            "id": "s1", "type": "command", "mode": "check",
+            "check_type": "http_status",
+            "check_url": "http://localhost:9876/ui-bridge/control/elements",
+            "expected_status": 200
+        })]);
+
+        let fixed = fix_sdk_urls(&workflow);
+        let check_url = fixed.verification_steps[0]
+            .get("check_url")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert!(
+            check_url.contains("ui-bridge/sdk/elements"),
+            "check_url should be fixed: {}",
+            check_url
+        );
+    }
+
+    // === inject_retries_after_navigation tests ===
+
+    #[test]
+    fn test_inject_retries_adds_retries_after_nav() {
+        let mut steps = vec![
+            json!({
+                "id": "nav", "type": "command", "mode": "shell",
+                "command": "curl -sf -X POST http://localhost:9876/ui-bridge/sdk/page/navigate -d '{\"url\":\"http://localhost:3001/build\"}'",
+                "name": "Navigate"
+            }),
+            json!({
+                "id": "s1", "type": "command", "mode": "shell",
+                "command": "curl -sf http://localhost:9876/ui-bridge/sdk/snapshot | grep elements",
+                "name": "Check snapshot"
+            }),
+            json!({
+                "id": "s2", "type": "command", "mode": "shell",
+                "command": "curl -sf http://localhost:9876/ui-bridge/sdk/elements | grep button",
+                "name": "Check elements"
+            }),
+        ];
+
+        let count = inject_retries_after_navigation(&mut steps);
+        assert_eq!(count, 2, "Should add retries to 2 SDK steps after nav");
+        assert_eq!(steps[1].get("retry_count").unwrap().as_u64().unwrap(), 5);
+        assert_eq!(
+            steps[1].get("retry_delay_ms").unwrap().as_u64().unwrap(),
+            3000
+        );
+        assert_eq!(steps[2].get("retry_count").unwrap().as_u64().unwrap(), 5);
+        // Nav step itself should not get retries
+        assert!(steps[0].get("retry_count").is_none());
+    }
+
+    #[test]
+    fn test_inject_retries_stops_at_non_sdk_step() {
+        let mut steps = vec![
+            json!({
+                "id": "nav", "type": "command", "mode": "shell",
+                "command": "curl -sf -X POST http://localhost:9876/ui-bridge/sdk/page/navigate -d '{}'",
+                "name": "Navigate"
+            }),
+            json!({
+                "id": "s1", "type": "command", "mode": "shell",
+                "command": "curl -sf http://localhost:9876/ui-bridge/sdk/snapshot",
+                "name": "Check snapshot"
+            }),
+            json!({
+                "id": "s2", "type": "command", "mode": "check",
+                "check_type": "typecheck",
+                "command": "npx tsc --noEmit",
+                "name": "Typecheck"
+            }),
+            json!({
+                "id": "s3", "type": "command", "mode": "shell",
+                "command": "curl -sf http://localhost:9876/ui-bridge/sdk/elements",
+                "name": "Check elements after typecheck"
+            }),
+        ];
+
+        let count = inject_retries_after_navigation(&mut steps);
+        assert_eq!(
+            count, 1,
+            "Should only add retries to the 1 SDK step before typecheck"
+        );
+        assert!(steps[1].get("retry_count").is_some());
+        assert!(steps[2].get("retry_count").is_none());
+        assert!(
+            steps[3].get("retry_count").is_none(),
+            "SDK step after non-SDK should not get retries"
+        );
+    }
+
+    #[test]
+    fn test_inject_retries_preserves_existing_retries() {
+        let mut steps = vec![
+            json!({
+                "id": "nav", "type": "command", "mode": "shell",
+                "command": "curl -sf -X POST http://localhost:9876/ui-bridge/sdk/page/navigate -d '{}'",
+                "name": "Navigate"
+            }),
+            json!({
+                "id": "s1", "type": "command", "mode": "shell",
+                "command": "curl -sf http://localhost:9876/ui-bridge/sdk/snapshot",
+                "name": "Check",
+                "retry_count": 10,
+                "retry_delay_ms": 5000
+            }),
+        ];
+
+        let count = inject_retries_after_navigation(&mut steps);
+        assert_eq!(
+            count, 0,
+            "Should not modify steps that already have retry_count"
+        );
+        assert_eq!(steps[1].get("retry_count").unwrap().as_u64().unwrap(), 10);
+    }
+
+    // ====================================================================
+    // Command sanitizer tests
+    // ====================================================================
+
+    #[test]
+    fn test_replace_jq_with_python_elements() {
+        // SDK /elements returns {data: [...]} not {elements: [], total: N}
+        let cmd = r#"curl -sf http://localhost:9876/ui-bridge/sdk/elements | jq -e ".total > 0""#;
+        let result = replace_jq_with_python(cmd);
+        assert!(result.is_some(), "Should replace jq with python");
+        let py_cmd = result.unwrap();
+        assert!(py_cmd.contains("python -c"), "Should use python -c");
+        assert!(!py_cmd.contains("jq"), "Should not contain jq");
+        // For SDK /elements, total is mapped to len(data) since the API has no total field
+        assert!(
+            py_cmd.contains("data"),
+            "Should use 'data' key for SDK elements: {}",
+            py_cmd
+        );
+        assert!(
+            py_cmd.contains("len(items)>0"),
+            "Should check len(data) > 0: {}",
+            py_cmd
+        );
+    }
+
+    #[test]
+    fn test_replace_jq_with_python_element_length() {
+        // /snapshot returns {data: {elements: [...]}} — elements key exists under data
+        let cmd = r#"curl -sf http://localhost:9876/ui-bridge/sdk/snapshot | jq -e '.elements | length > 2'"#;
+        let result = replace_jq_with_python(cmd);
+        assert!(result.is_some(), "Should replace jq with python");
+        let py_cmd = result.unwrap();
+        assert!(
+            py_cmd.contains("len(elems)>2"),
+            "Should check elements length > 2: {}",
+            py_cmd
+        );
+    }
+
+    #[test]
+    fn test_sanitize_commands_replaces_jq() {
+        let mut steps = vec![json!({
+            "id": "s1", "type": "command", "mode": "shell",
+            "command": "curl -sf http://localhost:9876/ui-bridge/sdk/elements | jq -e \".total > 0\"",
+            "name": "Check elements"
+        })];
+        let count = sanitize_commands_in_steps(&mut steps);
+        assert!(count >= 1, "Should sanitize at least 1 step");
+        let cmd = steps[0].get("command").unwrap().as_str().unwrap();
+        assert!(cmd.contains("python"), "Should use python now");
+        assert!(!cmd.contains("jq"), "Should not contain jq");
+    }
+
+    #[test]
+    fn test_sanitize_commands_fixes_nested_retry() {
+        let mut steps = vec![json!({
+            "id": "s1", "type": "command", "mode": "shell",
+            "command": "curl -sf http://localhost:9876/ui-bridge/sdk/snapshot | grep elements",
+            "name": "Check",
+            "retry": {"count": 5, "delay_ms": 3000}
+        })];
+        let count = sanitize_commands_in_steps(&mut steps);
+        assert!(count >= 1, "Should fix retry format");
+        assert_eq!(steps[0].get("retry_count").unwrap().as_u64().unwrap(), 5);
+        assert_eq!(
+            steps[0].get("retry_delay_ms").unwrap().as_u64().unwrap(),
+            3000
+        );
+        assert!(
+            steps[0].get("retry").is_none(),
+            "Nested retry should be removed"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_commands_leaves_non_jq_alone() {
+        let mut steps = vec![json!({
+            "id": "s1", "type": "command", "mode": "shell",
+            "command": "curl -sf http://localhost:9876/ui-bridge/sdk/snapshot | grep 'elements'",
+            "name": "Simple grep"
+        })];
+        let count = sanitize_commands_in_steps(&mut steps);
+        assert_eq!(count, 0, "Should not modify non-jq commands");
+    }
+
+    #[test]
+    fn test_sanitize_python_fstring_with_clean() {
+        let cmd = r#"curl -sf http://localhost:9876/ui-bridge/sdk/snapshot | python -c "import sys,json; d=json.load(sys.stdin); assert d.get('elements') and len(d['elements'])>2, f'Expected >2 elements, got {len(d.get(\"elements\",[]))}'"#;
+        let result = replace_python_fstring_with_clean(cmd);
+        assert!(result.is_some(), "Should replace fstring python");
+        let clean = result.unwrap();
+        assert!(!clean.contains("f'"), "Should not contain f-strings");
+        assert!(clean.contains("len(elems)>2"), "Should check elements > 2");
+    }
+
+    #[test]
+    fn test_extract_number_threshold() {
+        assert_eq!(extract_number_threshold("len(x)>2"), Some(2));
+        assert_eq!(extract_number_threshold("total > 0"), Some(0));
+        assert_eq!(extract_number_threshold("len(d['elements'])>10"), Some(10));
+        assert_eq!(extract_number_threshold("no threshold here"), None);
+    }
+
+    // === quote_curl_urls_with_ampersand tests ===
+
+    #[test]
+    fn test_quote_url_with_ampersand() {
+        let cmd = r#"curl -sf http://localhost:9876/ui-bridge/sdk/elements?contentOnly=true&contentTypes=heading | grep -i "sweep""#;
+        let result = quote_curl_urls_with_ampersand(cmd);
+        assert!(result.is_some(), "Should quote URL with &");
+        let fixed = result.unwrap();
+        assert!(
+            fixed.contains(r#""http://localhost:9876/ui-bridge/sdk/elements?contentOnly=true&contentTypes=heading""#),
+            "URL should be wrapped in double quotes: {}",
+            fixed
+        );
+        assert!(
+            fixed.contains(r#"| grep -i "sweep""#),
+            "grep part should be preserved: {}",
+            fixed
+        );
+    }
+
+    #[test]
+    fn test_quote_url_no_ampersand_noop() {
+        let cmd =
+            "curl -sf http://localhost:9876/ui-bridge/sdk/elements?contentOnly=true | grep button";
+        let result = quote_curl_urls_with_ampersand(cmd);
+        assert!(result.is_none(), "Should not modify URL without &");
+    }
+
+    #[test]
+    fn test_quote_url_already_quoted_noop() {
+        let cmd = r#"curl -sf "http://localhost:9876/ui-bridge/sdk/elements?contentOnly=true&contentTypes=heading" | grep button"#;
+        let result = quote_curl_urls_with_ampersand(cmd);
+        assert!(result.is_none(), "Should not modify already-quoted URL");
+    }
+
+    #[test]
+    fn test_quote_url_no_curl_noop() {
+        let cmd = "python -c 'import sys; print(sys.argv)' & echo done";
+        let result = quote_curl_urls_with_ampersand(cmd);
+        assert!(result.is_none(), "Should not modify non-curl commands");
+    }
+
+    #[test]
+    fn test_sanitize_commands_quotes_curl_urls() {
+        let mut steps = vec![json!({
+            "id": "s1", "type": "command", "mode": "shell",
+            "command": r#"curl -sf http://localhost:9876/ui-bridge/sdk/elements?contentOnly=true&contentTypes=heading | grep -i "sweep""#,
+            "name": "Check heading"
+        })];
+        let count = sanitize_commands_in_steps(&mut steps);
+        assert!(count >= 1, "Should sanitize URL with &");
+        let cmd = steps[0].get("command").unwrap().as_str().unwrap();
+        assert!(
+            cmd.contains(r#""http://localhost:9876/ui-bridge/sdk/elements?contentOnly=true&contentTypes=heading""#),
+            "URL should be quoted: {}",
+            cmd
+        );
     }
 }

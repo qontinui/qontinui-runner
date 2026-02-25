@@ -93,11 +93,12 @@ export function StepOutputPanel({
           <Button
             size="sm"
             variant="ghost"
-            className="h-6 w-6 p-0"
+            className="h-6 w-6 p-0 focus-visible:ring-2 focus-visible:ring-primary/50"
             onClick={(e) => {
               e.stopPropagation();
               handleCopy();
             }}
+            aria-label="Copy output to clipboard"
             title="Copy to clipboard"
           >
             {copied ? (
@@ -111,8 +112,10 @@ export function StepOutputPanel({
           <Button
             size="sm"
             variant="ghost"
-            className="h-6 w-6 p-0"
+            className="h-6 w-6 p-0 focus-visible:ring-2 focus-visible:ring-primary/50"
             onClick={() => setIsCollapsed(!isCollapsed)}
+            aria-label={isCollapsed ? "Expand output panel" : "Collapse output panel"}
+            aria-expanded={!isCollapsed}
           >
             {isCollapsed ? (
               <ChevronDown className="h-4 w-4 text-muted-foreground" />

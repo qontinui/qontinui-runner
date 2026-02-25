@@ -192,15 +192,33 @@ impl StepHandler for UiBridgeHandler {
         context: &HandlerContext,
     ) -> StepHandlerResult {
         let action = step.ui_bridge_action.as_deref().unwrap_or("snapshot");
-        let base_url = step
+        let raw_url = step
             .ui_bridge_url
             .as_deref()
             .unwrap_or("http://localhost:9876/ui-bridge");
+
+        // SDK operations (navigate, execute, assert) always go through the runner's SDK proxy.
+        // The `ui_bridge_url` may be a page URL (e.g., "http://localhost:3001/build/page-sweep")
+        // rather than a UI Bridge API base — detect this and use the runner proxy instead.
+        let base_url: &str = if matches!(action, "navigate" | "execute" | "assert") {
+            // Always use runner SDK proxy for SDK operations
+            "http://localhost:9876/ui-bridge"
+        } else if raw_url.contains("/ui-bridge") {
+            // URL already contains UI Bridge path — use as-is
+            raw_url
+        } else {
+            // Fallback: use runner SDK proxy
+            "http://localhost:9876/ui-bridge"
+        };
+
         let timeout_ms =
             step.ui_bridge_timeout_ms
                 .unwrap_or(if action == "compare" { 120000 } else { 30000 });
 
-        info!("UI Bridge step: action={}, url={}", action, base_url);
+        info!(
+            "UI Bridge step: action={}, url={}, base={}",
+            action, raw_url, base_url
+        );
 
         // (#7) Clean up stale locks before acquiring — only in workflow context
         if let Some(ref task_run_id) = context.task_run_id {
@@ -235,21 +253,141 @@ impl StepHandler for UiBridgeHandler {
 
         // (#2) Health check before operations — skip for snapshot (it IS the health check)
         if action != "snapshot" {
-            let health_url = format!("{}/control/snapshot", base_url.trim_end_matches('/'));
-            let health_client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(2))
-                .build()
-                .ok();
+            let is_sdk_op = matches!(action, "navigate" | "execute" | "assert");
 
-            if let Some(hc) = health_client {
-                match hc.get(&health_url).send().await {
-                    Ok(_) => {
-                        // Health check passed
+            if is_sdk_op {
+                // For SDK operations, check SDK connection status (not runner webview).
+                // The SDK proxy is independent of the runner's Tauri webview — the proxy
+                // can be functional even when the webview is temporarily unavailable.
+                let status_url = format!("{}/sdk/status", base_url.trim_end_matches('/'));
+                let health_client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build()
+                    .ok();
+
+                if let Some(hc) = &health_client {
+                    let mut connected = false;
+
+                    // Check SDK connection status with retry
+                    for attempt in 1..=3u32 {
+                        match hc.get(&status_url).send().await {
+                            Ok(resp) if resp.status().is_success() => {
+                                if let Ok(body) = resp.text().await {
+                                    connected = body.contains("\"connected\":true");
+                                    if connected {
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                warn!("SDK status check attempt {}/3 failed: {}", attempt, e);
+                            }
+                        }
+
+                        if !connected && attempt < 3 {
+                            // Try to auto-reconnect using origin from step URL
+                            let app_origin = step
+                                .ui_bridge_url
+                                .as_deref()
+                                .and_then(|u| {
+                                    if let Some(scheme_end) = u.find("://") {
+                                        let after = &u[scheme_end + 3..];
+                                        if let Some(path_start) = after.find('/') {
+                                            Some(&u[..scheme_end + 3 + path_start])
+                                        } else {
+                                            Some(u)
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or("http://localhost:3001");
+
+                            info!(
+                                "SDK not connected, attempting reconnect to {} (attempt {}/3)",
+                                app_origin, attempt
+                            );
+
+                            let connect_url =
+                                format!("{}/sdk/connect", base_url.trim_end_matches('/'));
+                            let connect_body = serde_json::json!({ "url": app_origin });
+
+                            match hc.post(&connect_url).json(&connect_body).send().await {
+                                Ok(r) if r.status().is_success() => {
+                                    info!("SDK reconnect succeeded");
+                                    // Wait briefly for connection to stabilize
+                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                }
+                                Ok(r) => {
+                                    warn!("SDK reconnect returned status {}", r.status());
+                                }
+                                Err(e) => {
+                                    warn!("SDK reconnect failed: {}", e);
+                                }
+                            }
+                        }
                     }
-                    Err(e) => {
+
+                    if !connected {
+                        // Final check after reconnect attempts
+                        if let Ok(resp) = hc.get(&status_url).send().await {
+                            if let Ok(body) = resp.text().await {
+                                connected = body.contains("\"connected\":true");
+                            }
+                        }
+                    }
+
+                    if !connected {
                         let msg = format!(
-                            "UI Bridge at {} is not reachable (health check failed: {})",
-                            base_url, e
+                            "UI Bridge SDK is not connected (checked {} — no active connection after reconnect attempts)",
+                            status_url
+                        );
+                        error!("{}", msg);
+                        return StepHandlerResult::failure(msg);
+                    }
+                }
+            } else {
+                // For non-SDK operations (compare, etc.), check control endpoint
+                let health_url = format!("{}/control/snapshot", base_url.trim_end_matches('/'));
+                let health_client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build()
+                    .ok();
+
+                if let Some(hc) = health_client {
+                    let mut reachable = false;
+                    for attempt in 1..=3u32 {
+                        match hc.get(&health_url).send().await {
+                            Ok(_) => {
+                                reachable = true;
+                                break;
+                            }
+                            Err(e) => {
+                                if attempt < 3 {
+                                    warn!(
+                                        "Health check attempt {}/3 failed: {}, retrying...",
+                                        attempt, e
+                                    );
+                                    tokio::time::sleep(std::time::Duration::from_secs(
+                                        attempt as u64,
+                                    ))
+                                    .await;
+                                } else {
+                                    let msg = format!(
+                                        "UI Bridge at {} is not reachable (health check failed after 3 attempts: {})",
+                                        base_url, e
+                                    );
+                                    error!("{}", msg);
+                                    return StepHandlerResult::failure(msg);
+                                }
+                            }
+                        }
+                    }
+                    if !reachable {
+                        let msg = format!(
+                            "UI Bridge at {} is not reachable after 3 attempts",
+                            base_url,
                         );
                         error!("{}", msg);
                         return StepHandlerResult::failure(msg);
@@ -284,13 +422,13 @@ impl StepHandler for UiBridgeHandler {
                             );
                         }
                     };
-                    let endpoint = format!("{}/sdk/navigate", base_url.trim_end_matches('/'));
+                    let endpoint = format!("{}/sdk/page/navigate", base_url.trim_end_matches('/'));
                     let body = serde_json::json!({ "url": url });
                     client.post(&endpoint).json(&body).send().await
                 }
                 "execute" => {
                     let instruction = step.ui_bridge_instruction.as_deref().unwrap_or("");
-                    let endpoint = format!("{}/sdk/execute", base_url.trim_end_matches('/'));
+                    let endpoint = format!("{}/sdk/ai/execute", base_url.trim_end_matches('/'));
                     let mut body = serde_json::json!({ "instruction": instruction });
                     if let Some(timeout) = step.ui_bridge_timeout_ms {
                         body["timeout"] = serde_json::json!(timeout);
@@ -301,7 +439,7 @@ impl StepHandler for UiBridgeHandler {
                     let target = step.ui_bridge_target.as_deref().unwrap_or("");
                     let assert_type = step.ui_bridge_assert_type.as_deref().unwrap_or("exists");
                     let expected = step.ui_bridge_expected.as_deref();
-                    let endpoint = format!("{}/sdk/assert", base_url.trim_end_matches('/'));
+                    let endpoint = format!("{}/sdk/ai/assert", base_url.trim_end_matches('/'));
                     let mut body = serde_json::json!({
                         "target": target,
                         "type": assert_type,

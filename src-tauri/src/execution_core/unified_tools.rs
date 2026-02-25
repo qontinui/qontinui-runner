@@ -258,6 +258,17 @@ async fn execute_shell_command(
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
+    // Runtime sanitization: replace jq with python since jq is unavailable on Windows MSYS
+    let command = if command.contains("| jq ") {
+        let sanitized = crate::step_executor::handlers::shell_command::ShellCommandHandler::replace_jq_with_python_static(&command);
+        if sanitized != command {
+            info!(step_id = %step_id, "Unified tools: jq→python replacement applied");
+        }
+        sanitized
+    } else {
+        command
+    };
+
     info!(
         step_id = %step_id,
         command = %command,

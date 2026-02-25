@@ -45,6 +45,13 @@ export type {
   ResumePoint,
 } from "./WorkflowExecutionContext";
 
+// Shared Step Data Context (centralized dashboard data fetching)
+export {
+  SharedStepDataProvider,
+  useSharedStepData,
+  useSharedStepDataRaw,
+} from "./SharedStepDataContext";
+
 // Re-export execution-related hooks for convenience
 export {
   usePythonExecutor,

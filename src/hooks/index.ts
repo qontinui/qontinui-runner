@@ -121,16 +121,6 @@ export {
   useSuccessRateTrend,
 } from "./usePerformanceMetrics";
 
-export {
-  discoveryKeys,
-  useDiscoverySummary,
-  useSyncStatus,
-  usePendingDiscoveries,
-  useSyncDiscoveries,
-  useClearDiscovery,
-  useClearFailedDiscoveries,
-} from "./useDiscoveries";
-
 export { useExecutionStatus } from "./useExecutionStatus";
 export type { UseExecutionStatusReturn } from "./useExecutionStatus";
 
@@ -247,3 +237,7 @@ export type {
   WorkflowConnectionStatus,
   WorkflowStatusSummary,
 } from "./useWorkflowExecution";
+
+export { useSharedElapsedTime } from "./useSharedElapsedTime";
+
+export { useRunnerConnectionStatus } from "./useRunnerConnectionStatus";

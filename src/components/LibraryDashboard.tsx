@@ -152,7 +152,7 @@ const CATEGORY_CONFIG: Record<
 };
 
 interface LibraryDashboardProps {
-  onNavigateToBuilder: (builderTab: string, itemId: string, itemType: ItemType) => void;
+  onNavigateToBuilder?: (builderTab: string, itemId: string, itemType: ItemType) => void;
   onLog?: (level: string, message: string) => void;
 }
 
@@ -439,7 +439,7 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
 
   const handleItemClick = (item: DashboardItem) => {
     const config = CATEGORY_CONFIG[item.type];
-    onNavigateToBuilder(config.builderTab, item.id, item.type);
+    onNavigateToBuilder?.(config.builderTab, item.id, item.type);
   };
 
   // Available type filters (only show types that have items)

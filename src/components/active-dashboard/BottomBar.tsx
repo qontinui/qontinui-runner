@@ -1,11 +1,12 @@
 /**
  * BottomBar Component
  *
- * Bottom status bar showing iteration progress, current action, and connection status.
+ * Bottom status bar showing elapsed time, current action, and connection status.
  */
 
 import {
   Wifi,
+  WifiOff,
   Monitor,
   Globe,
   Globe2,
@@ -22,12 +23,15 @@ import {
   GitBranch,
   Plug,
   ListOrdered,
+  Clock,
 } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { Badge } from "../ui";
 import type { ActivityType } from "../../types/dashboard/activity-types";
 import { ACTIVITY_DISPLAY_CONFIG } from "../../types/dashboard/activity-types";
 import { getStatusColors, getAccentColors } from "@/design-system";
+import { useSharedElapsedTime, useRunnerConnectionStatus } from "@/hooks";
+import { useSharedStepDataRaw } from "@/contexts";
 import type { OrchestratorAgent } from "../shared/AiMessageDisplay";
 import { ORCHESTRATOR_AGENT_DISPLAY } from "../shared/AiMessageDisplay";
 
@@ -35,10 +39,6 @@ import { ORCHESTRATOR_AGENT_DISPLAY } from "../shared/AiMessageDisplay";
  * Props for BottomBar component.
  */
 export interface BottomBarProps {
-  /** Current iteration (1-based) */
-  iteration?: number;
-  /** Maximum iterations */
-  maxIterations?: number;
   /** Currently active activity type */
   activeActivity?: ActivityType | null;
   /** Description of current action */
@@ -47,6 +47,8 @@ export interface BottomBarProps {
   isRunning?: boolean;
   /** Current orchestrator agent (if using orchestrated workflow) */
   currentOrchestratorAgent?: OrchestratorAgent;
+  /** Task start time (ms since epoch) for elapsed time display */
+  taskStartTime?: number | null;
 }
 
 /**
@@ -82,21 +84,36 @@ const orchestratorAgentIcons: Record<
   worker: Bot,
 };
 
+/**
+ * Format elapsed seconds into human-readable string.
+ */
+function formatElapsedTime(totalSeconds: number): string {
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const mins = Math.floor(totalSeconds / 60);
+  const secs = totalSeconds % 60;
+  if (mins < 60) return `${mins}m ${secs}s`;
+  const hours = Math.floor(mins / 60);
+  const remainMins = mins % 60;
+  return `${hours}h ${remainMins}m`;
+}
+
 export function BottomBar({
   currentAction,
-  iteration = 1,
-  maxIterations = 1,
   activeActivity,
   isRunning = false,
   currentOrchestratorAgent,
+  taskStartTime = null,
 }: BottomBarProps) {
-  const iterationProgress = maxIterations > 0 ? (iteration / maxIterations) * 100 : 0;
+  const elapsedSec = useSharedElapsedTime(taskStartTime ?? null);
+  const { isConnected, latencyMs } = useRunnerConnectionStatus();
+  const { lastFetchedAt } = useSharedStepDataRaw();
+  const dataAgeSec = useSharedElapsedTime(lastFetchedAt);
+  const isStale = dataAgeSec > 10;
+  const connColors = getStatusColors(isConnected ? "success" : "error");
 
   // Get activity display info
   const activityInfo = activeActivity ? ACTIVITY_DISPLAY_CONFIG[activeActivity] : null;
   const ActivityIcon = activeActivity ? activityIcons[activeActivity] : null;
-  const blueColors = getAccentColors("blue");
-  const successColors = getStatusColors("success");
 
   // Get orchestrator agent display info
   const agentConfig = currentOrchestratorAgent
@@ -109,40 +126,15 @@ export function BottomBar({
 
   return (
     <div className="flex h-10 items-center border-t border-border bg-card px-4">
-      {/* Left: Iteration Progress */}
+      {/* Left: Elapsed Time */}
       <div className="flex items-center gap-2 w-[30%]">
-        {/* Circular progress indicator */}
-        <div className="relative h-4 w-4">
-          <svg className="h-4 w-4 -rotate-90 transform">
-            <circle
-              cx="8"
-              cy="8"
-              r="6"
-              stroke="currentColor"
-              strokeWidth="2"
-              fill="none"
-              className="text-muted"
-            />
-            <circle
-              cx="8"
-              cy="8"
-              r="6"
-              stroke="currentColor"
-              strokeWidth="2"
-              fill="none"
-              strokeDasharray={`${2 * Math.PI * 6}`}
-              strokeDashoffset={`${2 * Math.PI * 6 * (1 - iterationProgress / 100)}`}
-              className={cn("transition-all", blueColors.text)}
-              strokeLinecap="round"
-            />
-          </svg>
-        </div>
+        <Clock className="h-4 w-4 text-muted-foreground" />
         <span
           data-content-role="metric"
-          data-content-label="iteration progress"
-          className="text-sm text-foreground font-medium"
+          data-content-label="elapsed time"
+          className="text-sm text-foreground font-medium font-mono"
         >
-          Iteration {iteration}/{maxIterations}
+          {formatElapsedTime(elapsedSec)}
         </span>
       </div>
 
@@ -186,15 +178,28 @@ export function BottomBar({
         </div>
       </div>
 
-      {/* Right: Connection Status */}
-      <div className="flex items-center justify-end w-[20%]">
+      {/* Right: Freshness + Connection Status */}
+      <div className="flex items-center justify-end gap-2 w-[20%]">
+        {lastFetchedAt && (
+          <span
+            data-content-role="metric"
+            data-content-label="data freshness"
+            className={cn("text-xs", isStale ? "text-amber-400" : "text-muted-foreground")}
+          >
+            {dataAgeSec}s ago
+          </span>
+        )}
         <Badge
           data-content-role="status"
           data-content-label="connection status"
-          className={cn(successColors.bg, successColors.text, "border", successColors.border)}
+          className={cn(connColors.bg, connColors.text, "border", connColors.border)}
         >
-          <Wifi className="mr-1.5 h-3 w-3" />
-          Connected
+          {isConnected ? (
+            <Wifi className="mr-1.5 h-3 w-3" />
+          ) : (
+            <WifiOff className="mr-1.5 h-3 w-3" />
+          )}
+          {isConnected ? (latencyMs !== null ? `${latencyMs}ms` : "Connected") : "Disconnected"}
         </Badge>
       </div>
     </div>

@@ -10593,6 +10593,49 @@ impl CheckpointDb {
         Ok(results)
     }
 
+    /// Get the first running task along with its step execution events in a single call.
+    /// Returns None if no tasks are running.
+    /// This is an optimized batch query that avoids two separate round-trips.
+    pub fn get_running_task_step_data(
+        &self,
+    ) -> Result<Option<(TaskRun, Vec<TaskRunEvent>)>, String> {
+        let running = self.get_running_task_runs()?;
+        let task = match running.into_iter().next() {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        let events = self.get_task_run_events(&task.id, None, None)?;
+        Ok(Some((task, events)))
+    }
+
+    /// Get the set of iteration numbers that have completed verification phase results.
+    /// Returns only the iteration integers, not the full result payloads.
+    pub fn get_completed_verification_iterations(
+        &self,
+        task_run_id: &str,
+    ) -> Result<Vec<i64>, String> {
+        let conn = self.get_conn()?;
+
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT iteration FROM workflow_verification_phase_results
+                WHERE task_run_id = ?1
+                ORDER BY iteration ASC
+                "#,
+            )
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+        let iterations: Vec<i64> = stmt
+            .query_map(params![task_run_id], |row| row.get(0))
+            .map_err(|e| format!("Failed to query completed iterations: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(iterations)
+    }
+
     // ========================================================================
     // Saved API Requests Operations
     // ========================================================================
@@ -16785,5 +16828,132 @@ mod tests {
         // Verify via get_task_run
         let loaded = db.get_task_run("test-task-1").unwrap().unwrap();
         assert!(!loaded.auto_continue);
+    }
+
+    #[test]
+    fn test_get_running_task_step_data_no_running_tasks() {
+        let (db, _temp) = create_test_db();
+
+        // No tasks at all
+        let result = db.get_running_task_step_data().unwrap();
+        assert!(result.is_none());
+
+        // Create a completed task (not running)
+        let input = CreateTaskRunInput::new("done-1", "Done Task").with_prompt("finished");
+        db.create_task_run(&input).unwrap();
+        db.update_task_run_status("done-1", "complete").unwrap();
+
+        let result = db.get_running_task_step_data().unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_running_task_step_data_with_events() {
+        let (db, _temp) = create_test_db();
+
+        let input = CreateTaskRunInput::new("run-1", "Running Task").with_prompt("do stuff");
+        db.create_task_run(&input).unwrap();
+
+        // Insert step events
+        let start_event = CreateTaskRunEventInput {
+            task_run_id: "run-1".to_string(),
+            event_type: "step_execution".to_string(),
+            event_subtype: Some("start".to_string()),
+            message: "Run npm test".to_string(),
+            data: Some(
+                serde_json::json!({
+                    "step_name": "npm test",
+                    "step_index": 0,
+                    "phase": "setup"
+                })
+                .to_string(),
+            ),
+            workflow_name: None,
+            state_name: None,
+            action_id: Some("action-1".to_string()),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            duration_ms: None,
+        };
+        db.create_task_run_event(&start_event).unwrap();
+
+        let complete_event = CreateTaskRunEventInput {
+            task_run_id: "run-1".to_string(),
+            event_type: "step_execution".to_string(),
+            event_subtype: Some("complete".to_string()),
+            message: "Run npm test".to_string(),
+            data: Some(
+                serde_json::json!({
+                    "step_name": "npm test",
+                    "step_index": 0,
+                    "phase": "setup",
+                    "duration_ms": 1500
+                })
+                .to_string(),
+            ),
+            workflow_name: None,
+            state_name: None,
+            action_id: Some("action-1".to_string()),
+            timestamp: "2026-01-01T00:00:02Z".to_string(),
+            duration_ms: Some(1500),
+        };
+        db.create_task_run_event(&complete_event).unwrap();
+
+        let result = db.get_running_task_step_data().unwrap();
+        assert!(result.is_some());
+
+        let (task, events) = result.unwrap();
+        assert_eq!(task.id, "run-1");
+        assert_eq!(task.status, "running");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_subtype.as_deref(), Some("start"));
+        assert_eq!(events[1].event_subtype.as_deref(), Some("complete"));
+    }
+
+    #[test]
+    fn test_get_completed_verification_iterations() {
+        let (db, _temp) = create_test_db();
+
+        let input = CreateTaskRunInput::new("task-v1", "Verification Task").with_prompt("verify");
+        db.create_task_run(&input).unwrap();
+
+        // Store verification results for iterations 1, 2, 3
+        for i in 1..=3 {
+            let result = serde_json::json!({
+                "all_passed": i == 3,
+                "total_steps": 5,
+                "passed_steps": if i == 3 { 5 } else { 3 },
+                "failed_steps": if i == 3 { 0 } else { 2 },
+                "skipped_steps": 0,
+                "total_duration_ms": 1000 * i,
+                "critical_failure": false,
+                "iteration": i
+            });
+            db.store_verification_phase_result("task-v1", i as u32, &result)
+                .unwrap();
+        }
+
+        let iterations = db.get_completed_verification_iterations("task-v1").unwrap();
+        assert_eq!(iterations, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_get_completed_verification_iterations_empty() {
+        let (db, _temp) = create_test_db();
+
+        // No verification results for a nonexistent task
+        let iterations = db
+            .get_completed_verification_iterations("nonexistent-task")
+            .unwrap();
+        assert!(iterations.is_empty());
+
+        // Create a task but don't add verification results
+        let input =
+            CreateTaskRunInput::new("task-empty", "Empty Task").with_prompt("no verification");
+        db.create_task_run(&input).unwrap();
+
+        let iterations = db
+            .get_completed_verification_iterations("task-empty")
+            .unwrap();
+        assert!(iterations.is_empty());
     }
 }

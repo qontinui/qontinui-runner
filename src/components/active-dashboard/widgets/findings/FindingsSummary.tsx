@@ -18,16 +18,28 @@ import { getSeverityColors, getStatusColors, getAccentColors } from "@/design-sy
 type FindingsSummaryProps = BaseWidgetProps;
 
 /**
- * Compact severity count display.
+ * Compact severity badge display using design system severity colors.
  */
-function SeverityCount({ severity, count }: { severity: FindingSeverity; count: number }) {
-  const config = getSeverityConfig(severity);
-
+function SeverityBadge({ severity, count }: { severity: FindingSeverity; count: number }) {
   if (count === 0) {
     return null;
   }
 
-  return <span className={cn("text-xs font-medium", config.color)}>{count}</span>;
+  const colors = getSeverityColors(severity);
+  const config = getSeverityConfig(severity);
+
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-medium",
+        colors.bg,
+        colors.text,
+      )}
+    >
+      {config.label}
+      <span className="opacity-70">{count}</span>
+    </span>
+  );
 }
 
 /**
@@ -117,17 +129,15 @@ export function FindingsSummary({
         )}
       </div>
 
-      {/* Severity counts */}
+      {/* Severity badges */}
       {hasIssues && (
-        <div className="flex items-center gap-2">
-          <div className="flex items-center gap-1.5 text-xs">
-            <SeverityCount severity="critical" count={data.bySeverity.critical} />
-            <SeverityCount severity="high" count={data.bySeverity.high} />
-            <SeverityCount severity="medium" count={data.bySeverity.medium} />
-            <SeverityCount severity="low" count={data.bySeverity.low} />
-          </div>
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <SeverityBadge severity="critical" count={data.bySeverity.critical} />
+          <SeverityBadge severity="high" count={data.bySeverity.high} />
+          <SeverityBadge severity="medium" count={data.bySeverity.medium} />
+          <SeverityBadge severity="low" count={data.bySeverity.low} />
           {data.byStatus.resolved > 0 && (
-            <span className={cn("text-xs", getStatusColors("success").text)}>
+            <span className={cn("text-xs ml-auto", getStatusColors("success").text)}>
               {data.byStatus.resolved} resolved
             </span>
           )}

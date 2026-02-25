@@ -136,6 +136,11 @@ impl InjectedStepParser {
                 // Force phase to verification
                 step.phase = Some("verification".to_string());
 
+                // Default command_mode to "shell" for command-type steps
+                if step.step_type == "command" && step.command_mode.is_none() {
+                    step.command_mode = Some("shell".to_string());
+                }
+
                 // Generate UUID id if none provided
                 if step.id.is_none() {
                     step.id = Some(uuid::Uuid::new_v4().to_string());

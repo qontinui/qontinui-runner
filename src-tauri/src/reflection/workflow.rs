@@ -109,6 +109,7 @@ pub fn build_verification_steps(source_task_run_id: &str) -> Vec<ExecutionStepCo
         {
             let mut step = ExecutionStepConfig {
                 step_type: "command".to_string(),
+                command_mode: Some("check".to_string()),
                 name: Some("Verify reflection data accessible".to_string()),
                 check_type: Some("http_status".to_string()),
                 check_url: Some(format!(
@@ -315,13 +316,13 @@ Only use `prompt` steps for high-level semantic checks that cannot be expressed 
 
 ```
 [INJECT_STEP]
-{{"type": "command", "name": "Verify KB entry exists", "command": "curl -sf http://localhost:9876/task-runs/current/knowledge | grep expected_keyword"}}
+{{"type": "command", "mode": "shell", "name": "Verify KB entry exists", "command": "curl -sf http://localhost:9876/task-runs/current/knowledge | grep expected_keyword"}}
 [/INJECT_STEP]
 ```
 
 ```
 [INJECT_STEP]
-{{"type": "command", "name": "Verify generation rule created", "command": "curl -sf 'http://localhost:9876/generation-rules?agent=schema_context&status=active' | grep rule_title_keyword"}}
+{{"type": "command", "mode": "shell", "name": "Verify generation rule created", "command": "curl -sf 'http://localhost:9876/generation-rules?agent=schema_context&status=active' | grep rule_title_keyword"}}
 [/INJECT_STEP]
 ```
 
@@ -369,6 +370,7 @@ fn build_api_step(
 
     let mut step = ExecutionStepConfig {
         step_type: "command".to_string(),
+        command_mode: Some("shell".to_string()),
         name: Some(name.to_string()),
         shell_command: Some(curl_cmd),
         extract,

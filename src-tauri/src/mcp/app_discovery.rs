@@ -141,7 +141,8 @@ async fn check_health(
     path: &str,
     base_path: &str,
 ) -> Option<DiscoveredApp> {
-    let url = format!("http://localhost:{}{}", port, path);
+    // Use 127.0.0.1 instead of localhost to avoid IPv6 resolution delays on Windows
+    let url = format!("http://127.0.0.1:{}{}", port, path);
 
     let response = match timeout(
         Duration::from_millis(SCAN_TIMEOUT_MS + 200),
@@ -183,7 +184,7 @@ async fn check_health(
             .get("framework")
             .and_then(|v| v.as_str())
             .map(String::from),
-        url: format!("http://localhost:{}", port),
+        url: format!("http://127.0.0.1:{}", port),
         port,
         base_path: base_path.to_string(),
         version: ui_bridge

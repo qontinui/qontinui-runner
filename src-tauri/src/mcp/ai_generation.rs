@@ -98,21 +98,6 @@ pub struct SuggestExplorationStrategyRequest {
     pub config_path: Option<String>,
 }
 
-/// Request body for POST /ai/compare-snapshots
-#[derive(Debug, Deserialize)]
-pub struct CompareSnapshotsRequest {
-    pub reference_snapshot: serde_json::Value,
-    pub target_snapshot: serde_json::Value,
-    #[serde(default = "default_comparison_mode")]
-    pub comparison_mode: String,
-    #[serde(default)]
-    pub user_prompt: Option<String>,
-}
-
-fn default_comparison_mode() -> String {
-    "structural".to_string()
-}
-
 // ============================================================================
 // Helper: Map AI provider to string
 // ============================================================================
@@ -570,55 +555,6 @@ pub async fn suggest_exploration_strategy_handler(
     handle_bridge_result(result, "Exploration strategy suggested successfully")
 }
 
-/// POST /ai/compare-snapshots
-///
-/// Compare two UI snapshots (reference vs target) using AI via the Python bridge.
-pub async fn compare_snapshots_handler(
-    State(state): State<Arc<ApiState>>,
-    Json(request): Json<CompareSnapshotsRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    use crate::settings;
-
-    info!(
-        "HTTP: Comparing snapshots with AI (mode={})",
-        request.comparison_mode
-    );
-
-    let ai_settings = settings::get_ai_settings();
-    let ai_provider = ai_provider_str(&ai_settings.provider);
-    let provider_settings = build_provider_settings(&ai_settings);
-    let app_state = state.app_state.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        let params = serde_json::json!({
-            "reference_snapshot": request.reference_snapshot,
-            "target_snapshot": request.target_snapshot,
-            "comparison_mode": request.comparison_mode,
-            "user_prompt": request.user_prompt,
-            "ai_provider": ai_provider,
-            "ai_settings": provider_settings,
-        });
-
-        with_default_bridge(&app_state, |bridge| {
-            bridge.send_command_and_wait(
-                "compare_snapshots_with_ai",
-                Some(params),
-                std::time::Duration::from_secs(180),
-            )
-        })
-    })
-    .await
-    .map_err(|e| {
-        error!("HTTP: spawn_blocking error for compare-snapshots: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Internal error: {}", e))),
-        )
-    })?;
-
-    handle_bridge_result(result, "Snapshots compared successfully")
-}
-
 // ============================================================================
 // Helper: Process bridge result into ApiResponse
 // ============================================================================
@@ -693,5 +629,4 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             "/ai/suggest-exploration-strategy",
             post(suggest_exploration_strategy_handler),
         )
-        .route("/ai/compare-snapshots", post(compare_snapshots_handler))
 }

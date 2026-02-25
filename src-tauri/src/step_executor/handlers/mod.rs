@@ -71,7 +71,7 @@ use super::executor::ExecutionStepConfig;
 // Internal modules used by CommandHandler (not registered directly)
 pub(super) mod check;
 pub(super) mod check_group;
-pub(super) mod shell_command;
+pub(crate) mod shell_command;
 pub(super) mod test;
 // Active handlers
 mod command;

@@ -195,6 +195,7 @@ pub fn build_meta_workflow_template(
             "name": "AI semantic review",
             "type": "command",
             "phase": "verification",
+            "mode": "check",
             "check_type": "ai_review",
             "ai_review_prompt": verification_prompt,
             "ai_review_input_path": "{{artifact_dir}}/workflow.json",

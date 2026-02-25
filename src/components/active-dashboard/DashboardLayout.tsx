@@ -7,8 +7,10 @@
 
 import { useCallback, useMemo, memo, useState, useRef, useEffect } from "react";
 import { cn } from "../../lib/utils";
+import { Pin, EyeOff } from "lucide-react";
 import type { ActivityType, ActivityStatus } from "../../types/dashboard/activity-types";
 import type { DashboardLayoutState } from "../../hooks/dashboard/useDashboardLayout";
+import type { UseWidgetPreferencesResult } from "../../hooks/dashboard/useWidgetPreferences";
 import { widgetRegistry } from "../../types/dashboard/widget-registry";
 import { WidgetHeader } from "./WidgetHeader";
 import { IdleState } from "./IdleState";
@@ -51,6 +53,8 @@ interface DashboardLayoutProps {
   lastRunWorkflowName?: string | null;
   /** ID of the last run workflow */
   lastRunWorkflowId?: string | null;
+  /** Widget pin/hide preferences */
+  widgetPreferences?: UseWidgetPreferencesResult;
 }
 
 /**
@@ -233,7 +237,8 @@ function CopyConversationButton({ entries }: { entries: { line: string }[] }) {
   return (
     <button
       onClick={handleCopy}
-      className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+      className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50 focus-visible:ring-offset-1"
+      aria-label="Copy conversation to clipboard"
       title="Copy conversation"
     >
       {copied ? (
@@ -827,6 +832,9 @@ interface SummaryRendererProps {
   status: ActivityStatus;
   onClick: () => void;
   onNavigateToDetail: () => void;
+  onPin?: () => void;
+  onHide?: () => void;
+  isPinned?: boolean;
 }
 
 /**
@@ -838,6 +846,9 @@ function SummaryContainer({
   onClick,
   onNavigateToDetail: _onNavigateToDetail,
   data,
+  onPin,
+  onHide,
+  isPinned,
 }: SummaryRendererProps & {
   config: NonNullable<ReturnType<typeof widgetRegistry.get>>;
   data: unknown;
@@ -848,17 +859,58 @@ function SummaryContainer({
   return (
     <div
       className={cn(
-        "rounded-lg border overflow-hidden bg-background cursor-pointer",
+        "relative group rounded-lg border overflow-hidden bg-background cursor-pointer",
         "hover:border-foreground/30 transition-colors duration-200",
+        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50 focus-visible:ring-offset-1 focus-visible:ring-offset-background",
         borderClasses,
       )}
       onClick={onClick}
       role="button"
       tabIndex={0}
+      aria-label={`Switch to ${config.displayName} widget`}
       onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") onClick();
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onClick();
+        }
       }}
     >
+      {/* Pin/Hide controls - appear on hover */}
+      {(onPin || onHide) && (
+        <div className="absolute top-1 right-1 hidden group-hover:flex gap-0.5 z-10">
+          {onPin && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onPin();
+              }}
+              className={cn(
+                "p-0.5 rounded hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50",
+                isPinned && "text-cyan-500",
+              )}
+              aria-label={isPinned ? "Unpin widget" : "Pin widget"}
+              title={isPinned ? "Unpin widget" : "Pin widget"}
+            >
+              <Pin
+                className={cn("h-3 w-3", isPinned ? "text-cyan-500" : "text-muted-foreground")}
+              />
+            </button>
+          )}
+          {onHide && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onHide();
+              }}
+              className="p-0.5 rounded hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
+              aria-label="Hide widget"
+              title="Hide widget"
+            >
+              <EyeOff className="h-3 w-3 text-muted-foreground" />
+            </button>
+          )}
+        </div>
+      )}
       <WidgetHeader
         title={config.displayName}
         icon={config.icon}
@@ -1023,117 +1075,54 @@ const SummaryWidget = memo(function SummaryWidget({
   status,
   onClick,
   onNavigateToDetail,
+  onPin,
+  onHide,
+  isPinned,
 }: {
   type: ActivityType;
   status: ActivityStatus;
   onClick: () => void;
   onNavigateToDetail: () => void;
+  onPin?: () => void;
+  onHide?: () => void;
+  isPinned?: boolean;
 }) {
+  const sharedProps: SummaryRendererProps = {
+    status,
+    onClick,
+    onNavigateToDetail,
+    onPin,
+    onHide,
+    isPinned,
+  };
+
   switch (type) {
     case "gui_automation":
-      return (
-        <GuiAutomationSummaryRenderer
-          status={status}
-          onClick={onClick}
-          onNavigateToDetail={onNavigateToDetail}
-        />
-      );
+      return <GuiAutomationSummaryRenderer {...sharedProps} />;
     case "playwright":
-      return (
-        <PlaywrightSummaryRenderer
-          status={status}
-          onClick={onClick}
-          onNavigateToDetail={onNavigateToDetail}
-        />
-      );
+      return <PlaywrightSummaryRenderer {...sharedProps} />;
     case "ai_conversation":
-      return (
-        <AiConversationSummaryRenderer
-          status={status}
-          onClick={onClick}
-          onNavigateToDetail={onNavigateToDetail}
-        />
-      );
+      return <AiConversationSummaryRenderer {...sharedProps} />;
     case "verification":
-      return (
-        <VerificationSummaryRenderer
-          status={status}
-          onClick={onClick}
-          onNavigateToDetail={onNavigateToDetail}
-        />
-      );
+      return <VerificationSummaryRenderer {...sharedProps} />;
     case "findings":
-      return (
-        <FindingsSummaryRenderer
-          status={status}
-          onClick={onClick}
-          onNavigateToDetail={onNavigateToDetail}
-        />
-      );
+      return <FindingsSummaryRenderer {...sharedProps} />;
     case "execution_status":
-      return (
-        <ExecutionStatusSummaryRenderer
-          status={status}
-          onClick={onClick}
-          onNavigateToDetail={onNavigateToDetail}
-        />
-      );
+      return <ExecutionStatusSummaryRenderer {...sharedProps} />;
     case "shell_command":
-      return (
-        <ShellCommandSummaryRenderer
-          status={status}
-          onClick={onClick}
-          onNavigateToDetail={onNavigateToDetail}
-        />
-      );
+      return <ShellCommandSummaryRenderer {...sharedProps} />;
     case "api_request":
-      return (
-        <ApiRequestSummaryRenderer
-          status={status}
-          onClick={onClick}
-          onNavigateToDetail={onNavigateToDetail}
-        />
-      );
+      return <ApiRequestSummaryRenderer {...sharedProps} />;
     case "script":
-      return (
-        <PlaywrightTestSummaryRenderer
-          status={status}
-          onClick={onClick}
-          onNavigateToDetail={onNavigateToDetail}
-        />
-      );
+      return <PlaywrightTestSummaryRenderer {...sharedProps} />;
     case "workflow_ref":
-      return (
-        <WorkflowRefSummaryRenderer
-          status={status}
-          onClick={onClick}
-          onNavigateToDetail={onNavigateToDetail}
-        />
-      );
+      return <WorkflowRefSummaryRenderer {...sharedProps} />;
     case "mcp_call":
-      return (
-        <McpCallSummaryRenderer
-          status={status}
-          onClick={onClick}
-          onNavigateToDetail={onNavigateToDetail}
-        />
-      );
+      return <McpCallSummaryRenderer {...sharedProps} />;
     case "execution_timeline":
-      return (
-        <ExecutionTimelineSummaryRenderer
-          status={status}
-          onClick={onClick}
-          onNavigateToDetail={onNavigateToDetail}
-        />
-      );
+      return <ExecutionTimelineSummaryRenderer {...sharedProps} />;
     case "flow_execution":
-      return (
-        <FlowExecutionSummaryRenderer
-          status={status}
-          onClick={onClick}
-          onNavigateToDetail={onNavigateToDetail}
-        />
-      );
+      return <FlowExecutionSummaryRenderer {...sharedProps} />;
     default:
       return null;
   }
@@ -1151,8 +1140,32 @@ export function DashboardLayout({
   isRunningLastWorkflow,
   lastRunWorkflowName,
   lastRunWorkflowId,
+  widgetPreferences,
 }: DashboardLayoutProps) {
-  const { activeWidget, summaryWidgets, activities, isIdle, detectedWidgets } = layout;
+  const {
+    activeWidget: rawActiveWidget,
+    summaryWidgets: _rawSummaryWidgets,
+    activities,
+    isIdle,
+    detectedWidgets: rawDetectedWidgets,
+  } = layout;
+
+  // Apply widget preferences (hide/pin filtering)
+  const detectedWidgets = useMemo(() => {
+    if (!widgetPreferences) return rawDetectedWidgets;
+    return widgetPreferences.applyPreferences(rawDetectedWidgets);
+  }, [rawDetectedWidgets, widgetPreferences]);
+
+  // Ensure active widget isn't hidden; fall back to first visible widget
+  const activeWidget = useMemo(() => {
+    if (rawActiveWidget && detectedWidgets.includes(rawActiveWidget)) return rawActiveWidget;
+    return detectedWidgets.length > 0 ? detectedWidgets[0] : null;
+  }, [rawActiveWidget, detectedWidgets]);
+
+  // Summary widgets: all visible widgets except the active one
+  const summaryWidgets = useMemo(() => {
+    return detectedWidgets.filter((type) => type !== activeWidget);
+  }, [detectedWidgets, activeWidget]);
 
   // Get status for a widget
   const getStatus = useCallback(
@@ -1190,11 +1203,17 @@ export function DashboardLayout({
     }
   }, [runningWidget, onWidgetClick]);
 
+  // Tabbed overview for Timeline + Flow (#13)
+  const showTimelineFlowTabs =
+    (activeWidget === "execution_timeline" || activeWidget === "flow_execution") &&
+    detectedWidgets.includes("execution_timeline") &&
+    detectedWidgets.includes("flow_execution");
+
   // Resizable panel state
   const STORAGE_KEY = "qontinui-dashboard-panel-width";
   const MIN_WIDTH = 30;
   const MAX_WIDTH = 80;
-  const HANDLE_WIDTH = 6;
+  const HANDLE_WIDTH = 8;
 
   const [leftWidthPercent, setLeftWidthPercent] = useState<number>(() => {
     try {
@@ -1270,11 +1289,13 @@ export function DashboardLayout({
   if (detectedWidgets.length === 1 && activeWidget) {
     return (
       <div className="h-full p-4">
-        <ActiveWidget
-          type={activeWidget}
-          status={getStatus(activeWidget)}
-          onNavigateToDetail={() => handleNavigateToDetail(activeWidget)}
-        />
+        <div key={activeWidget} className="h-full animate-in fade-in duration-200">
+          <ActiveWidget
+            type={activeWidget}
+            status={getStatus(activeWidget)}
+            onNavigateToDetail={() => handleNavigateToDetail(activeWidget)}
+          />
+        </div>
       </div>
     );
   }
@@ -1285,21 +1306,71 @@ export function DashboardLayout({
       {/* Active Widget - resizable left panel */}
       {activeWidget && (
         <div style={{ width: `${leftWidthPercent}%`, flexShrink: 0 }} className="pr-1">
-          <ActiveWidget
-            type={activeWidget}
-            status={getStatus(activeWidget)}
-            onNavigateToDetail={() => handleNavigateToDetail(activeWidget)}
-          />
+          <div className="h-full flex flex-col">
+            {/* Tabbed header for Timeline + Flow (#13) */}
+            {showTimelineFlowTabs && (
+              <div
+                className="flex border-b border-border bg-muted/10 px-2 rounded-t-xl"
+                role="tablist"
+              >
+                <button
+                  className={cn(
+                    "px-3 py-1.5 text-xs font-medium border-b-2 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50",
+                    activeWidget === "execution_timeline"
+                      ? "border-cyan-500 text-foreground"
+                      : "border-transparent text-muted-foreground hover:text-foreground",
+                  )}
+                  onClick={() => onWidgetClick("execution_timeline")}
+                  role="tab"
+                  aria-selected={activeWidget === "execution_timeline"}
+                >
+                  Timeline
+                </button>
+                <button
+                  className={cn(
+                    "px-3 py-1.5 text-xs font-medium border-b-2 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50",
+                    activeWidget === "flow_execution"
+                      ? "border-rose-500 text-foreground"
+                      : "border-transparent text-muted-foreground hover:text-foreground",
+                  )}
+                  onClick={() => onWidgetClick("flow_execution")}
+                  role="tab"
+                  aria-selected={activeWidget === "flow_execution"}
+                >
+                  Flow
+                </button>
+              </div>
+            )}
+            <div
+              key={activeWidget}
+              className={cn(
+                "flex-1 min-h-0 animate-in fade-in duration-200",
+                showTimelineFlowTabs && "rounded-t-none",
+              )}
+            >
+              <ActiveWidget
+                type={activeWidget}
+                status={getStatus(activeWidget)}
+                onNavigateToDetail={() => handleNavigateToDetail(activeWidget)}
+              />
+            </div>
+          </div>
         </div>
       )}
 
-      {/* Drag Handle */}
+      {/* Drag Handle (#15) - improved discoverability */}
       <div
         onMouseDown={handleMouseDown}
-        className="flex-shrink-0 flex items-center justify-center cursor-col-resize group"
+        onDoubleClick={() => setLeftWidthPercent(65)}
+        className="flex-shrink-0 flex items-center justify-center cursor-col-resize group hover:bg-muted/50 transition-colors rounded"
         style={{ width: HANDLE_WIDTH }}
+        title="Drag to resize. Double-click to reset."
       >
-        <div className="w-[2px] h-8 rounded-full bg-white/10 group-hover:bg-white/30 transition-colors" />
+        <div className="flex flex-col items-center justify-center gap-0.5">
+          <div className="w-4 h-px bg-muted-foreground/40 group-hover:bg-muted-foreground/70 transition-colors" />
+          <div className="w-4 h-px bg-muted-foreground/40 group-hover:bg-muted-foreground/70 transition-colors" />
+          <div className="w-4 h-px bg-muted-foreground/40 group-hover:bg-muted-foreground/70 transition-colors" />
+        </div>
       </div>
 
       {/* Summary Widgets - fills remaining space */}
@@ -1308,7 +1379,7 @@ export function DashboardLayout({
         {showRestoreButton && (
           <button
             onClick={handleRestoreToRunning}
-            className="flex items-center justify-center gap-2 px-3 py-2 text-xs font-medium text-primary bg-primary/10 hover:bg-primary/20 border border-primary/30 rounded-lg transition-colors"
+            className="flex items-center justify-center gap-2 px-3 py-2 text-xs font-medium text-primary bg-primary/10 hover:bg-primary/20 border border-primary/30 rounded-lg transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50 focus-visible:ring-offset-1 focus-visible:ring-offset-background"
           >
             <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
             Restore to Active Process
@@ -1321,6 +1392,9 @@ export function DashboardLayout({
             status={getStatus(type)}
             onClick={() => onWidgetClick(type)}
             onNavigateToDetail={() => handleNavigateToDetail(type)}
+            onPin={widgetPreferences ? () => widgetPreferences.togglePin(type) : undefined}
+            onHide={widgetPreferences ? () => widgetPreferences.hideWidget(type) : undefined}
+            isPinned={widgetPreferences?.isPinned(type)}
           />
         ))}
       </div>

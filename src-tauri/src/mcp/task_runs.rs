@@ -2412,6 +2412,297 @@ pub async fn get_session_state(
 }
 
 // ============================================================================
+// Batch Endpoint & Aggregation Helpers
+// ============================================================================
+
+/// Result of aggregating step events into execution data.
+#[derive(Debug, Serialize)]
+pub struct AggregatedStepData {
+    pub steps: Vec<StepExecutionData>,
+    pub has_setup: bool,
+    pub has_verification: bool,
+    pub has_agentic: bool,
+}
+
+/// Aggregate raw task run events into per-step execution summaries.
+///
+/// This extracts the event aggregation logic that was previously inline in
+/// `get_current_execution_steps`, making it testable and reusable.
+/// Events with the same action_id (or synthesized key from step_name + step_index + iteration)
+/// are merged so that start and complete events produce a single `StepExecutionData`.
+pub fn aggregate_step_events(events: &[crate::database::TaskRunEvent]) -> AggregatedStepData {
+    use std::collections::HashMap;
+
+    let mut step_map: HashMap<String, StepExecutionData> = HashMap::new();
+
+    for event in events {
+        let event_type = event.event_type.as_str();
+        if event_type != "step_execution"
+            && event_type != "command"
+            && event_type != "shell_command"
+        {
+            continue;
+        }
+
+        let data: Option<serde_json::Value> = event
+            .data
+            .as_ref()
+            .and_then(|s| serde_json::from_str(s).ok());
+
+        let event_subtype = event.event_subtype.as_deref().unwrap_or("");
+        let message = event.message.as_str();
+
+        let step_name = data
+            .as_ref()
+            .and_then(|d| d.get("step_name"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| message.to_string());
+
+        let step_index = data
+            .as_ref()
+            .and_then(|d| d.get("step_index"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(-1);
+
+        let step_type_str = data
+            .as_ref()
+            .and_then(|d| d.get("step_type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(event_type)
+            .to_string();
+
+        let iteration_for_key = data
+            .as_ref()
+            .and_then(|d| d.get("iteration"))
+            .and_then(|v| v.as_i64());
+
+        let key = event.action_id.clone().unwrap_or_else(|| {
+            if let Some(iter) = iteration_for_key {
+                format!("{}:{}:{}", step_name, step_index, iter)
+            } else {
+                format!("{}:{}", step_name, step_index)
+            }
+        });
+
+        let event_timestamp = chrono::DateTime::parse_from_rfc3339(&event.timestamp)
+            .ok()
+            .map(|dt| dt.timestamp_millis());
+
+        let status = match event_subtype {
+            "start" => "running",
+            "complete" | "success" => "success",
+            "error" | "failed" => "failed",
+            _ => "pending",
+        }
+        .to_string();
+
+        if let Some(existing) = step_map.get_mut(&key) {
+            let should_update_status = match (existing.status.as_str(), status.as_str()) {
+                ("failed", _) => false,
+                ("running", "success") | ("running", "failed") => true,
+                ("pending", "success") | ("pending", "failed") => true,
+                ("success", "failed") => true,
+                ("success", "success") | ("success", "running") => false,
+                _ => status != "running",
+            };
+            if should_update_status {
+                existing.status = status;
+            }
+
+            if let Some(d) = &data {
+                if existing.phase.is_none() {
+                    if let Some(v) = d.get("phase").and_then(|v| v.as_str()) {
+                        existing.phase = Some(v.to_string());
+                    }
+                }
+                if existing.iteration.is_none() {
+                    if let Some(v) = d.get("iteration").and_then(|v| v.as_i64()) {
+                        existing.iteration = Some(v);
+                    }
+                }
+                if let Some(v) = d.get("duration_ms").and_then(|v| v.as_i64()) {
+                    existing.duration_ms = Some(v);
+                } else if existing.duration_ms.is_none() {
+                    existing.duration_ms = event.duration_ms;
+                }
+                if let Some(v) = d.get("end_time").and_then(|v| v.as_i64()) {
+                    existing.end_time = Some(v);
+                }
+                if let Some(v) = d.get("exit_code").and_then(|v| v.as_i64()) {
+                    existing.exit_code = Some(v as i32);
+                }
+                if let Some(v) = d.get("stdout").and_then(|v| v.as_str()) {
+                    existing.stdout = Some(v.to_string());
+                }
+                if let Some(v) = d.get("stderr").and_then(|v| v.as_str()) {
+                    existing.stderr = Some(v.to_string());
+                }
+                if let Some(v) = d.get("error").and_then(|v| v.as_str()) {
+                    existing.error = Some(v.to_string());
+                }
+                if let Some(v) = d.get("output").and_then(|v| v.as_str()) {
+                    existing.output = Some(v.to_string());
+                }
+            }
+        } else {
+            let phase = data
+                .as_ref()
+                .and_then(|d| d.get("phase"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            let iteration = data
+                .as_ref()
+                .and_then(|d| d.get("iteration"))
+                .and_then(|v| v.as_i64());
+
+            let step_data = StepExecutionData {
+                id: event.id.to_string(),
+                step_type: step_type_str,
+                step_name,
+                status,
+                phase,
+                step_index: if step_index >= 0 {
+                    Some(step_index)
+                } else {
+                    None
+                },
+                iteration,
+                start_time: event_timestamp,
+                end_time: data
+                    .as_ref()
+                    .and_then(|d| d.get("end_time"))
+                    .and_then(|v| v.as_i64()),
+                duration_ms: data
+                    .as_ref()
+                    .and_then(|d| d.get("duration_ms"))
+                    .and_then(|v| v.as_i64())
+                    .or(event.duration_ms),
+                error: data
+                    .as_ref()
+                    .and_then(|d| d.get("error"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                output: data
+                    .as_ref()
+                    .and_then(|d| d.get("output"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                command: data
+                    .as_ref()
+                    .and_then(|d| d.get("command"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                working_directory: data
+                    .as_ref()
+                    .and_then(|d| d.get("working_directory"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                exit_code: data
+                    .as_ref()
+                    .and_then(|d| d.get("exit_code"))
+                    .and_then(|v| v.as_i64())
+                    .map(|i| i as i32),
+                stdout: data
+                    .as_ref()
+                    .and_then(|d| d.get("stdout"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                stderr: data
+                    .as_ref()
+                    .and_then(|d| d.get("stderr"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                template_command: data
+                    .as_ref()
+                    .and_then(|d| d.get("template_command"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                resolved_variables: data
+                    .as_ref()
+                    .and_then(|d| d.get("resolved_variables"))
+                    .cloned(),
+            };
+
+            step_map.insert(key, step_data);
+        }
+    }
+
+    let has_setup = step_map
+        .values()
+        .any(|s| s.phase.as_deref() == Some("setup"));
+    let has_verification = step_map
+        .values()
+        .any(|s| s.phase.as_deref() == Some("verification"));
+    let has_agentic = step_map
+        .values()
+        .any(|s| s.phase.as_deref() == Some("agentic"));
+
+    let mut steps: Vec<StepExecutionData> = step_map.into_values().collect();
+    steps.sort_by(|a, b| a.start_time.cmp(&b.start_time));
+
+    AggregatedStepData {
+        steps,
+        has_setup,
+        has_verification,
+        has_agentic,
+    }
+}
+
+/// Batch endpoint: returns the running task, its aggregated step data, and
+/// completed verification iterations in a single response.
+/// This replaces multiple round-trips the frontend would otherwise need.
+pub async fn get_current_execution_batch(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let db = state.app_state.checkpoint_db.clone();
+
+    // Single blocking call for all DB work
+    let batch = tokio::task::spawn_blocking(move || -> Result<_, String> {
+        let task_and_events = db.get_running_task_step_data()?;
+        let (task, events) = match task_and_events {
+            Some(pair) => pair,
+            None => {
+                return Ok(serde_json::json!({
+                    "success": true,
+                    "task_run_id": null,
+                    "executions": [],
+                    "completed_iterations": [],
+                    "count": 0,
+                    "message": "No running task"
+                }));
+            }
+        };
+
+        let completed_iterations = db.get_completed_verification_iterations(&task.id)?;
+        let aggregated = aggregate_step_events(&events);
+
+        Ok(serde_json::json!({
+            "success": true,
+            "task_run_id": task.id,
+            "workflow_name": task.workflow_name,
+            "workflow_type": task.workflow_type,
+            "workflow_start_time": task.created_at,
+            "has_setup": aggregated.has_setup,
+            "has_verification": aggregated.has_verification,
+            "has_agentic": aggregated.has_agentic,
+            "executions": aggregated.steps,
+            "completed_iterations": completed_iterations,
+            "count": aggregated.steps.len()
+        }))
+    })
+    .await
+    .map_err(|e| {
+        error!("spawn_blocking error in get_current_execution_batch: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(batch))
+}
+
+// ============================================================================
 // End Task Run HTTP API Handlers
 // ============================================================================
 
@@ -2468,4 +2759,249 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/task-runs/:id/message", post(send_message_to_session))
         .route("/task-runs/:id/session-state", get(get_session_state))
         .route("/current-execution/steps", get(get_current_execution_steps))
+        .route("/current-execution/batch", get(get_current_execution_batch))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::TaskRunEvent;
+
+    fn make_event(
+        id: i64,
+        event_type: &str,
+        event_subtype: &str,
+        action_id: Option<&str>,
+        data_json: Option<serde_json::Value>,
+        timestamp: &str,
+        duration_ms: Option<i64>,
+    ) -> TaskRunEvent {
+        TaskRunEvent {
+            id,
+            task_run_id: "test-run".to_string(),
+            event_type: event_type.to_string(),
+            event_subtype: Some(event_subtype.to_string()),
+            message: "test step".to_string(),
+            data: data_json.map(|v| v.to_string()),
+            workflow_name: None,
+            state_name: None,
+            action_id: action_id.map(|s| s.to_string()),
+            timestamp: timestamp.to_string(),
+            duration_ms,
+        }
+    }
+
+    #[test]
+    fn test_aggregate_step_events_empty() {
+        let events: Vec<TaskRunEvent> = vec![];
+        let result = aggregate_step_events(&events);
+
+        assert!(result.steps.is_empty());
+        assert!(!result.has_setup);
+        assert!(!result.has_verification);
+        assert!(!result.has_agentic);
+    }
+
+    #[test]
+    fn test_aggregate_step_events_basic() {
+        let events = vec![
+            make_event(
+                1,
+                "step_execution",
+                "start",
+                Some("action-1"),
+                Some(serde_json::json!({
+                    "step_name": "run tests",
+                    "step_index": 0,
+                    "step_type": "shell_command",
+                    "phase": "setup"
+                })),
+                "2026-01-01T00:00:00Z",
+                None,
+            ),
+            make_event(
+                2,
+                "step_execution",
+                "complete",
+                Some("action-1"),
+                Some(serde_json::json!({
+                    "step_name": "run tests",
+                    "step_index": 0,
+                    "step_type": "shell_command",
+                    "phase": "setup",
+                    "duration_ms": 2500,
+                    "exit_code": 0,
+                    "stdout": "all tests passed"
+                })),
+                "2026-01-01T00:00:03Z",
+                Some(2500),
+            ),
+        ];
+
+        let result = aggregate_step_events(&events);
+
+        assert_eq!(result.steps.len(), 1);
+        let step = &result.steps[0];
+        assert_eq!(step.step_name, "run tests");
+        assert_eq!(step.step_type, "shell_command");
+        assert_eq!(step.status, "success");
+        assert_eq!(step.phase.as_deref(), Some("setup"));
+        assert_eq!(step.step_index, Some(0));
+        assert_eq!(step.duration_ms, Some(2500));
+        assert_eq!(step.exit_code, Some(0));
+        assert_eq!(step.stdout.as_deref(), Some("all tests passed"));
+    }
+
+    #[test]
+    fn test_aggregate_step_events_phase_tracking() {
+        let events = vec![
+            // Setup step
+            make_event(
+                1,
+                "step_execution",
+                "start",
+                Some("s-1"),
+                Some(serde_json::json!({
+                    "step_name": "install deps",
+                    "step_index": 0,
+                    "phase": "setup"
+                })),
+                "2026-01-01T00:00:00Z",
+                None,
+            ),
+            // Verification step
+            make_event(
+                2,
+                "step_execution",
+                "start",
+                Some("v-1"),
+                Some(serde_json::json!({
+                    "step_name": "check output",
+                    "step_index": 0,
+                    "phase": "verification",
+                    "iteration": 1
+                })),
+                "2026-01-01T00:01:00Z",
+                None,
+            ),
+            // Agentic step
+            make_event(
+                3,
+                "step_execution",
+                "start",
+                Some("a-1"),
+                Some(serde_json::json!({
+                    "step_name": "fix issues",
+                    "step_index": 0,
+                    "phase": "agentic",
+                    "iteration": 1
+                })),
+                "2026-01-01T00:02:00Z",
+                None,
+            ),
+        ];
+
+        let result = aggregate_step_events(&events);
+
+        assert_eq!(result.steps.len(), 3);
+        assert!(result.has_setup);
+        assert!(result.has_verification);
+        assert!(result.has_agentic);
+    }
+
+    #[test]
+    fn test_aggregate_step_events_ignores_non_step_events() {
+        let events = vec![
+            // ai_output event should be ignored
+            make_event(
+                1,
+                "ai_output",
+                "text",
+                None,
+                Some(serde_json::json!({"text": "thinking..."})),
+                "2026-01-01T00:00:00Z",
+                None,
+            ),
+            // state_change event should be ignored
+            make_event(
+                2,
+                "state_change",
+                "transition",
+                None,
+                Some(serde_json::json!({"from": "idle", "to": "running"})),
+                "2026-01-01T00:00:01Z",
+                None,
+            ),
+            // Only this step_execution should be counted
+            make_event(
+                3,
+                "step_execution",
+                "start",
+                Some("act-1"),
+                Some(serde_json::json!({
+                    "step_name": "build",
+                    "step_index": 0,
+                    "phase": "setup"
+                })),
+                "2026-01-01T00:00:02Z",
+                None,
+            ),
+        ];
+
+        let result = aggregate_step_events(&events);
+        assert_eq!(result.steps.len(), 1);
+        assert_eq!(result.steps[0].step_name, "build");
+    }
+
+    #[test]
+    fn test_aggregate_step_events_failed_status_is_sticky() {
+        // If a step gets both a "failed" and "complete" event, it should stay "failed"
+        let events = vec![
+            make_event(
+                1,
+                "step_execution",
+                "start",
+                Some("action-x"),
+                Some(serde_json::json!({
+                    "step_name": "flaky step",
+                    "step_index": 0,
+                    "phase": "verification",
+                    "iteration": 1
+                })),
+                "2026-01-01T00:00:00Z",
+                None,
+            ),
+            make_event(
+                2,
+                "step_execution",
+                "failed",
+                Some("action-x"),
+                Some(serde_json::json!({
+                    "step_name": "flaky step",
+                    "step_index": 0,
+                    "error": "assertion failed"
+                })),
+                "2026-01-01T00:00:01Z",
+                None,
+            ),
+            make_event(
+                3,
+                "step_execution",
+                "complete",
+                Some("action-x"),
+                Some(serde_json::json!({
+                    "step_name": "flaky step",
+                    "step_index": 0,
+                    "duration_ms": 500
+                })),
+                "2026-01-01T00:00:02Z",
+                Some(500),
+            ),
+        ];
+
+        let result = aggregate_step_events(&events);
+        assert_eq!(result.steps.len(), 1);
+        assert_eq!(result.steps[0].status, "failed");
+        assert_eq!(result.steps[0].error.as_deref(), Some("assertion failed"));
+    }
 }

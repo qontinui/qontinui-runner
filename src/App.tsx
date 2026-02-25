@@ -34,8 +34,6 @@ import {
   BarChart3,
   Database,
   TestTube,
-  Accessibility,
-  Cloud,
 } from "lucide-react";
 
 // Contexts
@@ -52,7 +50,6 @@ import { ContextualTutorial } from "./components/tutorial";
 
 // UI Bridge for AI-driven UI automation
 import { UIBridgeProvider, AutoRegisterProvider } from "ui-bridge";
-import { SdkUIBridgeInspector } from "./components/ui-bridge/SdkUIBridgeInspector";
 
 // Navigation context for tutorials to navigate to pages
 interface NavigationContextValue {
@@ -127,16 +124,6 @@ import { HelpTab } from "./components/HelpTab";
 import { SchedulerTab } from "./components/scheduler";
 import { Sidebar } from "./components/navigation";
 import { WorkflowBuilderTab } from "./components/workflow-builder";
-import { PlaywrightTestsPage } from "./components/PlaywrightTestsPage";
-import { MacroBuilderTab } from "./components/macro-builder";
-import { TestBuilderTab } from "./components/test-builder";
-import { CheckBuilderTab } from "./components/check-builder";
-import { ShellCommandBuilderTab } from "./components/shell-command-builder";
-import { TaskBuilderTab } from "./components/TaskBuilderTab";
-import { ContextBuilderTab } from "./components/ContextBuilderTab";
-import { StateExplorerBuilderTab } from "./components/StateExplorerBuilderTab";
-import { ApiRequestBuilderTab } from "./components/ApiRequestBuilderTab";
-import { AwasBuilderTab } from "./components/AwasBuilderTab";
 import { ActiveDashboardPage } from "./components/active-dashboard";
 import { HistoryTab } from "./components/HistoryTab";
 import { ExecuteTab } from "./components/ExecuteTab";
@@ -147,7 +134,6 @@ import { ExecutionReport } from "./components/findings";
 import { StateExplorerTab } from "./components/state-explorer";
 import { TestResultsTab } from "./components/test-results";
 import { StatisticsTab } from "./components/statistics";
-import { DiscoverySyncPanel } from "./components/discoveries";
 // Run-specific components
 import { RunSelectionProvider } from "./contexts/RunSelectionContext";
 import { RunPageLayout } from "./components/run-dashboard/RunPageLayout";
@@ -156,17 +142,10 @@ import { RunImageRecognitionTab } from "./components/run-logs/RunImageRecognitio
 import { AiDataViewerTab } from "./components/run-logs/AiDataViewerTab";
 import { RunRecapTab } from "./components/run-recap";
 import { useTaskRuns } from "./hooks/useAiData";
-// Accessibility components
-import { AccessibilityExplorerPanel } from "./components/accessibility";
-// UI Bridge Inspector
-// New dashboard components
-import { LearningDashboard } from "./components/learning-dashboard";
-import { CheckpointBrowser } from "./components/checkpoint-browser";
-import { FlowDesigner } from "./components/flow-designer";
 // Spec Discovery (formerly Live Page Generator)
 import { SpecDiscoveryTab } from "./components/spec-discovery";
-// App Comparison Wizard (two-app snapshot comparison)
-import { AppComparisonWizard } from "./components/discover";
+// Page Sweep builder
+import { PageSweepTab } from "./components/page-sweep";
 import type { UnifiedWorkflow } from "./types/unified-workflow";
 // Configure components
 import { ExternalLogsTab as _ExternalLogsTab } from "./components/ExternalLogsTab";
@@ -203,12 +182,6 @@ type MainTabId =
   | "run-ai-output"
   | "run-statistics"
   | "run-ai-data"
-  | "run-accessibility"
-  | "run-ui-bridge"
-  | "learning"
-  | "checkpoints"
-  | "discoveries"
-  | "flow-designer"
   // Legacy tab IDs for migration
   | "ai"
   | "logs"
@@ -221,19 +194,9 @@ type MainTabId =
   | "monitor-statistics"
   | "monitor-discoveries"
   | "library"
-  | "task-builder"
   | "unified-workflow-builder"
-  | "macro-builder"
-  | "playwright-test-builder"
-  | "context-builder"
-  | "state-explorer-builder"
-  | "api-request-builder"
-  | "awas-builder"
-  | "test-builder"
-  | "check-builder"
-  | "shell-command-builder"
   | "spec-discovery"
-  | "app-comparison"
+  | "page-sweep"
   | "capture"
   | "config-log-sources"
   | "config-findings"
@@ -275,12 +238,6 @@ const VALID_TAB_IDS: MainTabId[] = [
   "run-ai-output",
   "run-statistics",
   "run-ai-data",
-  "run-accessibility",
-  "run-ui-bridge",
-  "learning",
-  "checkpoints",
-  "discoveries",
-  "flow-designer",
   // Legacy (for migration)
   "ai",
   "logs",
@@ -293,19 +250,8 @@ const VALID_TAB_IDS: MainTabId[] = [
   "monitor-statistics",
   "monitor-discoveries",
   "library",
-  "task-builder",
   "unified-workflow-builder",
-  "macro-builder",
-  "playwright-test-builder",
-  "context-builder",
-  "state-explorer-builder",
-  "api-request-builder",
-  "awas-builder",
-  "test-builder",
-  "check-builder",
-  "shell-command-builder",
   "spec-discovery",
-  "app-comparison",
   "capture",
   "config-log-sources",
   "config-findings",
@@ -346,8 +292,8 @@ function migrateTabId(stored: string | null): MainTabId {
     "ai-builder": "unified-workflow-builder",
     builder: "unified-workflow-builder",
     prompts: "library",
-    scripts: "playwright-test-builder", // Old "scripts" tab maps to new name
-    "script-builder": "playwright-test-builder", // Old "script-builder" tab maps to new name
+    scripts: "library", // Old "scripts" tab maps to library
+    "script-builder": "library", // Old "script-builder" tab maps to library
     contexts: "library",
     scheduler: "tasks",
     dataset: "capture", // Dataset is now part of capture
@@ -365,7 +311,7 @@ function migrateTabId(stored: string | null): MainTabId {
     "monitor-verification": "run-state-explorer",
     "monitor-state-explorer": "run-state-explorer",
     "monitor-statistics": "run-statistics",
-    "monitor-discoveries": "discoveries",
+    "monitor-discoveries": "run-recap", // Discoveries removed, map to recap
     // Legacy monitor tab migrations
     monitor: "run-recap", // Map to recap
     issues: "run-findings", // Issues merged into Findings
@@ -374,7 +320,7 @@ function migrateTabId(stored: string | null): MainTabId {
     verification: "run-state-explorer",
     "run-verification": "run-state-explorer",
     "run-exploration": "run-state-explorer",
-    "verification-builder": "state-explorer-builder",
+    "verification-builder": "library", // Builder removed, map to library
     statistics: "run-statistics",
     // Configure tab migrations
     "log-sources": "config-log-sources",
@@ -429,9 +375,6 @@ function AppContent() {
         "gui-automation": "gui-automation",
         active: "active",
         "unified-workflow-builder": "unified-workflow-builder",
-        "macro-builder": "macro-builder",
-        "playwright-test-builder": "playwright-test-builder",
-        "check-builder": "check-builder",
         library: "library",
         ai: "ai",
         settings: "settings",
@@ -471,7 +414,6 @@ function AppContent() {
           logs: "logs",
           ai: "ai",
           settings: "settings",
-          "test-builder": "test-builder",
           "unified-workflow-builder": "unified-workflow-builder",
           "error-monitor": "error-monitor",
         };
@@ -534,82 +476,14 @@ function AppContent() {
     };
   }, []);
 
-  // Script ID to edit (when navigating from Library to Playwright Test Builder)
-  const [editScriptId, setEditScriptId] = useState<string | null>(null);
-
   // Workflow ID to edit (when navigating from Library to Workflow Builder)
   const [editWorkflowId, setEditWorkflowId] = useState<string | null>(null);
-
-  // Macro ID to edit (when navigating from Library to Macro Builder)
-  const [editMacroId, setEditMacroId] = useState<string | null>(null);
-
-  // Builder edit IDs (when navigating from Library Dashboard to builders)
-  const [editTaskId, setEditTaskId] = useState<string | null>(null);
-  const [editPromptSnippetId, setEditPromptSnippetId] = useState<string | null>(null);
-  const [editContextId, setEditContextId] = useState<string | null>(null);
-  const [editExplorationId, setEditExplorationId] = useState<string | null>(null);
-  const [editApiRequestId, setEditApiRequestId] = useState<string | null>(null);
-  const [editAwasConfigId, setEditAwasConfigId] = useState<string | null>(null);
-
-  // Handle editing a script from Library
-  const _handleEditScript = useCallback((scriptId: string) => {
-    setEditScriptId(scriptId);
-    setActiveTab("playwright-test-builder");
-  }, []);
 
   // Handle editing a workflow from Library
   const _handleEditWorkflow = useCallback((workflowId: string) => {
     setEditWorkflowId(workflowId);
     setActiveTab("unified-workflow-builder");
   }, []);
-
-  // Handle editing a macro from Library
-  const _handleEditMacro = useCallback((macroId: string) => {
-    setEditMacroId(macroId);
-    setActiveTab("macro-builder");
-  }, []);
-
-  // Handle navigation from Library Dashboard to any builder
-  const handleNavigateToBuilder = useCallback(
-    (builderTab: string, itemId: string, itemType: string) => {
-      // Set the appropriate edit ID based on item type
-      switch (itemType) {
-        case "task":
-          setEditTaskId(itemId);
-          break;
-        case "prompt-snippet":
-          setEditPromptSnippetId(itemId);
-          break;
-        case "context":
-          setEditContextId(itemId);
-          break;
-        case "exploration":
-        case "state-explorer":
-          setEditExplorationId(itemId);
-          break;
-        case "api-request":
-          setEditApiRequestId(itemId);
-          break;
-        case "awas":
-        case "awas-config":
-          setEditAwasConfigId(itemId);
-          break;
-        case "script":
-          setEditScriptId(itemId);
-          break;
-        case "workflow":
-        case "unified-workflow":
-          setEditWorkflowId(itemId);
-          break;
-        case "macro":
-          setEditMacroId(itemId);
-          break;
-      }
-      // Navigate to the builder tab
-      setActiveTab(builderTab as MainTabId);
-    },
-    [],
-  );
 
   // Store the last inline workflow definition for re-execution via "Run Last Workflow" button.
   // Inline workflows aren't saved to the DB, so we keep the definition here.
@@ -750,35 +624,11 @@ function AppContent() {
     }
   }, [lastRun]);
 
-  // Clear script ID when navigating away from script builder
-  useEffect(() => {
-    if (activeTab !== "playwright-test-builder") {
-      setEditScriptId(null);
-    }
-  }, [activeTab]);
-
   // Clear workflow ID when navigating away from workflow builder
   useEffect(() => {
     if (activeTab !== "unified-workflow-builder") {
       setEditWorkflowId(null);
     }
-  }, [activeTab]);
-
-  // Clear macro ID when navigating away from macro builder
-  useEffect(() => {
-    if (activeTab !== "macro-builder") {
-      setEditMacroId(null);
-    }
-  }, [activeTab]);
-
-  // Clear builder edit IDs when navigating away
-  useEffect(() => {
-    if (activeTab !== "task-builder") setEditTaskId(null);
-    if (activeTab !== "playwright-test-builder") setEditPromptSnippetId(null);
-    if (activeTab !== "context-builder") setEditContextId(null);
-    if (activeTab !== "state-explorer-builder") setEditExplorationId(null);
-    if (activeTab !== "api-request-builder") setEditApiRequestId(null);
-    if (activeTab !== "awas-builder") setEditAwasConfigId(null);
   }, [activeTab]);
 
   // Sidebar collapsed state
@@ -1230,65 +1080,6 @@ function AppContent() {
           </RunSelectionProvider>
         );
 
-      case "run-accessibility":
-        // Accessibility Explorer is a standalone tool for inspecting web pages via CDP
-        // It doesn't require a task run to be selected
-        return (
-          <div className="h-full flex flex-col overflow-hidden">
-            <div className="flex-shrink-0 bg-background border-b border-border px-4 py-3">
-              <div className="flex items-center gap-2">
-                <Accessibility className="w-4 h-4 text-muted-foreground" />
-                <span className="text-sm font-medium">Accessibility Explorer</span>
-              </div>
-            </div>
-            <div className="flex-1 min-h-0 overflow-hidden">
-              <AccessibilityExplorerPanel />
-            </div>
-          </div>
-        );
-
-      case "run-ui-bridge":
-        return <SdkUIBridgeInspector />;
-
-      case "discoveries":
-        return (
-          <div className="h-full overflow-y-auto p-4 space-y-4">
-            <div>
-              <div className="flex items-center gap-2 mb-2">
-                <Cloud className="w-6 h-6 text-blue-500" />
-                <h1 className="text-xl font-bold text-white">GUI Discoveries</h1>
-              </div>
-              <p className="text-sm text-gray-400">
-                Detects patterns from GUI automation runs including new UI elements, state
-                transitions, timing updates, and flaky behaviors. Requires running GUI automation
-                workflows (not AI-only tasks).
-              </p>
-            </div>
-            <DiscoverySyncPanel />
-          </div>
-        );
-
-      case "learning":
-        return (
-          <div className="h-full overflow-hidden">
-            <LearningDashboard />
-          </div>
-        );
-
-      case "checkpoints":
-        return (
-          <div className="h-full overflow-hidden">
-            <CheckpointBrowser />
-          </div>
-        );
-
-      case "flow-designer":
-        return (
-          <div className="h-full overflow-hidden">
-            <FlowDesigner />
-          </div>
-        );
-
       // ========== LEGACY TABS (for backward compatibility) ==========
       case "ai":
         return (
@@ -1345,18 +1136,7 @@ function AppContent() {
         );
 
       case "library":
-        return <LibraryDashboard onNavigateToBuilder={handleNavigateToBuilder} onLog={addLog} />;
-
-      case "task-builder":
-        return (
-          <div className="h-full overflow-hidden">
-            <TaskBuilderTab
-              onLog={addLog}
-              editTaskId={editTaskId}
-              _onNavigateToLibrary={() => setActiveTab("library")}
-            />
-          </div>
-        );
+        return <LibraryDashboard onLog={addLog} />;
 
       case "unified-workflow-builder":
         return (
@@ -1365,90 +1145,6 @@ function AppContent() {
               editWorkflowId={editWorkflowId}
               onNavigateToActive={() => setActiveTab("active")}
             />
-          </div>
-        );
-
-      case "macro-builder":
-        return (
-          <div className="h-full overflow-hidden">
-            <MacroBuilderTab editMacroId={editMacroId} />
-          </div>
-        );
-
-      case "playwright-test-builder":
-        return (
-          <div className="h-full overflow-hidden">
-            <PlaywrightTestsPage
-              onLog={addLog}
-              editScriptId={editScriptId}
-              editPromptSnippetId={editPromptSnippetId}
-              onNavigateToLibrary={() => setActiveTab("library")}
-            />
-          </div>
-        );
-
-      case "context-builder":
-        return (
-          <div className="h-full overflow-hidden">
-            <ContextBuilderTab
-              onLog={addLog}
-              editContextId={editContextId}
-              _onNavigateToLibrary={() => setActiveTab("library")}
-            />
-          </div>
-        );
-
-      case "state-explorer-builder":
-        return (
-          <div className="h-full overflow-hidden">
-            <StateExplorerBuilderTab
-              onLog={addLog}
-              editExplorationId={editExplorationId}
-              _onNavigateToLibrary={() => setActiveTab("library")}
-            />
-          </div>
-        );
-
-      case "api-request-builder":
-        return (
-          <div className="h-full overflow-hidden">
-            <ApiRequestBuilderTab
-              onLog={addLog}
-              editRequestId={editApiRequestId}
-              _onNavigateToLibrary={() => setActiveTab("library")}
-            />
-          </div>
-        );
-
-      case "awas-builder":
-        return (
-          <div className="h-full overflow-hidden">
-            <AwasBuilderTab
-              onLog={addLog}
-              editConfigId={editAwasConfigId}
-              _onNavigateToLibrary={() => setActiveTab("library")}
-            />
-          </div>
-        );
-
-      case "test-builder":
-        return (
-          <div className="h-full overflow-hidden">
-            <TestBuilderTab onLog={addLog} />
-          </div>
-        );
-
-      case "check-builder":
-        return (
-          <div className="h-full overflow-hidden">
-            <CheckBuilderTab onLog={addLog} />
-          </div>
-        );
-
-      case "shell-command-builder":
-        return (
-          <div className="h-full overflow-hidden">
-            <ShellCommandBuilderTab onLog={addLog} />
           </div>
         );
 
@@ -1463,10 +1159,10 @@ function AppContent() {
           </div>
         );
 
-      case "app-comparison":
+      case "page-sweep":
         return (
           <div className="h-full overflow-hidden">
-            <AppComparisonWizard onLog={addLog} />
+            <PageSweepTab onLog={addLog} />
           </div>
         );
 
@@ -1496,13 +1192,6 @@ function AppContent() {
               configId={execution.config?.path ?? null}
               configName={execution.config?.name}
             />
-          </div>
-        );
-
-      case "monitor-discoveries":
-        return (
-          <div className="h-full overflow-y-auto p-4">
-            <DiscoverySyncPanel />
           </div>
         );
 

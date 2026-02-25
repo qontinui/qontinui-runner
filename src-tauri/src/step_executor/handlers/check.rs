@@ -146,11 +146,22 @@ impl StepHandler for CheckHandler {
         // On Windows, detect PowerShell syntax and run directly via PowerShell
         // This avoids cmd.exe quote escaping issues that cause "string is missing terminator" errors
         let is_powershell = Self::is_powershell_syntax(&final_command);
+        let is_bash = !is_powershell
+            && super::shell_command::ShellCommandHandler::is_bash_command(&final_command);
         let mut cmd = if cfg!(target_os = "windows") {
             if is_powershell {
                 // PowerShell syntax detected - run directly via PowerShell
                 let mut c = Command::new("powershell");
                 c.args(["-NoProfile", "-NonInteractive", "-Command", &final_command]);
+                c
+            } else if is_bash {
+                // Bash/Unix syntax detected (curl, pipes with single quotes, etc.)
+                // Use Git Bash which handles single quotes correctly, unlike cmd.exe
+                // which strips them and breaks inline Python/jq commands.
+                let bash_path = super::shell_command::ShellCommandHandler::find_git_bash()
+                    .unwrap_or_else(|| "bash".to_string());
+                let mut c = Command::new(&bash_path);
+                c.args(["-c", &final_command]);
                 c
             } else {
                 // cmd.exe doesn't understand single quotes as string delimiters —
@@ -172,9 +183,18 @@ impl StepHandler for CheckHandler {
             c
         };
 
-        // Set working directory if specified
+        // Set working directory if specified (resolve relative paths against workspace root)
         if let Some(ref wd) = working_directory {
-            cmd.current_dir(wd);
+            let resolved = crate::paths::resolve_working_directory(wd);
+            if !resolved.exists() {
+                warn!(
+                    "Check '{}': working directory does not exist: {} (resolved from '{}')",
+                    step_name,
+                    resolved.display(),
+                    wd
+                );
+            }
+            cmd.current_dir(&resolved);
         }
 
         // Capture stdout and stderr
@@ -668,11 +688,30 @@ impl CheckHandler {
             }
         };
 
-        // Optionally run deterministic workflow validation first
+        // Optionally run deterministic workflow validation + fixups first
+        let mut input_content = input_content;
         if step.ai_review_validate_as_workflow.unwrap_or(false) {
             match serde_json::from_str::<crate::unified_workflows::UnifiedWorkflow>(&input_content)
             {
-                Ok(workflow) => {
+                Ok(mut workflow) => {
+                    // Apply deterministic command sanitization before AI review
+                    use crate::workflow_generation::hardener::sanitize_commands_in_steps;
+                    let mut fixed_count = 0;
+                    fixed_count += sanitize_commands_in_steps(&mut workflow.setup_steps);
+                    fixed_count += sanitize_commands_in_steps(&mut workflow.verification_steps);
+                    fixed_count += sanitize_commands_in_steps(&mut workflow.completion_steps);
+                    if fixed_count > 0 {
+                        tracing::info!(
+                            "AI review pre-processing: sanitized {} commands with escaping issues",
+                            fixed_count
+                        );
+                        // Write the fixed workflow back to the artifact file
+                        if let Ok(fixed_json) = serde_json::to_string_pretty(&workflow) {
+                            let _ = std::fs::write(&input_path, &fixed_json);
+                            input_content = fixed_json;
+                        }
+                    }
+
                     let errors =
                         crate::workflow_generation::validation::validate_workflow(&workflow);
                     if !errors.is_empty() {

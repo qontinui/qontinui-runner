@@ -4,7 +4,7 @@
  * TypeScript types for the AI-driven multi-step API test orchestration system.
  */
 
-import type { HttpMethod } from "../components/test-builder/types";
+import type { HttpMethod } from "./test-builder";
 
 /**
  * User input for creating a test orchestration plan

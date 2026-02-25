@@ -16,3 +16,19 @@ export {
   type ProgressMarker,
 } from "./StepProgressMarker";
 export type { StepExecution, StepExecutionStatus, StepStats } from "./types";
+
+// Shared utilities
+export {
+  calculateStepStats,
+  detectStartTime,
+  mapStepType,
+  inferStepStatus,
+  mapPhase,
+  getStepStatusColors,
+} from "./utils";
+export type { CurrentExecutionStepsResponse, EmptySuccessRate } from "./utils";
+
+// Shared UI components
+export { EmptyState } from "./EmptyState";
+export { ModeBadge } from "./ModeBadge";
+export { TypeBadge } from "./TypeBadge";
