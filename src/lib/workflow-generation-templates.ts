@@ -228,6 +228,42 @@ List endpoints (or leave blank to auto-discover from OpenAPI/swagger):
     },
   },
   {
+    id: "multi-phase-plan",
+    name: "Multi-Phase Plan",
+    icon: "ListOrdered",
+    description: "Sequential implementation with distinct research, build, and test phases",
+    content: `Create a multi-stage workflow that breaks this task into sequential phases, each with its own verification.
+
+## Task Description
+[DESCRIBE_THE_TASK — what needs to be accomplished end-to-end]
+
+## Phases (adjust as needed)
+1. **Research / Analysis**
+   - [What to investigate or discover before starting implementation]
+   - Verification: [How to confirm research is complete — e.g., output file exists, key findings documented]
+
+2. **Implementation**
+   - [What to build, modify, or configure]
+   - Verification: [How to confirm implementation works — e.g., tests pass, build succeeds, endpoint responds]
+
+3. **Testing / Validation**
+   - [What to test beyond basic implementation checks]
+   - Verification: [How to confirm quality — e.g., integration tests, UI checks, performance benchmarks]
+
+## Instructions
+1. Create a multi-stage workflow using the \`stages\` array
+2. Each phase becomes a stage with its own setup, verification, agentic, and completion steps
+3. Assess difficulty per stage and set provider/model accordingly:
+   - Simple stages (checks, file ops): use faster model
+   - Complex stages (implementation, debugging): use capable model
+4. Every stage MUST have deterministic verification steps
+5. Later stages can reference output from earlier stages
+6. Set \`stop_on_failure: false\` unless sequential correctness is critical`,
+    advancedDefaults: {
+      category: "planning",
+    },
+  },
+  {
     id: "smoke-test-after-deploy",
     name: "Smoke Test After Deploy",
     icon: "Rocket",

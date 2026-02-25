@@ -72,6 +72,12 @@ export interface DashboardState {
   planPhaseIndex: number | null;
   /** Total plan phases (only for plan workflows) */
   planTotalPhases: number | null;
+  /** Current stage index, zero-based (for multi-stage workflows) */
+  currentStageIndex: number | null;
+  /** Current stage name (for multi-stage workflows) */
+  currentStageName: string | null;
+  /** Total stages (for multi-stage workflows) */
+  totalStages: number | null;
 }
 
 /**
@@ -293,6 +299,9 @@ export function useDashboardState(): UseDashboardStateResult {
       planPhaseName: orchestratorState.planPhaseName,
       planPhaseIndex: orchestratorState.planPhaseIndex,
       planTotalPhases: orchestratorState.planTotalPhases,
+      currentStageIndex: orchestratorState.currentStageIndex,
+      currentStageName: orchestratorState.currentStageName,
+      totalStages: orchestratorState.totalStages,
     }),
     [
       layout,
@@ -313,6 +322,9 @@ export function useDashboardState(): UseDashboardStateResult {
       orchestratorState.planPhaseName,
       orchestratorState.planPhaseIndex,
       orchestratorState.planTotalPhases,
+      orchestratorState.currentStageIndex,
+      orchestratorState.currentStageName,
+      orchestratorState.totalStages,
     ],
   );
 

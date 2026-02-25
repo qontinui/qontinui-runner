@@ -243,6 +243,52 @@ The Verification/Agentic loop continues until all blocking checks pass or max_it
 }}
 ```
 
+## Multi-Stage Workflows
+
+For complex tasks with distinct sequential phases, use the `stages` array instead of top-level step arrays.
+Each stage has its own setup, verification, agentic, and completion steps with its own verification-agentic loop.
+
+### When to use stages
+- Tasks with 2+ distinct sequential phases (e.g., research → implement → test)
+- Multi-app or multi-service tasks where each target has different verification
+- Tasks where each phase has genuinely different verification criteria
+- Single-phase tasks should NOT use stages — use top-level steps instead
+- Prefer fewer stages over more: only split when phases have distinct verification
+
+### Stage schema
+```json
+{{
+  "stages": [
+    {{
+      "id": "uuid-v4",
+      "name": "Stage Name",
+      "description": "What this stage does",
+      "setup_steps": [...],
+      "verification_steps": [...],
+      "agentic_steps": [...],
+      "completion_steps": [],
+      "max_iterations": 5,
+      "provider": "claude_cli",
+      "model": "claude-sonnet-4"
+    }}
+  ],
+  "stop_on_failure": false
+}}
+```
+
+### Rules for stages
+- Every stage MUST have at least one deterministic verification step
+- Stages execute sequentially: Stage 1 must complete before Stage 2 starts
+- Later stages see full output from all prior stages in AI context
+- When using `stages`, leave top-level step arrays empty (setup_steps: [], etc.)
+- `stop_on_failure` defaults to false — workflow continues even if a stage fails
+- Per-stage `provider`/`model` override the workflow-level defaults
+
+### Difficulty-based model selection per stage
+- Simple stages (file checks, status checks, log reading): faster model (claude-sonnet-4, gemini-2.0-flash)
+- Complex stages (implementation, debugging, refactoring): capable model (claude-opus-4, gemini-2.5-pro)
+- Research/analysis stages: mid-tier model (claude-sonnet-4)
+
 ## Step Types
 
 ### Common Fields (all steps)

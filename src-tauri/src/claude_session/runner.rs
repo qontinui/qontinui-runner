@@ -125,6 +125,7 @@ fn run_claude_session_inline(
     doctor_handle: Option<&DoctorHandle>,
     reflection_fix_ctx: Option<ReflectionFixContext>,
     step_injection_ctx: Option<StepInjectionContext>,
+    model_override: Option<&str>,
 ) -> Result<(bool, String, Vec<ExecutionStepConfig>), String> {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -160,16 +161,25 @@ fn run_claude_session_inline(
     //
     // Alternative considered: Using "acceptEdits" mode would still require user interaction
     // for bash commands, which breaks automation. Full bypass is necessary for autonomous operation.
+    let mut cli_args = vec![
+        "/c",
+        "claude",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--permission-mode",
+        "bypassPermissions",
+    ];
+    // Add model override if specified (e.g., from per-stage config)
+    let model_flag;
+    if let Some(model) = model_override {
+        model_flag = model.to_string();
+        cli_args.push("--model");
+        cli_args.push(&model_flag);
+        info!("Using model override for session {}: {}", session_id, model);
+    }
     let mut child = std::process::Command::new("cmd.exe")
-        .args([
-            "/c",
-            "claude",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--permission-mode",
-            "bypassPermissions",
-        ])
+        .args(&cli_args)
         .current_dir(working_dir)
         // Remove CLAUDECODE env var to prevent "nested session" detection.
         // The runner spawns Claude CLI as an automation tool, not as a nested session.
@@ -1142,6 +1152,7 @@ pub fn run_claude_session_with_retry(
     doctor_handle: Option<&DoctorHandle>,
     reflection_fix_ctx: Option<ReflectionFixContext>,
     step_injection_ctx: Option<StepInjectionContext>,
+    model_override: Option<&str>,
 ) -> Result<(bool, String, Option<RetryState>, Vec<ExecutionStepConfig>), String> {
     use std::thread;
     use std::time::Duration;
@@ -1162,6 +1173,7 @@ pub fn run_claude_session_with_retry(
                 doctor_handle,
                 reflection_fix_ctx,
                 step_injection_ctx,
+                model_override,
             )?;
             return Ok((result.0, result.1, None, result.2));
         }
@@ -1203,6 +1215,7 @@ pub fn run_claude_session_with_retry(
             doctor_handle,
             reflection_fix_ctx_clone,
             step_injection_ctx_clone,
+            model_override,
         );
 
         match result {
@@ -1397,6 +1410,7 @@ pub fn run_claude_session_interactive_with_retry(
     doctor_handle: Option<&DoctorHandle>,
     reflection_fix_ctx: Option<ReflectionFixContext>,
     step_injection_ctx: Option<StepInjectionContext>,
+    _model_override: Option<&str>, // TODO: wire to interactive session CLI args
 ) -> Result<(bool, String, Option<RetryState>, Vec<ExecutionStepConfig>), String> {
     use std::thread;
     use std::time::Duration;

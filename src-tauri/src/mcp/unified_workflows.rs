@@ -1,7 +1,7 @@
 //! Unified workflow handlers for MCP API
 //!
 //! Provides HTTP handlers for unified workflow CRUD operations,
-//! execution (single, inline, plan, sequence), generation, and stats.
+//! execution (single, inline, composed multi-stage), generation, and stats.
 
 use axum::{
     extract::{Path, Query, State},
@@ -14,7 +14,6 @@ use tauri::Manager;
 use tracing::{error, info, warn};
 
 use crate::database::CreateTaskRunInput;
-use crate::mcp::misc::default_true;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::step_event_builder::categorize_steps;
 use crate::workflow_generation;
@@ -375,6 +374,8 @@ pub async fn get_unified_workflow(
                 generated_by_task_run_id: workflow.generated_by_task_run_id.clone(),
                 enable_sweep: Some(workflow.enable_sweep),
                 max_sweep_iterations: Some(workflow.max_sweep_iterations),
+                stages: Some(workflow.stages.clone()),
+                stop_on_failure: Some(workflow.stop_on_failure),
             };
             if let Err(e) = state
                 .app_state
@@ -775,6 +776,8 @@ pub async fn import_unified_workflow(
         generated_by_task_run_id: workflow.generated_by_task_run_id.clone(),
         enable_sweep: Some(workflow.enable_sweep),
         max_sweep_iterations: Some(workflow.max_sweep_iterations),
+        stages: Some(workflow.stages.clone()),
+        stop_on_failure: Some(workflow.stop_on_failure),
     };
 
     // Use the database's create function but with our custom ID
@@ -985,6 +988,8 @@ pub async fn generate_unified_workflow_async_handler(
         generated_by_task_run_id: None, // Will be set after task run creation
         enable_sweep: Some(meta_workflow.enable_sweep),
         max_sweep_iterations: Some(meta_workflow.max_sweep_iterations),
+        stages: Some(meta_workflow.stages.clone()),
+        stop_on_failure: Some(meta_workflow.stop_on_failure),
     };
 
     let saved_workflow = match state
@@ -1093,6 +1098,58 @@ pub async fn generate_unified_workflow_async_handler(
             is_dev_mode: cfg!(debug_assertions),
             enable_sweep: saved_workflow.enable_sweep,
             max_sweep_iterations: saved_workflow.max_sweep_iterations,
+            stages: {
+                use crate::unified_workflow_executor::{
+                    convert_json_steps_with_phase, extract_prompt_steps_with_phase, StageConfig,
+                };
+                saved_workflow
+                    .stages
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, stage)| {
+                        let setup_auto =
+                            convert_json_steps_with_phase(&stage.setup_steps, 0, Some("setup"));
+                        let setup_prompt =
+                            extract_prompt_steps_with_phase(&stage.setup_steps, Some("setup"));
+                        let verif = convert_json_steps_with_phase(
+                            &stage.verification_steps,
+                            0,
+                            Some("verification"),
+                        );
+                        let agentic =
+                            extract_prompt_steps_with_phase(&stage.agentic_steps, Some("agentic"));
+                        let comp_auto = convert_json_steps_with_phase(
+                            &stage.completion_steps,
+                            0,
+                            Some("completion"),
+                        );
+                        let comp_prompt = extract_prompt_steps_with_phase(
+                            &stage.completion_steps,
+                            Some("completion"),
+                        );
+                        StageConfig {
+                            id: stage.id.clone(),
+                            name: stage.name.clone(),
+                            index: idx,
+                            total_stages: saved_workflow.stages.len(),
+                            setup_automation_steps: setup_auto,
+                            setup_prompt_steps: setup_prompt,
+                            verification_steps: verif,
+                            agentic_steps: agentic,
+                            completion_automation_steps: comp_auto,
+                            completion_prompt_steps: comp_prompt,
+                            max_iterations: stage.max_iterations,
+                            provider: stage.provider.clone(),
+                            model: stage.model.clone(),
+                            timeout_seconds: stage.timeout_seconds,
+                        }
+                    })
+                    .collect()
+            },
+            stop_on_failure: saved_workflow.stop_on_failure,
+            provider_override: None,
+            model_override: None,
+            stage_index: None,
         };
 
         // Clone state fields for the background task
@@ -1214,38 +1271,6 @@ pub struct ExecuteInlineWorkflowRequest {
 
 pub fn default_max_iterations() -> u32 {
     10
-}
-
-/// Request body for executing a structured implementation plan.
-///
-/// Each phase runs as a separate AI session with full context from prior phases.
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ExecutePlanRequest {
-    /// Name of the plan.
-    plan_name: String,
-    /// Overview/description of the plan.
-    plan_overview: String,
-    /// Ordered list of phases to execute.
-    phases: Vec<PlanPhaseInput>,
-    /// Whether to run a "next steps sweep" after all phases (default: true).
-    #[serde(default = "default_true")]
-    next_steps_sweep: bool,
-    /// Maximum number of sweep iterations (default: 5).
-    #[serde(default = "default_max_sweep_iterations")]
-    max_next_steps_iterations: u32,
-}
-
-/// A single phase in a plan execution request.
-#[derive(Debug, Deserialize, Serialize)]
-pub struct PlanPhaseInput {
-    /// Human-readable name for this phase.
-    name: String,
-    /// The prompt/instructions for this phase.
-    prompt: String,
-}
-
-fn default_max_sweep_iterations() -> u32 {
-    5
 }
 
 /// Run a unified workflow by ID
@@ -1740,6 +1765,11 @@ pub async fn run_unified_workflow(
             is_dev_mode: cfg!(debug_assertions),
             enable_sweep: workflow.enable_sweep,
             max_sweep_iterations: workflow.max_sweep_iterations,
+            stages: Vec::new(),
+            stop_on_failure: false,
+            provider_override: None,
+            model_override: None,
+            stage_index: None,
         };
 
         // Spawn execution in background (non-blocking) — same pattern as
@@ -1998,6 +2028,8 @@ pub async fn execute_inline_workflow(
         enable_sweep: false,
         max_sweep_iterations: 5,
         generated_by_task_run_id: None,
+        stages: Vec::new(),
+        stop_on_failure: false,
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
     };
@@ -2221,6 +2253,11 @@ pub async fn execute_inline_workflow(
             is_dev_mode: cfg!(debug_assertions),
             enable_sweep: workflow.enable_sweep,
             max_sweep_iterations: workflow.max_sweep_iterations,
+            stages: Vec::new(),
+            stop_on_failure: false,
+            provider_override: None,
+            model_override: None,
+            stage_index: None,
         };
 
         let session_manager: Arc<crate::claude_session::SessionManager> = state
@@ -2311,101 +2348,6 @@ pub async fn execute_inline_workflow(
     }
 
     Ok(Json(ApiResponse::success(result)))
-}
-
-/// Execute a structured implementation plan.
-///
-/// Each phase runs as a separate AI session. Output from each phase is
-/// accumulated so subsequent phases have full context from prior work.
-/// Optionally runs a "next steps sweep" to catch overlooked items.
-pub async fn execute_plan(
-    State(state): State<Arc<ApiState>>,
-    Json(request): Json<ExecutePlanRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // Validate request
-    if request.phases.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ApiResponse::error("Plan must have at least one phase")),
-        ));
-    }
-
-    let execution_id = format!("plan-{}", chrono::Utc::now().timestamp_millis());
-    let plan_name = request.plan_name.clone();
-
-    info!(
-        "MCP API: execute_plan '{}' with {} phases (id: {})",
-        plan_name,
-        request.phases.len(),
-        execution_id
-    );
-
-    // Create task_run in database
-    let input = crate::database::CreateTaskRunInput::new(&execution_id, &plan_name)
-        .with_task_type("ai")
-        .with_workflow_type("plan")
-        .with_workflow_name(format!("[Plan] {}", plan_name))
-        .with_max_sessions(
-            request.phases.len() as u32
-                + if request.next_steps_sweep {
-                    request.max_next_steps_iterations
-                } else {
-                    0
-                },
-        )
-        .with_auto_continue(true)
-        .with_prompt(&request.plan_overview);
-
-    if let Err(e) = state.app_state.checkpoint_db.create_task_run(&input) {
-        warn!("Failed to create task_run for plan {}: {}", execution_id, e);
-    }
-
-    // Build PlanConfig
-    let config = crate::plan_executor::PlanConfig {
-        plan_name: request.plan_name.clone(),
-        plan_overview: request.plan_overview.clone(),
-        phases: request
-            .phases
-            .into_iter()
-            .map(|p| crate::plan_executor::PlanPhase {
-                name: p.name,
-                prompt: p.prompt,
-            })
-            .collect(),
-        next_steps_sweep: request.next_steps_sweep,
-        max_next_steps_iterations: request.max_next_steps_iterations,
-        execution_id: execution_id.clone(),
-    };
-
-    // Get session manager for interactive mode (clone out before async block)
-    let session_manager: Option<Arc<crate::claude_session::SessionManager>> = state
-        .app_handle
-        .try_state::<Arc<crate::claude_session::SessionManager>>()
-        .map(|sm| sm.inner().clone());
-
-    let app_state = state.app_state.clone();
-    let app_handle = state.app_handle.clone();
-    let pid_tracker = state.current_ai_pids.clone();
-    let checkpoint_db = state.app_state.checkpoint_db.clone();
-    let exec_id = execution_id.clone();
-    let name = request.plan_name.clone();
-
-    crate::plan_executor::spawn_plan_with_panic_guard(checkpoint_db, exec_id, name, async move {
-        let mut executor =
-            crate::plan_executor::PlanExecutor::new(app_state, app_handle, pid_tracker);
-
-        if let Some(sm) = session_manager {
-            executor = executor.with_session_manager(sm);
-        }
-
-        executor.run(config).await
-    });
-
-    Ok(Json(ApiResponse::success(serde_json::json!({
-        "success": true,
-        "execution_id": execution_id,
-        "message": format!("Plan '{}' execution started", plan_name),
-    }))))
 }
 
 /// Workflow execution statistics
@@ -2516,9 +2458,9 @@ pub async fn get_unified_workflow_stats(
     }
 }
 
-/// Request body for running a sequence of workflows
+/// Request body for running a composed multi-stage workflow from multiple workflows
 #[derive(Deserialize)]
-pub struct RunWorkflowSequenceRequest {
+pub struct RunComposedWorkflowRequest {
     workflow_ids: Vec<String>,
     #[serde(default = "default_stop_on_failure")]
     stop_on_failure: bool,
@@ -2528,19 +2470,22 @@ pub fn default_stop_on_failure() -> bool {
     true
 }
 
-/// Response for workflow sequence execution
+/// Response for composed workflow execution
 #[derive(Serialize)]
-pub struct WorkflowSequenceResponse {
+pub struct ComposedWorkflowResponse {
     task_run_id: String,
     workflow_count: usize,
     workflow_names: Vec<String>,
 }
 
-/// Run a sequence of unified workflows
-pub async fn run_workflow_sequence(
+/// Run a composed multi-stage workflow from multiple workflows.
+///
+/// Each workflow becomes a stage with its own verification-agentic loop.
+/// Stages execute sequentially with full output context accumulation.
+pub async fn run_composed_workflow(
     State(state): State<Arc<ApiState>>,
-    Json(request): Json<RunWorkflowSequenceRequest>,
-) -> Result<Json<ApiResponse<WorkflowSequenceResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    Json(request): Json<RunComposedWorkflowRequest>,
+) -> Result<Json<ApiResponse<ComposedWorkflowResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     if request.workflow_ids.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -2549,7 +2494,7 @@ pub async fn run_workflow_sequence(
     }
 
     info!(
-        "Running workflow sequence: {} workflows, stop_on_failure={}",
+        "Running composed workflow: {} workflows as stages, stop_on_failure={}",
         request.workflow_ids.len(),
         request.stop_on_failure
     );
@@ -2576,18 +2521,14 @@ pub async fn run_workflow_sequence(
     }
 
     let workflow_names: Vec<String> = workflows.iter().map(|w| w.name.clone()).collect();
-    let sequence_name = if workflows.len() == 1 {
+    let composed_name = if workflows.len() == 1 {
         workflows[0].name.clone()
     } else {
-        format!(
-            "Sequence: {} + {} more",
-            workflows[0].name,
-            workflows.len() - 1
-        )
+        format!("{} + {} more", workflows[0].name, workflows.len() - 1)
     };
 
-    // Create a combined prompt describing the sequence
-    let sequence_description = workflows
+    // Create a combined prompt describing the composed workflow
+    let stage_descriptions = workflows
         .iter()
         .enumerate()
         .map(|(i, w)| format!("{}. {} - {}", i + 1, w.name, w.description))
@@ -2595,128 +2536,62 @@ pub async fn run_workflow_sequence(
         .join("\n");
 
     let combined_prompt = format!(
-        "Execute the following workflow sequence{}:\n\n{}\n\nTotal workflows: {}",
+        "Execute the following multi-stage workflow{}:\n\n{}\n\nTotal stages: {}",
         if request.stop_on_failure {
             " (stopping on first failure)"
         } else {
             ""
         },
-        sequence_description,
+        stage_descriptions,
         workflows.len()
     );
 
-    // Create a single task run for the sequence
-    let execution_id = format!(
-        "workflow-sequence-{}",
-        chrono::Utc::now().timestamp_millis()
-    );
+    // Create a single task run for the composed workflow
+    let execution_id = format!("composed-run-{}", chrono::Utc::now().timestamp_millis());
 
-    // Build combined steps from all workflows
-    let mut all_steps: Vec<crate::step_executor::ExecutionStepConfig> = Vec::new();
-    let monitor_index = 0i32;
-
-    for (workflow_idx, workflow) in workflows.iter().enumerate() {
-        info!(
-            "Adding workflow {}/{}: {} ({} setup, {} verification, {} agentic, {} completion steps)",
-            workflow_idx + 1,
-            workflows.len(),
-            workflow.name,
-            workflow.setup_steps.len(),
-            workflow.verification_steps.len(),
-            workflow.agentic_steps.len(),
-            workflow.completion_steps.len()
-        );
-
-        // Helper to convert Value steps to ExecutionStepConfig (same as run_unified_workflow)
-        let convert_step = |step: &serde_json::Value,
-                            _monitor: i32|
-         -> Option<crate::step_executor::ExecutionStepConfig> {
-            if let Ok(config) =
-                serde_json::from_value::<crate::step_executor::ExecutionStepConfig>(step.clone())
-            {
-                return Some(config);
-            }
-
-            let step_type = step.get("type").and_then(|t| t.as_str())?;
-            let name = step
-                .get("name")
-                .and_then(|n| n.as_str())
-                .map(|s| s.to_string());
-
-            Some(crate::step_executor::ExecutionStepConfig {
-                step_type: step_type.to_string(),
-                name,
-                ..Default::default()
-            })
-        };
-
-        // Add steps from each phase
-        for step in &workflow.setup_steps {
-            if let Some(mut config) = convert_step(step, monitor_index) {
-                config.phase = Some("setup".to_string());
-                all_steps.push(config);
-            }
-        }
-
-        for step in &workflow.verification_steps {
-            if let Some(mut config) = convert_step(step, monitor_index) {
-                config.phase = Some("verification".to_string());
-                all_steps.push(config);
-            }
-        }
-
-        for step in &workflow.agentic_steps {
-            if let Some(mut config) = convert_step(step, monitor_index) {
-                config.phase = Some("agentic".to_string());
-                all_steps.push(config);
-            }
-        }
-
-        for step in &workflow.completion_steps {
-            if let Some(mut config) = convert_step(step, monitor_index) {
-                config.phase = Some("completion".to_string());
-                all_steps.push(config);
-            }
-        }
-    }
+    // Build StageConfig entries from the fetched workflows
+    let total = workflows.len();
+    let stages: Vec<crate::unified_workflow_executor::StageConfig> = workflows
+        .iter()
+        .enumerate()
+        .map(|(idx, workflow)| {
+            crate::unified_workflows::workflow_to_stage_config(workflow, idx, total, true)
+        })
+        .collect();
 
     // Create task run for tracking
-    let execution_steps_json = serde_json::to_string(&all_steps).ok();
-    let mut input = CreateTaskRunInput::new(&execution_id, &sequence_name)
+    let input = CreateTaskRunInput::new(&execution_id, &composed_name)
         .with_prompt(&combined_prompt)
         .with_task_type("ai")
         .with_workflow_name(workflow_names.join(", "))
         .with_auto_continue(true)
         .with_workflow_type("unified");
-    if let Some(esj) = execution_steps_json {
-        input = input.with_execution_steps_json(esj);
-    }
     if let Err(e) = state.app_state.checkpoint_db.create_task_run(&input) {
-        warn!("Failed to create task_run for sequence: {}", e);
+        warn!("Failed to create task_run for composed workflow: {}", e);
     }
 
     // Capture values for response before moving workflows into the async block
     let workflow_count = workflows.len();
     let workflow_names_response = workflow_names.clone();
 
-    // Spawn background task to execute workflow sequence with panic protection
+    // Spawn background task to execute composed workflow with panic protection
     let state_clone = state.clone();
     let execution_id_clone = execution_id.clone();
     let stop_on_failure = request.stop_on_failure;
     let checkpoint_db_for_guard = state.app_state.checkpoint_db.clone();
-    let sequence_name_for_guard = format!("Workflow Sequence ({} workflows)", workflow_count);
+    let sequence_name_for_guard = format!("Composed Workflow ({} stages)", workflow_count);
     let execution_id_for_guard = execution_id.clone();
-    let url_lock_for_sequence = Some(state.app_state.url_lock_manager.clone());
+    let url_lock_for_composed = Some(state.app_state.url_lock_manager.clone());
 
-    // Use panic-safe spawning to ensure task is marked as failed if sequence panics
+    // Use panic-safe spawning to ensure task is marked as failed on panic
     crate::unified_workflow_executor::spawn_sequence_with_panic_guard(
         checkpoint_db_for_guard,
         execution_id_for_guard,
         sequence_name_for_guard,
-        url_lock_for_sequence,
+        url_lock_for_composed,
         async move {
             info!(
-                "Starting workflow sequence execution: {} workflows",
+                "Starting composed workflow execution: {} stages",
                 workflow_count
             );
 
@@ -2733,233 +2608,57 @@ pub async fn run_workflow_sequence(
             )
             .with_session_manager(session_manager);
 
-            let mut all_results: Vec<crate::step_executor::StepExecutionResult> = Vec::new();
-            let mut sequence_success = true;
-            let mut failed_workflow: Option<String> = None;
+            // Build a single LoopConfig with stages populated from the input workflows
+            let loop_config = crate::unified_workflow_executor::LoopConfig {
+                max_iterations: 10, // Default; stages have per-stage max_iterations
+                base_prompt: combined_prompt,
+                workflow_name: composed_name.clone(),
+                workflow_id: format!("composed-{}", chrono::Utc::now().timestamp_millis()),
+                execution_id: execution_id_clone.clone(),
+                targeted_error_ids: Vec::new(),
+                starting_iteration: 0,
+                run_agentic_first: false,
+                artifact_dir: None,
+                is_dev_mode: cfg!(debug_assertions),
+                enable_sweep: false,
+                max_sweep_iterations: 0,
+                stages,
+                stop_on_failure,
+                provider_override: None,
+                model_override: None,
+                stage_index: None,
+            };
 
-            for (idx, workflow) in workflows.iter().enumerate() {
-                info!(
-                    "=== Executing workflow {}/{}: {} ===",
-                    idx + 1,
-                    workflow_count,
-                    workflow.name
-                );
+            // Run the LoopController once with all stages
+            let result = controller
+                .run(
+                    loop_config,
+                    Vec::new(), // No top-level setup (all in stages)
+                    Vec::new(), // No top-level setup prompts
+                    Vec::new(), // No top-level verification
+                    Vec::new(), // No top-level agentic
+                    Vec::new(), // No top-level completion
+                    Vec::new(), // No top-level completion prompts
+                )
+                .await;
 
-                // Convert workflow steps to ExecutionStepConfig
-                let monitor_index = 0i32;
-                let convert_step =
-                    |step: &serde_json::Value,
-                     _monitor: i32|
-                     -> Option<crate::step_executor::ExecutionStepConfig> {
-                        if let Ok(config) = serde_json::from_value::<
-                            crate::step_executor::ExecutionStepConfig,
-                        >(step.clone())
-                        {
-                            return Some(config);
-                        }
-
-                        let step_type = step.get("type").and_then(|t| t.as_str())?;
-                        let name = step
-                            .get("name")
-                            .and_then(|n| n.as_str())
-                            .map(|s| s.to_string());
-
-                        Some(crate::step_executor::ExecutionStepConfig {
-                            step_type: step_type.to_string(),
-                            name,
-                            ..Default::default()
-                        })
-                    };
-
-                // Collect all steps with phases
-                let mut workflow_steps: Vec<crate::step_executor::ExecutionStepConfig> = Vec::new();
-
-                for step in &workflow.setup_steps {
-                    if let Some(mut config) = convert_step(step, monitor_index) {
-                        config.phase = Some("setup".to_string());
-                        workflow_steps.push(config);
-                    }
-                }
-                for step in &workflow.verification_steps {
-                    if let Some(mut config) = convert_step(step, monitor_index) {
-                        config.phase = Some("verification".to_string());
-                        workflow_steps.push(config);
-                    }
-                }
-                for step in &workflow.agentic_steps {
-                    if let Some(mut config) = convert_step(step, monitor_index) {
-                        config.phase = Some("agentic".to_string());
-                        workflow_steps.push(config);
-                    }
-                }
-                for step in &workflow.completion_steps {
-                    if let Some(mut config) = convert_step(step, monitor_index) {
-                        config.phase = Some("completion".to_string());
-                        workflow_steps.push(config);
-                    }
-                }
-
-                // Separate automation from prompt steps
-                let (automation_steps, prompt_steps) =
-                    categorize_steps(workflow_steps, |s| &s.step_type);
-
-                // Check if this is an AI workflow (has prompt steps)
-                let has_prompt_steps = !prompt_steps.is_empty();
-
-                if has_prompt_steps {
-                    // Separate by phase
-                    let setup_automation: Vec<_> = automation_steps
-                        .iter()
-                        .filter(|s| s.phase.as_deref() == Some("setup"))
-                        .cloned()
-                        .collect();
-                    // Prepend pre-flight check if enabled (default: true)
-                    let setup_automation = crate::unified_workflows::prepend_preflight_check_step(
-                        setup_automation,
-                        workflow.preflight_check_enabled,
-                    );
-                    let setup_prompts: Vec<_> = prompt_steps
-                        .iter()
-                        .filter(|s| s.phase.as_deref() == Some("setup"))
-                        .cloned()
-                        .collect();
-                    let verification: Vec<_> = automation_steps
-                        .iter()
-                        .filter(|s| s.phase.as_deref() == Some("verification"))
-                        .cloned()
-                        .collect();
-                    let agentic: Vec<_> = prompt_steps
-                        .iter()
-                        .filter(|s| s.phase.as_deref() == Some("agentic"))
-                        .cloned()
-                        .collect();
-                    let completion_automation: Vec<_> = automation_steps
-                        .iter()
-                        .filter(|s| s.phase.as_deref() == Some("completion"))
-                        .cloned()
-                        .collect();
-                    let completion_prompts: Vec<_> = prompt_steps
-                        .iter()
-                        .filter(|s| s.phase.as_deref() == Some("completion"))
-                        .cloned()
-                        .collect();
-
-                    // Build prompt content
-                    let prompt_content = prompt_steps
-                        .iter()
-                        .filter_map(|s| s.prompt_content.as_ref())
-                        .map(|c| c.as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n\n---\n\n");
-
-                    // Create workflow-specific execution ID for internal tracking
-                    // Note: We don't create a separate task_run row for each workflow in a sequence
-                    // The parent sequence task_run is sufficient for tracking. Creating child task_runs
-                    // caused duplicate entries to appear in the running tasks list.
-                    let workflow_exec_id = format!("{}-workflow-{}", execution_id_clone, idx + 1);
-
-                    // For error-fix workflows, run agentic first
-                    let run_agentic_first = !workflow.targeted_error_ids.is_empty();
-
-                    let loop_config = crate::unified_workflow_executor::LoopConfig {
-                        max_iterations: workflow.max_iterations,
-                        base_prompt: prompt_content,
-                        workflow_name: workflow.name.clone(),
-                        workflow_id: workflow.id.clone(),
-                        execution_id: workflow_exec_id,
-                        targeted_error_ids: workflow.targeted_error_ids.clone(),
-                        starting_iteration: 0, // Fresh start
-                        run_agentic_first,
-                        artifact_dir: None,
-                        is_dev_mode: cfg!(debug_assertions),
-                        enable_sweep: workflow.enable_sweep,
-                        max_sweep_iterations: workflow.max_sweep_iterations,
-                    };
-
-                    let result = controller
-                        .run(
-                            loop_config,
-                            setup_automation,
-                            setup_prompts,
-                            verification,
-                            agentic,
-                            completion_automation,
-                            completion_prompts,
-                        )
-                        .await;
-
-                    all_results.extend(result.step_results);
-
-                    if !result.success {
-                        sequence_success = false;
-                        failed_workflow = Some(workflow.name.clone());
-                        error!("Workflow '{}' failed in sequence", workflow.name);
-
-                        if stop_on_failure {
-                            info!(
-                                "Stopping sequence due to workflow failure (stop_on_failure=true)"
-                            );
-                            break;
-                        }
-                    } else {
-                        info!("Workflow '{}' completed successfully", workflow.name);
-                    }
-                } else {
-                    // Automation-only workflow - use StepExecutor
-                    let executor = crate::step_executor::StepExecutor::with_app_handle(
-                        state_clone.app_state.clone(),
-                        state_clone.config_storage.clone(),
-                        state_clone.app_handle.clone(),
-                    );
-
-                    let workflow_exec_id = format!("{}-workflow-{}", execution_id_clone, idx + 1);
-
-                    let result = executor
-                        .execute_steps_with_log_sources(&automation_steps, &workflow_exec_id, &[])
-                        .await;
-
-                    all_results.extend(result.steps);
-
-                    if !result.success {
-                        sequence_success = false;
-                        failed_workflow = Some(workflow.name.clone());
-                        error!("Automation workflow '{}' failed in sequence", workflow.name);
-
-                        if stop_on_failure {
-                            info!(
-                                "Stopping sequence due to workflow failure (stop_on_failure=true)"
-                            );
-                            break;
-                        }
-                    } else {
-                        info!(
-                            "Automation workflow '{}' completed successfully",
-                            workflow.name
-                        );
-                    }
-                }
-            }
-
-            // Update task_run status
-            if sequence_success {
-                info!("Workflow sequence completed successfully");
+            // Update task_run status based on result
+            if result.success {
+                info!("Composed workflow completed successfully");
                 let _ = state_clone
                     .app_state
                     .checkpoint_db
                     .complete_task_run(&execution_id_clone);
             } else {
-                let error_msg = match failed_workflow {
-                    Some(name) => format!("Workflow '{}' failed", name),
-                    None => "Sequence failed".to_string(),
-                };
-                error!("Workflow sequence failed: {}", error_msg);
+                let error_msg = "Composed workflow failed".to_string();
+                error!("{}", error_msg);
                 let _ = state_clone
                     .app_state
                     .checkpoint_db
                     .fail_task_run(&execution_id_clone, &error_msg);
             }
 
-            // Fire-and-forget summary generation for the sequence task
+            // Fire-and-forget summary generation for the composed workflow task
             let db = state_clone.app_state.checkpoint_db.clone();
             let exec_id = execution_id_clone.clone();
             let doctor_handle = state_clone.doctor_handle.clone();
@@ -2971,9 +2670,9 @@ pub async fn run_workflow_sequence(
                 )
                 .await
                 {
-                    Ok(_) => info!("Generated summary for sequence task {}", exec_id),
+                    Ok(_) => info!("Generated summary for composed workflow task {}", exec_id),
                     Err(e) => warn!(
-                        "Failed to generate summary for sequence task {}: {}",
+                        "Failed to generate summary for composed workflow task {}: {}",
                         exec_id, e
                     ),
                 }
@@ -2981,7 +2680,7 @@ pub async fn run_workflow_sequence(
         },
     );
 
-    Ok(Json(ApiResponse::success(WorkflowSequenceResponse {
+    Ok(Json(ApiResponse::success(ComposedWorkflowResponse {
         task_run_id: execution_id,
         workflow_count,
         workflow_names: workflow_names_response,
@@ -3066,8 +2765,8 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             get(get_last_inline_workflow),
         )
         .route(
-            "/unified-workflows/run-sequence",
-            post(run_workflow_sequence),
+            "/unified-workflows/run-composed",
+            post(run_composed_workflow),
         )
         // Parameterized paths after all literal paths
         .route(
@@ -3093,5 +2792,4 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/unified-workflows/:id/example-status",
             axum::routing::put(update_example_status_handler),
         )
-        .route("/execute-plan", post(execute_plan))
 }

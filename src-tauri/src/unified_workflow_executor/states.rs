@@ -31,6 +31,9 @@ pub enum UnifiedWorkflowState {
     VerificationRunning {
         /// Current iteration (1-indexed).
         iteration: u32,
+        /// Stage index for multi-stage workflows. None = single-stage (backward compat).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stage_index: Option<u32>,
     },
 
     /// Verification phase completed for this iteration.
@@ -39,18 +42,33 @@ pub enum UnifiedWorkflowState {
         iteration: u32,
         /// Whether all verification checks passed.
         passed: bool,
+        /// Stage index for multi-stage workflows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stage_index: Option<u32>,
     },
 
     /// Agentic phase is running (AI fixing issues).
     AgenticRunning {
         /// Current iteration (1-indexed).
         iteration: u32,
+        /// Stage index for multi-stage workflows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stage_index: Option<u32>,
     },
 
     /// Agentic phase completed for this iteration.
     AgenticComplete {
         /// Current iteration (1-indexed).
         iteration: u32,
+        /// Stage index for multi-stage workflows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stage_index: Option<u32>,
+    },
+
+    /// A stage completed in a multi-stage workflow.
+    StageComplete {
+        /// Index of the completed stage (0-indexed).
+        stage_index: u32,
     },
 
     /// Completion phase is running.
@@ -88,6 +106,7 @@ impl WorkflowState for UnifiedWorkflowState {
             UnifiedWorkflowState::VerificationComplete { .. } => "verification_complete",
             UnifiedWorkflowState::AgenticRunning { .. } => "agentic_running",
             UnifiedWorkflowState::AgenticComplete { .. } => "agentic_complete",
+            UnifiedWorkflowState::StageComplete { .. } => "stage_complete",
             UnifiedWorkflowState::CompletionRunning => "completion_running",
             UnifiedWorkflowState::CompletionComplete => "completion_complete",
             UnifiedWorkflowState::Failed { .. } => "failed",
@@ -125,6 +144,7 @@ impl WorkflowState for UnifiedWorkflowState {
             | UnifiedWorkflowState::VerificationComplete { .. } => Some("verification"),
             UnifiedWorkflowState::AgenticRunning { .. }
             | UnifiedWorkflowState::AgenticComplete { .. } => Some("agentic"),
+            UnifiedWorkflowState::StageComplete { .. } => None,
             UnifiedWorkflowState::CompletionRunning | UnifiedWorkflowState::CompletionComplete => {
                 Some("completion")
             }
@@ -149,10 +169,10 @@ impl WorkflowState for UnifiedWorkflowState {
 
     fn iteration(&self) -> Option<u32> {
         match self {
-            UnifiedWorkflowState::VerificationRunning { iteration }
+            UnifiedWorkflowState::VerificationRunning { iteration, .. }
             | UnifiedWorkflowState::VerificationComplete { iteration, .. }
-            | UnifiedWorkflowState::AgenticRunning { iteration }
-            | UnifiedWorkflowState::AgenticComplete { iteration } => Some(*iteration),
+            | UnifiedWorkflowState::AgenticRunning { iteration, .. }
+            | UnifiedWorkflowState::AgenticComplete { iteration, .. } => Some(*iteration),
             UnifiedWorkflowState::Failed { iteration, .. }
             | UnifiedWorkflowState::Stopped { iteration, .. } => *iteration,
             _ => None,
@@ -178,22 +198,73 @@ impl UnifiedWorkflowState {
 
     /// Create a VerificationRunning state.
     pub fn verification_running(iteration: u32) -> Self {
-        UnifiedWorkflowState::VerificationRunning { iteration }
+        UnifiedWorkflowState::VerificationRunning {
+            iteration,
+            stage_index: None,
+        }
+    }
+
+    /// Create a VerificationRunning state for a specific stage.
+    pub fn verification_running_staged(iteration: u32, stage_index: u32) -> Self {
+        UnifiedWorkflowState::VerificationRunning {
+            iteration,
+            stage_index: Some(stage_index),
+        }
     }
 
     /// Create a VerificationComplete state.
     pub fn verification_complete(iteration: u32, passed: bool) -> Self {
-        UnifiedWorkflowState::VerificationComplete { iteration, passed }
+        UnifiedWorkflowState::VerificationComplete {
+            iteration,
+            passed,
+            stage_index: None,
+        }
+    }
+
+    /// Create a VerificationComplete state for a specific stage.
+    pub fn verification_complete_staged(iteration: u32, passed: bool, stage_index: u32) -> Self {
+        UnifiedWorkflowState::VerificationComplete {
+            iteration,
+            passed,
+            stage_index: Some(stage_index),
+        }
     }
 
     /// Create an AgenticRunning state.
     pub fn agentic_running(iteration: u32) -> Self {
-        UnifiedWorkflowState::AgenticRunning { iteration }
+        UnifiedWorkflowState::AgenticRunning {
+            iteration,
+            stage_index: None,
+        }
+    }
+
+    /// Create an AgenticRunning state for a specific stage.
+    pub fn agentic_running_staged(iteration: u32, stage_index: u32) -> Self {
+        UnifiedWorkflowState::AgenticRunning {
+            iteration,
+            stage_index: Some(stage_index),
+        }
     }
 
     /// Create an AgenticComplete state.
     pub fn agentic_complete(iteration: u32) -> Self {
-        UnifiedWorkflowState::AgenticComplete { iteration }
+        UnifiedWorkflowState::AgenticComplete {
+            iteration,
+            stage_index: None,
+        }
+    }
+
+    /// Create an AgenticComplete state for a specific stage.
+    pub fn agentic_complete_staged(iteration: u32, stage_index: u32) -> Self {
+        UnifiedWorkflowState::AgenticComplete {
+            iteration,
+            stage_index: Some(stage_index),
+        }
+    }
+
+    /// Create a StageComplete state.
+    pub fn stage_complete(stage_index: u32) -> Self {
+        UnifiedWorkflowState::StageComplete { stage_index }
     }
 
     /// Create a CompletionRunning state.
@@ -272,22 +343,66 @@ impl std::fmt::Display for UnifiedWorkflowState {
             UnifiedWorkflowState::Created => write!(f, "Created"),
             UnifiedWorkflowState::SetupRunning => write!(f, "Setup Running"),
             UnifiedWorkflowState::SetupComplete => write!(f, "Setup Complete"),
-            UnifiedWorkflowState::VerificationRunning { iteration } => {
-                write!(f, "Verification Running (iteration {})", iteration)
+            UnifiedWorkflowState::VerificationRunning {
+                iteration,
+                stage_index,
+            } => {
+                if let Some(si) = stage_index {
+                    write!(
+                        f,
+                        "Verification Running (stage {}, iteration {})",
+                        si, iteration
+                    )
+                } else {
+                    write!(f, "Verification Running (iteration {})", iteration)
+                }
             }
-            UnifiedWorkflowState::VerificationComplete { iteration, passed } => {
-                write!(
-                    f,
-                    "Verification Complete (iteration {}, {})",
-                    iteration,
-                    if *passed { "PASSED" } else { "FAILED" }
-                )
+            UnifiedWorkflowState::VerificationComplete {
+                iteration,
+                passed,
+                stage_index,
+            } => {
+                let status = if *passed { "PASSED" } else { "FAILED" };
+                if let Some(si) = stage_index {
+                    write!(
+                        f,
+                        "Verification Complete (stage {}, iteration {}, {})",
+                        si, iteration, status
+                    )
+                } else {
+                    write!(
+                        f,
+                        "Verification Complete (iteration {}, {})",
+                        iteration, status
+                    )
+                }
             }
-            UnifiedWorkflowState::AgenticRunning { iteration } => {
-                write!(f, "Agentic Running (iteration {})", iteration)
+            UnifiedWorkflowState::AgenticRunning {
+                iteration,
+                stage_index,
+            } => {
+                if let Some(si) = stage_index {
+                    write!(f, "Agentic Running (stage {}, iteration {})", si, iteration)
+                } else {
+                    write!(f, "Agentic Running (iteration {})", iteration)
+                }
             }
-            UnifiedWorkflowState::AgenticComplete { iteration } => {
-                write!(f, "Agentic Complete (iteration {})", iteration)
+            UnifiedWorkflowState::AgenticComplete {
+                iteration,
+                stage_index,
+            } => {
+                if let Some(si) = stage_index {
+                    write!(
+                        f,
+                        "Agentic Complete (stage {}, iteration {})",
+                        si, iteration
+                    )
+                } else {
+                    write!(f, "Agentic Complete (iteration {})", iteration)
+                }
+            }
+            UnifiedWorkflowState::StageComplete { stage_index } => {
+                write!(f, "Stage {} Complete", stage_index)
             }
             UnifiedWorkflowState::CompletionRunning => write!(f, "Completion Running"),
             UnifiedWorkflowState::CompletionComplete => write!(f, "Completion Complete"),

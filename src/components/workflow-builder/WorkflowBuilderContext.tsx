@@ -26,6 +26,7 @@ import type {
   WorkflowExport,
   WorkflowImportResult,
   PromptStep,
+  WorkflowStage,
 } from "../../types";
 import {
   detectWorkflowFeatures,
@@ -53,6 +54,7 @@ interface WorkflowBuilderState {
 
   // UI state
   selectedStepId: string | null;
+  currentStageIndex: number | null; // null = top-level (single-stage mode)
   expandedPhases: Record<WorkflowPhase, boolean>;
   showSaveDialog: boolean;
   showAddDropdown: boolean;
@@ -87,7 +89,89 @@ type WorkflowBuilderAction =
   | { type: "SET_SAVING"; payload: boolean }
   | { type: "SET_ERROR"; payload: string | null }
   | { type: "RESET_TO_NEW" }
-  | { type: "MARK_SAVED" };
+  | { type: "MARK_SAVED" }
+  | { type: "ADD_STAGE"; payload: { name: string } }
+  | { type: "REMOVE_STAGE"; payload: { stageIndex: number } }
+  | { type: "SELECT_STAGE"; payload: number | null }
+  | {
+      type: "UPDATE_STAGE";
+      payload: { stageIndex: number; updates: Partial<WorkflowStage> };
+    }
+  | {
+      type: "MOVE_STAGE";
+      payload: { stageIndex: number; direction: "up" | "down" };
+    }
+  | { type: "ENABLE_STAGES" }
+  | { type: "DISABLE_STAGES" };
+
+// =============================================================================
+// Stage-Aware Helpers
+// =============================================================================
+
+/** Get the step array for a given phase, respecting stage context. */
+function getPhaseSteps(
+  workflow: UnifiedWorkflow,
+  stageIndex: number | null,
+  phase: WorkflowPhase,
+): UnifiedStep[] {
+  const source =
+    stageIndex !== null && workflow.stages?.[stageIndex] ? workflow.stages[stageIndex] : workflow;
+  switch (phase) {
+    case "setup":
+      return source.setup_steps ?? [];
+    case "verification":
+      return source.verification_steps ?? [];
+    case "agentic":
+      return source.agentic_steps ?? [];
+    case "completion":
+      return source.completion_steps ?? [];
+    default:
+      return [];
+  }
+}
+
+/** Return a new workflow with the given steps set for the phase, respecting stage context. */
+function setPhaseSteps(
+  workflow: UnifiedWorkflow,
+  stageIndex: number | null,
+  phase: WorkflowPhase,
+  steps: UnifiedStep[],
+): UnifiedWorkflow {
+  if (stageIndex !== null && workflow.stages) {
+    const stages = workflow.stages.map((s, i) => {
+      if (i !== stageIndex) return s;
+      const updated = { ...s };
+      switch (phase) {
+        case "setup":
+          updated.setup_steps = steps as SetupStep[];
+          break;
+        case "verification":
+          updated.verification_steps = steps as VerificationStep[];
+          break;
+        case "agentic":
+          updated.agentic_steps = steps as AgenticStep[];
+          break;
+        case "completion":
+          updated.completion_steps = steps as CompletionStep[];
+          break;
+      }
+      return updated;
+    });
+    return { ...workflow, stages };
+  }
+  switch (phase) {
+    case "setup":
+      return { ...workflow, setup_steps: steps as SetupStep[] };
+    case "verification":
+      return { ...workflow, verification_steps: steps as VerificationStep[] };
+    case "agentic":
+      return { ...workflow, agentic_steps: steps as AgenticStep[] };
+    case "completion":
+      return { ...workflow, completion_steps: steps as CompletionStep[] };
+    default:
+      return workflow;
+  }
+}
 
 // =============================================================================
 // Reducer
@@ -116,202 +200,70 @@ function workflowBuilderReducer(
       const { step, phase } = action.payload;
       const stepWithId = { ...step, id: step.id || generateStepId() };
 
-      // Check for duplicate step ID across all phases to prevent double-adding
-      const allStepIds = new Set([
-        ...state.workflow.setup_steps.map((s) => s.id),
-        ...state.workflow.verification_steps.map((s) => s.id),
-        ...state.workflow.agentic_steps.map((s) => s.id),
-        ...(state.workflow.completion_steps ?? []).map((s) => s.id),
-      ]);
-
-      if (allStepIds.has(stepWithId.id)) {
+      // Check for duplicate IDs across all phases of the active context
+      const allSteps = (
+        ["setup", "verification", "agentic", "completion"] as WorkflowPhase[]
+      ).flatMap((p) => getPhaseSteps(state.workflow, state.currentStageIndex, p));
+      if (allSteps.some((s) => s.id === stepWithId.id)) {
         console.log("[WorkflowBuilder] Skipping duplicate step ID:", stepWithId.id);
-        return state; // Skip duplicate
+        return state;
       }
 
-      switch (phase) {
-        case "setup":
-          return {
-            ...state,
-            workflow: {
-              ...state.workflow,
-              setup_steps: [...state.workflow.setup_steps, stepWithId as SetupStep],
-            },
-            selectedStepId: stepWithId.id,
-            expandedPhases: { ...state.expandedPhases, setup: true },
-          };
-        case "verification":
-          return {
-            ...state,
-            workflow: {
-              ...state.workflow,
-              verification_steps: [
-                ...state.workflow.verification_steps,
-                stepWithId as VerificationStep,
-              ],
-            },
-            selectedStepId: stepWithId.id,
-            expandedPhases: { ...state.expandedPhases, verification: true },
-          };
-        case "agentic":
-          return {
-            ...state,
-            workflow: {
-              ...state.workflow,
-              agentic_steps: [...state.workflow.agentic_steps, stepWithId as AgenticStep],
-            },
-            selectedStepId: stepWithId.id,
-            expandedPhases: { ...state.expandedPhases, agentic: true },
-          };
-        case "completion": {
-          const existingSteps = state.workflow.completion_steps ?? [];
-          // Find the summary step (if it exists) to insert before it
-          const summaryIndex = existingSteps.findIndex(
-            (s) => s.type === "prompt" && (s as PromptStep).is_summary_step === true,
-          );
+      const existing = getPhaseSteps(state.workflow, state.currentStageIndex, phase);
+      let newSteps: UnifiedStep[];
 
-          let newSteps: CompletionStep[];
-          if (summaryIndex >= 0) {
-            // Insert before the summary step (keep summary at the end)
-            newSteps = [
-              ...existingSteps.slice(0, summaryIndex),
-              stepWithId as CompletionStep,
-              ...existingSteps.slice(summaryIndex),
-            ];
-          } else {
-            // No summary step, just append
-            newSteps = [...existingSteps, stepWithId as CompletionStep];
-          }
-
-          return {
-            ...state,
-            workflow: {
-              ...state.workflow,
-              completion_steps: newSteps,
-            },
-            selectedStepId: stepWithId.id,
-            expandedPhases: { ...state.expandedPhases, completion: true },
-          };
+      if (phase === "completion") {
+        const summaryIndex = existing.findIndex(
+          (s) => s.type === "prompt" && (s as PromptStep).is_summary_step === true,
+        );
+        if (summaryIndex >= 0) {
+          newSteps = [
+            ...existing.slice(0, summaryIndex),
+            stepWithId,
+            ...existing.slice(summaryIndex),
+          ];
+        } else {
+          newSteps = [...existing, stepWithId];
         }
-        default:
-          return state;
+      } else {
+        newSteps = [...existing, stepWithId];
       }
+
+      return {
+        ...state,
+        workflow: setPhaseSteps(state.workflow, state.currentStageIndex, phase, newSteps),
+        selectedStepId: stepWithId.id,
+        expandedPhases: { ...state.expandedPhases, [phase]: true },
+      };
     }
 
     case "REMOVE_STEP": {
       const { stepId, phase } = action.payload;
-
-      switch (phase) {
-        case "setup":
-          return {
-            ...state,
-            workflow: {
-              ...state.workflow,
-              setup_steps: state.workflow.setup_steps.filter((s) => s.id !== stepId),
-            },
-            selectedStepId: state.selectedStepId === stepId ? null : state.selectedStepId,
-          };
-        case "verification":
-          return {
-            ...state,
-            workflow: {
-              ...state.workflow,
-              verification_steps: state.workflow.verification_steps.filter((s) => s.id !== stepId),
-            },
-            selectedStepId: state.selectedStepId === stepId ? null : state.selectedStepId,
-          };
-        case "agentic":
-          return {
-            ...state,
-            workflow: {
-              ...state.workflow,
-              agentic_steps: state.workflow.agentic_steps.filter((s) => s.id !== stepId),
-            },
-            selectedStepId: state.selectedStepId === stepId ? null : state.selectedStepId,
-          };
-        case "completion":
-          return {
-            ...state,
-            workflow: {
-              ...state.workflow,
-              completion_steps: (state.workflow.completion_steps ?? []).filter(
-                (s) => s.id !== stepId,
-              ),
-            },
-            selectedStepId: state.selectedStepId === stepId ? null : state.selectedStepId,
-          };
-        default:
-          return state;
-      }
+      const steps = getPhaseSteps(state.workflow, state.currentStageIndex, phase);
+      const filtered = steps.filter((s) => s.id !== stepId);
+      return {
+        ...state,
+        workflow: setPhaseSteps(state.workflow, state.currentStageIndex, phase, filtered),
+        selectedStepId: state.selectedStepId === stepId ? null : state.selectedStepId,
+      };
     }
 
     case "UPDATE_STEP": {
       const { step, phase } = action.payload;
-
-      switch (phase) {
-        case "setup":
-          return {
-            ...state,
-            workflow: {
-              ...state.workflow,
-              setup_steps: state.workflow.setup_steps.map((s) =>
-                s.id === step.id ? (step as SetupStep) : s,
-              ),
-            },
-          };
-        case "verification":
-          return {
-            ...state,
-            workflow: {
-              ...state.workflow,
-              verification_steps: state.workflow.verification_steps.map((s) =>
-                s.id === step.id ? (step as VerificationStep) : s,
-              ),
-            },
-          };
-        case "agentic":
-          return {
-            ...state,
-            workflow: {
-              ...state.workflow,
-              agentic_steps: state.workflow.agentic_steps.map((s) =>
-                s.id === step.id ? (step as AgenticStep) : s,
-              ),
-            },
-          };
-        case "completion":
-          return {
-            ...state,
-            workflow: {
-              ...state.workflow,
-              completion_steps: (state.workflow.completion_steps ?? []).map((s) =>
-                s.id === step.id ? (step as CompletionStep) : s,
-              ),
-            },
-          };
-        default:
-          return state;
-      }
+      const steps = getPhaseSteps(state.workflow, state.currentStageIndex, phase);
+      const updated = steps.map((s) => (s.id === step.id ? step : s));
+      return {
+        ...state,
+        workflow: setPhaseSteps(state.workflow, state.currentStageIndex, phase, updated),
+      };
     }
 
     case "MOVE_STEP": {
       const { stepId, phase, direction } = action.payload;
-
-      const moveInArray = <T extends { id: string }>(arr: T[]): T[] => {
-        const index = arr.findIndex((s) => s.id === stepId);
-        if (index === -1) return arr;
-        if (direction === "up" && index === 0) return arr;
-        if (direction === "down" && index === arr.length - 1) return arr;
-
-        const newArr = [...arr];
-        const targetIndex = direction === "up" ? index - 1 : index + 1;
-        [newArr[index], newArr[targetIndex]] = [newArr[targetIndex], newArr[index]];
-        return newArr;
-      };
+      const steps = getPhaseSteps(state.workflow, state.currentStageIndex, phase);
 
       // Special handling for completion phase to protect summary step position
       if (phase === "completion") {
-        const steps = state.workflow.completion_steps ?? [];
         const stepToMove = steps.find((s) => s.id === stepId);
 
         // Prevent moving the summary step
@@ -325,50 +277,27 @@ function workflowBuilderReducer(
 
         // Prevent moving any step past (below) the summary step
         if (direction === "down") {
-          const index = steps.findIndex((s) => s.id === stepId);
-          const nextStep = steps[index + 1];
+          const idx = steps.findIndex((s) => s.id === stepId);
+          const nextStep = steps[idx + 1];
           if (nextStep && nextStep.type === "prompt" && (nextStep as PromptStep).is_summary_step) {
             return state;
           }
         }
       }
 
-      switch (phase) {
-        case "setup":
-          return {
-            ...state,
-            workflow: {
-              ...state.workflow,
-              setup_steps: moveInArray(state.workflow.setup_steps),
-            },
-          };
-        case "verification":
-          return {
-            ...state,
-            workflow: {
-              ...state.workflow,
-              verification_steps: moveInArray(state.workflow.verification_steps),
-            },
-          };
-        case "agentic":
-          return {
-            ...state,
-            workflow: {
-              ...state.workflow,
-              agentic_steps: moveInArray(state.workflow.agentic_steps),
-            },
-          };
-        case "completion":
-          return {
-            ...state,
-            workflow: {
-              ...state.workflow,
-              completion_steps: moveInArray(state.workflow.completion_steps ?? []),
-            },
-          };
-        default:
-          return state;
-      }
+      const index = steps.findIndex((s) => s.id === stepId);
+      if (index === -1) return state;
+      if (direction === "up" && index === 0) return state;
+      if (direction === "down" && index === steps.length - 1) return state;
+
+      const newSteps = [...steps];
+      const targetIndex = direction === "up" ? index - 1 : index + 1;
+      [newSteps[index], newSteps[targetIndex]] = [newSteps[targetIndex], newSteps[index]];
+
+      return {
+        ...state,
+        workflow: setPhaseSteps(state.workflow, state.currentStageIndex, phase, newSteps),
+      };
     }
 
     case "SELECT_STEP":
@@ -433,6 +362,133 @@ function workflowBuilderReducer(
         originalWorkflow: state.workflow,
       };
 
+    case "ADD_STAGE": {
+      const existingStages = state.workflow.stages ?? [];
+      const newStage: WorkflowStage = {
+        id: generateStepId(),
+        name: action.payload.name,
+        description: "",
+        setup_steps: [],
+        verification_steps: [],
+        agentic_steps: [],
+        completion_steps: [],
+        max_iterations: state.workflow.max_iterations ?? 10,
+      };
+      return {
+        ...state,
+        workflow: {
+          ...state.workflow,
+          stages: [...existingStages, newStage],
+        },
+        currentStageIndex: existingStages.length,
+      };
+    }
+
+    case "REMOVE_STAGE": {
+      const { stageIndex } = action.payload;
+      const stages = state.workflow.stages ?? [];
+      if (stageIndex < 0 || stageIndex >= stages.length) return state;
+      const newStages = stages.filter((_, i) => i !== stageIndex);
+      let newCurrentStage = state.currentStageIndex;
+      if (newStages.length === 0) {
+        newCurrentStage = null;
+      } else if (newCurrentStage !== null && newCurrentStage >= newStages.length) {
+        newCurrentStage = newStages.length - 1;
+      }
+      return {
+        ...state,
+        workflow: {
+          ...state.workflow,
+          stages: newStages.length > 0 ? newStages : undefined,
+        },
+        currentStageIndex: newCurrentStage,
+        selectedStepId: null,
+      };
+    }
+
+    case "SELECT_STAGE":
+      return {
+        ...state,
+        currentStageIndex: action.payload,
+        selectedStepId: null,
+      };
+
+    case "UPDATE_STAGE": {
+      const { stageIndex, updates } = action.payload;
+      const stages = state.workflow.stages ?? [];
+      if (stageIndex < 0 || stageIndex >= stages.length) return state;
+      const updatedStages = stages.map((s, i) => (i === stageIndex ? { ...s, ...updates } : s));
+      return {
+        ...state,
+        workflow: { ...state.workflow, stages: updatedStages },
+      };
+    }
+
+    case "MOVE_STAGE": {
+      const { stageIndex, direction } = action.payload;
+      const stages = state.workflow.stages ?? [];
+      if (stageIndex < 0 || stageIndex >= stages.length) return state;
+      if (direction === "up" && stageIndex === 0) return state;
+      if (direction === "down" && stageIndex === stages.length - 1) return state;
+      const targetIndex = direction === "up" ? stageIndex - 1 : stageIndex + 1;
+      const newStages = [...stages];
+      [newStages[stageIndex], newStages[targetIndex]] = [
+        newStages[targetIndex],
+        newStages[stageIndex],
+      ];
+      return {
+        ...state,
+        workflow: { ...state.workflow, stages: newStages },
+        currentStageIndex: targetIndex,
+      };
+    }
+
+    case "ENABLE_STAGES": {
+      if (state.workflow.stages && state.workflow.stages.length > 0) return state;
+      // Move top-level steps into Stage 1
+      const stage1: WorkflowStage = {
+        id: generateStepId(),
+        name: "Stage 1",
+        setup_steps: state.workflow.setup_steps,
+        verification_steps: state.workflow.verification_steps,
+        agentic_steps: state.workflow.agentic_steps,
+        completion_steps: state.workflow.completion_steps ?? [],
+        max_iterations: state.workflow.max_iterations ?? 10,
+      };
+      return {
+        ...state,
+        workflow: {
+          ...state.workflow,
+          stages: [stage1],
+          setup_steps: [],
+          verification_steps: [],
+          agentic_steps: [],
+          completion_steps: [],
+        },
+        currentStageIndex: 0,
+      };
+    }
+
+    case "DISABLE_STAGES": {
+      const stages = state.workflow.stages ?? [];
+      if (stages.length === 0) return state;
+      // Move first stage's steps back to top level
+      const first = stages[0];
+      return {
+        ...state,
+        workflow: {
+          ...state.workflow,
+          stages: undefined,
+          setup_steps: first.setup_steps ?? [],
+          verification_steps: first.verification_steps ?? [],
+          agentic_steps: first.agentic_steps ?? [],
+          completion_steps: first.completion_steps ?? [],
+        },
+        currentStageIndex: null,
+        selectedStepId: null,
+      };
+    }
+
     default:
       return state;
   }
@@ -490,6 +546,18 @@ interface WorkflowBuilderContextValue {
     workflow: UnifiedWorkflow,
     conflictStrategy?: "keep" | "generate" | "overwrite",
   ) => Promise<WorkflowImportResult | null>;
+
+  // Stage management
+  currentStageIndex: number | null;
+  currentStage: WorkflowStage | null;
+  addStage: (name: string) => void;
+  removeStage: (stageIndex: number) => void;
+  selectStage: (stageIndex: number | null) => void;
+  updateStage: (stageIndex: number, updates: Partial<WorkflowStage>) => void;
+  moveStage: (stageIndex: number, direction: "up" | "down") => void;
+  enableStages: () => void;
+  disableStages: () => void;
+  getActiveSteps: (phase: WorkflowPhase) => UnifiedStep[];
 }
 
 // =============================================================================
@@ -583,6 +651,7 @@ export function WorkflowBuilderProvider({
     // Restore originalWorkflow from storage to preserve update vs create state after app reload
     originalWorkflow: initialWorkflow ?? storedOriginalWorkflow ?? null,
     selectedStepId: null,
+    currentStageIndex: null,
     expandedPhases: {
       setup: true,
       verification: true,
@@ -661,21 +730,14 @@ export function WorkflowBuilderProvider({
 
   const getSelectedStep = useCallback((): UnifiedStep | null => {
     if (!state.selectedStepId) return null;
-
-    for (const step of state.workflow.setup_steps) {
-      if (step.id === state.selectedStepId) return step;
-    }
-    for (const step of state.workflow.verification_steps) {
-      if (step.id === state.selectedStepId) return step;
-    }
-    for (const step of state.workflow.agentic_steps) {
-      if (step.id === state.selectedStepId) return step;
-    }
-    for (const step of state.workflow.completion_steps ?? []) {
-      if (step.id === state.selectedStepId) return step;
+    const phases: WorkflowPhase[] = ["setup", "verification", "agentic", "completion"];
+    for (const phase of phases) {
+      const steps = getPhaseSteps(state.workflow, state.currentStageIndex, phase);
+      const found = steps.find((s) => s.id === state.selectedStepId);
+      if (found) return found;
     }
     return null;
-  }, [state.selectedStepId, state.workflow]);
+  }, [state.selectedStepId, state.workflow, state.currentStageIndex]);
 
   const togglePhase = useCallback((phase: WorkflowPhase) => {
     dispatch({ type: "TOGGLE_PHASE", payload: phase });
@@ -708,6 +770,47 @@ export function WorkflowBuilderProvider({
   const markSaved = useCallback(() => {
     dispatch({ type: "MARK_SAVED" });
   }, []);
+
+  // Stage management
+  const currentStage = useMemo((): WorkflowStage | null => {
+    if (state.currentStageIndex === null) return null;
+    return state.workflow.stages?.[state.currentStageIndex] ?? null;
+  }, [state.currentStageIndex, state.workflow.stages]);
+
+  const addStage = useCallback((name: string) => {
+    dispatch({ type: "ADD_STAGE", payload: { name } });
+  }, []);
+
+  const removeStage = useCallback((stageIndex: number) => {
+    dispatch({ type: "REMOVE_STAGE", payload: { stageIndex } });
+  }, []);
+
+  const selectStage = useCallback((stageIndex: number | null) => {
+    dispatch({ type: "SELECT_STAGE", payload: stageIndex });
+  }, []);
+
+  const updateStage = useCallback((stageIndex: number, updates: Partial<WorkflowStage>) => {
+    dispatch({ type: "UPDATE_STAGE", payload: { stageIndex, updates } });
+  }, []);
+
+  const moveStage = useCallback((stageIndex: number, direction: "up" | "down") => {
+    dispatch({ type: "MOVE_STAGE", payload: { stageIndex, direction } });
+  }, []);
+
+  const enableStages = useCallback(() => {
+    dispatch({ type: "ENABLE_STAGES" });
+  }, []);
+
+  const disableStages = useCallback(() => {
+    dispatch({ type: "DISABLE_STAGES" });
+  }, []);
+
+  const getActiveSteps = useCallback(
+    (phase: WorkflowPhase): UnifiedStep[] => {
+      return getPhaseSteps(state.workflow, state.currentStageIndex, phase);
+    },
+    [state.workflow, state.currentStageIndex],
+  );
 
   // Save workflow to API
   const saveWorkflow = useCallback(async (): Promise<UnifiedWorkflow | null> => {
@@ -887,6 +990,16 @@ export function WorkflowBuilderProvider({
     loadWorkflow,
     exportWorkflow,
     importWorkflow,
+    currentStageIndex: state.currentStageIndex,
+    currentStage,
+    addStage,
+    removeStage,
+    selectStage,
+    updateStage,
+    moveStage,
+    enableStages,
+    disableStages,
+    getActiveSteps,
   };
 
   return (

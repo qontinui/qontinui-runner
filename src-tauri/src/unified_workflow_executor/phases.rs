@@ -1916,8 +1916,8 @@ impl AgenticExecutor {
             }
         };
 
-        // Append execution timing context if available (from iteration 2+)
-        let enhanced_prompt = if iteration > 1 {
+        // Append execution timing context if available (from iteration 2+ or cross-stage)
+        let enhanced_prompt = if iteration > 1 || config.stage_index.is_some_and(|idx| idx > 0) {
             match build_execution_timing_context(&self.checkpoint_db, &config.execution_id) {
                 Some(timing) => {
                     info!(
@@ -1933,18 +1933,26 @@ impl AgenticExecutor {
         };
 
         // For iteration 2+, add context from previous iterations (findings + verification results)
-        let enhanced_prompt = if iteration > 1 {
+        // Also for stage > 0 at iteration 1, inject cross-stage context so the AI
+        // has visibility into prior stages' findings and knowledge.
+        let needs_iteration_context =
+            iteration > 1 || config.stage_index.is_some_and(|idx| idx > 0);
+        let enhanced_prompt = if needs_iteration_context {
             match build_unified_iteration_context(
                 &self.checkpoint_db,
                 &config.execution_id,
                 iteration,
             ) {
                 Some(ctx) => {
-                    info!(
-                        "AGENTIC-PHASE: Appending iteration context ({} chars) for iteration {}",
-                        ctx.len(),
-                        iteration
-                    );
+                    let label = if iteration == 1 {
+                        format!(
+                            "cross-stage context for stage {}",
+                            config.stage_index.unwrap_or(0)
+                        )
+                    } else {
+                        format!("iteration context for iteration {}", iteration)
+                    };
+                    info!("AGENTIC-PHASE: Appending {} ({} chars)", label, ctx.len(),);
                     format!("{}\n\n{}", enhanced_prompt, ctx)
                 }
                 None => enhanced_prompt,
@@ -1965,7 +1973,8 @@ impl AgenticExecutor {
         // Use the unified AI session executor with timing
         let mut ai_config =
             AiSessionConfig::agentic(&config.execution_id, &config.workflow_name, iteration)
-                .with_checkpoint_id(&checkpoint.id);
+                .with_checkpoint_id(&checkpoint.id)
+                .with_model_override(config.model_override.clone());
 
         // Attach reflection fix context if this is a reflection workflow
         if let Some(ref ctx) = self.reflection_fix_ctx {
@@ -3022,6 +3031,11 @@ impl Executor for AgenticExecutor {
             is_dev_mode: false,
             enable_sweep: false,
             max_sweep_iterations: 5,
+            stages: Vec::new(),
+            stop_on_failure: false,
+            provider_override: None,
+            model_override: None,
+            stage_index: None,
         };
 
         let (outcome, _injected_steps) = self

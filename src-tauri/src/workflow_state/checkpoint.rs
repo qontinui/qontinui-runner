@@ -202,11 +202,11 @@ impl CheckpointManager {
     /// This is called when a step starts (status=running) and when it completes
     /// (status=success/failed/skipped).
     ///
-    /// Note: For workflow sequence children (e.g., workflow-sequence-X-workflow-N),
+    /// Note: For composed run children (e.g., composed-run-X-workflow-N),
     /// the execution_id is automatically remapped to the parent task ID because
     /// only parent IDs exist in task_runs (required by foreign key constraint).
     pub fn save_step(&self, checkpoint: &StepCheckpoint) -> Result<(), String> {
-        // For workflow sequence children, remap to parent ID to satisfy FK constraint
+        // For composed run children, remap to parent ID to satisfy FK constraint
         let parent_id = get_parent_task_id(&checkpoint.execution_id);
 
         debug!(

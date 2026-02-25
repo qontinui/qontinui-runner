@@ -4,11 +4,11 @@
  * Configuration panel for the selected workflow step.
  * Shows different options based on step type.
  *
- * Core step types: command, ui_bridge, prompt
+ * Core step types: command, ui_bridge, prompt, workflow
  */
 
 import { useState } from "react";
-import { X, AlertCircle, ChevronDown, ChevronRight, Plus, Trash2 } from "lucide-react";
+import { X, AlertCircle, ChevronDown, ChevronRight, Plus, Trash2, Workflow } from "lucide-react";
 import type { UnifiedStep, WorkflowPhase } from "../../types";
 import type {
   TestType,
@@ -16,6 +16,7 @@ import type {
   CheckType,
   BaseStep,
   CommandStep,
+  WorkflowStep,
 } from "../../types/unified-workflow";
 import { useWorkflowBuilder } from "./WorkflowBuilderContext";
 // =============================================================================
@@ -1420,14 +1421,63 @@ function UiBridgeConfig({
 }
 
 // =============================================================================
+// Workflow Step Config
+// =============================================================================
+
+function WorkflowConfig({
+  step,
+  onChangeWorkflow,
+}: {
+  step: UnifiedStep & { type: "workflow" };
+  onChangeWorkflow?: () => void;
+}) {
+  const wfStep = step as WorkflowStep;
+  return (
+    <div className="space-y-4">
+      <div className="flex items-start gap-3 p-3 bg-zinc-800 border border-zinc-700 rounded-lg">
+        <div className="p-2 rounded-md bg-blue-500/10 text-blue-400">
+          <Workflow className="w-5 h-5" />
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="font-medium text-zinc-200">
+            {wfStep.workflow_name || "No workflow selected"}
+          </div>
+          {wfStep.workflow_id && (
+            <p className="text-xs text-zinc-500 mt-0.5 font-mono truncate">{wfStep.workflow_id}</p>
+          )}
+        </div>
+      </div>
+
+      {onChangeWorkflow && (
+        <button
+          onClick={onChangeWorkflow}
+          className="w-full px-3 py-2 text-sm bg-zinc-700 hover:bg-zinc-600 rounded-md text-zinc-200 transition-colors"
+          data-ui-id="workflow-builder-step-config-change-workflow-btn"
+        >
+          Change Workflow
+        </button>
+      )}
+
+      {!wfStep.workflow_id && (
+        <p className="text-sm text-amber-400/80">
+          No workflow selected. Click &quot;Change Workflow&quot; to pick one.
+        </p>
+      )}
+    </div>
+  );
+}
+
+// =============================================================================
 // Main StepConfigPanel Component
 // =============================================================================
 
 interface StepConfigPanelProps {
   onClose?: () => void;
+  /** Callback to open the workflow library picker for changing the referenced workflow */
+  onOpenWorkflowPicker?: () => void;
 }
 
-export function StepConfigPanel({ onClose }: StepConfigPanelProps) {
+export function StepConfigPanel({ onClose, onOpenWorkflowPicker }: StepConfigPanelProps) {
   const { state, getSelectedStep, updateStep } = useWorkflowBuilder();
   const selectedStep = getSelectedStep();
 
@@ -1470,6 +1520,8 @@ export function StepConfigPanel({ onClose }: StepConfigPanelProps) {
         return "AI Prompt";
       case "ui_bridge":
         return "UI Bridge";
+      case "workflow":
+        return "Workflow";
       default:
         return "Step";
     }
@@ -1527,6 +1579,12 @@ export function StepConfigPanel({ onClose }: StepConfigPanelProps) {
         {/* TestConfig removed — test mode is now inside CommandConfig */}
         {selectedStep.type === "ui_bridge" && (
           <UiBridgeConfig step={selectedStep} onUpdate={handleUpdate} />
+        )}
+        {selectedStep.type === "workflow" && (
+          <WorkflowConfig
+            step={selectedStep as UnifiedStep & { type: "workflow" }}
+            onChangeWorkflow={onOpenWorkflowPicker}
+          />
         )}
 
         {/* Console Error Handling -- shown for all verification phase steps */}

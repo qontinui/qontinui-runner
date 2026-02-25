@@ -852,6 +852,10 @@ CREATE TABLE IF NOT EXISTS unified_workflows (
     enable_sweep INTEGER DEFAULT 0,  -- 0 = disabled (default), 1 = enabled
     max_sweep_iterations INTEGER DEFAULT 5,  -- Maximum sweep iterations
 
+    -- Multi-stage workflow configuration
+    stages TEXT DEFAULT '[]',  -- JSON array of WorkflowStage objects
+    stop_on_failure INTEGER DEFAULT 0,  -- 0 = continue on failure (default), 1 = stop
+
     -- Generation tracking (for workflows created by meta-workflows)
     generated_by_task_run_id TEXT,  -- Links back to the meta-workflow task_run that created this
 
@@ -2018,8 +2022,9 @@ CREATE TABLE IF NOT EXISTS workflow_step_checkpoints (
     completed_at TEXT,
     duration_ms INTEGER,
     error TEXT,                             -- Error message if failed
+    stage_index INTEGER DEFAULT 0,         -- Stage index for multi-stage workflows (0 = single-stage)
     FOREIGN KEY (execution_id) REFERENCES task_runs(id) ON DELETE CASCADE,
-    UNIQUE(execution_id, phase, iteration, step_index)
+    UNIQUE(execution_id, phase, iteration, step_index, stage_index)
 );
 
 CREATE INDEX IF NOT EXISTS idx_step_checkpoints_execution ON workflow_step_checkpoints(execution_id);
@@ -2201,4 +2206,4 @@ CREATE INDEX IF NOT EXISTS idx_stk_composite ON step_type_knowledge(step_type, l
 -- Initialize singleton tables
 INSERT OR IGNORE INTO gui_lock (id, holder_session_id, acquired_at) VALUES (1, NULL, NULL);
 INSERT OR IGNORE INTO scheduler_settings (id) VALUES (1);
-INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (60, datetime('now'));
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (66, datetime('now'));

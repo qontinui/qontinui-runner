@@ -92,6 +92,12 @@ export interface OrchestratorStateResult {
   planPhaseIndex: number | null;
   /** Total number of plan phases (only for plan workflows) */
   planTotalPhases: number | null;
+  /** Current stage index, zero-based (for multi-stage workflows) */
+  currentStageIndex: number | null;
+  /** Current stage name (for multi-stage workflows) */
+  currentStageName: string | null;
+  /** Total number of stages (for multi-stage workflows) */
+  totalStages: number | null;
 }
 
 /**
@@ -240,6 +246,9 @@ export function useOrchestratorState(
       planPhaseName: unifiedContext.planPhaseName ?? null,
       planPhaseIndex: unifiedContext.planPhaseIndex ?? null,
       planTotalPhases: unifiedContext.planTotalPhases ?? null,
+      currentStageIndex: unifiedContext.currentStageIndex ?? null,
+      currentStageName: unifiedContext.currentStageName ?? null,
+      totalStages: unifiedContext.totalStages ?? null,
     };
   }
 
@@ -262,6 +271,9 @@ export function useOrchestratorState(
     planPhaseName: state?.plan_phase_name ?? null,
     planPhaseIndex: state?.plan_phase_index ?? null,
     planTotalPhases: state?.plan_total_phases ?? null,
+    currentStageIndex: null,
+    currentStageName: null,
+    totalStages: null,
   };
 }
 

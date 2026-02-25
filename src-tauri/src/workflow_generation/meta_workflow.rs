@@ -263,6 +263,8 @@ pub fn build_meta_workflow_template(
         enable_sweep: false,
         max_sweep_iterations: 5,
         generated_by_task_run_id: None,
+        stages: Vec::new(),
+        stop_on_failure: false,
         created_at: now.clone(),
         updated_at: now,
     }

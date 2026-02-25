@@ -28,6 +28,7 @@ import type {
   UnifiedStep,
   UnifiedWorkflow,
   WorkflowExport,
+  WorkflowStep,
   SavedPrompt,
   SavedShellCommand,
   LogSourceSelection,
@@ -46,8 +47,10 @@ import { CheckLibraryPicker } from "./CheckLibraryPicker";
 import { CheckGroupLibraryPicker } from "./CheckGroupLibraryPicker";
 import { TestLibraryPicker } from "./TestLibraryPicker";
 import { McpServerToolPicker } from "./McpServerToolPicker";
+import { WorkflowLibraryPicker } from "./WorkflowLibraryPicker";
 import { AiGenerateWorkflowModal } from "./AiGenerateWorkflowModal";
 import { AiGeneratePanel } from "./AiGeneratePanel";
+import { StageSelector } from "./StageSelector";
 import { GenerateFromStatesModal } from "./GenerateFromStatesModal";
 import { AddStateStepsModal } from "./AddStateStepsModal";
 import { PromptTemplateEditor } from "./PromptTemplateEditor";
@@ -700,11 +703,13 @@ function WorkflowBuilderContent({
     moveStep,
     selectStep,
     getSelectedStep,
+    updateStep,
     showAddDropdown: _showAddDropdown,
     resetToNew,
     saveWorkflow,
     loadWorkflow,
     updateWorkflow,
+    getActiveSteps,
   } = useWorkflowBuilder();
 
   const selectedStep = getSelectedStep();
@@ -736,6 +741,10 @@ function WorkflowBuilderContent({
   // MCP server tool picker state
   const [mcpPickerOpen, setMcpPickerOpen] = useState(false);
   const [mcpPickerPhase, setMcpPickerPhase] = useState<WorkflowPhase>("setup");
+
+  // Workflow library picker state
+  const [workflowPickerOpen, setWorkflowPickerOpen] = useState(false);
+  const [workflowPickerPhase, setWorkflowPickerPhase] = useState<WorkflowPhase>("setup");
 
   // AI generate workflow modal state
   const [aiGenerateModalOpen, setAiGenerateModalOpen] = useState(false);
@@ -1339,6 +1348,43 @@ function WorkflowBuilderContent({
     [addStep],
   );
 
+  // Handler to open the workflow library picker
+  const handleOpenWorkflowPicker = useCallback((phase: WorkflowPhase) => {
+    setWorkflowPickerPhase(phase);
+    setWorkflowPickerOpen(true);
+  }, []);
+
+  // Handler for when a workflow is selected from the picker
+  const handleWorkflowSelected = useCallback(
+    (workflow: UnifiedWorkflow, phase: WorkflowPhase) => {
+      // If a workflow step is already selected, update it instead of adding a new one
+      const selected = getSelectedStep();
+      if (selected && selected.type === "workflow") {
+        const updatedStep = {
+          ...selected,
+          name: workflow.name,
+          workflow_id: workflow.id,
+          workflow_name: workflow.name,
+        } as UnifiedStep;
+        // Find the phase from the step itself
+        const stepPhase = (selected as WorkflowStep).phase as WorkflowPhase;
+        updateStep(updatedStep, stepPhase);
+      } else {
+        const step: WorkflowStep = {
+          id: generateStepId(),
+          type: "workflow",
+          phase: phase as "setup" | "verification" | "completion",
+          name: workflow.name,
+          workflow_id: workflow.id,
+          workflow_name: workflow.name,
+        };
+        addStep(step as UnifiedStep, phase);
+      }
+      setWorkflowPickerOpen(false);
+    },
+    [addStep, getSelectedStep, updateStep],
+  );
+
   // Handler for when an AI-generated workflow is ready to load
   const handleAiWorkflowGenerated = useCallback(
     (workflow: UnifiedWorkflow) => {
@@ -1697,18 +1743,19 @@ function WorkflowBuilderContent({
             <div
               className={`flex-1 overflow-y-auto p-4 ${selectedStep ? "border-r border-zinc-700" : ""}`}
             >
+              <StageSelector />
               <div className="space-y-4 max-w-3xl mx-auto">
                 {/* Setup Phase */}
                 <PhaseSection
                   phase="setup"
-                  steps={state.workflow.setup_steps}
+                  steps={getActiveSteps("setup")}
                   onAddStep={handleAddStep}
                   renderStep={(step, index, isSelectionMode, isSelectedForDelete, onToggleSelect) =>
                     renderStep(
                       step,
                       index,
                       "setup",
-                      state.workflow.setup_steps,
+                      getActiveSteps("setup"),
                       isSelectionMode,
                       isSelectedForDelete,
                       onToggleSelect,
@@ -1719,7 +1766,7 @@ function WorkflowBuilderContent({
                 {/* Verification Phase */}
                 <PhaseSection
                   phase="verification"
-                  steps={state.workflow.verification_steps}
+                  steps={getActiveSteps("verification")}
                   onAddStep={handleAddStep}
                   headerActions={null}
                   renderStep={(step, index, isSelectionMode, isSelectedForDelete, onToggleSelect) =>
@@ -1727,7 +1774,7 @@ function WorkflowBuilderContent({
                       step,
                       index,
                       "verification",
-                      state.workflow.verification_steps,
+                      getActiveSteps("verification"),
                       isSelectionMode,
                       isSelectedForDelete,
                       onToggleSelect,
@@ -1738,14 +1785,14 @@ function WorkflowBuilderContent({
                 {/* Agentic Phase */}
                 <PhaseSection
                   phase="agentic"
-                  steps={state.workflow.agentic_steps}
+                  steps={getActiveSteps("agentic")}
                   onAddStep={handleAddStep}
                   renderStep={(step, index, isSelectionMode, isSelectedForDelete, onToggleSelect) =>
                     renderStep(
                       step,
                       index,
                       "agentic",
-                      state.workflow.agentic_steps,
+                      getActiveSteps("agentic"),
                       isSelectionMode,
                       isSelectedForDelete,
                       onToggleSelect,
@@ -1756,14 +1803,14 @@ function WorkflowBuilderContent({
                 {/* Completion Phase */}
                 <PhaseSection
                   phase="completion"
-                  steps={state.workflow.completion_steps ?? []}
+                  steps={getActiveSteps("completion")}
                   onAddStep={handleAddStep}
                   renderStep={(step, index, isSelectionMode, isSelectedForDelete, onToggleSelect) =>
                     renderStep(
                       step,
                       index,
                       "completion",
-                      state.workflow.completion_steps ?? [],
+                      getActiveSteps("completion"),
                       isSelectionMode,
                       isSelectedForDelete,
                       onToggleSelect,
@@ -1789,12 +1836,7 @@ function WorkflowBuilderContent({
                       onAddStep={handleStepAdded}
                       isOpen={dropdownOpen}
                       onClose={() => setDropdownOpen(false)}
-                      onOpenPromptLibrary={handleOpenPromptLibrary}
-                      onOpenShellCommandLibrary={handleOpenShellCommandLibrary}
-                      onOpenCheckLibrary={handleOpenCheckLibrary}
-                      onOpenCheckGroupLibrary={handleOpenCheckGroupLibrary}
-                      onOpenTestLibrary={handleOpenTestLibrary}
-                      onOpenMcpServerToolPicker={handleOpenMcpServerToolPicker}
+                      onOpenWorkflowPicker={handleOpenWorkflowPicker}
                     />
                   </div>
                 </div>
@@ -1846,6 +1888,15 @@ function WorkflowBuilderContent({
                 onClose={() => setMcpPickerOpen(false)}
                 onSelect={handleMcpToolSelected}
                 phase={mcpPickerPhase}
+              />
+
+              {/* Workflow Library Picker */}
+              <WorkflowLibraryPicker
+                isOpen={workflowPickerOpen}
+                onClose={() => setWorkflowPickerOpen(false)}
+                onSelect={handleWorkflowSelected}
+                phase={workflowPickerPhase}
+                excludeWorkflowId={state.workflow.id}
               />
 
               {/* AI Generate Workflow Modal */}
@@ -1907,7 +1958,16 @@ function WorkflowBuilderContent({
           {/* Right: Step Configuration Panel */}
           {selectedStep && (
             <div className="w-96 flex-shrink-0">
-              <StepConfigPanel onClose={() => selectStep(null)} />
+              <StepConfigPanel
+                onClose={() => selectStep(null)}
+                onOpenWorkflowPicker={() => {
+                  // Determine the phase of the currently selected step
+                  const step = getSelectedStep();
+                  if (step && "phase" in step) {
+                    handleOpenWorkflowPicker(step.phase as WorkflowPhase);
+                  }
+                }}
+              />
             </div>
           )}
         </div>

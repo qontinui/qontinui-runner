@@ -313,7 +313,7 @@ impl LoopController {
                 // iteration is 1-indexed, starting_iteration is 0-indexed (number of completed iterations)
                 (true, iteration.saturating_sub(1), false, false)
             }
-            ResumePoint::AgenticPhase { iteration } => {
+            ResumePoint::AgenticPhase { iteration, .. } => {
                 // Skip setup, run agentic phase first, then continue verification loop
                 // The agentic phase is at the given iteration, so we'll run it and then
                 // continue with verification at iteration + 1
@@ -322,6 +322,11 @@ impl LoopController {
             ResumePoint::CompletionPhase { .. } => {
                 // Skip directly to completion - verification already passed
                 (true, 0, false, true)
+            }
+            ResumePoint::StageStart { .. } => {
+                // Multi-stage resume: skip to the correct stage in run_multi_stage
+                // Don't skip setup/verification here; run_multi_stage handles stage skipping
+                (false, 0, false, false)
             }
         };
 
@@ -382,6 +387,26 @@ impl LoopController {
                     e
                 );
             }
+        }
+
+        // =====================================================================
+        // MULTI-STAGE EXECUTION (if stages are defined)
+        // =====================================================================
+        // When a workflow has stages, each stage runs its own
+        // setup → verification-agentic loop → stage completion cycle.
+        // After all stages, the top-level completion phase runs.
+        if !config.stages.is_empty() {
+            return self
+                .run_multi_stage(
+                    config,
+                    all_step_results,
+                    transitions,
+                    current_stage,
+                    &logger,
+                    start,
+                    &resume_point,
+                )
+                .await;
         }
 
         // =====================================================================
@@ -1006,6 +1031,430 @@ impl LoopController {
             step_results: all_step_results,
             duration_ms: start.elapsed().as_millis() as u64,
             loop_result: Some(loop_result),
+        }
+    }
+
+    /// Run a multi-stage workflow where each stage has its own
+    /// setup → verification-agentic loop → stage completion cycle.
+    ///
+    /// After all stages complete, the top-level completion phase runs.
+    /// Context accumulates across stages: each stage's output is visible to later stages.
+    async fn run_multi_stage(
+        &mut self,
+        config: LoopConfig,
+        mut all_step_results: Vec<crate::step_executor::StepExecutionResult>,
+        mut transitions: Vec<StageTransition>,
+        mut current_stage: String,
+        logger: &StepEventLogger,
+        start: std::time::Instant,
+        resume_point: &ResumePoint,
+    ) -> WorkflowResult {
+        let total_stages = config.stages.len();
+
+        // Determine which stage to start from based on resume point
+        let start_from_stage = match resume_point {
+            ResumePoint::StageStart { from_stage } => *from_stage as usize,
+            ResumePoint::VerificationPhase {
+                stage_index: Some(si),
+                ..
+            } => *si as usize,
+            ResumePoint::AgenticPhase {
+                stage_index: Some(si),
+                ..
+            } => *si as usize,
+            ResumePoint::SetupPhase {
+                stage_index: Some(si),
+                ..
+            } => *si as usize,
+            _ => 0,
+        };
+
+        if start_from_stage > 0 {
+            info!(
+                "=== MULTI-STAGE WORKFLOW: {} stages, stop_on_failure={}, RESUMING from stage {} ===",
+                total_stages, config.stop_on_failure, start_from_stage
+            );
+        } else {
+            info!(
+                "=== MULTI-STAGE WORKFLOW: {} stages, stop_on_failure={} ===",
+                total_stages, config.stop_on_failure
+            );
+        }
+
+        let mut any_stage_passed = false;
+        let mut last_loop_result: Option<LoopResult> = None;
+
+        for (stage_idx, stage) in config.stages.iter().enumerate() {
+            // Skip stages that have already completed (resume support)
+            if stage_idx < start_from_stage {
+                info!(
+                    "  Skipping stage {}/{} (already completed before resume)",
+                    stage_idx + 1,
+                    total_stages
+                );
+                continue;
+            }
+            let stage_num = stage_idx + 1;
+
+            // Check for external stop
+            if self.is_task_stopped(&config.execution_id) {
+                warn!("Task stopped before stage {}/{}", stage_num, total_stages);
+                self.persist_workflow_state(
+                    &config.execution_id,
+                    &UnifiedWorkflowState::stopped_in_phase("stage", Some(stage_idx as u32)),
+                );
+                return WorkflowResult {
+                    success: false,
+                    verification_passed: false,
+                    step_results: all_step_results,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    loop_result: last_loop_result,
+                };
+            }
+
+            // Append stage header to output
+            let separator = "=".repeat(60);
+            let stage_header = format!(
+                "\n\n{}\n=== STAGE {}/{}: \"{}\" ===\n{}\n",
+                separator, stage_num, total_stages, stage.name, separator
+            );
+            let _ = self.checkpoint_db.append_task_output_ex(
+                &config.execution_id,
+                &stage_header,
+                false,
+                false,
+            );
+
+            info!(
+                "=== STAGE {}/{}: {} (id: {}) ===",
+                stage_num, total_stages, stage.name, stage.id
+            );
+
+            // ─── Stage Setup ───
+            if !stage.setup_automation_steps.is_empty() || !stage.setup_prompt_steps.is_empty() {
+                info!("  Stage {}: Running setup", stage_num);
+                self.persist_workflow_state(
+                    &config.execution_id,
+                    &UnifiedWorkflowState::setup_running(),
+                );
+                self.record_stage_transition(
+                    &config.execution_id,
+                    &mut transitions,
+                    &mut current_stage,
+                    &format!("stage_{}_setup", stage_num),
+                    0,
+                );
+
+                let (setup_ok, setup_results) = self
+                    .setup_executor
+                    .run_setup(
+                        &stage.setup_automation_steps,
+                        &stage.setup_prompt_steps,
+                        &config.execution_id,
+                        &format!(
+                            "{} > Stage {}: {}",
+                            config.workflow_name, stage_num, stage.name
+                        ),
+                        logger,
+                    )
+                    .await;
+
+                // Log setup output
+                {
+                    let mut output = format!(
+                        "\n--- Stage {} Setup ---\nSteps: {}\nSuccess: {}\n",
+                        stage_num,
+                        setup_results.len(),
+                        setup_ok,
+                    );
+                    for sr in &setup_results {
+                        output.push_str(&format!(
+                            "  [{}] {} - {} ({}ms)\n",
+                            if sr.success { "OK" } else { "FAIL" },
+                            sr.step_type,
+                            sr.step_name,
+                            sr.duration_ms,
+                        ));
+                    }
+                    let _ = self.checkpoint_db.append_task_output_ex(
+                        &config.execution_id,
+                        &output,
+                        false,
+                        false,
+                    );
+                }
+
+                all_step_results.extend(setup_results);
+
+                if !setup_ok {
+                    warn!("Stage {} setup failed", stage_num);
+                    if config.stop_on_failure {
+                        error!("stop_on_failure=true, aborting workflow");
+                        self.persist_workflow_state(
+                            &config.execution_id,
+                            &UnifiedWorkflowState::failed_in_phase(
+                                format!("Stage {} setup failed", stage_num),
+                                "setup",
+                                None,
+                            ),
+                        );
+                        self.mark_task_failed(
+                            &config.execution_id,
+                            &format!("Stage {} setup failed", stage_num),
+                        )
+                        .await;
+                        return WorkflowResult {
+                            success: false,
+                            verification_passed: false,
+                            step_results: all_step_results,
+                            duration_ms: start.elapsed().as_millis() as u64,
+                            loop_result: last_loop_result,
+                        };
+                    }
+                    // stop_on_failure=false: skip to next stage
+                    info!("stop_on_failure=false, continuing to next stage");
+                    self.persist_workflow_state(
+                        &config.execution_id,
+                        &UnifiedWorkflowState::stage_complete(stage_idx as u32),
+                    );
+                    continue;
+                }
+            }
+
+            // ─── Stage Verification-Agentic Loop ───
+            let has_agentic = !stage.agentic_steps.is_empty();
+            if !stage.verification_steps.is_empty() || has_agentic {
+                info!(
+                    "  Stage {}: Running verification-agentic loop (max_iterations={})",
+                    stage_num, stage.max_iterations
+                );
+
+                // Build a per-stage LoopConfig with provider/model overrides from stage config.
+                // If resuming into this specific stage, set starting_iteration from the resume point.
+                let (stage_starting_iter, stage_agentic_first) = if stage_idx == start_from_stage {
+                    match resume_point {
+                        ResumePoint::VerificationPhase { iteration, .. } => {
+                            (iteration.saturating_sub(1), false)
+                        }
+                        ResumePoint::AgenticPhase { iteration, .. } => {
+                            (iteration.saturating_sub(1), true)
+                        }
+                        _ => (0, false),
+                    }
+                } else {
+                    (0, false)
+                };
+                let stage_loop_config = LoopConfig {
+                    max_iterations: stage.max_iterations,
+                    base_prompt: config.base_prompt.clone(),
+                    workflow_name: format!(
+                        "{} > Stage {}: {}",
+                        config.workflow_name, stage_num, stage.name
+                    ),
+                    workflow_id: config.workflow_id.clone(),
+                    execution_id: config.execution_id.clone(),
+                    targeted_error_ids: config.targeted_error_ids.clone(),
+                    starting_iteration: stage_starting_iter,
+                    run_agentic_first: stage_agentic_first,
+                    artifact_dir: config.artifact_dir.clone(),
+                    is_dev_mode: config.is_dev_mode,
+                    enable_sweep: false, // Sweep only at workflow level
+                    max_sweep_iterations: 0,
+                    stages: Vec::new(), // No nested stages
+                    stop_on_failure: config.stop_on_failure,
+                    provider_override: stage.provider.clone(),
+                    model_override: stage.model.clone(),
+                    stage_index: Some(stage_idx as u32),
+                };
+
+                self.record_stage_transition(
+                    &config.execution_id,
+                    &mut transitions,
+                    &mut current_stage,
+                    &format!("stage_{}_verification", stage_num),
+                    0,
+                );
+
+                let loop_result = self
+                    .run_verification_agentic_loop(
+                        &stage_loop_config,
+                        &stage.verification_steps,
+                        has_agentic,
+                        &stage.agentic_steps,
+                        &mut all_step_results,
+                        &mut transitions,
+                        &mut current_stage,
+                        logger,
+                        Vec::new(),
+                    )
+                    .await;
+
+                info!(
+                    "  Stage {}: Loop result: {}",
+                    stage_num,
+                    loop_result.summary()
+                );
+
+                if loop_result.verification_passed {
+                    any_stage_passed = true;
+                }
+
+                // Run per-stage completion steps if verification passed
+                if loop_result.should_run_completion()
+                    && (!stage.completion_automation_steps.is_empty()
+                        || !stage.completion_prompt_steps.is_empty())
+                {
+                    info!("  Stage {}: Running completion", stage_num);
+                    let (_, completion_results) = self
+                        .completion_executor
+                        .run_completion(
+                            &stage.completion_automation_steps,
+                            &stage.completion_prompt_steps,
+                            &config.execution_id,
+                            &format!(
+                                "{} > Stage {}: {}",
+                                config.workflow_name, stage_num, stage.name
+                            ),
+                            loop_result.iterations_run,
+                            logger,
+                        )
+                        .await;
+                    all_step_results.extend(completion_results);
+                }
+
+                if !loop_result.verification_passed && config.stop_on_failure {
+                    warn!(
+                        "Stage {} verification failed and stop_on_failure=true",
+                        stage_num
+                    );
+                    self.persist_workflow_state(
+                        &config.execution_id,
+                        &UnifiedWorkflowState::failed_in_phase(
+                            format!("Stage {} verification failed", stage_num),
+                            "verification",
+                            Some(loop_result.iterations_run),
+                        ),
+                    );
+                    self.mark_task_failed(
+                        &config.execution_id,
+                        &format!(
+                            "Stage {} verification failed after {} iterations",
+                            stage_num, loop_result.iterations_run
+                        ),
+                    )
+                    .await;
+                    return WorkflowResult {
+                        success: false,
+                        verification_passed: false,
+                        step_results: all_step_results,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                        loop_result: Some(loop_result),
+                    };
+                }
+
+                last_loop_result = Some(loop_result);
+            }
+
+            // Mark stage as complete
+            self.persist_workflow_state(
+                &config.execution_id,
+                &UnifiedWorkflowState::stage_complete(stage_idx as u32),
+            );
+
+            info!("  Stage {}/{} complete", stage_num, total_stages);
+        }
+
+        // ─── Workflow-level Completion ───
+        // Run top-level completion steps (from the workflow, not from stages)
+        // Use the last loop result for determining success
+        let overall_passed = any_stage_passed || !config.stop_on_failure;
+
+        if overall_passed {
+            info!(
+                "=== MULTI-STAGE WORKFLOW: All stages processed, running workflow completion ==="
+            );
+            self.persist_workflow_state(
+                &config.execution_id,
+                &UnifiedWorkflowState::completion_running(),
+            );
+            self.record_stage_transition(
+                &config.execution_id,
+                &mut transitions,
+                &mut current_stage,
+                "completion",
+                0,
+            );
+
+            // Note: Top-level completion steps are not passed to run_multi_stage.
+            // They should be handled at the top-level run() call.
+            // For multi-stage workflows, the top-level steps arrays are typically empty
+            // (all content is in stages). Mark as complete.
+
+            self.persist_workflow_state(
+                &config.execution_id,
+                &UnifiedWorkflowState::completion_complete(),
+            );
+            self.mark_task_completed(&config.execution_id, Some(&config.workflow_id))
+                .await;
+
+            // Resolve targeted errors on successful completion
+            if any_stage_passed && !config.targeted_error_ids.is_empty() {
+                self.resolve_targeted_errors(&config.execution_id, &config.targeted_error_ids)
+                    .await;
+            }
+
+            // Fire-and-forget summary generation
+            let db = self.checkpoint_db.clone();
+            let exec_id = config.execution_id.clone();
+            let doctor_handle = self.doctor_handle.clone();
+            tokio::spawn(async move {
+                match generate_task_summary_async(db, exec_id.clone(), doctor_handle).await {
+                    Ok(_) => info!(
+                        "Generated summary for completed multi-stage task {}",
+                        exec_id
+                    ),
+                    Err(e) => warn!(
+                        "Failed to generate summary for multi-stage task {}: {}",
+                        exec_id, e
+                    ),
+                }
+            });
+
+            info!("=== MULTI-STAGE WORKFLOW COMPLETED ===");
+        } else {
+            info!("=== MULTI-STAGE WORKFLOW: No stages passed verification ===");
+            self.persist_workflow_state(
+                &config.execution_id,
+                &UnifiedWorkflowState::failed_in_phase(
+                    "No stages passed verification",
+                    "verification",
+                    None,
+                ),
+            );
+            self.mark_task_failed(&config.execution_id, "No stages passed verification")
+                .await;
+
+            // Fire-and-forget summary generation for failed task
+            let db = self.checkpoint_db.clone();
+            let exec_id = config.execution_id.clone();
+            let doctor_handle = self.doctor_handle.clone();
+            tokio::spawn(async move {
+                match generate_task_summary_async(db, exec_id.clone(), doctor_handle).await {
+                    Ok(_) => info!("Generated summary for failed multi-stage task {}", exec_id),
+                    Err(e) => warn!(
+                        "Failed to generate summary for failed multi-stage task {}: {}",
+                        exec_id, e
+                    ),
+                }
+            });
+        }
+
+        WorkflowResult {
+            success: any_stage_passed,
+            verification_passed: any_stage_passed,
+            step_results: all_step_results,
+            duration_ms: start.elapsed().as_millis() as u64,
+            loop_result: last_loop_result,
         }
     }
 
@@ -1715,7 +2164,7 @@ impl LoopController {
     ///
     /// This allows the loop to gracefully abort when the user clicks the Stop button.
     fn is_task_stopped(&self, execution_id: &str) -> bool {
-        // For workflow sequence children (e.g., workflow-sequence-X-workflow-N),
+        // For composed run children (e.g., composed-run-X-workflow-N),
         // check the parent task instead since children don't have their own task_run records
         let task_id_to_check = get_parent_task_id(execution_id);
 
@@ -1767,11 +2216,11 @@ impl LoopController {
     /// After successful persistence, broadcasts an `orchestrator-state-change` event
     /// to both Tauri frontend and WebSocket clients in real-time.
     ///
-    /// For workflow sequence children (e.g., workflow-sequence-X-workflow-N),
-    /// state is persisted under the parent sequence ID since children don't have
+    /// For composed run children (e.g., composed-run-X-workflow-N),
+    /// state is persisted under the parent composed run ID since children don't have
     /// their own task_run records.
     fn persist_workflow_state(&self, execution_id: &str, state: &UnifiedWorkflowState) {
-        // For workflow sequence children (e.g., workflow-sequence-X-workflow-N),
+        // For composed run children (e.g., composed-run-X-workflow-N),
         // persist under the parent ID since children don't have their own task_run records.
         let persist_id = get_parent_task_id(execution_id);
 
@@ -2261,6 +2710,11 @@ pub async fn resume_interrupted_workflows(
                                 is_dev_mode: cfg!(debug_assertions),
                                 enable_sweep: workflow.enable_sweep,
                                 max_sweep_iterations: workflow.max_sweep_iterations,
+                                stages: Vec::new(),
+                                stop_on_failure: false,
+                                provider_override: None,
+                                model_override: None,
+                                stage_index: None,
                             };
 
                             controller
@@ -2292,7 +2746,7 @@ pub async fn resume_interrupted_workflows(
                 }
             }
         } else if let Some(ref wf_name) = task_run.workflow_name {
-            // New format: workflow-sequence-{timestamp} or workflow-sequence-{timestamp}-workflow-{n}
+            // New format: composed-run-{timestamp} or composed-run-{timestamp}-workflow-{n}
             // Look up workflow by name instead
             info!(
                 "Looking up workflow by name '{}' for task_id: {}",
@@ -2405,6 +2859,11 @@ pub async fn resume_interrupted_workflows(
                                 is_dev_mode: cfg!(debug_assertions),
                                 enable_sweep: workflow.enable_sweep,
                                 max_sweep_iterations: workflow.max_sweep_iterations,
+                                stages: Vec::new(),
+                                stop_on_failure: false,
+                                provider_override: None,
+                                model_override: None,
+                                stage_index: None,
                             };
 
                             controller

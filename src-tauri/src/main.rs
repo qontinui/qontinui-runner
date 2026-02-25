@@ -49,7 +49,6 @@ mod mcp_client;
 mod mcp_embedded;
 mod orchestrator;
 mod paths;
-mod plan_executor;
 mod playwright;
 mod prompt_snippets;
 mod prompts;

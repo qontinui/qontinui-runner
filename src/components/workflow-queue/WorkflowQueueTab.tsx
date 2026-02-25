@@ -175,7 +175,7 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
 
     setIsExecuting(true);
     try {
-      const response = await fetch(`${API_BASE}/unified-workflows/run-sequence`, {
+      const response = await fetch(`${API_BASE}/unified-workflows/run-composed`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -186,10 +186,10 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
 
       const result = await response.json();
       if (result.success) {
-        onLog?.("success", `Started workflow sequence: ${queue.length} workflows`);
+        onLog?.("success", `Started composed workflow: ${queue.length} stages`);
         onNavigateToActive();
       } else {
-        throw new Error(result.error || "Failed to start sequence");
+        throw new Error(result.error || "Failed to start composed workflow");
       }
     } catch (error) {
       onLog?.("error", `Failed to execute queue: ${error}`);

@@ -500,6 +500,19 @@ pub struct ExecutionStepConfig {
     pub artifact_input_path: Option<String>,
 
     // ========================================================================
+    // Workflow Step Fields (for "workflow" step type — run a saved workflow inline)
+    // ========================================================================
+    /// ID of the referenced workflow to execute inline.
+    #[serde(alias = "workflowId", alias = "workflow_id")]
+    pub ref_workflow_id: Option<String>,
+
+    /// Cached display name of the referenced workflow.
+    /// Note: `workflow_name` alias already claimed by `ci_cd_workflow_name`,
+    /// so the handler reads the name from the loaded workflow instead.
+    #[serde(alias = "refWorkflowName")]
+    pub ref_workflow_name: Option<String>,
+
+    // ========================================================================
     // Console Error Handling
     // ========================================================================
     /// If true, step fails when console errors are captured during execution
@@ -1392,6 +1405,8 @@ pub struct StepExecutor {
     shared_variables: SharedVariableStore,
     /// Registry of step handlers for polymorphic dispatch
     handler_registry: HandlerRegistry,
+    /// PID tracker for AI process management (passed to WorkflowStepHandler)
+    pid_tracker: Option<Arc<std::sync::Mutex<Vec<u32>>>>,
 }
 
 impl StepExecutor {
@@ -1406,6 +1421,7 @@ impl StepExecutor {
             runtime_context: RuntimeContext::new(),
             shared_variables: SharedVariableStore::new(),
             handler_registry: HandlerRegistry::with_standard_handlers(),
+            pid_tracker: None,
         }
     }
 
@@ -1424,6 +1440,7 @@ impl StepExecutor {
             runtime_context: RuntimeContext::new(),
             shared_variables: SharedVariableStore::new(),
             handler_registry: HandlerRegistry::with_standard_handlers(),
+            pid_tracker: None,
         }
     }
 
@@ -1478,6 +1495,7 @@ impl StepExecutor {
             self.runtime_context.clone(),
             self.shared_variables.clone(),
             self.task_run_id.clone(),
+            self.pid_tracker.clone(),
         )
     }
 
@@ -1543,7 +1561,7 @@ impl StepExecutor {
     ///
     /// This logs step start, complete, and error events to the task_run_events table.
     ///
-    /// Note: For workflow sequence children (e.g., workflow-sequence-X-workflow-N),
+    /// Note: For composed run children (e.g., composed-run-X-workflow-N),
     /// the task_run_id is automatically remapped to the parent task ID because
     /// only parent IDs exist in task_runs (required by foreign key constraint).
     fn log_step_event(

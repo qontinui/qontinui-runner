@@ -22,6 +22,8 @@ pub enum ResumePoint {
     SetupPhase {
         /// Step index to resume from (0-indexed).
         from_step: usize,
+        /// Stage index for multi-stage workflows (None = single-stage).
+        stage_index: Option<u32>,
     },
 
     /// Resume from verification phase at a specific iteration and step.
@@ -30,18 +32,29 @@ pub enum ResumePoint {
         iteration: u32,
         /// Step index to resume from within the iteration.
         from_step: usize,
+        /// Stage index for multi-stage workflows (None = single-stage).
+        stage_index: Option<u32>,
     },
 
     /// Resume from agentic phase at a specific iteration.
     AgenticPhase {
         /// Iteration number (1-indexed).
         iteration: u32,
+        /// Stage index for multi-stage workflows (None = single-stage).
+        stage_index: Option<u32>,
     },
 
     /// Resume from completion phase at a specific step.
     CompletionPhase {
         /// Step index to resume from.
         from_step: usize,
+    },
+
+    /// Resume from a specific stage in a multi-stage workflow.
+    /// All stages before `from_stage` are skipped.
+    StageStart {
+        /// Stage index to resume from (0-indexed).
+        from_stage: u32,
     },
 }
 
@@ -50,23 +63,48 @@ impl ResumePoint {
     pub fn description(&self) -> String {
         match self {
             ResumePoint::FromStart => "from start".to_string(),
-            ResumePoint::SetupPhase { from_step } => {
-                format!("from setup phase, step {}", from_step)
+            ResumePoint::SetupPhase {
+                from_step,
+                stage_index,
+            } => {
+                if let Some(si) = stage_index {
+                    format!("from setup phase, step {}, stage {}", from_step, si)
+                } else {
+                    format!("from setup phase, step {}", from_step)
+                }
             }
             ResumePoint::VerificationPhase {
                 iteration,
                 from_step,
+                stage_index,
             } => {
-                format!(
-                    "from verification phase, iteration {}, step {}",
-                    iteration, from_step
-                )
+                if let Some(si) = stage_index {
+                    format!(
+                        "from verification phase, iteration {}, step {}, stage {}",
+                        iteration, from_step, si
+                    )
+                } else {
+                    format!(
+                        "from verification phase, iteration {}, step {}",
+                        iteration, from_step
+                    )
+                }
             }
-            ResumePoint::AgenticPhase { iteration } => {
-                format!("from agentic phase, iteration {}", iteration)
+            ResumePoint::AgenticPhase {
+                iteration,
+                stage_index,
+            } => {
+                if let Some(si) = stage_index {
+                    format!("from agentic phase, iteration {}, stage {}", iteration, si)
+                } else {
+                    format!("from agentic phase, iteration {}", iteration)
+                }
             }
             ResumePoint::CompletionPhase { from_step } => {
                 format!("from completion phase, step {}", from_step)
+            }
+            ResumePoint::StageStart { from_stage } => {
+                format!("from stage {} start", from_stage)
             }
         }
     }
@@ -129,6 +167,7 @@ impl ResumeManager {
                     state_name = %s.state_name,
                     phase = ?s.phase,
                     iteration = ?s.iteration,
+                    state_data = ?s.state_data,
                     "Found saved workflow state"
                 );
 
@@ -138,6 +177,7 @@ impl ResumeManager {
                     s.phase.as_deref(),
                     s.iteration,
                     execution_id,
+                    s.state_data.as_deref(),
                 )
             }
             None => {
@@ -158,7 +198,17 @@ impl ResumeManager {
         _phase: Option<&str>,
         iteration: Option<u32>,
         execution_id: &str,
+        state_data: Option<&str>,
     ) -> Result<ResumePoint, String> {
+        // Extract stage_index from state_data JSON if present.
+        // state_data is the full serialized UnifiedWorkflowState, e.g.:
+        // {"type":"verification_running","iteration":2,"stage_index":1}
+        let stage_index = state_data.and_then(|data| {
+            serde_json::from_str::<serde_json::Value>(data)
+                .ok()
+                .and_then(|v| v.get("stage_index")?.as_u64().map(|n| n as u32))
+        });
+
         match state_name {
             "created" => {
                 // Not started yet
@@ -170,6 +220,7 @@ impl ResumeManager {
                 let completed_count = self.count_completed_steps(execution_id, "setup", None)?;
                 Ok(ResumePoint::SetupPhase {
                     from_step: completed_count,
+                    stage_index,
                 })
             }
 
@@ -178,6 +229,7 @@ impl ResumeManager {
                 Ok(ResumePoint::VerificationPhase {
                     iteration: 1,
                     from_step: 0,
+                    stage_index,
                 })
             }
 
@@ -188,20 +240,24 @@ impl ResumeManager {
                 Ok(ResumePoint::VerificationPhase {
                     iteration: iter,
                     from_step: completed_count,
+                    stage_index,
                 })
             }
 
             "verification_complete" => {
-                // Check if verification passed - if so, we might need to go to completion
-                // For now, assume we need to continue to agentic or completion based on pass status
-                // The loop controller will handle this logic
                 let iter = iteration.unwrap_or(1);
-                Ok(ResumePoint::AgenticPhase { iteration: iter })
+                Ok(ResumePoint::AgenticPhase {
+                    iteration: iter,
+                    stage_index,
+                })
             }
 
             "agentic_running" => {
                 let iter = iteration.unwrap_or(1);
-                Ok(ResumePoint::AgenticPhase { iteration: iter })
+                Ok(ResumePoint::AgenticPhase {
+                    iteration: iter,
+                    stage_index,
+                })
             }
 
             "agentic_complete" => {
@@ -210,6 +266,7 @@ impl ResumeManager {
                 Ok(ResumePoint::VerificationPhase {
                     iteration: iter + 1,
                     from_step: 0,
+                    stage_index,
                 })
             }
 
@@ -218,6 +275,15 @@ impl ResumeManager {
                     self.count_completed_steps(execution_id, "completion", None)?;
                 Ok(ResumePoint::CompletionPhase {
                     from_step: completed_count,
+                })
+            }
+
+            "stage_complete" => {
+                // A stage completed — resume from the NEXT stage.
+                // stage_index is the index of the completed stage, so resume from stage_index + 1.
+                let completed_stage = stage_index.unwrap_or(0);
+                Ok(ResumePoint::StageStart {
+                    from_stage: completed_stage + 1,
                 })
             }
 
@@ -296,6 +362,7 @@ impl ResumeManager {
                     Ok(ResumePoint::VerificationPhase {
                         iteration: 1,
                         from_step: 0,
+                        stage_index: None,
                     })
                 } else {
                     // No sessions run yet
@@ -356,34 +423,61 @@ mod tests {
     fn test_resume_point_description() {
         assert_eq!(ResumePoint::FromStart.description(), "from start");
         assert_eq!(
-            ResumePoint::SetupPhase { from_step: 2 }.description(),
+            ResumePoint::SetupPhase {
+                from_step: 2,
+                stage_index: None
+            }
+            .description(),
             "from setup phase, step 2"
         );
         assert_eq!(
             ResumePoint::VerificationPhase {
                 iteration: 3,
-                from_step: 1
+                from_step: 1,
+                stage_index: None,
             }
             .description(),
             "from verification phase, iteration 3, step 1"
         );
         assert_eq!(
-            ResumePoint::AgenticPhase { iteration: 2 }.description(),
+            ResumePoint::VerificationPhase {
+                iteration: 2,
+                from_step: 0,
+                stage_index: Some(1),
+            }
+            .description(),
+            "from verification phase, iteration 2, step 0, stage 1"
+        );
+        assert_eq!(
+            ResumePoint::AgenticPhase {
+                iteration: 2,
+                stage_index: None
+            }
+            .description(),
             "from agentic phase, iteration 2"
         );
         assert_eq!(
             ResumePoint::CompletionPhase { from_step: 0 }.description(),
             "from completion phase, step 0"
         );
+        assert_eq!(
+            ResumePoint::StageStart { from_stage: 2 }.description(),
+            "from stage 2 start"
+        );
     }
 
     #[test]
     fn test_is_fresh_start() {
         assert!(ResumePoint::FromStart.is_fresh_start());
-        assert!(!ResumePoint::SetupPhase { from_step: 0 }.is_fresh_start());
+        assert!(!ResumePoint::SetupPhase {
+            from_step: 0,
+            stage_index: None
+        }
+        .is_fresh_start());
         assert!(!ResumePoint::VerificationPhase {
             iteration: 1,
-            from_step: 0
+            from_step: 0,
+            stage_index: None,
         }
         .is_fresh_start());
     }

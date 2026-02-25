@@ -15,6 +15,7 @@ import {
   CheckCircle,
   Monitor,
   Activity,
+  Workflow,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
@@ -78,6 +79,13 @@ export const STEP_ICON_CONFIG: Record<string, StepIconConfig> = {
     icon: Monitor,
     bgClass: "bg-emerald-500/10",
     textClass: "text-emerald-400",
+  },
+
+  // Workflow composition steps
+  workflow: {
+    icon: Workflow,
+    bgClass: "bg-blue-500/10",
+    textClass: "text-blue-400",
   },
 };
 

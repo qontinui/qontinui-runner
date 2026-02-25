@@ -836,6 +836,8 @@ mod tests {
             max_sweep_iterations: 5,
             generated_by_task_run_id: None,
             targeted_error_ids: vec![],
+            stages: Vec::new(),
+            stop_on_failure: false,
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -946,6 +948,8 @@ mod tests {
             max_sweep_iterations: 5,
             generated_by_task_run_id: None,
             targeted_error_ids: vec![],
+            stages: Vec::new(),
+            stop_on_failure: false,
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         }
@@ -1067,6 +1071,8 @@ mod tests {
             max_sweep_iterations: 5,
             generated_by_task_run_id: None,
             targeted_error_ids: vec![],
+            stages: Vec::new(),
+            stop_on_failure: false,
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -1134,6 +1140,8 @@ mod tests {
             max_sweep_iterations: 5,
             generated_by_task_run_id: None,
             targeted_error_ids: vec![],
+            stages: Vec::new(),
+            stop_on_failure: false,
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -1473,6 +1481,8 @@ mod tests {
             max_sweep_iterations: 5,
             generated_by_task_run_id: None,
             targeted_error_ids: vec![],
+            stages: Vec::new(),
+            stop_on_failure: false,
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };

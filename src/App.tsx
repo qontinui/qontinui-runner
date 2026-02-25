@@ -128,7 +128,6 @@ import { ActiveDashboardPage } from "./components/active-dashboard";
 import { HistoryTab } from "./components/HistoryTab";
 import { ExecuteTab } from "./components/ExecuteTab";
 import { WorkflowQueueTab } from "./components/workflow-queue";
-import { RunPlanTab } from "./components/run-plan";
 // Monitor/Observe components
 import { ExecutionReport } from "./components/findings";
 import { StateExplorerTab } from "./components/state-explorer";
@@ -142,11 +141,8 @@ import { RunImageRecognitionTab } from "./components/run-logs/RunImageRecognitio
 import { AiDataViewerTab } from "./components/run-logs/AiDataViewerTab";
 import { RunRecapTab } from "./components/run-recap";
 import { useTaskRuns } from "./hooks/useAiData";
-// Spec Discovery (formerly Live Page Generator)
-import { SpecDiscoveryTab } from "./components/spec-discovery";
 // Page Sweep builder
 import { PageSweepTab } from "./components/page-sweep";
-import type { UnifiedWorkflow } from "./types/unified-workflow";
 // Configure components
 import { ExternalLogsTab as _ExternalLogsTab } from "./components/ExternalLogsTab";
 import { CategoryManager } from "./components/findings/CategoryManager";
@@ -166,7 +162,6 @@ type LogSubTab = "general" | "image" | "actions";
 type MainTabId =
   | "gui-automation"
   | "workflow-queue"
-  | "run-plan"
   | "active"
   | "runs"
   | "history"
@@ -195,7 +190,6 @@ type MainTabId =
   | "monitor-discoveries"
   | "library"
   | "unified-workflow-builder"
-  | "spec-discovery"
   | "page-sweep"
   | "capture"
   | "config-log-sources"
@@ -222,7 +216,6 @@ type MainTabId =
 const VALID_TAB_IDS: MainTabId[] = [
   "gui-automation",
   "workflow-queue",
-  "run-plan",
   "active",
   "runs",
   "history",
@@ -251,7 +244,6 @@ const VALID_TAB_IDS: MainTabId[] = [
   "monitor-discoveries",
   "library",
   "unified-workflow-builder",
-  "spec-discovery",
   "capture",
   "config-log-sources",
   "config-findings",
@@ -298,7 +290,8 @@ function migrateTabId(stored: string | null): MainTabId {
     scheduler: "tasks",
     dataset: "capture", // Dataset is now part of capture
     extract: "capture",
-    "live-page-generator": "spec-discovery", // Renamed to Spec Discovery
+    "live-page-generator": "unified-workflow-builder", // Spec discovery now in AI Generate panel
+    "spec-discovery": "unified-workflow-builder", // Spec discovery now in AI Generate panel
     // Old observe tab migrations to new structure
     logs: "run-recap",
     "run-dashboard": "run-recap", // Dashboard merged into Summary (formerly Recap)
@@ -496,37 +489,6 @@ function AppContent() {
     completion_steps: unknown[];
     max_iterations?: number;
   } | null>(null);
-
-  // Handle applying a generated workflow from Live Page Generator
-  const handleApplyWorkflow = useCallback(async (workflow: UnifiedWorkflow) => {
-    const inlinePayload = {
-      name: workflow.name,
-      description: workflow.description || "",
-      setup_steps: workflow.setup_steps || [],
-      verification_steps: workflow.verification_steps || [],
-      agentic_steps: workflow.agentic_steps || [],
-      completion_steps: workflow.completion_steps || [],
-      max_iterations: workflow.max_iterations || 3,
-    };
-
-    // Store for re-execution via "Run Last Workflow" button
-    lastInlineWorkflowRef.current = inlinePayload;
-
-    // Fire the execute-inline request (don't await — the backend runs it synchronously,
-    // so we navigate to the Active page immediately while the workflow executes in the
-    // background HTTP request. The backend creates the task_run entry before execution
-    // starts, so the Active page's polling will detect it.)
-    fetch("http://127.0.0.1:9876/unified-workflows/execute-inline", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(inlinePayload),
-    }).catch((error) => {
-      console.error("[APP] Failed to execute workflow:", error);
-    });
-
-    // Navigate to active dashboard immediately to monitor execution
-    setActiveTab("active");
-  }, []);
 
   // State for "Run Last Workflow" button
   const [isRunningLastWorkflow, setIsRunningLastWorkflow] = useState(false);
@@ -878,17 +840,6 @@ function AppContent() {
           <WorkflowQueueTab onNavigateToActive={() => setActiveTab("active")} onLog={addLog} />
         );
 
-      case "run-plan":
-        return (
-          <RunPlanTab
-            onNavigateToActive={() => setActiveTab("active")}
-            onGoToRecap={(taskRunId) => {
-              localStorage.setItem("qontinui-selected-task-run-id", taskRunId);
-              setActiveTab("run-recap");
-            }}
-          />
-        );
-
       case "active":
         return (
           <ActiveDashboardPage
@@ -1144,17 +1095,6 @@ function AppContent() {
             <WorkflowBuilderTab
               editWorkflowId={editWorkflowId}
               onNavigateToActive={() => setActiveTab("active")}
-            />
-          </div>
-        );
-
-      case "spec-discovery":
-        return (
-          <div className="h-full overflow-hidden">
-            <SpecDiscoveryTab
-              onLog={addLog}
-              onNavigateToLibrary={() => setActiveTab("library")}
-              onApplyWorkflow={handleApplyWorkflow}
             />
           </div>
         );

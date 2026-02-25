@@ -289,6 +289,7 @@ export type {
   VerificationStep,
   AgenticStep,
   CompletionStep,
+  WorkflowStep,
   UnifiedWorkflow,
   WorkflowFeatures,
   StepTypeInfo,
@@ -302,6 +303,8 @@ export type {
   WorkflowExportManifest,
   WorkflowExport,
   WorkflowImportResult,
+  // Stage types
+  WorkflowStage,
 } from "./unified-workflow";
 
 // Re-export unified workflow types with original names for internal use

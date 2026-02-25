@@ -14,6 +14,7 @@ import {
   TestTube2,
   Monitor,
   AlertTriangle,
+  Workflow,
 } from "lucide-react";
 import type { WorkflowPhase, UnifiedStep } from "../../types";
 import { STEP_TYPES, generateStepId } from "../../types";
@@ -33,6 +34,7 @@ const STEP_ICON_MAP: Record<string, React.ElementType> = {
   Monitor,
   Bot: MessageSquare,
   AlertTriangle,
+  Workflow,
 };
 
 const COLOR_MAP: Record<string, string> = {
@@ -60,22 +62,17 @@ interface AddStepDropdownProps {
   isOpen: boolean;
   /** Called to close the dropdown */
   onClose: () => void;
-  // Legacy props - accepted but unused (kept for parent compatibility)
-  onOpenApiLibrary?: (phase: WorkflowPhase) => void;
-  onOpenCurlImport?: (phase: WorkflowPhase) => void;
-  onOpenPromptLibrary?: (phase: WorkflowPhase) => void;
-  onOpenShellCommandLibrary?: (phase: WorkflowPhase) => void;
-  onOpenCheckLibrary?: (phase: WorkflowPhase) => void;
-  onOpenCheckGroupLibrary?: (phase: WorkflowPhase) => void;
-  onOpenMacroLibrary?: (phase: WorkflowPhase) => void;
-  onOpenPlaywrightScriptLibrary?: (phase: WorkflowPhase) => void;
-  onOpenTestLibrary?: (phase: WorkflowPhase) => void;
-  onOpenWorkflowLibrary?: (phase: WorkflowPhase) => void;
-  onOpenStateLibrary?: (phase: WorkflowPhase) => void;
-  onOpenMcpServerToolPicker?: (phase: WorkflowPhase) => void;
+  /** Called when the "Workflow" step type is clicked — opens the picker */
+  onOpenWorkflowPicker?: (phase: WorkflowPhase) => void;
 }
 
-export function AddStepDropdown({ filterPhase, onAddStep, isOpen, onClose }: AddStepDropdownProps) {
+export function AddStepDropdown({
+  filterPhase,
+  onAddStep,
+  isOpen,
+  onClose,
+  onOpenWorkflowPicker,
+}: AddStepDropdownProps) {
   const dropdownRef = useRef<HTMLDivElement>(null);
 
   // Close dropdown when clicking outside
@@ -97,6 +94,13 @@ export function AddStepDropdown({ filterPhase, onAddStep, isOpen, onClose }: Add
 
   // Handle step creation
   const handleStepClick = (stepType: string) => {
+    // Workflow steps open the picker instead of creating directly
+    if (stepType === "workflow") {
+      onOpenWorkflowPicker?.(phase);
+      onClose();
+      return;
+    }
+
     const id = generateStepId();
 
     let step: UnifiedStep;

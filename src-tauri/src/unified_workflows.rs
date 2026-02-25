@@ -58,6 +58,46 @@ fn default_is_critical() -> bool {
     true
 }
 
+/// A workflow stage — a self-contained unit of execution with its own
+/// setup/verification/agentic/completion steps and verification-agentic loop.
+///
+/// Multi-stage workflows execute stages sequentially. Each stage gets its own
+/// verification-agentic loop, and later stages see full output from all prior stages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowStage {
+    /// Unique identifier (UUID v4)
+    pub id: String,
+    /// Display name for this stage
+    pub name: String,
+    /// Description of what this stage does
+    #[serde(default)]
+    pub description: String,
+    /// Setup phase steps for this stage
+    #[serde(default)]
+    pub setup_steps: Vec<Value>,
+    /// Verification phase steps for this stage
+    #[serde(default)]
+    pub verification_steps: Vec<Value>,
+    /// Agentic phase steps for this stage
+    #[serde(default)]
+    pub agentic_steps: Vec<Value>,
+    /// Completion phase steps for this stage
+    #[serde(default)]
+    pub completion_steps: Vec<Value>,
+    /// Maximum iterations for this stage's verification-agentic loop
+    #[serde(default = "default_max_iterations")]
+    pub max_iterations: u32,
+    /// Optional inactivity timeout in seconds for this stage's AI sessions
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
+    /// AI provider override for this stage
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Model override for this stage
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
 /// A unified workflow with steps organized by phase
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnifiedWorkflow {
@@ -183,6 +223,17 @@ pub struct UnifiedWorkflow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_by_task_run_id: Option<String>,
 
+    /// Optional stages for multi-stage workflows.
+    /// When non-empty, the workflow executes stages sequentially instead of using top-level steps.
+    /// Each stage has its own setup/verification/agentic/completion steps and loop.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stages: Vec<WorkflowStage>,
+
+    /// Whether to stop execution if a stage fails verification.
+    /// Default: false (autonomous mode — continue to next stage even if previous failed).
+    #[serde(default)]
+    pub stop_on_failure: bool,
+
     /// ISO 8601 timestamp of creation
     pub created_at: String,
     /// ISO 8601 timestamp of last modification (serialized as "modified_at" to match frontend)
@@ -283,6 +334,12 @@ pub struct CreateUnifiedWorkflowRequest {
     /// Task run ID that generated this workflow (for meta-workflow tracking)
     #[serde(default)]
     pub generated_by_task_run_id: Option<String>,
+    /// Optional stages for multi-stage workflows
+    #[serde(default)]
+    pub stages: Option<Vec<WorkflowStage>>,
+    /// Whether to stop execution if a stage fails verification
+    #[serde(default)]
+    pub stop_on_failure: Option<bool>,
 }
 
 /// Request body for updating a unified workflow
@@ -323,6 +380,10 @@ pub struct UpdateUnifiedWorkflowRequest {
     pub enable_sweep: Option<bool>,
     /// Maximum number of sweep iterations (default: 5)
     pub max_sweep_iterations: Option<u32>,
+    /// Optional stages for multi-stage workflows
+    pub stages: Option<Vec<WorkflowStage>>,
+    /// Whether to stop execution if a stage fails verification
+    pub stop_on_failure: Option<bool>,
 }
 
 /// Query parameters for searching unified workflows
@@ -475,4 +536,56 @@ pub fn prepend_preflight_check_step(
     let mut steps = vec![crate::step_executor::ExecutionStepConfig::default_preflight_check()];
     steps.extend(setup_steps);
     steps
+}
+
+/// Convert a `UnifiedWorkflow` into a `StageConfig` for execution.
+///
+/// This is the canonical conversion used by both:
+/// - The compose endpoint (running multiple workflows in sequence)
+/// - The WorkflowStepHandler (running a nested workflow inline)
+///
+/// Set `include_preflight` to true to prepend a preflight check step
+/// (used by the compose endpoint; nested workflows skip it since the
+/// parent workflow already ran preflight).
+pub fn workflow_to_stage_config(
+    workflow: &UnifiedWorkflow,
+    index: usize,
+    total_stages: usize,
+    include_preflight: bool,
+) -> crate::unified_workflow_executor::StageConfig {
+    use crate::unified_workflow_executor::{
+        convert_json_steps_with_phase, extract_prompt_steps_with_phase,
+    };
+
+    let setup_auto = convert_json_steps_with_phase(&workflow.setup_steps, 0, Some("setup"));
+    let setup_auto = if include_preflight {
+        prepend_preflight_check_step(setup_auto, workflow.preflight_check_enabled)
+    } else {
+        setup_auto
+    };
+    let setup_prompt = extract_prompt_steps_with_phase(&workflow.setup_steps, Some("setup"));
+    let verif =
+        convert_json_steps_with_phase(&workflow.verification_steps, 0, Some("verification"));
+    let agentic = extract_prompt_steps_with_phase(&workflow.agentic_steps, Some("agentic"));
+    let comp_auto =
+        convert_json_steps_with_phase(&workflow.completion_steps, 0, Some("completion"));
+    let comp_prompt =
+        extract_prompt_steps_with_phase(&workflow.completion_steps, Some("completion"));
+
+    crate::unified_workflow_executor::StageConfig {
+        id: workflow.id.clone(),
+        name: workflow.name.clone(),
+        index,
+        total_stages,
+        setup_automation_steps: setup_auto,
+        setup_prompt_steps: setup_prompt,
+        verification_steps: verif,
+        agentic_steps: agentic,
+        completion_automation_steps: comp_auto,
+        completion_prompt_steps: comp_prompt,
+        max_iterations: workflow.max_iterations,
+        provider: workflow.provider.clone(),
+        model: workflow.model.clone(),
+        timeout_seconds: workflow.timeout_seconds,
+    }
 }

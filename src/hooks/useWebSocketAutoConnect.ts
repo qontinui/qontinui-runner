@@ -70,6 +70,8 @@ export function useWebSocketAutoConnect({
   const userDisconnectedRef = useRef(false);
   // Track which project we've auto-connected for
   const autoConnectAttemptedRef = useRef<string | null>(null);
+  // Track when the last connect was initiated (to prevent rapid reconnection)
+  const lastConnectTimeRef = useRef<number>(0);
 
   // Load connection info when authenticated
   useEffect(() => {
@@ -112,6 +114,7 @@ export function useWebSocketAutoConnect({
 
     setConnecting(true);
     setError(null);
+    lastConnectTimeRef.current = Date.now();
 
     try {
       console.log("[WS_AUTO_CONNECT] Getting access token from AuthManager...");
@@ -224,11 +227,15 @@ export function useWebSocketAutoConnect({
       return;
     }
 
+    let cancelled = false;
+
     const sendHeartbeat = async () => {
+      if (cancelled) return;
       try {
         const response = await invoke<{ has_active_connection: boolean }>("send_device_heartbeat", {
           projectId: selectedProjectId,
         });
+        if (cancelled) return;
         console.log(
           "[WS_AUTO_CONNECT] Heartbeat sent (has_active_connection:",
           response.has_active_connection,
@@ -236,27 +243,42 @@ export function useWebSocketAutoConnect({
         );
 
         // If backend says no active connection but we think we're connected,
-        // the WebSocket has silently dropped — trigger reconnection
+        // the WebSocket has silently dropped — trigger reconnection.
+        // Only trigger if we've been connected for at least 15 seconds to avoid
+        // a race condition where the heartbeat fires before the backend has
+        // registered the WebSocket connection.
         if (!response.has_active_connection) {
-          console.warn(
-            "[WS_AUTO_CONNECT] Backend reports no active connection — triggering reconnect",
-          );
-          setConnected(false);
-          autoConnectAttemptedRef.current = null;
-          // The auto-connect effect will pick this up and call connect()
+          const timeSinceConnect = Date.now() - lastConnectTimeRef.current;
+          if (timeSinceConnect < 15000) {
+            console.log(
+              "[WS_AUTO_CONNECT] Backend reports no active connection, but connected recently (" +
+                Math.round(timeSinceConnect / 1000) +
+                "s ago) — waiting for registration",
+            );
+          } else {
+            console.warn(
+              "[WS_AUTO_CONNECT] Backend reports no active connection — triggering reconnect",
+            );
+            setConnected(false);
+            autoConnectAttemptedRef.current = null;
+            // The auto-connect effect will pick this up and call connect()
+          }
         }
       } catch (err) {
         console.error("[WS_AUTO_CONNECT] Heartbeat failed:", err);
       }
     };
 
-    // Send immediately
-    sendHeartbeat();
+    // Delay the first heartbeat by 10 seconds to allow the WebSocket connection
+    // to be fully registered on the backend before checking
+    const initialDelay = setTimeout(sendHeartbeat, 10000);
 
     // Then every 30 seconds
     const intervalId = setInterval(sendHeartbeat, 30000);
 
     return () => {
+      cancelled = true;
+      clearTimeout(initialDelay);
       clearInterval(intervalId);
     };
   }, [connected, selectedProjectId]);

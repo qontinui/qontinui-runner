@@ -119,7 +119,9 @@ interface FullStateResponse {
     updated_at: string;
     workflow_stage: string | null;
     workflow_stage_display: string | null;
+    stage_index?: number | null;
   } | null;
+  stage_names?: string[];
   checkpoints: Array<{
     id: string;
     execution_id: string;
@@ -205,6 +207,11 @@ export interface WorkflowExecutionState {
   planPhaseIndex: number | null;
   planTotalPhases: number | null;
 
+  // === Multi-Stage Workflow ===
+  currentStageIndex: number | null;
+  currentStageName: string | null;
+  totalStages: number | null;
+
   // === Metadata ===
   workflowName: string | null;
   taskName: string | null;
@@ -286,6 +293,9 @@ const DEFAULT_STATE: WorkflowExecutionState = {
   planPhaseName: null,
   planPhaseIndex: null,
   planTotalPhases: null,
+  currentStageIndex: null,
+  currentStageName: null,
+  totalStages: null,
   workflowName: null,
   taskName: null,
   stepStats: DEFAULT_STEP_STATS,
@@ -740,6 +750,13 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
         isPlan && planInner ? ((planInner.phase_index as number) ?? null) : null;
       const planTotalPhases = isPlan ? (data.task_run.max_sessions ?? null) : null;
 
+      // Extract multi-stage workflow info
+      const stageIndex = data.orchestrator_state?.stage_index ?? null;
+      const stageNames: string[] = data.stage_names ?? [];
+      const totalStages = stageNames.length > 0 ? stageNames.length : null;
+      const stageName =
+        stageIndex !== null && stageNames[stageIndex] ? stageNames[stageIndex] : null;
+
       setState((prev) => ({
         ...prev,
         taskRunId: data.task_run.id,
@@ -770,6 +787,9 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
         planPhaseName,
         planPhaseIndex,
         planTotalPhases,
+        currentStageIndex: stageIndex,
+        currentStageName: stageName,
+        totalStages,
         workflowName: data.task_run.workflow_name,
         taskName: data.task_run.task_name,
         stepStats: finalStepStats,

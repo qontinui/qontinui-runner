@@ -415,6 +415,9 @@ export function DashboardPage({
             planPhaseName={state.planPhaseName}
             planPhaseIndex={state.planPhaseIndex}
             planTotalPhases={state.planTotalPhases}
+            currentStageIndex={state.currentStageIndex}
+            currentStageName={state.currentStageName}
+            totalStages={state.totalStages}
             onPlayPause={handlePlayPause}
             onStop={handleStop}
           />

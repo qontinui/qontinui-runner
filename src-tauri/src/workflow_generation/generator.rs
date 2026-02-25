@@ -555,7 +555,15 @@ If the workflow targets a web app but does NOT include a setup step to connect v
 For EACH prompt step in agentic_steps, there MUST be at least one corresponding deterministic verification step that can detect whether that agentic step's work succeeded. Tab/section existence checks do NOT count as adequate verification for the tab's CONTENT or FUNCTIONALITY.
 
 ### Cross-step and structural checks
-If there are verification steps, there should be at least one agentic prompt step. Setup steps should logically prepare for what verification checks. Step names are descriptive (not "Step 1", "Test", "Check"). No duplicate step IDs."#;
+If there are verification steps, there should be at least one agentic prompt step. Setup steps should logically prepare for what verification checks. Step names are descriptive (not "Step 1", "Test", "Check"). No duplicate step IDs.
+
+### Multi-stage workflow validation (if `stages` array is present)
+- Every stage MUST have a unique, valid UUID v4 `id`
+- Every stage MUST have at least one deterministic verification step (same rules as top-level verification)
+- When `stages` is non-empty, top-level step arrays (setup_steps, verification_steps, agentic_steps, completion_steps) should be empty
+- Per-stage `provider` and `model`, if set, must be valid values (e.g., claude_cli, claude_api, gemini_cli, gemini_api)
+- Stages should only be used when the task genuinely has 2+ distinct phases with different verification criteria — don't use stages for single-phase tasks
+- Each stage's agentic-verification correspondence must hold independently"#;
 
 /// Parse the verification agent's response into a list of issue strings.
 fn parse_verification_response(response: &str) -> Vec<String> {

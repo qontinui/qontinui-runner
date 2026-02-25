@@ -14,7 +14,7 @@
 //!             └── handler.execute(step, context)
 //! ```
 //!
-//! ## Available Handlers (4 active)
+//! ## Available Handlers (5 active)
 //!
 //! | Category | Handlers |
 //! |----------|----------|
@@ -22,6 +22,7 @@
 //! | **UI Bridge** | ui_bridge |
 //! | **AI** | prompt |
 //! | **Artifact** | save_workflow_artifact |
+//! | **Composition** | workflow (runs a saved workflow inline) |
 //!
 //! ## Adding a New Step Type
 //!
@@ -60,7 +61,7 @@ use crate::commands::AppState;
 use crate::config_storage::ConfigStorage;
 use crate::orchestrator::context_propagation::{RuntimeContext, SharedVariableStore};
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 
@@ -77,11 +78,13 @@ pub(super) mod test;
 mod command;
 mod save_workflow_artifact;
 pub(crate) mod ui_bridge;
+mod workflow;
 
 // Re-export handlers for registration
 use command::CommandHandler;
 use save_workflow_artifact::SaveWorkflowArtifactHandler;
 use ui_bridge::UiBridgeHandler;
+use workflow::WorkflowStepHandler;
 
 /// Result of executing a step handler.
 ///
@@ -181,6 +184,13 @@ pub struct HandlerContext {
     pub shared_variables: SharedVariableStore,
     /// Optional task run ID for database logging
     pub task_run_id: Option<String>,
+    /// Tauri app handle (needed by WorkflowStepHandler to create LoopController)
+    pub app_handle: Option<tauri::AppHandle>,
+    /// PID tracker for AI process management
+    pub pid_tracker: Option<Arc<std::sync::Mutex<Vec<u32>>>>,
+    /// Recursion guard for nested workflow execution.
+    /// Tracks workflow IDs currently on the execution stack to detect circular references.
+    pub workflow_recursion_stack: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 impl HandlerContext {
@@ -193,7 +203,7 @@ impl HandlerContext {
         task_run_id: Option<String>,
     ) -> Self {
         let action_service = UnifiedActionService::new(app_state.clone(), config_storage.clone());
-        let event_emitter = TreeEventEmitter::new(app_state.clone(), app_handle);
+        let event_emitter = TreeEventEmitter::new(app_state.clone(), app_handle.clone());
         let runtime_context = task_run_id
             .as_ref()
             .map(|id| RuntimeContext::with_task_run_id(id))
@@ -207,6 +217,9 @@ impl HandlerContext {
             runtime_context,
             shared_variables: SharedVariableStore::new(),
             task_run_id,
+            app_handle,
+            pid_tracker: None,
+            workflow_recursion_stack: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
 
@@ -224,9 +237,10 @@ impl HandlerContext {
         runtime_context: RuntimeContext,
         shared_variables: SharedVariableStore,
         task_run_id: Option<String>,
+        pid_tracker: Option<Arc<std::sync::Mutex<Vec<u32>>>>,
     ) -> Self {
         let action_service = UnifiedActionService::new(app_state.clone(), config_storage.clone());
-        let event_emitter = TreeEventEmitter::new(app_state.clone(), app_handle);
+        let event_emitter = TreeEventEmitter::new(app_state.clone(), app_handle.clone());
 
         Self {
             app_state,
@@ -236,6 +250,9 @@ impl HandlerContext {
             runtime_context,
             shared_variables,
             task_run_id,
+            app_handle,
+            pid_tracker,
+            workflow_recursion_stack: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
 
@@ -348,7 +365,7 @@ impl HandlerRegistry {
     /// Create a registry pre-populated with all standard handlers.
     ///
     /// This is the recommended way to create a registry for production use.
-    /// 4 active handlers: command (incl. test dispatch), ui_bridge, prompt, save_workflow_artifact
+    /// 5 active handlers: command (incl. test dispatch), ui_bridge, prompt, save_workflow_artifact, workflow
     pub fn with_standard_handlers() -> Self {
         let mut registry = Self::new();
 
@@ -356,6 +373,7 @@ impl HandlerRegistry {
         registry.register(PromptStepHandler);
         registry.register(SaveWorkflowArtifactHandler);
         registry.register(UiBridgeHandler);
+        registry.register(WorkflowStepHandler);
 
         registry
     }

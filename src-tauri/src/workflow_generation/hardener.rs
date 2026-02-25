@@ -1310,6 +1310,8 @@ mod tests {
             enable_sweep: false,
             max_sweep_iterations: 5,
             generated_by_task_run_id: None,
+            stages: Vec::new(),
+            stop_on_failure: false,
             created_at: "2025-01-01T00:00:00Z".to_string(),
             updated_at: "2025-01-01T00:00:00Z".to_string(),
         }

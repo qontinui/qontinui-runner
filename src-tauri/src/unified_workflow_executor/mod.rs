@@ -80,7 +80,7 @@ pub use loop_controller::{
     LoopController,
     ResumeConfig,
 };
-pub use types::{get_parent_task_id, LoopConfig, LoopResult, WorkflowPhase};
+pub use types::{get_parent_task_id, LoopConfig, LoopResult, StageConfig, WorkflowPhase};
 
 // Types exposed for API consumers and advanced usage
 // These may not be directly used in this crate but are part of the public API

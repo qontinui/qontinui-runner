@@ -69,6 +69,12 @@ export interface ControlBarProps {
   planPhaseIndex?: number | null;
   /** Total number of plan phases */
   planTotalPhases?: number | null;
+  /** Current stage index, zero-based (for multi-stage workflows) */
+  currentStageIndex?: number | null;
+  /** Current stage name (for multi-stage workflows) */
+  currentStageName?: string | null;
+  /** Total stages (for multi-stage workflows) */
+  totalStages?: number | null;
   /** Execution stats data */
   statsData?: ExecutionStatsData;
   /** Whether to show inline stats (compact mode) */
@@ -277,6 +283,44 @@ function PlanPhaseIndicator({
   );
 }
 
+// Multi-stage workflow indicator
+function StageIndicator({
+  stageIndex,
+  stageName,
+  totalStages,
+  isRunning,
+}: {
+  stageIndex: number | null;
+  stageName: string | null;
+  totalStages: number | null;
+  isRunning: boolean;
+}) {
+  const colors = getAccentColors("cyan");
+  const displayIndex = stageIndex != null ? stageIndex + 1 : null;
+
+  if (displayIndex == null || totalStages == null) return null;
+
+  return (
+    <div
+      data-content-role="badge"
+      data-content-label={`Stage ${displayIndex}/${totalStages}${stageName ? `: ${stageName}` : ""}`}
+      className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md ${colors.bg} ${colors.text} ${colors.border} border ${isRunning ? "animate-phase-glow" : ""}`}
+      title={`Stage ${displayIndex} of ${totalStages}${stageName ? `: ${stageName}` : ""}`}
+    >
+      <span className="opacity-60">Stage</span>
+      <span className="font-mono">{displayIndex}</span>
+      <span className="opacity-60">/</span>
+      <span className="font-mono opacity-80">{totalStages}</span>
+      {stageName && (
+        <>
+          <span className="opacity-40 mx-0.5">:</span>
+          <span className="truncate max-w-[200px]">{stageName}</span>
+        </>
+      )}
+    </div>
+  );
+}
+
 export function ControlBar({
   taskName,
   phase = "idle",
@@ -290,6 +334,9 @@ export function ControlBar({
   planPhaseName,
   planPhaseIndex,
   planTotalPhases,
+  currentStageIndex,
+  currentStageName,
+  totalStages,
   statsData,
   showInlineStats = false,
   phaseStepCounts,
@@ -335,6 +382,15 @@ export function ControlBar({
             phaseName={planPhaseName ?? null}
             phaseIndex={planPhaseIndex ?? null}
             totalPhases={planTotalPhases ?? null}
+            isRunning={isRunning}
+          />
+        )}
+        {/* Show multi-stage indicator when workflow has multiple stages */}
+        {isOrchestrated && totalStages != null && totalStages > 1 && (
+          <StageIndicator
+            stageIndex={currentStageIndex ?? null}
+            stageName={currentStageName ?? null}
+            totalStages={totalStages}
             isRunning={isRunning}
           />
         )}

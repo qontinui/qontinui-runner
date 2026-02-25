@@ -91,6 +91,43 @@ impl LoopResult {
     }
 }
 
+/// Configuration for a single stage within a multi-stage workflow.
+///
+/// Each stage has its own steps and execution settings. The loop controller
+/// iterates over stages sequentially, running each stage's verification-agentic
+/// loop independently.
+#[derive(Debug, Clone)]
+pub struct StageConfig {
+    /// Unique identifier for this stage.
+    pub id: String,
+    /// Display name for this stage.
+    pub name: String,
+    /// Index of this stage (0-indexed).
+    pub index: usize,
+    /// Total number of stages in the workflow.
+    pub total_stages: usize,
+    /// Setup automation steps for this stage.
+    pub setup_automation_steps: Vec<crate::step_executor::ExecutionStepConfig>,
+    /// Setup prompt steps for this stage.
+    pub setup_prompt_steps: Vec<crate::step_executor::ExecutionStepConfig>,
+    /// Verification steps for this stage.
+    pub verification_steps: Vec<crate::step_executor::ExecutionStepConfig>,
+    /// Agentic steps for this stage.
+    pub agentic_steps: Vec<crate::step_executor::ExecutionStepConfig>,
+    /// Completion automation steps for this stage.
+    pub completion_automation_steps: Vec<crate::step_executor::ExecutionStepConfig>,
+    /// Completion prompt steps for this stage.
+    pub completion_prompt_steps: Vec<crate::step_executor::ExecutionStepConfig>,
+    /// Maximum iterations for this stage's loop.
+    pub max_iterations: u32,
+    /// AI provider override for this stage (None = use workflow default).
+    pub provider: Option<String>,
+    /// Model override for this stage (None = use workflow default).
+    pub model: Option<String>,
+    /// Timeout in seconds for this stage's AI sessions.
+    pub timeout_seconds: Option<u64>,
+}
+
 /// Configuration for the verification-agentic loop.
 #[derive(Debug, Clone)]
 pub struct LoopConfig {
@@ -125,6 +162,16 @@ pub struct LoopConfig {
     pub enable_sweep: bool,
     /// Maximum number of sweep iterations.
     pub max_sweep_iterations: u32,
+    /// Stages for multi-stage workflows. Empty = single-stage (backward compat).
+    pub stages: Vec<StageConfig>,
+    /// Whether to stop execution if a stage fails verification (default: false).
+    pub stop_on_failure: bool,
+    /// Optional AI provider override for this loop (from stage config).
+    pub provider_override: Option<String>,
+    /// Optional AI model override for this loop (from stage config).
+    pub model_override: Option<String>,
+    /// Stage index when running as part of a multi-stage workflow (None = single-stage).
+    pub stage_index: Option<u32>,
 }
 
 /// Result of the completion sweep phase.
@@ -185,16 +232,16 @@ impl AgenticOutcome {
     }
 }
 
-/// Extract the parent task ID from a workflow sequence child ID.
+/// Extract the parent task ID from a composed run child ID.
 ///
-/// For workflow sequences, individual workflows have IDs like:
-/// `workflow-sequence-{timestamp}-workflow-{n}`
+/// For composed runs, individual workflows have IDs like:
+/// `composed-run-{timestamp}-workflow-{n}`
 ///
-/// But only the parent `workflow-sequence-{timestamp}` exists in task_runs.
+/// But only the parent `composed-run-{timestamp}` exists in task_runs.
 /// This function extracts the parent ID for use in database operations that
 /// reference task_runs (step checkpoints, task_run_events, etc.).
 ///
-/// For non-sequence IDs (e.g., `unified-workflow-{id}-{timestamp}`), returns
+/// For non-composed IDs (e.g., `unified-workflow-{id}-{timestamp}`), returns
 /// the original ID unchanged.
 ///
 /// # Examples
@@ -202,33 +249,33 @@ impl AgenticOutcome {
 /// ```
 /// use qontinui_runner::unified_workflow_executor::get_parent_task_id;
 ///
-/// // Sequence child → parent
+/// // Composed run child → parent
 /// assert_eq!(
-///     get_parent_task_id("workflow-sequence-1234567890-workflow-1"),
-///     "workflow-sequence-1234567890"
+///     get_parent_task_id("composed-run-1234567890-workflow-1"),
+///     "composed-run-1234567890"
 /// );
 ///
-/// // Non-sequence → unchanged
+/// // Non-composed → unchanged
 /// assert_eq!(
 ///     get_parent_task_id("unified-workflow-abc-1234567890"),
 ///     "unified-workflow-abc-1234567890"
 /// );
 /// ```
 pub fn get_parent_task_id(execution_id: &str) -> String {
-    // Check if this is a sequence child: workflow-sequence-{timestamp}-workflow-{n}
+    // Check if this is a composed run child: composed-run-{timestamp}-workflow-{n}
     if let Some(pos) = execution_id.rfind("-workflow-") {
         let potential_parent = &execution_id[..pos];
-        // Verify it looks like a sequence parent (starts with workflow-sequence-)
-        if potential_parent.starts_with("workflow-sequence-") {
+        // Verify it looks like a composed run parent (starts with composed-run-)
+        if potential_parent.starts_with("composed-run-") {
             return potential_parent.to_string();
         }
     }
     execution_id.to_string()
 }
 
-/// Check if an execution ID is a workflow sequence child.
+/// Check if an execution ID is a composed run child.
 ///
-/// Returns true for IDs like `workflow-sequence-{timestamp}-workflow-{n}`.
+/// Returns true for IDs like `composed-run-{timestamp}-workflow-{n}`.
 pub fn is_sequence_child(execution_id: &str) -> bool {
     get_parent_task_id(execution_id) != execution_id
 }

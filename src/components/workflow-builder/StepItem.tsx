@@ -116,6 +116,8 @@ export function StepItem({
         if (step.action === "assert") return step.target || "Configure assertion...";
         if (step.action === "snapshot") return "Take snapshot";
         return step.action;
+      case "workflow":
+        return (step as { workflow_name?: string }).workflow_name || "Select workflow...";
       default:
         return "";
     }

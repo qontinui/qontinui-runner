@@ -14,6 +14,7 @@ use crate::mcp::shared::emit_ai_output;
 use crate::mcp::types::ApiState;
 use crate::safe_lock::safe_lock_or_recover;
 use crate::summary_generator;
+use crate::unified_workflow_executor::extract_workflow_id_from_task_id;
 use tauri::Manager;
 
 /// Query params for listing task runs.
@@ -385,6 +386,9 @@ pub struct FullWorkflowStateResponse {
     resume_point: ResumePointData,
     /// Phases defined in the workflow (e.g., ["setup", "verification", "agentic", "completion"])
     defined_phases: Vec<String>,
+    /// Stage names for multi-stage workflows (ordered). Empty if no stages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    stage_names: Vec<String>,
 }
 
 /// Task run summary for full state response.
@@ -411,6 +415,9 @@ pub struct OrchestratorStateData {
     /// Mapped workflow stage for UI display
     workflow_stage: Option<String>,
     workflow_stage_display: Option<String>,
+    /// Stage index for multi-stage workflows (0-indexed, from state_data)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stage_index: Option<u32>,
 }
 
 /// Step checkpoint data for full state response.
@@ -456,6 +463,25 @@ pub struct ResumePointData {
     description: String,
 }
 
+/// Extract stage_index from the state_data JSON.
+///
+/// The state_data is an enum-like JSON object where the key is the variant name
+/// and the value may contain a `stage_index` field. For example:
+/// `{ "VerificationRunning": { "iteration": 1, "stage_index": 2 } }`
+fn extract_stage_index(state_data: &Option<serde_json::Value>) -> Option<u32> {
+    let data = state_data.as_ref()?;
+    let obj = data.as_object()?;
+    // Try each variant that might contain stage_index
+    for (_variant_name, inner) in obj.iter() {
+        if let Some(inner_obj) = inner.as_object() {
+            if let Some(idx) = inner_obj.get("stage_index").and_then(|v| v.as_u64()) {
+                return Some(idx as u32);
+            }
+        }
+    }
+    None
+}
+
 /// Get full workflow state for restart recovery.
 ///
 /// This endpoint returns authoritative state from the database for the frontend
@@ -488,6 +514,7 @@ pub async fn get_full_workflow_state(
             .state_data
             .as_ref()
             .and_then(|s| serde_json::from_str(s).ok());
+        let stage_index = extract_stage_index(&state_data);
         let (workflow_stage, workflow_stage_display) = state_name_to_stage(&ws.state_name);
 
         OrchestratorStateData {
@@ -498,6 +525,7 @@ pub async fn get_full_workflow_state(
             updated_at: ws.updated_at,
             workflow_stage,
             workflow_stage_display,
+            stage_index,
         }
     });
 
@@ -592,6 +620,19 @@ pub async fn get_full_workflow_state(
         vec![]
     };
 
+    // Get stage names from workflow definition
+    let stage_names: Vec<String> = extract_workflow_id_from_task_id(&id)
+        .and_then(|wf_id| {
+            state
+                .app_state
+                .checkpoint_db
+                .get_unified_workflow(&wf_id)
+                .ok()
+                .flatten()
+        })
+        .map(|wf| wf.stages.iter().map(|s| s.name.clone()).collect())
+        .unwrap_or_default();
+
     Ok(Json(FullWorkflowStateResponse {
         task_run: TaskRunSummary {
             id: task_run.id,
@@ -608,6 +649,7 @@ pub async fn get_full_workflow_state(
         current_step_progress,
         resume_point,
         defined_phases,
+        stage_names,
     }))
 }
 
@@ -631,7 +673,7 @@ pub fn compute_resume_point(
                     from_step: None,
                     description: resume_point.description(),
                 },
-                ResumePoint::SetupPhase { from_step } => ResumePointData {
+                ResumePoint::SetupPhase { from_step, .. } => ResumePointData {
                     resume_type: "setup_phase".to_string(),
                     iteration: None,
                     from_step: Some(from_step),
@@ -640,13 +682,14 @@ pub fn compute_resume_point(
                 ResumePoint::VerificationPhase {
                     iteration,
                     from_step,
+                    ..
                 } => ResumePointData {
                     resume_type: "verification_phase".to_string(),
                     iteration: Some(iteration),
                     from_step: Some(from_step),
                     description: resume_point.description(),
                 },
-                ResumePoint::AgenticPhase { iteration } => ResumePointData {
+                ResumePoint::AgenticPhase { iteration, .. } => ResumePointData {
                     resume_type: "agentic_phase".to_string(),
                     iteration: Some(iteration),
                     from_step: None,
@@ -656,6 +699,12 @@ pub fn compute_resume_point(
                     resume_type: "completion_phase".to_string(),
                     iteration: None,
                     from_step: Some(from_step),
+                    description: resume_point.description(),
+                },
+                ResumePoint::StageStart { from_stage } => ResumePointData {
+                    resume_type: "stage_start".to_string(),
+                    iteration: None,
+                    from_step: Some(from_stage as usize),
                     description: resume_point.description(),
                 },
             }
@@ -976,7 +1025,7 @@ pub async fn resume_task_run(
             })?;
         (wf_id, wf)
     } else if let Some(ref wf_name) = task_run.workflow_name {
-        // New format: workflow-sequence-{timestamp}-workflow-{n}
+        // New format: composed-run-{timestamp}-workflow-{n}
         // Look up workflow by name instead
         let wf = state
             .app_state
@@ -1056,6 +1105,11 @@ pub async fn resume_task_run(
         is_dev_mode: cfg!(debug_assertions),
         enable_sweep: workflow.enable_sweep,
         max_sweep_iterations: workflow.max_sweep_iterations,
+        stages: Vec::new(),
+        stop_on_failure: false,
+        provider_override: None,
+        model_override: None,
+        stage_index: None,
     };
 
     // Spawn the workflow execution in background with panic protection

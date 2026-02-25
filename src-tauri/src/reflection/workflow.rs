@@ -30,6 +30,11 @@ pub fn build_reflection_config(
         is_dev_mode: false, // CRITICAL: Prevents cascade reflection
         enable_sweep: false,
         max_sweep_iterations: 5,
+        stages: Vec::new(),
+        stop_on_failure: false,
+        provider_override: None,
+        model_override: None,
+        stage_index: None,
     }
 }
 

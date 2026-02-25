@@ -80,6 +80,9 @@ pub struct AiSessionConfig {
     /// When set, the AI session will parse [INJECT_STEP]...[/INJECT_STEP] markers
     /// and collect injected verification steps.
     pub step_injection_ctx: Option<crate::step_injection::types::StepInjectionContext>,
+    /// Optional model override from stage config (e.g., "claude-sonnet-4-5-20250514").
+    /// When set, the AI CLI will be invoked with --model <model>.
+    pub model_override: Option<String>,
 }
 
 impl AiSessionConfig {
@@ -102,6 +105,7 @@ impl AiSessionConfig {
             sub_step_metadata: None,
             reflection_fix_ctx: None,
             step_injection_ctx: None,
+            model_override: None,
         }
     }
 
@@ -124,6 +128,7 @@ impl AiSessionConfig {
             sub_step_metadata: None,
             reflection_fix_ctx: None,
             step_injection_ctx: None,
+            model_override: None,
         }
     }
 
@@ -147,6 +152,7 @@ impl AiSessionConfig {
             sub_step_metadata: None,
             reflection_fix_ctx: None,
             step_injection_ctx: None,
+            model_override: None,
         }
     }
 
@@ -188,6 +194,13 @@ impl AiSessionConfig {
         ctx: crate::step_injection::types::StepInjectionContext,
     ) -> Self {
         self.step_injection_ctx = Some(ctx);
+        self
+    }
+
+    /// Set a model override for the AI CLI invocation.
+    /// When set, the Claude CLI will be invoked with `--model <model>`.
+    pub fn with_model_override(mut self, model: Option<String>) -> Self {
+        self.model_override = model;
         self
     }
 }
@@ -444,6 +457,7 @@ impl UnifiedAiSessionExecutor {
         let task_run_id_for_claude = config.task_run_id.clone();
         let reflection_fix_ctx = config.reflection_fix_ctx.clone();
         let step_injection_ctx = config.step_injection_ctx.clone();
+        let model_override = config.model_override.clone();
 
         let result = tokio::task::spawn_blocking(move || {
             let doctor_ref = doctor_handle.as_ref();
@@ -464,6 +478,7 @@ impl UnifiedAiSessionExecutor {
                     doctor_ref,
                     reflection_fix_ctx,
                     step_injection_ctx,
+                    model_override.as_deref(),
                 )
             } else {
                 // Inline mode: one-shot session (either no session manager or interactive disabled)
@@ -484,6 +499,7 @@ impl UnifiedAiSessionExecutor {
                     doctor_ref,
                     reflection_fix_ctx,
                     step_injection_ctx,
+                    model_override.as_deref(),
                 )
             }
         })
@@ -618,7 +634,7 @@ impl UnifiedAiSessionExecutor {
             "source": "claude",
         });
 
-        // For workflow sequence children (e.g., workflow-sequence-X-workflow-N),
+        // For composed run children (e.g., composed-run-X-workflow-N),
         // remap to the parent task ID since only the parent has a task_runs record.
         let task_run_id = get_parent_task_id(&config.task_run_id);
 

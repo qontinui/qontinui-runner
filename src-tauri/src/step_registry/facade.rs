@@ -72,7 +72,7 @@ impl std::fmt::Debug for StepEventLogger {
 impl StepEventLogger {
     /// Create a new step event logger.
     ///
-    /// Note: For workflow sequence children (e.g., workflow-sequence-X-workflow-N),
+    /// Note: For composed run children (e.g., composed-run-X-workflow-N),
     /// the execution_id is automatically remapped to the parent task ID because
     /// only parent IDs exist in task_runs (required by foreign key constraint).
     pub fn new(
@@ -80,7 +80,7 @@ impl StepEventLogger {
         execution_id: impl Into<String>,
         workflow_name: impl Into<String>,
     ) -> Self {
-        // For workflow sequence children, remap to parent ID to satisfy FK constraint
+        // For composed run children, remap to parent ID to satisfy FK constraint
         let exec_id = execution_id.into();
         let parent_id = get_parent_task_id(&exec_id);
 

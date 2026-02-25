@@ -5200,6 +5200,30 @@ impl CheckpointDb {
             );
         }
 
+        // Version 66: Add stage_index to workflow_step_checkpoints and stages/stop_on_failure to unified_workflows
+        if current_version < 66 {
+            info!(
+                "Migrating to version 66 (add stage_index to checkpoints, stages to workflows)..."
+            );
+
+            // Add stage_index column to workflow_step_checkpoints
+            // For existing rows, default to 0 (single-stage backward compat)
+            conn.execute_batch(
+                r#"
+                ALTER TABLE workflow_step_checkpoints ADD COLUMN stage_index INTEGER DEFAULT 0;
+
+                -- Add stages and stop_on_failure to unified_workflows
+                ALTER TABLE unified_workflows ADD COLUMN stages TEXT DEFAULT '[]';
+                ALTER TABLE unified_workflows ADD COLUMN stop_on_failure INTEGER DEFAULT 0;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (66, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 66: {}", e))?;
+
+            info!("Successfully migrated to version 66 (stage_index, stages, stop_on_failure)");
+        }
+
         Ok(())
     }
 
@@ -11117,7 +11141,8 @@ impl CheckpointDb {
                        skip_ai_summary, created_at, updated_at, log_source_selection,
                        context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                        log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
-                       preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations
+                       preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
+                       stages, stop_on_failure
                 FROM unified_workflows
                 ORDER BY updated_at DESC
                 "#,
@@ -11184,6 +11209,11 @@ impl CheckpointDb {
                     generated_by_task_run_id: row.get(25)?,
                     enable_sweep: row.get::<_, Option<i32>>(26)?.unwrap_or(0) != 0,
                     max_sweep_iterations: row.get::<_, Option<i32>>(27)?.unwrap_or(5) as u32,
+                    stages: row
+                        .get::<_, Option<String>>(28)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    stop_on_failure: row.get::<_, Option<i32>>(29)?.unwrap_or(0) != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -11209,7 +11239,8 @@ impl CheckpointDb {
                    skip_ai_summary, created_at, updated_at, log_source_selection,
                    context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                    log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
-                   preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations
+                   preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
+                   stages, stop_on_failure
             FROM unified_workflows
             WHERE id = ?1
             "#,
@@ -11273,6 +11304,11 @@ impl CheckpointDb {
                     generated_by_task_run_id: row.get(25)?,
                     enable_sweep: row.get::<_, Option<i32>>(26)?.unwrap_or(0) != 0,
                     max_sweep_iterations: row.get::<_, Option<i32>>(27)?.unwrap_or(5) as u32,
+                    stages: row
+                        .get::<_, Option<String>>(28)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    stop_on_failure: row.get::<_, Option<i32>>(29)?.unwrap_or(0) != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -11300,7 +11336,8 @@ impl CheckpointDb {
                    skip_ai_summary, created_at, updated_at, log_source_selection,
                    context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                    log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
-                   preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations
+                   preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
+                   stages, stop_on_failure
             FROM unified_workflows
             WHERE name = ?1
             ORDER BY updated_at DESC
@@ -11366,6 +11403,11 @@ impl CheckpointDb {
                     generated_by_task_run_id: row.get(25)?,
                     enable_sweep: row.get::<_, Option<i32>>(26)?.unwrap_or(0) != 0,
                     max_sweep_iterations: row.get::<_, Option<i32>>(27)?.unwrap_or(5) as u32,
+                    stages: row
+                        .get::<_, Option<String>>(28)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    stop_on_failure: row.get::<_, Option<i32>>(29)?.unwrap_or(0) != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -11430,8 +11472,9 @@ impl CheckpointDb {
                 skip_ai_summary, created_at, updated_at, log_source_selection,
                 context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                 log_watch_enabled, health_check_enabled, health_check_urls, preflight_check_enabled,
-                generated_by_task_run_id, enable_sweep, max_sweep_iterations
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
+                generated_by_task_run_id, enable_sweep, max_sweep_iterations,
+                stages, stop_on_failure
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
             "#,
             params![
                 id,
@@ -11462,6 +11505,8 @@ impl CheckpointDb {
                 request.generated_by_task_run_id,
                 request.enable_sweep.unwrap_or(false),
                 request.max_sweep_iterations.unwrap_or(5) as i64,
+                serde_json::to_string(&request.stages).unwrap_or_else(|_| "[]".to_string()),
+                request.stop_on_failure.unwrap_or(false),
             ],
         )
         .map_err(|e| format!("Failed to create unified workflow: {}", e))?;
@@ -11521,8 +11566,9 @@ impl CheckpointDb {
                 skip_ai_summary, created_at, updated_at, log_source_selection,
                 context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                 log_watch_enabled, health_check_enabled, health_check_urls, preflight_check_enabled,
-                generated_by_task_run_id, enable_sweep, max_sweep_iterations
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
+                generated_by_task_run_id, enable_sweep, max_sweep_iterations,
+                stages, stop_on_failure
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
             "#,
             params![
                 id,
@@ -11553,6 +11599,8 @@ impl CheckpointDb {
                 request.generated_by_task_run_id,
                 request.enable_sweep.unwrap_or(false),
                 request.max_sweep_iterations.unwrap_or(5) as i64,
+                serde_json::to_string(&request.stages).unwrap_or_else(|_| "[]".to_string()),
+                request.stop_on_failure.unwrap_or(false),
             ],
         )
         .map_err(|e| format!("Failed to create unified workflow: {}", e))?;
@@ -11650,6 +11698,8 @@ impl CheckpointDb {
         let max_sweep_iterations = request
             .max_sweep_iterations
             .unwrap_or(existing.max_sweep_iterations);
+        let stages = request.stages.as_ref().unwrap_or(&existing.stages);
+        let stop_on_failure = request.stop_on_failure.unwrap_or(existing.stop_on_failure);
 
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
         let setup_steps_json =
@@ -11668,6 +11718,7 @@ impl CheckpointDb {
             serde_json::to_string(disabled_context_ids).unwrap_or_else(|_| "[]".to_string());
         let health_check_urls_json =
             serde_json::to_string(health_check_urls).unwrap_or_else(|_| "[]".to_string());
+        let stages_json = serde_json::to_string(stages).unwrap_or_else(|_| "[]".to_string());
 
         conn.execute(
             r#"
@@ -11696,8 +11747,10 @@ impl CheckpointDb {
                 health_check_urls = ?22,
                 preflight_check_enabled = ?23,
                 enable_sweep = ?24,
-                max_sweep_iterations = ?25
-            WHERE id = ?26
+                max_sweep_iterations = ?25,
+                stages = ?26,
+                stop_on_failure = ?27
+            WHERE id = ?28
             "#,
             params![
                 name,
@@ -11725,6 +11778,8 @@ impl CheckpointDb {
                 preflight_check_enabled,
                 enable_sweep,
                 max_sweep_iterations as i64,
+                stages_json,
+                stop_on_failure,
                 id,
             ],
         )
@@ -11759,7 +11814,8 @@ impl CheckpointDb {
                    skip_ai_summary, created_at, updated_at, log_source_selection,
                    context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                    log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
-                   preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations
+                   preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
+                   stages, stop_on_failure
             FROM unified_workflows
             WHERE 1=1
             "#,
@@ -11855,6 +11911,11 @@ impl CheckpointDb {
                     generated_by_task_run_id: row.get(25)?,
                     enable_sweep: row.get::<_, Option<i32>>(26)?.unwrap_or(0) != 0,
                     max_sweep_iterations: row.get::<_, Option<i32>>(27)?.unwrap_or(5) as u32,
+                    stages: row
+                        .get::<_, Option<String>>(28)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    stop_on_failure: row.get::<_, Option<i32>>(29)?.unwrap_or(0) != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -11902,6 +11963,8 @@ impl CheckpointDb {
             generated_by_task_run_id: None, // Don't copy the generator reference
             enable_sweep: Some(original.enable_sweep),
             max_sweep_iterations: Some(original.max_sweep_iterations),
+            stages: Some(original.stages),
+            stop_on_failure: Some(original.stop_on_failure),
         };
 
         self.create_unified_workflow(&create_request)
@@ -11926,7 +11989,7 @@ impl CheckpointDb {
                        context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                        log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
                        preflight_check_enabled, generated_by_task_run_id, enable_sweep,
-                       max_sweep_iterations
+                       max_sweep_iterations, stages, stop_on_failure
                 FROM unified_workflows
                 WHERE sync_pending = 1
                 "#,
@@ -11993,6 +12056,11 @@ impl CheckpointDb {
                     generated_by_task_run_id: row.get(25)?,
                     enable_sweep: row.get::<_, Option<i32>>(26)?.unwrap_or(0) != 0,
                     max_sweep_iterations: row.get::<_, Option<i32>>(27)?.unwrap_or(5) as u32,
+                    stages: row
+                        .get::<_, Option<String>>(28)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    stop_on_failure: row.get::<_, Option<i32>>(29)?.unwrap_or(0) != 0,
                     targeted_error_ids: vec![],
                 })
             })
@@ -14592,7 +14660,13 @@ impl CheckpointDb {
             .prepare(
                 r#"
                 SELECT id, name, description, category, tags, setup_steps, verification_steps,
-                       agentic_steps, max_iterations, provider, model, created_at, updated_at
+                       agentic_steps, max_iterations, provider, model, created_at, updated_at,
+                       completion_steps, skip_ai_summary, timeout_seconds,
+                       log_watch_enabled, health_check_enabled, health_check_urls,
+                       preflight_check_enabled, log_source_selection, context_ids,
+                       disabled_context_ids, auto_include_contexts, prompt_template,
+                       generated_by_task_run_id, enable_sweep, max_sweep_iterations,
+                       stages, stop_on_failure, sync_pending, example_status
                 FROM unified_workflows
                 ORDER BY updated_at DESC
                 "#,
@@ -14601,6 +14675,7 @@ impl CheckpointDb {
 
         let results = stmt
             .query_map([], |row| {
+                // Parse JSON text columns
                 let tags_str: String = row.get(4)?;
                 let tags: serde_json::Value =
                     serde_json::from_str(&tags_str).unwrap_or(serde_json::json!([]));
@@ -14613,6 +14688,32 @@ impl CheckpointDb {
                 let agent_str: String = row.get(7)?;
                 let agentic: serde_json::Value =
                     serde_json::from_str(&agent_str).unwrap_or(serde_json::json!([]));
+
+                // Post-v19 JSON text columns
+                let completion_str: Option<String> = row.get(13)?;
+                let completion: serde_json::Value = completion_str
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or(serde_json::json!([]));
+                let health_check_urls_str: Option<String> = row.get(18)?;
+                let health_check_urls: serde_json::Value = health_check_urls_str
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or(serde_json::json!([]));
+                let log_source_str: Option<String> = row.get(20)?;
+                let log_source: serde_json::Value = log_source_str
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or(serde_json::json!("default"));
+                let context_ids_str: Option<String> = row.get(21)?;
+                let context_ids: serde_json::Value = context_ids_str
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or(serde_json::json!([]));
+                let disabled_context_ids_str: Option<String> = row.get(22)?;
+                let disabled_context_ids: serde_json::Value = disabled_context_ids_str
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or(serde_json::json!([]));
+                let stages_str: Option<String> = row.get(28)?;
+                let stages: serde_json::Value = stages_str
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or(serde_json::json!([]));
 
                 Ok(serde_json::json!({
                     "id": row.get::<_, String>(0)?,
@@ -14628,6 +14729,25 @@ impl CheckpointDb {
                     "model": row.get::<_, Option<String>>(10)?,
                     "created_at": row.get::<_, String>(11)?,
                     "updated_at": row.get::<_, String>(12)?,
+                    "completion_steps": completion,
+                    "skip_ai_summary": row.get::<_, Option<bool>>(14)?,
+                    "timeout_seconds": row.get::<_, Option<i64>>(15)?,
+                    "log_watch_enabled": row.get::<_, Option<i64>>(16)?,
+                    "health_check_enabled": row.get::<_, Option<i64>>(17)?,
+                    "health_check_urls": health_check_urls,
+                    "preflight_check_enabled": row.get::<_, Option<i64>>(19)?,
+                    "log_source_selection": log_source,
+                    "context_ids": context_ids,
+                    "disabled_context_ids": disabled_context_ids,
+                    "auto_include_contexts": row.get::<_, Option<i64>>(23)?,
+                    "prompt_template": row.get::<_, Option<String>>(24)?,
+                    "generated_by_task_run_id": row.get::<_, Option<String>>(25)?,
+                    "enable_sweep": row.get::<_, Option<i64>>(26)?,
+                    "max_sweep_iterations": row.get::<_, Option<i64>>(27)?,
+                    "stages": stages,
+                    "stop_on_failure": row.get::<_, Option<i64>>(29)?,
+                    "sync_pending": row.get::<_, Option<i64>>(30)?,
+                    "example_status": row.get::<_, Option<String>>(31)?,
                 }))
             })
             .map_err(|e| format!("Failed to export unified workflows: {}", e))?
@@ -15104,12 +15224,84 @@ impl CheckpointDb {
             let provider = workflow["provider"].as_str();
             let model = workflow["model"].as_str();
 
+            // Post-v19 columns
+            let completion =
+                serde_json::to_string(&workflow["completion_steps"]).unwrap_or("[]".to_string());
+            let skip_ai_summary = workflow["skip_ai_summary"].as_bool().unwrap_or(false);
+            let timeout_seconds = workflow["timeout_seconds"].as_i64();
+            let log_watch_enabled = workflow["log_watch_enabled"].as_i64().unwrap_or(1);
+            let health_check_enabled = workflow["health_check_enabled"].as_i64().unwrap_or(1);
+            let health_check_urls =
+                serde_json::to_string(&workflow["health_check_urls"]).unwrap_or("[]".to_string());
+            let preflight_check_enabled = workflow["preflight_check_enabled"].as_i64().unwrap_or(1);
+            let log_source_selection = serde_json::to_string(&workflow["log_source_selection"])
+                .unwrap_or("\"default\"".to_string());
+            let context_ids =
+                serde_json::to_string(&workflow["context_ids"]).unwrap_or("[]".to_string());
+            let disabled_context_ids = serde_json::to_string(&workflow["disabled_context_ids"])
+                .unwrap_or("[]".to_string());
+            let auto_include_contexts = workflow["auto_include_contexts"].as_i64().unwrap_or(1);
+            let prompt_template = workflow["prompt_template"].as_str();
+            let generated_by_task_run_id = workflow["generated_by_task_run_id"].as_str();
+            let enable_sweep = workflow["enable_sweep"].as_i64().unwrap_or(0);
+            let max_sweep_iterations = workflow["max_sweep_iterations"].as_i64().unwrap_or(5);
+            let stages = serde_json::to_string(&workflow["stages"]).unwrap_or("[]".to_string());
+            let stop_on_failure = workflow["stop_on_failure"].as_i64().unwrap_or(0);
+            let sync_pending = workflow["sync_pending"].as_i64().unwrap_or(0);
+            let example_status = workflow["example_status"].as_str().unwrap_or("pending");
+
             let result = conn.execute(
                 r#"
-                INSERT OR REPLACE INTO unified_workflows (id, name, description, category, tags, setup_steps, verification_steps, agentic_steps, max_iterations, provider, model, created_at, updated_at)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                INSERT OR REPLACE INTO unified_workflows (
+                    id, name, description, category, tags, setup_steps, verification_steps,
+                    agentic_steps, max_iterations, provider, model, created_at, updated_at,
+                    completion_steps, skip_ai_summary, timeout_seconds,
+                    log_watch_enabled, health_check_enabled, health_check_urls,
+                    preflight_check_enabled, log_source_selection, context_ids,
+                    disabled_context_ids, auto_include_contexts, prompt_template,
+                    generated_by_task_run_id, enable_sweep, max_sweep_iterations,
+                    stages, stop_on_failure, sync_pending, example_status
+                )
+                VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                    ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
+                    ?26, ?27, ?28, ?29, ?30, ?31, ?32
+                )
                 "#,
-                params![id, name, description, category, tags, setup, verif, agent, max_iter, provider, model, now, now],
+                params![
+                    id,
+                    name,
+                    description,
+                    category,
+                    tags,
+                    setup,
+                    verif,
+                    agent,
+                    max_iter,
+                    provider,
+                    model,
+                    now,
+                    now,
+                    completion,
+                    skip_ai_summary,
+                    timeout_seconds,
+                    log_watch_enabled,
+                    health_check_enabled,
+                    health_check_urls,
+                    preflight_check_enabled,
+                    log_source_selection,
+                    context_ids,
+                    disabled_context_ids,
+                    auto_include_contexts,
+                    prompt_template,
+                    generated_by_task_run_id,
+                    enable_sweep,
+                    max_sweep_iterations,
+                    stages,
+                    stop_on_failure,
+                    sync_pending,
+                    example_status
+                ],
             );
 
             match result {
