@@ -304,4 +304,59 @@ List endpoints (or leave blank to auto-discover from OpenAPI/swagger):
       category: "testing",
     },
   },
+  {
+    id: "ui-bridge-onboard",
+    name: "Add UI Bridge SDK",
+    icon: "Plug",
+    description:
+      "Instrument a React project with UI Bridge SDK — provider, hooks, data-ui-id attributes, and spec files",
+    content: `Instrument an existing React project with the UI Bridge SDK so it can be discovered, inspected, and verified by Qontinui workflows.
+
+## Project
+- Path: [PROJECT_PATH, e.g. C:\\Users\\me\\my-react-app]
+- Framework: [FRAMEWORK, e.g. Next.js 15, Vite + React, Create React App]
+- App URL when running: [APP_URL, e.g. http://localhost:3000]
+
+## What to Instrument
+- [List key pages/routes, e.g. /dashboard, /settings, /users, or "all routes"]
+- [List key interactive elements, e.g. forms, modals, navigation, or "discover automatically"]
+
+## Instructions
+1. Install the UI Bridge SDK package: \`npm install @anthropic/ui-bridge\` (or check if already installed)
+2. Wrap the root layout with \`<UIBridgeProvider>\` — find the top-level layout file and add the provider
+3. For each page/route listed above:
+   a. Add \`data-ui-id\` attributes to all interactive and semantically meaningful elements following the naming convention: \`{feature}-{component}-{element}\` with suffixes like \`-btn\`, \`-input\`, \`-link\`
+   b. Register key interactive elements (buttons, inputs, links, toggles) with the \`useUIElement\` hook
+   c. Register component-level actions with \`useUIComponent\` for forms and complex components
+   d. Register important UI states (loading, error, empty) with \`useUIState\`
+   e. Create a \`.spec.uibridge.json\` file alongside the page with grouped assertions:
+      - An \`element-presence\` group verifying core layout elements exist
+      - A \`state-consistency\` group verifying interactive element states (enabled/disabled, initial values)
+      - A \`semantic\` group describing the page's purpose and key capabilities
+      - Use diverse assertion types: exists, enabled, disabled, hasText, containsText, hasValue — not just exists
+      - Use conditions for state-dependent assertions
+      - Use graduated severity: critical for core, warning for important, info for nice-to-have
+4. Verify the instrumented app starts without errors and the UI Bridge endpoints respond
+5. Connect via UI Bridge and confirm elements are discoverable
+
+## Spec File Format
+Each spec file should follow this structure:
+\`\`\`json
+{
+  "version": "1.0.0",
+  "description": "Specs for [page name]",
+  "groups": [
+    { "id": "...", "name": "...", "category": "element-presence", "assertions": [...], "source": "manual" },
+    { "id": "...", "name": "...", "category": "state-consistency", "assertions": [...], "source": "manual" },
+    { "id": "...", "name": "...", "category": "semantic", "assertions": [...], "source": "manual" }
+  ],
+  "metadata": { "component": "...", "pageUrl": "/...", "elementSource": "sdk" }
+}
+\`\`\``,
+    advancedDefaults: {
+      discoveryMode: "enabled",
+      category: "instrumentation",
+      tags: "ui-bridge, sdk, onboarding",
+    },
+  },
 ];

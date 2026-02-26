@@ -20,12 +20,9 @@ import {
   EyeOff,
   Globe,
 } from "lucide-react";
-import {
-  buildSemanticSpecPrompt,
-  type DiscoveredSpec,
-  type SpecGroup,
-} from "@/lib/spec-prompt-builder";
+import { buildSpecPrompt, type DiscoveredSpec, type SpecGroup } from "@/lib/spec-prompt-builder";
 import { parseDiscoveredSpecs, unwrapSpecResponse } from "@/lib/ui-bridge/spec-parser";
+import { getAllSpecs } from "@/lib/spec-registry";
 
 const API_BASE = "http://localhost:9876";
 
@@ -51,11 +48,14 @@ export interface SpecSourceSectionProps {
 
 // localStorage key
 const STORAGE_KEY = "ai-generate-spec-source";
+// Bump this when bundled specs change to auto-select new groups
+const BUNDLED_SPEC_VERSION = 3;
 
 interface PersistedSpecState {
   sdkUrl: string;
   discoveredSpecs: DiscoveredSpec[];
   selectedGroupIds: string[];
+  bundledSpecVersion?: number;
   discoveredPages?: DiscoveredPage[];
   selectedPageUrls?: string[];
 }
@@ -65,24 +65,11 @@ interface PersistedSpecState {
 // =============================================================================
 
 /**
- * Filter specs to only keep groups where category === "semantic".
- * Removes specs that end up with no semantic groups.
+ * Pass through all specs that have at least one group.
+ * No longer filters by category — the UI selection handles filtering.
  */
-function filterSemanticGroups(specs: DiscoveredSpec[]): DiscoveredSpec[] {
-  const filtered: DiscoveredSpec[] = [];
-  for (const spec of specs) {
-    const semanticGroups = (spec.config?.groups ?? []).filter((g) => g.category === "semantic");
-    if (semanticGroups.length > 0) {
-      filtered.push({
-        ...spec,
-        config: {
-          ...spec.config,
-          groups: semanticGroups,
-        },
-      });
-    }
-  }
-  return filtered;
+function filterSelectedGroups(specs: DiscoveredSpec[]): DiscoveredSpec[] {
+  return specs.filter((spec) => (spec.config?.groups ?? []).length > 0);
 }
 
 /** Get the page URL for a spec */
@@ -168,37 +155,29 @@ export function SpecSourceSection({ onSpecsChanged }: SpecSourceSectionProps) {
     };
   }, []);
 
-  // Load persisted specs from localStorage on mount
+  // Load bundled specs on mount, overlay persisted selection state
   useEffect(() => {
+    // Start with all bundled specs
+    const bundled = getAllSpecs();
+    const specMap = new Map(bundled.map((s) => [s.specId, s]));
+
+    // Merge any additional specs from localStorage (e.g. from external apps)
+    let persistedSelectedIds: string[] | null = null;
+    let persistedPages: DiscoveredPage[] = [];
+    let persistedPageUrls: string[] = [];
     try {
       const stored = localStorage.getItem(STORAGE_KEY);
       if (stored) {
         const parsed: PersistedSpecState = JSON.parse(stored);
+        persistedSelectedIds = parsed.selectedGroupIds ?? null;
+        persistedPages = parsed.discoveredPages ?? [];
+        persistedPageUrls = parsed.selectedPageUrls ?? [];
         if (parsed.discoveredSpecs?.length > 0) {
-          const filtered = filterSemanticGroups(parsed.discoveredSpecs);
-          if (filtered.length > 0) {
-            setDiscoveredSpecs(filtered);
-            const ids = new Set(parsed.selectedGroupIds ?? []);
-            const validIds = new Set<string>();
-            for (const spec of filtered) {
-              for (const group of spec.config?.groups ?? []) {
-                if (ids.has(group.id)) {
-                  validIds.add(group.id);
-                }
-              }
+          const filtered = filterSelectedGroups(parsed.discoveredSpecs);
+          for (const spec of filtered) {
+            if (!specMap.has(spec.specId)) {
+              specMap.set(spec.specId, spec);
             }
-            setSelectedGroupIds(validIds);
-
-            // Restore multi-page state
-            const pages = parsed.discoveredPages ?? [];
-            const pageUrls = new Set(parsed.selectedPageUrls ?? []);
-            setDiscoveredPages(pages);
-            setSelectedPageUrls(pageUrls);
-
-            if (validIds.size > 0) {
-              setIsOpen(true);
-            }
-            onSpecsChangedRef.current(buildState(filtered, validIds, pages, pageUrls));
           }
         }
         if (parsed.sdkUrl) {
@@ -208,6 +187,53 @@ export function SpecSourceSection({ onSpecsChanged }: SpecSourceSectionProps) {
     } catch {
       // Ignore parse errors
     }
+
+    const allSpecs = Array.from(specMap.values());
+
+    // Build selected IDs
+    const selectedIds = new Set<string>();
+
+    // Check if bundled specs version changed
+    let storedVersion = 0;
+    try {
+      const stored = localStorage.getItem(STORAGE_KEY);
+      if (stored) {
+        storedVersion = JSON.parse(stored).bundledSpecVersion ?? 0;
+      }
+    } catch {
+      // ignore
+    }
+
+    const versionChanged = storedVersion !== BUNDLED_SPEC_VERSION;
+
+    if (versionChanged || persistedSelectedIds === null) {
+      for (const spec of allSpecs) {
+        for (const group of spec.config?.groups ?? []) {
+          selectedIds.add(group.id);
+        }
+      }
+    } else {
+      const persistedSet = new Set(persistedSelectedIds);
+      for (const spec of allSpecs) {
+        for (const group of spec.config?.groups ?? []) {
+          if (persistedSet.has(group.id)) {
+            selectedIds.add(group.id);
+          }
+        }
+      }
+    }
+
+    const pages = persistedPages;
+    const pageUrls = new Set(persistedPageUrls);
+
+    setDiscoveredSpecs(allSpecs);
+    setSelectedGroupIds(selectedIds);
+    setDiscoveredPages(pages);
+    setSelectedPageUrls(pageUrls);
+    if (allSpecs.length > 0) {
+      setIsOpen(true);
+    }
+    onSpecsChangedRef.current(buildState(allSpecs, selectedIds, pages, pageUrls));
   }, [buildState]);
 
   // Persist state changes
@@ -216,6 +242,7 @@ export function SpecSourceSection({ onSpecsChanged }: SpecSourceSectionProps) {
       sdkUrl,
       discoveredSpecs,
       selectedGroupIds: Array.from(selectedGroupIds),
+      bundledSpecVersion: BUNDLED_SPEC_VERSION,
       discoveredPages,
       selectedPageUrls: Array.from(selectedPageUrls),
     };
@@ -314,7 +341,7 @@ export function SpecSourceSection({ onSpecsChanged }: SpecSourceSectionProps) {
       const json = await resp.json();
       const rawSpecs = unwrapSpecResponse(json.data ?? json);
       const allSpecs = parseDiscoveredSpecs(rawSpecs);
-      const semanticSpecs = filterSemanticGroups(allSpecs);
+      const semanticSpecs = filterSelectedGroups(allSpecs);
       if (semanticSpecs.length === 0) return;
       mergeSpecs(semanticSpecs);
       setIsOpen(true);
@@ -389,7 +416,7 @@ export function SpecSourceSection({ onSpecsChanged }: SpecSourceSectionProps) {
           const specJson = await specResp.json();
           const rawSpecs = unwrapSpecResponse(specJson.data ?? specJson);
           const specs = parseDiscoveredSpecs(rawSpecs);
-          const semanticSpecs = filterSemanticGroups(specs);
+          const semanticSpecs = filterSelectedGroups(specs);
 
           const title = pathname;
           pages.push({ url: pathname, title });
@@ -584,7 +611,7 @@ export function SpecSourceSection({ onSpecsChanged }: SpecSourceSectionProps) {
   const [showPromptPreview, setShowPromptPreview] = useState(false);
   const promptPreview = useMemo(() => {
     if (selectedCount === 0) return null;
-    return buildSemanticSpecPrompt({ discoveredSpecs, selectedGroupIds });
+    return buildSpecPrompt({ discoveredSpecs, selectedGroupIds });
   }, [discoveredSpecs, selectedGroupIds, selectedCount]);
 
   return (
@@ -710,7 +737,7 @@ export function SpecSourceSection({ onSpecsChanged }: SpecSourceSectionProps) {
               {/* Header with select all/none/clear */}
               <div className="flex items-center justify-between">
                 <span className="text-xs font-medium text-zinc-400 uppercase tracking-wider">
-                  Semantic Specs ({selectedCount}/{totalGroups})
+                  Page Specs ({selectedCount}/{totalGroups})
                 </span>
                 <div className="flex items-center gap-2 text-xs">
                   <button onClick={handleSelectAll} className="text-zinc-500 hover:text-zinc-200">

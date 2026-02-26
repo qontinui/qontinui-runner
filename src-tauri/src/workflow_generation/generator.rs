@@ -79,6 +79,14 @@ pub struct GenerateWorkflowRequest {
     /// Discovery mode: "auto" (default), "enabled" (always), "disabled" (never)
     #[serde(default)]
     pub discovery_mode: Option<String>,
+
+    /// Whether to include UI Bridge SDK integration instructions in the builder prompt (default: true)
+    #[serde(default = "default_true")]
+    pub include_ui_bridge_instructions: Option<bool>,
+}
+
+fn default_true() -> Option<bool> {
+    Some(true)
 }
 
 /// One pass of the verification→fix loop.
@@ -369,6 +377,9 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
     if !context_section.is_empty() {
         sections.push(context_section.clone());
     }
+    if request.include_ui_bridge_instructions.unwrap_or(true) {
+        sections.push(UI_BRIDGE_INSTRUCTIONS.to_string());
+    }
     sections.push(user_prompt.clone());
     let full_prompt = sections.join("\n\n");
 
@@ -525,6 +536,162 @@ Examples:
         workflow_json = workflow_json,
     )
 }
+
+/// Comprehensive UI Bridge SDK integration instructions injected into the builder prompt
+/// when `include_ui_bridge_instructions` is true (the default).
+const UI_BRIDGE_INSTRUCTIONS: &str = r#"## UI Bridge SDK Integration
+
+When the workflow's agentic prompts instruct AI to create or modify React frontend code, include these UI Bridge SDK integration instructions in the agentic prompt content so the AI agent adds proper SDK instrumentation to the code it writes.
+
+### data-ui-id Attributes
+Add `data-ui-id` attributes to all interactive and semantically meaningful elements.
+Naming convention: `{feature}-{component}-{element}` (e.g., `settings-form-save-btn`, `dashboard-metrics-revenue`, `nav-sidebar-home-link`).
+- Buttons: `feature-component-action-btn`
+- Inputs: `feature-component-field-input`
+- Links: `feature-component-target-link`
+- Display elements: `feature-component-content-name`
+
+### useUIElement Hook
+Register interactive elements (buttons, inputs, links, toggles) with useUIElement for programmatic discovery and control:
+```tsx
+import { useUIElement } from '@/hooks/useUIBridge';
+
+const { ref } = useUIElement({
+  id: 'feature-component-element',
+  type: 'button', // 'button' | 'input' | 'link' | 'toggle' | 'select' | 'display'
+  label: 'Human-Readable Label',
+});
+// Attach ref to the element: <button ref={ref} data-ui-id="feature-component-element">...</button>
+```
+
+### useUIComponent Hook
+Register component-level actions for automation and group child elements:
+```tsx
+import { useUIComponent } from '@/hooks/useUIBridge';
+
+useUIComponent({
+  id: 'feature-component',
+  name: 'Component Name',
+  description: 'What this component does',
+  actions: [
+    { id: 'submit', label: 'Submit Form', handler: handleSubmit },
+    { id: 'reset', label: 'Reset Form', handler: handleReset },
+  ],
+  elementIds: ['feature-component-name-input', 'feature-component-submit-btn'],
+});
+```
+
+### useUIState Hook
+Register conditional UI states for status tracking:
+```tsx
+import { useUIState } from '@/hooks/useUIBridge';
+
+useUIState({
+  id: 'feature-component-loading',
+  value: isLoading,
+  label: 'Loading State',
+});
+```
+
+### Page Spec Files (.spec.uibridge.json)
+Create a `.spec.uibridge.json` file alongside each new page/route with grouped assertions covering multiple categories:
+```json
+{
+  "version": "1.0.0",
+  "description": "Specs for the feature page",
+  "groups": [
+    {
+      "id": "feature-page-structure",
+      "name": "Page Structure",
+      "description": "Core layout elements of the feature page",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "feature-heading",
+          "description": "Page heading is present",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "role": "heading", "textContent": "Feature" } },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "feature-form-state",
+      "name": "Form State",
+      "description": "Interactive state of form elements",
+      "category": "state-consistency",
+      "assertions": [
+        {
+          "id": "feature-submit-enabled",
+          "description": "Submit button is enabled when form is valid",
+          "category": "state-consistency",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "role": "button", "textContent": "Submit" } },
+          "assertionType": "enabled",
+          "condition": { "type": "exists", "target": { "type": "search", "criteria": { "idPattern": "feature-form-valid" } } },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "feature-submit-disabled-empty",
+          "description": "Submit button is disabled when form is empty",
+          "category": "form-validation",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "role": "button", "textContent": "Submit" } },
+          "assertionType": "disabled",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "feature-input-value",
+          "description": "Name input starts empty",
+          "category": "form-validation",
+          "severity": "info",
+          "target": { "type": "search", "criteria": { "idPattern": "feature-name-input" } },
+          "assertionType": "hasValue",
+          "expected": "",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "FeaturePage",
+    "pageUrl": "/feature",
+    "elementSource": "sdk"
+  }
+}
+```
+
+### Assertion Types & Severity
+
+Available assertion types: exists, notExists, visible, hidden, enabled, disabled, focused, checked, unchecked, hasText, containsText, hasValue, count, attribute, hasClass, cssProperty.
+
+Severity levels: "critical" (core functionality), "warning" (important features), "info" (nice-to-have).
+
+Use diverse assertion types — not just "exists". Verify element states (enabled/disabled), text content (hasText/containsText), input values (hasValue), and element counts (count). Use conditions for state-dependent assertions (e.g., button disabled when form is empty).
+
+### UIBridgeProvider
+Ensure the app wraps its root with `<UIBridgeProvider>` (usually already done in the app layout).
+
+### Workflow Verification Steps
+For verification steps that check the frontend, prefer UI Bridge SDK endpoints over Playwright:
+- Use `POST /ui-bridge/sdk/connect` in setup to connect to the target app
+- Use `sdk_elements`, `sdk_snapshot`, `sdk_ai_search` for element discovery
+- Use `sdk_ai_execute` for UI interactions
+- Use `sdk_page_navigate` / `sdk_page_refresh` for navigation
+
+These instructions enable the runner to discover, inspect, and control the frontend programmatically for automated testing and verification."#;
 
 /// Hardcoded fallback verification checks, used when no DB connection is available.
 const FALLBACK_VERIFICATION_CHECKS: &str = r#"## What to check

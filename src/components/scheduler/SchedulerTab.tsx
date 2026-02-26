@@ -17,6 +17,7 @@ import { SchedulerTaskList } from "./SchedulerTaskList";
 import { SchedulerTaskForm } from "./SchedulerTaskForm";
 import { SchedulerHistory } from "./SchedulerHistory";
 import { SchedulerSettings } from "./SchedulerSettings";
+import { SchedulerStats } from "./SchedulerStats";
 import type { ScheduledTask, CreateScheduledTaskRequest } from "../../types/scheduler";
 
 type SchedulerSubTab = "tasks" | "history" | "settings";
@@ -129,6 +130,11 @@ export function SchedulerTab({ className = "" }: SchedulerTabProps) {
         <div className="mx-4 mt-4 p-3 bg-destructive/10 text-destructive rounded-lg text-sm">
           {error}
         </div>
+      )}
+
+      {/* Statistics dashboard - hidden when creating/editing a task */}
+      {!isCreating && !editingTask && (
+        <SchedulerStats tasks={tasks} taskHistory={taskHistory} status={status} />
       )}
 
       {/* Sub-tabs */}

@@ -462,6 +462,8 @@ fn store_parsed_findings(db: &CheckpointDb, task_run_id: &str, findings: &[Parse
 /// - Latest verification feedback from knowledge base
 /// - Findings from the findings database
 /// - Previous verification results (pass/fail history)
+/// - Managed process status (if provided by caller)
+/// - Error monitor summary (if provided by caller)
 /// - Accumulated knowledge entries (unresolved issues, solutions, observations)
 /// - Available data APIs for deeper investigation
 /// - Tool priority guidance (UI Bridge vs Playwright)
@@ -469,6 +471,8 @@ fn build_unified_iteration_context(
     checkpoint_db: &CheckpointDb,
     execution_id: &str,
     current_iteration: u32,
+    process_status_summary: Option<&str>,
+    error_monitor_summary: Option<&str>,
 ) -> Option<String> {
     let mut sections = Vec::new();
 
@@ -549,6 +553,16 @@ fn build_unified_iteration_context(
     }
     if has_prev_results {
         sections.push(verification_lines.join("\n"));
+    }
+
+    // 3b. Managed process status (pre-built by caller)
+    if let Some(summary) = process_status_summary {
+        sections.push(summary.to_string());
+    }
+
+    // 3c. Error monitor summary (pre-built by caller)
+    if let Some(summary) = error_monitor_summary {
+        sections.push(summary.to_string());
     }
 
     // 4. Collect accumulated knowledge entries (task_knowledge table)
@@ -670,6 +684,15 @@ fn build_unified_iteration_context(
             "- `curl http://localhost:9876/task-runs/{}/mcp-calls` - MCP tool calls",
             execution_id
         ));
+        api_lines.push(String::new());
+        api_lines.push("**Managed Processes:**".to_string());
+        api_lines.push(
+            "- `GET /processes/status` \u{2014} Current status of all managed processes"
+                .to_string(),
+        );
+        api_lines.push(
+            "- `GET /processes/{id}/output?tail=100` \u{2014} Recent output lines from a managed process".to_string(),
+        );
         api_lines.push(String::new());
         api_lines.push(
             "Use these APIs when you need more detail than provided in this context.".to_string(),
@@ -1957,6 +1980,87 @@ impl AgenticExecutor {
             enhanced_prompt
         };
 
+        // Pre-build managed process status summary for iteration context
+        let process_status_summary = {
+            let mgr_lock = self.app_state.process_capture_manager.lock().await;
+            if let Some(ref mgr) = *mgr_lock {
+                let statuses = mgr.get_all_status().await;
+                if !statuses.is_empty() {
+                    let mut lines = vec!["## Managed Process Status".to_string()];
+                    lines.push("The following dev processes are being managed:".to_string());
+                    for s in &statuses {
+                        let health = s
+                            .port_healthy
+                            .map(|h| {
+                                if h {
+                                    "port healthy"
+                                } else {
+                                    "port not responding"
+                                }
+                            })
+                            .unwrap_or("no health check");
+                        let uptime = s
+                            .uptime_secs
+                            .map(|u| format!("uptime {}s", u))
+                            .unwrap_or_default();
+                        lines.push(format!(
+                            "- {} [{}]: {} ({}, {} errors)",
+                            s.name,
+                            s.category,
+                            s.state,
+                            if uptime.is_empty() {
+                                health.to_string()
+                            } else {
+                                format!("{}, {}", uptime, health)
+                            },
+                            s.error_count
+                        ));
+                    }
+                    Some(lines.join("\n"))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        // Pre-build error monitor summary for iteration context
+        let error_monitor_summary = {
+            match self.app_state.checkpoint_db.get_conn() {
+                Ok(conn) => {
+                    match crate::error_monitor::ErrorEventStorage::get_unresolved(&conn, None, 20) {
+                        Ok(errors) if !errors.is_empty() => {
+                            let mut lines = vec!["## Recent Errors (Error Monitor)".to_string()];
+                            lines.push(format!(
+                                "The error monitor has detected {} unresolved error(s):",
+                                errors.len()
+                            ));
+                            for e in errors.iter().take(15) {
+                                let count_str = if e.occurrence_count > 1 {
+                                    format!(" ({} occurrences)", e.occurrence_count)
+                                } else {
+                                    String::new()
+                                };
+                                lines.push(format!(
+                                    "- [{}] {}{}",
+                                    e.log_source_name,
+                                    e.message.chars().take(200).collect::<String>(),
+                                    count_str
+                                ));
+                            }
+                            if errors.len() > 15 {
+                                lines.push(format!("... and {} more", errors.len() - 15));
+                            }
+                            Some(lines.join("\n"))
+                        }
+                        _ => None,
+                    }
+                }
+                Err(_) => None,
+            }
+        };
+
         // For iteration 2+, add context from previous iterations (findings + verification results)
         // Also for stage > 0 at iteration 1, inject cross-stage context so the AI
         // has visibility into prior stages' findings and knowledge.
@@ -1967,6 +2071,8 @@ impl AgenticExecutor {
                 &self.checkpoint_db,
                 &config.execution_id,
                 iteration,
+                process_status_summary.as_deref(),
+                error_monitor_summary.as_deref(),
             ) {
                 Some(ctx) => {
                     let label = if iteration == 1 {

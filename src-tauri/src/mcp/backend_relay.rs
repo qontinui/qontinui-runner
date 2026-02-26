@@ -648,6 +648,10 @@ async fn handle_relay_command(
                 .and_then(|v| v.as_str())
                 .unwrap_or("Generate workflow from chat conversation")
                 .to_string();
+            let include_ui_bridge = data
+                .get("params")
+                .and_then(|p| p.get("include_ui_bridge_instructions"))
+                .and_then(|v| v.as_bool());
 
             if task_run_id.is_empty() {
                 return Some(serde_json::json!({
@@ -697,6 +701,7 @@ async fn handle_relay_command(
                 context_ids: None,
                 max_fix_iterations: Some(3),
                 discovery_mode: None,
+                include_ui_bridge_instructions: include_ui_bridge,
             };
 
             let doctor_handle = api_state.doctor_handle.clone();

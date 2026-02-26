@@ -1468,6 +1468,60 @@ impl LoopController {
                 failure_context
             };
 
+            // Enrich failure context with recent process stderr from managed processes.
+            // This gives the AI direct visibility into runtime/compiler errors.
+            let failure_context = {
+                let mut enriched = failure_context;
+                let mgr_lock = self.app_state.process_capture_manager.lock().await;
+                if let Some(ref mgr) = *mgr_lock {
+                    let statuses = mgr.get_all_status().await;
+                    let running_ids: Vec<(String, String)> = statuses
+                        .iter()
+                        .filter(|s| s.state != crate::process_capture::types::ProcessState::Stopped)
+                        .map(|s| (s.id.clone(), s.name.clone()))
+                        .collect();
+
+                    let mut stderr_sections: Vec<String> = Vec::new();
+                    for (id, name) in &running_ids {
+                        if let Ok(lines) = mgr.get_output(id, 80).await {
+                            let stderr_lines: Vec<&crate::process_capture::types::OutputLine> =
+                                lines
+                                    .iter()
+                                    .filter(|l| {
+                                        l.stream
+                                            == crate::process_capture::types::OutputStream::Stderr
+                                    })
+                                    .collect();
+                            // Take last 50 stderr lines
+                            let tail: Vec<&&crate::process_capture::types::OutputLine> =
+                                if stderr_lines.len() > 50 {
+                                    stderr_lines[stderr_lines.len() - 50..].iter().collect()
+                                } else {
+                                    stderr_lines.iter().collect()
+                                };
+                            if !tail.is_empty() {
+                                let mut section = format!("**{} (stderr):**\n```\n", name);
+                                for line in &tail {
+                                    section.push_str(&line.line);
+                                    section.push('\n');
+                                }
+                                section.push_str("```");
+                                stderr_sections.push(section);
+                            }
+                        }
+                    }
+
+                    if !stderr_sections.is_empty() {
+                        enriched.push_str("\n\n## Recent Process Errors\n\n");
+                        enriched.push_str(
+                            "The following stderr output was captured from managed dev processes:\n\n",
+                        );
+                        enriched.push_str(&stderr_sections.join("\n\n"));
+                    }
+                }
+                enriched
+            };
+
             // -----------------------------------------------------------------
             // AGENTIC PHASE
             // -----------------------------------------------------------------
@@ -1659,6 +1713,68 @@ impl LoopController {
                     unfixable_errors: false,
                     iteration_results,
                 };
+            }
+
+            // Capture git diff after agentic phase for cross-iteration context.
+            // This helps the AI understand what it changed in the previous iteration.
+            {
+                let parent_id = get_parent_task_id(&config.execution_id);
+                match tokio::process::Command::new("git")
+                    .args(["diff", "--stat"])
+                    .output()
+                    .await
+                {
+                    Ok(output) if output.status.success() => {
+                        let diff_stat = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        if !diff_stat.is_empty() {
+                            // Also capture the actual diff (truncated)
+                            let full_diff = match tokio::process::Command::new("git")
+                                .args(["diff"])
+                                .output()
+                                .await
+                            {
+                                Ok(d) if d.status.success() => {
+                                    let raw = String::from_utf8_lossy(&d.stdout).to_string();
+                                    if raw.len() > 8000 {
+                                        format!(
+                                            "{}...\n[truncated, {} more chars]",
+                                            &raw[..8000],
+                                            raw.len() - 8000
+                                        )
+                                    } else {
+                                        raw
+                                    }
+                                }
+                                _ => String::new(),
+                            };
+
+                            let observation = format!(
+                                "Git changes after iteration {}:\n{}\n\n{}",
+                                iteration, diff_stat, full_diff
+                            );
+                            if let Err(e) = self.knowledge_base.record_observation(
+                                &parent_id,
+                                AgentType::Worker,
+                                iteration,
+                                &observation,
+                                &[],
+                            ) {
+                                warn!(
+                                    "Failed to record git diff observation (iteration {}): {}",
+                                    iteration, e
+                                );
+                            } else {
+                                debug!(
+                                    "Recorded git diff as knowledge observation (iteration {})",
+                                    iteration
+                                );
+                            }
+                        }
+                    }
+                    _ => {
+                        debug!("Git diff capture skipped (git not available or not in repo)");
+                    }
+                }
             }
 
             info!(

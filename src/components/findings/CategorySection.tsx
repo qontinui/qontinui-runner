@@ -48,6 +48,12 @@ const iconMap: Record<string, React.ComponentType<{ className?: string }>> = {
 interface CategorySectionProps {
   category: FindingCategory;
   findings: Finding[];
+  /** Total unfiltered findings count for this category */
+  totalFindingsCount?: number;
+  /** Whether any filter is currently active */
+  isFilterActive?: boolean;
+  /** Whether this category is the selected category filter */
+  isHighlighted?: boolean;
   onAnalyze?: (finding: Finding) => void;
   onResolve?: (finding: Finding, resolution: string) => void;
   onProvideInput?: (finding: Finding, response: string) => void;
@@ -59,6 +65,9 @@ interface CategorySectionProps {
 export function CategorySection({
   category,
   findings,
+  totalFindingsCount,
+  isFilterActive = false,
+  isHighlighted = false,
   onAnalyze,
   onResolve,
   onProvideInput,
@@ -82,10 +91,16 @@ export function CategorySection({
     return null;
   }
 
+  // Determine if we should show "N of M" filtered count
+  const totalCount = totalFindingsCount ?? findings.length;
+  const showFilteredCount = isFilterActive && findings.length !== totalCount;
+
   return (
     <div
       data-ui-id={`findings-category-section-${category.id}`}
-      className="rounded-lg border border-border overflow-hidden"
+      className={`rounded-lg border overflow-hidden ${
+        isHighlighted ? "border-primary/50 ring-1 ring-primary/30" : "border-border"
+      }`}
     >
       {/* Category Header */}
       <button
@@ -112,6 +127,9 @@ export function CategorySection({
             >
               {findings.length}
             </span>
+            {showFilteredCount && (
+              <span className="text-xs text-muted-foreground">of {totalCount}</span>
+            )}
           </div>
           <p className="text-xs text-muted-foreground">{category.description}</p>
         </div>

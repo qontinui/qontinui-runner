@@ -98,6 +98,11 @@ pub enum ServiceCommand {
     ClearWorkflowContext,
     /// Request manual scan of all sources
     ScanAll,
+    /// Ingest errors from a managed process stream (no file needed)
+    IngestStreamErrors {
+        source_name: String,
+        errors: Vec<ErrorEvent>,
+    },
     /// Stop the service
     Stop,
 }
@@ -155,6 +160,22 @@ impl ErrorMonitorHandle {
             .send(ServiceCommand::ScanAll)
             .await
             .map_err(|e| format!("Failed to send scan command: {}", e))
+    }
+
+    /// Ingest errors from a managed process stream.
+    /// These errors are stored and emitted just like file-based errors.
+    pub async fn ingest_stream_errors(
+        &self,
+        source_name: String,
+        errors: Vec<ErrorEvent>,
+    ) -> Result<(), String> {
+        self.command_tx
+            .send(ServiceCommand::IngestStreamErrors {
+                source_name,
+                errors,
+            })
+            .await
+            .map_err(|e| format!("Failed to send ingest stream errors command: {}", e))
     }
 
     /// Stop the error monitor service.
@@ -294,6 +315,37 @@ impl ErrorMonitorService {
                         }
                         ServiceCommand::ScanAll => {
                             self.scan_all_sources().await;
+                        }
+                        ServiceCommand::IngestStreamErrors { source_name, errors } => {
+                            if !errors.is_empty() {
+                                tracing::debug!(
+                                    "Ingesting {} stream error(s) from '{}'",
+                                    errors.len(),
+                                    source_name
+                                );
+                                match self.store_errors(errors).await {
+                                    Ok(stored) => {
+                                        if stored.len() == 1 {
+                                            let _ = self.event_tx.send(
+                                                ErrorMonitorEvent::NewError(Box::new(
+                                                    stored.into_iter().next().unwrap(),
+                                                ))
+                                            ).await;
+                                        } else if !stored.is_empty() {
+                                            let _ = self.event_tx.send(
+                                                ErrorMonitorEvent::NewErrors(stored)
+                                            ).await;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Failed to store stream errors from '{}': {}",
+                                            source_name,
+                                            e
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                 }

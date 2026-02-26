@@ -353,7 +353,7 @@ mod tests {
 
     #[test]
     fn test_vector_blob_single_value() {
-        let v = vec![3.14f32];
+        let v = vec![std::f32::consts::PI];
         let blob = vector_to_blob(&v);
         assert_eq!(blob.len(), 4);
         let recovered = blob_to_vector(&blob).unwrap();

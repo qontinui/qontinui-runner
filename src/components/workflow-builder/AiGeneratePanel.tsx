@@ -26,6 +26,7 @@ import {
   Monitor,
   Rocket,
   ListOrdered,
+  Plug,
   X,
   Save,
   AlertCircle,
@@ -34,7 +35,7 @@ import {
 } from "lucide-react";
 import { getAccentColors } from "@/design-system";
 import { SpecSourceSection, type SpecSourceState } from "./SpecSourceSection";
-import { buildSemanticSpecPrompt } from "@/lib/spec-prompt-builder";
+import { buildSpecPrompt } from "@/lib/spec-prompt-builder";
 import {
   GENERATION_TEMPLATES,
   type WorkflowGenerationTemplate,
@@ -51,6 +52,7 @@ const TEMPLATE_ICONS: Record<string, LucideIcon> = {
   Monitor,
   Rocket,
   ListOrdered,
+  Plug,
 };
 
 // Provider and model constants
@@ -439,7 +441,7 @@ export function AiGeneratePanel({
 
     let fullDescription = "";
     if (specState.discoveredSpecs.length > 0 && specState.selectedGroupIds.size > 0) {
-      const specResult = buildSemanticSpecPrompt({
+      const specResult = buildSpecPrompt({
         discoveredSpecs: specState.discoveredSpecs,
         selectedGroupIds: specState.selectedGroupIds,
       });
@@ -477,7 +479,7 @@ export function AiGeneratePanel({
       }
       if (pageGroupIds.size === 0) continue;
 
-      const specResult = buildSemanticSpecPrompt({
+      const specResult = buildSpecPrompt({
         discoveredSpecs: pageSpecs,
         selectedGroupIds: pageGroupIds,
       });

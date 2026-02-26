@@ -13,6 +13,7 @@ export type {
   ScheduleOnce,
   ScheduleCron,
   ScheduleInterval,
+  ScheduleState,
   ScheduleExpression,
   IdleCondition,
   RepositoryWatch,

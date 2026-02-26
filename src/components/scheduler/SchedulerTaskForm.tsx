@@ -5,7 +5,7 @@
  */
 
 import { useState, useEffect } from "react";
-import { X, Save, Loader2, Trash2, Plus, FolderOpen } from "lucide-react";
+import { X, Save, Loader2, Trash2, Plus, FolderOpen, GitBranch } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getAccentColors } from "@/design-system";
 import type {
@@ -37,7 +37,7 @@ interface SchedulerTaskFormProps {
   loading: boolean;
 }
 
-type ScheduleType = "once" | "cron" | "interval";
+type ScheduleType = "once" | "cron" | "interval" | "state";
 type TaskType = "workflow" | "prompt" | "autofix";
 
 const CRON_PRESETS = [
@@ -70,6 +70,8 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
         return "cron";
       case "Interval":
         return "interval";
+      case "State":
+        return "state";
     }
   });
   const [onceDateTime, setOnceDateTime] = useState(() => {
@@ -87,6 +89,15 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
   );
   const [intervalSeconds, setIntervalSeconds] = useState(
     task?.schedule.type === "Interval" ? task.schedule.value : 3600,
+  );
+  const [stateId, setStateId] = useState(
+    task?.schedule.type === "State" ? task.schedule.state_id : "",
+  );
+  const [checkDelay, setCheckDelay] = useState(
+    task?.schedule.type === "State" ? (task.schedule.check_delay_seconds ?? 0) : 0,
+  );
+  const [rebuildDelay, setRebuildDelay] = useState(
+    task?.schedule.type === "State" ? (task.schedule.rebuild_delay_seconds ?? 300) : 300,
   );
 
   // Task type state
@@ -200,6 +211,13 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
         return { type: "Cron", value: cronExpression };
       case "interval":
         return { type: "Interval", value: intervalSeconds };
+      case "state":
+        return {
+          type: "State",
+          state_id: stateId,
+          check_delay_seconds: checkDelay || undefined,
+          rebuild_delay_seconds: rebuildDelay || undefined,
+        };
     }
   };
 
@@ -310,6 +328,9 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
   const isValid = () => {
     if (!name.trim()) return false;
 
+    // Schedule-type validation
+    if (scheduleType === "state" && !stateId.trim()) return false;
+
     switch (taskType) {
       case "workflow":
         return workflowName.trim() !== "";
@@ -394,6 +415,19 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
             />
             <span className="text-sm">Interval</span>
           </label>
+          <label className="flex items-center gap-2">
+            <input
+              type="radio"
+              name="scheduleType"
+              checked={scheduleType === "state"}
+              onChange={() => setScheduleType("state")}
+              className="text-primary"
+            />
+            <span className="text-sm flex items-center gap-1">
+              <GitBranch className="w-3.5 h-3.5" />
+              State Trigger
+            </span>
+          </label>
         </div>
 
         {scheduleType === "cron" && (
@@ -442,6 +476,55 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
               className="w-32 px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50"
             />
             <span className="text-sm text-muted-foreground">seconds</span>
+          </div>
+        )}
+
+        {scheduleType === "state" && (
+          <div className="space-y-4">
+            <p className="text-xs text-muted-foreground">
+              Triggered when a state machine enters a specific state
+            </p>
+            <div className="space-y-2">
+              <label className="block text-sm font-medium mb-1">State ID *</label>
+              <input
+                type="text"
+                value={stateId}
+                onChange={(e) => setStateId(e.target.value)}
+                placeholder="e.g., build_complete, tests_passed"
+                className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50"
+              />
+              <p className="text-xs text-muted-foreground">
+                The state machine state that triggers this task
+              </p>
+            </div>
+            <div className="space-y-2">
+              <label className="block text-sm font-medium mb-1">Check Delay (seconds)</label>
+              <input
+                type="number"
+                value={checkDelay}
+                onChange={(e) => setCheckDelay(Number(e.target.value))}
+                placeholder="0"
+                min={0}
+                className="w-32 px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50"
+              />
+              <p className="text-xs text-muted-foreground">
+                Wait this many seconds after state entry before triggering
+              </p>
+            </div>
+            <div className="space-y-2">
+              <label className="block text-sm font-medium mb-1">Rebuild Delay (seconds)</label>
+              <input
+                type="number"
+                value={rebuildDelay}
+                onChange={(e) => setRebuildDelay(Number(e.target.value))}
+                placeholder="300"
+                min={0}
+                className="w-32 px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50"
+              />
+              <p className="text-xs text-muted-foreground">
+                Minimum seconds between re-triggers if state is re-entered
+              </p>
+            </div>
           </div>
         )}
       </div>

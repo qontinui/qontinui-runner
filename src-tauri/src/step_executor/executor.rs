@@ -513,6 +513,25 @@ pub struct ExecutionStepConfig {
     pub ref_workflow_name: Option<String>,
 
     // ========================================================================
+    // Restart Process Step Fields
+    // ========================================================================
+    /// Process config ID to restart
+    #[serde(alias = "restartProcessId", alias = "restart_process_id")]
+    pub restart_process_id: Option<String>,
+
+    /// Process name to restart (resolved to ID at runtime)
+    #[serde(alias = "restartProcessName", alias = "restart_process_name")]
+    pub restart_process_name: Option<String>,
+
+    /// Whether to wait for health port after restart (default: true)
+    #[serde(
+        alias = "restartWaitForHealth",
+        alias = "restart_wait_for_health",
+        default
+    )]
+    pub restart_wait_for_health: Option<bool>,
+
+    // ========================================================================
     // Console Error Handling
     // ========================================================================
     /// If true, step fails when console errors are captured during execution

@@ -285,6 +285,7 @@ pub fn create_router(
         .merge(crate::mcp::models::routes())
         .merge(crate::mcp::monitors::routes())
         .merge(crate::mcp::playwright::routes())
+        .merge(crate::mcp::processes::routes())
         .merge(crate::mcp::prompts::routes())
         .merge(crate::mcp::query_tool::routes())
         .merge(crate::mcp::rag::routes())

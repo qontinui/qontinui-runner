@@ -34,6 +34,7 @@ import {
   BarChart3,
   Database,
   TestTube,
+  MessageSquare,
 } from "lucide-react";
 
 // Contexts
@@ -117,9 +118,19 @@ import ActionDetailModal from "./components/ActionDetailModal";
 import ImageDetailModal from "./components/ImageDetailModal";
 import { Settings } from "./components/Settings";
 import { LoginScreen } from "./components/LoginScreen";
+import { SetupWizard } from "./components/setup-wizard";
 import { LogSourcePicker } from "./components/LogSourcePicker";
 import { AiTab } from "./components/AiTab";
 import { LibraryDashboard } from "./components/LibraryDashboard";
+import {
+  ChecksPage,
+  CheckGroupsPage,
+  ShellCommandsPage,
+  TasksPage,
+  ContextsPage,
+  PlaywrightTestsPage,
+} from "./components/library";
+import { StepBuildersPage } from "./components/StepBuildersPage";
 import { HelpTab } from "./components/HelpTab";
 import { SchedulerTab } from "./components/scheduler";
 import { Sidebar } from "./components/navigation";
@@ -147,6 +158,7 @@ import { ExternalLogsTab as _ExternalLogsTab } from "./components/ExternalLogsTa
 import { CategoryManager } from "./components/findings/CategoryManager";
 import { HooksManagerPanel } from "./components/hooks";
 import { ErrorMonitorTab } from "./components/error-monitor";
+import { ProcessManagerTab } from "./components/process-manager";
 import { ReflectionDashboard } from "./components/reflection-dashboard/ReflectionDashboard";
 
 // Development tools
@@ -161,10 +173,12 @@ type LogSubTab = "general" | "image" | "actions";
 type MainTabId =
   | "gui-automation"
   | "workflow-queue"
+  | "run-plan"
   | "active"
   | "runs"
   | "history"
   | "error-monitor"
+  | "processes"
   | "reflection"
   // Observe group - new structure
   | "run-recap"
@@ -188,6 +202,13 @@ type MainTabId =
   | "monitor-statistics"
   | "monitor-discoveries"
   | "library"
+  | "step-builders"
+  | "check-builder"
+  | "check-group-builder"
+  | "shell-command-builder"
+  | "task-builder"
+  | "context-builder"
+  | "playwright-test-builder"
   | "unified-workflow-builder"
   | "capture"
   | "config-log-sources"
@@ -215,10 +236,12 @@ type MainTabId =
 const VALID_TAB_IDS: MainTabId[] = [
   "gui-automation",
   "workflow-queue",
+  "run-plan",
   "active",
   "runs",
   "history",
   "error-monitor",
+  "processes",
   "reflection",
   // New observe tabs
   "run-recap",
@@ -242,6 +265,13 @@ const VALID_TAB_IDS: MainTabId[] = [
   "monitor-statistics",
   "monitor-discoveries",
   "library",
+  "step-builders",
+  "check-builder",
+  "check-group-builder",
+  "shell-command-builder",
+  "task-builder",
+  "context-builder",
+  "playwright-test-builder",
   "unified-workflow-builder",
   "capture",
   "config-log-sources",
@@ -316,6 +346,13 @@ function migrateTabId(stored: string | null): MainTabId {
     "run-exploration": "run-state-explorer",
     "verification-builder": "library", // Builder removed, map to library
     statistics: "run-statistics",
+    // Builder tab migrations (stored last-active-tab → step-builders landing)
+    "check-builder": "step-builders",
+    "check-group-builder": "step-builders",
+    "shell-command-builder": "step-builders",
+    "task-builder": "step-builders",
+    "context-builder": "step-builders",
+    "playwright-test-builder": "step-builders",
     // Configure tab migrations
     "log-sources": "config-log-sources",
     "log-locations": "config-log-sources",
@@ -339,6 +376,14 @@ function migrateTabId(stored: string | null): MainTabId {
 function AppContent() {
   // Auth state from context
   const auth = useAuth();
+
+  // Setup wizard state
+  const [setupCompleted, setSetupCompleted] = useState<boolean | null>(null);
+  useEffect(() => {
+    invoke<boolean>("check_setup_completed")
+      .then(setSetupCompleted)
+      .catch(() => setSetupCompleted(true));
+  }, []);
 
   // HTTP API readiness (port 9876)
   const isApiReady = useApiReady();
@@ -823,6 +868,11 @@ function AppContent() {
     return <LoginScreen onLogin={auth.login} />;
   }
 
+  // Show setup wizard on first launch
+  if (setupCompleted === false) {
+    return <SetupWizard onComplete={() => setSetupCompleted(true)} />;
+  }
+
   console.log("[APP] Rendering main app (authenticated)");
 
   // Get last run task_run_id for render logging context
@@ -839,6 +889,19 @@ function AppContent() {
       case "workflow-queue":
         return (
           <WorkflowQueueTab onNavigateToActive={() => setActiveTab("active")} onLog={addLog} />
+        );
+
+      case "run-plan":
+        return (
+          <div className="h-full flex items-center justify-center">
+            <div className="text-center space-y-4 max-w-md">
+              <MessageSquare className="w-12 h-12 mx-auto text-muted-foreground/50" />
+              <h2 className="text-xl font-semibold">AI Chat</h2>
+              <p className="text-muted-foreground">
+                Plan features with AI and generate workflows. This feature is coming soon.
+              </p>
+            </div>
+          </div>
         );
 
       case "active":
@@ -873,6 +936,13 @@ function AppContent() {
         return (
           <div className="h-full overflow-hidden">
             <ErrorMonitorTab />
+          </div>
+        );
+
+      case "processes":
+        return (
+          <div className="h-full overflow-hidden">
+            <ProcessManagerTab />
           </div>
         );
 
@@ -1089,6 +1159,27 @@ function AppContent() {
 
       case "library":
         return <LibraryDashboard onLog={addLog} />;
+
+      case "step-builders":
+        return <StepBuildersPage onNavigate={(id) => setActiveTab(id as MainTabId)} />;
+
+      case "check-builder":
+        return <ChecksPage />;
+
+      case "check-group-builder":
+        return <CheckGroupsPage />;
+
+      case "shell-command-builder":
+        return <ShellCommandsPage />;
+
+      case "task-builder":
+        return <TasksPage />;
+
+      case "context-builder":
+        return <ContextsPage />;
+
+      case "playwright-test-builder":
+        return <PlaywrightTestsPage />;
 
       case "unified-workflow-builder":
         return (

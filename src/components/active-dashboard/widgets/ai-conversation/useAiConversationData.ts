@@ -19,6 +19,9 @@ const THINKING_THRESHOLD_MS = 5000;
 /**
  * Filter entries to only show entries for a specific task run.
  * This ensures proper isolation when multiple workflows run simultaneously.
+ *
+ * When no taskRunId is specified (idle state), falls back to showing entries
+ * from the most recent task run so users can review completed conversations.
  */
 function filterByTaskRunId(
   allEntries: AiOutputEntry[] | undefined,
@@ -27,11 +30,21 @@ function filterByTaskRunId(
   // Defensive: handle undefined or null input
   if (!allEntries || allEntries.length === 0) return [];
 
-  // If no taskRunId specified, return empty (don't show other tasks' data)
-  if (!taskRunId) return [];
+  // If taskRunId specified, filter to that specific task run
+  if (taskRunId) {
+    return allEntries.filter((entry) => entry.taskRunId === taskRunId);
+  }
 
-  // Filter to only entries for this specific task run
-  return allEntries.filter((entry) => entry.taskRunId === taskRunId);
+  // No taskRunId specified (idle state) — show the most recent task run's entries
+  // so users can still view conversations after a workflow completes
+  const lastEntry = allEntries[allEntries.length - 1];
+  const lastTaskRunId = lastEntry?.taskRunId;
+  if (lastTaskRunId) {
+    return allEntries.filter((entry) => entry.taskRunId === lastTaskRunId);
+  }
+
+  // No task run IDs on any entries — return all entries
+  return allEntries;
 }
 
 /**

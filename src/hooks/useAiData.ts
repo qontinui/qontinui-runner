@@ -15,21 +15,21 @@ import type {
   TextLogsResult,
   TextLogsSummary,
   TextLogType,
-  ScreenshotsResult,
   LoadedConfigInfo,
   AiPromptsResult,
   ContextsResult,
   ConsolidatedAiOutputResult,
   // SQLite migrated log types
   TaskRunEventsResult,
-  TaskRunScreenshotsDbResult,
   TaskRunPlaywrightResultsDbResult,
   TaskRunMigratedLogsSummary,
   TaskRunApiRequestsDbResult,
   TaskRunAwasStepsDbResult,
   TaskRunVerificationResultsDbResult,
+  // Process session types
+  ProcessSession,
+  ProcessSessionOutputLine,
 } from "../types/aiData";
-import type { RunDetails } from "../types/statistics";
 import type { TaskRunMcpCallsDbResult } from "../types/mcp-config";
 
 // Keys for react-query cache
@@ -37,23 +37,18 @@ export const aiDataKeys = {
   all: ["aiData"] as const,
   taskRuns: () => [...aiDataKeys.all, "taskRuns"] as const,
   taskRun: (taskId: string) => [...aiDataKeys.all, "taskRun", taskId] as const,
-  automationRuns: (configId: string) => [...aiDataKeys.all, "automationRuns", configId] as const,
-  automationRun: (runId: string) => [...aiDataKeys.all, "automationRun", runId] as const,
   jsonlSummary: () => [...aiDataKeys.all, "jsonlSummary"] as const,
   jsonlLogs: (logType: JsonlLogType) => [...aiDataKeys.all, "jsonlLogs", logType] as const,
   consolidatedAiOutput: (taskRunId: string) =>
     [...aiDataKeys.all, "consolidatedAiOutput", taskRunId] as const,
   textSummary: () => [...aiDataKeys.all, "textSummary"] as const,
   textLogs: (logType: TextLogType) => [...aiDataKeys.all, "textLogs", logType] as const,
-  screenshots: () => [...aiDataKeys.all, "screenshots"] as const,
   loadedConfig: () => [...aiDataKeys.all, "loadedConfig"] as const,
   aiPrompts: (taskRunId: string) => [...aiDataKeys.all, "aiPrompts", taskRunId] as const,
   contexts: () => [...aiDataKeys.all, "contexts"] as const,
   // SQLite migrated logs
   taskRunEvents: (taskRunId: string, eventType?: string) =>
     [...aiDataKeys.all, "taskRunEvents", taskRunId, eventType] as const,
-  taskRunScreenshotsDb: (taskRunId: string) =>
-    [...aiDataKeys.all, "taskRunScreenshotsDb", taskRunId] as const,
   taskRunPlaywrightResults: (taskRunId: string) =>
     [...aiDataKeys.all, "taskRunPlaywrightResults", taskRunId] as const,
   taskRunMigratedLogsSummary: (taskRunId: string) =>
@@ -66,6 +61,9 @@ export const aiDataKeys = {
     [...aiDataKeys.all, "taskRunMcpCalls", taskRunId, successFilter] as const,
   taskRunVerificationResults: (taskRunId: string) =>
     [...aiDataKeys.all, "taskRunVerificationResults", taskRunId] as const,
+  processSessions: (configId?: string) => [...aiDataKeys.all, "processSessions", configId] as const,
+  processSessionOutput: (sessionId: string) =>
+    [...aiDataKeys.all, "processSessionOutput", sessionId] as const,
 };
 
 /**
@@ -115,45 +113,6 @@ export function useTaskRun(taskId: string | null) {
     },
   });
   return query;
-}
-
-/**
- * Hook to get automation runs for a config
- */
-export function useAutomationRuns(configId: string | null, limit?: number) {
-  return useQuery({
-    queryKey: [...aiDataKeys.automationRuns(configId ?? ""), limit],
-    queryFn: async (): Promise<RunDetails[]> => {
-      if (!configId) return [];
-      const response = await aiDataService.getAutomationRuns(configId, limit);
-      if (!response.success || !response.data) {
-        throw new Error(response.error || "Failed to load automation runs");
-      }
-      return response.data;
-    },
-    enabled: !!configId,
-    staleTime: 10000,
-    refetchInterval: 30000,
-  });
-}
-
-/**
- * Hook to get a specific automation run
- */
-export function useAutomationRun(runId: string | null) {
-  return useQuery({
-    queryKey: aiDataKeys.automationRun(runId ?? ""),
-    queryFn: async (): Promise<RunDetails | null> => {
-      if (!runId) return null;
-      const response = await aiDataService.getAutomationRun(runId);
-      if (!response.success || !response.data) {
-        throw new Error(response.error || "Failed to load automation run");
-      }
-      return response.data;
-    },
-    enabled: !!runId,
-    staleTime: 10000,
-  });
 }
 
 /**
@@ -307,28 +266,6 @@ export function useTextLogs(logType: TextLogType, taskRunId: string | null) {
 }
 
 // =============================================================================
-// Screenshots
-// =============================================================================
-
-/**
- * Hook to get screenshots (annotated and playwright)
- */
-export function useScreenshots() {
-  return useQuery({
-    queryKey: aiDataKeys.screenshots(),
-    queryFn: async (): Promise<ScreenshotsResult | null> => {
-      const response = await aiDataService.getScreenshots();
-      if (!response.success || !response.data) {
-        throw new Error(response.error || "Failed to load screenshots");
-      }
-      return response.data;
-    },
-    staleTime: 5000,
-    refetchInterval: 15000, // Refetch every 15 seconds
-  });
-}
-
-// =============================================================================
 // Loaded Config
 // =============================================================================
 
@@ -418,26 +355,6 @@ export function useTaskRunEvents(taskRunId: string | null, eventType?: string) {
     },
     enabled: !!taskRunId,
     staleTime: 10000, // 10 seconds - data is static after migration
-  });
-}
-
-/**
- * Hook to get task run screenshots from SQLite database.
- * @param taskRunId - Task run ID to get screenshots for
- */
-export function useTaskRunScreenshotsFromDb(taskRunId: string | null) {
-  return useQuery({
-    queryKey: aiDataKeys.taskRunScreenshotsDb(taskRunId ?? ""),
-    queryFn: async (): Promise<TaskRunScreenshotsDbResult | null> => {
-      if (!taskRunId) return null;
-      const response = await aiDataService.getTaskRunScreenshotsFromDb(taskRunId);
-      if (!response.success || !response.data) {
-        throw new Error(response.error || "Failed to load task run screenshots");
-      }
-      return response.data;
-    },
-    enabled: !!taskRunId,
-    staleTime: 10000,
   });
 }
 
@@ -562,5 +479,50 @@ export function useTaskRunVerificationResults(taskRunId: string | null) {
     },
     enabled: !!taskRunId,
     staleTime: 10000,
+  });
+}
+
+// =============================================================================
+// Process Sessions (persistent process history)
+// =============================================================================
+
+/**
+ * Hook to get process sessions from database.
+ * @param configId - Optional process config ID to filter by
+ * @param limit - Maximum number of sessions to return
+ */
+export function useProcessSessions(configId?: string, limit?: number) {
+  return useQuery({
+    queryKey: [...aiDataKeys.processSessions(configId), limit],
+    queryFn: async (): Promise<ProcessSession[]> => {
+      const response = await aiDataService.getProcessSessions(configId, limit);
+      if (!response.success || !response.data) {
+        throw new Error(response.error || "Failed to load process sessions");
+      }
+      return response.data;
+    },
+    staleTime: 10000,
+  });
+}
+
+/**
+ * Hook to get process session output from database.
+ * @param sessionId - Session ID to get output for (null to disable)
+ * @param limit - Maximum number of lines to return
+ * @param offset - Offset for pagination
+ */
+export function useProcessSessionOutput(sessionId: string | null, limit?: number, offset?: number) {
+  return useQuery({
+    queryKey: [...aiDataKeys.processSessionOutput(sessionId ?? ""), limit, offset],
+    queryFn: async (): Promise<ProcessSessionOutputLine[]> => {
+      if (!sessionId) return [];
+      const response = await aiDataService.getProcessSessionOutput(sessionId, limit, offset);
+      if (!response.success || !response.data) {
+        throw new Error(response.error || "Failed to load process session output");
+      }
+      return response.data;
+    },
+    enabled: !!sessionId,
+    staleTime: 30000,
   });
 }

@@ -21,10 +21,11 @@ import {
   ToggleLeft,
   ToggleRight,
   Wrench,
+  X,
 } from "lucide-react";
 import { getStatusColors, getAccentColors } from "@/design-system";
 import type { ExecutionReport as ExecutionReportType, Finding } from "../../types/findings";
-import { findingsTracker, getVisibleCategories } from "../../services";
+import { findingsTracker, getVisibleCategories, getCategoryById } from "../../services";
 import { CategorySection } from "./CategorySection";
 import { useAiTaskPolling } from "../../hooks";
 import { useRunSelectionOptional } from "../../contexts/RunSelectionContext";
@@ -54,6 +55,15 @@ const statusLabels: Record<
 
 type FilterMode = "all" | "actionable" | "needs_input" | "resolved";
 
+const SEVERITY_OPTIONS: { value: string; label: string }[] = [
+  { value: "all", label: "All Severities" },
+  { value: "critical", label: "Critical" },
+  { value: "high", label: "High" },
+  { value: "medium", label: "Medium" },
+  { value: "low", label: "Low" },
+  { value: "info", label: "Info" },
+];
+
 export function ExecutionReport({
   report,
   onAnalyzeFinding,
@@ -63,7 +73,11 @@ export function ExecutionReport({
   onContinue,
 }: ExecutionReportProps) {
   const [filterMode, setFilterMode] = useState<FilterMode>("all");
+  const [severityFilter, setSeverityFilter] = useState<string>("all");
+  const [categoryFilter, setCategoryFilter] = useState<string>("all");
   const [showFilterMenu, setShowFilterMenu] = useState(false);
+  const [showSeverityMenu, setShowSeverityMenu] = useState(false);
+  const [showCategoryMenu, setShowCategoryMenu] = useState(false);
   const [processingFindingId, setProcessingFindingId] = useState<string | null>(null);
   const [liveFindings, setLiveFindings] = useState<Finding[]>([]);
   const [isAnalyzingAll, setIsAnalyzingAll] = useState(false);
@@ -148,21 +162,64 @@ export function ExecutionReport({
   // Get visible categories
   const categories = useMemo(() => getVisibleCategories(), []);
 
-  // Filter findings based on filter mode
+  // Build dynamic category options from current findings
+  const categoryOptions = useMemo(() => {
+    const uniqueCategoryIds = new Set(findings.map((f) => f.categoryId));
+    const options: { value: string; label: string }[] = [{ value: "all", label: "All Categories" }];
+    for (const catId of uniqueCategoryIds) {
+      const category = getCategoryById(catId);
+      options.push({ value: catId, label: category?.name ?? catId });
+    }
+    return options;
+  }, [findings]);
+
+  // Count of active filters (not counting "all" as active)
+  const activeFilterCount = useMemo(() => {
+    let count = 0;
+    if (filterMode !== "all") count++;
+    if (severityFilter !== "all") count++;
+    if (categoryFilter !== "all") count++;
+    return count;
+  }, [filterMode, severityFilter, categoryFilter]);
+
+  // Clear all filters
+  const clearAllFilters = useCallback(() => {
+    setFilterMode("all");
+    setSeverityFilter("all");
+    setCategoryFilter("all");
+  }, []);
+
+  // Filter findings based on all filter criteria
   const filteredFindings = useMemo(() => {
+    let result = findings;
+
+    // Mode filter
     switch (filterMode) {
       case "actionable":
-        return findings.filter(
+        result = result.filter(
           (f) => f.actionable && f.status !== "resolved" && f.status !== "wont_fix",
         );
+        break;
       case "needs_input":
-        return findings.filter((f) => f.status === "needs_input");
+        result = result.filter((f) => f.status === "needs_input");
+        break;
       case "resolved":
-        return findings.filter((f) => f.status === "resolved");
-      default:
-        return findings;
+        result = result.filter((f) => f.status === "resolved");
+        break;
     }
-  }, [findings, filterMode]);
+
+    // Severity filter
+    if (severityFilter !== "all") {
+      result = result.filter((f) => f.severity === severityFilter);
+    }
+
+    // Category filter
+    if (categoryFilter !== "all") {
+      result = result.filter((f) => f.categoryId === categoryFilter);
+    }
+
+    return result;
+  }, [findings, filterMode, severityFilter, categoryFilter]);
 
   // Group findings by category
   const findingsByCategory = useMemo(() => {
@@ -173,6 +230,18 @@ export function ExecutionReport({
     }
     return grouped;
   }, [filteredFindings]);
+
+  // Total (unfiltered) findings count by category - used for "N of M" display
+  const totalFindingsByCategory = useMemo(() => {
+    const grouped = new Map<string, number>();
+    for (const finding of findings) {
+      grouped.set(finding.categoryId, (grouped.get(finding.categoryId) || 0) + 1);
+    }
+    return grouped;
+  }, [findings]);
+
+  // Whether any filter is active (for showing "N of M" badges)
+  const isFilterActive = activeFilterCount > 0;
 
   // Calculate summary stats
   const summary = useMemo(() => {
@@ -459,48 +528,163 @@ Work through ALL findings systematically. Fix each one and report your resolutio
 
         {/* Filter and Actions */}
         <div className="flex items-center justify-between">
-          {/* Filter Dropdown */}
-          <div className="relative">
-            <button
-              data-ui-id="findings-filter-btn"
-              onClick={() => setShowFilterMenu(!showFilterMenu)}
-              className="flex items-center gap-2 px-3 py-1.5 bg-muted/50 hover:bg-muted rounded-lg text-sm transition-colors"
-            >
-              <Filter className="w-4 h-4" />
-              <span>
-                {filterMode === "all"
-                  ? "All Findings"
-                  : filterMode === "actionable"
-                    ? "Actionable"
-                    : filterMode === "needs_input"
-                      ? "Needs Input"
-                      : "Resolved"}
-              </span>
-              <ChevronDown className="w-4 h-4" />
-            </button>
+          {/* Filter Dropdowns */}
+          <div className="flex items-center gap-2">
+            {/* Mode Filter Dropdown */}
+            <div className="relative">
+              <button
+                data-ui-id="findings-filter-btn"
+                onClick={() => {
+                  setShowFilterMenu(!showFilterMenu);
+                  setShowSeverityMenu(false);
+                  setShowCategoryMenu(false);
+                }}
+                className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm transition-colors ${
+                  filterMode !== "all"
+                    ? "bg-primary/15 text-primary hover:bg-primary/20"
+                    : "bg-muted/50 hover:bg-muted"
+                }`}
+              >
+                <Filter className="w-4 h-4" />
+                <span>
+                  {filterMode === "all"
+                    ? "All Findings"
+                    : filterMode === "actionable"
+                      ? "Actionable"
+                      : filterMode === "needs_input"
+                        ? "Needs Input"
+                        : "Resolved"}
+                </span>
+                <ChevronDown className="w-4 h-4" />
+              </button>
 
-            {showFilterMenu && (
-              <div className="absolute top-full left-0 mt-1 w-40 bg-popover border border-border rounded-lg shadow-lg z-50">
-                {[
-                  { value: "all", label: "All Findings" },
-                  { value: "actionable", label: "Actionable" },
-                  { value: "needs_input", label: "Needs Input" },
-                  { value: "resolved", label: "Resolved" },
-                ].map((option) => (
-                  <button
-                    key={option.value}
-                    onClick={() => {
-                      setFilterMode(option.value as FilterMode);
-                      setShowFilterMenu(false);
-                    }}
-                    className={`w-full text-left px-3 py-2 text-sm hover:bg-muted transition-colors ${
-                      filterMode === option.value ? "bg-muted" : ""
-                    }`}
-                  >
-                    {option.label}
-                  </button>
-                ))}
-              </div>
+              {showFilterMenu && (
+                <div className="absolute top-full left-0 mt-1 w-40 bg-popover border border-border rounded-lg shadow-lg z-50">
+                  {[
+                    { value: "all", label: "All Findings" },
+                    { value: "actionable", label: "Actionable" },
+                    { value: "needs_input", label: "Needs Input" },
+                    { value: "resolved", label: "Resolved" },
+                  ].map((option) => (
+                    <button
+                      key={option.value}
+                      onClick={() => {
+                        setFilterMode(option.value as FilterMode);
+                        setShowFilterMenu(false);
+                      }}
+                      className={`w-full text-left px-3 py-2 text-sm hover:bg-muted transition-colors ${
+                        filterMode === option.value ? "bg-muted font-medium" : ""
+                      }`}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Severity Filter Dropdown */}
+            <div className="relative">
+              <button
+                data-ui-id="findings-severity-filter-btn"
+                onClick={() => {
+                  setShowSeverityMenu(!showSeverityMenu);
+                  setShowFilterMenu(false);
+                  setShowCategoryMenu(false);
+                }}
+                className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm transition-colors ${
+                  severityFilter !== "all"
+                    ? "bg-primary/15 text-primary hover:bg-primary/20"
+                    : "bg-muted/50 hover:bg-muted"
+                }`}
+              >
+                <span>
+                  {severityFilter === "all"
+                    ? "Severity"
+                    : (SEVERITY_OPTIONS.find((o) => o.value === severityFilter)?.label ??
+                      severityFilter)}
+                </span>
+                <ChevronDown className="w-4 h-4" />
+              </button>
+
+              {showSeverityMenu && (
+                <div className="absolute top-full left-0 mt-1 w-40 bg-popover border border-border rounded-lg shadow-lg z-50">
+                  {SEVERITY_OPTIONS.map((option) => (
+                    <button
+                      key={option.value}
+                      onClick={() => {
+                        setSeverityFilter(option.value);
+                        setShowSeverityMenu(false);
+                      }}
+                      className={`w-full text-left px-3 py-2 text-sm hover:bg-muted transition-colors ${
+                        severityFilter === option.value ? "bg-muted font-medium" : ""
+                      }`}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Category Filter Dropdown */}
+            <div className="relative">
+              <button
+                data-ui-id="findings-category-filter-btn"
+                onClick={() => {
+                  setShowCategoryMenu(!showCategoryMenu);
+                  setShowFilterMenu(false);
+                  setShowSeverityMenu(false);
+                }}
+                className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm transition-colors ${
+                  categoryFilter !== "all"
+                    ? "bg-primary/15 text-primary hover:bg-primary/20"
+                    : "bg-muted/50 hover:bg-muted"
+                }`}
+              >
+                <span>
+                  {categoryFilter === "all"
+                    ? "Category"
+                    : (categoryOptions.find((o) => o.value === categoryFilter)?.label ??
+                      categoryFilter)}
+                </span>
+                <ChevronDown className="w-4 h-4" />
+              </button>
+
+              {showCategoryMenu && (
+                <div className="absolute top-full left-0 mt-1 w-48 bg-popover border border-border rounded-lg shadow-lg z-50 max-h-64 overflow-y-auto">
+                  {categoryOptions.map((option) => (
+                    <button
+                      key={option.value}
+                      onClick={() => {
+                        setCategoryFilter(option.value);
+                        setShowCategoryMenu(false);
+                      }}
+                      className={`w-full text-left px-3 py-2 text-sm hover:bg-muted transition-colors ${
+                        categoryFilter === option.value ? "bg-muted font-medium" : ""
+                      }`}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Active Filter Count Badge + Clear */}
+            {activeFilterCount > 0 && (
+              <button
+                data-ui-id="findings-clear-filters-btn"
+                onClick={clearAllFilters}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-muted-foreground hover:text-foreground bg-muted/50 hover:bg-muted rounded-lg transition-colors"
+                title="Clear all filters"
+              >
+                <span className="flex items-center justify-center w-4 h-4 rounded-full bg-primary/20 text-primary text-[10px] font-bold">
+                  {activeFilterCount}
+                </span>
+                <X className="w-3 h-3" />
+                <span>Clear</span>
+              </button>
             )}
           </div>
 
@@ -593,6 +777,11 @@ Work through ALL findings systematically. Fix each one and report your resolutio
               key={category.id}
               category={category}
               findings={categoryFindings}
+              totalFindingsCount={
+                totalFindingsByCategory.get(category.id) ?? categoryFindings.length
+              }
+              isFilterActive={isFilterActive}
+              isHighlighted={categoryFilter === category.id}
               onAnalyze={handleAnalyze}
               onResolve={onResolveFinding}
               onProvideInput={handleProvideInput}
@@ -619,6 +808,11 @@ Work through ALL findings systematically. Fix each one and report your resolutio
                 sortOrder: 999,
               }}
               findings={categoryFindings}
+              totalFindingsCount={
+                totalFindingsByCategory.get(categoryId) ?? categoryFindings.length
+              }
+              isFilterActive={isFilterActive}
+              isHighlighted={categoryFilter === categoryId}
               onAnalyze={handleAnalyze}
               onResolve={onResolveFinding}
               onProvideInput={handleProvideInput}

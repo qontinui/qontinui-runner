@@ -956,3 +956,26 @@ export interface TaskRunVerificationResultsDbResult {
 
 // RunDetails is already defined in statistics.ts, we re-export here for convenience
 export type { RunDetails, RunStatus } from "./statistics";
+
+// =============================================================================
+// Process Session Types (persistent process history)
+// =============================================================================
+
+export interface ProcessSession {
+  id: string;
+  process_config_id: string;
+  process_name: string;
+  started_at: string;
+  stopped_at: string | null;
+  exit_code: number | null;
+  state: string;
+  error_count: number;
+}
+
+export interface ProcessSessionOutputLine {
+  id: number;
+  session_id: string;
+  timestamp: string;
+  stream: string;
+  line: string;
+}

@@ -2,8 +2,7 @@
  * AI Data Service
  *
  * Provides Tauri invoke calls for the AI Data Viewer.
- * Wraps the ai_data Tauri commands from src-tauri/src/commands/ai_data.rs
- * and tiered_info commands for automation runs.
+ * Wraps the ai_data Tauri commands from src-tauri/src/commands/ai_data.rs.
  */
 
 import { invoke } from "@tauri-apps/api/core";
@@ -16,21 +15,21 @@ import type {
   TextLogsResult,
   TextLogsSummary,
   TextLogType,
-  ScreenshotsResult,
   LoadedConfigInfo,
   AiPromptsResult,
   ContextsResult,
   ConsolidatedAiOutputResult,
   // SQLite migrated log types
   TaskRunEventsResult,
-  TaskRunScreenshotsDbResult,
   TaskRunPlaywrightResultsDbResult,
   TaskRunMigratedLogsSummary,
   TaskRunApiRequestsDbResult,
   TaskRunAwasStepsDbResult,
   TaskRunVerificationResultsDbResult,
+  // Process session types
+  ProcessSession,
+  ProcessSessionOutputLine,
 } from "../types/aiData";
-import type { TieredInfoResponse, RunDetails } from "../types/statistics";
 import type { TaskRunMcpCallsDbResult } from "../types/mcp-config";
 
 /**
@@ -124,30 +123,6 @@ export const aiDataService = {
   },
 
   // ===========================================================================
-  // Automation Runs (from run_details table via tiered_info)
-  // ===========================================================================
-
-  /**
-   * Get recent automation runs for a configuration.
-   * @param configId - Configuration ID
-   * @param limit - Maximum number of runs to return (default: 10)
-   */
-  async getAutomationRuns(
-    configId: string,
-    limit?: number,
-  ): Promise<TieredInfoResponse<RunDetails[]>> {
-    return invoke("get_recent_runs", { configId, limit });
-  },
-
-  /**
-   * Get a specific automation run.
-   * @param runId - Run ID
-   */
-  async getAutomationRun(runId: string): Promise<TieredInfoResponse<RunDetails>> {
-    return invoke("get_run_details", { runId });
-  },
-
-  // ===========================================================================
   // JSONL Logs (from .dev-logs/ directory)
   // ===========================================================================
 
@@ -218,17 +193,6 @@ export const aiDataService = {
   },
 
   // ===========================================================================
-  // Screenshots (annotated and playwright)
-  // ===========================================================================
-
-  /**
-   * Get list of screenshots from .dev-logs/screenshots/ and playwright-screenshots/.
-   */
-  async getScreenshots(): Promise<AiDataResponse<ScreenshotsResult>> {
-    return invoke("get_screenshots_for_viewer");
-  },
-
-  // ===========================================================================
   // Loaded Config
   // ===========================================================================
 
@@ -279,18 +243,6 @@ export const aiDataService = {
     limit?: number,
   ): Promise<AiDataResponse<TaskRunEventsResult>> {
     return invoke("get_task_run_events_from_db", { taskRunId, eventType, limit });
-  },
-
-  /**
-   * Get task run screenshots from SQLite database.
-   * @param taskRunId - Task run ID to get screenshots for
-   * @param screenshotType - Optional filter by screenshot type ('annotated', 'raw', 'diff', 'failure')
-   */
-  async getTaskRunScreenshotsFromDb(
-    taskRunId: string,
-    screenshotType?: string,
-  ): Promise<AiDataResponse<TaskRunScreenshotsDbResult>> {
-    return invoke("get_task_run_screenshots_from_db", { taskRunId, screenshotType });
   },
 
   /**
@@ -358,5 +310,52 @@ export const aiDataService = {
     taskRunId: string,
   ): Promise<AiDataResponse<TaskRunVerificationResultsDbResult>> {
     return invoke("get_task_run_verification_results_from_db", { taskRunId });
+  },
+
+  // ===========================================================================
+  // Process Sessions (persistent history)
+  // ===========================================================================
+
+  /**
+   * Get process sessions from database.
+   * @param configId - Optional process config ID to filter by
+   * @param limit - Maximum number of sessions to return (default: 50)
+   */
+  async getProcessSessions(
+    configId?: string,
+    limit?: number,
+  ): Promise<AiDataResponse<ProcessSession[]>> {
+    try {
+      const data = await invoke<ProcessSession[]>("get_process_sessions_from_db", {
+        configId: configId || null,
+        limit: limit || 50,
+      });
+      return { success: true, data };
+    } catch (error) {
+      return { success: false, error: String(error) };
+    }
+  },
+
+  /**
+   * Get process session output from database.
+   * @param sessionId - Session ID to get output for
+   * @param limit - Maximum number of lines to return (default: 5000)
+   * @param offset - Offset for pagination (default: 0)
+   */
+  async getProcessSessionOutput(
+    sessionId: string,
+    limit?: number,
+    offset?: number,
+  ): Promise<AiDataResponse<ProcessSessionOutputLine[]>> {
+    try {
+      const data = await invoke<ProcessSessionOutputLine[]>("get_process_session_output_from_db", {
+        sessionId,
+        limit: limit || 5000,
+        offset: offset || 0,
+      });
+      return { success: true, data };
+    } catch (error) {
+      return { success: false, error: String(error) };
+    }
   },
 };

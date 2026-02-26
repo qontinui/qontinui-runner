@@ -5288,6 +5288,45 @@ impl CheckpointDb {
             );
         }
 
+        // Migration to version 68: Add process_sessions and process_session_output tables
+        if current_version < 68 {
+            info!("Migrating to version 68 (process session persistence)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS process_sessions (
+                    id TEXT PRIMARY KEY,
+                    process_config_id TEXT NOT NULL,
+                    process_name TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    stopped_at TEXT,
+                    exit_code INTEGER,
+                    state TEXT NOT NULL DEFAULT 'running',
+                    error_count INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_process_sessions_config_id ON process_sessions(process_config_id);
+                CREATE INDEX IF NOT EXISTS idx_process_sessions_started_at ON process_sessions(started_at);
+
+                CREATE TABLE IF NOT EXISTS process_session_output (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    stream TEXT NOT NULL,
+                    line TEXT NOT NULL,
+                    FOREIGN KEY (session_id) REFERENCES process_sessions(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_process_session_output_session ON process_session_output(session_id);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (68, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 68: {}", e))?;
+
+            info!("Successfully migrated to version 68 (process session persistence)");
+        }
+
         Ok(())
     }
 
@@ -16943,6 +16982,261 @@ impl CheckpointDb {
             None => Ok(None),
         }
     }
+
+    // ========================================================================
+    // Process Session Persistence
+    // ========================================================================
+
+    /// Create a new process session record.
+    pub fn create_process_session(
+        &self,
+        id: &str,
+        config_id: &str,
+        name: &str,
+    ) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        conn.execute(
+            "INSERT INTO process_sessions (id, process_config_id, process_name, started_at, state)
+             VALUES (?1, ?2, ?3, ?4, 'running')",
+            params![id, config_id, name, Utc::now().to_rfc3339()],
+        )
+        .map_err(|e| format!("Failed to create process session: {}", e))?;
+        Ok(())
+    }
+
+    /// Update a process session (on stop/exit).
+    pub fn update_process_session(
+        &self,
+        session_id: &str,
+        state: &str,
+        exit_code: Option<i32>,
+        error_count: u32,
+    ) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        conn.execute(
+            "UPDATE process_sessions SET stopped_at = ?1, state = ?2, exit_code = ?3, error_count = ?4
+             WHERE id = ?5",
+            params![
+                Utc::now().to_rfc3339(),
+                state,
+                exit_code,
+                error_count,
+                session_id,
+            ],
+        )
+        .map_err(|e| format!("Failed to update process session: {}", e))?;
+        Ok(())
+    }
+
+    /// Get process sessions, optionally filtered by config_id.
+    pub fn get_process_sessions(
+        &self,
+        config_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<ProcessSession>, String> {
+        let conn = self.get_conn()?;
+        let mut sessions = Vec::new();
+
+        if let Some(cid) = config_id {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, process_config_id, process_name, started_at, stopped_at, exit_code, state, error_count
+                     FROM process_sessions
+                     WHERE process_config_id = ?1
+                     ORDER BY started_at DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+            let rows = stmt
+                .query_map(params![cid, limit], |row| {
+                    Ok(ProcessSession {
+                        id: row.get(0)?,
+                        process_config_id: row.get(1)?,
+                        process_name: row.get(2)?,
+                        started_at: row.get(3)?,
+                        stopped_at: row.get(4)?,
+                        exit_code: row.get(5)?,
+                        state: row.get(6)?,
+                        error_count: row.get(7)?,
+                    })
+                })
+                .map_err(|e| format!("Failed to query sessions: {}", e))?;
+
+            for row in rows {
+                sessions.push(row.map_err(|e| format!("Failed to read session row: {}", e))?);
+            }
+        } else {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, process_config_id, process_name, started_at, stopped_at, exit_code, state, error_count
+                     FROM process_sessions
+                     ORDER BY started_at DESC
+                     LIMIT ?1",
+                )
+                .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+            let rows = stmt
+                .query_map(params![limit], |row| {
+                    Ok(ProcessSession {
+                        id: row.get(0)?,
+                        process_config_id: row.get(1)?,
+                        process_name: row.get(2)?,
+                        started_at: row.get(3)?,
+                        stopped_at: row.get(4)?,
+                        exit_code: row.get(5)?,
+                        state: row.get(6)?,
+                        error_count: row.get(7)?,
+                    })
+                })
+                .map_err(|e| format!("Failed to query sessions: {}", e))?;
+
+            for row in rows {
+                sessions.push(row.map_err(|e| format!("Failed to read session row: {}", e))?);
+            }
+        }
+
+        Ok(sessions)
+    }
+
+    /// Batch insert process session output lines.
+    pub fn insert_process_session_output(
+        &self,
+        session_id: &str,
+        lines: &[(String, String, String)], // (timestamp, stream, line)
+    ) -> Result<(), String> {
+        if lines.is_empty() {
+            return Ok(());
+        }
+        let conn = self.get_conn()?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("Failed to begin transaction: {}", e))?;
+
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO process_session_output (session_id, timestamp, stream, line)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )
+                .map_err(|e| format!("Failed to prepare insert: {}", e))?;
+
+            for (timestamp, stream, line) in lines {
+                stmt.execute(params![session_id, timestamp, stream, line])
+                    .map_err(|e| format!("Failed to insert output line: {}", e))?;
+            }
+        }
+
+        tx.commit()
+            .map_err(|e| format!("Failed to commit output lines: {}", e))?;
+        Ok(())
+    }
+
+    /// Get process session output lines.
+    pub fn get_process_session_output(
+        &self,
+        session_id: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<ProcessSessionOutputLine>, String> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, session_id, timestamp, stream, line
+                 FROM process_session_output
+                 WHERE session_id = ?1
+                 ORDER BY id ASC
+                 LIMIT ?2 OFFSET ?3",
+            )
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+        let rows = stmt
+            .query_map(params![session_id, limit, offset], |row| {
+                Ok(ProcessSessionOutputLine {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    timestamp: row.get(2)?,
+                    stream: row.get(3)?,
+                    line: row.get(4)?,
+                })
+            })
+            .map_err(|e| format!("Failed to query output: {}", e))?;
+
+        let mut output = Vec::new();
+        for row in rows {
+            output.push(row.map_err(|e| format!("Failed to read output row: {}", e))?);
+        }
+        Ok(output)
+    }
+
+    /// Prune output lines for a session, keeping only the most recent `max_lines`.
+    pub fn prune_session_output_lines(
+        &self,
+        session_id: &str,
+        max_lines: u32,
+    ) -> Result<u32, String> {
+        let conn = self.get_conn()?;
+        let deleted: usize = conn
+            .execute(
+                "DELETE FROM process_session_output
+                 WHERE session_id = ?1
+                 AND id NOT IN (
+                     SELECT id FROM process_session_output
+                     WHERE session_id = ?1
+                     ORDER BY id DESC
+                     LIMIT ?2
+                 )",
+                params![session_id, max_lines],
+            )
+            .map_err(|e| format!("Failed to prune session output: {}", e))?;
+        Ok(deleted as u32)
+    }
+
+    /// Prune old sessions for a config, keeping the most recent `keep_count`.
+    pub fn prune_old_process_sessions(
+        &self,
+        config_id: &str,
+        keep_count: u32,
+    ) -> Result<u32, String> {
+        let conn = self.get_conn()?;
+        let deleted: usize = conn
+            .execute(
+                "DELETE FROM process_sessions
+                 WHERE process_config_id = ?1
+                 AND id NOT IN (
+                     SELECT id FROM process_sessions
+                     WHERE process_config_id = ?1
+                     ORDER BY started_at DESC
+                     LIMIT ?2
+                 )",
+                params![config_id, keep_count],
+            )
+            .map_err(|e| format!("Failed to prune sessions: {}", e))?;
+        Ok(deleted as u32)
+    }
+}
+
+/// Persisted process session record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessSession {
+    pub id: String,
+    pub process_config_id: String,
+    pub process_name: String,
+    pub started_at: String,
+    pub stopped_at: Option<String>,
+    pub exit_code: Option<i32>,
+    pub state: String,
+    pub error_count: u32,
+}
+
+/// A single line of persisted process output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessSessionOutputLine {
+    pub id: i64,
+    pub session_id: String,
+    pub timestamp: String,
+    pub stream: String,
+    pub line: String,
 }
 
 /// Result of an import operation.
@@ -17254,5 +17548,171 @@ mod tests {
             .get_completed_verification_iterations("task-empty")
             .unwrap();
         assert!(iterations.is_empty());
+    }
+
+    #[test]
+    fn test_process_session_crud() {
+        let (db, _temp) = create_test_db();
+
+        // Create a session
+        db.create_process_session("sess-1", "config-a", "My Process")
+            .unwrap();
+
+        // Verify it appears in get_process_sessions (filtered by config_id)
+        let sessions = db.get_process_sessions(Some("config-a"), 100).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "sess-1");
+        assert_eq!(sessions[0].process_config_id, "config-a");
+        assert_eq!(sessions[0].process_name, "My Process");
+        assert_eq!(sessions[0].state, "running");
+        assert!(sessions[0].stopped_at.is_none());
+        assert!(sessions[0].exit_code.is_none());
+        assert_eq!(sessions[0].error_count, 0);
+
+        // Verify it also appears when querying without filter
+        let all_sessions = db.get_process_sessions(None, 100).unwrap();
+        assert_eq!(all_sessions.len(), 1);
+        assert_eq!(all_sessions[0].id, "sess-1");
+
+        // Update the session (simulate process exit)
+        db.update_process_session("sess-1", "exited", Some(0), 3)
+            .unwrap();
+
+        // Verify the update
+        let sessions = db.get_process_sessions(Some("config-a"), 100).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].state, "exited");
+        assert_eq!(sessions[0].exit_code, Some(0));
+        assert_eq!(sessions[0].error_count, 3);
+        assert!(sessions[0].stopped_at.is_some());
+
+        // Create a second session for a different config and verify filtering
+        db.create_process_session("sess-2", "config-b", "Other Process")
+            .unwrap();
+
+        let config_a = db.get_process_sessions(Some("config-a"), 100).unwrap();
+        assert_eq!(config_a.len(), 1);
+        assert_eq!(config_a[0].id, "sess-1");
+
+        let config_b = db.get_process_sessions(Some("config-b"), 100).unwrap();
+        assert_eq!(config_b.len(), 1);
+        assert_eq!(config_b[0].id, "sess-2");
+
+        let all = db.get_process_sessions(None, 100).unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn test_process_session_output() {
+        let (db, _temp) = create_test_db();
+
+        // Create a session to attach output to
+        db.create_process_session("sess-out-1", "config-x", "Output Test")
+            .unwrap();
+
+        // Insert output lines
+        let lines = vec![
+            (
+                "2026-01-01T00:00:01Z".to_string(),
+                "stdout".to_string(),
+                "Starting server...".to_string(),
+            ),
+            (
+                "2026-01-01T00:00:02Z".to_string(),
+                "stdout".to_string(),
+                "Listening on port 8080".to_string(),
+            ),
+            (
+                "2026-01-01T00:00:03Z".to_string(),
+                "stderr".to_string(),
+                "Warning: deprecated config option".to_string(),
+            ),
+        ];
+        db.insert_process_session_output("sess-out-1", &lines)
+            .unwrap();
+
+        // Retrieve all output lines
+        let output = db.get_process_session_output("sess-out-1", 100, 0).unwrap();
+        assert_eq!(output.len(), 3);
+
+        // Verify order (should be ordered by id ASC, matching insertion order)
+        assert_eq!(output[0].line, "Starting server...");
+        assert_eq!(output[0].stream, "stdout");
+        assert_eq!(output[0].session_id, "sess-out-1");
+
+        assert_eq!(output[1].line, "Listening on port 8080");
+        assert_eq!(output[1].stream, "stdout");
+
+        assert_eq!(output[2].line, "Warning: deprecated config option");
+        assert_eq!(output[2].stream, "stderr");
+
+        // Verify limit works
+        let limited = db.get_process_session_output("sess-out-1", 2, 0).unwrap();
+        assert_eq!(limited.len(), 2);
+        assert_eq!(limited[0].line, "Starting server...");
+        assert_eq!(limited[1].line, "Listening on port 8080");
+
+        // Verify offset works
+        let offset = db.get_process_session_output("sess-out-1", 100, 1).unwrap();
+        assert_eq!(offset.len(), 2);
+        assert_eq!(offset[0].line, "Listening on port 8080");
+        assert_eq!(offset[1].line, "Warning: deprecated config option");
+
+        // Verify empty insert is a no-op
+        db.insert_process_session_output("sess-out-1", &[]).unwrap();
+        let output_after = db.get_process_session_output("sess-out-1", 100, 0).unwrap();
+        assert_eq!(output_after.len(), 3);
+
+        // Verify output for a different session is isolated
+        db.create_process_session("sess-out-2", "config-x", "Output Test 2")
+            .unwrap();
+        let other_output = db.get_process_session_output("sess-out-2", 100, 0).unwrap();
+        assert!(other_output.is_empty());
+    }
+
+    #[test]
+    fn test_process_session_pruning() {
+        let (db, _temp) = create_test_db();
+
+        // Create 12 sessions for the same config_id with staggered timestamps.
+        // create_process_session uses Utc::now() so we insert them sequentially;
+        // the order in the DB will match insertion order.
+        for i in 1..=12 {
+            let session_id = format!("prune-sess-{}", i);
+            db.create_process_session(&session_id, "config-prune", &format!("Process {}", i))
+                .unwrap();
+        }
+
+        // Verify all 12 exist
+        let before = db.get_process_sessions(Some("config-prune"), 100).unwrap();
+        assert_eq!(before.len(), 12);
+
+        // Prune, keeping only the 10 most recent
+        let deleted = db.prune_old_process_sessions("config-prune", 10).unwrap();
+        assert_eq!(deleted, 2);
+
+        // Verify 10 remain
+        let after = db.get_process_sessions(Some("config-prune"), 100).unwrap();
+        assert_eq!(after.len(), 10);
+
+        // The most recent sessions should survive (ordered DESC by started_at).
+        // Sessions 3..=12 should remain; 1 and 2 should be pruned.
+        // get_process_sessions returns DESC order, so first result is newest.
+        let remaining_ids: Vec<String> = after.iter().map(|s| s.id.clone()).collect();
+        assert!(!remaining_ids.contains(&"prune-sess-1".to_string()));
+        assert!(!remaining_ids.contains(&"prune-sess-2".to_string()));
+        assert!(remaining_ids.contains(&"prune-sess-12".to_string()));
+        assert!(remaining_ids.contains(&"prune-sess-3".to_string()));
+
+        // Pruning a different config should not affect these sessions
+        let deleted_other = db.prune_old_process_sessions("config-other", 5).unwrap();
+        assert_eq!(deleted_other, 0);
+
+        let still_ten = db.get_process_sessions(Some("config-prune"), 100).unwrap();
+        assert_eq!(still_ten.len(), 10);
+
+        // Pruning again with same keep_count should delete nothing
+        let deleted_again = db.prune_old_process_sessions("config-prune", 10).unwrap();
+        assert_eq!(deleted_again, 0);
     }
 }

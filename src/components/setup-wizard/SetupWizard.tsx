@@ -1,0 +1,151 @@
+import { useState, useCallback } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { StepIndicator } from "./StepIndicator";
+import { WelcomeStep } from "./WelcomeStep";
+import { ProjectStep } from "./ProjectStep";
+import { LogSourcesStep } from "./LogSourcesStep";
+import { ProcessStep } from "./ProcessStep";
+import { AiProviderStep } from "./AiProviderStep";
+
+const STEPS = ["Welcome", "Projects", "Log Sources", "Processes", "AI Provider"];
+
+interface Project {
+  path: string;
+  name: string;
+  type: string;
+  manifest: string;
+}
+
+interface LogSource {
+  id: string;
+  name: string;
+  description: string;
+  category: string;
+  type: string;
+  path: string;
+  pattern: string | null;
+  format: string;
+  parser: string;
+  enabled: boolean;
+  keywords: string[];
+  error_patterns: string[];
+  warning_patterns: string[];
+  tail_lines: number;
+  color: string | null;
+  timestamp_pattern: string | null;
+  timezone: string;
+  ignore_patterns: string[];
+  poll_interval_ms: number;
+}
+
+interface ProcessConfig {
+  id: string;
+  name: string;
+  command: string;
+  args: string[];
+  cwd: string;
+  health_port?: number;
+  parser: string;
+  category: string;
+  auto_start: boolean;
+  enabled: boolean;
+  buffer_size: number;
+  env?: Record<string, string>;
+}
+
+interface SetupWizardProps {
+  onComplete: () => void;
+}
+
+export function SetupWizard({ onComplete }: SetupWizardProps) {
+  const [currentStep, setCurrentStep] = useState(0);
+  const [workspacePath, setWorkspacePath] = useState("");
+  const [selectedProjects, setSelectedProjects] = useState<Project[]>([]);
+  const [selectedSources, setSelectedSources] = useState<LogSource[]>([]);
+  const [selectedProcessConfigs, setSelectedProcessConfigs] = useState<ProcessConfig[]>([]);
+
+  const goNext = useCallback(() => {
+    setCurrentStep((s) => Math.min(s + 1, STEPS.length - 1));
+  }, []);
+
+  const goBack = useCallback(() => {
+    setCurrentStep((s) => Math.max(s - 1, 0));
+  }, []);
+
+  const finishSetup = useCallback(
+    async (aiConfig: { provider: string } | null) => {
+      try {
+        // Save selected log sources
+        if (selectedSources.length > 0) {
+          await invoke("save_log_sources_from_setup", {
+            sources: selectedSources,
+          });
+        }
+
+        // Save process configs
+        if (selectedProcessConfigs.length > 0) {
+          for (const config of selectedProcessConfigs) {
+            await invoke("save_process_config", { config });
+          }
+        }
+
+        // Mark setup as completed
+        await invoke("complete_setup");
+        onComplete();
+      } catch (err) {
+        console.error("Failed to complete setup:", err);
+        // Still complete even if save fails - user can configure later
+        try {
+          await invoke("complete_setup");
+        } catch {
+          // Ignore
+        }
+        onComplete();
+      }
+    },
+    [selectedSources, selectedProcessConfigs, onComplete],
+  );
+
+  return (
+    <div className="min-h-screen bg-background grid-dots flex flex-col items-center justify-center p-4">
+      <div className="card w-full max-w-2xl p-8">
+        <StepIndicator steps={STEPS} currentStep={currentStep} />
+
+        {currentStep === 0 && <WelcomeStep onNext={goNext} />}
+
+        {currentStep === 1 && (
+          <ProjectStep
+            selectedProjects={selectedProjects}
+            onProjectsChange={setSelectedProjects}
+            onWorkspacePathChange={setWorkspacePath}
+            onNext={goNext}
+            onBack={goBack}
+          />
+        )}
+
+        {currentStep === 2 && (
+          <LogSourcesStep
+            workspacePath={workspacePath}
+            selectedProjects={selectedProjects}
+            selectedSources={selectedSources}
+            onSourcesChange={setSelectedSources}
+            onNext={goNext}
+            onBack={goBack}
+          />
+        )}
+
+        {currentStep === 3 && (
+          <ProcessStep
+            selectedProjects={selectedProjects}
+            selectedConfigs={selectedProcessConfigs}
+            onConfigsChange={setSelectedProcessConfigs}
+            onNext={goNext}
+            onBack={goBack}
+          />
+        )}
+
+        {currentStep === 4 && <AiProviderStep onComplete={finishSetup} onBack={goBack} />}
+      </div>
+    </div>
+  );
+}

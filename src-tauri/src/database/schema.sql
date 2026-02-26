@@ -1,5 +1,5 @@
 -- SQLite Schema for qontinui-runner
--- Version: 60
+-- Version: 68
 --
 -- This schema provides persistent storage for task runs, settings,
 -- prompts, and scheduler state.
@@ -2203,7 +2203,37 @@ CREATE INDEX IF NOT EXISTS idx_stk_step_type ON step_type_knowledge(step_type);
 CREATE INDEX IF NOT EXISTS idx_stk_layer ON step_type_knowledge(layer);
 CREATE INDEX IF NOT EXISTS idx_stk_composite ON step_type_knowledge(step_type, layer, status);
 
+-- =============================================================================
+-- Process Sessions (v68)
+-- Persistent history of managed process sessions (start/stop/output).
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS process_sessions (
+    id TEXT PRIMARY KEY,
+    process_config_id TEXT NOT NULL,
+    process_name TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    stopped_at TEXT,
+    exit_code INTEGER,
+    state TEXT NOT NULL DEFAULT 'running',
+    error_count INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_process_sessions_config_id ON process_sessions(process_config_id);
+CREATE INDEX IF NOT EXISTS idx_process_sessions_started_at ON process_sessions(started_at);
+
+CREATE TABLE IF NOT EXISTS process_session_output (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    stream TEXT NOT NULL,
+    line TEXT NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES process_sessions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_process_session_output_session ON process_session_output(session_id);
+
 -- Initialize singleton tables
 INSERT OR IGNORE INTO gui_lock (id, holder_session_id, acquired_at) VALUES (1, NULL, NULL);
 INSERT OR IGNORE INTO scheduler_settings (id) VALUES (1);
-INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (67, datetime('now'));
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (68, datetime('now'));

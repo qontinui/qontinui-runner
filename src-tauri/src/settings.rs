@@ -765,6 +765,9 @@ pub struct Settings {
     pub mobile: MobileSettings,
     #[serde(default)]
     pub log_sources: GlobalLogSourceSettings,
+    /// Managed process configurations for process capture
+    #[serde(default)]
+    pub managed_processes: Vec<crate::process_capture::ProcessConfig>,
     #[serde(default)]
     pub execution_variables: ExecutionVariablesSettings,
     /// Global default: Run pre-flight environment check at start of Setup phase (default: true)
@@ -774,6 +777,9 @@ pub struct Settings {
     /// App mode: "simple" or "advanced" — synced across runner and web apps
     #[serde(default = "default_app_mode")]
     pub app_mode: String,
+    /// Whether the first-launch setup wizard has been completed
+    #[serde(default)]
+    pub setup_completed: bool,
     /// Cloud relay settings for remote mobile access via backend WebSocket
     #[serde(default)]
     pub cloud_relay: CloudRelaySettings,
@@ -867,6 +873,19 @@ pub fn save_last_config_path(path: &str) -> Result<(), String> {
 pub fn get_last_config_path() -> Option<String> {
     let settings = load_settings();
     settings.last_config_path
+}
+
+/// Check if setup wizard has been completed
+pub fn get_setup_completed() -> bool {
+    load_settings().setup_completed
+}
+
+/// Mark setup wizard as completed
+pub fn save_setup_completed(completed: bool) -> Result<(), String> {
+    let mut settings = load_settings();
+    settings.setup_completed = completed;
+    save_settings(&settings)?;
+    Ok(())
 }
 
 /// Get the current debug settings
@@ -1329,6 +1348,40 @@ pub fn get_log_sources_for_ai_selection() -> Vec<GlobalLogSource> {
 pub fn get_log_source_ai_selection_mode() -> LogSourceAiSelectionMode {
     let settings = get_global_log_source_settings();
     settings.ai_selection_mode
+}
+
+// ============================================================================
+// Managed Processes Settings
+// ============================================================================
+
+/// Get all managed process configurations
+pub fn get_managed_process_configs() -> Vec<crate::process_capture::ProcessConfig> {
+    let settings = load_settings();
+    settings.managed_processes
+}
+
+/// Save a managed process config (add or update).
+pub fn save_managed_process_config(
+    config: crate::process_capture::ProcessConfig,
+) -> Result<(), String> {
+    let mut settings = load_settings();
+    if let Some(existing) = settings
+        .managed_processes
+        .iter_mut()
+        .find(|p| p.id == config.id)
+    {
+        *existing = config;
+    } else {
+        settings.managed_processes.push(config);
+    }
+    save_settings(&settings)
+}
+
+/// Delete a managed process config by ID.
+pub fn delete_managed_process_config(id: &str) -> Result<(), String> {
+    let mut settings = load_settings();
+    settings.managed_processes.retain(|p| p.id != id);
+    save_settings(&settings)
 }
 
 // ============================================================================

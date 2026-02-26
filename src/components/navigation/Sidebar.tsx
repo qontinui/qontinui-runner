@@ -28,8 +28,10 @@ import {
   Bot,
   ScrollText,
   BookOpen,
+  BookText,
   Camera,
   Calendar,
+  CheckCircle2,
   Settings,
   HelpCircle,
   ChevronDown,
@@ -80,6 +82,10 @@ import {
   AlertCircle,
   ListChecks,
   RotateCcw,
+  MessageSquare,
+  Server,
+  Workflow,
+  Cpu,
 } from "lucide-react";
 
 // Import shared navigation structure and state management
@@ -87,8 +93,6 @@ import {
   type NavigationItem as SharedNavigationItem,
   type NavigationGroup as SharedNavigationGroup,
   type IconName,
-  type NavigationState as _NavigationState,
-  type NavigationAction as _NavigationAction,
   getRunnerNavigation,
   getChildrenForPlatform,
   STORAGE_KEYS,
@@ -96,7 +100,6 @@ import {
   navigationReducer,
   navigationActions,
   isGroupExpanded,
-  isSecondaryOpenFor as _isSecondaryOpenFor,
   serializeState,
   deserializeState,
 } from "qontinui-navigation";
@@ -127,6 +130,8 @@ const ICON_MAP: Record<IconName, LucideIcon> = {
   Database,
   Cloud,
   BookOpen,
+  BookText,
+  CheckCircle2,
   Sparkles,
   MousePointer2,
   Layers,
@@ -158,6 +163,10 @@ const ICON_MAP: Record<IconName, LucideIcon> = {
   AlertCircle,
   ListChecks,
   RotateCcw,
+  MessageSquare,
+  Server,
+  Workflow,
+  Cpu,
 };
 
 function getIconComponent(iconName: IconName): LucideIcon {

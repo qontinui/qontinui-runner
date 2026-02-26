@@ -33,6 +33,7 @@ use crate::doctor::DoctorHandle;
 use crate::error_monitor::ErrorMonitorHandle;
 use crate::executor::{BridgeManager, ExtractionExecutor, UrlLockManager};
 use crate::mcp_client::McpClientManager;
+use crate::process_capture::ProcessCaptureManager;
 use crate::step_executor::handlers::ui_bridge::UiBridgeFailureTracker;
 use crate::storage::LocalStorage;
 use crate::tiered_info::RunRecordingHandler;
@@ -84,6 +85,7 @@ pub mod recap; // Session recap overview
 pub mod screenshot;
 pub mod screenshots;
 pub mod self_healing_settings;
+pub mod setup_wizard; // First-launch setup wizard commands
 pub mod shell_commands; // Shell command management and execution
 pub mod state_explorer; // State explorer for AI-driven state machine exploration
 pub mod state_machine;
@@ -155,6 +157,9 @@ pub struct AppState {
     /// Tracks consecutive UI Bridge failures per URL.
     /// After 3+ consecutive failures to the same URL, triggers an AI diagnostic.
     pub ui_bridge_failure_tracker: UiBridgeFailureTracker,
+    /// Process capture manager for spawning and managing child processes.
+    /// Captures stdout/stderr and feeds errors into the Error Monitor.
+    pub process_capture_manager: TokioMutex<Option<Arc<ProcessCaptureManager>>>,
     /// Flag indicating the HTTP API server (port 9876) has bound and is ready.
     /// Set by `mcp_api::start_server` after successful bind, checked by the
     /// `is_api_ready` Tauri command so the frontend can gate HTTP calls.

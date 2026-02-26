@@ -5,13 +5,13 @@
  * Organized into grouped sidebar navigation:
  * - AI Session: Prompt, AI Output, Contexts
  * - Execution Logs: Events, API Requests, Image Recognition, Playwright
- * - Captures: Screenshots, DOM Snapshots
- * - Configuration: Loaded Config, Automation Runs, Dev Logs
+ * - Captures: DOM Snapshots
+ * - Configuration: Loaded Config, Dev Logs
  *
  * This helps users see exactly what data the AI receives.
  */
 
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, Fragment } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import {
   Loader2,
@@ -24,8 +24,6 @@ import {
   Clock,
   CheckCircle,
   XCircle,
-  Pause,
-  Image,
   Settings,
   MessageSquare,
   BookOpen,
@@ -44,17 +42,15 @@ import {
   Smartphone,
   Terminal,
   Wifi,
+  Search,
 } from "lucide-react";
 import { isDevelopmentMode } from "qontinui-navigation";
-import { useExecution } from "../../contexts/ExecutionContext";
 import { useRunSelection } from "../../contexts/RunSelectionContext";
 import {
-  useAutomationRuns,
   useJsonlLogsForTaskRun,
   useConsolidatedAiOutput,
   useTextLogsSummary,
   useTextLogs,
-  useScreenshots,
   useLoadedConfig,
   useAiPrompts,
   useContexts,
@@ -62,25 +58,25 @@ import {
   useTaskRunEvents,
   useTaskRunMigratedLogsSummary,
   useTaskRunPlaywrightResults,
-  useTaskRunScreenshotsFromDb,
   useTaskRunApiRequests,
   useTaskRunAwasSteps,
   useTaskRunMcpCalls,
+  // Process sessions
+  useProcessSessions,
+  useProcessSessionOutput,
 } from "../../hooks/useAiData";
 import type {
   JsonlLogType,
   TextLogType,
-  ScreenshotInfo,
   ContextInfo,
   AiOutputChunk,
   TaskRunEvent,
   TaskRunPlaywrightResultDb,
-  TaskRunScreenshotDb,
   TaskRunApiRequestDb,
   TaskRunAwasStepDb,
+  ProcessSession,
 } from "../../types/aiData";
 import type { TaskRunMcpCallDb } from "../../types/mcp-config";
-import type { RunDetails } from "../../types/statistics";
 import { MarkdownViewer } from "../MarkdownViewer";
 import { DomSnapshotsPanel } from "../dom-captures";
 import { getStatusColors, getAccentColors } from "@/design-system";
@@ -100,16 +96,17 @@ type DataCategory =
   | "awas-steps"
   | "execution-spans"
   // Captures group
-  | "screenshots"
   | "dom-snapshots"
   // Mobile group
   | "mobile-state"
   | "mobile-screenshots"
   | "mobile-logs"
   | "mobile-errors"
+  // Processes group
+  | "process-sessions"
+  | "process-output"
   // Configuration group
   | "loaded-config"
-  | "automation-runs"
   | "dev-logs";
 
 // Navigation group definition
@@ -130,14 +127,12 @@ interface NavItem {
 function SidebarNav({
   activeCategory,
   onCategoryChange,
-  automationRunsCount,
 }: {
   activeCategory: DataCategory;
   onCategoryChange: (category: DataCategory) => void;
-  automationRunsCount?: number;
 }) {
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(
-    new Set(["ai-session", "execution-logs", "captures", "mobile", "configuration"]),
+    new Set(["ai-session", "execution-logs", "captures", "mobile", "processes", "configuration"]),
   );
 
   const toggleGroup = (groupId: string) => {
@@ -209,10 +204,7 @@ function SidebarNav({
       id: "captures",
       label: "Captures",
       icon: <Camera className="w-4 h-4" />,
-      items: [
-        { id: "screenshots", label: "Screenshots", icon: <Image className="w-4 h-4" /> },
-        { id: "dom-snapshots", label: "DOM Snapshots", icon: <Code className="w-4 h-4" /> },
-      ],
+      items: [{ id: "dom-snapshots", label: "DOM Snapshots", icon: <Code className="w-4 h-4" /> }],
     },
     // Mobile group - only shown in development mode (unfinished feature)
     ...(isDevMode
@@ -247,12 +239,28 @@ function SidebarNav({
         ]
       : []),
     {
+      id: "processes",
+      label: "Processes",
+      icon: <Terminal className="w-4 h-4" />,
+      items: [
+        {
+          id: "process-sessions" as DataCategory,
+          label: "Sessions",
+          icon: <Clock className="w-4 h-4" />,
+        },
+        {
+          id: "process-output" as DataCategory,
+          label: "Output",
+          icon: <FileText className="w-4 h-4" />,
+        },
+      ],
+    },
+    {
       id: "configuration",
       label: "Configuration",
       icon: <Cog className="w-4 h-4" />,
       items: [
         { id: "loaded-config", label: "Loaded Config", icon: <Settings className="w-4 h-4" /> },
-        { id: "automation-runs", label: "Automation Runs", icon: <Activity className="w-4 h-4" /> },
         { id: "dev-logs", label: "Dev Logs", icon: <FileJson className="w-4 h-4" /> },
       ],
     },
@@ -292,7 +300,6 @@ function SidebarNav({
                 <div className="ml-4 space-y-0.5">
                   {group.items.map((item) => {
                     const isActive = item.id === activeCategory;
-                    const count = item.id === "automation-runs" ? automationRunsCount : undefined;
 
                     return (
                       <button
@@ -307,11 +314,6 @@ function SidebarNav({
                       >
                         {item.icon}
                         <span className="flex-1 text-left">{item.label}</span>
-                        {count !== undefined && count > 0 && (
-                          <span className="px-1.5 py-0.5 text-xs rounded-full bg-muted/50">
-                            {count}
-                          </span>
-                        )}
                       </button>
                     );
                   })}
@@ -325,167 +327,12 @@ function SidebarNav({
   );
 }
 
-function getStatusIcon(status: string) {
-  switch (status) {
-    case "running":
-      return <Loader2 className={`w-3 h-3 animate-spin ${getStatusColors("running").icon}`} />;
-    case "complete":
-    case "completed":
-      return <CheckCircle className={`w-3 h-3 ${getStatusColors("success").icon}`} />;
-    case "failed":
-      return <XCircle className={`w-3 h-3 ${getStatusColors("error").icon}`} />;
-    case "stopped":
-      return <Pause className={`w-3 h-3 ${getStatusColors("cancelled").icon}`} />;
-    default:
-      return <Clock className="w-3 h-3 text-muted-foreground" />;
-  }
-}
-
 function formatTimestamp(ts: string): string {
   try {
     return new Date(ts).toLocaleString();
   } catch {
     return ts;
   }
-}
-
-// Automation Runs Section
-function AutomationRunsSection() {
-  const { config } = useExecution();
-  const configId = config?.path || "";
-  const { data: runs, isLoading, error } = useAutomationRuns(configId, 50);
-  const [expandedId, setExpandedId] = useState<string | null>(null);
-
-  if (!configId) {
-    return (
-      <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
-        <Activity className="w-8 h-8 mb-3 opacity-50" />
-        <p className="text-sm">Load a configuration to view automation runs</p>
-      </div>
-    );
-  }
-
-  if (isLoading) {
-    return (
-      <div className="flex items-center justify-center py-8 text-muted-foreground">
-        <Loader2 className="w-5 h-5 animate-spin mr-2" />
-        Loading automation runs...
-      </div>
-    );
-  }
-
-  if (error) {
-    return (
-      <div className={`flex items-center justify-center py-8 ${getStatusColors("error").text}`}>
-        <AlertCircle className="w-5 h-5 mr-2" />
-        Error: {error.message}
-      </div>
-    );
-  }
-
-  if (!runs || runs.length === 0) {
-    return (
-      <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
-        <Activity className="w-8 h-8 mb-3 opacity-50" />
-        <p className="text-sm">No automation runs found for this config</p>
-      </div>
-    );
-  }
-
-  return (
-    <div className="space-y-2">
-      {runs.map((run: RunDetails) => (
-        <div key={run.id} className="border border-border rounded-lg overflow-hidden">
-          <button
-            onClick={() => setExpandedId(expandedId === run.id ? null : run.id)}
-            className="w-full flex items-center gap-3 px-4 py-3 bg-card hover:bg-muted/50 transition-colors text-left"
-          >
-            {expandedId === run.id ? (
-              <ChevronDown className="w-4 h-4 text-muted-foreground" />
-            ) : (
-              <ChevronRight className="w-4 h-4 text-muted-foreground" />
-            )}
-            {getStatusIcon(run.status)}
-            <span className="font-medium truncate flex-1">
-              {run.workflow_name || "Unknown Workflow"}
-            </span>
-            {run.duration_ms !== undefined && (
-              <span className="text-xs text-muted-foreground">
-                {(run.duration_ms / 1000).toFixed(1)}s
-              </span>
-            )}
-            <span className="text-xs text-muted-foreground">{formatTimestamp(run.started_at)}</span>
-          </button>
-          {expandedId === run.id && (
-            <div className="px-4 py-3 bg-muted/30 border-t border-border space-y-3">
-              {run.actions_summary && (
-                <div>
-                  <div className="text-xs font-medium text-muted-foreground mb-1">
-                    Actions Summary
-                  </div>
-                  <pre className="text-xs bg-background p-2 rounded overflow-x-auto">
-                    {JSON.stringify(run.actions_summary, null, 2)}
-                  </pre>
-                </div>
-              )}
-              {run.states_visited && run.states_visited.length > 0 && (
-                <div>
-                  <div className="text-xs font-medium text-muted-foreground mb-1">
-                    States Visited ({run.states_visited.length})
-                  </div>
-                  <pre className="text-xs bg-background p-2 rounded overflow-x-auto">
-                    {JSON.stringify(run.states_visited, null, 2)}
-                  </pre>
-                </div>
-              )}
-              {run.transitions_executed && run.transitions_executed.length > 0 && (
-                <div>
-                  <div className="text-xs font-medium text-muted-foreground mb-1">
-                    Transitions Executed ({run.transitions_executed.length})
-                  </div>
-                  <pre className="text-xs bg-background p-2 rounded overflow-x-auto max-h-48 overflow-y-auto">
-                    {JSON.stringify(run.transitions_executed, null, 2)}
-                  </pre>
-                </div>
-              )}
-              {run.template_matches && run.template_matches.length > 0 && (
-                <div>
-                  <div className="text-xs font-medium text-muted-foreground mb-1">
-                    Template Matches ({run.template_matches.length})
-                  </div>
-                  <pre className="text-xs bg-background p-2 rounded overflow-x-auto max-h-48 overflow-y-auto">
-                    {JSON.stringify(run.template_matches, null, 2)}
-                  </pre>
-                </div>
-              )}
-              {run.anomalies && run.anomalies.length > 0 && (
-                <div>
-                  <div className="text-xs font-medium text-muted-foreground mb-1">
-                    Anomalies ({run.anomalies.length})
-                  </div>
-                  <pre className="text-xs bg-background p-2 rounded overflow-x-auto">
-                    {JSON.stringify(run.anomalies, null, 2)}
-                  </pre>
-                </div>
-              )}
-              {run.error_message && (
-                <div>
-                  <div className={`text-xs font-medium ${getStatusColors("error").text} mb-1`}>
-                    Error
-                  </div>
-                  <pre
-                    className={`text-xs ${getStatusColors("error").bg} ${getStatusColors("error").text} p-2 rounded overflow-x-auto`}
-                  >
-                    {run.error_message}
-                  </pre>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-      ))}
-    </div>
-  );
 }
 
 // Consolidated AI Output display component
@@ -1417,340 +1264,6 @@ function DevLogsSection() {
         <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
           <FileText className="w-8 h-8 mb-3 opacity-50" />
           <p className="text-sm">No {activeLogType} log entries during this task run</p>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// Screenshots Section - uses SQLite for completed tasks, file system for running tasks
-function ScreenshotsSection() {
-  const { selectedRunId, selectedRun } = useRunSelection();
-  const [selectedImage, setSelectedImage] = useState<string | null>(null);
-  const [imageLoadErrors, setImageLoadErrors] = useState<Set<string>>(new Set());
-
-  // Determine if task is completed (screenshots migrated to SQLite)
-  const isCompleted = selectedRun?.completed_at != null;
-
-  // SQLite query for completed tasks
-  const {
-    data: dbScreenshots,
-    isLoading: dbLoading,
-    error: dbError,
-  } = useTaskRunScreenshotsFromDb(isCompleted ? selectedRunId : null);
-
-  // File system query for running tasks (real-time)
-  const { data: fsScreenshots, isLoading: fsLoading, error: fsError } = useScreenshots();
-
-  // Select appropriate loading/error state
-  const isLoading = isCompleted ? dbLoading : fsLoading;
-  const error = isCompleted ? dbError : fsError;
-
-  // Convert file paths to Tauri asset URLs
-  const getImageSrc = useMemo(() => {
-    return (path: string) => {
-      try {
-        return convertFileSrc(path);
-      } catch {
-        // Fallback to file:// protocol
-        return `file://${path}`;
-      }
-    };
-  }, []);
-
-  // Helper to get screenshot type badge styling
-  const getScreenshotTypeBadge = (type: string) => {
-    switch (type) {
-      case "annotated":
-        return {
-          bg: getAccentColors("blue").bg,
-          text: getAccentColors("blue").text,
-          label: "Annotated",
-        };
-      case "raw":
-        return { bg: "bg-muted", text: "text-muted-foreground", label: "Raw" };
-      case "diff":
-        return {
-          bg: getAccentColors("purple").bg,
-          text: getAccentColors("purple").text,
-          label: "Diff",
-        };
-      case "failure":
-        return {
-          bg: getStatusColors("error").bg,
-          text: getStatusColors("error").text,
-          label: "Failure",
-        };
-      default:
-        return { bg: "bg-muted", text: "text-muted-foreground", label: type };
-    }
-  };
-
-  if (!selectedRunId) {
-    return (
-      <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
-        <Image className="w-8 h-8 mb-3 opacity-50" />
-        <p className="text-sm">Select a task run to view screenshots</p>
-      </div>
-    );
-  }
-
-  if (isLoading) {
-    return (
-      <div className="flex items-center justify-center py-8 text-muted-foreground">
-        <Loader2 className="w-5 h-5 animate-spin mr-2" />
-        Loading screenshots...
-      </div>
-    );
-  }
-
-  if (error) {
-    return (
-      <div className={`flex items-center justify-center py-8 ${getStatusColors("error").text}`}>
-        <AlertCircle className="w-5 h-5 mr-2" />
-        Error: {error.message}
-      </div>
-    );
-  }
-
-  const handleImageError = (path: string) => {
-    setImageLoadErrors((prev) => new Set(prev).add(path));
-  };
-
-  // Render screenshots from SQLite (completed tasks)
-  const renderDbScreenshotGrid = (items: TaskRunScreenshotDb[]) => {
-    if (items.length === 0) return null;
-
-    // Group by screenshot type
-    const groupedByType = items.reduce(
-      (acc, item) => {
-        const type = item.screenshot_type || "unknown";
-        if (!acc[type]) acc[type] = [];
-        acc[type].push(item);
-        return acc;
-      },
-      {} as Record<string, TaskRunScreenshotDb[]>,
-    );
-
-    return (
-      <div className="space-y-6">
-        {Object.entries(groupedByType).map(([type, screenshots]) => {
-          const badge = getScreenshotTypeBadge(type);
-          return (
-            <div key={type} className="space-y-2">
-              <h3 className="text-sm font-medium text-muted-foreground flex items-center gap-2">
-                <span
-                  className={`px-2 py-0.5 text-xs font-medium rounded ${badge.bg} ${badge.text}`}
-                >
-                  {badge.label}
-                </span>
-                <span>({screenshots.length})</span>
-              </h3>
-              <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
-                {screenshots.map((img) => {
-                  const filename = img.file_path.split(/[/\\]/).pop() || img.file_path;
-                  return (
-                    <button
-                      key={img.id}
-                      onClick={() => setSelectedImage(img.file_path)}
-                      className="border border-border rounded-lg overflow-hidden hover:border-blue-500/50 transition-colors text-left"
-                    >
-                      <div className="aspect-video bg-muted flex items-center justify-center overflow-hidden">
-                        {imageLoadErrors.has(img.file_path) ? (
-                          <Image className="w-8 h-8 text-muted-foreground opacity-50" />
-                        ) : (
-                          <img
-                            src={getImageSrc(img.file_path)}
-                            alt={filename}
-                            className="w-full h-full object-cover"
-                            onError={() => handleImageError(img.file_path)}
-                          />
-                        )}
-                      </div>
-                      <div className="p-2 space-y-1">
-                        <div className="text-xs font-medium truncate">{filename}</div>
-                        {img.template_name && (
-                          <div className="text-xs text-muted-foreground truncate">
-                            Template: {img.template_name}
-                          </div>
-                        )}
-                        {img.confidence != null && (
-                          <div className="text-xs text-muted-foreground">
-                            Confidence: {(img.confidence * 100).toFixed(1)}%
-                          </div>
-                        )}
-                        {img.match_location && (
-                          <div className="text-xs text-muted-foreground">
-                            {(() => {
-                              try {
-                                const loc = JSON.parse(img.match_location);
-                                return `Location: (${loc.x}, ${loc.y})`;
-                              } catch {
-                                return null;
-                              }
-                            })()}
-                          </div>
-                        )}
-                        {img.file_size_bytes && (
-                          <div className="text-xs text-muted-foreground">
-                            {(img.file_size_bytes / 1024).toFixed(1)} KB
-                          </div>
-                        )}
-                      </div>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    );
-  };
-
-  // Render screenshots from file system (running tasks)
-  const renderFsScreenshotList = (items: ScreenshotInfo[], title: string) => {
-    if (items.length === 0) return null;
-    return (
-      <div className="space-y-2">
-        <h3 className="text-sm font-medium text-muted-foreground">{title}</h3>
-        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
-          {items.map((img) => (
-            <button
-              key={img.path}
-              onClick={() => setSelectedImage(img.path)}
-              className="border border-border rounded-lg overflow-hidden hover:border-blue-500/50 transition-colors"
-            >
-              <div className="aspect-video bg-muted flex items-center justify-center overflow-hidden">
-                {imageLoadErrors.has(img.path) ? (
-                  <Image className="w-8 h-8 text-muted-foreground opacity-50" />
-                ) : (
-                  <img
-                    src={getImageSrc(img.path)}
-                    alt={img.filename}
-                    className="w-full h-full object-cover"
-                    onError={() => handleImageError(img.path)}
-                  />
-                )}
-              </div>
-              <div className="p-2">
-                <div className="text-xs font-medium truncate">{img.filename}</div>
-                <div className="text-xs text-muted-foreground">
-                  {(img.size_bytes / 1024).toFixed(1)} KB
-                </div>
-              </div>
-            </button>
-          ))}
-        </div>
-      </div>
-    );
-  };
-
-  // Check if we have any screenshots
-  const hasDbScreenshots = dbScreenshots && dbScreenshots.screenshots.length > 0;
-  const hasFsScreenshots =
-    fsScreenshots && (fsScreenshots.annotated.length > 0 || fsScreenshots.playwright.length > 0);
-
-  if (isCompleted && !hasDbScreenshots) {
-    return (
-      <div className="space-y-4">
-        {selectedRun && (
-          <div className="text-xs text-muted-foreground bg-muted/30 px-3 py-2 rounded-md">
-            <span className="font-medium">Time range:</span>{" "}
-            {formatTimestamp(selectedRun.created_at)}
-            {selectedRun.completed_at
-              ? ` -> ${formatTimestamp(selectedRun.completed_at)}`
-              : " -> (still running)"}
-            <span data-content-role="badge" className="ml-2 px-2 py-0.5 rounded bg-muted">
-              SQLite
-            </span>
-          </div>
-        )}
-        <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
-          <Image className="w-8 h-8 mb-3 opacity-50" />
-          <p className="text-sm">No screenshots found for this task run</p>
-        </div>
-      </div>
-    );
-  }
-
-  if (!isCompleted && !hasFsScreenshots) {
-    return (
-      <div className="space-y-4">
-        {selectedRun && (
-          <div className="text-xs text-muted-foreground bg-muted/30 px-3 py-2 rounded-md">
-            <span className="font-medium">Time range:</span>{" "}
-            {formatTimestamp(selectedRun.created_at)}
-            {" -> (still running)"}
-            <span data-content-role="badge" className="ml-2 px-2 py-0.5 rounded bg-muted">
-              File System (real-time)
-            </span>
-          </div>
-        )}
-        <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
-          <Image className="w-8 h-8 mb-3 opacity-50" />
-          <p className="text-sm">No screenshots found yet</p>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="space-y-4">
-      {/* Show data source info */}
-      {selectedRun && (
-        <div className="text-xs text-muted-foreground bg-muted/30 px-3 py-2 rounded-md">
-          <span className="font-medium">Time range:</span> {formatTimestamp(selectedRun.created_at)}
-          {selectedRun.completed_at
-            ? ` -> ${formatTimestamp(selectedRun.completed_at)}`
-            : " -> (still running)"}
-          <span className="ml-2 px-2 py-0.5 rounded bg-muted">
-            {isCompleted ? "SQLite" : "File System (real-time)"}
-          </span>
-          {isCompleted && dbScreenshots && (
-            <span className="ml-2">{dbScreenshots.count} screenshots</span>
-          )}
-        </div>
-      )}
-
-      {/* Screenshots content */}
-      {isCompleted && dbScreenshots ? (
-        renderDbScreenshotGrid(dbScreenshots.screenshots)
-      ) : (
-        <div className="space-y-6">
-          {fsScreenshots &&
-            renderFsScreenshotList(fsScreenshots.annotated, "Annotated Screenshots")}
-          {fsScreenshots &&
-            renderFsScreenshotList(fsScreenshots.playwright, "Playwright Screenshots")}
-        </div>
-      )}
-
-      {/* Image preview modal */}
-      {selectedImage && (
-        <div
-          className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4"
-          onClick={() => setSelectedImage(null)}
-        >
-          <div
-            className="max-w-[90vw] max-h-[90vh] flex flex-col"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="text-xs text-muted-foreground mb-2 truncate">{selectedImage}</div>
-            {imageLoadErrors.has(selectedImage) ? (
-              <div className="bg-muted p-4 rounded-lg text-center text-muted-foreground">
-                Image failed to load.
-                <br />
-                <span className="text-xs">Path: {selectedImage}</span>
-              </div>
-            ) : (
-              <img
-                src={getImageSrc(selectedImage)}
-                alt="Screenshot preview"
-                className="max-w-full max-h-[calc(90vh-2rem)] object-contain rounded-lg"
-                onError={() => handleImageError(selectedImage)}
-              />
-            )}
-          </div>
         </div>
       )}
     </div>
@@ -3937,11 +3450,393 @@ function MobileErrorsSection() {
   );
 }
 
+// Helper to calculate duration between two date strings
+function formatSessionDuration(startedAt: string, stoppedAt: string | null): string {
+  if (!stoppedAt) return "running";
+  try {
+    const ms = new Date(stoppedAt).getTime() - new Date(startedAt).getTime();
+    if (ms < 0) return "\u2014";
+    if (ms < 1000) return `${ms}ms`;
+    if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+    const minutes = Math.floor(ms / 60_000);
+    const seconds = Math.floor((ms % 60_000) / 1000);
+    if (minutes < 60) return `${minutes}m ${seconds}s`;
+    const hours = Math.floor(minutes / 60);
+    const remainingMinutes = minutes % 60;
+    return `${hours}h ${remainingMinutes}m`;
+  } catch {
+    return "\u2014";
+  }
+}
+
+// Inline detail panel for an expanded process session
+function ProcessSessionDetailPanel({ session }: { session: ProcessSession }) {
+  const stateIcon =
+    session.state === "running" ? (
+      <Activity className="w-3.5 h-3.5 text-green-500" />
+    ) : session.state === "failed" ? (
+      <XCircle className="w-3.5 h-3.5 text-red-500" />
+    ) : session.state === "stopped" ? (
+      <CheckCircle className="w-3.5 h-3.5 text-muted-foreground" />
+    ) : (
+      <Clock className="w-3.5 h-3.5 text-muted-foreground" />
+    );
+
+  const stateBadgeClass =
+    session.state === "running"
+      ? "bg-green-500/10 text-green-500"
+      : session.state === "failed"
+        ? "bg-red-500/10 text-red-500"
+        : "bg-muted text-muted-foreground";
+
+  return (
+    <div className="border-t border-border bg-muted/30 px-4 py-3 space-y-3">
+      {/* Session metadata header */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+        <div>
+          <span className="text-muted-foreground block mb-0.5">Process</span>
+          <span className="font-medium flex items-center gap-1.5">
+            <Terminal className="w-3 h-3 text-muted-foreground" />
+            {session.process_name}
+          </span>
+        </div>
+        <div>
+          <span className="text-muted-foreground block mb-0.5">State</span>
+          <span
+            className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 font-medium ${stateBadgeClass}`}
+          >
+            {stateIcon}
+            {session.state}
+          </span>
+        </div>
+        <div>
+          <span className="text-muted-foreground block mb-0.5">Duration</span>
+          <span className="font-mono flex items-center gap-1.5">
+            <Timer className="w-3 h-3 text-muted-foreground" />
+            {formatSessionDuration(session.started_at, session.stopped_at)}
+          </span>
+        </div>
+        <div>
+          <span className="text-muted-foreground block mb-0.5">Exit Code</span>
+          <span
+            className={`font-mono ${
+              session.exit_code !== null && session.exit_code !== 0 ? "text-red-500" : ""
+            }`}
+          >
+            {session.exit_code !== null ? session.exit_code : "\u2014"}
+          </span>
+        </div>
+        <div>
+          <span className="text-muted-foreground block mb-0.5">Started</span>
+          <span className="font-mono">{formatTimestamp(session.started_at)}</span>
+        </div>
+        <div>
+          <span className="text-muted-foreground block mb-0.5">Stopped</span>
+          <span className="font-mono">
+            {session.stopped_at ? formatTimestamp(session.stopped_at) : "\u2014"}
+          </span>
+        </div>
+        <div>
+          <span className="text-muted-foreground block mb-0.5">Errors</span>
+          <span className={session.error_count > 0 ? "text-red-500 font-medium" : ""}>
+            {session.error_count > 0 ? (
+              <span className="flex items-center gap-1">
+                <AlertCircle className="w-3 h-3" />
+                {session.error_count}
+              </span>
+            ) : (
+              "0"
+            )}
+          </span>
+        </div>
+        <div>
+          <span className="text-muted-foreground block mb-0.5">Session ID</span>
+          <span
+            className="font-mono text-[10px] text-muted-foreground truncate block"
+            title={session.id}
+          >
+            {session.id}
+          </span>
+        </div>
+      </div>
+
+      {/* Inline output viewer */}
+      <div className="border-t border-border pt-2">
+        <ProcessSessionOutputSection sessionId={session.id} compact />
+      </div>
+    </div>
+  );
+}
+
+// Process Sessions Section
+function ProcessSessionsSection({
+  onSelectSession,
+}: {
+  onSelectSession?: (sessionId: string) => void;
+}) {
+  const { data: sessions, isLoading, error } = useProcessSessions();
+  const [expandedSessionId, setExpandedSessionId] = useState<string | null>(null);
+
+  if (isLoading) {
+    return (
+      <div className="p-4 text-muted-foreground flex items-center gap-2">
+        <Loader2 className="w-4 h-4 animate-spin" />
+        Loading sessions...
+      </div>
+    );
+  }
+  if (error) {
+    return <div className="p-4 text-red-500">Error: {String(error)}</div>;
+  }
+  if (!sessions || sessions.length === 0) {
+    return <div className="p-4 text-muted-foreground">No process sessions found.</div>;
+  }
+
+  const handleRowClick = (session: ProcessSession) => {
+    setExpandedSessionId((prev) => (prev === session.id ? null : session.id));
+    onSelectSession?.(session.id);
+  };
+
+  return (
+    <div className="space-y-1">
+      <h3 className="px-4 pt-4 pb-2 text-sm font-medium text-muted-foreground">
+        Process Sessions ({sessions.length})
+      </h3>
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="border-b text-left text-muted-foreground">
+              <th className="px-2 py-2 w-8"></th>
+              <th className="px-4 py-2">Process</th>
+              <th className="px-4 py-2">Started</th>
+              <th className="px-4 py-2">Duration</th>
+              <th className="px-4 py-2">State</th>
+              <th className="px-4 py-2">Exit Code</th>
+              <th className="px-4 py-2">Errors</th>
+            </tr>
+          </thead>
+          <tbody>
+            {sessions.map((session) => {
+              const isExpanded = expandedSessionId === session.id;
+              return (
+                <Fragment key={session.id}>
+                  <tr
+                    className={`border-b hover:bg-muted/50 cursor-pointer ${
+                      isExpanded ? "bg-muted/30" : ""
+                    }`}
+                    onClick={() => handleRowClick(session)}
+                  >
+                    <td className="px-2 py-2">
+                      {isExpanded ? (
+                        <ChevronDown className="w-4 h-4 text-muted-foreground" />
+                      ) : (
+                        <ChevronRight className="w-4 h-4 text-muted-foreground" />
+                      )}
+                    </td>
+                    <td className="px-4 py-2 font-medium">{session.process_name}</td>
+                    <td className="px-4 py-2 text-muted-foreground">
+                      {formatTimestamp(session.started_at)}
+                    </td>
+                    <td className="px-4 py-2 text-muted-foreground font-mono text-xs">
+                      {formatSessionDuration(session.started_at, session.stopped_at)}
+                    </td>
+                    <td className="px-4 py-2">
+                      <span
+                        className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${
+                          session.state === "running"
+                            ? "bg-green-500/10 text-green-500"
+                            : session.state === "failed"
+                              ? "bg-red-500/10 text-red-500"
+                              : "bg-muted text-muted-foreground"
+                        }`}
+                      >
+                        {session.state}
+                      </span>
+                    </td>
+                    <td className="px-4 py-2 font-mono">
+                      {session.exit_code !== null ? session.exit_code : "\u2014"}
+                    </td>
+                    <td className="px-4 py-2">
+                      {session.error_count > 0 ? (
+                        <span className="text-red-500">{session.error_count}</span>
+                      ) : (
+                        "0"
+                      )}
+                    </td>
+                  </tr>
+                  {isExpanded && (
+                    <tr>
+                      <td colSpan={7} className="p-0">
+                        <ProcessSessionDetailPanel session={session} />
+                      </td>
+                    </tr>
+                  )}
+                </Fragment>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// Process Session Output Section
+function ProcessSessionOutputSection({
+  sessionId,
+  compact = false,
+}: {
+  sessionId: string | null;
+  compact?: boolean;
+}) {
+  const { data: lines, isLoading, error } = useProcessSessionOutput(sessionId);
+  const [streamFilter, setStreamFilter] = useState<"all" | "stdout" | "stderr">("all");
+  const [searchText, setSearchText] = useState("");
+
+  const filteredLines = useMemo(() => {
+    if (!lines) return [];
+    return lines.filter((line) => {
+      if (streamFilter !== "all" && line.stream !== streamFilter) return false;
+      if (searchText && !line.line.toLowerCase().includes(searchText.toLowerCase())) return false;
+      return true;
+    });
+  }, [lines, streamFilter, searchText]);
+
+  const stdoutCount = useMemo(
+    () => lines?.filter((l) => l.stream === "stdout").length ?? 0,
+    [lines],
+  );
+  const stderrCount = useMemo(
+    () => lines?.filter((l) => l.stream === "stderr").length ?? 0,
+    [lines],
+  );
+
+  if (!sessionId) {
+    return (
+      <div className={`${compact ? "p-2" : "p-4"} text-muted-foreground`}>
+        Select a session from the Sessions tab to view output.
+      </div>
+    );
+  }
+  if (isLoading) {
+    return (
+      <div className={`${compact ? "p-2" : "p-4"} text-muted-foreground flex items-center gap-2`}>
+        <Loader2 className="w-3 h-3 animate-spin" />
+        Loading output...
+      </div>
+    );
+  }
+  if (error) {
+    return <div className={`${compact ? "p-2" : "p-4"} text-red-500`}>Error: {String(error)}</div>;
+  }
+  if (!lines || lines.length === 0) {
+    return (
+      <div className={`${compact ? "p-2" : "p-4"} text-muted-foreground`}>
+        No output captured for this session.
+      </div>
+    );
+  }
+
+  const isFiltered = streamFilter !== "all" || searchText.length > 0;
+
+  return (
+    <div className={compact ? "flex flex-col" : "flex flex-col h-full"}>
+      <div className={compact ? "pb-1 space-y-2" : "px-4 pt-4 pb-2 space-y-3"}>
+        <h3 className="text-sm font-medium text-muted-foreground">
+          Session Output
+          {isFiltered
+            ? ` \u2014 Showing ${filteredLines.length} of ${lines.length} lines`
+            : ` (${lines.length} lines)`}
+        </h3>
+
+        {/* Toolbar: stream filter + text search */}
+        <div className="flex flex-wrap items-center gap-3">
+          {/* Stream filter buttons */}
+          <div className="flex gap-1.5">
+            <button
+              onClick={() => setStreamFilter("all")}
+              className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+                streamFilter === "all"
+                  ? `${getAccentColors("blue").bg} ${getAccentColors("blue").text} border ${getAccentColors("blue").border}`
+                  : "bg-muted text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              All ({lines.length})
+            </button>
+            <button
+              onClick={() => setStreamFilter("stdout")}
+              className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+                streamFilter === "stdout"
+                  ? `${getAccentColors("green").bg} ${getAccentColors("green").text} border ${getAccentColors("green").border}`
+                  : "bg-muted text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              stdout ({stdoutCount})
+            </button>
+            <button
+              onClick={() => setStreamFilter("stderr")}
+              className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+                streamFilter === "stderr"
+                  ? `${getAccentColors("red").bg} ${getAccentColors("red").text} border ${getAccentColors("red").border}`
+                  : "bg-muted text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              stderr ({stderrCount})
+            </button>
+          </div>
+
+          {/* Text search input */}
+          <div className="relative flex-1 min-w-[200px]">
+            <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground pointer-events-none" />
+            <input
+              type="text"
+              placeholder="Filter lines by text..."
+              value={searchText}
+              onChange={(e) => setSearchText(e.target.value)}
+              className="w-full pl-8 pr-3 py-1.5 text-xs rounded-md border border-border bg-muted/50 text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+            />
+            {searchText && (
+              <button
+                onClick={() => setSearchText("")}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground text-xs"
+                title="Clear search"
+              >
+                &times;
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div className={compact ? "overflow-auto" : "flex-1 overflow-auto px-4 pb-4"}>
+        {filteredLines.length === 0 ? (
+          <div className="text-sm text-muted-foreground py-4">
+            No lines match the current filters.
+          </div>
+        ) : (
+          <pre
+            className={`text-xs font-mono bg-black/80 text-green-400 rounded-lg overflow-auto ${
+              compact ? "p-2 max-h-[40vh]" : "p-4 max-h-[70vh]"
+            }`}
+          >
+            {filteredLines.map((line) => (
+              <div key={line.id} className={line.stream === "stderr" ? "text-red-400" : ""}>
+                <span className="text-gray-500 select-none">
+                  {new Date(line.timestamp).toLocaleTimeString()}{" "}
+                </span>
+                {line.line}
+              </div>
+            ))}
+          </pre>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function AiDataViewerTab() {
   const [activeCategory, setActiveCategory] = useState<DataCategory>("ai-prompt");
-  const { config } = useExecution();
-  const configId = config?.path || "";
-  const { data: automationRuns } = useAutomationRuns(configId, 50);
+  const [selectedProcessSessionId, setSelectedProcessSessionId] = useState<string | null>(null);
 
   // Render the content for the active category
   const renderContent = () => {
@@ -3969,8 +3864,6 @@ export function AiDataViewerTab() {
       case "execution-spans":
         return <ExecutionSpansSection />;
       // Captures group
-      case "screenshots":
-        return <ScreenshotsSection />;
       case "dom-snapshots":
         return <DomSnapshotsPanel />;
       // Mobile group
@@ -3982,11 +3875,14 @@ export function AiDataViewerTab() {
         return <MobileLogsSection />;
       case "mobile-errors":
         return <MobileErrorsSection />;
+      // Processes group
+      case "process-sessions":
+        return <ProcessSessionsSection />;
+      case "process-output":
+        return <ProcessSessionOutputSection sessionId={selectedProcessSessionId} />;
       // Configuration group
       case "loaded-config":
         return <LoadedConfigSection />;
-      case "automation-runs":
-        return <AutomationRunsSection />;
       case "dev-logs":
         return <DevLogsSection />;
       default:
@@ -4000,11 +3896,7 @@ export function AiDataViewerTab() {
   return (
     <div data-ui-id="logs-ai-data-viewer-tab" className="h-full flex overflow-hidden">
       {/* Sidebar navigation */}
-      <SidebarNav
-        activeCategory={activeCategory}
-        onCategoryChange={setActiveCategory}
-        automationRunsCount={automationRuns?.length}
-      />
+      <SidebarNav activeCategory={activeCategory} onCategoryChange={setActiveCategory} />
 
       {/* Content area */}
       <div

@@ -3111,6 +3111,9 @@ pub async fn generate_workflow_from_chat(
         .and_then(|v| v.as_str())
         .unwrap_or("Generate workflow from chat conversation")
         .to_string();
+    let include_ui_bridge = req
+        .get("include_ui_bridge_instructions")
+        .and_then(|v| v.as_bool());
 
     let request = crate::workflow_generation::GenerateWorkflowRequest {
         description,
@@ -3131,6 +3134,7 @@ pub async fn generate_workflow_from_chat(
         context_ids: None,
         max_fix_iterations: Some(3),
         discovery_mode: None,
+        include_ui_bridge_instructions: include_ui_bridge,
     };
 
     let doctor_handle = state.doctor_handle.clone();

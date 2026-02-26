@@ -50,6 +50,7 @@ mod mcp_embedded;
 mod orchestrator;
 mod paths;
 mod playwright;
+mod process_capture;
 mod prompt_snippets;
 mod prompts;
 mod rag;
@@ -272,7 +273,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         url_lock_manager: Arc::new(crate::executor::UrlLockManager::new()),
         ui_bridge_failure_tracker:
             crate::step_executor::handlers::ui_bridge::UiBridgeFailureTracker::new(),
-        api_ready: AtomicBool::new(false), // Set when MCP API server binds
+        process_capture_manager: TokioMutex::new(None), // Initialized in setup()
+        api_ready: AtomicBool::new(false),              // Set when MCP API server binds
     });
     let mcp_app_state = shared_app_state.clone();
     let mcp_rag_state = rag_state.clone();
@@ -810,6 +812,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::global_log_sources::read_log_sources_by_profile,
             commands::global_log_sources::migrate_project_sources_to_global,
             commands::global_log_sources::select_log_sources_for_context,
+            // Setup wizard commands (first-launch setup)
+            commands::setup_wizard::check_setup_completed,
+            commands::setup_wizard::complete_setup,
+            commands::setup_wizard::scan_workspace_for_setup,
+            commands::setup_wizard::detect_project_framework_for_setup,
+            commands::setup_wizard::suggest_log_sources_for_setup,
+            commands::setup_wizard::suggest_workspace_sources_for_setup,
+            commands::setup_wizard::save_log_sources_from_setup,
+            commands::setup_wizard::save_ai_provider_from_setup,
+            commands::setup_wizard::suggest_process_configs_for_setup,
             // Test Orchestrator commands (AI-driven multi-step API test creation)
             commands::test_orchestrator::plan_test_orchestration,
             commands::test_orchestrator::execute_test_orchestration,
@@ -865,6 +877,19 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             mcp::backend_relay::commands::get_cloud_relay_status,
             mcp::backend_relay::commands::save_cloud_relay_settings,
             mcp::backend_relay::commands::get_cloud_relay_settings,
+            // Process capture commands
+            process_capture::commands::start_managed_process,
+            process_capture::commands::stop_managed_process,
+            process_capture::commands::restart_managed_process,
+            process_capture::commands::start_all_managed_processes,
+            process_capture::commands::stop_all_managed_processes,
+            process_capture::commands::get_managed_processes,
+            process_capture::commands::get_process_output,
+            process_capture::commands::get_process_configs,
+            process_capture::commands::save_process_config,
+            process_capture::commands::delete_process_config,
+            process_capture::commands::get_process_sessions_from_db,
+            process_capture::commands::get_process_session_output_from_db,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");
@@ -1030,6 +1055,45 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 info!("Error monitor service started and handle stored in AppState");
             });
 
+            // Initialize process capture manager
+            info!("Initializing process capture manager");
+            let app_state_for_pcm = app.state::<Arc<AppState>>().inner().clone();
+            let app_handle_for_pcm = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                // Wait for error monitor handle to be ready
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+                let error_monitor = {
+                    let handle_lock = app_state_for_pcm.error_monitor_handle.lock().await;
+                    handle_lock.clone()
+                };
+                let error_monitor_arc =
+                    Arc::new(tokio::sync::RwLock::new(error_monitor));
+
+                let pcm_db = app_state_for_pcm.checkpoint_db.clone();
+                let manager = Arc::new(process_capture::ProcessCaptureManager::new(
+                    error_monitor_arc,
+                    app_handle_for_pcm,
+                    pcm_db,
+                ));
+
+                // Load configs from settings and register them
+                let configs = settings::get_managed_process_configs();
+                for config in configs {
+                    if config.enabled {
+                        manager.register(config).await;
+                    }
+                }
+
+                // Auto-start processes
+                manager.start_auto_processes().await;
+
+                // Store the manager
+                let mut manager_lock = app_state_for_pcm.process_capture_manager.lock().await;
+                *manager_lock = Some(manager);
+                info!("Process capture manager initialized");
+            });
+
             // Start Doctor health monitoring service in background
             info!("Starting Doctor health monitoring service");
             let app_state_for_doctor = app.state::<Arc<AppState>>().inner().clone();
@@ -1106,6 +1170,17 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     sm.close_all_sessions();
                 }
+
+                // Stop all managed processes
+                let app_state_pcm = app_state.inner().clone();
+                tauri::async_runtime::spawn(async move {
+                    let manager_lock = app_state_pcm.process_capture_manager.lock().await;
+                    if let Some(ref manager) = *manager_lock {
+                        info!("Stopping all managed processes");
+                        manager.stop_all().await;
+                        info!("All managed processes stopped");
+                    }
+                });
 
                 // Stop error monitor service
                 let app_state_clone2 = app_state.inner().clone();

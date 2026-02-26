@@ -38,6 +38,7 @@ pub mod misc;
 pub mod models;
 pub mod monitors;
 pub mod playwright;
+pub mod processes;
 pub mod prompt_snippets;
 pub mod prompts;
 pub mod query_tool;

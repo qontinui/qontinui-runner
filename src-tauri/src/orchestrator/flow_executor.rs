@@ -2775,7 +2775,7 @@ mod tests {
         let resolved = resolve_input_mappings(&mappings, &context);
 
         // Missing source should not produce any output
-        assert!(resolved.get("input1").is_none());
+        assert!(!resolved.contains_key("input1"));
     }
 
     #[test]
