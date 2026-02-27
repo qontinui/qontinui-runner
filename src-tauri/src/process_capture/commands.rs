@@ -112,15 +112,16 @@ pub async fn save_process_config(
     config: ProcessConfig,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    // Save to settings
+    // Save to settings (persists across restarts)
     crate::settings::save_managed_process_config(config.clone())?;
 
-    // Register with manager
+    // Register with manager if available. During setup wizard the manager may
+    // not be initialized yet — that's fine, configs will be loaded from
+    // settings when the manager starts up (main.rs startup sequence).
     let manager = state.process_capture_manager.lock().await;
-    let manager = manager
-        .as_ref()
-        .ok_or("Process capture manager not initialized")?;
-    manager.register(config).await;
+    if let Some(mgr) = manager.as_ref() {
+        mgr.register(config).await;
+    }
 
     Ok(())
 }

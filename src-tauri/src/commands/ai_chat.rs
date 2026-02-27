@@ -1,7 +1,7 @@
 //! Tauri commands for interactive AI chat sessions.
 //!
 //! These commands allow the frontend to send messages to active Claude CLI sessions,
-//! interrupt processing, and query session state.
+//! interrupt processing, query session state, and manage standalone chat sessions.
 
 use std::sync::Arc;
 
@@ -11,9 +11,10 @@ use tracing::{info, warn};
 
 use crate::claude_session::manager::SessionManager;
 use crate::claude_session::state::SessionState;
-use crate::commands::CommandResponse;
-use crate::database::CheckpointDb;
-use crate::mcp::shared::emit_ai_output;
+use crate::commands::{AppState, CommandResponse};
+use crate::database::{CheckpointDb, CreateTaskRunInput};
+use crate::execution_context::AiSessionContext;
+use crate::mcp::shared::AiOutputEvent;
 
 /// Session state event payload (emitted on state transitions).
 #[derive(Debug, Clone, Serialize)]
@@ -65,11 +66,27 @@ pub async fn send_user_message(
         .get(&task_run_id)
         .ok_or_else(|| format!("No active session found for task_run_id: {}", task_run_id))?;
 
-    // Emit the user's message as an ai-output event so it appears in the conversation
-    let session_ctx = None; // User messages don't have session context
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        emit_ai_output(&app_handle, &message, "user_message", None, session_ctx);
-    }));
+    // Emit the user's message as an ai-output event so it appears in the conversation.
+    // We emit directly (not via emit_ai_output) so we can include task_run_id
+    // without needing a full AiSessionContext.
+    {
+        let now = chrono::Utc::now().timestamp_millis();
+        let event = AiOutputEvent {
+            id: format!("ai-{}-{}", now, rand::random::<u32>()),
+            timestamp: now,
+            line: message.clone(),
+            source: "user_message".to_string(),
+            action_id: None,
+            task_run_id: Some(task_run_id.clone()),
+            session_id: None,
+            session_name: None,
+            phase: None,
+            phase_iteration: None,
+        };
+        if let Err(e) = app_handle.emit("ai-output", &event) {
+            warn!("Failed to emit user message ai-output event: {}", e);
+        }
+    }
 
     // Persist user message to output_log for recap/summary generation
     if let Ok(db) = CheckpointDb::new() {
@@ -187,6 +204,328 @@ pub async fn get_ai_session_state(
             data: Some(serde_json::json!({
                 "state": null,
             })),
+        }),
+    }
+}
+
+/// Create a standalone chat session.
+///
+/// Creates a task run record in the database, spawns a Claude CLI session
+/// in the background, and returns the task_run_id immediately.
+#[tauri::command]
+pub async fn create_chat_session(
+    app_handle: tauri::AppHandle,
+    session_manager: tauri::State<'_, Arc<SessionManager>>,
+    app_state: tauri::State<'_, Arc<AppState>>,
+    task_name: Option<String>,
+) -> Result<CommandResponse, String> {
+    let task_run_id = uuid::Uuid::new_v4().to_string();
+    let name = task_name.unwrap_or_else(|| "New Chat".to_string());
+
+    info!(
+        "create_chat_session: task_run_id={}, name={}",
+        task_run_id, name
+    );
+
+    // 1. Create task run record in DB
+    let db = app_state.checkpoint_db.clone();
+    let id_clone = task_run_id.clone();
+    let name_clone = name.clone();
+    let create_result = tokio::task::spawn_blocking(move || {
+        db.create_task_run(
+            &CreateTaskRunInput::new(id_clone, name_clone)
+                .with_prompt("Chat session")
+                .with_workflow_type("chat"),
+        )
+    })
+    .await;
+
+    if create_result.is_err() || create_result.as_ref().unwrap().is_err() {
+        return Ok(CommandResponse {
+            success: false,
+            message: Some("Failed to create task run record".to_string()),
+            data: None,
+        });
+    }
+
+    // 2. Spawn session setup in background
+    let sm = session_manager.inner().clone();
+    let handle = app_handle.clone();
+    let trid = task_run_id.clone();
+    let name_for_ctx = name.clone();
+    tokio::spawn(async move {
+        let working_dir = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+
+        // Create an AiSessionContext so output events include the taskRunId.
+        // Without this, emit_ai_output would emit events with taskRunId=null
+        // and the frontend would be unable to filter them.
+        let session_ctx = AiSessionContext::setup(&trid, &name_for_ctx);
+
+        match crate::claude_session::ClaudeSession::spawn(
+            &working_dir,
+            &trid,
+            &handle,
+            Some(session_ctx), // Tags output events with taskRunId
+            None,              // finding_ctx
+            None,              // progress_ctx
+            None,              // pid_tracker
+        ) {
+            Ok(session) => {
+                let session = Arc::new(session);
+
+                if let Err(e) = sm.register(&trid, session.clone()) {
+                    warn!("Failed to register chat session: {}", e);
+                    return;
+                }
+
+                // Emit ready state — session is ready for the user's first message.
+                // No initial prompt is sent; the first user message will include
+                // a context switch note via send_user_message's first-interaction logic.
+                emit_session_state(&handle, &trid, &trid, session.state());
+
+                info!("Chat session ready: task_run_id={}", trid);
+            }
+            Err(e) => {
+                warn!("Failed to spawn chat session: {}", e);
+            }
+        }
+    });
+
+    // 3. Return immediately with task_run_id
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Chat session creating".to_string()),
+        data: Some(serde_json::json!({
+            "task_run_id": task_run_id,
+            "state": "initializing",
+        })),
+    })
+}
+
+/// Close a chat session.
+///
+/// Gracefully closes the Claude CLI session and updates the task run status.
+#[tauri::command]
+pub async fn close_chat_session(
+    app_handle: tauri::AppHandle,
+    session_manager: tauri::State<'_, Arc<SessionManager>>,
+    app_state: tauri::State<'_, Arc<AppState>>,
+    task_run_id: String,
+) -> Result<CommandResponse, String> {
+    info!("close_chat_session: task_run_id={}", task_run_id);
+
+    // Remove and close the session
+    if let Some(session) = session_manager.remove(&task_run_id) {
+        let _ = session.close();
+    }
+
+    // Update DB status
+    let db = app_state.checkpoint_db.clone();
+    let id_clone = task_run_id.clone();
+    let _ =
+        tokio::task::spawn_blocking(move || db.update_task_run_status(&id_clone, "stopped")).await;
+
+    // Emit closed state
+    emit_session_state(
+        &app_handle,
+        &task_run_id,
+        &task_run_id,
+        SessionState::Closed,
+    );
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Chat session closed".to_string()),
+        data: Some(serde_json::json!({
+            "state": "closed",
+        })),
+    })
+}
+
+/// Rename a chat session.
+///
+/// Updates the task_name for the task run in the database.
+#[tauri::command]
+pub async fn rename_chat_session(
+    app_state: tauri::State<'_, Arc<AppState>>,
+    task_run_id: String,
+    name: String,
+) -> Result<CommandResponse, String> {
+    info!(
+        "rename_chat_session: task_run_id={}, name={}",
+        task_run_id, name
+    );
+
+    let db = app_state.checkpoint_db.clone();
+    let id_clone = task_run_id.clone();
+    let name_clone = name.clone();
+    let result =
+        tokio::task::spawn_blocking(move || db.update_task_run_name(&id_clone, &name_clone)).await;
+
+    match result {
+        Ok(Ok(())) => Ok(CommandResponse {
+            success: true,
+            message: Some("Session renamed".to_string()),
+            data: Some(serde_json::json!({
+                "task_run_id": task_run_id,
+                "name": name,
+            })),
+        }),
+        _ => Ok(CommandResponse {
+            success: false,
+            message: Some("Failed to rename session".to_string()),
+            data: None,
+        }),
+    }
+}
+
+/// Get the output log for a chat session.
+///
+/// Returns the full conversation output from the database.
+#[tauri::command]
+pub async fn get_chat_output(
+    app_state: tauri::State<'_, Arc<AppState>>,
+    task_run_id: String,
+) -> Result<CommandResponse, String> {
+    let db = app_state.checkpoint_db.clone();
+    let id_clone = task_run_id.clone();
+    let result = tokio::task::spawn_blocking(move || db.get_task_run_output(&id_clone)).await;
+
+    match result {
+        Ok(Ok(Some(output))) => Ok(CommandResponse {
+            success: true,
+            message: None,
+            data: Some(serde_json::json!({
+                "task_run_id": task_run_id,
+                "output_log": output,
+            })),
+        }),
+        Ok(Ok(None)) => Ok(CommandResponse {
+            success: true,
+            message: Some("No output available".to_string()),
+            data: Some(serde_json::json!({
+                "task_run_id": task_run_id,
+                "output_log": "",
+            })),
+        }),
+        _ => Ok(CommandResponse {
+            success: false,
+            message: Some("Failed to get output".to_string()),
+            data: None,
+        }),
+    }
+}
+
+/// Generate a workflow from a chat conversation.
+///
+/// Reads the conversation output log and uses the workflow generator
+/// to create a UnifiedWorkflow from the conversation context.
+#[tauri::command]
+pub async fn generate_workflow_from_chat(
+    app_state: tauri::State<'_, Arc<AppState>>,
+    task_run_id: String,
+    description: Option<String>,
+    include_ui_bridge: Option<bool>,
+) -> Result<CommandResponse, String> {
+    info!("generate_workflow_from_chat: task_run_id={}", task_run_id);
+
+    // Get conversation from DB output_log
+    let db = app_state.checkpoint_db.clone();
+    let id_clone = task_run_id.clone();
+    let output_log =
+        match tokio::task::spawn_blocking(move || db.get_task_run_output(&id_clone)).await {
+            Ok(Ok(Some(log))) => log,
+            Ok(Ok(None)) => {
+                return Ok(CommandResponse {
+                    success: false,
+                    message: Some("No conversation history available".to_string()),
+                    data: None,
+                });
+            }
+            _ => {
+                return Ok(CommandResponse {
+                    success: false,
+                    message: Some("Failed to read conversation".to_string()),
+                    data: None,
+                });
+            }
+        };
+
+    // Build generation request with conversation as inline context
+    let request = crate::workflow_generation::GenerateWorkflowRequest {
+        description: description
+            .unwrap_or_else(|| "Generate workflow from chat conversation".to_string()),
+        inline_context: Some(format!(
+            "The following is a conversation between a user and an AI assistant. \
+             Use this conversation context to generate an appropriate workflow:\n\n{}",
+            output_log
+        )),
+        category: None,
+        tags: None,
+        max_iterations: None,
+        provider: None,
+        model: None,
+        skip_ai_summary: None,
+        log_source_selection: None,
+        prompt_template: None,
+        auto_include_contexts: Some(true),
+        context_ids: None,
+        max_fix_iterations: Some(3),
+        discovery_mode: None,
+        include_ui_bridge_instructions: include_ui_bridge,
+    };
+
+    // Get doctor handle for health monitoring
+    let doctor_handle = app_state.doctor_handle.lock().await.clone();
+    let db2 = app_state.checkpoint_db.clone();
+
+    let gen_result = tokio::task::spawn_blocking(move || {
+        let gen_result = db2.with_conn(|conn| {
+            Ok(crate::workflow_generation::generate_workflow(
+                request,
+                doctor_handle.as_ref(),
+                Some(conn),
+                None,
+            ))
+        });
+        match gen_result {
+            Ok(response) => response,
+            Err(e) => {
+                warn!("DB access failed for chat workflow generation: {}", e);
+                crate::workflow_generation::GenerateWorkflowResponse {
+                    workflow: None,
+                    validation_errors: vec![],
+                    success: false,
+                    error: Some(format!("Database error during generation: {}", e)),
+                    model_used: None,
+                    verification_iterations: vec![],
+                    hardening_summary: None,
+                    discovery_calls: vec![],
+                }
+            }
+        }
+    })
+    .await;
+
+    match gen_result {
+        Ok(response) => Ok(CommandResponse {
+            success: response.success,
+            message: response.error.clone(),
+            data: Some(serde_json::json!({
+                "task_run_id": task_run_id,
+                "success": response.success,
+                "workflow": response.workflow,
+                "error": response.error,
+                "validation_errors": response.validation_errors,
+                "model_used": response.model_used,
+            })),
+        }),
+        Err(e) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Generation task failed: {}", e)),
+            data: None,
         }),
     }
 }
