@@ -23,6 +23,10 @@ fn get_api_base_url() -> String {
 #[derive(Debug, Deserialize)]
 struct PaginatedResponse {
     items: Vec<UnifiedWorkflow>,
+    /// Pagination metadata from the backend (not used, but must be accepted to avoid parse failures)
+    #[serde(default)]
+    #[allow(dead_code)]
+    pagination: Option<serde_json::Value>,
 }
 
 /// Client for communicating with the web backend's workflow API.
@@ -113,10 +117,25 @@ impl WebBackendWorkflowClient {
             ));
         }
 
-        let paginated: PaginatedResponse = response
-            .json()
+        // Parse as text first so we can log the body on failure
+        let body = response
+            .text()
             .await
-            .map_err(|e| format!("Failed to parse workflows response: {}", e))?;
+            .map_err(|e| format!("Failed to read workflows response body: {}", e))?;
+
+        let paginated: PaginatedResponse = serde_json::from_str(&body).map_err(|e| {
+            // Log a truncated snippet of the body to help debug deserialization issues
+            let snippet = if body.len() > 500 {
+                format!("{}...", &body[..500])
+            } else {
+                body.clone()
+            };
+            warn!(
+                "Failed to parse workflows response: {}. Body snippet: {}",
+                e, snippet
+            );
+            format!("Failed to parse workflows response: {}", e)
+        })?;
 
         Ok(paginated.items)
     }
@@ -279,6 +298,7 @@ pub async fn sync_workflows_from_backend(
                     max_sweep_iterations: Some(workflow.max_sweep_iterations),
                     stages: Some(workflow.stages.clone()),
                     stop_on_failure: Some(workflow.stop_on_failure),
+                    reflection_mode: Some(workflow.reflection_mode),
                 };
                 if let Err(e) = db.update_unified_workflow(&workflow.id, &update_req) {
                     warn!("Failed to update cached workflow {}: {}", workflow.id, e);
@@ -315,6 +335,7 @@ pub async fn sync_workflows_from_backend(
                     max_sweep_iterations: Some(workflow.max_sweep_iterations),
                     stages: Some(workflow.stages.clone()),
                     stop_on_failure: Some(workflow.stop_on_failure),
+                    reflection_mode: Some(workflow.reflection_mode),
                 };
                 if let Err(e) = db.create_unified_workflow(&create_req) {
                     warn!("Failed to cache workflow {}: {}", workflow.id, e);

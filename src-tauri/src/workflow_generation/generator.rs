@@ -83,6 +83,10 @@ pub struct GenerateWorkflowRequest {
     /// Whether to include UI Bridge SDK integration instructions in the builder prompt (default: true)
     #[serde(default = "default_true")]
     pub include_ui_bridge_instructions: Option<bool>,
+
+    /// Whether to enable reflection mode for agentic iterations (default: true)
+    #[serde(default = "default_true")]
+    pub reflection_mode: Option<bool>,
 }
 
 fn default_true() -> Option<bool> {
@@ -904,6 +908,9 @@ fn apply_request_options(workflow: &mut UnifiedWorkflow, request: &GenerateWorkf
     }
     if let Some(auto_include) = request.auto_include_contexts {
         workflow.auto_include_contexts = auto_include;
+    }
+    if let Some(reflection_mode) = request.reflection_mode {
+        workflow.reflection_mode = reflection_mode;
     }
 }
 

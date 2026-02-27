@@ -147,12 +147,9 @@ pub fn build_meta_workflow_template(
     let now = chrono::Utc::now().to_rfc3339();
     let max_fix_iterations = request.max_fix_iterations.unwrap_or(3);
 
-    // Truncate description for the workflow name
-    let name_suffix = if request.description.len() > 50 {
-        format!("{}...", &request.description[..50])
-    } else {
-        request.description.clone()
-    };
+    // Extract a clean, descriptive name from the description.
+    // Strip markdown formatting and grab the first meaningful line.
+    let name_suffix = extract_workflow_name_from_description(&request.description);
 
     // Build the prompt strings for each agent
     let schema_context = build_schema_context_for_description(&request.description);
@@ -265,8 +262,65 @@ pub fn build_meta_workflow_template(
         generated_by_task_run_id: None,
         stages: Vec::new(),
         stop_on_failure: false,
+        reflection_mode: false,
         created_at: now.clone(),
         updated_at: now,
+    }
+}
+
+// ============================================================================
+// Name extraction helpers
+// ============================================================================
+
+/// Extract a clean, descriptive workflow name from a potentially long description.
+///
+/// Handles common cases:
+/// - Markdown headings (`# Title` → `Title`)
+/// - Multi-line specs (uses first meaningful line)
+/// - Long descriptions (truncates to ~60 chars at a word boundary)
+fn extract_workflow_name_from_description(description: &str) -> String {
+    let max_len = 60;
+
+    // Find the first non-empty, meaningful line
+    let first_line = description
+        .lines()
+        .map(|line| line.trim())
+        .find(|line| !line.is_empty())
+        .unwrap_or(description.trim());
+
+    // Strip markdown heading markers (e.g., "## My Title" → "My Title")
+    let cleaned = first_line.trim_start_matches('#').trim_start();
+
+    // If the first line is very short and looks like a title, and there's a second
+    // meaningful line, combine them for more context
+    let name = if cleaned.len() < 20 {
+        // Look for a second meaningful line to append
+        let second_line = description
+            .lines()
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty())
+            .nth(1)
+            .map(|l| l.trim_start_matches('#').trim_start())
+            .unwrap_or("");
+
+        if !second_line.is_empty() && !second_line.starts_with("```") {
+            format!("{} — {}", cleaned, second_line)
+        } else {
+            cleaned.to_string()
+        }
+    } else {
+        cleaned.to_string()
+    };
+
+    // Truncate at a word boundary if too long
+    if name.len() <= max_len {
+        name
+    } else {
+        // Find the last space before the limit
+        match name[..max_len].rfind(' ') {
+            Some(pos) => format!("{}...", &name[..pos]),
+            None => format!("{}...", &name[..max_len]),
+        }
     }
 }
 
@@ -415,6 +469,19 @@ If the task description includes "out of scope", "do not change", "do not modify
 2. Or add a `prompt` verification step that specifically reviews whether scope boundaries were respected
 3. Reference the specific constraints in the verification step name (e.g., "Verify data model unchanged")
 
+### CRITICAL PROHIBITIONS
+
+You MUST NOT do any of the following:
+- Make code changes, create files, edit files, or modify any project code
+- Execute shell commands or terminal operations
+- Ask clarifying questions or request more information
+- Provide explanations, commentary, or markdown formatting
+- Output anything other than a single JSON object
+- Interpret the task description as instructions for YOU to execute
+
+You are a workflow DESIGNER, not a workflow EXECUTOR. Your only output is a workflow JSON specification.
+If the task description is ambiguous, interpret it as a workflow generation request and make reasonable assumptions.
+
 Generate the workflow JSON now:
 "#,
     );
@@ -509,6 +576,12 @@ Fix ALL the issues while preserving the workflow's intent.
         r#"
 ## Instructions
 
+Determine which mode to use based on the input:
+
+### Mode 1 — Fix (input contains workflow JSON)
+
+If the input contains a JSON workflow object, fix it:
+
 1. Read the input workflow JSON carefully
 2. The verification issues will be provided in the failure context
 3. Fix each issue while maintaining the overall workflow structure
@@ -521,7 +594,19 @@ Fix ALL the issues while preserving the workflow's intent.
 10. Ensure no circular dependencies exist in `depends_on` chains
 11. Only use the 4 core step types: command, test, ui_bridge, prompt
 
-Output the corrected workflow JSON now:
+### Mode 2 — Generate from scratch (input is empty or not valid JSON)
+
+If the input is empty, contains non-JSON text, or contains code changes instead of workflow JSON:
+
+1. IGNORE the input entirely — it is the result of a failed generation attempt
+2. Read the **Original Task Description** above carefully
+3. Generate a complete, valid workflow JSON from scratch based on that description
+4. Follow the same schema and quality standards as the original builder
+5. Include all 4 phases: setup_steps, verification_steps, agentic_steps, completion_steps
+6. Ensure at least one automated verification step (not just prompts)
+7. Output ONLY the workflow JSON — no markdown, no code fences, no explanation
+
+Output the workflow JSON now:
 "#,
     );
 
@@ -625,4 +710,65 @@ fn build_past_fixes_section(conn: &Connection) -> String {
     section.push('\n');
 
     section
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_name_strips_markdown_heading() {
+        let desc = "# UI Bridge Spec Assertion Types\n\nSome detailed spec...";
+        let name = extract_workflow_name_from_description(desc);
+        assert!(
+            !name.starts_with('#'),
+            "Name should not start with '#': {}",
+            name
+        );
+        assert!(name.contains("UI Bridge Spec Assertion Types"));
+    }
+
+    #[test]
+    fn test_extract_name_multi_level_heading() {
+        let desc = "### Chat Page Testing\n\nVerify the chat page works correctly";
+        let name = extract_workflow_name_from_description(desc);
+        assert_eq!(
+            name,
+            "Chat Page Testing — Verify the chat page works correctly"
+        );
+    }
+
+    #[test]
+    fn test_extract_name_plain_text() {
+        let desc = "Test the login flow end-to-end";
+        let name = extract_workflow_name_from_description(desc);
+        assert_eq!(name, "Test the login flow end-to-end");
+    }
+
+    #[test]
+    fn test_extract_name_truncates_long_text() {
+        let desc = "This is a very long description that goes on and on about all the things that need to be tested in the application";
+        let name = extract_workflow_name_from_description(desc);
+        assert!(name.len() <= 63); // 60 + "..."
+        assert!(name.ends_with("..."));
+    }
+
+    #[test]
+    fn test_extract_name_short_title_gets_context() {
+        let desc = "# Chat Page\n\nVerify all chat functionality works correctly";
+        let name = extract_workflow_name_from_description(desc);
+        assert!(name.contains("Chat Page"), "Should contain title: {}", name);
+        assert!(
+            name.contains("Verify"),
+            "Should include second line for context: {}",
+            name
+        );
+    }
+
+    #[test]
+    fn test_extract_name_skips_empty_lines() {
+        let desc = "\n\n  \n# My Workflow\n\nDetails here";
+        let name = extract_workflow_name_from_description(desc);
+        assert!(name.contains("My Workflow"));
+    }
 }

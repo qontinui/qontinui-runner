@@ -253,6 +253,10 @@ CREATE TABLE IF NOT EXISTS task_runs (
     is_reflection INTEGER DEFAULT 0,            -- Whether this is a reflection analysis run
     reflection_source_task_run_id TEXT,          -- Source task run being analyzed by this reflection
 
+    -- Follow-up (v71)
+    is_follow_up INTEGER DEFAULT 0,             -- Whether this is a follow-up run for unfixed issues
+    follow_up_source_task_run_id TEXT,           -- Source task run whose unfixed issues this run addresses
+
     -- Timestamps
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -855,6 +859,7 @@ CREATE TABLE IF NOT EXISTS unified_workflows (
     -- Multi-stage workflow configuration
     stages TEXT DEFAULT '[]',  -- JSON array of WorkflowStage objects
     stop_on_failure INTEGER DEFAULT 0,  -- 0 = continue on failure (default), 1 = stop
+    reflection_mode INTEGER DEFAULT 1,  -- 0 = disabled, 1 = enabled (default)
 
     -- Generation tracking (for workflows created by meta-workflows)
     generated_by_task_run_id TEXT,  -- Links back to the meta-workflow task_run that created this

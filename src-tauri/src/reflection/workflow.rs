@@ -32,6 +32,7 @@ pub fn build_reflection_config(
         max_sweep_iterations: 5,
         stages: Vec::new(),
         stop_on_failure: false,
+        reflection_mode: true,
         provider_override: None,
         model_override: None,
         stage_index: None,

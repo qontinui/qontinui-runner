@@ -1134,6 +1134,7 @@ pub async fn resume_task_run(
         max_sweep_iterations: workflow.max_sweep_iterations,
         stages,
         stop_on_failure: workflow.stop_on_failure,
+        reflection_mode: workflow.reflection_mode,
         provider_override: None,
         model_override: None,
         stage_index: None,
@@ -3135,6 +3136,7 @@ pub async fn generate_workflow_from_chat(
         max_fix_iterations: Some(3),
         discovery_mode: None,
         include_ui_bridge_instructions: include_ui_bridge,
+        reflection_mode: Some(true),
     };
 
     let doctor_handle = state.doctor_handle.clone();

@@ -3,8 +3,19 @@
 //! This module provides types for the unified Workflow Builder system.
 //! All workflows are organized into three phases: Setup, Verification, Agentic.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+
+/// Deserialize a Vec field that might be null in JSON (e.g., from Python's `None`).
+/// Returns an empty Vec for null, or the actual Vec for a valid array.
+fn deserialize_null_as_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    let opt: Option<Vec<T>> = Option::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
 
 /// Log source selection mode for a workflow
 /// - "default": Use the global default profile (from Settings)
@@ -226,13 +237,23 @@ pub struct UnifiedWorkflow {
     /// Optional stages for multi-stage workflows.
     /// When non-empty, the workflow executes stages sequentially instead of using top-level steps.
     /// Each stage has its own setup/verification/agentic/completion steps and loop.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_null_as_empty_vec"
+    )]
     pub stages: Vec<WorkflowStage>,
 
     /// Whether to stop execution if a stage fails verification.
     /// Default: false (autonomous mode — continue to next stage even if previous failed).
     #[serde(default)]
     pub stop_on_failure: bool,
+
+    /// Whether to enable reflection mode during agentic iterations.
+    /// When true, the AI investigates root causes before fixing failures.
+    /// Default: true for user-created workflows.
+    #[serde(default = "default_reflection_mode")]
+    pub reflection_mode: bool,
 
     /// ISO 8601 timestamp of creation
     pub created_at: String,
@@ -303,6 +324,10 @@ fn default_category() -> String {
 
 fn default_max_iterations() -> u32 {
     10
+}
+
+fn default_reflection_mode() -> bool {
+    true
 }
 
 fn is_default_log_source(selection: &LogSourceSelection) -> bool {
@@ -376,6 +401,9 @@ pub struct CreateUnifiedWorkflowRequest {
     /// Whether to stop execution if a stage fails verification
     #[serde(default)]
     pub stop_on_failure: Option<bool>,
+    /// Whether to enable reflection mode during agentic iterations
+    #[serde(default)]
+    pub reflection_mode: Option<bool>,
 }
 
 /// Request body for updating a unified workflow
@@ -420,6 +448,8 @@ pub struct UpdateUnifiedWorkflowRequest {
     pub stages: Option<Vec<WorkflowStage>>,
     /// Whether to stop execution if a stage fails verification
     pub stop_on_failure: Option<bool>,
+    /// Whether to enable reflection mode during agentic iterations
+    pub reflection_mode: Option<bool>,
 }
 
 /// Query parameters for searching unified workflows

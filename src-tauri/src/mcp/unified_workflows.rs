@@ -375,6 +375,7 @@ pub async fn get_unified_workflow(
                 max_sweep_iterations: Some(workflow.max_sweep_iterations),
                 stages: Some(workflow.stages.clone()),
                 stop_on_failure: Some(workflow.stop_on_failure),
+                reflection_mode: Some(workflow.reflection_mode),
             };
             if let Err(e) = state
                 .app_state
@@ -777,6 +778,7 @@ pub async fn import_unified_workflow(
         max_sweep_iterations: Some(workflow.max_sweep_iterations),
         stages: Some(workflow.stages.clone()),
         stop_on_failure: Some(workflow.stop_on_failure),
+        reflection_mode: Some(workflow.reflection_mode),
     };
 
     // Use the database's create function but with our custom ID
@@ -989,6 +991,7 @@ pub async fn generate_unified_workflow_async_handler(
         max_sweep_iterations: Some(meta_workflow.max_sweep_iterations),
         stages: Some(meta_workflow.stages.clone()),
         stop_on_failure: Some(meta_workflow.stop_on_failure),
+        reflection_mode: Some(meta_workflow.reflection_mode),
     };
 
     let saved_workflow = match state
@@ -1103,6 +1106,7 @@ pub async fn generate_unified_workflow_async_handler(
             max_sweep_iterations: saved_workflow.max_sweep_iterations,
             stages,
             stop_on_failure: saved_workflow.stop_on_failure,
+            reflection_mode: saved_workflow.reflection_mode,
             provider_override: None,
             model_override: None,
             stage_index: None,
@@ -1430,6 +1434,7 @@ pub async fn run_unified_workflow(
             max_sweep_iterations: workflow.max_sweep_iterations,
             stages,
             stop_on_failure: workflow.stop_on_failure,
+            reflection_mode: workflow.reflection_mode,
             provider_override: None,
             model_override: None,
             stage_index: None,
@@ -1710,6 +1715,7 @@ pub async fn execute_inline_workflow(
         generated_by_task_run_id: None,
         stages: Vec::new(),
         stop_on_failure: false,
+        reflection_mode: false,
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
     };
@@ -1816,6 +1822,7 @@ pub async fn execute_inline_workflow(
             max_sweep_iterations: workflow.max_sweep_iterations,
             stages,
             stop_on_failure: workflow.stop_on_failure,
+            reflection_mode: workflow.reflection_mode,
             provider_override: None,
             model_override: None,
             stage_index: None,
@@ -2212,6 +2219,7 @@ pub async fn run_composed_workflow(
                 max_sweep_iterations: 0,
                 stages,
                 stop_on_failure,
+                reflection_mode: false,
                 provider_override: None,
                 model_override: None,
                 stage_index: None,

@@ -631,6 +631,36 @@ impl ErrorEventStorage {
         Ok(count)
     }
 
+    /// Bulk-resolve all unresolved errors scoped to a specific task run.
+    ///
+    /// This is called when a workflow completes successfully to clean up errors
+    /// that were captured during its execution. Errors with status 'promoted'
+    /// (linked to findings) are excluded — they're resolved through that system.
+    ///
+    /// Returns the count of resolved errors.
+    pub fn resolve_errors_by_task_run(
+        conn: &Connection,
+        task_run_id: &str,
+        resolved_by_task_run_id: &str,
+    ) -> Result<usize, String> {
+        let count = conn
+            .execute(
+                r#"
+                UPDATE error_events SET
+                    status = 'resolved',
+                    resolved_by_task_run_id = ?1,
+                    resolution_notes = 'Auto-resolved: workflow completed successfully',
+                    resolved_at = datetime('now')
+                WHERE task_run_id = ?2
+                  AND status IN ('new', 'acknowledged', 'in_progress')
+                "#,
+                params![resolved_by_task_run_id, task_run_id],
+            )
+            .map_err(|e| format!("Failed to bulk-resolve errors for task run: {}", e))?;
+
+        Ok(count)
+    }
+
     /// Get error summary statistics
     pub fn get_summary(
         conn: &Connection,

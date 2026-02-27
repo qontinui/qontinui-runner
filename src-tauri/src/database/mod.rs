@@ -126,6 +126,28 @@ pub struct SessionEvent {
     pub data: Option<serde_json::Value>,
 }
 
+/// Cached spec for an external app discovered via UI Bridge SDK.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedAppSpec {
+    pub id: String,
+    pub app_url: String,
+    pub app_name: String,
+    pub spec_id: String,
+    pub spec_json: String,
+    pub discovered_at: String,
+    pub page_url: Option<String>,
+}
+
+/// Lightweight summary of a chat session for sidebar listing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatSessionSummary {
+    pub id: String,
+    pub task_name: String,
+    pub status: String,
+    pub updated_at: String,
+    pub created_at: String,
+}
+
 /// Task run data structure for the unified task model.
 /// TaskRun is THE single concept for all runs (AI, automation, or mixed).
 /// Every task runs until [TASK_COMPLETE] is found in output.
@@ -252,6 +274,17 @@ pub struct TaskRun {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reflection_source_task_run_id: Option<String>,
 
+    // ========================================================================
+    // Follow-Up Fields
+    // ========================================================================
+    /// Whether this task run is a follow-up run for unfixed issues.
+    #[serde(default)]
+    pub is_follow_up: bool,
+
+    /// The source task run ID whose unfixed issues this run addresses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub follow_up_source_task_run_id: Option<String>,
+
     pub created_at: String,
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -298,6 +331,8 @@ pub struct CreateTaskRunInput {
     pub bridge_id: Option<String>,
     pub is_reflection: bool,
     pub reflection_source_task_run_id: Option<String>,
+    pub is_follow_up: bool,
+    pub follow_up_source_task_run_id: Option<String>,
 }
 
 impl CreateTaskRunInput {
@@ -323,6 +358,8 @@ impl CreateTaskRunInput {
             bridge_id: None,
             is_reflection: false,
             reflection_source_task_run_id: None,
+            is_follow_up: false,
+            follow_up_source_task_run_id: None,
         }
     }
 
@@ -425,6 +462,18 @@ impl CreateTaskRunInput {
     /// Set the source task run ID that this reflection analyzes.
     pub fn with_reflection_source_task_run_id(mut self, source_id: impl Into<String>) -> Self {
         self.reflection_source_task_run_id = Some(source_id.into());
+        self
+    }
+
+    /// Mark this task run as a follow-up run.
+    pub fn with_is_follow_up(mut self, is_follow_up: bool) -> Self {
+        self.is_follow_up = is_follow_up;
+        self
+    }
+
+    /// Set the source task run ID whose unfixed issues this run addresses.
+    pub fn with_follow_up_source_task_run_id(mut self, source_id: impl Into<String>) -> Self {
+        self.follow_up_source_task_run_id = Some(source_id.into());
         self
     }
 }
@@ -5327,6 +5376,64 @@ impl CheckpointDb {
             info!("Successfully migrated to version 68 (process session persistence)");
         }
 
+        if current_version < 69 {
+            info!("Migrating to version 69 (cached app specs)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS cached_app_specs (
+                    id TEXT PRIMARY KEY,
+                    app_url TEXT NOT NULL,
+                    app_name TEXT NOT NULL,
+                    spec_id TEXT NOT NULL,
+                    spec_json TEXT NOT NULL,
+                    discovered_at TEXT NOT NULL,
+                    page_url TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_cached_specs_app ON cached_app_specs(app_url);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (69, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 69: {}", e))?;
+
+            info!("Successfully migrated to version 69 (cached app specs)");
+        }
+
+        // Version 70: Add reflection_mode to unified_workflows
+        if current_version < 70 {
+            info!("Migrating to version 70 (add reflection_mode to unified_workflows)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE unified_workflows ADD COLUMN reflection_mode INTEGER DEFAULT 1;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (70, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 70: {}", e))?;
+
+            info!("Successfully migrated to version 70 (reflection_mode)");
+        }
+
+        // Version 71: Add follow-up columns to task_runs
+        if current_version < 71 {
+            info!("Migrating to version 71 (add follow-up columns to task_runs)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE task_runs ADD COLUMN is_follow_up INTEGER DEFAULT 0;
+                ALTER TABLE task_runs ADD COLUMN follow_up_source_task_run_id TEXT;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (71, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 71: {}", e))?;
+
+            info!("Successfully migrated to version 71 (follow-up columns)");
+        }
+
         Ok(())
     }
 
@@ -5756,8 +5863,9 @@ impl CheckpointDb {
                                    parent_task_run_id, root_task_run_id, depth,
                                    workspace_id, triggered_by, bridge_id,
                                    is_reflection, reflection_source_task_run_id,
+                                   is_follow_up, follow_up_source_task_run_id,
                                    created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, 'running', 0, ?5, '', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?20)
+            VALUES (?1, ?2, ?3, ?4, 'running', 0, ?5, '', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?22)
             "#,
             params![
                 input.id,
@@ -5779,6 +5887,8 @@ impl CheckpointDb {
                 input.bridge_id,
                 input.is_reflection as i32,
                 input.reflection_source_task_run_id,
+                input.is_follow_up as i32,
+                input.follow_up_source_task_run_id,
                 now
             ],
         )
@@ -5815,6 +5925,8 @@ impl CheckpointDb {
             result_data: None,
             is_reflection: input.is_reflection,
             reflection_source_task_run_id: input.reflection_source_task_run_id.clone(),
+            is_follow_up: input.is_follow_up,
+            follow_up_source_task_run_id: input.follow_up_source_task_run_id.clone(),
             created_at: now.clone(),
             updated_at: now,
             completed_at: None,
@@ -6042,6 +6154,7 @@ impl CheckpointDb {
                    workspace_id, triggered_by,
                    parent_task_run_id, root_task_run_id, depth, bridge_id, result_data,
                    COALESCE(is_reflection, 0) as is_reflection, reflection_source_task_run_id,
+                   COALESCE(is_follow_up, 0) as is_follow_up, follow_up_source_task_run_id,
                    created_at, updated_at, completed_at
             FROM task_runs
             WHERE id = ?1
@@ -6079,9 +6192,11 @@ impl CheckpointDb {
                     result_data: row.get(26)?,
                     is_reflection: row.get::<_, i32>(27)? != 0,
                     reflection_source_task_run_id: row.get(28)?,
-                    created_at: row.get(29)?,
-                    updated_at: row.get(30)?,
-                    completed_at: row.get(31)?,
+                    is_follow_up: row.get::<_, i32>(29)? != 0,
+                    follow_up_source_task_run_id: row.get(30)?,
+                    created_at: row.get(31)?,
+                    updated_at: row.get(32)?,
+                    completed_at: row.get(33)?,
                 })
             },
         );
@@ -6123,6 +6238,7 @@ impl CheckpointDb {
                        workspace_id, triggered_by,
                        parent_task_run_id, root_task_run_id, depth, bridge_id, result_data,
                        COALESCE(is_reflection, 0) as is_reflection, reflection_source_task_run_id,
+                       COALESCE(is_follow_up, 0) as is_follow_up, follow_up_source_task_run_id,
                        created_at, updated_at, completed_at
                 FROM task_runs
                 WHERE parent_task_run_id = ?1
@@ -6166,9 +6282,11 @@ impl CheckpointDb {
                     result_data: row.get(26)?,
                     is_reflection: row.get::<_, i32>(27)? != 0,
                     reflection_source_task_run_id: row.get(28)?,
-                    created_at: row.get(29)?,
-                    updated_at: row.get(30)?,
-                    completed_at: row.get(31)?,
+                    is_follow_up: row.get::<_, i32>(29)? != 0,
+                    follow_up_source_task_run_id: row.get(30)?,
+                    created_at: row.get(31)?,
+                    updated_at: row.get(32)?,
+                    completed_at: row.get(33)?,
                 })
             })
             .map_err(|e| format!("Failed to query child tasks: {}", e))?
@@ -6204,6 +6322,7 @@ impl CheckpointDb {
                        workspace_id, triggered_by,
                        parent_task_run_id, root_task_run_id, depth, bridge_id, result_data,
                        COALESCE(is_reflection, 0) as is_reflection, reflection_source_task_run_id,
+                       COALESCE(is_follow_up, 0) as is_follow_up, follow_up_source_task_run_id,
                        created_at, updated_at, completed_at
                 FROM task_runs
                 WHERE root_task_run_id = ?1 AND id != ?1
@@ -6247,9 +6366,11 @@ impl CheckpointDb {
                     result_data: row.get(26)?,
                     is_reflection: row.get::<_, i32>(27)? != 0,
                     reflection_source_task_run_id: row.get(28)?,
-                    created_at: row.get(29)?,
-                    updated_at: row.get(30)?,
-                    completed_at: row.get(31)?,
+                    is_follow_up: row.get::<_, i32>(29)? != 0,
+                    follow_up_source_task_run_id: row.get(30)?,
+                    created_at: row.get(31)?,
+                    updated_at: row.get(32)?,
+                    completed_at: row.get(33)?,
                 })
             })
             .map_err(|e| format!("Failed to query task hierarchy: {}", e))?
@@ -6735,7 +6856,7 @@ impl CheckpointDb {
                        created_at, updated_at, completed_at,
                        task_type, config_id, workflow_name
                 FROM task_runs
-                WHERE status = 'running'
+                WHERE status = 'running' AND (workflow_type IS NULL OR workflow_type != 'chat')
                 ORDER BY updated_at DESC
                 "#,
             )
@@ -6771,6 +6892,8 @@ impl CheckpointDb {
                     result_data: None,        // Not queried for performance
                     is_reflection: false,     // Not queried for performance
                     reflection_source_task_run_id: None, // Not queried for performance
+                    is_follow_up: false,      // Not queried for performance
+                    follow_up_source_task_run_id: None, // Not queried for performance
                     created_at: row.get(17)?,
                     updated_at: row.get(18)?,
                     completed_at: row.get(19)?,
@@ -6838,6 +6961,8 @@ impl CheckpointDb {
                     result_data: None,        // Not queried for performance
                     is_reflection: false,     // Not queried for performance
                     reflection_source_task_run_id: None, // Not queried for performance
+                    is_follow_up: false,      // Not queried for performance
+                    follow_up_source_task_run_id: None, // Not queried for performance
                     created_at: row.get(17)?,
                     updated_at: row.get(18)?,
                     completed_at: row.get(19)?,
@@ -6851,6 +6976,109 @@ impl CheckpointDb {
             .collect();
 
         Ok(task_runs)
+    }
+
+    /// Get all running chat session task runs for resume on startup.
+    /// Returns task runs where status = 'running' AND workflow_type = 'chat'.
+    pub fn get_running_chat_sessions(&self) -> Result<Vec<TaskRun>, String> {
+        let conn = self.get_conn()?;
+
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT id, task_name, prompt, status, sessions_count, max_sessions, error_message, auto_continue,
+                       execution_steps_json, log_sources_json,
+                       COALESCE(summary, ai_summary) as summary, ai_summary,
+                       goal_achieved, remaining_work, summary_generated_at,
+                       workspace_id, triggered_by,
+                       created_at, updated_at, completed_at,
+                       task_type, config_id, workflow_name
+                FROM task_runs
+                WHERE status = 'running' AND workflow_type = 'chat'
+                ORDER BY updated_at DESC
+                "#,
+            )
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+        let task_runs = stmt
+            .query_map([], |row| {
+                Ok(TaskRun {
+                    id: row.get(0)?,
+                    task_name: row.get(1)?,
+                    prompt: row.get(2)?,
+                    status: row.get(3)?,
+                    sessions_count: row.get::<_, i64>(4)? as u32,
+                    max_sessions: row.get::<_, Option<i64>>(5)?.map(|v| v as u32),
+                    output_log: String::new(), // Empty for performance
+                    error_message: row.get(6)?,
+                    auto_continue: row.get::<_, i32>(7)? != 0,
+                    execution_steps_json: row.get(8)?,
+                    log_sources_json: row.get(9)?,
+                    summary: row.get(10)?,
+                    ai_summary: row.get(11)?,
+                    goal_achieved: row.get::<_, Option<i32>>(12)?.map(|v| v != 0),
+                    remaining_work: row.get(13)?,
+                    summary_generated_at: row.get(14)?,
+                    transition_history_json: None,
+                    workflow_type: Some("chat".to_string()),
+                    workspace_id: row.get(15)?,
+                    triggered_by: row.get(16)?,
+                    parent_task_run_id: None,
+                    root_task_run_id: None,
+                    depth: 0,
+                    bridge_id: None,
+                    result_data: None,
+                    is_reflection: false,
+                    reflection_source_task_run_id: None,
+                    is_follow_up: false,
+                    follow_up_source_task_run_id: None,
+                    created_at: row.get(17)?,
+                    updated_at: row.get(18)?,
+                    completed_at: row.get(19)?,
+                    task_type: row.get(20)?,
+                    config_id: row.get(21)?,
+                    workflow_name: row.get(22)?,
+                })
+            })
+            .map_err(|e| format!("Failed to execute query: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(task_runs)
+    }
+
+    /// Get recent chat sessions (all statuses) for sidebar listing.
+    /// Returns lightweight summaries ordered by most recently updated.
+    pub fn get_chat_sessions(&self, limit: u32) -> Result<Vec<ChatSessionSummary>, String> {
+        let conn = self.get_conn()?;
+
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT id, task_name, status, updated_at, created_at
+                FROM task_runs
+                WHERE workflow_type = 'chat'
+                ORDER BY updated_at DESC
+                LIMIT ?1
+                "#,
+            )
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+        let sessions = stmt
+            .query_map(params![limit], |row| {
+                Ok(ChatSessionSummary {
+                    id: row.get(0)?,
+                    task_name: row.get(1)?,
+                    status: row.get(2)?,
+                    updated_at: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            })
+            .map_err(|e| format!("Failed to execute query: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(sessions)
     }
 
     /// Find an incomplete (running) task_run for a specific workflow by config_id.
@@ -7013,6 +7241,8 @@ impl CheckpointDb {
                     result_data: None,        // Not queried for performance
                     is_reflection: false,     // Not queried for performance
                     reflection_source_task_run_id: None, // Not queried for performance
+                    is_follow_up: false,      // Not queried for performance
+                    follow_up_source_task_run_id: None, // Not queried for performance
                     created_at: row.get(18)?,
                     updated_at: row.get(19)?,
                     completed_at: row.get(20)?,
@@ -7112,6 +7342,8 @@ impl CheckpointDb {
                     result_data: None,
                     is_reflection: false, // Not queried for performance
                     reflection_source_task_run_id: None, // Not queried for performance
+                    is_follow_up: false,  // Not queried for performance
+                    follow_up_source_task_run_id: None, // Not queried for performance
                     created_at: row.get(19)?,
                     updated_at: row.get(20)?,
                     completed_at: row.get(21)?,
@@ -11283,7 +11515,7 @@ impl CheckpointDb {
                        context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                        log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
                        preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
-                       stages, stop_on_failure
+                       stages, stop_on_failure, reflection_mode
                 FROM unified_workflows
                 ORDER BY updated_at DESC
                 "#,
@@ -11355,6 +11587,7 @@ impl CheckpointDb {
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
                     stop_on_failure: row.get::<_, Option<i32>>(29)?.unwrap_or(0) != 0,
+                    reflection_mode: row.get::<_, Option<i32>>(30)?.unwrap_or(1) != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -11381,7 +11614,7 @@ impl CheckpointDb {
                    context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                    log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
                    preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
-                   stages, stop_on_failure
+                   stages, stop_on_failure, reflection_mode
             FROM unified_workflows
             WHERE id = ?1
             "#,
@@ -11450,6 +11683,7 @@ impl CheckpointDb {
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
                     stop_on_failure: row.get::<_, Option<i32>>(29)?.unwrap_or(0) != 0,
+                    reflection_mode: row.get::<_, Option<i32>>(30)?.unwrap_or(1) != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -11478,7 +11712,7 @@ impl CheckpointDb {
                    context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                    log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
                    preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
-                   stages, stop_on_failure
+                   stages, stop_on_failure, reflection_mode
             FROM unified_workflows
             WHERE name = ?1
             ORDER BY updated_at DESC
@@ -11549,6 +11783,7 @@ impl CheckpointDb {
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
                     stop_on_failure: row.get::<_, Option<i32>>(29)?.unwrap_or(0) != 0,
+                    reflection_mode: row.get::<_, Option<i32>>(30)?.unwrap_or(1) != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -11614,8 +11849,8 @@ impl CheckpointDb {
                 context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                 log_watch_enabled, health_check_enabled, health_check_urls, preflight_check_enabled,
                 generated_by_task_run_id, enable_sweep, max_sweep_iterations,
-                stages, stop_on_failure
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
+                stages, stop_on_failure, reflection_mode
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)
             "#,
             params![
                 id,
@@ -11648,6 +11883,7 @@ impl CheckpointDb {
                 request.max_sweep_iterations.unwrap_or(5) as i64,
                 serde_json::to_string(&request.stages).unwrap_or_else(|_| "[]".to_string()),
                 request.stop_on_failure.unwrap_or(false),
+                request.reflection_mode.unwrap_or(true),
             ],
         )
         .map_err(|e| format!("Failed to create unified workflow: {}", e))?;
@@ -11708,8 +11944,8 @@ impl CheckpointDb {
                 context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                 log_watch_enabled, health_check_enabled, health_check_urls, preflight_check_enabled,
                 generated_by_task_run_id, enable_sweep, max_sweep_iterations,
-                stages, stop_on_failure
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
+                stages, stop_on_failure, reflection_mode
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)
             "#,
             params![
                 id,
@@ -11742,6 +11978,7 @@ impl CheckpointDb {
                 request.max_sweep_iterations.unwrap_or(5) as i64,
                 serde_json::to_string(&request.stages).unwrap_or_else(|_| "[]".to_string()),
                 request.stop_on_failure.unwrap_or(false),
+                request.reflection_mode.unwrap_or(true),
             ],
         )
         .map_err(|e| format!("Failed to create unified workflow: {}", e))?;
@@ -11841,6 +12078,7 @@ impl CheckpointDb {
             .unwrap_or(existing.max_sweep_iterations);
         let stages = request.stages.as_ref().unwrap_or(&existing.stages);
         let stop_on_failure = request.stop_on_failure.unwrap_or(existing.stop_on_failure);
+        let reflection_mode = request.reflection_mode.unwrap_or(existing.reflection_mode);
 
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
         let setup_steps_json =
@@ -11890,8 +12128,9 @@ impl CheckpointDb {
                 enable_sweep = ?24,
                 max_sweep_iterations = ?25,
                 stages = ?26,
-                stop_on_failure = ?27
-            WHERE id = ?28
+                stop_on_failure = ?27,
+                reflection_mode = ?28
+            WHERE id = ?29
             "#,
             params![
                 name,
@@ -11921,6 +12160,7 @@ impl CheckpointDb {
                 max_sweep_iterations as i64,
                 stages_json,
                 stop_on_failure,
+                reflection_mode,
                 id,
             ],
         )
@@ -11956,7 +12196,7 @@ impl CheckpointDb {
                    context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                    log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
                    preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
-                   stages, stop_on_failure
+                   stages, stop_on_failure, reflection_mode
             FROM unified_workflows
             WHERE 1=1
             "#,
@@ -12057,6 +12297,7 @@ impl CheckpointDb {
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
                     stop_on_failure: row.get::<_, Option<i32>>(29)?.unwrap_or(0) != 0,
+                    reflection_mode: row.get::<_, Option<i32>>(30)?.unwrap_or(1) != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -12106,6 +12347,7 @@ impl CheckpointDb {
             max_sweep_iterations: Some(original.max_sweep_iterations),
             stages: Some(original.stages),
             stop_on_failure: Some(original.stop_on_failure),
+            reflection_mode: Some(original.reflection_mode),
         };
 
         self.create_unified_workflow(&create_request)
@@ -12130,7 +12372,7 @@ impl CheckpointDb {
                        context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                        log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
                        preflight_check_enabled, generated_by_task_run_id, enable_sweep,
-                       max_sweep_iterations, stages, stop_on_failure
+                       max_sweep_iterations, stages, stop_on_failure, reflection_mode
                 FROM unified_workflows
                 WHERE sync_pending = 1
                 "#,
@@ -12202,6 +12444,7 @@ impl CheckpointDb {
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
                     stop_on_failure: row.get::<_, Option<i32>>(29)?.unwrap_or(0) != 0,
+                    reflection_mode: row.get::<_, Option<i32>>(30)?.unwrap_or(1) != 0,
                     targeted_error_ids: vec![],
                 })
             })
@@ -14807,7 +15050,7 @@ impl CheckpointDb {
                        preflight_check_enabled, log_source_selection, context_ids,
                        disabled_context_ids, auto_include_contexts, prompt_template,
                        generated_by_task_run_id, enable_sweep, max_sweep_iterations,
-                       stages, stop_on_failure, sync_pending, example_status
+                       stages, stop_on_failure, reflection_mode, sync_pending, example_status
                 FROM unified_workflows
                 ORDER BY updated_at DESC
                 "#,
@@ -14887,8 +15130,9 @@ impl CheckpointDb {
                     "max_sweep_iterations": row.get::<_, Option<i64>>(27)?,
                     "stages": stages,
                     "stop_on_failure": row.get::<_, Option<i64>>(29)?,
-                    "sync_pending": row.get::<_, Option<i64>>(30)?,
-                    "example_status": row.get::<_, Option<String>>(31)?,
+                    "reflection_mode": row.get::<_, Option<i64>>(30)?,
+                    "sync_pending": row.get::<_, Option<i64>>(31)?,
+                    "example_status": row.get::<_, Option<String>>(32)?,
                 }))
             })
             .map_err(|e| format!("Failed to export unified workflows: {}", e))?
@@ -15388,6 +15632,7 @@ impl CheckpointDb {
             let max_sweep_iterations = workflow["max_sweep_iterations"].as_i64().unwrap_or(5);
             let stages = serde_json::to_string(&workflow["stages"]).unwrap_or("[]".to_string());
             let stop_on_failure = workflow["stop_on_failure"].as_i64().unwrap_or(0);
+            let reflection_mode = workflow["reflection_mode"].as_i64().unwrap_or(1);
             let sync_pending = workflow["sync_pending"].as_i64().unwrap_or(0);
             let example_status = workflow["example_status"].as_str().unwrap_or("pending");
 
@@ -15401,12 +15646,12 @@ impl CheckpointDb {
                     preflight_check_enabled, log_source_selection, context_ids,
                     disabled_context_ids, auto_include_contexts, prompt_template,
                     generated_by_task_run_id, enable_sweep, max_sweep_iterations,
-                    stages, stop_on_failure, sync_pending, example_status
+                    stages, stop_on_failure, reflection_mode, sync_pending, example_status
                 )
                 VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
-                    ?26, ?27, ?28, ?29, ?30, ?31, ?32
+                    ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33
                 )
                 "#,
                 params![
@@ -15440,6 +15685,7 @@ impl CheckpointDb {
                     max_sweep_iterations,
                     stages,
                     stop_on_failure,
+                    reflection_mode,
                     sync_pending,
                     example_status
                 ],
@@ -16981,6 +17227,122 @@ impl CheckpointDb {
             Some(checkpoint_id) => self.get_latest_step_progress_marker(&checkpoint_id),
             None => Ok(None),
         }
+    }
+
+    // ========================================================================
+    // Cached App Specs
+    // ========================================================================
+
+    /// Upsert a cached spec for an external app.
+    pub fn upsert_cached_spec(
+        &self,
+        app_url: &str,
+        app_name: &str,
+        spec_id: &str,
+        spec_json: &str,
+        page_url: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        let id = format!("{}:{}", app_url, spec_id);
+        let now = Utc::now().to_rfc3339();
+
+        conn.execute(
+            r#"
+            INSERT INTO cached_app_specs (id, app_url, app_name, spec_id, spec_json, discovered_at, page_url)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(id) DO UPDATE SET
+                app_name = excluded.app_name,
+                spec_json = excluded.spec_json,
+                discovered_at = excluded.discovered_at,
+                page_url = excluded.page_url
+            "#,
+            params![id, app_url, app_name, spec_id, spec_json, now, page_url],
+        )
+        .map_err(|e| format!("Failed to upsert cached spec: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Get all cached specs for a specific app URL.
+    pub fn get_cached_specs_for_app(&self, app_url: &str) -> Result<Vec<CachedAppSpec>, String> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT id, app_url, app_name, spec_id, spec_json, discovered_at, page_url
+                FROM cached_app_specs
+                WHERE app_url = ?1
+                ORDER BY spec_id
+                "#,
+            )
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+        let rows = stmt
+            .query_map(params![app_url], |row| {
+                Ok(CachedAppSpec {
+                    id: row.get(0)?,
+                    app_url: row.get(1)?,
+                    app_name: row.get(2)?,
+                    spec_id: row.get(3)?,
+                    spec_json: row.get(4)?,
+                    discovered_at: row.get(5)?,
+                    page_url: row.get(6)?,
+                })
+            })
+            .map_err(|e| format!("Failed to query cached specs: {}", e))?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row.map_err(|e| format!("Failed to read row: {}", e))?);
+        }
+        Ok(result)
+    }
+
+    /// Get all cached specs across all apps.
+    pub fn get_all_cached_specs(&self) -> Result<Vec<CachedAppSpec>, String> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT id, app_url, app_name, spec_id, spec_json, discovered_at, page_url
+                FROM cached_app_specs
+                ORDER BY app_url, spec_id
+                "#,
+            )
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(CachedAppSpec {
+                    id: row.get(0)?,
+                    app_url: row.get(1)?,
+                    app_name: row.get(2)?,
+                    spec_id: row.get(3)?,
+                    spec_json: row.get(4)?,
+                    discovered_at: row.get(5)?,
+                    page_url: row.get(6)?,
+                })
+            })
+            .map_err(|e| format!("Failed to query cached specs: {}", e))?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row.map_err(|e| format!("Failed to read row: {}", e))?);
+        }
+        Ok(result)
+    }
+
+    /// Delete all cached specs for a specific app URL.
+    pub fn delete_cached_specs_for_app(&self, app_url: &str) -> Result<u64, String> {
+        let conn = self.get_conn()?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM cached_app_specs WHERE app_url = ?1",
+                params![app_url],
+            )
+            .map_err(|e| format!("Failed to delete cached specs: {}", e))?;
+
+        Ok(deleted as u64)
     }
 
     // ========================================================================

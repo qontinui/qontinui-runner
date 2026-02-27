@@ -155,6 +155,7 @@ impl StepHandler for WorkflowStepHandler {
             max_sweep_iterations: 0,
             stages: vec![stage],
             stop_on_failure: true,
+            reflection_mode: false,
             provider_override: workflow.provider.clone(),
             model_override: workflow.model.clone(),
             stage_index: None,

@@ -59,6 +59,52 @@ use super::types::{get_parent_task_id, AgenticOutcome, LoopConfig};
 use crate::mcp::types::MCP_API_PORT;
 
 // =============================================================================
+// Reflection Mode Preamble
+// =============================================================================
+
+/// Preamble injected into the agentic phase prompt when reflection mode is enabled.
+/// Instructs the AI to investigate root causes before implementing fixes.
+const REFLECTION_MODE_PREAMBLE: &str = r#"## Reflection Mode: Investigate Before Fixing
+
+IMPORTANT: Do NOT jump straight to fixing the failed checks. Follow this investigation protocol first.
+
+### Phase 1: Root Cause Investigation
+
+Before writing any fixes, investigate the failures thoroughly:
+
+1. **Read the failing code paths end-to-end.** Don't just look at the line that errors — trace the call chain. Use subagents (the Task tool) to explore multiple code paths in parallel.
+
+2. **Distinguish symptoms from root causes.** A check failing may be a symptom of:
+   - A bug several layers deeper
+   - A missing configuration or selector
+   - An incorrect assumption in the check itself
+   - An API contract mismatch between modules
+
+3. **Check if the fix belongs at a different layer.** Ask yourself:
+   - Am I about to add a workaround, or fix the actual problem?
+   - Should this fix be in the library/framework rather than the application?
+   - Would fixing this at the source prevent an entire class of similar failures?
+
+4. **Research related code.** Use grep/glob to find:
+   - Other callers of the same function — are they also affected?
+   - Similar patterns elsewhere — is this a systemic inconsistency?
+   - Related selector lists, configs, or constants that should be in sync
+
+### Phase 2: Document Findings
+
+Before implementing any fix, write a brief analysis:
+- **Root cause:** What is the actual underlying issue
+- **Proposed fix:** What to change and why it addresses the root cause, not just the symptom
+- **Risk assessment:** What else might this change affect
+
+### Phase 3: Implement Fix
+
+Now implement the fix, prioritizing:
+- Root-cause fixes over workarounds
+- Fixes that prevent entire classes of failures over point fixes
+- Minimal, targeted changes unless the architecture is fundamentally wrong"#;
+
+// =============================================================================
 // Console Error Fetching (UI Bridge)
 // =============================================================================
 
@@ -1952,10 +1998,17 @@ impl AgenticExecutor {
                 failure_context.len(),
                 iteration
             );
-            let base = format!(
-                "{}\n\n---\n\nThe following verification checks FAILED. Please fix these issues:\n\n{}\n\nFix the issues above and ensure all checks pass.",
-                config.base_prompt, failure_context
-            );
+            let base = if config.reflection_mode {
+                format!(
+                    "{}\n\n---\n\n{}\n\nThe following verification checks FAILED:\n\n{}\n\nAfter your investigation, implement fixes that address root causes.",
+                    config.base_prompt, REFLECTION_MODE_PREAMBLE, failure_context
+                )
+            } else {
+                format!(
+                    "{}\n\n---\n\nThe following verification checks FAILED. Please fix these issues:\n\n{}\n\nFix the issues above and ensure all checks pass.",
+                    config.base_prompt, failure_context
+                )
+            };
             // Append progress context if available
             if let Some(ref progress) = progress_context {
                 format!("{}\n\n{}", base, progress)
@@ -3004,6 +3057,91 @@ impl CompletionExecutor {
             }
         }
 
+        // Include unresolved errors so the completion AI can report on them.
+        // This runs BEFORE the loop_controller marks completion, so workflow-scoped
+        // errors are still visible here.
+        match self.checkpoint_db.get_conn() {
+            Ok(conn) => {
+                match crate::error_monitor::ErrorEventStorage::get_unresolved(&conn, None, 20) {
+                    Ok(errors) if !errors.is_empty() => {
+                        let mut workflow_errors = Vec::new();
+                        let mut pre_existing_errors = Vec::new();
+
+                        for e in &errors {
+                            let is_workflow_scoped = e
+                                .task_run_id
+                                .as_deref()
+                                .is_some_and(|id| id == execution_id);
+                            if is_workflow_scoped {
+                                workflow_errors.push(e);
+                            } else {
+                                pre_existing_errors.push(e);
+                            }
+                        }
+
+                        let mut lines = vec!["### Unresolved Errors (Error Monitor)\n".to_string()];
+
+                        if !workflow_errors.is_empty() {
+                            lines.push(format!(
+                                "**Errors from this workflow run ({}):**",
+                                workflow_errors.len()
+                            ));
+                            for e in &workflow_errors {
+                                lines.push(format!(
+                                    "- [{}] {}",
+                                    e.severity.as_str(),
+                                    e.message.chars().take(200).collect::<String>()
+                                ));
+                            }
+                            lines.push(String::new());
+                        }
+
+                        if !pre_existing_errors.is_empty() {
+                            lines.push(format!(
+                                "**Pre-existing errors ({}):**",
+                                pre_existing_errors.len()
+                            ));
+                            for e in pre_existing_errors.iter().take(10) {
+                                lines.push(format!(
+                                    "- [{}] {}",
+                                    e.severity.as_str(),
+                                    e.message.chars().take(200).collect::<String>()
+                                ));
+                            }
+                            if pre_existing_errors.len() > 10 {
+                                lines.push(format!(
+                                    "... and {} more",
+                                    pre_existing_errors.len() - 10
+                                ));
+                            }
+                            lines.push(String::new());
+                        }
+
+                        lines.push(
+                            "Include any relevant errors in your completion summary. \
+                             Workflow-scoped errors will be auto-resolved if the workflow succeeded."
+                                .to_string(),
+                        );
+
+                        sections.push(lines.join("\n"));
+                    }
+                    Ok(_) => {} // No unresolved errors
+                    Err(e) => {
+                        warn!(
+                            "Failed to read unresolved errors for completion context: {}",
+                            e
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to get DB connection for completion error context: {}",
+                    e
+                );
+            }
+        }
+
         sections.join("\n")
     }
 }
@@ -3176,6 +3314,7 @@ impl Executor for AgenticExecutor {
             max_sweep_iterations: 5,
             stages: Vec::new(),
             stop_on_failure: false,
+            reflection_mode: false,
             provider_override: None,
             model_override: None,
             stage_index: None,

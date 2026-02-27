@@ -56,6 +56,7 @@ pub enum ParserType {
     /// Python tracebacks and exceptions
     Python,
     /// JavaScript/TypeScript errors and stack traces
+    #[serde(alias = "java_script", rename = "javascript")]
     JavaScript,
     /// Rust panics and errors
     Rust,

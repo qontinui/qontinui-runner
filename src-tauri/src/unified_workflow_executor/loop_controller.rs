@@ -705,6 +705,7 @@ impl LoopController {
                     max_sweep_iterations: 0,
                     stages: Vec::new(), // No nested stages
                     stop_on_failure: config.stop_on_failure,
+                    reflection_mode: config.reflection_mode,
                     provider_override: stage.provider.clone(),
                     model_override: stage.model.clone(),
                     stage_index: Some(stage_idx as u32),
@@ -961,6 +962,12 @@ impl LoopController {
                     .await;
             }
 
+            // Auto-resolve errors captured during this workflow run
+            if any_stage_passed {
+                self.resolve_workflow_scoped_errors(&config.execution_id)
+                    .await;
+            }
+
             // Fire-and-forget summary generation
             let db = self.checkpoint_db.clone();
             let exec_id = config.execution_id.clone();
@@ -1069,6 +1076,39 @@ impl LoopController {
                         warn!(
                             "Failed to launch reflection for {}: {}",
                             source_task_run_id, e
+                        );
+                    }
+                }
+            });
+
+            // Trigger follow-up workflow (15s delay, after reflection's 5s)
+            let follow_up_deps = crate::follow_up::trigger::FollowUpDeps {
+                app_state: self.app_state.clone(),
+                config_storage: self.config_storage.clone(),
+                app_handle: self.app_handle.clone(),
+                pid_tracker: self.pid_tracker.clone(),
+            };
+            let follow_up_source_id = config.execution_id.clone();
+            tokio::spawn(async move {
+                // Longer delay to allow reflection to start first and summary generation to finish
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                match crate::follow_up::trigger::launch_follow_up(
+                    follow_up_deps,
+                    follow_up_source_id.clone(),
+                ) {
+                    Ok(id) if id == "skipped" => {
+                        debug!("Follow-up skipped for {}", follow_up_source_id);
+                    }
+                    Ok(id) => {
+                        info!(
+                            "Launched follow-up {} for completed run {}",
+                            id, follow_up_source_id
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to launch follow-up for {}: {}",
+                            follow_up_source_id, e
                         );
                     }
                 }
@@ -1903,6 +1943,44 @@ impl LoopController {
         }
     }
 
+    /// Resolve all errors captured during this workflow run on successful completion.
+    ///
+    /// This bulk-resolves errors scoped to the execution_id, reducing noise from
+    /// errors that the workflow already handled. Placed after targeted resolution
+    /// so those get their specific notes first; already-resolved errors won't be
+    /// double-processed by the WHERE clause.
+    async fn resolve_workflow_scoped_errors(&self, execution_id: &str) {
+        match self.checkpoint_db.connection() {
+            Ok(conn) => {
+                match crate::error_monitor::ErrorEventStorage::resolve_errors_by_task_run(
+                    &conn,
+                    execution_id,
+                    execution_id,
+                ) {
+                    Ok(count) if count > 0 => {
+                        info!(
+                            "Auto-resolved {} workflow-scoped errors for task {}",
+                            count, execution_id
+                        );
+                    }
+                    Ok(_) => {} // No errors to resolve
+                    Err(e) => {
+                        warn!(
+                            "Failed to auto-resolve workflow-scoped errors for {}: {}",
+                            execution_id, e
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                error!(
+                    "Failed to get database connection for workflow-scoped error resolution: {}",
+                    e
+                );
+            }
+        }
+    }
+
     /// Check if the task has been stopped externally (via stop_ai_analysis endpoint).
     ///
     /// This allows the loop to gracefully abort when the user clicks the Stop button.
@@ -2435,6 +2513,7 @@ pub async fn resume_interrupted_workflows(
                                 max_sweep_iterations: workflow.max_sweep_iterations,
                                 stages,
                                 stop_on_failure: workflow.stop_on_failure,
+                                reflection_mode: workflow.reflection_mode,
                                 provider_override: None,
                                 model_override: None,
                                 stage_index: None,
@@ -2567,6 +2646,7 @@ pub async fn resume_interrupted_workflows(
                                 max_sweep_iterations: workflow.max_sweep_iterations,
                                 stages,
                                 stop_on_failure: workflow.stop_on_failure,
+                                reflection_mode: workflow.reflection_mode,
                                 provider_override: None,
                                 model_override: None,
                                 stage_index: None,

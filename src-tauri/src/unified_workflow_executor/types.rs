@@ -166,6 +166,9 @@ pub struct LoopConfig {
     pub stages: Vec<StageConfig>,
     /// Whether to stop execution if a stage fails verification (default: false).
     pub stop_on_failure: bool,
+    /// Whether to enable reflection mode during agentic iterations.
+    /// When true, the AI investigates root causes before fixing failures.
+    pub reflection_mode: bool,
     /// Optional AI provider override for this loop (from stage config).
     pub provider_override: Option<String>,
     /// Optional AI model override for this loop (from stage config).
