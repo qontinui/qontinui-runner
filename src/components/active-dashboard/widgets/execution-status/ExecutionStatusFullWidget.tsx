@@ -15,6 +15,7 @@ import {
   Circle,
   Radio,
   ListChecks,
+  Activity,
 } from "lucide-react";
 import { Badge } from "../../../ui/Badge";
 import { ScrollArea } from "../../../ui/ScrollArea";
@@ -23,6 +24,7 @@ import { RetryStatusSection } from "../../../execution-status/RetryStatusSection
 import { CompressionStatusSection } from "../../../execution-status/CompressionStatusSection";
 import { HookExecutionSection } from "../../../execution-status/HookExecutionSection";
 import { SubStepProgressWidget } from "../sub-step-progress";
+import { EmptyState } from "../shared";
 import { getStatusColors, getAccentColors } from "@/design-system";
 import type { BaseWidgetProps } from "../../../../types/dashboard/widget-props";
 import type { ExecutionStatusWidgetData } from "./types";
@@ -117,6 +119,20 @@ export function ExecutionStatusFullWidget({ data }: ExecutionStatusFullWidgetPro
   const hasCompression = status.compression.currentTokenCount !== null;
   const hasHooks = status.hooks.executionHistory.length > 0;
   const hasSubSteps = status.subSteps.isActive || status.subSteps.steps.length > 0;
+
+  // Empty state: no active workflow and no meaningful data
+  const hasAnyData = hasRouting || hasRetries || hasCompression || hasHooks || hasSubSteps;
+  if (status.status === "idle" && !hasAnyData) {
+    return (
+      <div className="h-full">
+        <EmptyState
+          icon={Activity}
+          title="No active workflow"
+          description="Execution status details will appear here when a workflow is running"
+        />
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col h-full">

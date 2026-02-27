@@ -46,6 +46,8 @@ export interface SpecConfig {
 export interface DiscoveredSpec {
   specId: string;
   config: SpecConfig;
+  /** The application this spec belongs to (e.g. "Qontinui Web", "Qontinui Runner") */
+  appName?: string;
 }
 
 // =============================================================================

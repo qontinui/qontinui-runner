@@ -53,6 +53,12 @@ interface CurrentExecutionStepsResponse {
     error?: string;
     output?: string;
     stdout?: string;
+    stderr?: string;
+    command?: string;
+    working_directory?: string;
+    exit_code?: number;
+    template_command?: string;
+    resolved_variables?: Record<string, string>;
   }>;
   count: number;
   /** Multi-stage workflow fields */
@@ -160,6 +166,13 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
               status = "running";
             }
 
+            const hasDetail =
+              exec.command ||
+              exec.stdout ||
+              exec.stderr ||
+              exec.output ||
+              exec.exit_code !== undefined;
+
             return {
               id: exec.id,
               type: mapStepType(exec.step_type),
@@ -174,6 +187,18 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
               durationMs: exec.duration_ms,
               error: exec.error,
               outputPreview: exec.stdout?.slice(0, 100) || exec.output?.slice(0, 100),
+              detail: hasDetail
+                ? {
+                    command: exec.command,
+                    workingDirectory: exec.working_directory,
+                    exitCode: exec.exit_code,
+                    stdout: exec.stdout,
+                    stderr: exec.stderr,
+                    output: exec.output,
+                    templateCommand: exec.template_command,
+                    resolvedVariables: exec.resolved_variables,
+                  }
+                : undefined,
             };
           });
           setAllSteps(steps);
@@ -323,13 +348,11 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
 
     const keysWithSteps = Array.from(groups.keys()).filter((k) => (groups.get(k)?.length ?? 0) > 0);
 
-    // Sort by earliest startTime, falling back to stage index then phase order
+    // Sort by stage index first, then phase order within each stage.
+    // Chronological sort is unreliable because checkpoint timestamps may not
+    // reflect logical execution order (e.g. setup may record timestamps later
+    // than verification, or a later stage may have earlier timestamps).
     keysWithSteps.sort((a, b) => {
-      const timeA = groupEarliestTime.get(a);
-      const timeB = groupEarliestTime.get(b);
-      if (timeA !== undefined && timeB !== undefined) return timeA - timeB;
-      if (timeA !== undefined) return -1;
-      if (timeB !== undefined) return 1;
       const [stageA, phaseA] = a.split(":") as [string, WorkflowStage];
       const [stageB, phaseB] = b.split(":") as [string, WorkflowStage];
       if (stageA !== stageB) return parseInt(stageA) - parseInt(stageB);

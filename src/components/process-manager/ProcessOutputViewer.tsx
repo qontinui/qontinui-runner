@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { cn } from "../../lib/utils";
-import { Search, ArrowDown, Trash2 } from "lucide-react";
+import { Search, ArrowDown, Trash2, Wand2 } from "lucide-react";
 
 interface OutputLine {
   timestamp: string;
@@ -14,12 +14,20 @@ interface ProcessOutputViewerProps {
   processId: string;
   processName: string;
   className?: string;
+  processState?: string;
+  errorCount?: number;
+  onFixWithAi?: () => void;
+  isFixActive?: boolean;
 }
 
 export function ProcessOutputViewer({
   processId,
-  processName,
+  processName: _processName,
   className,
+  processState,
+  errorCount = 0,
+  onFixWithAi,
+  isFixActive = false,
 }: ProcessOutputViewerProps) {
   const [lines, setLines] = useState<OutputLine[]>([]);
   const [searchText, setSearchText] = useState("");
@@ -122,6 +130,22 @@ export function ProcessOutputViewer({
         >
           <Trash2 className="w-3.5 h-3.5" />
         </button>
+        {onFixWithAi && (processState === "failed" || errorCount > 0) && (
+          <button
+            onClick={onFixWithAi}
+            disabled={isFixActive}
+            className={cn(
+              "flex items-center gap-1 px-2 py-0.5 text-xs rounded border transition-colors",
+              isFixActive
+                ? "text-zinc-500 border-zinc-700 cursor-not-allowed"
+                : "text-amber-300 border-amber-700/50 bg-amber-900/30 hover:bg-amber-800/40",
+            )}
+            title="Analyze errors with AI"
+          >
+            <Wand2 className="w-3 h-3" />
+            Fix with AI
+          </button>
+        )}
         <span className="text-xs text-zinc-600">{lines.length} lines</span>
       </div>
 

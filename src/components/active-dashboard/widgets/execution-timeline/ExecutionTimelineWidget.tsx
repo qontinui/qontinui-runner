@@ -7,10 +7,11 @@
  * Provides a high-level overview of workflow execution progress.
  */
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import {
   Terminal,
   CheckCircle,
+  CheckCircle2,
   Bot,
   Globe2,
   FileCode,
@@ -22,16 +23,25 @@ import {
   Loader2,
   Clock,
   AlertCircle,
+  AlertTriangle,
   Camera,
   MousePointer,
   Network,
   Layers,
   Repeat,
   RotateCcw,
+  XCircle,
+  Play,
 } from "lucide-react";
 import { cn } from "../../../../lib/utils";
 import { Badge, ScrollArea, ProgressErrorBoundary } from "../../../ui";
-import { StepStatusBadge, StepProgressMarker, formatDuration } from "../shared";
+import {
+  StepStatusBadge,
+  StepProgressMarker,
+  StepOutputPanel,
+  EmptyState,
+  formatDuration,
+} from "../shared";
 import { TimelineStatsBar } from "./TimelineStatsBar";
 import { getAccentColors, getStatusColors } from "@/design-system";
 import {
@@ -111,16 +121,164 @@ function getStepAccentColor(type: StepType): string {
 }
 
 /**
+ * Detail panel shown when a completed step is expanded.
+ */
+function StepDetailPanel({ step }: { step: TimelineStep }) {
+  const detail = step.detail;
+  const errorColors = getStatusColors("error");
+
+  const noData =
+    !step.error &&
+    !detail?.command &&
+    !detail?.stdout &&
+    !detail?.stderr &&
+    !detail?.output &&
+    !step.outputPreview;
+
+  return (
+    <div className="px-3 pb-2 pl-10 space-y-2 animate-slideDown">
+      {/* Full error message */}
+      {step.error && (
+        <StepOutputPanel
+          title="Error"
+          content={step.error}
+          contentType="error"
+          accentColor="red"
+          maxHeight="max-h-[150px]"
+          showCopy
+        />
+      )}
+
+      {/* Command info */}
+      {detail?.command && (
+        <div className="space-y-1">
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] font-medium text-muted-foreground uppercase">Command</span>
+            {detail.exitCode !== undefined && (
+              <Badge
+                variant="muted"
+                className={cn(
+                  "text-[10px] px-1.5 py-0 h-4",
+                  detail.exitCode === 0 ? "text-green-500" : errorColors.text,
+                )}
+              >
+                exit {detail.exitCode}
+              </Badge>
+            )}
+          </div>
+          <pre className="text-xs font-mono bg-muted/30 rounded px-2 py-1.5 whitespace-pre-wrap break-all text-foreground">
+            {detail.command}
+          </pre>
+          {detail.workingDirectory && (
+            <span className="text-[10px] text-muted-foreground">
+              cwd: {detail.workingDirectory}
+            </span>
+          )}
+        </div>
+      )}
+
+      {/* Stdout */}
+      {detail?.stdout && (
+        <StepOutputPanel
+          title="stdout"
+          content={detail.stdout}
+          maxHeight="max-h-[200px]"
+          collapsible
+          defaultCollapsed={detail.stdout.length > 500}
+          showCopy
+          showLineNumbers={detail.stdout.split("\n").length > 5}
+        />
+      )}
+
+      {/* Stderr */}
+      {detail?.stderr && (
+        <StepOutputPanel
+          title="stderr"
+          content={detail.stderr}
+          contentType="error"
+          accentColor="red"
+          maxHeight="max-h-[200px]"
+          collapsible
+          defaultCollapsed
+          showCopy
+        />
+      )}
+
+      {/* General output for non-command steps */}
+      {detail?.output && !detail?.stdout && (
+        <StepOutputPanel
+          title="Output"
+          content={detail.output}
+          maxHeight="max-h-[200px]"
+          collapsible
+          defaultCollapsed={detail.output.length > 500}
+          showCopy
+        />
+      )}
+
+      {/* Output preview as fallback when no full detail */}
+      {!detail?.command &&
+        !detail?.stdout &&
+        !detail?.stderr &&
+        !detail?.output &&
+        step.outputPreview && (
+          <StepOutputPanel
+            title="Output Preview"
+            content={step.outputPreview}
+            maxHeight="max-h-[100px]"
+            showCopy={false}
+          />
+        )}
+
+      {/* Completed progress summary */}
+      {step.progress && step.progress.total !== null && (
+        <div className="flex items-center gap-2">
+          <span className="text-[10px] font-medium text-muted-foreground uppercase">Progress</span>
+          <span className="text-xs font-mono text-foreground">
+            {step.progress.current}/{step.progress.total}
+            {step.progress.type && (
+              <span className="ml-1 text-muted-foreground">{step.progress.type}</span>
+            )}
+          </span>
+          {step.progress.description && (
+            <span className="text-[10px] text-muted-foreground">{step.progress.description}</span>
+          )}
+        </div>
+      )}
+
+      {/* Empty state */}
+      {noData && (
+        <span className="text-xs text-muted-foreground italic">No additional detail available</span>
+      )}
+    </div>
+  );
+}
+
+/**
  * Individual step row component.
  * Shows step progress bar for running steps or completed steps with progress data.
+ * Expandable for terminal steps (success/failed) to show detail panel.
  */
-function StepRow({ step, taskRunId }: { step: TimelineStep; taskRunId: string | null }) {
+function StepRow({
+  step,
+  taskRunId,
+  isExpanded,
+  onToggle,
+}: {
+  step: TimelineStep;
+  taskRunId: string | null;
+  isExpanded: boolean;
+  onToggle: (stepId: string) => void;
+}) {
   const Icon = getStepIcon(step.type);
   const accentColor = getStepAccentColor(step.type);
   const colors = getAccentColors(accentColor as Parameters<typeof getAccentColors>[0]);
   const errorColors = getStatusColors("error");
   const isActive = step.status === "running";
   const pendingColors = getStatusColors("pending");
+
+  const isTerminal = step.status === "success" || step.status === "failed";
+  const isClickable = isTerminal;
 
   // Show progress for running steps or completed steps that have progress data
   const showProgress = isActive && step.checkpointId && taskRunId;
@@ -130,6 +288,17 @@ function StepRow({ step, taskRunId }: { step: TimelineStep; taskRunId: string | 
     !isActive &&
     step.progress &&
     step.progress.total !== null;
+
+  const handleClick = () => {
+    if (isClickable) onToggle(step.id);
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (isClickable && (e.key === "Enter" || e.key === " ")) {
+      e.preventDefault();
+      onToggle(step.id);
+    }
+  };
 
   return (
     <div
@@ -141,7 +310,14 @@ function StepRow({ step, taskRunId }: { step: TimelineStep; taskRunId: string | 
       )}
     >
       {/* Main step row */}
-      <div className="flex items-center gap-3 px-3 py-2">
+      <div
+        className={cn("flex items-center gap-3 px-3 py-2", isClickable && "cursor-pointer")}
+        onClick={handleClick}
+        onKeyDown={handleKeyDown}
+        role={isClickable ? "button" : undefined}
+        tabIndex={isClickable ? 0 : undefined}
+        aria-expanded={isClickable ? isExpanded : undefined}
+      >
         {/* Status indicator */}
         <StepStatusBadge status={step.status} iconOnly size="sm" />
 
@@ -165,8 +341,14 @@ function StepRow({ step, taskRunId }: { step: TimelineStep; taskRunId: string | 
 
         {/* Completed progress summary */}
         {showCompletedProgress && step.progress && (
-          <span className="text-xs text-muted-foreground tabular-nums">
+          <span
+            className="text-xs text-muted-foreground tabular-nums"
+            title={step.progress.description}
+          >
             {step.progress.current}/{step.progress.total}
+            {step.progress.type && (
+              <span className="ml-1 text-muted-foreground/70">{step.progress.type}</span>
+            )}
           </span>
         )}
 
@@ -181,12 +363,41 @@ function StepRow({ step, taskRunId }: { step: TimelineStep; taskRunId: string | 
         {isActive && <Loader2 className={cn("h-3.5 w-3.5 animate-spin", pendingColors.text)} />}
 
         {/* Error indicator */}
-        {step.error && (
+        {step.error && !isExpanded && (
           <span title={step.error}>
             <AlertCircle className={cn("h-3.5 w-3.5", errorColors.text)} />
           </span>
         )}
+
+        {/* Expand/collapse chevron for clickable steps */}
+        {isClickable &&
+          (isExpanded ? (
+            <ChevronDown className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
+          ) : (
+            <ChevronRight className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
+          ))}
       </div>
+
+      {/* Inline error summary (always visible on failed steps when not expanded) */}
+      {step.status === "failed" && step.error && !isExpanded && (
+        <div className="px-3 pb-1.5 pl-10">
+          <p className={cn("text-xs truncate", errorColors.text)} title={step.error}>
+            {step.error.length > 120 ? step.error.slice(0, 120) + "..." : step.error}
+          </p>
+        </div>
+      )}
+
+      {/* Output preview (shown on successful steps when not expanded and no error) */}
+      {step.outputPreview && !isExpanded && step.status !== "failed" && (
+        <div className="px-3 pb-1.5 pl-10">
+          <p
+            className="text-xs text-muted-foreground/70 truncate font-mono"
+            title={step.outputPreview}
+          >
+            {step.outputPreview}
+          </p>
+        </div>
+      )}
 
       {/* Progress bar for running steps */}
       {showProgress && taskRunId && step.checkpointId && (
@@ -198,8 +409,14 @@ function StepRow({ step, taskRunId }: { step: TimelineStep; taskRunId: string | 
             compact
             size="xs"
           />
+          {step.progress?.description && (
+            <p className="text-[10px] text-muted-foreground mt-0.5">{step.progress.description}</p>
+          )}
         </div>
       )}
+
+      {/* Expanded detail panel */}
+      {isExpanded && <StepDetailPanel step={step} />}
     </div>
   );
 }
@@ -215,6 +432,8 @@ function IterationSection({
   onIterationToggle,
   iterationKey,
   taskRunId,
+  expandedStepId,
+  onStepToggle,
 }: {
   iterationGroup: IterationGroup;
   phaseColor: string;
@@ -223,6 +442,8 @@ function IterationSection({
   onIterationToggle?: (key: string, expanded: boolean) => void;
   iterationKey?: string;
   taskRunId: string | null;
+  expandedStepId: string | null;
+  onStepToggle: (stepId: string) => void;
 }) {
   const [expanded, setExpanded] = useState(defaultExpanded);
 
@@ -302,7 +523,13 @@ function IterationSection({
       {expanded && (
         <div className="bg-muted/5">
           {iterationGroup.steps.map((step) => (
-            <StepRow key={step.id} step={step} taskRunId={taskRunId} />
+            <StepRow
+              key={step.id}
+              step={step}
+              taskRunId={taskRunId}
+              isExpanded={expandedStepId === step.id}
+              onToggle={onStepToggle}
+            />
           ))}
         </div>
       )}
@@ -319,12 +546,16 @@ function PhaseSection({
   expandedIterations,
   onIterationToggle,
   taskRunId,
+  expandedStepId,
+  onStepToggle,
 }: {
   group: PhaseGroup;
   defaultExpanded?: boolean;
   expandedIterations: Set<string>;
   onIterationToggle: (key: string, expanded: boolean) => void;
   taskRunId: string | null;
+  expandedStepId: string | null;
+  onStepToggle: (stepId: string) => void;
 }) {
   const [expanded, setExpanded] = useState(
     group.isUpcoming ? false : defaultExpanded || group.isActive,
@@ -427,7 +658,13 @@ function PhaseSection({
             // Flat list for phases without iterations
             <>
               {group.steps.map((step) => (
-                <StepRow key={step.id} step={step} taskRunId={taskRunId} />
+                <StepRow
+                  key={step.id}
+                  step={step}
+                  taskRunId={taskRunId}
+                  isExpanded={expandedStepId === step.id}
+                  onToggle={onStepToggle}
+                />
               ))}
               {group.steps.length === 0 && (
                 <div className="px-4 py-3 text-sm text-muted-foreground text-center">
@@ -451,6 +688,8 @@ function PhaseSection({
                     onIterationToggle={onIterationToggle}
                     iterationKey={iterKey}
                     taskRunId={taskRunId}
+                    expandedStepId={expandedStepId}
+                    onStepToggle={onStepToggle}
                   />
                 );
               })}
@@ -463,6 +702,57 @@ function PhaseSection({
 }
 
 /**
+ * Completion summary shown when all phases have finished.
+ */
+function CompletionSummary({
+  stats,
+  stepStats,
+}: {
+  stats: ExecutionTimelineWidgetProps["data"]["stats"];
+  stepStats: ExecutionTimelineWidgetProps["data"]["stepStats"];
+}) {
+  const successColors = getStatusColors("success");
+  const errorColors = getStatusColors("error");
+  const allPassed = stepStats.failed === 0 && stepStats.successful > 0;
+
+  return (
+    <div
+      className={cn(
+        "mx-4 my-3 rounded-lg border p-3",
+        allPassed
+          ? cn(successColors.border, successColors.bg)
+          : cn(errorColors.border, errorColors.bg),
+      )}
+    >
+      <div className="flex items-center gap-2 mb-2">
+        {allPassed ? (
+          <CheckCircle2 className={cn("h-4 w-4", successColors.text)} />
+        ) : (
+          <XCircle className={cn("h-4 w-4", errorColors.text)} />
+        )}
+        <span
+          className={cn("text-sm font-semibold", allPassed ? successColors.text : errorColors.text)}
+        >
+          Workflow {allPassed ? "Completed Successfully" : "Completed with Failures"}
+        </span>
+      </div>
+      <div className="flex items-center gap-4 text-xs text-muted-foreground">
+        <span className="font-mono">Duration: {formatDuration(stats.elapsedTime * 1000)}</span>
+        <span>{stepStats.successful} passed</span>
+        {stepStats.failed > 0 && (
+          <span className={errorColors.text}>{stepStats.failed} failed</span>
+        )}
+        {stats.maxIteration > 0 && (
+          <span>
+            {stats.maxIteration} iteration{stats.maxIteration !== 1 ? "s" : ""}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/**
  * Full Execution Timeline widget component.
  */
 export function ExecutionTimelineWidget({
@@ -470,7 +760,15 @@ export function ExecutionTimelineWidget({
   data,
   className,
 }: ExecutionTimelineWidgetProps) {
-  const { phaseGroups, stats, stepStats, isLoading, workflowName, currentPhase, taskRunId } = data;
+  const { phaseGroups, stats, stepStats, isLoading, error, workflowName, currentPhase, taskRunId } =
+    data;
+
+  // Track which step detail panel is expanded (only one at a time)
+  const [expandedStepId, setExpandedStepId] = useState<string | null>(null);
+
+  const handleStepToggle = useCallback((stepId: string) => {
+    setExpandedStepId((prev) => (prev === stepId ? null : stepId));
+  }, []);
 
   // Track which iterations are expanded
   // By default, only the current/latest iteration in each phase is expanded
@@ -539,15 +837,50 @@ export function ExecutionTimelineWidget({
     });
   }, []);
 
+  // Detect workflow completion: has steps, all phases complete, no running steps
+  const isWorkflowComplete = useMemo(() => {
+    if (stepStats.total === 0) return false;
+    if (stepStats.pending > 0) return false;
+    return phaseGroups.length > 0 && phaseGroups.every((g) => g.isComplete);
+  }, [phaseGroups, stepStats]);
+
   // If summary mode, don't render (use ExecutionTimelineSummary instead)
   if (isSummary) {
     return null;
   }
 
+  // Loading state
   if (isLoading) {
     return (
-      <div className={cn("flex items-center justify-center h-full", className)}>
+      <div className={cn("flex flex-col items-center justify-center h-full gap-2", className)}>
         <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+        <span className="text-xs text-muted-foreground">Loading execution data...</span>
+      </div>
+    );
+  }
+
+  // Error state
+  if (error) {
+    return (
+      <div className={cn("flex flex-col items-center justify-center h-full gap-2 px-4", className)}>
+        <div className="rounded-full bg-destructive/10 p-3">
+          <AlertTriangle className="h-6 w-6 text-destructive" />
+        </div>
+        <p className="text-sm font-medium text-foreground">Failed to load timeline data</p>
+        <p className="text-xs text-muted-foreground text-center max-w-[250px]">{error}</p>
+      </div>
+    );
+  }
+
+  // Empty state: no workflow running and no steps
+  if (!taskRunId && phaseGroups.length === 0 && stepStats.total === 0) {
+    return (
+      <div className={cn("h-full", className)}>
+        <EmptyState
+          icon={Play}
+          title="No active workflow"
+          description="Start a workflow to see execution progress here"
+        />
       </div>
     );
   }
@@ -555,7 +888,7 @@ export function ExecutionTimelineWidget({
   return (
     <div className={cn("flex flex-col h-full overflow-hidden", className)}>
       {/* Stats Bar with overall workflow progress */}
-      <TimelineStatsBar stats={stats} stepStats={stepStats} />
+      {stepStats.total > 0 && <TimelineStatsBar stats={stats} stepStats={stepStats} />}
 
       {/* Workflow name header */}
       {workflowName && (
@@ -576,6 +909,9 @@ export function ExecutionTimelineWidget({
       <ScrollArea className="flex-1">
         <ProgressErrorBoundary componentName="ExecutionTimelineWidget">
           <div className="flex flex-col">
+            {/* Completion summary banner */}
+            {isWorkflowComplete && <CompletionSummary stats={stats} stepStats={stepStats} />}
+
             {phaseGroups.map((group) => (
               <PhaseSection
                 key={`${group.stageIndex}:${group.phase}`}
@@ -584,9 +920,11 @@ export function ExecutionTimelineWidget({
                 expandedIterations={expandedIterations}
                 onIterationToggle={handleIterationToggle}
                 taskRunId={taskRunId}
+                expandedStepId={expandedStepId}
+                onStepToggle={handleStepToggle}
               />
             ))}
-            {phaseGroups.length === 0 && (
+            {phaseGroups.length === 0 && stepStats.total === 0 && (
               <div className="flex flex-col items-center justify-center h-32 text-muted-foreground">
                 <Clock className="h-8 w-8 mb-2 opacity-50" />
                 <span className="text-sm">Waiting for steps to execute...</span>

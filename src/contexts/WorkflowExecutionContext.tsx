@@ -480,13 +480,12 @@ function buildPhaseGroups(
   }
 
   keysToShow.sort((a, b) => {
-    const timeA = groupEarliestTime.get(a);
-    const timeB = groupEarliestTime.get(b);
-    if (timeA !== undefined && timeB !== undefined) return timeA - timeB;
-    if (timeA !== undefined) return -1;
-    if (timeB !== undefined) return 1;
     const [stageA, phaseA] = a.split(":") as [string, WorkflowStage];
     const [stageB, phaseB] = b.split(":") as [string, WorkflowStage];
+    // Always sort by stage index first, then phase order within each stage.
+    // Chronological sort is unreliable because checkpoint timestamps may not
+    // reflect logical execution order (e.g. setup may record timestamps later
+    // than verification, or stage 2 may have earlier timestamps than stage 1).
     if (stageA !== stageB) return parseInt(stageA) - parseInt(stageB);
     return PHASE_ORDER.indexOf(phaseA) - PHASE_ORDER.indexOf(phaseB);
   });
@@ -556,7 +555,23 @@ function buildIterationGroups(
   }
 
   const iterations = Array.from(iterMap.keys()).sort((a, b) => a - b);
-  const maxIter = Math.max(...iterations, 0);
+
+  // Find which iteration is actually running by searching backwards for one with running steps.
+  // Only the last running iteration should be marked active — earlier ones are complete/failed.
+  let activeIteration: number | null = null;
+  if (isActivePhase) {
+    for (let i = iterations.length - 1; i >= 0; i--) {
+      const iterSteps = iterMap.get(iterations[i]) || [];
+      if (iterSteps.some((s) => s.status === "running")) {
+        activeIteration = iterations[i];
+        break;
+      }
+    }
+    // Fallback: if no running steps found, mark the latest iteration as active
+    if (activeIteration === null && iterations.length > 0) {
+      activeIteration = iterations[iterations.length - 1];
+    }
+  }
 
   return iterations.map((iteration) => {
     const iterSteps = iterMap.get(iteration) || [];
@@ -565,7 +580,7 @@ function buildIterationGroups(
     ).length;
     const successful = iterSteps.filter((s) => s.status === "success").length;
     const failed = iterSteps.filter((s) => s.status === "failed").length;
-    const isActive = isActivePhase && iteration === maxIter;
+    const isActive = iteration === activeIteration;
     const isComplete = iterSteps.length > 0 && completed === iterSteps.length;
 
     return {

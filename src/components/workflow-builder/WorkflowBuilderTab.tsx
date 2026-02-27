@@ -36,6 +36,22 @@ import type {
 } from "../../types";
 import { generateStepId } from "../../types";
 import { useGlobalLogSources } from "../../hooks/useGlobalLogSources";
+import {
+  type SettingDef,
+  type BooleanSettingDef,
+  type NumberSettingDef,
+  type SelectSettingDef,
+  type CustomSettingDef,
+  type SettingsSection,
+  WORKFLOW_SETTINGS_CONFIG,
+  PROVIDER_OPTIONS,
+  MODELS_BY_PROVIDER,
+  getVisibleSections,
+  getBooleanDisplayValue,
+  toBooleanStoredValue,
+  getLogSourceValue as _getLogSourceValue,
+  parseLogSourceValue as _parseLogSourceValue,
+} from "@qontinui/workflow-utils";
 import { WorkflowBuilderProvider, useWorkflowBuilder } from "./WorkflowBuilderContext";
 import { PhaseSection } from "./PhaseSection";
 import { StepItem } from "./StepItem";
@@ -62,55 +78,48 @@ import { BuilderToolbar, toolbarActions } from "../ui/BuilderToolbar";
 
 const API_BASE = "http://localhost:9876";
 
-// =============================================================================
-// AI Provider/Model Options
-// =============================================================================
-
-/** Provider options for workflow-level AI override */
-const PROVIDER_OPTIONS = [
-  { value: "", label: "Use Default (from Settings)" },
-  { value: "claude_cli", label: "Claude CLI" },
-  { value: "anthropic_api", label: "Anthropic API" },
-  { value: "openai_api", label: "OpenAI API" },
-  { value: "gemini_api", label: "Gemini API" },
-];
-
-/** Model options per provider - shown when a specific provider is selected */
-const MODELS_BY_PROVIDER: Record<string, { value: string; label: string }[]> = {
-  claude_cli: [
-    { value: "", label: "Default" },
-    { value: "claude-sonnet-4-20250514", label: "Claude Sonnet 4" },
-    { value: "claude-opus-4-20250514", label: "Claude Opus 4" },
-  ],
-  anthropic_api: [
-    { value: "", label: "Default" },
-    { value: "claude-sonnet-4-20250514", label: "Claude Sonnet 4" },
-    { value: "claude-opus-4-20250514", label: "Claude Opus 4" },
-  ],
-  openai_api: [
-    { value: "", label: "Default" },
-    { value: "gpt-4o", label: "GPT-4o" },
-    { value: "gpt-4o-mini", label: "GPT-4o Mini" },
-    { value: "o1", label: "o1" },
-    { value: "o1-mini", label: "o1-mini" },
-  ],
-  gemini_api: [
-    { value: "", label: "Default" },
-    { value: "gemini-3-flash-preview", label: "Gemini 3 Flash (Fast)" },
-    { value: "gemini-3-pro-preview", label: "Gemini 3 Pro" },
-    { value: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
-    { value: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
-  ],
-};
-
 // EmptyState removed — replaced by AiGeneratePanel as the default empty view
 
 // =============================================================================
-// Settings Panel Component
+// Settings Panel Component (config-driven via @qontinui/workflow-utils)
 // =============================================================================
 
 interface SettingsPanelProps {
   nameInputRef?: React.RefObject<HTMLInputElement | null>;
+}
+
+/** Toggle switch component for the runner settings panel */
+function ToggleSwitch({
+  checked,
+  onChange,
+  dataUiId,
+}: {
+  checked: boolean;
+  onChange: (value: boolean) => void;
+  dataUiId?: string;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      onClick={() => onChange(!checked)}
+      className={`
+        relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent
+        transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500/50
+        ${checked ? "bg-blue-600" : "bg-zinc-600"}
+      `}
+      data-ui-id={dataUiId}
+    >
+      <span
+        className={`
+          pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0
+          transition duration-200 ease-in-out
+          ${checked ? "translate-x-5" : "translate-x-0"}
+        `}
+      />
+    </button>
+  );
 }
 
 function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
@@ -118,265 +127,220 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
   const { workflow } = state;
   const { settings: logSourceSettings } = useGlobalLogSources();
 
-  // Get current log source selection value for display
-  const getLogSourceDisplayValue = (): string => {
-    const selection = workflow.log_source_selection;
-    if (!selection || selection === "default") return "default";
-    if (selection === "ai") return "ai";
-    if (selection === "all") return "all";
-    if (typeof selection === "object" && "profile_id" in selection) {
-      return `profile:${selection.profile_id}`;
-    }
-    return "default";
-  };
+  const visibleSections = getVisibleSections(WORKFLOW_SETTINGS_CONFIG, features);
 
-  // Handle log source selection change
-  const handleLogSourceChange = (value: string) => {
-    let selection: LogSourceSelection;
-    if (value === "default") {
-      selection = "default";
-    } else if (value === "ai") {
-      selection = "ai";
-    } else if (value === "all") {
-      selection = "all";
-    } else if (value.startsWith("profile:")) {
-      selection = { profile_id: value.replace("profile:", "") };
-    } else {
-      selection = "default";
-    }
-    updateWorkflow({ log_source_selection: selection });
-  };
+  const inputClass =
+    "w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50";
+  const selectClass =
+    "w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50";
 
-  return (
-    <div className="p-4 border-t border-zinc-700 space-y-4">
-      {/* Always show name and description */}
-      <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-1">Name</label>
-        <input
-          ref={nameInputRef}
-          type="text"
-          value={workflow.name}
-          onChange={(e) => updateWorkflow({ name: e.target.value })}
-          placeholder="Workflow name..."
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-          data-ui-id="workflow-builder-name-input"
-        />
-      </div>
+  // ─── Setting Renderers ──────────────────────────────────────────────
 
-      <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-1">Description</label>
-        <textarea
-          value={workflow.description}
-          onChange={(e) => updateWorkflow({ description: e.target.value })}
-          placeholder="What does this workflow do?"
-          rows={2}
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 resize-none"
-          data-ui-id="workflow-builder-description-input"
-        />
-      </div>
+  function renderBooleanSetting(def: BooleanSettingDef) {
+    const displayValue = getBooleanDisplayValue(def, (workflow as never)[def.key]);
 
-      {/* Show iteration settings when there are agentic steps */}
-      {features.showIterationSettings && (
-        <div className="space-y-4">
+    // Use toggle switch style for most boolean settings (runner uses switches)
+    if (
+      def.key === "skip_ai_summary" ||
+      def.key === "health_check_enabled" ||
+      def.key === "log_watch_enabled"
+    ) {
+      return (
+        <div
+          key={def.key}
+          className="flex items-center justify-between py-2 px-3 bg-zinc-800/50 rounded-md"
+        >
           <div>
-            <label className="block text-sm font-medium text-zinc-400 mb-1">Max Iterations</label>
-            <input
-              type="number"
-              value={workflow.max_iterations ?? 10}
-              onChange={(e) => updateWorkflow({ max_iterations: parseInt(e.target.value) || 10 })}
-              min={1}
-              max={100}
-              className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-              data-ui-id="workflow-builder-iterations-input"
-            />
-            <p className="text-xs text-zinc-500 mt-1">
-              Maximum number of verification {"<->"} agentic loops
-            </p>
+            <label className="block text-sm font-medium text-zinc-300">{def.label}</label>
+            {def.tooltip && <p className="text-xs text-zinc-500">{def.tooltip}</p>}
           </div>
+          <ToggleSwitch
+            checked={displayValue}
+            onChange={(v) => updateWorkflow({ [def.key]: toBooleanStoredValue(def, v) })}
+            dataUiId={`workflow-builder-${def.key.replace(/_/g, "-")}-toggle`}
+          />
+        </div>
+      );
+    }
 
-          <div>
-            <label className="block text-sm font-medium text-zinc-400 mb-1">
-              AI Session Timeout
+    // Checkbox style for reflection mode, stop_on_failure
+    return (
+      <label key={def.key} className="flex items-center gap-2 text-sm text-zinc-400">
+        <input
+          type="checkbox"
+          checked={displayValue}
+          onChange={(e) =>
+            updateWorkflow({ [def.key]: toBooleanStoredValue(def, e.target.checked) })
+          }
+          className="w-4 h-4 rounded border-zinc-600 bg-zinc-800 text-blue-500 focus:ring-blue-500/50"
+        />
+        {def.label}
+        {def.tooltip && (
+          <span className="relative group">
+            <svg
+              className="w-3.5 h-3.5 text-zinc-500 cursor-help"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+              strokeWidth={2}
+            >
+              <circle cx="12" cy="12" r="10" />
+              <path d="M12 16v-4M12 8h.01" />
+            </svg>
+            <span className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 hidden group-hover:block w-64 p-2.5 bg-zinc-700 border border-zinc-600 rounded-lg text-[11px] text-zinc-300 leading-relaxed z-50 shadow-lg pointer-events-none">
+              {def.tooltip}
+            </span>
+          </span>
+        )}
+      </label>
+    );
+  }
+
+  function renderNumberSetting(def: NumberSettingDef) {
+    if (def.key === "timeout_seconds") {
+      // Special timeout rendering with enable/disable checkbox
+      return (
+        <div key={def.key}>
+          <label className="block text-sm font-medium text-zinc-400 mb-1">AI Session Timeout</label>
+          <div className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              id="timeout-enabled"
+              checked={workflow.timeout_seconds != null}
+              onChange={(e) => {
+                updateWorkflow({ timeout_seconds: e.target.checked ? 300 : null });
+              }}
+              className="w-4 h-4 rounded border-zinc-600 bg-zinc-800 text-blue-500 focus:ring-blue-500/50"
+              data-ui-id="workflow-builder-timeout-checkbox"
+            />
+            <label htmlFor="timeout-enabled" className="text-sm text-zinc-400">
+              Enable timeout
             </label>
-            <div className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                id="timeout-enabled"
-                checked={workflow.timeout_seconds != null}
-                onChange={(e) => {
-                  if (e.target.checked) {
-                    updateWorkflow({ timeout_seconds: 300 }); // Default 5 minutes
-                  } else {
-                    updateWorkflow({ timeout_seconds: null });
-                  }
-                }}
-                className="w-4 h-4 rounded border-zinc-600 bg-zinc-800 text-blue-500 focus:ring-blue-500/50"
-                data-ui-id="workflow-builder-timeout-checkbox"
-              />
-              <label htmlFor="timeout-enabled" className="text-sm text-zinc-400">
-                Enable timeout
-              </label>
-              {workflow.timeout_seconds != null && (
+            {workflow.timeout_seconds != null && (
+              <>
                 <input
                   type="number"
                   value={workflow.timeout_seconds}
                   onChange={(e) =>
                     updateWorkflow({
-                      timeout_seconds: Math.max(60, parseInt(e.target.value) || 300),
+                      timeout_seconds: Math.max(def.min ?? 60, parseInt(e.target.value) || 300),
                     })
                   }
-                  min={60}
-                  max={7200}
+                  min={def.min}
+                  max={def.max}
                   className="w-24 px-2 py-1 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm"
                   data-ui-id="workflow-builder-timeout-input"
                 />
-              )}
-              {workflow.timeout_seconds != null && (
                 <span className="text-sm text-zinc-500">seconds</span>
-              )}
-            </div>
-            <p className="text-xs text-zinc-500 mt-1">
-              {workflow.timeout_seconds != null
-                ? `Kill AI session after ${workflow.timeout_seconds}s of inactivity`
-                : "No timeout - runs until completion or manual stop (recommended)"}
-            </p>
+              </>
+            )}
           </div>
+          <p className="text-xs text-zinc-500 mt-1">
+            {workflow.timeout_seconds != null
+              ? `Kill AI session after ${workflow.timeout_seconds}s of inactivity`
+              : "No timeout - runs until completion or manual stop (recommended)"}
+          </p>
         </div>
-      )}
+      );
+    }
 
-      {/* Show provider/model settings when there are agentic steps */}
-      {features.showIterationSettings && (
-        <div className="p-3 bg-zinc-800/50 rounded-md space-y-3">
-          <div className="flex items-center gap-2">
-            <Sparkles className="w-4 h-4 text-purple-400" />
-            <span
-              data-content-role="label"
-              data-content-label="AI provider override"
-              className="text-sm font-medium text-zinc-300"
-            >
-              AI Provider Override
-            </span>
-            <div className="relative group">
-              <Info className="w-3.5 h-3.5 text-zinc-500 hover:text-zinc-300 cursor-help" />
-              <div className="absolute left-0 bottom-full mb-2 w-64 p-3 bg-zinc-800 border border-zinc-600 rounded-lg shadow-lg opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 z-50">
-                <p className="text-xs text-zinc-300">
-                  Override the default AI provider for this workflow. Use Gemini Flash for fast,
-                  cost-effective tasks. Leave empty to use the provider from Settings.
-                </p>
-              </div>
-            </div>
+    return (
+      <div key={def.key}>
+        <label className="block text-sm font-medium text-zinc-400 mb-1">{def.label}</label>
+        <input
+          type="number"
+          value={(workflow as never)[def.key] ?? def.defaultValue ?? ""}
+          onChange={(e) =>
+            updateWorkflow({ [def.key]: parseInt(e.target.value) || def.defaultValue || 10 })
+          }
+          min={def.min}
+          max={def.max}
+          className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+          data-ui-id={`workflow-builder-${def.key.replace(/_/g, "-")}-input`}
+        />
+        {def.description && <p className="text-xs text-zinc-500 mt-1">{def.description}</p>}
+      </div>
+    );
+  }
+
+  function renderCustomSetting(def: CustomSettingDef) {
+    switch (def.customType) {
+      case "name_input":
+        return (
+          <div key={def.key}>
+            <label className="block text-sm font-medium text-zinc-400 mb-1">Name</label>
+            <input
+              ref={nameInputRef}
+              type="text"
+              value={workflow.name}
+              onChange={(e) => updateWorkflow({ name: e.target.value })}
+              placeholder="Workflow name..."
+              className={inputClass}
+              data-ui-id="workflow-builder-name-input"
+            />
           </div>
-          <div className="flex gap-3">
+        );
+
+      case "description_input":
+        return (
+          <div key={def.key}>
+            <label className="block text-sm font-medium text-zinc-400 mb-1">Description</label>
+            <textarea
+              value={workflow.description}
+              onChange={(e) => updateWorkflow({ description: e.target.value })}
+              placeholder="What does this workflow do?"
+              rows={2}
+              className={`${inputClass} resize-none`}
+              data-ui-id="workflow-builder-description-input"
+            />
+          </div>
+        );
+
+      case "model_select": {
+        if (!workflow.provider || !MODELS_BY_PROVIDER[workflow.provider]) return null;
+        // Rendered inline with provider in the ai section
+        return null;
+      }
+
+      case "log_source_select":
+        return (
+          <div key={def.key}>
+            <label className="block text-sm font-medium text-zinc-400 mb-1">Log Sources</label>
             <select
-              value={workflow.provider ?? ""}
+              value={_getLogSourceValue(
+                workflow.log_source_selection as LogSourceSelection | undefined,
+              )}
               onChange={(e) => {
-                updateWorkflow({
-                  provider: e.target.value || undefined,
-                  model: undefined, // Reset model when provider changes
-                });
+                const parsed = _parseLogSourceValue(e.target.value);
+                updateWorkflow({ log_source_selection: parsed ?? "default" });
               }}
-              className="flex-1 px-3 py-2 bg-zinc-700 border border-zinc-600 rounded-md text-zinc-200 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500/50"
-              data-ui-id="workflow-builder-provider-select"
+              className={selectClass}
+              data-ui-id="workflow-builder-log-sources-select"
             >
-              {PROVIDER_OPTIONS.map((opt) => (
-                <option key={opt.value} value={opt.value}>
-                  {opt.label}
+              <option value="default">Default (use global setting)</option>
+              <option value="ai">AI-based selection</option>
+              <option value="all">All enabled sources</option>
+              {logSourceSettings?.profiles.map((profile) => (
+                <option key={profile.id} value={`profile:${profile.id}`}>
+                  Profile: {profile.name}
                 </option>
               ))}
             </select>
-            {workflow.provider && MODELS_BY_PROVIDER[workflow.provider] && (
-              <select
-                value={workflow.model ?? ""}
-                onChange={(e) => updateWorkflow({ model: e.target.value || undefined })}
-                className="flex-1 px-3 py-2 bg-zinc-700 border border-zinc-600 rounded-md text-zinc-200 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500/50"
-                data-ui-id="workflow-builder-model-select"
-              >
-                {MODELS_BY_PROVIDER[workflow.provider].map((opt) => (
-                  <option key={opt.value} value={opt.value}>
-                    {opt.label}
-                  </option>
-                ))}
-              </select>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* AI Summary toggle - show when workflow has any AI prompts */}
-      {features.hasAiPrompts && (
-        <div className="flex items-center justify-between py-2 px-3 bg-zinc-800/50 rounded-md">
-          <div>
-            <label className="block text-sm font-medium text-zinc-300">AI Summary</label>
-            <p className="text-xs text-zinc-500">
-              Generate an AI summary of the workflow execution
+            <p className="text-xs text-zinc-500 mt-1">
+              Which log sources to include when running this workflow
             </p>
           </div>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={!workflow.skip_ai_summary}
-            onClick={() => updateWorkflow({ skip_ai_summary: !workflow.skip_ai_summary })}
-            className={`
-              relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent
-              transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500/50
-              ${!workflow.skip_ai_summary ? "bg-blue-600" : "bg-zinc-600"}
-            `}
-            data-ui-id="workflow-builder-ai-summary-toggle"
-          >
-            <span
-              className={`
-                pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0
-                transition duration-200 ease-in-out
-                ${!workflow.skip_ai_summary ? "translate-x-5" : "translate-x-0"}
-              `}
-            />
-          </button>
-        </div>
-      )}
+        );
 
-      {/* Health Check toggle - automatic server health checks */}
-      <div className="space-y-2">
-        <div className="flex items-center justify-between py-2 px-3 bg-zinc-800/50 rounded-md">
-          <div>
-            <label className="block text-sm font-medium text-zinc-300">Server Health Checks</label>
-            <p className="text-xs text-zinc-500">
-              Verify configured servers are running before verification
-            </p>
-          </div>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={workflow.health_check_enabled ?? true}
-            onClick={() =>
-              updateWorkflow({ health_check_enabled: !(workflow.health_check_enabled ?? true) })
-            }
-            className={`
-              relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent
-              transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500/50
-              ${(workflow.health_check_enabled ?? true) ? "bg-blue-600" : "bg-zinc-600"}
-            `}
-            data-ui-id="workflow-builder-health-check-toggle"
-          >
-            <span
-              className={`
-                pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0
-                transition duration-200 ease-in-out
-                ${(workflow.health_check_enabled ?? true) ? "translate-x-5" : "translate-x-0"}
-              `}
-            />
-          </button>
-        </div>
-
-        {/* Health Check URLs - shown when health checks are enabled */}
-        {(workflow.health_check_enabled ?? true) && (
-          <div className="pl-3 space-y-2">
+      case "health_check_urls": {
+        if (!(workflow.health_check_enabled ?? true)) return null;
+        return (
+          <div key={def.key} className="pl-3 space-y-2">
             <div className="text-xs text-zinc-500">
               {(workflow.health_check_urls ?? []).length === 0
                 ? "No health check URLs configured. Add URLs to check server availability."
                 : `${(workflow.health_check_urls ?? []).length} health check URL(s) configured`}
             </div>
-
-            {/* List existing health check URLs with inline editing */}
             {(workflow.health_check_urls ?? []).map((hc, index) => (
               <HealthCheckUrlEditor
                 key={index}
@@ -393,8 +357,6 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
                 }}
               />
             ))}
-
-            {/* Add new health check URL */}
             <button
               type="button"
               onClick={() => {
@@ -415,110 +377,201 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
               Add Health Check URL
             </button>
           </div>
-        )}
-      </div>
+        );
+      }
 
-      {/* Log Watch toggle - automatic log error detection */}
-      <div className="flex items-center justify-between py-2 px-3 bg-zinc-800/50 rounded-md">
-        <div>
-          <label className="block text-sm font-medium text-zinc-300">
-            Automatic Log Error Detection
-          </label>
-          <p className="text-xs text-zinc-500">
-            Scan backend and frontend logs for errors before each verification
-          </p>
-        </div>
-        <button
-          type="button"
-          role="switch"
-          aria-checked={workflow.log_watch_enabled ?? true}
-          onClick={() =>
-            updateWorkflow({ log_watch_enabled: !(workflow.log_watch_enabled ?? true) })
-          }
-          className={`
-            relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent
-            transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500/50
-            ${(workflow.log_watch_enabled ?? true) ? "bg-blue-600" : "bg-zinc-600"}
-          `}
-          data-ui-id="workflow-builder-log-watch-toggle"
-        >
-          <span
-            className={`
-              pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0
-              transition duration-200 ease-in-out
-              ${(workflow.log_watch_enabled ?? true) ? "translate-x-5" : "translate-x-0"}
-            `}
+      case "prompt_template":
+        return (
+          <PromptTemplateEditor
+            key={def.key}
+            workflowTemplate={workflow.prompt_template}
+            onWorkflowTemplateChange={(template) => updateWorkflow({ prompt_template: template })}
+            hasAgenticSteps={true}
           />
-        </button>
-      </div>
+        );
 
-      {/* Developer Prompt Template - show when workflow has agentic steps */}
-      {features.showIterationSettings && (
-        <PromptTemplateEditor
-          workflowTemplate={workflow.prompt_template}
-          onWorkflowTemplateChange={(template) => updateWorkflow({ prompt_template: template })}
-          hasAgenticSteps={true}
-        />
-      )}
+      case "context_management":
+        return <ContextManagement key={def.key} />;
 
-      {/* Log Source Selection */}
-      <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-1">Log Sources</label>
+      case "category_input":
+        return (
+          <div key={def.key}>
+            <label className="block text-sm font-medium text-zinc-400 mb-1">Category</label>
+            <input
+              type="text"
+              value={workflow.category}
+              onChange={(e) => updateWorkflow({ category: e.target.value })}
+              placeholder="general"
+              className={inputClass}
+              data-ui-id="workflow-builder-category-input"
+            />
+          </div>
+        );
+
+      case "tags_input":
+        return (
+          <div key={def.key}>
+            <label className="block text-sm font-medium text-zinc-400 mb-1">Tags</label>
+            <input
+              type="text"
+              value={workflow.tags.join(", ")}
+              onChange={(e) =>
+                updateWorkflow({
+                  tags: e.target.value
+                    .split(",")
+                    .map((t) => t.trim())
+                    .filter(Boolean),
+                })
+              }
+              placeholder="tag1, tag2"
+              className={inputClass}
+              data-ui-id="workflow-builder-tags-input"
+            />
+          </div>
+        );
+
+      default:
+        return null;
+    }
+  }
+
+  function renderSelectSetting(def: SelectSettingDef) {
+    return (
+      <div key={def.key}>
+        <label className="block text-sm font-medium text-zinc-400 mb-1">{def.label}</label>
         <select
-          value={getLogSourceDisplayValue()}
-          onChange={(e) => handleLogSourceChange(e.target.value)}
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-          data-ui-id="workflow-builder-log-sources-select"
+          value={((workflow as never)[def.key] as string) ?? def.defaultValue}
+          onChange={(e) =>
+            updateWorkflow({
+              [def.key]: e.target.value || undefined,
+              ...(def.key === "provider" ? { model: undefined } : {}),
+            })
+          }
+          className={selectClass}
+          data-ui-id={`workflow-builder-${def.key.replace(/_/g, "-")}-select`}
         >
-          <option value="default">Default (use global setting)</option>
-          <option value="ai">AI-based selection</option>
-          <option value="all">All enabled sources</option>
-          {logSourceSettings?.profiles.map((profile) => (
-            <option key={profile.id} value={`profile:${profile.id}`}>
-              Profile: {profile.name}
+          {def.options.map((opt) => (
+            <option key={opt.value} value={opt.value}>
+              {opt.label}
             </option>
           ))}
         </select>
-        <p className="text-xs text-zinc-500 mt-1">
-          Which log sources to include when running this workflow
-        </p>
+        {def.description && <p className="text-xs text-zinc-500 mt-1">{def.description}</p>}
       </div>
+    );
+  }
 
-      {/* AI Contexts - show when workflow has agentic steps */}
-      {features.hasAiPrompts && <ContextManagement />}
+  // ─── Setting Dispatch ───────────────────────────────────────────────
 
-      {/* Category and tags */}
-      <div className="grid grid-cols-2 gap-4">
-        <div>
-          <label className="block text-sm font-medium text-zinc-400 mb-1">Category</label>
-          <input
-            type="text"
-            value={workflow.category}
-            onChange={(e) => updateWorkflow({ category: e.target.value })}
-            placeholder="general"
-            className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-            data-ui-id="workflow-builder-category-input"
-          />
+  function renderSetting(def: SettingDef) {
+    switch (def.type) {
+      case "boolean":
+        return renderBooleanSetting(def);
+      case "number":
+        return renderNumberSetting(def);
+      case "select":
+        return renderSelectSetting(def);
+      case "custom":
+        return renderCustomSetting(def);
+    }
+  }
+
+  // ─── Section Layout ─────────────────────────────────────────────────
+
+  function renderSection(section: SettingsSection) {
+    if (section.id === "identity") {
+      return (
+        <React.Fragment key={section.id}>{section.settings.map(renderSetting)}</React.Fragment>
+      );
+    }
+
+    if (section.id === "metadata") {
+      return (
+        <div key={section.id} className="grid grid-cols-2 gap-4">
+          {section.settings.map(renderSetting)}
         </div>
-        <div>
-          <label className="block text-sm font-medium text-zinc-400 mb-1">Tags</label>
-          <input
-            type="text"
-            value={workflow.tags.join(", ")}
-            onChange={(e) =>
-              updateWorkflow({
-                tags: e.target.value
-                  .split(",")
-                  .map((t) => t.trim())
-                  .filter(Boolean),
-              })
-            }
-            placeholder="tag1, tag2"
-            className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-            data-ui-id="workflow-builder-tags-input"
-          />
+      );
+    }
+
+    if (section.id === "iteration") {
+      return (
+        <div key={section.id} className="space-y-4">
+          {section.settings.map(renderSetting)}
         </div>
-      </div>
+      );
+    }
+
+    if (section.id === "ai") {
+      const providerDef = section.settings.find((s) => s.key === "provider");
+      const _modelKey = section.settings.find((s) => s.key === "model");
+      const booleans = section.settings.filter((s) => s.type === "boolean");
+      const otherCustom = section.settings.filter(
+        (s) => s.key !== "provider" && s.key !== "model" && s.type !== "boolean",
+      );
+
+      return (
+        <React.Fragment key={section.id}>
+          {/* Reflection mode and other booleans */}
+          {booleans.map(renderSetting)}
+          {/* Provider/Model override block */}
+          {providerDef && (
+            <div className="p-3 bg-zinc-800/50 rounded-md space-y-3">
+              <div className="flex items-center gap-2">
+                <Sparkles className="w-4 h-4 text-purple-400" />
+                <span className="text-sm font-medium text-zinc-300">AI Provider Override</span>
+                <div className="relative group">
+                  <Info className="w-3.5 h-3.5 text-zinc-500 hover:text-zinc-300 cursor-help" />
+                  <div className="absolute left-0 bottom-full mb-2 w-64 p-3 bg-zinc-800 border border-zinc-600 rounded-lg shadow-lg opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 z-50">
+                    <p className="text-xs text-zinc-300">
+                      Override the default AI provider for this workflow.
+                    </p>
+                  </div>
+                </div>
+              </div>
+              <div className="flex gap-3">
+                <select
+                  value={workflow.provider ?? ""}
+                  onChange={(e) =>
+                    updateWorkflow({ provider: e.target.value || undefined, model: undefined })
+                  }
+                  className="flex-1 px-3 py-2 bg-zinc-700 border border-zinc-600 rounded-md text-zinc-200 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500/50"
+                  data-ui-id="workflow-builder-provider-select"
+                >
+                  {PROVIDER_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+                {workflow.provider && MODELS_BY_PROVIDER[workflow.provider] && (
+                  <select
+                    value={workflow.model ?? ""}
+                    onChange={(e) => updateWorkflow({ model: e.target.value || undefined })}
+                    className="flex-1 px-3 py-2 bg-zinc-700 border border-zinc-600 rounded-md text-zinc-200 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500/50"
+                    data-ui-id="workflow-builder-model-select"
+                  >
+                    {MODELS_BY_PROVIDER[workflow.provider]!.map((opt) => (
+                      <option key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                )}
+              </div>
+            </div>
+          )}
+          {otherCustom.map(renderSetting)}
+        </React.Fragment>
+      );
+    }
+
+    // Default section rendering
+    return <React.Fragment key={section.id}>{section.settings.map(renderSetting)}</React.Fragment>;
+  }
+
+  return (
+    <div className="p-4 border-t border-zinc-700 space-y-4">
+      {visibleSections.map(renderSection)}
     </div>
   );
 }

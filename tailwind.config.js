@@ -3,7 +3,7 @@ import { tailwindColors } from "@qontinui/design-tokens/tailwind";
 
 export default {
   darkMode: ["class"],
-  content: ["./index.html", "./src/**/*.{js,ts,jsx,tsx}"],
+  content: ["./index.html", "./src/**/*.{js,ts,jsx,tsx}", "../qontinui-workflow-ui/src/**/*.{js,ts,tsx}"],
   theme: {
     container: {
       center: true,

@@ -5,7 +5,7 @@
  * Shows quick stats for routing, retries, compression, and hooks.
  */
 
-import { Brain, RefreshCw, Archive, Webhook, Circle } from "lucide-react";
+import { Brain, RefreshCw, Archive, Webhook, Circle, Activity } from "lucide-react";
 import { Badge } from "../../../ui/Badge";
 import { getStatusColors, getAccentColors } from "@/design-system";
 import type { BaseWidgetProps } from "../../../../types/dashboard/widget-props";
@@ -62,6 +62,16 @@ export function ExecutionStatusSummary({ data }: ExecutionStatusSummaryProps) {
 
   // Count active features
   const activeFeatures = [hasRouting, hasRetries, hasCompression, hasHooks].filter(Boolean).length;
+
+  // Empty state: no active workflow
+  if (status.status === "idle" && activeFeatures === 0) {
+    return (
+      <div className="text-center py-2">
+        <Activity className="h-4 w-4 mx-auto mb-1 text-muted-foreground opacity-50" />
+        <span className="text-xs text-muted-foreground">No active workflow</span>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-3">

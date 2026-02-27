@@ -39,10 +39,10 @@ function getStatusIcon(status: SubStepInfo["status"]) {
     case "failed":
       return <XCircle className="w-4 h-4 text-red-500" />;
     case "skipped":
-      return <SkipForward className="w-4 h-4 text-gray-400" />;
+      return <SkipForward className="w-4 h-4 text-muted-foreground" />;
     case "pending":
     default:
-      return <Circle className="w-4 h-4 text-gray-400" />;
+      return <Circle className="w-4 h-4 text-muted-foreground" />;
   }
 }
 
@@ -81,27 +81,27 @@ export function SubStepProgressWidget({
   const runningStep = subSteps.steps.find((s) => s.status === "running");
 
   return (
-    <div className={`bg-gray-800 rounded-lg border border-gray-700 ${className}`}>
+    <div className={`bg-background rounded-lg border border-border ${className}`}>
       {/* Header */}
       <button
         onClick={onToggleExpand}
-        className="w-full flex items-center justify-between p-3 hover:bg-gray-750 transition-colors"
+        className="w-full flex items-center justify-between p-3 hover:bg-muted/50 transition-colors"
       >
         <div className="flex items-center gap-2">
           {isExpanded ? (
-            <ChevronDown className="w-4 h-4 text-gray-400" />
+            <ChevronDown className="w-4 h-4 text-muted-foreground" />
           ) : (
-            <ChevronRight className="w-4 h-4 text-gray-400" />
+            <ChevronRight className="w-4 h-4 text-muted-foreground" />
           )}
-          <span className="text-sm font-medium text-gray-200">Sub-Step Progress</span>
+          <span className="text-sm font-medium text-foreground">Sub-Step Progress</span>
           {subSteps.currentPhase && (
-            <span className="text-xs text-gray-500 px-2 py-0.5 bg-gray-700 rounded">
+            <span className="text-xs text-muted-foreground px-2 py-0.5 bg-muted rounded">
               {getPhaseDisplayName(subSteps.currentPhase)}
             </span>
           )}
         </div>
         <div className="flex items-center gap-2">
-          <span className="text-xs text-gray-400">
+          <span className="text-xs text-muted-foreground">
             {subSteps.completedCount}/{subSteps.totalCount}
           </span>
           {subSteps.isActive && runningStep && (
@@ -127,7 +127,7 @@ export function SubStepProgressWidget({
 
       {/* Expanded content */}
       {isExpanded && hasSteps && (
-        <div className="border-t border-gray-700 max-h-64 overflow-y-auto">
+        <div className="border-t border-border max-h-64 overflow-y-auto">
           <div className="p-2 space-y-1">
             {subSteps.steps.map((step) => (
               <div
@@ -135,23 +135,25 @@ export function SubStepProgressWidget({
                 className={`flex items-center gap-2 p-2 rounded text-sm ${
                   step.status === "running"
                     ? "bg-blue-500/10 border border-blue-500/20"
-                    : "hover:bg-gray-750"
+                    : "hover:bg-muted/50"
                 }`}
               >
                 {getStatusIcon(step.status)}
                 <span
                   className={`flex-1 truncate ${
                     step.status === "completed"
-                      ? "text-gray-400"
+                      ? "text-muted-foreground"
                       : step.status === "running"
-                        ? "text-blue-300"
-                        : "text-gray-500"
+                        ? "text-blue-400"
+                        : "text-muted-foreground/70"
                   }`}
                 >
                   {step.name}
                 </span>
                 {step.durationMs !== null && (
-                  <span className="text-xs text-gray-500">{formatDuration(step.durationMs)}</span>
+                  <span className="text-xs text-muted-foreground">
+                    {formatDuration(step.durationMs)}
+                  </span>
                 )}
               </div>
             ))}
@@ -161,7 +163,7 @@ export function SubStepProgressWidget({
 
       {/* Summary when collapsed */}
       {!isExpanded && completedSteps.length > 0 && !runningStep && (
-        <div className="px-3 pb-2 text-xs text-gray-500">
+        <div className="px-3 pb-2 text-xs text-muted-foreground">
           All {completedSteps.length} steps completed
         </div>
       )}
@@ -185,8 +187,8 @@ export function SubStepProgressSummary({ subSteps }: { subSteps: SubStepStatus_D
     <div className="flex items-center gap-2 text-sm">
       <div className="flex-1 min-w-0">
         <div className="flex items-center justify-between mb-1">
-          <span className="text-xs text-gray-400">Progress</span>
-          <span className="text-xs text-gray-500">
+          <span className="text-xs text-muted-foreground">Progress</span>
+          <span className="text-xs text-muted-foreground">
             {subSteps.completedCount}/{subSteps.totalCount}
           </span>
         </div>

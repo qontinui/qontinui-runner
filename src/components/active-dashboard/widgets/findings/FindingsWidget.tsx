@@ -187,8 +187,7 @@ function EmptyState() {
       </div>
       <h3 className="text-lg font-medium mb-2">No Issues Detected</h3>
       <p className="text-sm text-muted-foreground max-w-xs">
-        AI analysis has not detected any issues. Start a task with AI analysis enabled to scan for
-        problems.
+        No issues have been detected. Findings will appear here as the AI analyzes your workflow.
       </p>
     </div>
   );

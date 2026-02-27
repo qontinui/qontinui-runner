@@ -59,7 +59,6 @@ export function ErrorBadge({ taskRunId, onClick, className }: ErrorBadgeProps) {
       className={cn(
         "flex items-center gap-1.5 px-2 py-1 rounded-full transition-colors",
         getColorClasses(highestSeverity),
-        hasActionable && "animate-pulse",
         onClick && "hover:opacity-80 cursor-pointer",
         className,
       )}

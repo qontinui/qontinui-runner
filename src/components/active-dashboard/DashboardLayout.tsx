@@ -16,7 +16,6 @@ import { WidgetHeader } from "./WidgetHeader";
 import { IdleState } from "./IdleState";
 
 import { useSessionState } from "../../hooks/useSessionState";
-import { useCurrentTaskRunId } from "../../contexts/TaskContext";
 
 // Import hooks directly to call them statically (avoids dynamic hook issues)
 import { useGuiAutomationData } from "./widgets/gui-automation";
@@ -280,10 +279,11 @@ function CopyConversationButton({ entries }: { entries: { line: string }[] }) {
 /**
  * Session state indicator for the AI Conversation widget header.
  * Shows a colored dot with label reflecting the current Claude session state.
+ * Uses unfiltered session state since the Rust executor's task_run_id may
+ * differ from the dashboard's task run ID.
  */
 function SessionStateIndicator() {
-  const taskRunId = useCurrentTaskRunId();
-  const { state, isActive } = useSessionState(taskRunId);
+  const { state, isActive } = useSessionState();
 
   if (!isActive || !state) return null;
 

@@ -868,6 +868,7 @@ function RunnerWorkflowBuilderInner({ children, initialWorkflow }: WorkflowBuild
         health_check_urls: workflow.health_check_urls,
         stages: workflow.stages,
         stop_on_failure: workflow.stop_on_failure,
+        reflection_mode: workflow.reflection_mode,
       };
 
       const url = isNew

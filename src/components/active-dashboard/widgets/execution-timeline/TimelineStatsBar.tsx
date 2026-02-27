@@ -11,7 +11,15 @@
  * data issues from crashing the timeline view.
  */
 
-import { Clock, RotateCcw, Timer, TrendingUp, TrendingDown, Minus } from "lucide-react";
+import {
+  CheckCircle2,
+  Clock,
+  RotateCcw,
+  Timer,
+  TrendingUp,
+  TrendingDown,
+  Minus,
+} from "lucide-react";
 import { cn } from "../../../../lib/utils";
 import { ProgressBar, ProgressErrorBoundary } from "../../../ui";
 import { getStatusColors } from "@/design-system";
@@ -94,6 +102,37 @@ export function TimelineStatsBar({
           </div>
         </div>
 
+        {/* Success Rate */}
+        {stepStats && stepStats.completed > 0 && (
+          <div className="flex items-center gap-2">
+            <CheckCircle2
+              className={cn(
+                "h-4 w-4",
+                stepStats.successRate >= 80
+                  ? successColors.text
+                  : stepStats.successRate >= 50
+                    ? "text-muted-foreground"
+                    : errorColors.text,
+              )}
+            />
+            <div>
+              <p className="text-xs text-muted-foreground">Pass Rate</p>
+              <p
+                className={cn(
+                  "font-mono text-sm",
+                  stepStats.successRate >= 80
+                    ? successColors.text
+                    : stepStats.successRate >= 50
+                      ? "text-foreground"
+                      : errorColors.text,
+                )}
+              >
+                {stepStats.successRate.toFixed(0)}%
+              </p>
+            </div>
+          </div>
+        )}
+
         {/* Current Iteration */}
         {stats.maxIteration > 0 && (
           <div className="flex items-center gap-2">
@@ -138,16 +177,48 @@ export function TimelineStatsBar({
           </div>
         )}
 
-        {/* Show latest verification result if no improvement data yet */}
-        {!stats.improvement && stats.verificationResults.length > 0 && (
+        {/* Verification results breakdown */}
+        {stats.verificationResults.length > 0 && (
           <div className="flex items-center gap-2">
             <TrendingUp className="h-4 w-4 text-muted-foreground" />
             <div>
-              <p className="text-xs text-muted-foreground">Verification</p>
-              <p className="font-mono text-sm text-foreground">
-                {stats.verificationResults[stats.verificationResults.length - 1].passed}/
-                {stats.verificationResults[stats.verificationResults.length - 1].total} passed
+              <p className="text-xs text-muted-foreground">
+                {stats.verificationResults.length === 1 ? "Verification" : "Verification History"}
               </p>
+              {stats.verificationResults.length === 1 ? (
+                <p className="font-mono text-sm text-foreground">
+                  {stats.verificationResults[0].passed}/{stats.verificationResults[0].total} passed
+                  {stats.verificationResults[0].durationMs != null && (
+                    <span className="ml-1 text-muted-foreground text-xs">
+                      in {formatDuration(stats.verificationResults[0].durationMs)}
+                    </span>
+                  )}
+                </p>
+              ) : (
+                <div className="flex items-center gap-1.5">
+                  {stats.verificationResults.map((result) => (
+                    <span
+                      key={result.iteration}
+                      className={cn(
+                        "font-mono text-xs px-1 py-0 rounded",
+                        result.passed === result.total && result.total > 0
+                          ? cn(successColors.text, "bg-green-500/10")
+                          : result.passed === 0
+                            ? cn(errorColors.text, "bg-red-500/10")
+                            : "text-foreground bg-muted/30",
+                      )}
+                      title={`Iteration ${result.iteration}: ${result.passed}/${result.total} passed${result.durationMs ? ` (${formatDuration(result.durationMs)})` : ""}`}
+                    >
+                      {result.passed}/{result.total}
+                      {result.durationMs != null && (
+                        <span className="ml-1 text-muted-foreground text-[10px]">
+                          {formatDuration(result.durationMs)}
+                        </span>
+                      )}
+                    </span>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         )}

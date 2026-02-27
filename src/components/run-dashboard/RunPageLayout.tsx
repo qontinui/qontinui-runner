@@ -5,8 +5,8 @@
  * Provides a consistent header with RunSelector dropdown and page title.
  */
 
-import { ReactNode } from "react";
-import { LucideIcon, Activity, ExternalLink } from "lucide-react";
+import { ReactNode, useState, useCallback } from "react";
+import { LucideIcon, Activity, ExternalLink, RotateCw } from "lucide-react";
 import { RunSelector } from "../run-selection/RunSelector";
 import { useRunSelectionOptional } from "../../contexts/RunSelectionContext";
 import { getStatusColors } from "@/design-system";
@@ -33,14 +33,60 @@ interface RunPageLayoutProps {
   icon: LucideIcon;
   /** Optional badge count */
   badgeCount?: number;
+  /** Navigate to the Active dashboard page */
+  onNavigateToActive?: () => void;
 }
 
 /**
  * RunPageLayout - Wrapper for run subpages with shared RunSelector header
  */
-export function RunPageLayout({ children, title, icon: Icon, badgeCount }: RunPageLayoutProps) {
+const API_BASE = "http://localhost:9876";
+
+export function RunPageLayout({
+  children,
+  title,
+  icon: Icon,
+  badgeCount,
+  onNavigateToActive,
+}: RunPageLayoutProps) {
   const runSelection = useRunSelectionOptional();
   const selectedRun = runSelection?.selectedRun;
+  const [isRerunning, setIsRerunning] = useState(false);
+
+  const handleRerun = useCallback(async () => {
+    if (!selectedRun?.workflow_name || isRerunning) return;
+    setIsRerunning(true);
+    try {
+      // Look up the workflow by name
+      const searchRes = await fetch(
+        `${API_BASE}/unified-workflows/search?q=${encodeURIComponent(selectedRun.workflow_name)}`,
+      );
+      const searchData = await searchRes.json();
+      const workflows = searchData?.data;
+      if (!workflows?.length) {
+        console.error("[Rerun] Workflow not found:", selectedRun.workflow_name);
+        return;
+      }
+      // Find exact name match
+      const workflow =
+        workflows.find(
+          (w: { name: string }) =>
+            w.name.toLowerCase() === selectedRun.workflow_name!.toLowerCase(),
+        ) || workflows[0];
+      // Run the workflow
+      await fetch(`${API_BASE}/unified-workflows/${workflow.id}/run`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ monitor_index: 0 }),
+      });
+      // Navigate to Active page after starting
+      setTimeout(() => onNavigateToActive?.(), 100);
+    } catch (error) {
+      console.error("[Rerun] Failed to rerun workflow:", error);
+    } finally {
+      setIsRerunning(false);
+    }
+  }, [selectedRun, isRerunning, onNavigateToActive]);
 
   // No run selection context available
   if (!runSelection) {
@@ -106,9 +152,22 @@ export function RunPageLayout({ children, title, icon: Icon, badgeCount }: RunPa
             )}
           </div>
 
-          {/* RunSelector dropdown */}
-          <div className="w-72">
-            <RunSelector />
+          {/* RunSelector dropdown + rerun button */}
+          <div className="flex items-center gap-2">
+            <div className="w-96">
+              <RunSelector />
+            </div>
+            {selectedRun && selectedRun.workflow_name && selectedRun.status !== "running" && (
+              <button
+                onClick={handleRerun}
+                disabled={isRerunning}
+                title="Rerun this workflow"
+                className="flex items-center gap-1.5 px-3 py-2 text-sm font-medium bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors whitespace-nowrap"
+              >
+                <RotateCw className={`w-4 h-4 ${isRerunning ? "animate-spin" : ""}`} />
+                {isRerunning ? "Starting..." : "Rerun"}
+              </button>
+            )}
           </div>
         </div>
 

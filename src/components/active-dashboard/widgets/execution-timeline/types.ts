@@ -39,6 +39,20 @@ export type StepType =
   | "unknown";
 
 /**
+ * Detail data for a completed step (command output, exit code, etc.).
+ */
+export interface StepDetail {
+  command?: string;
+  workingDirectory?: string;
+  exitCode?: number;
+  stdout?: string;
+  stderr?: string;
+  output?: string;
+  templateCommand?: string;
+  resolvedVariables?: Record<string, string>;
+}
+
+/**
  * Individual step in the execution timeline.
  */
 export interface TimelineStep {
@@ -70,6 +84,8 @@ export interface TimelineStep {
   error?: string;
   /** Brief output/result preview */
   outputPreview?: string;
+  /** Execution detail (command, stdout, stderr, exit code) */
+  detail?: StepDetail;
   /** Progress marker data (if available) */
   progress?: {
     current: number;

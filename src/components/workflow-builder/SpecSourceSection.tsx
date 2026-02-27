@@ -23,6 +23,7 @@ import {
 import { buildSpecPrompt, type DiscoveredSpec, type SpecGroup } from "@/lib/spec-prompt-builder";
 import { parseDiscoveredSpecs, unwrapSpecResponse } from "@/lib/ui-bridge/spec-parser";
 import { getAllSpecs } from "@/lib/spec-registry";
+import { listen } from "@tauri-apps/api/event";
 
 const API_BASE = "http://localhost:9876";
 
@@ -155,85 +156,110 @@ export function SpecSourceSection({ onSpecsChanged }: SpecSourceSectionProps) {
     };
   }, []);
 
-  // Load bundled specs on mount, overlay persisted selection state
+  // Load bundled specs on mount, overlay persisted selection state and cached specs
   useEffect(() => {
-    // Start with all bundled specs
-    const bundled = getAllSpecs();
-    const specMap = new Map(bundled.map((s) => [s.specId, s]));
+    async function loadSpecs() {
+      // Start with all bundled specs
+      const bundled = getAllSpecs();
+      const specMap = new Map(bundled.map((s) => [s.specId, s]));
 
-    // Merge any additional specs from localStorage (e.g. from external apps)
-    let persistedSelectedIds: string[] | null = null;
-    let persistedPages: DiscoveredPage[] = [];
-    let persistedPageUrls: string[] = [];
-    try {
-      const stored = localStorage.getItem(STORAGE_KEY);
-      if (stored) {
-        const parsed: PersistedSpecState = JSON.parse(stored);
-        persistedSelectedIds = parsed.selectedGroupIds ?? null;
-        persistedPages = parsed.discoveredPages ?? [];
-        persistedPageUrls = parsed.selectedPageUrls ?? [];
-        if (parsed.discoveredSpecs?.length > 0) {
-          const filtered = filterSelectedGroups(parsed.discoveredSpecs);
-          for (const spec of filtered) {
-            if (!specMap.has(spec.specId)) {
-              specMap.set(spec.specId, spec);
+      // Merge any additional specs from localStorage (e.g. from external apps)
+      let persistedSelectedIds: string[] | null = null;
+      let persistedPages: DiscoveredPage[] = [];
+      let persistedPageUrls: string[] = [];
+      try {
+        const stored = localStorage.getItem(STORAGE_KEY);
+        if (stored) {
+          const parsed: PersistedSpecState = JSON.parse(stored);
+          persistedSelectedIds = parsed.selectedGroupIds ?? null;
+          persistedPages = parsed.discoveredPages ?? [];
+          persistedPageUrls = parsed.selectedPageUrls ?? [];
+          if (parsed.discoveredSpecs?.length > 0) {
+            const filtered = filterSelectedGroups(parsed.discoveredSpecs);
+            for (const spec of filtered) {
+              if (!specMap.has(spec.specId)) {
+                specMap.set(spec.specId, spec);
+              }
+            }
+          }
+          if (parsed.sdkUrl) {
+            setSdkUrl(parsed.sdkUrl);
+          }
+        }
+      } catch {
+        // Ignore parse errors
+      }
+
+      // Merge cached specs from the runner database
+      try {
+        const resp = await fetch(`${API_BASE}/ui-bridge/sdk/cached-specs`);
+        const json = await resp.json();
+        if (json.success && Array.isArray(json.data)) {
+          for (const cached of json.data) {
+            const specId = `ext:${cached.app_name}:${cached.spec_id}`;
+            if (!specMap.has(specId)) {
+              try {
+                const config = JSON.parse(cached.spec_json);
+                specMap.set(specId, { specId, config, appName: cached.app_name || undefined });
+              } catch {
+                // Skip malformed spec JSON
+              }
             }
           }
         }
-        if (parsed.sdkUrl) {
-          setSdkUrl(parsed.sdkUrl);
+      } catch {
+        // Runner not available — ignore
+      }
+
+      const allSpecs = Array.from(specMap.values());
+
+      // Build selected IDs
+      const selectedIds = new Set<string>();
+
+      // Check if bundled specs version changed
+      let storedVersion = 0;
+      try {
+        const stored = localStorage.getItem(STORAGE_KEY);
+        if (stored) {
+          storedVersion = JSON.parse(stored).bundledSpecVersion ?? 0;
         }
+      } catch {
+        // ignore
       }
-    } catch {
-      // Ignore parse errors
-    }
 
-    const allSpecs = Array.from(specMap.values());
+      const versionChanged = storedVersion !== BUNDLED_SPEC_VERSION;
 
-    // Build selected IDs
-    const selectedIds = new Set<string>();
-
-    // Check if bundled specs version changed
-    let storedVersion = 0;
-    try {
-      const stored = localStorage.getItem(STORAGE_KEY);
-      if (stored) {
-        storedVersion = JSON.parse(stored).bundledSpecVersion ?? 0;
-      }
-    } catch {
-      // ignore
-    }
-
-    const versionChanged = storedVersion !== BUNDLED_SPEC_VERSION;
-
-    if (versionChanged || persistedSelectedIds === null) {
-      for (const spec of allSpecs) {
-        for (const group of spec.config?.groups ?? []) {
-          selectedIds.add(group.id);
-        }
-      }
-    } else {
-      const persistedSet = new Set(persistedSelectedIds);
-      for (const spec of allSpecs) {
-        for (const group of spec.config?.groups ?? []) {
-          if (persistedSet.has(group.id)) {
+      if (versionChanged || persistedSelectedIds === null) {
+        for (const spec of allSpecs) {
+          for (const group of spec.config?.groups ?? []) {
             selectedIds.add(group.id);
           }
         }
+      } else {
+        const persistedSet = new Set(persistedSelectedIds);
+        for (const spec of allSpecs) {
+          for (const group of spec.config?.groups ?? []) {
+            if (persistedSet.has(group.id)) {
+              selectedIds.add(group.id);
+            }
+          }
+        }
       }
+
+      const pages = persistedPages;
+      const pageUrls = new Set(persistedPageUrls);
+
+      setDiscoveredSpecs(allSpecs);
+      setSelectedGroupIds(selectedIds);
+      setDiscoveredPages(pages);
+      setSelectedPageUrls(pageUrls);
+      if (allSpecs.length > 0) {
+        setIsOpen(true);
+      }
+      onSpecsChangedRef.current(buildState(allSpecs, selectedIds, pages, pageUrls));
     }
 
-    const pages = persistedPages;
-    const pageUrls = new Set(persistedPageUrls);
-
-    setDiscoveredSpecs(allSpecs);
-    setSelectedGroupIds(selectedIds);
-    setDiscoveredPages(pages);
-    setSelectedPageUrls(pageUrls);
-    if (allSpecs.length > 0) {
-      setIsOpen(true);
-    }
-    onSpecsChangedRef.current(buildState(allSpecs, selectedIds, pages, pageUrls));
+    loadSpecs();
   }, [buildState]);
 
   // Persist state changes
@@ -248,6 +274,47 @@ export function SpecSourceSection({ onSpecsChanged }: SpecSourceSectionProps) {
     };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(toSave));
   }, [sdkUrl, discoveredSpecs, selectedGroupIds, discoveredPages, selectedPageUrls]);
+
+  // Listen for auto-discovered specs from the runner (Tauri event)
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+
+    listen<{ app_url: string; app_name: string; spec_count: number }>(
+      "specs-discovered",
+      async () => {
+        // Refresh cached specs from runner
+        try {
+          const resp = await fetch(`${API_BASE}/ui-bridge/sdk/cached-specs`);
+          const json = await resp.json();
+          if (json.success && Array.isArray(json.data)) {
+            setDiscoveredSpecs((prev) => {
+              const specMap = new Map(prev.map((s) => [s.specId, s]));
+              for (const cached of json.data) {
+                const specId = `ext:${cached.app_name}:${cached.spec_id}`;
+                if (!specMap.has(specId)) {
+                  try {
+                    const config = JSON.parse(cached.spec_json);
+                    specMap.set(specId, { specId, config, appName: cached.app_name || undefined });
+                  } catch {
+                    // skip
+                  }
+                }
+              }
+              return Array.from(specMap.values());
+            });
+          }
+        } catch {
+          // Runner not available
+        }
+      },
+    ).then((fn) => {
+      unlisten = fn;
+    });
+
+    return () => {
+      unlisten?.();
+    };
+  }, []);
 
   // Notify parent when selection changes
   const notifyParent = useCallback(
@@ -343,14 +410,16 @@ export function SpecSourceSection({ onSpecsChanged }: SpecSourceSectionProps) {
       const allSpecs = parseDiscoveredSpecs(rawSpecs);
       const semanticSpecs = filterSelectedGroups(allSpecs);
       if (semanticSpecs.length === 0) return;
-      mergeSpecs(semanticSpecs);
+      const appLabel = connectedAppName || undefined;
+      const tagged = semanticSpecs.map((s) => ({ ...s, appName: appLabel }));
+      mergeSpecs(tagged);
       setIsOpen(true);
     } catch {
       // Discovery failed
     } finally {
       setIsDiscovering(false);
     }
-  }, [isConnected, mergeSpecs]);
+  }, [isConnected, connectedAppName, mergeSpecs]);
 
   // Discover all pages via crawl, then get specs for each
   const handleDiscoverAllPages = useCallback(async () => {
@@ -423,7 +492,8 @@ export function SpecSourceSection({ onSpecsChanged }: SpecSourceSectionProps) {
           newPageUrls.add(pathname);
 
           if (semanticSpecs.length > 0) {
-            newSpecs.push(...semanticSpecs);
+            const appLabel = connectedAppName || undefined;
+            newSpecs.push(...semanticSpecs.map((s) => ({ ...s, appName: appLabel })));
           }
         } catch {
           // Skip pages that fail
@@ -467,7 +537,7 @@ export function SpecSourceSection({ onSpecsChanged }: SpecSourceSectionProps) {
     } finally {
       setIsCrawling(false);
     }
-  }, [isConnected, sdkUrl, discoveredSpecs, selectedGroupIds, notifyParent]);
+  }, [isConnected, sdkUrl, connectedAppName, discoveredSpecs, selectedGroupIds, notifyParent]);
 
   // Manual connect
   const handleManualConnect = useCallback(async () => {
@@ -579,13 +649,17 @@ export function SpecSourceSection({ onSpecsChanged }: SpecSourceSectionProps) {
 
   // Group specs by page URL for hierarchical display
   const specsByPage = useMemo(() => {
-    const map = new Map<string, { spec: DiscoveredSpec; groups: SpecGroup[] }>();
+    const map = new Map<string, { spec: DiscoveredSpec; groups: SpecGroup[]; appName?: string }>();
     for (const spec of discoveredSpecs) {
       const pageUrl = getSpecPageUrl(spec);
       if (!map.has(pageUrl)) {
-        map.set(pageUrl, { spec, groups: [] });
+        map.set(pageUrl, { spec, groups: [], appName: spec.appName });
       }
       const entry = map.get(pageUrl)!;
+      // Use the first non-empty appName found for this page
+      if (!entry.appName && spec.appName) {
+        entry.appName = spec.appName;
+      }
       for (const group of spec.config?.groups ?? []) {
         entry.groups.push(group);
       }
@@ -760,7 +834,7 @@ export function SpecSourceSection({ onSpecsChanged }: SpecSourceSectionProps) {
 
               {/* Hierarchical page → groups display */}
               <div className="max-h-[320px] overflow-y-auto space-y-1 pr-1">
-                {Array.from(specsByPage.entries()).map(([pageUrl, { groups }]) => {
+                {Array.from(specsByPage.entries()).map(([pageUrl, { groups, appName }]) => {
                   const checkState = getPageCheckState(pageUrl);
                   const isCollapsed = collapsedPages.has(pageUrl);
                   return (
@@ -789,7 +863,12 @@ export function SpecSourceSection({ onSpecsChanged }: SpecSourceSectionProps) {
                         <span className="text-xs text-zinc-300 font-medium flex-1 truncate">
                           {pageUrl}
                         </span>
-                        <span className="text-[10px] text-zinc-500">
+                        {appName && (
+                          <span className="text-[10px] px-1.5 py-0 rounded border border-zinc-600 text-zinc-500 shrink-0">
+                            {appName}
+                          </span>
+                        )}
+                        <span className="text-[10px] text-zinc-500 shrink-0">
                           {groups.length} group{groups.length !== 1 ? "s" : ""}
                         </span>
                       </div>

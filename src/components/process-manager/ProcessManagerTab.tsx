@@ -19,6 +19,8 @@ import {
 import { ProcessStatusBadge } from "./ProcessStatusBadge";
 import { ProcessOutputViewer } from "./ProcessOutputViewer";
 import { ProcessConfigEditor } from "./ProcessConfigEditor";
+import { AiFixPanel } from "./AiFixPanel";
+import { useChatSession } from "../../hooks/useChatSession";
 
 interface ProcessStatus {
   id: string;
@@ -56,6 +58,12 @@ function formatUptime(secs: number | null): string {
   return `${h}h ${m}m`;
 }
 
+interface OutputLine {
+  timestamp: string;
+  stream: "stdout" | "stderr";
+  line: string;
+}
+
 export function ProcessManagerTab() {
   const [processes, setProcesses] = useState<ProcessStatus[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -63,6 +71,21 @@ export function ProcessManagerTab() {
   const [editConfig, setEditConfig] = useState<ProcessConfig | undefined>();
   const [loading, setLoading] = useState(true);
   const unlistenRef = useRef<UnlistenFn | null>(null);
+
+  // AI Fix session state
+  const [aiFixActive, setAiFixActive] = useState(false);
+  const [aiFixProcessId, setAiFixProcessId] = useState<string | null>(null);
+  const aiFixAbortRef = useRef(false);
+  const {
+    sessionState: aiSessionState,
+    messages: aiMessages,
+    streamingContent: aiStreamingContent,
+    createSession: aiCreateSession,
+    sendMessage: aiSendMessage,
+    interrupt: aiInterrupt,
+    close: aiClose,
+    resetSession: aiResetSession,
+  } = useChatSession();
 
   // Load processes
   const loadProcesses = useCallback(async () => {
@@ -164,6 +187,126 @@ export function ProcessManagerTab() {
     setEditConfig(undefined);
     loadProcesses();
   }, [loadProcesses]);
+
+  // Close AI fix session
+  const closeAiFix = useCallback(() => {
+    aiFixAbortRef.current = true;
+    aiClose();
+    aiResetSession();
+    setAiFixActive(false);
+    setAiFixProcessId(null);
+  }, [aiClose, aiResetSession]);
+
+  // Handle "Fix with AI" button click
+  const handleFixWithAi = useCallback(
+    async (processId: string, processName: string) => {
+      if (aiFixActive) return;
+
+      setAiFixActive(true);
+      setAiFixProcessId(processId);
+      aiFixAbortRef.current = false;
+
+      try {
+        // Close any lingering session from hook's localStorage restore
+        aiResetSession();
+
+        // Fetch recent output and process configs in parallel
+        const [outputLines, configs] = await Promise.all([
+          invoke<OutputLine[]>("get_process_output", {
+            id: processId,
+            tail: 200,
+          }),
+          invoke<ProcessConfig[]>("get_process_configs"),
+        ]);
+
+        const config = configs.find((c) => c.id === processId);
+
+        // Extract stderr lines for error context
+        const stderrLines = outputLines.filter((l) => l.stream === "stderr").map((l) => l.line);
+
+        // Fall back to last 50 lines if no stderr
+        const errorContext =
+          stderrLines.length > 0
+            ? stderrLines.join("\n")
+            : outputLines
+                .slice(-50)
+                .map((l) => l.line)
+                .join("\n");
+
+        // Build the prompt
+        const commandStr = config ? `${config.command} ${config.args.join(" ")}`.trim() : "unknown";
+        const cwdStr = config?.cwd || "unknown";
+
+        const prompt = `You are debugging errors from a process called "${processName}".
+
+## Process Configuration
+- Command: ${commandStr}
+- Working Directory: ${cwdStr}
+
+## Recent Error Output
+\`\`\`
+${errorContext}
+\`\`\`
+
+Analyze the errors, identify root causes, and suggest specific fixes.
+Be concise and actionable.`;
+
+        // Create AI session
+        const sessionId = await aiCreateSession(`Fix: ${processName}`);
+        if (!sessionId) {
+          throw new Error("Failed to create AI session");
+        }
+
+        // Poll backend directly for ready state, then send the prompt.
+        // This avoids React state/closure races with the hook's useEffect.
+        for (let i = 0; i < 40; i++) {
+          if (aiFixAbortRef.current) return;
+          await new Promise((r) => setTimeout(r, 250));
+          if (aiFixAbortRef.current) return;
+          const resp = await invoke<{ success: boolean; data?: Record<string, unknown> }>(
+            "get_ai_session_state",
+            { taskRunId: sessionId },
+          );
+          const state = resp.data?.state as string | undefined;
+          if (state === "ready") {
+            // Send directly via Tauri command — bypasses stale closure issues
+            await invoke("send_user_message", {
+              taskRunId: sessionId,
+              message: prompt,
+            });
+            return;
+          }
+          if (state === "closed" || state === "not_found") {
+            throw new Error(`Session reached unexpected state: ${state}`);
+          }
+        }
+        throw new Error("Timed out waiting for AI session to be ready");
+      } catch (e) {
+        console.error("[ProcessManager] Failed to start AI fix:", e);
+        setAiFixActive(false);
+        setAiFixProcessId(null);
+      }
+    },
+    [aiFixActive, aiCreateSession, aiResetSession],
+  );
+
+  // Close AI session when switching selected process
+  const prevSelectedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (prevSelectedRef.current !== null && selectedId !== prevSelectedRef.current && aiFixActive) {
+      closeAiFix();
+    }
+    prevSelectedRef.current = selectedId;
+  }, [selectedId, aiFixActive, closeAiFix]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (aiFixActive) {
+        aiClose();
+      }
+    };
+  }, [aiFixActive, aiClose]);
 
   const isRunning = (state: string) =>
     ["starting", "running", "healthy", "stopping"].includes(state);
@@ -301,14 +444,31 @@ export function ProcessManagerTab() {
           )}
         </div>
 
-        {/* Output viewer */}
-        <div className="flex-1 min-w-0 relative">
+        {/* Output viewer + AI Fix panel */}
+        <div className="flex-1 min-w-0 relative flex flex-col">
           {selected ? (
-            <ProcessOutputViewer
-              processId={selected.id}
-              processName={selected.name}
-              className="h-full"
-            />
+            <>
+              <ProcessOutputViewer
+                processId={selected.id}
+                processName={selected.name}
+                processState={selected.state}
+                errorCount={selected.error_count}
+                onFixWithAi={() => handleFixWithAi(selected.id, selected.name)}
+                isFixActive={aiFixActive}
+                className={aiFixActive && aiFixProcessId === selected.id ? "h-1/2" : "h-full"}
+              />
+              {aiFixActive && aiFixProcessId === selected.id && (
+                <AiFixPanel
+                  messages={aiMessages}
+                  streamingContent={aiStreamingContent}
+                  sessionState={aiSessionState}
+                  processName={selected.name}
+                  onSendFollowUp={aiSendMessage}
+                  onInterrupt={aiInterrupt}
+                  onClose={closeAiFix}
+                />
+              )}
+            </>
           ) : (
             <div className="flex items-center justify-center h-full text-zinc-600 text-sm">
               Select a process to view its output

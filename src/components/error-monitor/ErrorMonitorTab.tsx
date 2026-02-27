@@ -432,6 +432,10 @@ export function ErrorMonitorTab({
             <SeverityBadge severity="critical" count={summary.criticalCount || 0} />
             <SeverityBadge severity="error" count={summary.errorCount || 0} />
             <SeverityBadge severity="warning" count={summary.warningCount || 0} />
+            <span className="text-xs text-muted-foreground ml-1">
+              Errors resolved by workflows are cleared automatically. Only errors the model could
+              not resolve should appear here.
+            </span>
           </div>
         )}
       </div>

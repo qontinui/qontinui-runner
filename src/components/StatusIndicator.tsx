@@ -32,7 +32,6 @@ interface ErrorEvent {
 
 interface StatusIndicatorProps {
   pythonStatus: "stopped" | "running";
-  configLoaded: boolean;
   executionActive: boolean;
   backgroundActivities?: BackgroundActivity[];
 }
@@ -63,7 +62,6 @@ const getActivityColor = (type: ActivityType) => {
 
 const StatusIndicator: React.FC<StatusIndicatorProps> = ({
   pythonStatus,
-  configLoaded,
   executionActive,
   backgroundActivities = [],
 }) => {
@@ -202,19 +200,6 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
             </span>
           </div>
         )}
-
-        <div className="flex items-center gap-2">
-          <div
-            className={`w-2 h-2 rounded-full ${configLoaded ? getAccentColors("green").bgSolid : "bg-muted-foreground"}`}
-          />
-          <span
-            data-content-role="status"
-            data-content-label="config status"
-            className="text-sm text-text-muted"
-          >
-            Config: {configLoaded ? "Loaded" : "Not Loaded"}
-          </span>
-        </div>
 
         {/* Error Badge - Navigate to Error Monitor on click */}
         <ErrorBadge

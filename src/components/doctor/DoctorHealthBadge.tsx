@@ -42,6 +42,11 @@ export function DoctorHealthBadge({ className }: DoctorHealthBadgeProps) {
     [dismiss],
   );
 
+  const formatTime = useCallback((timestamp: number) => {
+    const date = new Date(timestamp);
+    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  }, []);
+
   // Don't render if all processes are healthy
   if (unhealthyCount === 0) return null;
 
@@ -155,7 +160,12 @@ export function DoctorHealthBadge({ className }: DoctorHealthBadgeProps) {
                     </p>
                   )}
                   <div className="mt-1 flex items-center justify-between">
-                    <p className="text-xs text-muted-foreground/60">PID: {proc.pid}</p>
+                    <div className="flex items-center gap-2">
+                      <p className="text-xs text-muted-foreground/60">PID: {proc.pid}</p>
+                      <span className="text-xs text-muted-foreground/60">
+                        {formatTime(proc.lastUpdated)}
+                      </span>
+                    </div>
                     {proc.status === "stuck" && (
                       <button
                         onClick={(e) => {

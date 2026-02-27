@@ -6,7 +6,7 @@
  * Progress bar is wrapped with error boundary to prevent crashes.
  */
 
-import { Loader2, CheckCircle2, XCircle, Clock } from "lucide-react";
+import { Loader2, CheckCircle2, XCircle, Clock, AlertTriangle } from "lucide-react";
 import { cn } from "../../../../lib/utils";
 import { Badge, ProgressBar, ProgressErrorBoundary } from "../../../ui";
 import { getAccentColors, getStatusColors } from "@/design-system";
@@ -56,7 +56,7 @@ function PhaseProgress({
  * Summary component for execution timeline.
  */
 export function ExecutionTimelineSummary({ data, className }: ExecutionTimelineSummaryProps) {
-  const { phaseGroups, stepStats, currentPhase, currentStep, isLoading } = data;
+  const { phaseGroups, stepStats, currentPhase, currentStep, isLoading, error, taskRunId } = data;
   const successColors = getStatusColors("success");
   const errorColors = getStatusColors("error");
 
@@ -68,7 +68,27 @@ export function ExecutionTimelineSummary({ data, className }: ExecutionTimelineS
     );
   }
 
-  // No steps yet
+  // Error state
+  if (error) {
+    return (
+      <div className={cn("text-center py-2", className)}>
+        <AlertTriangle className="h-4 w-4 mx-auto mb-1 text-destructive" />
+        <span className="text-xs text-destructive">Failed to load data</span>
+      </div>
+    );
+  }
+
+  // No active workflow
+  if (!taskRunId && stepStats.total === 0) {
+    return (
+      <div className={cn("text-center py-2", className)}>
+        <Clock className="h-4 w-4 mx-auto mb-1 text-muted-foreground opacity-50" />
+        <span className="text-xs text-muted-foreground">No active workflow</span>
+      </div>
+    );
+  }
+
+  // Workflow running but no steps yet
   if (stepStats.total === 0) {
     return (
       <div className={cn("text-center py-2", className)}>

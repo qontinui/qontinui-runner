@@ -3,39 +3,16 @@ import { invoke } from "@tauri-apps/api/core";
 import { StepIndicator } from "./StepIndicator";
 import { WelcomeStep } from "./WelcomeStep";
 import { ProjectStep } from "./ProjectStep";
-import { LogSourcesStep } from "./LogSourcesStep";
 import { ProcessStep } from "./ProcessStep";
 import { AiProviderStep } from "./AiProviderStep";
 
-const STEPS = ["Welcome", "Projects", "Log Sources", "Processes", "AI Provider"];
+const STEPS = ["Welcome", "Projects", "Processes", "AI Provider"];
 
 interface Project {
   path: string;
   name: string;
   type: string;
   manifest: string;
-}
-
-interface LogSource {
-  id: string;
-  name: string;
-  description: string;
-  category: string;
-  type: string;
-  path: string;
-  pattern: string | null;
-  format: string;
-  parser: string;
-  enabled: boolean;
-  keywords: string[];
-  error_patterns: string[];
-  warning_patterns: string[];
-  tail_lines: number;
-  color: string | null;
-  timestamp_pattern: string | null;
-  timezone: string;
-  ignore_patterns: string[];
-  poll_interval_ms: number;
 }
 
 interface ProcessConfig {
@@ -59,9 +36,8 @@ interface SetupWizardProps {
 
 export function SetupWizard({ onComplete }: SetupWizardProps) {
   const [currentStep, setCurrentStep] = useState(0);
-  const [workspacePath, setWorkspacePath] = useState("");
+  const [, setWorkspacePath] = useState("");
   const [selectedProjects, setSelectedProjects] = useState<Project[]>([]);
-  const [selectedSources, setSelectedSources] = useState<LogSource[]>([]);
   const [selectedProcessConfigs, setSelectedProcessConfigs] = useState<ProcessConfig[]>([]);
 
   const goNext = useCallback(() => {
@@ -75,18 +51,9 @@ export function SetupWizard({ onComplete }: SetupWizardProps) {
   const finishSetup = useCallback(
     async (aiConfig: { provider: string } | null) => {
       try {
-        // Save selected log sources
-        if (selectedSources.length > 0) {
-          await invoke("save_log_sources_from_setup", {
-            sources: selectedSources,
-          });
-        }
-
         // Save process configs
-        if (selectedProcessConfigs.length > 0) {
-          for (const config of selectedProcessConfigs) {
-            await invoke("save_process_config", { config });
-          }
+        for (const config of selectedProcessConfigs) {
+          await invoke("save_process_config", { config });
         }
 
         // Mark setup as completed
@@ -103,7 +70,7 @@ export function SetupWizard({ onComplete }: SetupWizardProps) {
         onComplete();
       }
     },
-    [selectedSources, selectedProcessConfigs, onComplete],
+    [selectedProcessConfigs, onComplete],
   );
 
   return (
@@ -124,17 +91,6 @@ export function SetupWizard({ onComplete }: SetupWizardProps) {
         )}
 
         {currentStep === 2 && (
-          <LogSourcesStep
-            workspacePath={workspacePath}
-            selectedProjects={selectedProjects}
-            selectedSources={selectedSources}
-            onSourcesChange={setSelectedSources}
-            onNext={goNext}
-            onBack={goBack}
-          />
-        )}
-
-        {currentStep === 3 && (
           <ProcessStep
             selectedProjects={selectedProjects}
             selectedConfigs={selectedProcessConfigs}
@@ -144,7 +100,7 @@ export function SetupWizard({ onComplete }: SetupWizardProps) {
           />
         )}
 
-        {currentStep === 4 && <AiProviderStep onComplete={finishSetup} onBack={goBack} />}
+        {currentStep === 3 && <AiProviderStep onComplete={finishSetup} onBack={goBack} />}
       </div>
     </div>
   );
