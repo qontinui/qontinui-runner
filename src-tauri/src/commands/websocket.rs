@@ -42,6 +42,16 @@ pub fn configure_websocket(
     config: WebSocketConfig,
     state: State<Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
+    let settings = crate::settings::load_settings();
+    if settings.cloud_relay.enabled && settings.cloud_relay.auto_connect {
+        info!("Cloud relay handles backend connection, skipping Python WebSocket configuration");
+        return Ok(CommandResponse {
+            success: true,
+            message: Some("Connection handled by cloud relay".to_string()),
+            data: None,
+        });
+    }
+
     info!(
         "Configuring WebSocket: enabled={}, url={}, runner_name={:?}",
         config.enabled, config.url, config.runner_name
@@ -81,6 +91,16 @@ pub fn configure_websocket(
 /// * `Err(String)` - Error if executor not running or connection fails
 #[tauri::command]
 pub fn connect_websocket(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
+    let settings = crate::settings::load_settings();
+    if settings.cloud_relay.enabled && settings.cloud_relay.auto_connect {
+        info!("Cloud relay handles backend connection, skipping Python WebSocket connect");
+        return Ok(CommandResponse {
+            success: true,
+            message: Some("Connection handled by cloud relay".to_string()),
+            data: None,
+        });
+    }
+
     info!("Connecting WebSocket");
 
     with_default_bridge(&state, |bridge| {
@@ -109,6 +129,16 @@ pub fn connect_websocket(state: State<Arc<AppState>>) -> Result<CommandResponse,
 /// * `Err(String)` - Error if executor not running or disconnection fails
 #[tauri::command]
 pub fn disconnect_websocket(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
+    let settings = crate::settings::load_settings();
+    if settings.cloud_relay.enabled && settings.cloud_relay.auto_connect {
+        info!("Cloud relay handles backend connection, skipping Python WebSocket disconnect");
+        return Ok(CommandResponse {
+            success: true,
+            message: Some("Connection handled by cloud relay".to_string()),
+            data: None,
+        });
+    }
+
     info!("Disconnecting WebSocket");
 
     with_default_bridge(&state, |bridge| {

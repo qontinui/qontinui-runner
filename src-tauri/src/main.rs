@@ -37,6 +37,7 @@ mod execution_context;
 mod execution_core;
 mod executor;
 mod findings;
+mod follow_up;
 mod health_monitor;
 mod iteration_bundle;
 mod log_consolidation;
@@ -293,9 +294,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .manage(checkpoint_db.clone()) // For error_monitor commands that need direct db access
         .invoke_handler(tauri::generate_handler![
             // Interactive AI chat commands (send messages, interrupt, query state)
+            commands::ai_chat::list_chat_sessions,
             commands::ai_chat::send_user_message,
             commands::ai_chat::interrupt_ai_session,
             commands::ai_chat::get_ai_session_state,
+            commands::ai_chat::create_chat_session,
+            commands::ai_chat::close_chat_session,
+            commands::ai_chat::rename_chat_session,
+            commands::ai_chat::get_chat_output,
+            commands::ai_chat::generate_workflow_from_chat,
             // Authentication commands
             commands::auth::login,
             commands::auth::logout,
@@ -902,67 +909,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Seed default log sources if none configured
             settings::seed_default_log_sources_if_empty();
 
-            // Position window at top-center of screen and maximize height
-            if let Some(window) = app.get_webview_window("main") {
-                if let Ok(monitor) = window.current_monitor() {
-                    if let Some(monitor) = monitor {
-                        let monitor_size = monitor.size();
-                        let monitor_pos = monitor.position();
-                        let scale_factor = monitor.scale_factor();
-
-                        if let Ok(window_size) = window.outer_size() {
-                            // Calculate optimal height: use most of screen with margins
-                            // Top margin: 20px, Bottom margin: 60px (for taskbar)
-                            let top_margin: u32 = 20;
-                            let bottom_margin: u32 = 60;
-                            let total_margin = top_margin + bottom_margin;
-
-                            // Calculate new height (leave room for margins)
-                            let new_height = if monitor_size.height > total_margin {
-                                monitor_size.height - total_margin
-                            } else {
-                                monitor_size.height
-                            };
-
-                            // Keep width the same, maximize height
-                            let new_width = window_size.width;
-
-                            // Set the new window size
-                            if let Err(e) = window.set_size(tauri::Size::Physical(
-                                tauri::PhysicalSize {
-                                    width: new_width,
-                                    height: new_height,
-                                },
-                            )) {
-                                error!("Failed to set window size: {}", e);
-                            } else {
-                                info!(
-                                    "Window resized to {}x{} (monitor: {}x{}, scale: {:.2})",
-                                    new_width, new_height, monitor_size.width, monitor_size.height, scale_factor
-                                );
-                            }
-
-                            // Calculate center X position using new width
-                            let x = monitor_pos.x
-                                + ((monitor_size.width as i32 - new_width as i32) / 2);
-                            // Position at top (with small margin)
-                            let y = monitor_pos.y + top_margin as i32;
-
-                            if let Err(e) = window.set_position(tauri::Position::Physical(
-                                tauri::PhysicalPosition { x, y },
-                            )) {
-                                error!("Failed to set window position: {}", e);
-                            } else {
-                                info!("Window positioned at top-center: x={}, y={}", x, y);
-                            }
-                        }
-                    }
-                } else {
-                    error!("Failed to get current monitor");
-                }
-            } else {
-                error!("Failed to get main window");
-            }
+            // Window starts maximized via tauri.conf.json
 
             // Initialize bridge manager for multi-bridge support
             // This replaces the legacy single python_bridge with a manager that can handle
@@ -1130,14 +1077,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 database::embedding_jobs::EmbeddingJobConfig::default(),
             );
 
-            // Auto-start cloud relay if configured
-            {
-                let relay_settings = crate::settings::load_settings().cloud_relay;
-                if relay_settings.enabled && relay_settings.auto_connect {
-                    info!("Cloud relay enabled and auto-connect configured, but auth token not yet available at startup");
-                    // The relay will be started via the start_cloud_relay Tauri command after user authentication
-                }
-            }
+            // Cloud relay auto-start is handled in mcp_api.rs where ApiState is available
 
             info!("Tauri application setup complete");
             Ok(())

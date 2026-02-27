@@ -278,15 +278,375 @@ pub fn save_ai_provider_from_setup(
 // Process Config Suggestions
 // ============================================================================
 
+/// Build a process config JSON value.
+fn build_process_config(
+    name: &str,
+    framework_label: &str,
+    command: &str,
+    args: &[&str],
+    cwd: &str,
+    health_port: Option<u16>,
+    parser: &str,
+    category: &str,
+) -> Value {
+    let mut config = serde_json::json!({
+        "id": Uuid::new_v4().to_string(),
+        "name": format!("{} ({})", name, framework_label),
+        "command": command,
+        "args": args,
+        "cwd": cwd,
+        "parser": parser,
+        "category": category,
+        "auto_start": false,
+        "enabled": true,
+        "buffer_size": 2000,
+    });
+    if let Some(port) = health_port {
+        config["health_port"] = serde_json::json!(port);
+    }
+    config
+}
+
+/// Detect the specific framework by inspecting manifest files.
+///
+/// Returns a framework key like "nextjs", "fastapi", "vite", etc.
+/// Falls back to a generic key like "node_dev" or empty string.
+fn detect_framework(path: &str, generic_type: &str) -> String {
+    let dir = std::path::Path::new(path);
+
+    match generic_type {
+        "node" => {
+            let pkg_path = dir.join("package.json");
+            if let Ok(contents) = std::fs::read_to_string(&pkg_path) {
+                if let Ok(pkg) = serde_json::from_str::<Value>(&contents) {
+                    let has_dep = |name: &str| -> bool {
+                        pkg.get("dependencies").and_then(|d| d.get(name)).is_some()
+                            || pkg
+                                .get("devDependencies")
+                                .and_then(|d| d.get(name))
+                                .is_some()
+                    };
+
+                    // Check for specific frameworks (order matters)
+                    if has_dep("next") {
+                        return "nextjs".to_string();
+                    }
+                    if has_dep("@docusaurus/core") {
+                        return "docusaurus".to_string();
+                    }
+                    if has_dep("expo") || has_dep("react-native") {
+                        return "react_native".to_string();
+                    }
+                    if has_dep("express") {
+                        return "express".to_string();
+                    }
+                    if has_dep("@nestjs/core") {
+                        return "nestjs".to_string();
+                    }
+                    if has_dep("vite") {
+                        return "vite".to_string();
+                    }
+
+                    // Check for runnable scripts (dev or start)
+                    if let Some(scripts) = pkg.get("scripts").and_then(|s| s.as_object()) {
+                        // Skip pure build/library packages
+                        let is_build_only = |script: &str| -> bool {
+                            let s = script.to_lowercase();
+                            s.contains("tsup")
+                                || s.contains("tsc")
+                                || s.contains("rollup")
+                                || s.contains("esbuild")
+                        };
+
+                        if let Some(dev) = scripts.get("dev").and_then(|v| v.as_str()) {
+                            if !is_build_only(dev) {
+                                return "node_dev".to_string();
+                            }
+                        }
+                        if let Some(start) = scripts.get("start").and_then(|v| v.as_str()) {
+                            if !is_build_only(start) {
+                                return "node_start".to_string();
+                            }
+                        }
+                    }
+                }
+            }
+            String::new()
+        }
+        "python" => {
+            // Check pyproject.toml for framework dependencies
+            let pyproject_path = dir.join("pyproject.toml");
+            if let Ok(contents) = std::fs::read_to_string(&pyproject_path) {
+                let contents_lower = contents.to_lowercase();
+                if contents_lower.contains("fastapi") {
+                    return "fastapi".to_string();
+                }
+                if contents_lower.contains("django") {
+                    return "django".to_string();
+                }
+                if contents_lower.contains("flask") {
+                    return "flask".to_string();
+                }
+            }
+            // Check requirements.txt as fallback
+            let req_path = dir.join("requirements.txt");
+            if let Ok(contents) = std::fs::read_to_string(&req_path) {
+                let contents_lower = contents.to_lowercase();
+                if contents_lower.contains("fastapi") {
+                    return "fastapi".to_string();
+                }
+                if contents_lower.contains("django") {
+                    return "django".to_string();
+                }
+                if contents_lower.contains("flask") {
+                    return "flask".to_string();
+                }
+            }
+            String::new()
+        }
+        "rust" => "rust".to_string(),
+        "go" => "go".to_string(),
+        "flutter" => "flutter".to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Generate process configs for a detected framework.
+fn configs_for_framework(name: &str, path: &str, framework: &str) -> Vec<Value> {
+    match framework {
+        "nextjs" => vec![build_process_config(
+            name,
+            "Next.js",
+            "npm",
+            &["run", "dev"],
+            path,
+            Some(3000),
+            "javascript",
+            "frontend",
+        )],
+        "fastapi" => vec![build_process_config(
+            name,
+            "FastAPI",
+            "python",
+            &["-m", "uvicorn", "main:app", "--reload"],
+            path,
+            Some(8000),
+            "python",
+            "backend",
+        )],
+        "express" => vec![build_process_config(
+            name,
+            "Express",
+            "npm",
+            &["start"],
+            path,
+            Some(3000),
+            "javascript",
+            "backend",
+        )],
+        "nestjs" => vec![build_process_config(
+            name,
+            "NestJS",
+            "npm",
+            &["run", "start:dev"],
+            path,
+            Some(3000),
+            "javascript",
+            "backend",
+        )],
+        "django" => vec![build_process_config(
+            name,
+            "Django",
+            "python",
+            &["manage.py", "runserver"],
+            path,
+            Some(8000),
+            "python",
+            "backend",
+        )],
+        "vite" => vec![build_process_config(
+            name,
+            "Vite",
+            "npm",
+            &["run", "dev"],
+            path,
+            Some(5173),
+            "javascript",
+            "frontend",
+        )],
+        "rust" => vec![build_process_config(
+            name,
+            "Cargo",
+            "cargo",
+            &["run"],
+            path,
+            None,
+            "rust",
+            "backend",
+        )],
+        "flask" => vec![build_process_config(
+            name,
+            "Flask",
+            "python",
+            &["-m", "flask", "run"],
+            path,
+            Some(5000),
+            "python",
+            "backend",
+        )],
+        "node_dev" => vec![build_process_config(
+            name,
+            "npm dev",
+            "npm",
+            &["run", "dev"],
+            path,
+            None,
+            "javascript",
+            "general",
+        )],
+        "node_start" => vec![build_process_config(
+            name,
+            "npm start",
+            "npm",
+            &["start"],
+            path,
+            None,
+            "javascript",
+            "general",
+        )],
+        "go" => vec![build_process_config(
+            name,
+            "Go",
+            "go",
+            &["run", "."],
+            path,
+            None,
+            "generic",
+            "backend",
+        )],
+        "react_native" => vec![build_process_config(
+            name,
+            "Expo",
+            "npx",
+            &["expo", "start"],
+            path,
+            Some(8081),
+            "javascript",
+            "mobile",
+        )],
+        "docusaurus" => vec![build_process_config(
+            name,
+            "Docusaurus",
+            "npm",
+            &["start"],
+            path,
+            Some(3000),
+            "javascript",
+            "frontend",
+        )],
+        "flutter" => vec![build_process_config(
+            name,
+            "Flutter",
+            "flutter",
+            &["run"],
+            path,
+            None,
+            "generic",
+            "mobile",
+        )],
+        _ => vec![],
+    }
+}
+
+/// Scan immediate subdirectories for additional runnable manifests (monorepo support).
+fn scan_subdir_manifests(project_path: &str, project_name: &str) -> Vec<Value> {
+    let dir = std::path::Path::new(project_path);
+    let mut results = Vec::new();
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return results,
+    };
+
+    let skip_dirs = [
+        "node_modules",
+        "target",
+        "dist",
+        "build",
+        "__pycache__",
+        ".next",
+        "venv",
+        ".venv",
+        "e2e",
+        "test",
+        "tests",
+        "__tests__",
+        "examples",
+        "packages",
+    ];
+
+    let manifests: &[(&str, &str)] = &[
+        ("package.json", "node"),
+        ("pyproject.toml", "python"),
+        ("Cargo.toml", "rust"),
+        ("go.mod", "go"),
+    ];
+
+    for entry in entries.flatten() {
+        let sub_path = entry.path();
+        if !sub_path.is_dir() {
+            continue;
+        }
+
+        let sub_name = sub_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+
+        if sub_name.starts_with('.') || skip_dirs.contains(&sub_name) {
+            continue;
+        }
+
+        for &(manifest, generic_type) in manifests {
+            if sub_path.join(manifest).exists() {
+                let sub_path_str = sub_path.to_string_lossy().to_string();
+                let framework = detect_framework(&sub_path_str, generic_type);
+                if !framework.is_empty() {
+                    let display_name = format!("{}/{}", project_name, sub_name);
+                    let configs = configs_for_framework(&display_name, &sub_path_str, &framework);
+                    results.extend(configs);
+                }
+                break;
+            }
+        }
+    }
+
+    results
+}
+
 /// Suggest process configurations based on detected project frameworks.
 ///
-/// Pure Rust mapping — no Python subprocess needed.
+/// Inspects manifest files (package.json, pyproject.toml, Cargo.toml) to detect
+/// the specific framework and suggest appropriate dev commands. For monorepos,
+/// also scans immediate subdirectories for additional runnable apps.
 #[tauri::command]
 pub async fn suggest_process_configs_for_setup(projects: Vec<Value>) -> Result<Vec<Value>, String> {
     info!(
         "Setup wizard: suggesting process configs for {} projects",
         projects.len()
     );
+
+    // Exclude the runner's own project directory.
+    let runner_dir = std::env::current_exe().ok().and_then(|exe| {
+        let mut dir = exe.parent().map(|p| p.to_path_buf());
+        while let Some(d) = dir {
+            if d.join("package.json").exists() && d.join("src-tauri").exists() {
+                return Some(d.to_string_lossy().replace('\\', "/"));
+            }
+            dir = d.parent().map(|p| p.to_path_buf());
+        }
+        None
+    });
 
     let mut suggestions = Vec::new();
 
@@ -295,7 +655,7 @@ pub async fn suggest_process_configs_for_setup(projects: Vec<Value>) -> Result<V
             .get("path")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        let framework = project
+        let generic_type = project
             .get("type")
             .or_else(|| project.get("framework"))
             .and_then(|v| v.as_str())
@@ -305,101 +665,46 @@ pub async fn suggest_process_configs_for_setup(projects: Vec<Value>) -> Result<V
             .and_then(|v| v.as_str())
             .unwrap_or_default();
 
-        let configs = match framework {
-            "nextjs" | "next" => vec![serde_json::json!({
-                "id": Uuid::new_v4().to_string(),
-                "name": format!("{} (Next.js)", name),
-                "command": "npm",
-                "args": ["run", "dev"],
-                "cwd": path,
-                "health_port": 3000,
-                "parser": "javascript",
-                "category": "frontend",
-                "auto_start": false,
-                "enabled": true,
-                "buffer_size": 2000,
-            })],
-            "fastapi" => vec![serde_json::json!({
-                "id": Uuid::new_v4().to_string(),
-                "name": format!("{} (FastAPI)", name),
-                "command": "python",
-                "args": ["-m", "uvicorn", "main:app", "--reload"],
-                "cwd": path,
-                "health_port": 8000,
-                "parser": "python",
-                "category": "backend",
-                "auto_start": false,
-                "enabled": true,
-                "buffer_size": 2000,
-            })],
-            "express" => vec![serde_json::json!({
-                "id": Uuid::new_v4().to_string(),
-                "name": format!("{} (Express)", name),
-                "command": "npm",
-                "args": ["start"],
-                "cwd": path,
-                "health_port": 3000,
-                "parser": "javascript",
-                "category": "backend",
-                "auto_start": false,
-                "enabled": true,
-                "buffer_size": 2000,
-            })],
-            "django" => vec![serde_json::json!({
-                "id": Uuid::new_v4().to_string(),
-                "name": format!("{} (Django)", name),
-                "command": "python",
-                "args": ["manage.py", "runserver"],
-                "cwd": path,
-                "health_port": 8000,
-                "parser": "python",
-                "category": "backend",
-                "auto_start": false,
-                "enabled": true,
-                "buffer_size": 2000,
-            })],
-            "react_vite" | "vite" => vec![serde_json::json!({
-                "id": Uuid::new_v4().to_string(),
-                "name": format!("{} (Vite)", name),
-                "command": "npm",
-                "args": ["run", "dev"],
-                "cwd": path,
-                "health_port": 5173,
-                "parser": "javascript",
-                "category": "frontend",
-                "auto_start": false,
-                "enabled": true,
-                "buffer_size": 2000,
-            })],
-            "rust_cargo" | "rust" => vec![serde_json::json!({
-                "id": Uuid::new_v4().to_string(),
-                "name": format!("{} (Cargo)", name),
-                "command": "cargo",
-                "args": ["run"],
-                "cwd": path,
-                "parser": "rust",
-                "category": "backend",
-                "auto_start": false,
-                "enabled": true,
-                "buffer_size": 2000,
-            })],
-            "flask" => vec![serde_json::json!({
-                "id": Uuid::new_v4().to_string(),
-                "name": format!("{} (Flask)", name),
-                "command": "python",
-                "args": ["-m", "flask", "run"],
-                "cwd": path,
-                "health_port": 5000,
-                "parser": "python",
-                "category": "backend",
-                "auto_start": false,
-                "enabled": true,
-                "buffer_size": 2000,
-            })],
-            _ => vec![],
+        // Skip the runner's own project.
+        if let Some(ref runner) = runner_dir {
+            let norm_path = path.replace('\\', "/");
+            if norm_path == *runner {
+                info!("Skipping runner's own project: {}", name);
+                continue;
+            }
+        }
+
+        // Detect framework from manifest files.
+        let framework = detect_framework(path, generic_type);
+
+        // Generate configs for the project root.
+        let root_configs = if framework.is_empty() {
+            vec![]
+        } else {
+            configs_for_framework(name, path, &framework)
         };
 
-        suggestions.extend(configs);
+        // Scan subdirectories for monorepo apps.
+        let sub_configs = scan_subdir_manifests(path, name);
+
+        if !sub_configs.is_empty() {
+            // If a subdir has the same framework as the root, the root is likely a
+            // workspace config rather than a runnable app — suppress it.
+            let root_duplicated = !framework.is_empty()
+                && sub_configs.iter().any(|c| {
+                    c.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|n| n.contains(&framework))
+                        .unwrap_or(false)
+                });
+
+            suggestions.extend(sub_configs);
+            if !root_duplicated {
+                suggestions.extend(root_configs);
+            }
+        } else {
+            suggestions.extend(root_configs);
+        }
     }
 
     Ok(suggestions)

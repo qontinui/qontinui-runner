@@ -441,6 +441,24 @@ impl ProcessCaptureManager {
                             // Transition state based on health
                             if healthy && p.runtime.state == ProcessState::Running {
                                 p.runtime.state = ProcessState::Healthy;
+
+                                // Auto-discover specs once per process start
+                                if !p.runtime.specs_discovered {
+                                    p.runtime.specs_discovered = true;
+                                    let discover_port = port;
+                                    let discover_db = db.clone();
+                                    let discover_app_handle = app_handle.clone();
+                                    let discover_name = p.config.name.clone();
+                                    tokio::spawn(async move {
+                                        auto_discover_specs(
+                                            discover_port,
+                                            &discover_name,
+                                            &discover_db,
+                                            &discover_app_handle,
+                                        )
+                                        .await;
+                                    });
+                                }
                             } else if !healthy && p.runtime.state == ProcessState::Healthy {
                                 p.runtime.state = ProcessState::Running;
                             }
@@ -460,5 +478,157 @@ impl ProcessCaptureManager {
 
     fn emit_state_change(&self, status: &ProcessStatus) {
         let _ = tauri::Emitter::emit(&self.app_handle, "process-state-changed", status);
+    }
+}
+
+/// Attempt to connect to a managed process's UI Bridge SDK and cache its specs.
+/// This runs as a background task — failures are logged but not propagated.
+async fn auto_discover_specs(
+    port: u16,
+    process_name: &str,
+    db: &Arc<CheckpointDb>,
+    app_handle: &tauri::AppHandle,
+) {
+    let base_url = format!("http://127.0.0.1:{}", port);
+    info!(
+        port,
+        process_name, "Auto-discovering specs for managed process"
+    );
+
+    // Wait a bit for the app to fully initialize after health port is available
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Auto-discover: failed to create HTTP client: {}", e);
+            return;
+        }
+    };
+
+    // Try to find the UI Bridge health endpoint to determine the base path
+    let health_paths: &[(&str, &str)] = &[
+        ("/api/ui-bridge/health", "/api/ui-bridge"),
+        ("/ui-bridge/health", "/ui-bridge"),
+        ("/health", ""),
+    ];
+
+    let mut base_path = String::new();
+    let mut app_name = process_name.to_string();
+
+    for (health_path, bp) in health_paths {
+        let health_url = format!("{}{}", base_url, health_path);
+        match client.get(&health_url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    base_path = bp.to_string();
+                    // Extract app name from health response
+                    if let Some(name) = json
+                        .get("uiBridge")
+                        .or_else(|| json.get("data").and_then(|d| d.get("uiBridge")))
+                        .and_then(|m| m.get("appName"))
+                        .and_then(|v| v.as_str())
+                    {
+                        app_name = name.to_string();
+                    }
+                    break;
+                }
+            }
+            _ => continue,
+        }
+    }
+
+    // Try to fetch specs
+    let specs_url = format!("{}{}/control/specs", base_url, base_path);
+    let specs_response = match client.get(&specs_url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+            Ok(json) => json,
+            Err(e) => {
+                info!(
+                    "Auto-discover: {} has no parseable specs endpoint: {}",
+                    process_name, e
+                );
+                return;
+            }
+        },
+        Ok(resp) => {
+            info!(
+                "Auto-discover: {} specs endpoint returned HTTP {}",
+                process_name,
+                resp.status()
+            );
+            return;
+        }
+        Err(_) => {
+            // App doesn't have a specs endpoint — this is normal for most apps
+            info!(
+                "Auto-discover: {} does not expose a specs endpoint (normal)",
+                process_name
+            );
+            return;
+        }
+    };
+
+    // Parse specs from response
+    let specs_data = specs_response.get("data").unwrap_or(&specs_response);
+    let specs_array: Vec<serde_json::Value> = if let Some(arr) = specs_data.as_array() {
+        arr.clone()
+    } else if specs_data.get("groups").is_some() {
+        vec![specs_data.clone()]
+    } else {
+        info!(
+            "Auto-discover: {} returned no recognizable specs",
+            process_name
+        );
+        return;
+    };
+
+    let mut cached_count = 0;
+    for spec in &specs_array {
+        let spec_id = spec
+            .get("specId")
+            .or_else(|| spec.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        let page_url = spec
+            .get("metadata")
+            .and_then(|m| m.get("pageUrl"))
+            .and_then(|v| v.as_str());
+
+        let spec_json_str = match serde_json::to_string(spec) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        if let Err(e) =
+            db.upsert_cached_spec(&base_url, &app_name, spec_id, &spec_json_str, page_url)
+        {
+            warn!("Auto-discover: failed to cache spec {}: {}", spec_id, e);
+            continue;
+        }
+        cached_count += 1;
+    }
+
+    if cached_count > 0 {
+        info!(
+            "Auto-discovered and cached {} specs for {} ({})",
+            cached_count, process_name, base_url
+        );
+
+        // Emit event so the frontend can refresh
+        let _ = tauri::Emitter::emit(
+            app_handle,
+            "specs-discovered",
+            &serde_json::json!({
+                "app_url": base_url,
+                "app_name": app_name,
+                "spec_count": cached_count,
+            }),
+        );
     }
 }

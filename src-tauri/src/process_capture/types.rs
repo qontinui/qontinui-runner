@@ -24,7 +24,7 @@ pub struct ProcessConfig {
     #[serde(default)]
     pub env: HashMap<String, String>,
     /// Port to check for health (optional)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_port: Option<u16>,
     /// Parser type for error detection
     #[serde(default)]
@@ -133,6 +133,8 @@ pub(crate) struct ProcessRuntime {
     pub port_healthy: Option<bool>,
     /// Active database session ID for output persistence
     pub session_id: Option<String>,
+    /// Whether specs have been auto-discovered for this process start
+    pub specs_discovered: bool,
 }
 
 impl Default for ProcessRuntime {
@@ -145,6 +147,7 @@ impl Default for ProcessRuntime {
             error_count: 0,
             port_healthy: None,
             session_id: None,
+            specs_discovered: false,
         }
     }
 }

@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 # Result storage locations
 AUTOMATION_RESULTS_DIR = Path.home() / ".automation-results"
-DEV_LOGS_DIR = Path("D:/qontinui_parent_directory/.dev-logs")
+DEV_LOGS_DIR = Path(__file__).resolve().parent.parent.parent / ".dev-logs"
 MAX_HISTORY_RUNS = 10
 
 

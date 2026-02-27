@@ -76,8 +76,9 @@ async fn relay_loop(
 ) {
     use crate::auth::AuthManager;
 
-    let mut backoff_ms: u64 = 1000;
-    let max_backoff_ms: u64 = 30000;
+    let mut backoff_ms: u64 = 2000;
+    let max_backoff_ms: u64 = 60000;
+    let mut consecutive_quick_disconnects: u32 = 0;
 
     // Bug #5 fix: Subscribe to event broadcast BEFORE the reconnection loop
     // so events are buffered during backoff/reconnection delays.
@@ -87,6 +88,30 @@ async fn relay_loop(
         if *shutdown_rx.borrow() {
             info!("Backend relay shutting down");
             return;
+        }
+
+        // After many consecutive quick disconnects, the backend is persistently
+        // rejecting us (e.g., streaming not enabled, session limits). Back off
+        // aggressively to avoid hammering the server.
+        if consecutive_quick_disconnects >= 5 {
+            let extended_backoff = max_backoff_ms.max(120_000); // 2 minutes
+            warn!(
+                "Backend relay: {} consecutive quick disconnects. \
+                 Check automation_streaming_enabled, session limits, and auth. \
+                 Backing off for {}s.",
+                consecutive_quick_disconnects,
+                extended_backoff / 1000
+            );
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(extended_backoff)) => {}
+                _ = shutdown_rx.changed() => {
+                    info!("Backend relay shutting down during extended backoff");
+                    return;
+                }
+            }
+            // Reset counter after extended backoff so we try again
+            consecutive_quick_disconnects = 0;
+            backoff_ms = 2000;
         }
 
         // Bug #4 fix: Refresh auth token on each reconnection attempt
@@ -115,13 +140,14 @@ async fn relay_loop(
         match connect_async(&url).await {
             Ok((ws_stream, _response)) => {
                 info!("Connected to backend relay");
-                backoff_ms = 1000; // Reset backoff on successful connection
+                let connected_at = std::time::Instant::now();
 
                 let (write, read) = ws_stream.split();
                 let write = Arc::new(Mutex::new(write));
 
                 // Run inbound and outbound handlers concurrently
                 let write_clone = write.clone();
+                let write_ping = write.clone();
                 let state_clone = api_state.clone();
                 let mut shutdown_clone = shutdown_rx.clone();
 
@@ -136,10 +162,42 @@ async fn relay_loop(
                         info!("Backend relay received shutdown signal");
                         return;
                     }
+                    // Keepalive: detect dead/half-open connections
+                    _ = async {
+                        let mut interval = tokio::time::interval(Duration::from_secs(30));
+                        interval.tick().await; // Skip immediate first tick
+                        loop {
+                            interval.tick().await;
+                            let mut w = write_ping.lock().await;
+                            if let Err(e) = w.send(Message::Ping(vec![])).await {
+                                warn!("Relay keepalive ping failed: {}", e);
+                                return;
+                            }
+                        }
+                    } => {
+                        warn!("Backend relay keepalive detected dead connection");
+                    }
+                }
+
+                // Check if connection was stable (lasted > 10 seconds)
+                let connection_duration = connected_at.elapsed();
+                if connection_duration > Duration::from_secs(10) {
+                    // Connection was stable — reset backoff
+                    backoff_ms = 2000;
+                    consecutive_quick_disconnects = 0;
+                } else {
+                    // Connection dropped quickly — likely rejected by backend
+                    consecutive_quick_disconnects += 1;
+                    warn!(
+                        "Backend relay connection lasted only {:.1}s (quick disconnect #{})",
+                        connection_duration.as_secs_f64(),
+                        consecutive_quick_disconnects
+                    );
                 }
             }
             Err(e) => {
                 warn!("Failed to connect to backend relay: {}", e);
+                consecutive_quick_disconnects += 1;
             }
         }
 
@@ -171,6 +229,7 @@ async fn handle_inbound<S>(
             Ok(Message::Text(text)) => match serde_json::from_str::<Value>(&text) {
                 Ok(data) => {
                     let msg_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    info!("Relay inbound message: type={}", msg_type);
                     let response = handle_relay_command(&api_state, msg_type, &data).await;
                     if let Some(response) = response {
                         let response_text = serde_json::to_string(&response).unwrap_or_default();
@@ -189,8 +248,15 @@ async fn handle_inbound<S>(
                 let mut w = write.lock().await;
                 let _ = w.send(Message::Pong(data)).await;
             }
-            Ok(Message::Close(_)) => {
-                info!("Backend relay WebSocket closed");
+            Ok(Message::Close(frame)) => {
+                if let Some(ref f) = frame {
+                    warn!(
+                        "Backend relay WebSocket closed by server: code={}, reason={}",
+                        f.code, f.reason
+                    );
+                } else {
+                    info!("Backend relay WebSocket closed (no close frame)");
+                }
                 return;
             }
             Err(e) => {
@@ -412,6 +478,7 @@ async fn handle_relay_command(
         }
 
         "chat_create" => {
+            info!("Handling chat_create command");
             let task_name = data
                 .get("task_name")
                 .and_then(|v| v.as_str())
@@ -422,7 +489,7 @@ async fn handle_relay_command(
                 .map(|s| s.to_string());
             let task_run_id = uuid::Uuid::new_v4().to_string();
 
-            // 1. Create task run record in DB
+            // 1. Create task run record in DB (fast, synchronous)
             let db = api_state.app_state.checkpoint_db.clone();
             let id_clone = task_run_id.clone();
             let name_clone = task_name.to_string();
@@ -442,103 +509,94 @@ async fn handle_relay_command(
                 }));
             }
 
-            // 2. Get SessionManager and spawn a Claude session
-            let session_manager: Option<Arc<crate::claude_session::SessionManager>> = api_state
-                .app_handle
-                .try_state::<Arc<crate::claude_session::SessionManager>>()
-                .map(|s| s.inner().clone());
+            // 2. Spawn session setup in background to avoid blocking the
+            //    inbound handler (Claude CLI init can take 30+ seconds,
+            //    during which we can't respond to WebSocket pings).
+            let bg_state = api_state.clone();
+            let bg_task_run_id = task_run_id.clone();
+            let bg_task_name = task_name.to_string();
+            tokio::spawn(async move {
+                let session_manager: Option<Arc<crate::claude_session::SessionManager>> = bg_state
+                    .app_handle
+                    .try_state::<Arc<crate::claude_session::SessionManager>>()
+                    .map(|s| s.inner().clone());
 
-            let Some(session_manager) = session_manager else {
-                return Some(serde_json::json!({
-                    "type": "chat_created",
-                    "id": task_run_id,
-                    "task_name": task_name,
-                    "state": "error",
-                    "error": "SessionManager not available"
-                }));
-            };
+                let Some(session_manager) = session_manager else {
+                    warn!("SessionManager not available for relay chat");
+                    return;
+                };
 
-            let working_dir = std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| ".".to_string());
+                let working_dir = std::env::current_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| ".".to_string());
 
-            let system_prompt = "You are an AI assistant in a chat session initiated from the \
-                qontinui mobile app. Respond helpfully and conversationally. The user may ask \
-                about anything — workflows, automation, code questions, or general topics."
-                .to_string();
+                let system_prompt = "You are an AI assistant in a chat session initiated from the \
+                    qontinui mobile app. Respond helpfully and conversationally. The user may ask \
+                    about anything — workflows, automation, code questions, or general topics."
+                    .to_string();
 
-            match crate::claude_session::ClaudeSession::spawn(
-                &working_dir,
-                &task_run_id,
-                &api_state.app_handle,
-                None, // session_ctx
-                None, // finding_ctx
-                None, // progress_ctx
-                None, // pid_tracker
-            ) {
-                Ok(session) => {
-                    let session = Arc::new(session);
+                match crate::claude_session::ClaudeSession::spawn(
+                    &working_dir,
+                    &bg_task_run_id,
+                    &bg_state.app_handle,
+                    None,
+                    None,
+                    None,
+                    None,
+                ) {
+                    Ok(session) => {
+                        let session = Arc::new(session);
 
-                    // 3. Register with session manager
-                    if let Err(e) = session_manager.register(&task_run_id, session.clone()) {
-                        warn!("Failed to register relay chat session: {}", e);
-                        return Some(serde_json::json!({
-                            "type": "chat_created",
-                            "id": task_run_id,
-                            "task_name": task_name,
-                            "state": "error",
-                            "error": format!("Session registration failed: {}", e)
-                        }));
+                        if let Err(e) = session_manager.register(&bg_task_run_id, session.clone()) {
+                            warn!("Failed to register relay chat session: {}", e);
+                            return;
+                        }
+
+                        // Emit ready state
+                        crate::commands::ai_chat::emit_session_state(
+                            &bg_state.app_handle,
+                            &bg_task_run_id,
+                            &bg_task_run_id,
+                            session.state(),
+                        );
+
+                        // Send initial prompt
+                        let prompt_to_send = initial_prompt.as_deref().unwrap_or(&system_prompt);
+                        if let Err(e) = session.send_initial_prompt(prompt_to_send) {
+                            warn!("Failed to send initial prompt for relay chat: {}", e);
+                            return;
+                        }
+
+                        // Emit processing state
+                        crate::commands::ai_chat::emit_session_state(
+                            &bg_state.app_handle,
+                            &bg_task_run_id,
+                            &bg_task_run_id,
+                            session.state(),
+                        );
+
+                        info!(
+                            "Relay chat session ready: task_run_id={}, task_name={}",
+                            bg_task_run_id, bg_task_name
+                        );
                     }
-
-                    // 4. Emit initial ready state
-                    crate::commands::ai_chat::emit_session_state(
-                        &api_state.app_handle,
-                        &task_run_id,
-                        &task_run_id,
-                        session.state(),
-                    );
-
-                    // 5. Send initial prompt (system prompt or user-provided prompt)
-                    let prompt_to_send = initial_prompt.as_deref().unwrap_or(&system_prompt);
-                    if let Err(e) = session.send_initial_prompt(prompt_to_send) {
-                        warn!("Failed to send initial prompt for relay chat: {}", e);
-                        return Some(serde_json::json!({
-                            "type": "chat_created",
-                            "id": task_run_id,
-                            "task_name": task_name,
-                            "state": "error",
-                            "error": format!("Failed to send initial prompt: {}", e)
-                        }));
+                    Err(e) => {
+                        warn!("Failed to spawn relay chat session: {}", e);
                     }
-
-                    // Emit processing state
-                    crate::commands::ai_chat::emit_session_state(
-                        &api_state.app_handle,
-                        &task_run_id,
-                        &task_run_id,
-                        session.state(),
-                    );
-
-                    info!("Relay chat session created: task_run_id={}", task_run_id);
-                    Some(serde_json::json!({
-                        "type": "chat_created",
-                        "id": task_run_id,
-                        "task_name": task_name,
-                        "state": "ready"
-                    }))
                 }
-                Err(e) => {
-                    warn!("Failed to spawn relay chat session: {}", e);
-                    Some(serde_json::json!({
-                        "type": "chat_created",
-                        "id": task_run_id,
-                        "task_name": task_name,
-                        "state": "error",
-                        "error": format!("Session creation failed: {}", e)
-                    }))
-                }
-            }
+            });
+
+            // Return immediately so handle_inbound stays responsive to pings
+            info!(
+                "Relay chat session initializing: task_run_id={}",
+                task_run_id
+            );
+            Some(serde_json::json!({
+                "type": "chat_created",
+                "id": task_run_id,
+                "task_name": task_name,
+                "state": "initializing"
+            }))
         }
 
         "chat_interrupt" => {
@@ -702,6 +760,7 @@ async fn handle_relay_command(
                 max_fix_iterations: Some(3),
                 discovery_mode: None,
                 include_ui_bridge_instructions: include_ui_bridge,
+                reflection_mode: Some(true),
             };
 
             let doctor_handle = api_state.doctor_handle.clone();
@@ -855,6 +914,39 @@ pub mod commands {
         RELAY_STATE.get_or_init(|| tokio::sync::Mutex::new(None))
     }
 
+    /// Auto-start the cloud relay if enabled and auto_connect is set.
+    /// Called from mcp_api.rs where ApiState is available.
+    pub async fn auto_start_cloud_relay(api_state: Arc<ApiState>) {
+        let settings = settings::load_settings();
+        if !settings.cloud_relay.enabled || !settings.cloud_relay.auto_connect {
+            return;
+        }
+
+        let mut guard = get_relay_holder().lock().await;
+
+        // Check if existing relay is still alive
+        if let Some(ref existing) = *guard {
+            let handle_guard = existing.task_handle.lock().await;
+            let is_alive = handle_guard.as_ref().is_some_and(|h| !h.is_finished());
+            drop(handle_guard);
+
+            if is_alive {
+                return; // Relay is running, nothing to do
+            }
+
+            // Relay task has finished (dead connection) — stop it and restart
+            info!("Cloud relay task has ended, restarting...");
+            existing.stop().await;
+            *guard = None;
+        }
+
+        let backend_url = &settings.cloud_relay.backend_url;
+        info!("Auto-starting cloud relay to {}", backend_url);
+
+        let relay = start_relay(api_state, backend_url).await;
+        *guard = Some(relay);
+    }
+
     #[tauri::command]
     pub async fn start_cloud_relay(
         state: tauri::State<'_, Arc<ApiState>>,
@@ -867,8 +959,18 @@ pub mod commands {
         // Bug #11 fix: Hold the lock for the entire start operation to prevent
         // TOCTOU race where rapid double-invocations could spawn two relays.
         let mut guard = get_relay_holder().lock().await;
-        if guard.is_some() {
-            return Ok("Cloud relay is already running".to_string());
+        if let Some(ref existing) = *guard {
+            let handle_guard = existing.task_handle.lock().await;
+            let is_alive = handle_guard.as_ref().is_some_and(|h| !h.is_finished());
+            drop(handle_guard);
+
+            if is_alive {
+                return Ok("Cloud relay is already running".to_string());
+            }
+
+            // Dead relay — stop and restart
+            existing.stop().await;
+            *guard = None;
         }
 
         let backend_url = &settings.cloud_relay.backend_url;
@@ -895,6 +997,26 @@ pub mod commands {
         } else {
             Ok("Cloud relay was not running".to_string())
         }
+    }
+
+    /// Check relay status without Tauri state (for HTTP endpoint)
+    pub async fn get_cloud_relay_status_internal() -> serde_json::Value {
+        let settings = settings::load_settings();
+        let holder = get_relay_holder().lock().await;
+
+        let is_running = if let Some(ref relay) = *holder {
+            let handle_guard = relay.task_handle.lock().await;
+            handle_guard.as_ref().is_some_and(|h| !h.is_finished())
+        } else {
+            false
+        };
+
+        serde_json::json!({
+            "enabled": settings.cloud_relay.enabled,
+            "backend_url": settings.cloud_relay.backend_url,
+            "auto_connect": settings.cloud_relay.auto_connect,
+            "is_running": is_running
+        })
     }
 
     /// Check if the cloud relay is currently running.

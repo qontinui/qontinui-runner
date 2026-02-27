@@ -61,7 +61,7 @@ use axum::{
 };
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
@@ -221,6 +221,37 @@ pub fn create_router(
         }
     });
 
+    // Resume interrupted chat sessions on startup
+    {
+        let chat_db = api_state.app_state.checkpoint_db.clone();
+        let chat_handle = app_handle.clone();
+        // Access session manager from Tauri state (managed separately from AppState)
+        let chat_sm: Arc<crate::claude_session::SessionManager> = app_handle
+            .state::<Arc<crate::claude_session::SessionManager>>()
+            .inner()
+            .clone();
+        tokio::spawn(async move {
+            // Wait a bit longer than unified workflows to let the server fully start
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+            let count =
+                crate::commands::ai_chat::resume_chat_sessions(chat_db, chat_sm, chat_handle).await;
+
+            if count > 0 {
+                info!("Resumed {} chat session(s) on startup", count);
+            }
+        });
+    }
+
+    // Auto-start cloud relay if configured
+    {
+        let relay_api_state = api_state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            crate::mcp::backend_relay::commands::auto_start_cloud_relay(relay_api_state).await;
+        });
+    }
+
     // Sync workflows from web backend on startup (background task)
     {
         let db = api_state.app_state.checkpoint_db.clone();
@@ -307,10 +338,26 @@ pub fn create_router(
         .merge(crate::mcp::unified_workflows::routes())
         .merge(crate::mcp::verification_tests::routes())
         .merge(crate::mcp::websocket::routes())
+        .route("/cloud-relay/start", post(cloud_relay_start))
+        .route("/cloud-relay/status", get(cloud_relay_status))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .layer(RequestBodyLimitLayer::new(100 * 1024 * 1024))
         .with_state(api_state)
+}
+
+/// HTTP endpoint to manually start the cloud relay
+async fn cloud_relay_start(
+    axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
+) -> axum::Json<serde_json::Value> {
+    crate::mcp::backend_relay::commands::auto_start_cloud_relay(state).await;
+    axum::Json(serde_json::json!({"status": "started"}))
+}
+
+/// HTTP endpoint to check cloud relay status
+async fn cloud_relay_status() -> axum::Json<serde_json::Value> {
+    let status = crate::mcp::backend_relay::commands::get_cloud_relay_status_internal().await;
+    axum::Json(status)
 }
 
 /// Try to bind to a port with SO_REUSEADDR

@@ -14,6 +14,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use crate::doctor::DoctorHandle;
+use crate::step_executor::handlers::shell_command::ShellCommandHandler;
 
 /// Build an enhanced PATH that includes Node.js tools and local node_modules.
 ///
@@ -505,13 +506,26 @@ impl DeterministicVerifier {
         // Build enhanced PATH to ensure npm/npx tools are found
         let enhanced_path = build_enhanced_path(&self.working_directory);
 
-        // Run command using shell with enhanced PATH
+        // Run command using appropriate shell with enhanced PATH.
+        // On Windows, detect bash-syntax commands (piped Python, heredocs, etc.)
+        // and use Git Bash instead of cmd.exe to avoid quote-handling issues.
         let output = if cfg!(target_os = "windows") {
-            Command::new("cmd")
-                .args(["/C", command])
-                .current_dir(&self.working_directory)
-                .env("PATH", &enhanced_path)
-                .output()
+            if ShellCommandHandler::is_bash_command(command) {
+                let bash_path =
+                    ShellCommandHandler::find_git_bash().unwrap_or_else(|| "bash".to_string());
+                info!("Using Git Bash for verification command: {}", bash_path);
+                Command::new(&bash_path)
+                    .args(["-c", command])
+                    .current_dir(&self.working_directory)
+                    .env("PATH", &enhanced_path)
+                    .output()
+            } else {
+                Command::new("cmd")
+                    .args(["/C", command])
+                    .current_dir(&self.working_directory)
+                    .env("PATH", &enhanced_path)
+                    .output()
+            }
         } else {
             Command::new("sh")
                 .args(["-c", command])

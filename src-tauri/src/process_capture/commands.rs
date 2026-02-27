@@ -112,8 +112,16 @@ pub async fn save_process_config(
     config: ProcessConfig,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
+    tracing::info!(
+        "save_process_config called: name={}, id={}, cwd={}",
+        config.name,
+        config.id,
+        config.cwd
+    );
+
     // Save to settings (persists across restarts)
     crate::settings::save_managed_process_config(config.clone())?;
+    tracing::info!("save_process_config: saved to settings OK");
 
     // Register with manager if available. During setup wizard the manager may
     // not be initialized yet — that's fine, configs will be loaded from

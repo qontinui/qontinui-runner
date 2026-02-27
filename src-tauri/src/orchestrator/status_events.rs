@@ -3,6 +3,7 @@
 //! Provides event emission for the agentic features to enable real-time
 //! visibility in the frontend. Emits events for:
 //! - Task routing decisions
+//! - Retry attempts
 //! - Memory compression operations
 //! - Lifecycle hook executions
 
@@ -14,6 +15,7 @@ use tracing::{debug, info};
 
 use super::compression::{CompressionResult, TokenCount};
 use super::hooks::{HookResult, HookTrigger};
+use super::retry::RetryState;
 use crate::ai_router::{ComplexityAssessment, TaskComplexity};
 
 // ============================================================================
@@ -57,6 +59,37 @@ pub struct RoutingDecisionEvent {
     #[serde(flatten)]
     pub base: EventBase,
     pub decision: RoutingDecisionPayload,
+}
+
+/// Retry attempt payload (matches frontend RawRetryAttemptPayload)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryAttemptPayload {
+    pub attempt_number: u32,
+    pub error: String,
+    pub attempt_timestamp: String,
+    pub delay_ms: u64,
+    pub feedback_injected: bool,
+}
+
+/// Retry state payload (matches frontend RawRetryStatePayload)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryStatePayload {
+    pub attempt: u32,
+    pub last_error: Option<String>,
+    pub last_attempt_at: Option<String>,
+    pub total_delay_ms: u64,
+    pub error_history: Vec<RetryAttemptPayload>,
+}
+
+/// Retry attempt event
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryAttemptEvent {
+    #[serde(flatten)]
+    pub base: EventBase,
+    pub attempt: RetryAttemptPayload,
+    pub state: RetryStatePayload,
+    pub exhausted: bool,
+    pub next_retry_delay_ms: Option<u64>,
 }
 
 /// Token count payload
@@ -201,6 +234,77 @@ impl StatusEventEmitter {
 
         if let Err(e) = app_handle.emit(Self::EVENT_CHANNEL, &event) {
             debug!("Failed to emit routing decision event: {}", e);
+        }
+    }
+
+    /// Emit a retry attempt event
+    pub fn emit_retry_attempt(
+        app_handle: &tauri::AppHandle,
+        task_run_id: &str,
+        state: &RetryState,
+        exhausted: bool,
+        next_retry_delay_ms: Option<u64>,
+        max_retries: u32,
+    ) {
+        // Get the latest attempt from error history
+        let latest_attempt = state.error_history.last().map(|a| RetryAttemptPayload {
+            attempt_number: a.attempt_number,
+            error: truncate_string(&a.error, 500),
+            attempt_timestamp: a.timestamp.clone(),
+            delay_ms: a.delay_ms,
+            feedback_injected: a.feedback_injected,
+        });
+
+        // Build the full state payload
+        let state_payload = RetryStatePayload {
+            attempt: state.attempt,
+            last_error: state.last_error.as_ref().map(|e| truncate_string(e, 500)),
+            last_attempt_at: state.last_attempt_at.clone(),
+            total_delay_ms: state.total_delay_ms,
+            error_history: state
+                .error_history
+                .iter()
+                .map(|a| RetryAttemptPayload {
+                    attempt_number: a.attempt_number,
+                    error: truncate_string(&a.error, 200),
+                    attempt_timestamp: a.timestamp.clone(),
+                    delay_ms: a.delay_ms,
+                    feedback_injected: a.feedback_injected,
+                })
+                .collect(),
+        };
+
+        // Use the latest attempt or a placeholder
+        let attempt_payload = latest_attempt.unwrap_or(RetryAttemptPayload {
+            attempt_number: state.attempt,
+            error: state
+                .last_error
+                .as_ref()
+                .map(|e| truncate_string(e, 500))
+                .unwrap_or_default(),
+            attempt_timestamp: state
+                .last_attempt_at
+                .clone()
+                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+            delay_ms: 0,
+            feedback_injected: false,
+        });
+
+        let event = RetryAttemptEvent {
+            base: Self::create_base("retry_attempt", task_run_id),
+            attempt: attempt_payload,
+            state: state_payload,
+            exhausted,
+            next_retry_delay_ms,
+        };
+
+        info!(
+            "Emitting retry attempt: attempt {} of {}, exhausted={}",
+            state.attempt, max_retries, exhausted
+        );
+
+        if let Err(e) = app_handle.emit(Self::EVENT_CHANNEL, &event) {
+            debug!("Failed to emit retry attempt event: {}", e);
         }
     }
 
