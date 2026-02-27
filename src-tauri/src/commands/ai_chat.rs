@@ -7,9 +7,10 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use tauri::Emitter;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::claude_session::manager::SessionManager;
+use crate::claude_session::resume::{build_replay_prompt, parse_conversation};
 use crate::claude_session::state::SessionState;
 use crate::commands::{AppState, CommandResponse};
 use crate::database::{CheckpointDb, CreateTaskRunInput};
@@ -40,6 +41,56 @@ pub fn emit_session_state(
     };
     if let Err(e) = app_handle.emit("claude-session-state", &event) {
         warn!("Failed to emit claude-session-state event: {}", e);
+    }
+}
+
+/// List recent chat sessions for the sidebar.
+///
+/// Returns lightweight summaries of all chat sessions (running, stopped, failed),
+/// enriched with `is_live` indicating whether a live CLI process exists.
+#[tauri::command]
+pub async fn list_chat_sessions(
+    app_state: tauri::State<'_, Arc<AppState>>,
+    session_manager: tauri::State<'_, Arc<SessionManager>>,
+) -> Result<CommandResponse, String> {
+    let db = app_state.checkpoint_db.clone();
+    let result = tokio::task::spawn_blocking(move || db.get_chat_sessions(50)).await;
+
+    match result {
+        Ok(Ok(sessions)) => {
+            let enriched: Vec<serde_json::Value> = sessions
+                .into_iter()
+                .map(|s| {
+                    let is_live = session_manager.get(&s.id).is_some();
+                    serde_json::json!({
+                        "id": s.id,
+                        "task_name": s.task_name,
+                        "status": s.status,
+                        "updated_at": s.updated_at,
+                        "created_at": s.created_at,
+                        "is_live": is_live,
+                    })
+                })
+                .collect();
+
+            Ok(CommandResponse {
+                success: true,
+                message: None,
+                data: Some(serde_json::json!({
+                    "sessions": enriched,
+                })),
+            })
+        }
+        Ok(Err(e)) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Failed to list chat sessions: {}", e)),
+            data: None,
+        }),
+        Err(e) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Task failed: {}", e)),
+            data: None,
+        }),
     }
 }
 
@@ -383,85 +434,164 @@ pub async fn rename_chat_session(
 
 /// Get the output log for a chat session.
 ///
-/// Returns the full conversation output from the database.
+/// Returns the full conversation output. Combines the persisted DB output_log
+/// with any in-memory accumulated output from the live session that hasn't
+/// been persisted yet (e.g., the current or most recent AI response).
 #[tauri::command]
 pub async fn get_chat_output(
     app_state: tauri::State<'_, Arc<AppState>>,
+    session_manager: tauri::State<'_, Arc<SessionManager>>,
     task_run_id: String,
 ) -> Result<CommandResponse, String> {
     let db = app_state.checkpoint_db.clone();
     let id_clone = task_run_id.clone();
     let result = tokio::task::spawn_blocking(move || db.get_task_run_output(&id_clone)).await;
 
-    match result {
-        Ok(Ok(Some(output))) => Ok(CommandResponse {
-            success: true,
-            message: None,
-            data: Some(serde_json::json!({
-                "task_run_id": task_run_id,
-                "output_log": output,
-            })),
-        }),
-        Ok(Ok(None)) => Ok(CommandResponse {
-            success: true,
-            message: Some("No output available".to_string()),
-            data: Some(serde_json::json!({
-                "task_run_id": task_run_id,
-                "output_log": "",
-            })),
-        }),
-        _ => Ok(CommandResponse {
-            success: false,
-            message: Some("Failed to get output".to_string()),
-            data: None,
-        }),
+    let db_output = match result {
+        Ok(Ok(Some(output))) => output,
+        Ok(Ok(None)) => String::new(),
+        _ => {
+            return Ok(CommandResponse {
+                success: false,
+                message: Some("Failed to get output".to_string()),
+                data: None,
+            });
+        }
+    };
+
+    // If there's a live session, append any unpersisted AI output.
+    // The accumulated_output contains all AI text from the current session.
+    // The DB output_log may be missing the most recent AI response if the
+    // turn hasn't completed yet or the persister thread hasn't flushed.
+    let mut combined_output = db_output;
+    if let Some(session) = session_manager.get(&task_run_id) {
+        let live_output = session.get_output();
+        if !live_output.is_empty() {
+            // Check if the live output contains text not yet in the DB.
+            // The DB has [USER_MESSAGE] and [AI_RESPONSE] blocks.
+            // The live accumulated_output has raw AI text (no tags).
+            // We append it as an [AI_RESPONSE] block so parseOutputLog can find it.
+            let db_len_without_whitespace = combined_output.trim().len();
+            if db_len_without_whitespace == 0 {
+                // DB is empty, just wrap the live output
+                combined_output = format!("\n[AI_RESPONSE]\n{}\n[/AI_RESPONSE]\n", live_output);
+            } else {
+                // Check if the live output is already covered by DB content.
+                // A simple heuristic: if the last [AI_RESPONSE] block in the DB
+                // ends with the same content as the live output, it's already persisted.
+                let already_persisted = combined_output.contains("[AI_RESPONSE]")
+                    && combined_output
+                        .rfind("[/AI_RESPONSE]")
+                        .map(|pos| {
+                            // Find the start of the last AI_RESPONSE block
+                            let before = &combined_output[..pos];
+                            if let Some(start) = before.rfind("[AI_RESPONSE]") {
+                                let block_content =
+                                    combined_output[start + "[AI_RESPONSE]".len()..pos].trim();
+                                // If the live output starts with or equals the last block, it's covered
+                                live_output.trim().starts_with(block_content)
+                                    || block_content.starts_with(live_output.trim())
+                            } else {
+                                false
+                            }
+                        })
+                        .unwrap_or(false);
+
+                if !already_persisted {
+                    // Append the live output as a new AI_RESPONSE block
+                    combined_output.push_str(&format!(
+                        "\n[AI_RESPONSE]\n{}\n[/AI_RESPONSE]\n",
+                        live_output
+                    ));
+                }
+            }
+        }
     }
+
+    Ok(CommandResponse {
+        success: true,
+        message: if combined_output.is_empty() {
+            Some("No output available".to_string())
+        } else {
+            None
+        },
+        data: Some(serde_json::json!({
+            "task_run_id": task_run_id,
+            "output_log": combined_output,
+        })),
+    })
 }
 
 /// Generate a workflow from a chat conversation.
 ///
 /// Reads the conversation output log and uses the workflow generator
 /// to create a UnifiedWorkflow from the conversation context.
+/// When `source_content` is provided, uses that specific message instead
+/// of the full conversation, and enriches the context with spec generation
+/// instructions and existing page specs.
 #[tauri::command]
 pub async fn generate_workflow_from_chat(
     app_state: tauri::State<'_, Arc<AppState>>,
     task_run_id: String,
     description: Option<String>,
     include_ui_bridge: Option<bool>,
+    source_content: Option<String>,
 ) -> Result<CommandResponse, String> {
-    info!("generate_workflow_from_chat: task_run_id={}", task_run_id);
+    info!(
+        "generate_workflow_from_chat: task_run_id={}, has_source_content={}",
+        task_run_id,
+        source_content.is_some()
+    );
 
-    // Get conversation from DB output_log
+    // Get conversation from DB output_log (needed as fallback if no source_content)
     let db = app_state.checkpoint_db.clone();
     let id_clone = task_run_id.clone();
     let output_log =
         match tokio::task::spawn_blocking(move || db.get_task_run_output(&id_clone)).await {
             Ok(Ok(Some(log))) => log,
             Ok(Ok(None)) => {
-                return Ok(CommandResponse {
-                    success: false,
-                    message: Some("No conversation history available".to_string()),
-                    data: None,
-                });
+                if source_content.is_none() {
+                    return Ok(CommandResponse {
+                        success: false,
+                        message: Some("No conversation history available".to_string()),
+                        data: None,
+                    });
+                }
+                String::new()
             }
             _ => {
-                return Ok(CommandResponse {
-                    success: false,
-                    message: Some("Failed to read conversation".to_string()),
-                    data: None,
-                });
+                if source_content.is_none() {
+                    return Ok(CommandResponse {
+                        success: false,
+                        message: Some("Failed to read conversation".to_string()),
+                        data: None,
+                    });
+                }
+                String::new()
             }
         };
+
+    // Determine the plan text to use for generation
+    let plan_text = source_content.as_deref().unwrap_or(&output_log);
+
+    // When generating from a specific message, fetch existing specs and build
+    // enriched context with spec generation instructions
+    let inline_context = if source_content.is_some() {
+        let existing_specs = fetch_existing_specs().await;
+        build_spec_aware_context(plan_text, &existing_specs)
+    } else {
+        format!(
+            "The following is a conversation between a user and an AI assistant. \
+             Use this conversation context to generate an appropriate workflow:\n\n{}",
+            plan_text
+        )
+    };
 
     // Build generation request with conversation as inline context
     let request = crate::workflow_generation::GenerateWorkflowRequest {
         description: description
             .unwrap_or_else(|| "Generate workflow from chat conversation".to_string()),
-        inline_context: Some(format!(
-            "The following is a conversation between a user and an AI assistant. \
-             Use this conversation context to generate an appropriate workflow:\n\n{}",
-            output_log
-        )),
+        inline_context: Some(inline_context),
         category: None,
         tags: None,
         max_iterations: None,
@@ -475,6 +605,7 @@ pub async fn generate_workflow_from_chat(
         max_fix_iterations: Some(3),
         discovery_mode: None,
         include_ui_bridge_instructions: include_ui_bridge,
+        reflection_mode: None,
     };
 
     // Get doctor handle for health monitoring
@@ -528,4 +659,359 @@ pub async fn generate_workflow_from_chat(
             data: None,
         }),
     }
+}
+
+/// Resume interrupted chat sessions on startup.
+///
+/// Queries for task runs with status='running' and workflow_type='chat',
+/// parses their conversation history from the output_log, spawns new
+/// Claude CLI sessions with a replay prompt, and re-registers them in
+/// the SessionManager.
+///
+/// Returns the number of sessions successfully resumed.
+pub async fn resume_chat_sessions(
+    db: Arc<CheckpointDb>,
+    session_manager: Arc<SessionManager>,
+    app_handle: tauri::AppHandle,
+) -> u32 {
+    // Query running chat sessions
+    let db_for_query = db.clone();
+    let chat_sessions =
+        match tokio::task::spawn_blocking(move || db_for_query.get_running_chat_sessions()).await {
+            Ok(Ok(sessions)) => sessions,
+            Ok(Err(e)) => {
+                warn!("Failed to query running chat sessions: {}", e);
+                return 0;
+            }
+            Err(e) => {
+                warn!("Task panicked querying chat sessions: {}", e);
+                return 0;
+            }
+        };
+
+    if chat_sessions.is_empty() {
+        return 0;
+    }
+
+    info!(
+        "Found {} interrupted chat session(s) to resume",
+        chat_sessions.len()
+    );
+
+    let mut resumed_count = 0u32;
+
+    for task_run in chat_sessions {
+        let task_run_id = task_run.id.clone();
+        let task_name = task_run.task_name.clone();
+
+        // Skip stale sessions older than 24 hours — mark as stopped
+        if let Ok(ts) =
+            chrono::NaiveDateTime::parse_from_str(&task_run.updated_at, "%Y-%m-%d %H:%M:%S")
+        {
+            let age = chrono::Utc::now().naive_utc() - ts;
+            if age > chrono::Duration::hours(24) {
+                info!(
+                    "Chat session {} is stale ({} hours old), marking as stopped",
+                    task_run_id,
+                    age.num_hours()
+                );
+                let db_for_stop = db.clone();
+                let id_for_stop = task_run_id.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    db_for_stop.update_task_run_status(&id_for_stop, "stopped")
+                })
+                .await;
+                continue;
+            }
+        }
+
+        // Read full output_log
+        let db_for_output = db.clone();
+        let id_for_output = task_run_id.clone();
+        let output_log = match tokio::task::spawn_blocking(move || {
+            db_for_output.get_task_run_output(&id_for_output)
+        })
+        .await
+        {
+            Ok(Ok(Some(log))) => log,
+            _ => {
+                info!(
+                    "No output_log for chat session {}, marking as stopped",
+                    task_run_id
+                );
+                let db_for_stop = db.clone();
+                let id_for_stop = task_run_id.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    db_for_stop.update_task_run_status(&id_for_stop, "stopped")
+                })
+                .await;
+                continue;
+            }
+        };
+
+        // Parse conversation history
+        let turns = parse_conversation(&output_log);
+        if turns.is_empty() {
+            info!(
+                "Empty conversation for chat session {}, marking as stopped",
+                task_run_id
+            );
+            let db_for_stop = db.clone();
+            let id_for_stop = task_run_id.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                db_for_stop.update_task_run_status(&id_for_stop, "stopped")
+            })
+            .await;
+            continue;
+        }
+
+        // Build replay prompt
+        let replay_prompt = build_replay_prompt(&turns, None);
+
+        // Write a [CHAT_RESUMED] marker to output_log and increment sessions_count
+        {
+            let db_for_marker = db.clone();
+            let id_for_marker = task_run_id.clone();
+            let marker = format!(
+                "\n[CHAT_RESUMED]\nSession resumed after runner restart ({} turns replayed)\n[/CHAT_RESUMED]\n",
+                turns.len()
+            );
+            let _ = tokio::task::spawn_blocking(move || {
+                // increment_session=true to track how many times this session has been (re)started
+                db_for_marker.append_task_output_ex(&id_for_marker, &marker, true, false)
+            })
+            .await;
+        }
+
+        // Spawn new Claude session
+        let working_dir = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+
+        let session_ctx = AiSessionContext::setup(&task_run_id, &task_name);
+
+        match crate::claude_session::ClaudeSession::spawn(
+            &working_dir,
+            &task_run_id,
+            &app_handle,
+            Some(session_ctx),
+            None, // finding_ctx
+            None, // progress_ctx
+            None, // pid_tracker
+        ) {
+            Ok(session) => {
+                // Send the replay prompt as the initial message
+                match session.send_initial_prompt(&replay_prompt) {
+                    Ok(()) => {
+                        let session = Arc::new(session);
+                        if let Err(e) = session_manager.register(&task_run_id, session.clone()) {
+                            warn!(
+                                "Failed to register resumed chat session {}: {}",
+                                task_run_id, e
+                            );
+                            let _ = session.close();
+                            continue;
+                        }
+
+                        // Emit processing state so frontend knows it's alive
+                        emit_session_state(
+                            &app_handle,
+                            &task_run_id,
+                            &task_run_id,
+                            SessionState::Processing,
+                        );
+
+                        info!("Resumed chat session: {} (\"{}\")", task_run_id, task_name);
+                        resumed_count += 1;
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to send replay prompt for chat session {}: {}",
+                            task_run_id, e
+                        );
+                        let _ = session.close();
+                        let db_for_fail = db.clone();
+                        let id_for_fail = task_run_id.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            db_for_fail.update_task_run_status(&id_for_fail, "failed")
+                        })
+                        .await;
+                    }
+                }
+            }
+            Err(e) => {
+                error!(
+                    "Failed to spawn Claude session for resume {}: {}",
+                    task_run_id, e
+                );
+                let db_for_fail = db.clone();
+                let id_for_fail = task_run_id.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    db_for_fail.update_task_run_status(&id_for_fail, "failed")
+                })
+                .await;
+            }
+        }
+    }
+
+    resumed_count
+}
+
+/// Fetch existing page specs from the runner's UI Bridge endpoints.
+///
+/// Tries both the cached external app specs and the runner's own specs.
+/// Returns a JSON string of whatever specs are available, or an empty message.
+async fn fetch_existing_specs() -> String {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .unwrap_or_default();
+
+    let mut specs_parts: Vec<String> = Vec::new();
+
+    // Fetch cached external app specs
+    match client
+        .get("http://localhost:9876/ui-bridge/sdk/cached-specs")
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(body) = resp.text().await {
+                if body.len() > 5 {
+                    specs_parts.push(format!("### External App Specs\n{}", body));
+                }
+            }
+        }
+        _ => {
+            info!("No cached external app specs available");
+        }
+    }
+
+    // Fetch runner's own page specs
+    match client
+        .get("http://localhost:9876/ui-bridge/control/specs")
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(body) = resp.text().await {
+                if body.len() > 5 {
+                    specs_parts.push(format!("### Runner Page Specs\n{}", body));
+                }
+            }
+        }
+        _ => {
+            info!("No runner page specs available");
+        }
+    }
+
+    if specs_parts.is_empty() {
+        "No existing specs found".to_string()
+    } else {
+        specs_parts.join("\n\n")
+    }
+}
+
+/// Build enriched inline context for spec-aware workflow generation.
+///
+/// Combines the plan text with spec generation instructions and any
+/// existing specs so the AI can create/update page specs alongside
+/// the workflow.
+fn build_spec_aware_context(plan_text: &str, existing_specs: &str) -> String {
+    format!(
+        r#"The following AI plan message describes what should be built. Generate a workflow
+that implements this plan, including creating or updating semantic page specs.
+
+## Plan
+{plan_text}
+
+## Semantic Page Spec Generation
+
+When the plan describes creating NEW pages:
+- Generate a `.spec.uibridge.json` file for each new page as part of the agentic steps
+- Use the plan's description to define semantic spec groups (what the page SHOULD do)
+- Wire individual UI elements with element-presence assertions using data-ui-id attributes
+- Include form-validation, state-consistency, and accessibility assertions
+- Set `source: "ai-generated"` on all assertion groups
+
+When the plan describes MODIFYING existing pages:
+- The existing specs are provided below — update them to reflect the planned changes
+- Add new assertions for new functionality, update existing ones for changed behavior
+
+### Spec File Format
+
+Each `.spec.uibridge.json` file follows this structure:
+```json
+{{
+  "version": "1.0",
+  "description": "Page description",
+  "groups": [
+    {{
+      "id": "group-id",
+      "name": "Group Name",
+      "description": "What this group verifies",
+      "category": "ui-elements",
+      "source": "ai-generated",
+      "assertions": [
+        {{
+          "id": "assert-id",
+          "description": "What this assertion checks",
+          "category": "element-presence",
+          "severity": "critical",
+          "enabled": true,
+          "target": {{
+            "type": "search",
+            "criteria": {{ "role": "button", "textContent": "Submit" }}
+          }},
+          "assertionType": "exists"
+        }}
+      ]
+    }}
+  ],
+  "metadata": {{
+    "component": "ComponentName",
+    "pageUrl": "/page-path",
+    "tags": ["generated"]
+  }}
+}}
+```
+
+### Available Assertion Types
+- `exists` / `notExists` — element presence or absence
+- `visible` / `hidden` — element visibility
+- `enabled` / `disabled` — interactive element state
+- `focused` — keyboard focus
+- `checked` / `unchecked` — checkbox/radio state
+- `hasText` / `containsText` — exact or partial text match
+- `hasValue` — form input value
+- `count` — number of matching elements
+- `attribute` — element attribute value
+- `hasClass` — CSS class presence
+- `cssProperty` — computed CSS property
+
+### Severity Levels
+- `critical` — core functionality that must work
+- `warning` — important features
+- `info` — nice-to-have checks
+
+### Target Types
+**Search target** (preferred — finds elements by semantic criteria):
+```json
+{{ "type": "search", "criteria": {{ "role": "button", "textContent": "Save" }} }}
+```
+
+**Element ID target** (use when data-ui-id is set):
+```json
+{{ "type": "elementId", "elementId": "settings-dark-mode-toggle" }}
+```
+
+### Implementation Guidelines
+- Add `data-ui-id` attributes to key interactive elements in generated markup
+- Create verification steps that load and run the generated specs
+- Group assertions semantically (e.g., "form-elements", "navigation", "state-management")
+
+### Existing Specs
+{existing_specs}
+"#
+    )
 }

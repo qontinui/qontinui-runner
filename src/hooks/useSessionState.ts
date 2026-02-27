@@ -52,9 +52,16 @@ function ensureListener() {
 
   listen<SessionStateEvent>("claude-session-state", (event) => {
     const { taskRunId, sessionId, state } = event.payload;
-    currentState = state as SessionState;
-    currentTaskRunId = taskRunId;
-    currentSessionId = sessionId;
+    if (state === "closed") {
+      // Reset module-level state so stale sessions don't leak across pages
+      currentState = null;
+      currentTaskRunId = null;
+      currentSessionId = null;
+    } else {
+      currentState = state as SessionState;
+      currentTaskRunId = taskRunId;
+      currentSessionId = sessionId;
+    }
     notifySubscribers();
   });
 }
@@ -63,7 +70,9 @@ function ensureListener() {
  * Hook to track the current interactive Claude session state.
  *
  * @param filterTaskRunId - Optional task run ID to filter events for.
- * @returns Session state info for the given task run.
+ *   Pass `undefined`/omit to accept all session state events (recommended
+ *   when the dashboard task ID may differ from the Rust executor's ID).
+ * @returns Session state info including the event's own taskRunId.
  */
 export function useSessionState(filterTaskRunId?: string | null) {
   const [state, setState] = useState<SessionState>(
@@ -71,6 +80,9 @@ export function useSessionState(filterTaskRunId?: string | null) {
   );
   const [sessionId, setSessionId] = useState<string | null>(
     filterTaskRunId && filterTaskRunId === currentTaskRunId ? currentSessionId : null,
+  );
+  const [taskRunId, setTaskRunId] = useState<string | null>(
+    filterTaskRunId && filterTaskRunId === currentTaskRunId ? currentTaskRunId : null,
   );
 
   useEffect(() => {
@@ -83,6 +95,7 @@ export function useSessionState(filterTaskRunId?: string | null) {
       }
       setState(currentState);
       setSessionId(currentSessionId);
+      setTaskRunId(currentTaskRunId);
     };
 
     subscribers.add(handler);
@@ -102,6 +115,8 @@ export function useSessionState(filterTaskRunId?: string | null) {
   return {
     state,
     sessionId,
+    /** The task run ID from the session state event (may differ from dashboard task ID). */
+    taskRunId,
     canSendMessage,
     canInterrupt,
     isActive,

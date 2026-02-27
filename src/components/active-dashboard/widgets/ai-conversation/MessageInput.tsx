@@ -2,7 +2,13 @@
  * MessageInput Component
  *
  * Text input for sending user messages to an active interactive Claude session.
+ * Always visible when a task is running, with session state indicator.
  * Shows send/interrupt buttons based on session state.
+ *
+ * Uses unfiltered session state events because the Rust executor's task_run_id
+ * (emitted in claude-session-state events) may differ from the dashboard's
+ * task run ID (from GET /task-runs/running). The event's own taskRunId is used
+ * for IPC calls like send_user_message and interrupt_ai_session.
  */
 
 import { useState, useCallback, useRef, useEffect } from "react";
@@ -10,14 +16,54 @@ import { invoke } from "@tauri-apps/api/core";
 import { Send, StopCircle, Loader2 } from "lucide-react";
 import { cn } from "../../../../lib/utils";
 import { useSessionState } from "../../../../hooks/useSessionState";
-import { useCurrentTaskRunId } from "../../../../contexts/TaskContext";
+import { useIsTaskRunning } from "../../../../contexts/TaskContext";
+
+/**
+ * Session state indicator dot + label.
+ */
+function SessionStateIndicator({ state, canSend }: { state: string | null; canSend: boolean }) {
+  if (canSend || state === "ready") {
+    return (
+      <div className="flex items-center gap-1.5">
+        <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
+        <span className="text-[10px] text-green-400">Ready</span>
+      </div>
+    );
+  }
+  if (state === "processing" || state === "interrupting") {
+    return (
+      <div className="flex items-center gap-1.5">
+        <div className="w-2 h-2 rounded-full bg-yellow-500 animate-pulse" />
+        <span className="text-[10px] text-yellow-400">AI Processing</span>
+      </div>
+    );
+  }
+  if (state === "initializing" || state === "created") {
+    return (
+      <div className="flex items-center gap-1.5">
+        <div className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
+        <span className="text-[10px] text-blue-400">Initializing</span>
+      </div>
+    );
+  }
+  return (
+    <div className="flex items-center gap-1.5">
+      <div className="w-2 h-2 rounded-full bg-muted-foreground/50" />
+      <span className="text-[10px] text-muted-foreground">Waiting for session</span>
+    </div>
+  );
+}
 
 /**
  * MessageInput component for the AI conversation widget.
+ * Renders whenever a task is running, with state-aware enable/disable.
  */
 export function MessageInput() {
-  const taskRunId = useCurrentTaskRunId();
-  const { state, canSendMessage, canInterrupt, isActive } = useSessionState(taskRunId);
+  const isTaskRunning = useIsTaskRunning();
+  // Don't filter by dashboard taskRunId — the Rust executor's task_run_id
+  // (in claude-session-state events) may differ from the dashboard's ID.
+  // The event's own taskRunId is used for IPC calls.
+  const { state, taskRunId: sessionTaskRunId, canSendMessage, canInterrupt } = useSessionState();
   const [message, setMessage] = useState("");
   const [isSending, setIsSending] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -31,12 +77,12 @@ export function MessageInput() {
   }, [message]);
 
   const handleSend = useCallback(async () => {
-    if (!message.trim() || !taskRunId || !canSendMessage) return;
+    if (!message.trim() || !sessionTaskRunId || !canSendMessage) return;
 
     setIsSending(true);
     try {
       await invoke("send_user_message", {
-        taskRunId,
+        taskRunId: sessionTaskRunId,
         message: message.trim(),
       });
       setMessage("");
@@ -45,17 +91,17 @@ export function MessageInput() {
     } finally {
       setIsSending(false);
     }
-  }, [message, taskRunId, canSendMessage]);
+  }, [message, sessionTaskRunId, canSendMessage]);
 
   const handleInterrupt = useCallback(async () => {
-    if (!taskRunId || !canInterrupt) return;
+    if (!sessionTaskRunId || !canInterrupt) return;
 
     try {
-      await invoke("interrupt_ai_session", { taskRunId });
+      await invoke("interrupt_ai_session", { taskRunId: sessionTaskRunId });
     } catch (err) {
       console.error("[MessageInput] Failed to interrupt:", err);
     }
-  }, [taskRunId, canInterrupt]);
+  }, [sessionTaskRunId, canInterrupt]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -68,16 +114,26 @@ export function MessageInput() {
     [handleSend],
   );
 
-  // Don't render if no active session
-  if (!isActive) return null;
+  // Don't render if no task is running
+  if (!isTaskRunning) return null;
 
   const isProcessing = state === "processing";
-  const placeholder = isProcessing
-    ? "AI is processing... (message will be queued)"
-    : "Send a message...";
+  const placeholder = canSendMessage
+    ? "Send a message to the AI..."
+    : isProcessing
+      ? "Type a message (will be queued)..."
+      : "Type a message...";
 
   return (
-    <div className="border-t border-border bg-background px-3 py-2">
+    <div className="border-t border-border bg-background px-3 py-2 space-y-1.5">
+      <div className="flex items-center justify-between">
+        <SessionStateIndicator state={state} canSend={canSendMessage} />
+        {isProcessing && message.trim() && (
+          <span className="text-[10px] text-muted-foreground/60 italic">
+            Message will be queued
+          </span>
+        )}
+      </div>
       <div className="flex items-end gap-2">
         <textarea
           ref={textareaRef}
@@ -85,7 +141,7 @@ export function MessageInput() {
           onChange={(e) => setMessage(e.target.value)}
           onKeyDown={handleKeyDown}
           placeholder={placeholder}
-          disabled={!canSendMessage || isSending}
+          disabled={isSending}
           rows={1}
           className={cn(
             "flex-1 resize-none rounded-md border border-border bg-muted/30 px-3 py-2 text-sm",
@@ -122,11 +178,6 @@ export function MessageInput() {
           {isSending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
         </button>
       </div>
-      {isProcessing && message.trim() && (
-        <p className="text-[10px] text-muted-foreground/60 mt-1 px-1">
-          Message will be queued and sent after the current turn completes
-        </p>
-      )}
     </div>
   );
 }

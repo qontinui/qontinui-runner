@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -73,6 +73,10 @@ pub struct ClaudeSession {
     pid_tracker: Option<Arc<Mutex<Vec<u32>>>>,
     /// Sender to signal completion to wait_for_result().
     completion_tx: Mutex<Option<mpsc::Sender<(bool, String)>>>,
+    /// Tracks how many bytes of accumulated_output have been persisted to DB.
+    persisted_output_len: Arc<AtomicUsize>,
+    /// Sender for AI output deltas to persist to DB after each turn.
+    turn_persist_tx: Option<mpsc::Sender<String>>,
 }
 
 // SAFETY: ClaudeSession contains a raw Windows handle (RawHandle = *mut c_void) for the stdout
@@ -176,6 +180,58 @@ impl ClaudeSession {
             .map_err(|e| format!("Failed to send init request: {}", e))?;
         info!("Sent initialize request (id: {})", init_request_id);
 
+        // AI output persistence tracking
+        let persisted_output_len = Arc::new(AtomicUsize::new(0));
+
+        // Create a channel for persisting AI output to DB after each turn.
+        // The persister thread receives output deltas and writes them with
+        // [AI_RESPONSE] markers via append_task_output_ex.
+        let (turn_persist_tx, turn_persist_rx) = mpsc::channel::<String>();
+        let turn_persist_tx_option = if session_ctx.is_some() {
+            let persist_task_run_id = session_ctx
+                .as_ref()
+                .map(|c| c.task_run_id().to_string())
+                .unwrap_or_default();
+
+            thread::spawn(move || {
+                // Open DB connection once for the lifetime of this thread
+                let db = match CheckpointDb::new() {
+                    Ok(db) => db,
+                    Err(e) => {
+                        warn!("Failed to open DB for AI output persistence: {}", e);
+                        // Drain the channel so senders don't block
+                        while turn_persist_rx.recv().is_ok() {}
+                        return;
+                    }
+                };
+
+                while let Ok(delta) = turn_persist_rx.recv() {
+                    if delta.is_empty() {
+                        continue;
+                    }
+                    let formatted = format!("\n[AI_RESPONSE]\n{}\n[/AI_RESPONSE]\n", delta);
+                    if let Err(e) =
+                        db.append_task_output_ex(&persist_task_run_id, &formatted, false, false)
+                    {
+                        warn!("Failed to persist AI response to output_log: {}", e);
+                    } else {
+                        debug!(
+                            "Persisted AI response ({} chars) for task_run_id={}",
+                            delta.len(),
+                            persist_task_run_id
+                        );
+                    }
+                }
+                debug!("AI output persister thread exiting");
+            });
+
+            Some(turn_persist_tx)
+        } else {
+            // No session context — drop the receiver so channel is closed
+            drop(turn_persist_rx);
+            None
+        };
+
         // Channels for findings and progress
         let (finding_tx, finding_rx) = mpsc::channel::<ParsedFinding>();
         let (progress_tx, progress_rx) = mpsc::channel::<ParsedProgress>();
@@ -242,6 +298,8 @@ impl ClaudeSession {
         let shared_output_for_thread = shared_output_buf.clone();
         let finding_ctx_for_stdout = finding_ctx.clone();
         let progress_ctx_for_stdout = progress_ctx.clone();
+        let persist_tx_for_stdout = turn_persist_tx_option.clone();
+        let persisted_len_for_stdout = persisted_output_len.clone();
 
         let stdout_handle = thread::spawn(move || {
             let mut all_text = String::new();
@@ -290,6 +348,8 @@ impl ClaudeSession {
                                 &pending_for_stdout,
                                 &accumulated_for_stdout,
                                 &user_interacted_for_stdout,
+                                &persist_tx_for_stdout,
+                                &persisted_len_for_stdout,
                             ) {
                                 has_output_stdout.store(true, Ordering::Relaxed);
                                 all_text.push_str(&text);
@@ -604,7 +664,7 @@ impl ClaudeSession {
 
         // Wait briefly for the init handshake to complete
         // The dispatcher handles the ControlResponse and transitions to Ready
-        let init_deadline = Instant::now() + Duration::from_secs(30);
+        let init_deadline = Instant::now() + Duration::from_secs(60);
         let mut stderr_handle = Some(stderr_handle);
         loop {
             let current_state = state_tracker.get();
@@ -630,7 +690,7 @@ impl ClaudeSession {
                 }
             }
             if Instant::now() > init_deadline {
-                return Err("Initialization timeout (30s) - Claude CLI did not respond".to_string());
+                return Err("Initialization timeout (60s) - Claude CLI did not respond".to_string());
             }
             thread::sleep(Duration::from_millis(50));
         }
@@ -657,6 +717,8 @@ impl ClaudeSession {
             stdout_raw_handle,
             pid_tracker,
             completion_tx: Mutex::new(None),
+            persisted_output_len,
+            turn_persist_tx: turn_persist_tx_option,
         })
     }
 
@@ -673,6 +735,11 @@ impl ClaudeSession {
     /// Get the child process PID.
     pub fn pid(&self) -> u32 {
         self.child_pid
+    }
+
+    /// Get the last-activity tracker Arc (for Doctor health monitoring).
+    pub fn last_activity_tracker(&self) -> Arc<AtomicU64> {
+        self.last_activity.clone()
     }
 
     /// Whether a user has interacted with this session.
@@ -852,6 +919,23 @@ impl ClaudeSession {
         // Stop heartbeat
         if let Some(ref tx) = self.stop_heartbeat {
             let _ = tx.send(());
+        }
+
+        // Flush any remaining unpersisted output before closing.
+        // Set persisted_output_len to MAX first to prevent the dispatcher from
+        // also sending a delta for the same content (race with stdout thread).
+        if let Some(ref tx) = self.turn_persist_tx {
+            if let Ok(buf) = self.accumulated_output.lock() {
+                let persisted = self.persisted_output_len.swap(usize::MAX, Ordering::SeqCst);
+                if buf.len() > persisted {
+                    let delta = buf[persisted..].to_string();
+                    if !delta.trim().is_empty() {
+                        let _ = tx.send(delta);
+                    }
+                }
+            }
+            // Note: the sender is dropped when the ClaudeSession struct is dropped,
+            // which terminates the persister thread after it processes pending messages.
         }
 
         // Close stdin (sends EOF to CLI)

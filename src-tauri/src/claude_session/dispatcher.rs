@@ -5,6 +5,7 @@
 //! handling, and state transitions.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
@@ -75,6 +76,8 @@ pub fn dispatch_line(
     pending_messages: &Arc<std::sync::Mutex<VecDeque<String>>>,
     accumulated_output: &Arc<std::sync::Mutex<String>>,
     user_has_interacted: &std::sync::atomic::AtomicBool,
+    turn_persist_tx: &Option<Sender<String>>,
+    persisted_output_len: &AtomicUsize,
 ) -> Option<String> {
     // Decode the NDJSON line
     let msg = match decode_message(line) {
@@ -87,6 +90,20 @@ pub fn dispatch_line(
 
     // Handle control requests from CLI (auto-approve tool use in bypass mode)
     if let Some(ctrl_req) = msg.as_control_request() {
+        // Emit tool activity event so the frontend can show what the AI is doing
+        if ctrl_req.request.subtype == "can_use_tool" {
+            if let Some(tool_name) = ctrl_req
+                .request
+                .data
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+            {
+                let activity = format_tool_activity(tool_name, &ctrl_req.request.data);
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    emit_ai_output(app_handle, &activity, "tool_activity", None, session_ctx);
+                }));
+            }
+        }
         handle_control_request(ctrl_req, stdin_writer);
         return None;
     }
@@ -129,6 +146,21 @@ pub fn dispatch_line(
             );
         }
 
+        // Persist the AI response delta to DB for chat session resilience.
+        // This captures everything the AI said since the last persist point.
+        if let Some(ref tx) = turn_persist_tx {
+            if let Ok(buf) = accumulated_output.lock() {
+                let persisted = persisted_output_len.load(Ordering::Relaxed);
+                if buf.len() > persisted {
+                    let delta = buf[persisted..].to_string();
+                    if !delta.trim().is_empty() {
+                        persisted_output_len.store(buf.len(), Ordering::Relaxed);
+                        let _ = tx.send(delta);
+                    }
+                }
+            }
+        }
+
         // Check for pending user messages and send the next one
         send_next_pending_message(
             state_tracker,
@@ -138,6 +170,11 @@ pub fn dispatch_line(
             app_handle,
             session_ctx,
         );
+
+        // Skip text extraction for result messages — the text was already
+        // emitted via streaming content_block_delta events. Extracting text
+        // from the result would duplicate the entire response.
+        return None;
     }
 
     // Extract text from the message
@@ -204,6 +241,87 @@ fn handle_control_request(
             "CLI control request without request_id, cannot respond: {}",
             subtype
         );
+    }
+}
+
+/// Format a human-readable description of a tool activity.
+///
+/// Extracts the tool name and key details (file path, command, etc.)
+/// to show what the AI is currently doing.
+fn format_tool_activity(
+    tool_name: &str,
+    data: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    match tool_name {
+        "Read" | "read" => {
+            if let Some(path) = data.get("file_path").and_then(|v| v.as_str()) {
+                let short = short_path(path);
+                format!("Reading {}", short)
+            } else {
+                "Reading file...".to_string()
+            }
+        }
+        "Write" | "write" => {
+            if let Some(path) = data.get("file_path").and_then(|v| v.as_str()) {
+                let short = short_path(path);
+                format!("Writing {}", short)
+            } else {
+                "Writing file...".to_string()
+            }
+        }
+        "Edit" | "edit" => {
+            if let Some(path) = data.get("file_path").and_then(|v| v.as_str()) {
+                let short = short_path(path);
+                format!("Editing {}", short)
+            } else {
+                "Editing file...".to_string()
+            }
+        }
+        "Bash" | "bash" => {
+            if let Some(cmd) = data.get("command").and_then(|v| v.as_str()) {
+                let short_cmd = if cmd.len() > 60 {
+                    format!("{}...", &cmd[..57])
+                } else {
+                    cmd.to_string()
+                };
+                format!("Running: {}", short_cmd)
+            } else {
+                "Running command...".to_string()
+            }
+        }
+        "Glob" | "glob" => {
+            if let Some(pattern) = data.get("pattern").and_then(|v| v.as_str()) {
+                format!("Searching for {}", pattern)
+            } else {
+                "Searching files...".to_string()
+            }
+        }
+        "Grep" | "grep" => {
+            if let Some(pattern) = data.get("pattern").and_then(|v| v.as_str()) {
+                let short = if pattern.len() > 40 {
+                    format!("{}...", &pattern[..37])
+                } else {
+                    pattern.to_string()
+                };
+                format!("Searching for \"{}\"", short)
+            } else {
+                "Searching code...".to_string()
+            }
+        }
+        "WebFetch" | "WebSearch" => "Searching the web...".to_string(),
+        "Task" => "Running subagent...".to_string(),
+        _ => format!("Using {}...", tool_name),
+    }
+}
+
+/// Shorten a file path to just the filename or last two components.
+fn short_path(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let parts: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
+    match parts.len() {
+        0 => path.to_string(),
+        1 => parts[0].to_string(),
+        _ => format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1]),
     }
 }
 

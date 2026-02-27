@@ -34,7 +34,6 @@ import {
   BarChart3,
   Database,
   TestTube,
-  MessageSquare,
 } from "lucide-react";
 
 // Contexts
@@ -139,6 +138,7 @@ import { ActiveDashboardPage } from "./components/active-dashboard";
 import { HistoryTab } from "./components/HistoryTab";
 import { ExecuteTab } from "./components/ExecuteTab";
 import { WorkflowQueueTab } from "./components/workflow-queue";
+import { ChatPage } from "./components/chat";
 // Monitor/Observe components
 import { ExecutionReport } from "./components/findings";
 import { StateExplorerTab } from "./components/state-explorer";
@@ -893,15 +893,10 @@ function AppContent() {
 
       case "run-plan":
         return (
-          <div className="h-full flex items-center justify-center">
-            <div className="text-center space-y-4 max-w-md">
-              <MessageSquare className="w-12 h-12 mx-auto text-muted-foreground/50" />
-              <h2 className="text-xl font-semibold">AI Chat</h2>
-              <p className="text-muted-foreground">
-                Plan features with AI and generate workflows. This feature is coming soon.
-              </p>
-            </div>
-          </div>
+          <ChatPage
+            onNavigateToBuilder={() => setActiveTab("unified-workflow-builder")}
+            onNavigateToActive={() => setActiveTab("active")}
+          />
         );
 
       case "active":
@@ -957,7 +952,11 @@ function AppContent() {
       case "run-recap":
         return (
           <RunSelectionProvider>
-            <RunPageLayout title="Recap" icon={ClipboardCheck}>
+            <RunPageLayout
+              title="Recap"
+              icon={ClipboardCheck}
+              onNavigateToActive={() => setActiveTab("active")}
+            >
               <div className="h-full overflow-hidden">
                 <RunRecapTab
                   onNavigateToAiOutput={(phase, iteration) => {
@@ -984,6 +983,7 @@ function AppContent() {
               title="Actions"
               icon={Zap}
               badgeCount={actionLogViewData?.visible_count || 0}
+              onNavigateToActive={() => setActiveTab("active")}
             >
               <div className="h-full p-4 overflow-hidden">
                 <div className="h-full card overflow-hidden">
@@ -1003,7 +1003,12 @@ function AppContent() {
       case "run-image":
         return (
           <RunSelectionProvider>
-            <RunPageLayout title="Image Recognition" icon={Image} badgeCount={imageLogCount}>
+            <RunPageLayout
+              title="Image Recognition"
+              icon={Image}
+              badgeCount={imageLogCount}
+              onNavigateToActive={() => setActiveTab("active")}
+            >
               <div className="h-full p-4 overflow-hidden">
                 <div className="h-full card overflow-hidden">
                   <RunImageRecognitionTab
@@ -1022,7 +1027,11 @@ function AppContent() {
       case "run-findings":
         return (
           <RunSelectionProvider>
-            <RunPageLayout title="Findings" icon={FileText}>
+            <RunPageLayout
+              title="Findings"
+              icon={FileText}
+              onNavigateToActive={() => setActiveTab("active")}
+            >
               <div className="h-full overflow-hidden">
                 <ExecutionReport />
               </div>
@@ -1033,7 +1042,11 @@ function AppContent() {
       case "run-state-explorer":
         return (
           <RunSelectionProvider>
-            <RunPageLayout title="State Explorer" icon={FileSearch}>
+            <RunPageLayout
+              title="State Explorer"
+              icon={FileSearch}
+              onNavigateToActive={() => setActiveTab("active")}
+            >
               <div className="h-full overflow-hidden">
                 <StateExplorerTab />
               </div>
@@ -1044,7 +1057,11 @@ function AppContent() {
       case "run-tests":
         return (
           <RunSelectionProvider>
-            <RunPageLayout title="Test Results" icon={TestTube}>
+            <RunPageLayout
+              title="Test Results"
+              icon={TestTube}
+              onNavigateToActive={() => setActiveTab("active")}
+            >
               <div className="h-full overflow-hidden">
                 <TestResultsTab />
               </div>
@@ -1055,7 +1072,11 @@ function AppContent() {
       case "run-ai-output":
         return (
           <RunSelectionProvider>
-            <RunPageLayout title="AI Output" icon={Bot}>
+            <RunPageLayout
+              title="AI Output"
+              icon={Bot}
+              onNavigateToActive={() => setActiveTab("active")}
+            >
               <AiTab
                 aiOutputLines={aiOutputLogs}
                 onClearAiOutput={clearAiOutputLogs}
@@ -1080,7 +1101,11 @@ function AppContent() {
       case "run-statistics":
         return (
           <RunSelectionProvider>
-            <RunPageLayout title="Statistics" icon={BarChart3}>
+            <RunPageLayout
+              title="Statistics"
+              icon={BarChart3}
+              onNavigateToActive={() => setActiveTab("active")}
+            >
               <div className="h-full overflow-hidden">
                 <StatisticsTab
                   configId={execution.config?.path ?? null}
@@ -1094,7 +1119,11 @@ function AppContent() {
       case "run-ai-data":
         return (
           <RunSelectionProvider>
-            <RunPageLayout title="AI Data Viewer" icon={Database}>
+            <RunPageLayout
+              title="AI Data Viewer"
+              icon={Database}
+              onNavigateToActive={() => setActiveTab("active")}
+            >
               <div className="h-full overflow-hidden">
                 <AiDataViewerTab />
               </div>
@@ -1422,7 +1451,6 @@ function AppContent() {
         {/* Status Bar - Sticky Top */}
         <StatusIndicator
           pythonStatus={execution.pythonStatus}
-          configLoaded={execution.configLoaded}
           executionActive={execution.executionActive}
           backgroundActivities={backgroundActivities}
         />

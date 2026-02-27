@@ -17,6 +17,7 @@ use crate::findings::{Finding, FindingParser, ParsedFinding};
 use crate::mcp::shared::{
     emit_ai_output, AiSessionContext, FindingContext, ProgressContext, ReflectionFixContext,
 };
+use crate::orchestrator::status_events::StatusEventEmitter;
 use crate::orchestrator::{RetryConfig, RetryService, RetryState};
 use crate::reflection::parser::{ParsedReflectionFix, ReflectionFixParser};
 use crate::reflection::storage as reflection_storage;
@@ -28,6 +29,33 @@ use crate::workflow_state::{ParsedProgress, ProgressParser};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::io::AsRawHandle;
+
+/// Join a thread with a bounded timeout, returning `T::default()` if the thread doesn't finish.
+///
+/// This prevents indefinite hangs when threads are stuck (e.g., blocking on a channel
+/// whose sender was never dropped because the stdout reader thread was abandoned).
+fn join_with_timeout<T: Send + Default + 'static>(
+    handle: std::thread::JoinHandle<T>,
+    timeout: std::time::Duration,
+    label: &str,
+    session_id: &str,
+) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = std::thread::spawn(move || {
+        let result = handle.join().unwrap_or_default();
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(value) => value,
+        Err(_) => {
+            warn!(
+                "Session {}: {} thread didn't finish within {:?} after process exit",
+                session_id, label, timeout
+            );
+            T::default()
+        }
+    }
+}
 
 /// Extract text from Claude CLI stream-json output line
 fn extract_text_from_stream_json(json_line: &str) -> Option<String> {
@@ -246,6 +274,14 @@ fn run_claude_session_inline(
 
     let has_output = Arc::new(AtomicBool::new(false));
     let has_output_heartbeat = has_output.clone();
+
+    // Flag to signal processor threads that the AI process has exited.
+    // Without this, processor threads block forever on recv() if the stdout
+    // thread is abandoned (timeout) and never drops the channel senders.
+    let session_done = Arc::new(AtomicBool::new(false));
+    let session_done_finding = session_done.clone();
+    let session_done_progress = session_done.clone();
+    let session_done_reflection = session_done.clone();
 
     // Heartbeat thread
     let app_handle_heartbeat = app_handle.clone();
@@ -491,8 +527,20 @@ fn run_claude_session_inline(
                 }
             };
 
-            // Process incoming findings from the channel
-            while let Ok(parsed_finding) = finding_rx.recv() {
+            // Process incoming findings from the channel.
+            // Use recv_timeout + session_done check so we don't block forever
+            // if the stdout thread is abandoned and never drops the sender.
+            loop {
+                let parsed_finding = match finding_rx.recv_timeout(Duration::from_secs(2)) {
+                    Ok(f) => f,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if session_done_finding.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
                 // Log the detection
                 info!(
                     "Detected finding: {} ({}:{})",
@@ -579,7 +627,17 @@ fn run_claude_session_inline(
             }
         } else {
             // No finding context - just drain the channel to avoid blocking
-            while finding_rx.recv().is_ok() {}
+            loop {
+                match finding_rx.recv_timeout(Duration::from_secs(2)) {
+                    Ok(_) => {}
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if session_done_finding.load(Ordering::Relaxed) {
+                            break;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
         }
 
         detected_findings
@@ -604,8 +662,20 @@ fn run_claude_session_inline(
                 }
             };
 
-            // Process incoming progress markers from the channel
-            while let Ok(parsed_progress) = progress_rx.recv() {
+            // Process incoming progress markers from the channel.
+            // Use recv_timeout + session_done check so we don't block forever
+            // if the stdout thread is abandoned and never drops the sender.
+            loop {
+                let parsed_progress = match progress_rx.recv_timeout(Duration::from_secs(2)) {
+                    Ok(p) => p,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if session_done_progress.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
                 // Log the detection
                 debug!(
                     "Detected progress: {} - {}/{}",
@@ -739,7 +809,17 @@ fn run_claude_session_inline(
             }
         } else {
             // No progress context - just drain the channel to avoid blocking
-            while progress_rx.recv().is_ok() {}
+            loop {
+                match progress_rx.recv_timeout(Duration::from_secs(2)) {
+                    Ok(_) => {}
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if session_done_progress.load(Ordering::Relaxed) {
+                            break;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
         }
 
         progress_count
@@ -762,7 +842,19 @@ fn run_claude_session_inline(
                 }
             };
 
-            while let Ok(parsed_fix) = reflection_fix_rx.recv() {
+            // Use recv_timeout + session_done check so we don't block forever
+            // if the stdout thread is abandoned and never drops the sender.
+            loop {
+                let parsed_fix = match reflection_fix_rx.recv_timeout(Duration::from_secs(2)) {
+                    Ok(f) => f,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if session_done_reflection.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
                 info!(
                     "Detected reflection fix: {} (type: {}, confidence: {})",
                     parsed_fix.description, parsed_fix.fix_type, parsed_fix.confidence
@@ -967,7 +1059,17 @@ fn run_claude_session_inline(
             }
         } else {
             // No reflection fix context - just drain the channel to avoid blocking
-            while reflection_fix_rx.recv().is_ok() {}
+            loop {
+                match reflection_fix_rx.recv_timeout(Duration::from_secs(2)) {
+                    Ok(_) => {}
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if session_done_reflection.load(Ordering::Relaxed) {
+                            break;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
         }
 
         fix_count
@@ -975,6 +1077,10 @@ fn run_claude_session_inline(
 
     // Stderr reader thread
     let stderr = child.stderr.take();
+
+    #[cfg(target_os = "windows")]
+    let stderr_raw_handle = stderr.as_ref().map(|s| s.as_raw_handle());
+
     let stderr_handle = thread::spawn(move || {
         let mut output = String::new();
         if let Some(mut stderr) = stderr {
@@ -990,6 +1096,7 @@ fn run_claude_session_inline(
     let status = match child.wait() {
         Ok(status) => status,
         Err(e) => {
+            session_done.store(true, Ordering::Relaxed);
             let _ = stop_tx.send(());
             let _ = heartbeat_handle.join();
             let _ = std::fs::remove_file(&prompt_file);
@@ -997,6 +1104,10 @@ fn run_claude_session_inline(
             return Err(format!("Failed to wait for Claude: {}", e));
         }
     };
+
+    // Signal all processor threads that the AI process has exited.
+    // This unblocks any recv_timeout loops within ~2 seconds.
+    session_done.store(true, Ordering::Relaxed);
 
     // Cleanup
     let _ = stop_tx.send(());
@@ -1012,6 +1123,16 @@ fn run_claude_session_inline(
             // into the reader thread. Closing it here causes the reader's read() to
             // return an error, terminating the BufReader::lines() loop. The reader
             // thread will then exit and join() will return promptly.
+            windows_sys::Win32::Foundation::CloseHandle(
+                raw_handle as windows_sys::Win32::Foundation::HANDLE,
+            );
+        }
+    }
+
+    // On Windows, also close the stderr pipe's read end.
+    #[cfg(target_os = "windows")]
+    if let Some(raw_handle) = stderr_raw_handle {
+        unsafe {
             windows_sys::Win32::Foundation::CloseHandle(
                 raw_handle as windows_sys::Win32::Foundation::HANDLE,
             );
@@ -1044,14 +1165,28 @@ fn run_claude_session_inline(
         }
     };
 
-    let stderr_output = stderr_handle.join().unwrap_or_default();
-    // Wait for the finding processor thread to complete
-    // (it will exit when the stdout thread closes the channel sender)
-    let detected_findings = finding_processor_handle.join().unwrap_or_default();
-    // Wait for the progress processor thread to complete
-    let progress_count = progress_processor_handle.join().unwrap_or_default();
-    // Wait for the reflection fix processor thread to complete
-    let reflection_fix_count = reflection_fix_processor_handle.join().unwrap_or_default();
+    let stderr_output =
+        join_with_timeout(stderr_handle, Duration::from_secs(5), "stderr", session_id);
+    // Wait for processor threads to complete.
+    // With session_done set, these should exit within ~2s. The 10s timeout is a safety net.
+    let detected_findings = join_with_timeout(
+        finding_processor_handle,
+        Duration::from_secs(10),
+        "finding_processor",
+        session_id,
+    );
+    let progress_count = join_with_timeout(
+        progress_processor_handle,
+        Duration::from_secs(10),
+        "progress_processor",
+        session_id,
+    );
+    let reflection_fix_count = join_with_timeout(
+        reflection_fix_processor_handle,
+        Duration::from_secs(10),
+        "reflection_fix_processor",
+        session_id,
+    );
     // Collect all injected steps from the channel
     let mut injected_steps: Vec<ExecutionStepConfig> = Vec::new();
     while let Ok(step) = injected_step_rx.try_recv() {
@@ -1242,6 +1377,20 @@ pub fn run_claude_session_with_retry(
                         // Record this attempt
                         retry_state.record_attempt(&error, delay_ms, will_inject_feedback);
 
+                        // Emit retry attempt event to frontend
+                        let task_run_id_str = session_ctx
+                            .as_ref()
+                            .map(|ctx| ctx.context.task_run_id.as_str())
+                            .unwrap_or(session_id);
+                        StatusEventEmitter::emit_retry_attempt(
+                            app_handle,
+                            task_run_id_str,
+                            &retry_state,
+                            false,
+                            Some(delay_ms),
+                            config.max_retries,
+                        );
+
                         warn!(
                             "Session {} failed (attempt {}), retrying in {}ms: {}",
                             session_id, retry_state.attempt, delay_ms, error
@@ -1262,6 +1411,20 @@ pub fn run_claude_session_with_retry(
                     crate::orchestrator::RetryDecision::GiveUp { reason } => {
                         // Record final attempt and give up
                         retry_state.record_attempt(&error, 0, false);
+
+                        // Emit exhausted retry event to frontend
+                        let task_run_id_str = session_ctx
+                            .as_ref()
+                            .map(|ctx| ctx.context.task_run_id.as_str())
+                            .unwrap_or(session_id);
+                        StatusEventEmitter::emit_retry_attempt(
+                            app_handle,
+                            task_run_id_str,
+                            &retry_state,
+                            true,
+                            None,
+                            config.max_retries,
+                        );
 
                         warn!(
                             "Session {} giving up after {} attempts: {}",
@@ -1329,7 +1492,7 @@ pub fn run_claude_session_interactive(
             pid: session.pid(),
             process_type: crate::doctor::ProcessType::SessionStreaming,
             label: format!("Claude interactive session: {}", session_id),
-            last_activity: None,
+            last_activity: Some(session.last_activity_tracker()),
         };
         if let Err(e) = handle.register_blocking(reg) {
             warn!("Failed to register interactive session with Doctor: {}", e);
@@ -1494,6 +1657,16 @@ pub fn run_claude_session_interactive_with_retry(
 
                         retry_state.record_attempt(&error, delay_ms, will_inject_feedback);
 
+                        // Emit retry attempt event to frontend
+                        StatusEventEmitter::emit_retry_attempt(
+                            app_handle,
+                            task_run_id,
+                            &retry_state,
+                            false,
+                            Some(delay_ms),
+                            config.max_retries,
+                        );
+
                         warn!(
                             "Interactive session {} failed (attempt {}), retrying in {}ms: {}",
                             session_id, retry_state.attempt, delay_ms, error
@@ -1507,6 +1680,16 @@ pub fn run_claude_session_interactive_with_retry(
                     }
                     crate::orchestrator::RetryDecision::GiveUp { reason } => {
                         retry_state.record_attempt(&error, 0, false);
+
+                        // Emit exhausted retry event to frontend
+                        StatusEventEmitter::emit_retry_attempt(
+                            app_handle,
+                            task_run_id,
+                            &retry_state,
+                            true,
+                            None,
+                            config.max_retries,
+                        );
 
                         warn!(
                             "Interactive session {} giving up after {} attempts: {}",

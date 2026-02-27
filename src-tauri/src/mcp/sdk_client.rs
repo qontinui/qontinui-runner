@@ -1106,6 +1106,215 @@ async fn handle_ai_analyze_cross_app_compare(
 }
 
 // =============================================================================
+// Cached Specs
+// =============================================================================
+
+/// Request body for discover-and-cache
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiscoverAndCacheRequest {
+    url: String,
+    #[serde(default)]
+    app_name: Option<String>,
+}
+
+/// GET /ui-bridge/sdk/cached-specs — Return all cached external specs
+async fn handle_cached_specs_all(
+    State(state): State<Arc<ApiState>>,
+) -> Json<ApiResponse<Vec<serde_json::Value>>> {
+    let db = &state.app_state.checkpoint_db;
+
+    match db.get_all_cached_specs() {
+        Ok(specs) => {
+            let data: Vec<serde_json::Value> = specs
+                .into_iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "id": s.id,
+                        "app_url": s.app_url,
+                        "app_name": s.app_name,
+                        "spec_id": s.spec_id,
+                        "spec_json": s.spec_json,
+                        "discovered_at": s.discovered_at,
+                        "page_url": s.page_url,
+                    })
+                })
+                .collect();
+            Json(ApiResponse::success(data))
+        }
+        Err(e) => Json(ApiResponse::error(format!(
+            "Failed to get cached specs: {}",
+            e
+        ))),
+    }
+}
+
+/// GET /ui-bridge/sdk/cached-specs/:app_url — Return cached specs for one app
+async fn handle_cached_specs_for_app(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<ApiResponse<Vec<serde_json::Value>>> {
+    let app_url = match query.get("app_url") {
+        Some(url) => url.clone(),
+        None => return Json(ApiResponse::error("Missing app_url query parameter")),
+    };
+
+    let db = &state.app_state.checkpoint_db;
+
+    match db.get_cached_specs_for_app(&app_url) {
+        Ok(specs) => {
+            let data: Vec<serde_json::Value> = specs
+                .into_iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "id": s.id,
+                        "app_url": s.app_url,
+                        "app_name": s.app_name,
+                        "spec_id": s.spec_id,
+                        "spec_json": s.spec_json,
+                        "discovered_at": s.discovered_at,
+                        "page_url": s.page_url,
+                    })
+                })
+                .collect();
+            Json(ApiResponse::success(data))
+        }
+        Err(e) => Json(ApiResponse::error(format!(
+            "Failed to get cached specs: {}",
+            e
+        ))),
+    }
+}
+
+/// POST /ui-bridge/sdk/discover-and-cache — Connect, discover specs, cache them
+async fn handle_discover_and_cache(
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<DiscoverAndCacheRequest>,
+) -> Json<ApiResponse<Vec<serde_json::Value>>> {
+    let url = normalize_localhost_url(req.url.trim_end_matches('/'));
+    let app_name = req.app_name.unwrap_or_else(|| "Unknown App".to_string());
+
+    info!(url = %url, app_name = %app_name, "Discover-and-cache specs");
+
+    // Step 1: Ensure connected to the app
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return Json(ApiResponse::error(format!(
+                "Failed to create HTTP client: {}",
+                e
+            )))
+        }
+    };
+
+    let (base_path, _health_data) = match try_health_check(&client, &url).await {
+        Ok(result) => result,
+        Err(e) => return Json(ApiResponse::error(format!("Health check failed: {}", e))),
+    };
+
+    // Step 2: Call getSpecs via the SDK
+    let specs_url = format!("{}{}/control/specs", url, base_path);
+    let specs_response = match client.get(&specs_url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+            Ok(json) => json,
+            Err(e) => {
+                return Json(ApiResponse::error(format!(
+                    "Failed to parse specs response: {}",
+                    e
+                )))
+            }
+        },
+        Ok(resp) => {
+            return Json(ApiResponse::error(format!(
+                "Specs endpoint returned HTTP {}",
+                resp.status()
+            )))
+        }
+        Err(e) => return Json(ApiResponse::error(format!("Failed to fetch specs: {}", e))),
+    };
+
+    // Step 3: Parse and cache each spec
+    let db = &state.app_state.checkpoint_db;
+    let specs_data = specs_response.get("data").or(Some(&specs_response));
+
+    let specs_array = match specs_data.and_then(|d| d.as_array()) {
+        Some(arr) => arr.clone(),
+        None => {
+            // Maybe it's a single spec object with groups
+            if specs_data.is_some_and(|d| d.get("groups").is_some()) {
+                vec![specs_data.unwrap().clone()]
+            } else {
+                return Json(ApiResponse::error(
+                    "No specs found in response (expected array or object with groups)",
+                ));
+            }
+        }
+    };
+
+    let mut cached: Vec<serde_json::Value> = Vec::new();
+
+    for spec in &specs_array {
+        let spec_id = spec
+            .get("specId")
+            .or_else(|| spec.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        let page_url = spec
+            .get("metadata")
+            .and_then(|m| m.get("pageUrl"))
+            .and_then(|v| v.as_str());
+
+        let spec_json_str = serde_json::to_string(spec).unwrap_or_default();
+
+        if let Err(e) = db.upsert_cached_spec(&url, &app_name, spec_id, &spec_json_str, page_url) {
+            warn!("Failed to cache spec {}: {}", spec_id, e);
+            continue;
+        }
+
+        cached.push(serde_json::json!({
+            "id": format!("{}:{}", url, spec_id),
+            "app_url": url,
+            "app_name": app_name,
+            "spec_id": spec_id,
+            "spec_json": spec_json_str,
+            "page_url": page_url,
+        }));
+    }
+
+    info!("Cached {} specs for {}", cached.len(), url);
+    Json(ApiResponse::success(cached))
+}
+
+/// DELETE /ui-bridge/sdk/cached-specs — Clear cached specs for an app
+async fn handle_delete_cached_specs(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    let app_url = match query.get("app_url") {
+        Some(url) => url.clone(),
+        None => return Json(ApiResponse::error("Missing app_url query parameter")),
+    };
+
+    let db = &state.app_state.checkpoint_db;
+
+    match db.delete_cached_specs_for_app(&app_url) {
+        Ok(count) => Json(ApiResponse::success(serde_json::json!({
+            "deleted": count,
+            "app_url": app_url,
+        }))),
+        Err(e) => Json(ApiResponse::error(format!(
+            "Failed to delete cached specs: {}",
+            e
+        ))),
+    }
+}
+
+// =============================================================================
 // Router
 // =============================================================================
 
@@ -1176,5 +1385,18 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route(
             "/ui-bridge/sdk/debug/highlight/:id",
             post(handle_debug_highlight),
+        )
+        // Cached specs
+        .route(
+            "/ui-bridge/sdk/cached-specs",
+            get(handle_cached_specs_all).delete(handle_delete_cached_specs),
+        )
+        .route(
+            "/ui-bridge/sdk/cached-specs/by-app",
+            get(handle_cached_specs_for_app),
+        )
+        .route(
+            "/ui-bridge/sdk/discover-and-cache",
+            post(handle_discover_and_cache),
         )
 }

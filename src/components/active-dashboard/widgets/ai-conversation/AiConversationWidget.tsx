@@ -63,7 +63,7 @@ function EmptyState() {
       </div>
       <h3 className="text-lg font-medium mb-2">No AI Conversation Yet</h3>
       <p className="text-sm text-muted-foreground max-w-xs">
-        Start a task with AI analysis enabled to see the conversation here.
+        The AI conversation will appear here once the workflow starts running.
       </p>
     </div>
   );

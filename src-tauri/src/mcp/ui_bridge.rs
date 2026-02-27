@@ -881,6 +881,80 @@ pub async fn discover_states_from_renders(
     }
 }
 
+// =============================================================================
+// Annotated Screenshot (for agent mode)
+// =============================================================================
+
+/// Query parameters for annotated screenshot
+#[derive(Debug, Deserialize)]
+pub struct AnnotatedScreenshotQuery {
+    /// Monitor index (0-based), None for primary monitor
+    #[serde(default)]
+    monitor: Option<i32>,
+}
+
+/// Annotated screenshot response
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnnotatedScreenshotData {
+    screenshot: String,
+    width: i32,
+    height: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    monitor: Option<i32>,
+}
+
+/// GET /ui-bridge/control/annotated-screenshot — Screenshot with metadata for annotation
+pub async fn ui_bridge_annotated_screenshot_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<AnnotatedScreenshotQuery>,
+) -> Json<ApiResponse<AnnotatedScreenshotData>> {
+    info!(
+        monitor = ?query.monitor,
+        "UI Bridge API: Capturing screenshot for annotation"
+    );
+
+    match super::misc::capture_screenshot_ipc(state.app_state.clone(), query.monitor, "png").await {
+        Ok(capture_data) => {
+            let screenshot_base64 = match capture_data
+                .get("screenshot_base64")
+                .and_then(|s| s.as_str())
+            {
+                Some(s) => s.to_string(),
+                None => {
+                    error!("UI Bridge annotated screenshot: No screenshot_base64 in IPC response");
+                    return Json(ApiResponse::error(
+                        "Screenshot captured but no image data returned",
+                    ));
+                }
+            };
+
+            let width = capture_data
+                .get("width")
+                .and_then(|w| w.as_i64())
+                .unwrap_or(0) as i32;
+            let height = capture_data
+                .get("height")
+                .and_then(|h| h.as_i64())
+                .unwrap_or(0) as i32;
+
+            Json(ApiResponse::success(AnnotatedScreenshotData {
+                screenshot: screenshot_base64,
+                width,
+                height,
+                monitor: query.monitor,
+            }))
+        }
+        Err(e) => {
+            error!("UI Bridge annotated screenshot: Failed to capture: {}", e);
+            Json(ApiResponse::error(format!(
+                "Screenshot capture failed: {}",
+                e
+            )))
+        }
+    }
+}
+
 /// Create routes for this module.
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::{get, post};
@@ -916,6 +990,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/control/snapshot",
             get(ui_bridge_get_snapshot_handler),
+        )
+        .route(
+            "/ui-bridge/control/annotated-screenshot",
+            get(ui_bridge_annotated_screenshot_handler),
         )
         .route(
             "/ui-bridge/control/console-errors",

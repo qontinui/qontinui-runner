@@ -12,6 +12,7 @@
 
 pub mod dispatcher;
 pub mod manager;
+pub mod resume;
 pub mod runner;
 pub mod session;
 pub mod state;
