@@ -49,7 +49,7 @@ export function SetupWizard({ onComplete }: SetupWizardProps) {
   }, []);
 
   const finishSetup = useCallback(
-    async (aiConfig: { provider: string } | null) => {
+    async (_aiConfig: { provider: string } | null) => {
       try {
         // Save process configs
         for (const config of selectedProcessConfigs) {

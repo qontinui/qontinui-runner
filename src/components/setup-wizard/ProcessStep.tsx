@@ -79,7 +79,7 @@ export function ProcessStep({
     return () => {
       cancelled = true;
     };
-  }, [selectedProjects]);
+  }, [selectedProjects, selectedConfigs.length, onConfigsChange]);
 
   const toggleConfig = useCallback(
     (config: ProcessConfig) => {

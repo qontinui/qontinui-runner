@@ -71,7 +71,7 @@ export function ProjectStep({
     } catch (err) {
       setError(`Failed to open folder picker: ${err}`);
     }
-  }, []);
+  }, [onWorkspacePathChange]);
 
   const scanWorkspace = useCallback(async () => {
     if (!scanPath) return;

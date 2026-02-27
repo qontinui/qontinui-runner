@@ -153,7 +153,7 @@ function ContextListItem({ item, isSelected }: { item: ContextItem; isSelected: 
 function ContextEditor({
   formState,
   setFormState,
-  isCreating,
+  isCreating: _isCreating,
 }: {
   formState: Partial<ContextItem>;
   setFormState: React.Dispatch<React.SetStateAction<Partial<ContextItem>>>;

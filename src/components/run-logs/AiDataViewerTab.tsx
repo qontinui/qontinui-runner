@@ -3836,7 +3836,7 @@ function ProcessSessionOutputSection({
 
 export function AiDataViewerTab() {
   const [activeCategory, setActiveCategory] = useState<DataCategory>("ai-prompt");
-  const [selectedProcessSessionId, setSelectedProcessSessionId] = useState<string | null>(null);
+  const [selectedProcessSessionId, _setSelectedProcessSessionId] = useState<string | null>(null);
 
   // Render the content for the active category
   const renderContent = () => {

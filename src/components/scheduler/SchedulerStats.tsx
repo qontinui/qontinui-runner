@@ -57,7 +57,7 @@ function getSuccessRateColor(rate: number): string {
   return "text-red-500";
 }
 
-export function SchedulerStats({ tasks, taskHistory, status }: SchedulerStatsProps) {
+export function SchedulerStats({ tasks, taskHistory, status: _status }: SchedulerStatsProps) {
   const stats = useMemo((): StatCard[] => {
     const totalTasks = tasks.length;
     const activeTasks = tasks.filter((t) => t.enabled).length;

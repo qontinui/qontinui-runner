@@ -75,17 +75,15 @@ export function CloudRelaySettings({ onLog }: CloudRelaySettingsProps) {
       }
     };
     init();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Periodic status polling while the settings page is mounted
   useEffect(() => {
     const interval = setInterval(loadStatus, 5000);
     return () => clearInterval(interval);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const loadSettings = async () => {
+  const _loadSettings = async () => {
     try {
       const result = await invoke<CloudRelaySettingsData>("get_cloud_relay_settings");
       if (result) {
