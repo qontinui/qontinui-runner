@@ -478,7 +478,7 @@ function OrchestratorLogBlock({ group }: { group: MessageGroup }) {
 
           return (
             <div
-              key={idx}
+              key={`${idx}-${cleanLine.slice(0, 40)}`}
               className={cn(
                 "font-mono leading-relaxed",
                 hasPassIndicator && "text-green-400",
@@ -708,7 +708,7 @@ function ChatBubble({ group, isAnimated }: { group: MessageGroup; isAnimated?: b
       {/* Message content */}
       <div
         className={cn(
-          "flex-1 max-w-[80%] rounded-lg px-4 py-2 border",
+          "flex-1 max-w-[80%] rounded-lg px-4 py-2 border bg-background",
           bubbleColors.bg,
           bubbleColors.border,
         )}
@@ -804,7 +804,7 @@ export function AiMessageDisplay({
 
         return (
           <MessageBlock
-            key={`${group.timestamp}-${index}`}
+            key={`${group.source}-${group.timestamp}-${index}`}
             group={group}
             mode={mode}
             isAnimated={isAnimated}
