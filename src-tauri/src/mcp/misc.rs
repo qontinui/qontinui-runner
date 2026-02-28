@@ -843,8 +843,6 @@ pub async fn get_findings_summary(
 
 /// Launch Chrome with remote debugging enabled
 pub async fn launch_debug_chrome() -> Json<ApiResponse<String>> {
-    use std::process::Command;
-
     // Common Chrome paths on Windows
     let chrome_paths = [
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
@@ -860,7 +858,7 @@ pub async fn launch_debug_chrome() -> Json<ApiResponse<String>> {
             // First, kill all existing Chrome processes
             // The debug port only works on the FIRST Chrome instance
             info!("Killing existing Chrome processes...");
-            let _ = Command::new("taskkill")
+            let _ = crate::process_helpers::no_window("taskkill")
                 .args(["/F", "/IM", "chrome.exe"])
                 .output();
 
@@ -870,7 +868,7 @@ pub async fn launch_debug_chrome() -> Json<ApiResponse<String>> {
             // Now launch Chrome with debug flag and separate profile
             // Using a separate user-data-dir ensures the debug port works
             // even if Chrome would normally restore a previous session
-            match Command::new(path)
+            match crate::process_helpers::no_window(path)
                 .args([
                     "--remote-debugging-port=9222",
                     "--user-data-dir=C:\\temp\\chrome-debug-profile",
@@ -2882,7 +2880,7 @@ pub async fn stop_ai_analysis(
         info!("MCP API: Killing AI process PID {}", pid);
         // Use taskkill with /T to kill the entire process tree (cmd.exe spawns node.exe for claude)
         // /F forces termination, /T terminates child processes
-        let result = std::process::Command::new("taskkill")
+        let result = crate::process_helpers::no_window("taskkill")
             .args(["/F", "/T", "/PID", &pid.to_string()])
             .output();
 
@@ -4103,7 +4101,6 @@ pub async fn execute_inline_python(
     Json(request): Json<InlinePythonRequest>,
 ) -> Result<Json<ApiResponse<InlinePythonResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     use std::time::Instant;
-    use tokio::process::Command;
     use tokio::time::timeout;
 
     let start = Instant::now();
@@ -4175,7 +4172,7 @@ if __name__ == "__main__":
         if !deps.is_empty() {
             // Use uvx for dependency isolation
             let deps_str = deps.join(",");
-            let mut cmd = Command::new("uvx");
+            let mut cmd = crate::process_helpers::tokio_no_window("uvx");
             cmd.args(["--with", &deps_str, "python", script_path.to_str().unwrap()])
                 .current_dir(&working_dir)
                 .kill_on_drop(true);
@@ -4183,7 +4180,7 @@ if __name__ == "__main__":
             run_with_optional_timeout(cmd, timeout_secs).await
         } else {
             // No dependencies, use python directly
-            let mut cmd = Command::new("python");
+            let mut cmd = crate::process_helpers::tokio_no_window("python");
             cmd.arg(script_path.to_str().unwrap())
                 .current_dir(&working_dir)
                 .kill_on_drop(true);
@@ -4192,7 +4189,7 @@ if __name__ == "__main__":
         }
     } else {
         // No dependencies, use python directly
-        let mut cmd = Command::new("python");
+        let mut cmd = crate::process_helpers::tokio_no_window("python");
         cmd.arg(script_path.to_str().unwrap())
             .current_dir(&working_dir)
             .kill_on_drop(true);
@@ -4507,7 +4504,7 @@ pub fn extract_video_frames(video_path: &str, max_frames: u32) -> Result<Vec<Str
     // Use ffmpeg to extract frames evenly distributed throughout the video
     // -vf "select='not(mod(n,X))'" extracts every Xth frame
     // For 3 frames from a 30 fps, 10 sec video (300 frames), we'd extract every 100th frame
-    let status = std::process::Command::new("ffmpeg")
+    let status = crate::process_helpers::no_window("ffmpeg")
         .args([
             "-y", // Overwrite output
             "-i",
@@ -4828,12 +4825,12 @@ pub async fn run_deterministic_verification(
         info!("Running npm build verification in {}", workspace_root);
 
         let output = if cfg!(target_os = "windows") {
-            std::process::Command::new("cmd")
+            crate::process_helpers::cmd_no_window()
                 .args(["/C", "npm run build"])
                 .current_dir(workspace_root)
                 .output()
         } else {
-            std::process::Command::new("sh")
+            crate::process_helpers::no_window("sh")
                 .args(["-c", "npm run build"])
                 .current_dir(workspace_root)
                 .output()
@@ -4875,7 +4872,7 @@ pub async fn run_deterministic_verification(
         checks_run.push("cargo check (critical)".to_string());
         info!("Running cargo check verification in {}", workspace_root);
 
-        let output = std::process::Command::new("cargo")
+        let output = crate::process_helpers::no_window("cargo")
             .args(["check"])
             .current_dir(workspace_root)
             .output();

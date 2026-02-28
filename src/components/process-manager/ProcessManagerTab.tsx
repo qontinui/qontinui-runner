@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 import { cn } from "../../lib/utils";
 import {
   Play,
@@ -14,11 +15,13 @@ import {
   ChevronDown,
   ChevronRight,
   Cpu,
+  FolderSearch,
 } from "lucide-react";
 
 import { ProcessStatusBadge } from "./ProcessStatusBadge";
 import { ProcessOutputViewer } from "./ProcessOutputViewer";
 import { ProcessConfigEditor } from "./ProcessConfigEditor";
+import { ScanProjectsModal } from "./ScanProjectsModal";
 import { AiFixPanel } from "./AiFixPanel";
 import { useChatSession } from "../../hooks/useChatSession";
 
@@ -188,6 +191,82 @@ export function ProcessManagerTab() {
     loadProcesses();
   }, [loadProcesses]);
 
+  // Scan for projects state
+  const [showScanModal, setShowScanModal] = useState(false);
+  const [scanResults, setScanResults] = useState<ProcessConfig[]>([]);
+  const [scanning, setScanning] = useState(false);
+  const [scanError, setScanError] = useState<string | null>(null);
+
+  const normalizePath = (p: string) => p.replace(/\\/g, "/").toLowerCase();
+
+  const handleScanForProjects = useCallback(async () => {
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: "Select workspace to scan",
+      });
+      if (!selected) return;
+
+      const scanPath = selected as string;
+      setShowScanModal(true);
+      setScanning(true);
+      setScanError(null);
+      setScanResults([]);
+
+      // Scan workspace for projects
+      const projects = await invoke<Array<{ path: string; name: string; type: string }>>(
+        "scan_workspace_for_setup",
+        { path: scanPath, maxDepth: 3 },
+      );
+
+      if (projects.length === 0) {
+        setScanResults([]);
+        setScanError("No projects detected in this directory.");
+        setScanning(false);
+        return;
+      }
+
+      // Generate process configs from discovered projects
+      const suggested = await invoke<ProcessConfig[]>("suggest_process_configs_for_setup", {
+        projects,
+      });
+
+      // Fetch existing configs for dedup
+      const existing = await invoke<ProcessConfig[]>("get_process_configs");
+
+      // Filter out duplicates by normalized cwd + command
+      const newConfigs = suggested.filter(
+        (s) =>
+          !existing.some(
+            (e) => normalizePath(e.cwd) === normalizePath(s.cwd) && e.command === s.command,
+          ),
+      );
+
+      setScanResults(newConfigs);
+    } catch (err) {
+      setScanError(String(err));
+    } finally {
+      setScanning(false);
+    }
+  }, []);
+
+  const handleAddScannedProcesses = useCallback(
+    async (selectedConfigs: ProcessConfig[]) => {
+      try {
+        for (const config of selectedConfigs) {
+          await invoke("save_process_config", { config });
+        }
+        setShowScanModal(false);
+        setScanResults([]);
+        await loadProcesses();
+      } catch (err) {
+        console.error("Failed to save scanned processes:", err);
+      }
+    },
+    [loadProcesses],
+  );
+
   // Close AI fix session
   const closeAiFix = useCallback(() => {
     aiFixAbortRef.current = true;
@@ -324,13 +403,22 @@ Be concise and actionable.`;
             {processes.filter((p) => isRunning(p.state)).length}/{processes.length} running
           </span>
         </div>
-        <button
-          onClick={handleAddNew}
-          className="flex items-center gap-1.5 px-3 py-1 text-xs bg-cyan-900/40 border border-cyan-700/50 rounded text-cyan-300 hover:bg-cyan-800/40 transition-colors"
-        >
-          <Plus className="w-3 h-3" />
-          Add Process
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={handleScanForProjects}
+            className="flex items-center gap-1.5 px-3 py-1 text-xs bg-zinc-800 border border-white/10 rounded text-zinc-300 hover:bg-zinc-700 hover:text-zinc-100 transition-colors"
+          >
+            <FolderSearch className="w-3 h-3" />
+            Scan for Projects
+          </button>
+          <button
+            onClick={handleAddNew}
+            className="flex items-center gap-1.5 px-3 py-1 text-xs bg-cyan-900/40 border border-cyan-700/50 rounded text-cyan-300 hover:bg-cyan-800/40 transition-colors"
+          >
+            <Plus className="w-3 h-3" />
+            Add Process
+          </button>
+        </div>
       </div>
 
       {/* Config Editor (shown when adding/editing) */}
@@ -476,6 +564,21 @@ Be concise and actionable.`;
           )}
         </div>
       </div>
+
+      {/* Scan Projects Modal */}
+      {showScanModal && (
+        <ScanProjectsModal
+          configs={scanResults}
+          scanning={scanning}
+          error={scanError}
+          onAdd={handleAddScannedProcesses}
+          onClose={() => {
+            setShowScanModal(false);
+            setScanResults([]);
+            setScanError(null);
+          }}
+        />
+      )}
     </div>
   );
 }

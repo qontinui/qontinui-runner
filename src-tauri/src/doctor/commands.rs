@@ -38,7 +38,7 @@ pub async fn stop_process_by_pid(pid: u32) -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     {
-        let output = std::process::Command::new("taskkill")
+        let output = crate::process_helpers::no_window("taskkill")
             .args(["/F", "/T", "/PID", &pid.to_string()])
             .output()
             .map_err(|e| format!("Failed to execute taskkill: {}", e))?;

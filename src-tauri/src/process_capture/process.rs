@@ -10,10 +10,26 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 
 use crate::error_monitor::types::ErrorEvent;
+use regex::Regex;
 
 use super::health;
 use super::stream_parser::StreamErrorParser;
 use super::types::*;
+
+/// Filter errors by removing any whose message or raw_entry matches an ignore pattern.
+fn filter_ignored_errors(errors: Vec<ErrorEvent>, ignore_patterns: &[Regex]) -> Vec<ErrorEvent> {
+    if ignore_patterns.is_empty() {
+        return errors;
+    }
+    errors
+        .into_iter()
+        .filter(|e| {
+            !ignore_patterns
+                .iter()
+                .any(|pat| pat.is_match(&e.message) || pat.is_match(&e.raw_entry))
+        })
+        .collect()
+}
 
 /// Message from reader tasks to the process owner.
 pub(crate) enum ProcessMessage {
@@ -80,10 +96,26 @@ impl ManagedProcess {
         let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
         let stderr = child.stderr.take().ok_or("Failed to capture stderr")?;
 
+        // Compile ignore patterns once for both stdout/stderr tasks
+        let compiled_ignore: Arc<Vec<Regex>> = Arc::new(
+            self.config
+                .ignore_patterns
+                .iter()
+                .filter_map(|p| match Regex::new(p) {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        warn!("Invalid ignore pattern '{}': {}", p, e);
+                        None
+                    }
+                })
+                .collect(),
+        );
+
         // Spawn stdout reader task
         let stdout_tx = msg_tx.clone();
         let source_name = self.config.name.clone();
         let parser_type = self.config.parser.clone();
+        let ignore = Arc::clone(&compiled_ignore);
         let stdout_handle = tokio::spawn(async move {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
@@ -99,13 +131,13 @@ impl ManagedProcess {
                     .send(ProcessMessage::OutputLine(output_line))
                     .await;
 
-                let errors = parser.process_line(&line);
+                let errors = filter_ignored_errors(parser.process_line(&line), &ignore);
                 if !errors.is_empty() {
                     let _ = stdout_tx.send(ProcessMessage::Errors(errors)).await;
                 }
             }
 
-            let errors = parser.flush();
+            let errors = filter_ignored_errors(parser.flush(), &ignore);
             if !errors.is_empty() {
                 let _ = stdout_tx.send(ProcessMessage::Errors(errors)).await;
             }
@@ -115,6 +147,7 @@ impl ManagedProcess {
         let stderr_tx = msg_tx.clone();
         let source_name = self.config.name.clone();
         let parser_type = self.config.parser.clone();
+        let ignore = Arc::clone(&compiled_ignore);
         let stderr_handle = tokio::spawn(async move {
             let reader = BufReader::new(stderr);
             let mut lines = reader.lines();
@@ -130,13 +163,13 @@ impl ManagedProcess {
                     .send(ProcessMessage::OutputLine(output_line))
                     .await;
 
-                let errors = parser.process_line(&line);
+                let errors = filter_ignored_errors(parser.process_line(&line), &ignore);
                 if !errors.is_empty() {
                     let _ = stderr_tx.send(ProcessMessage::Errors(errors)).await;
                 }
             }
 
-            let errors = parser.flush();
+            let errors = filter_ignored_errors(parser.flush(), &ignore);
             if !errors.is_empty() {
                 let _ = stderr_tx.send(ProcessMessage::Errors(errors)).await;
             }
@@ -181,7 +214,7 @@ impl ManagedProcess {
             #[cfg(windows)]
             {
                 // On Windows, use taskkill to kill the process tree
-                let _ = std::process::Command::new("taskkill")
+                let _ = crate::process_helpers::no_window("taskkill")
                     .args(["/F", "/T", "/PID", &pid.to_string()])
                     .output();
             }
@@ -231,7 +264,8 @@ impl ManagedProcess {
         {
             #[allow(unused_imports)]
             use std::os::windows::process::CommandExt;
-            const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
             let full_command = if self.config.args.is_empty() {
                 self.config.command.clone()
@@ -241,12 +275,12 @@ impl ManagedProcess {
 
             cmd = Command::new("cmd");
             cmd.args(["/C", &full_command]);
-            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
         }
 
         #[cfg(not(windows))]
         {
-            cmd = Command::new(&self.config.command);
+            cmd = crate::process_helpers::tokio_no_window(&self.config.command);
             cmd.args(&self.config.args);
         }
 

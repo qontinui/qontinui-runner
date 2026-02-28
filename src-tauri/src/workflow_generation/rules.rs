@@ -263,7 +263,44 @@ pub fn next_rule_number(conn: &Connection, agent: &str, section: &str) -> i32 {
 }
 
 /// Insert a new generation rule.
+/// If `source_fix_id` is provided and a rule with that source already exists, returns the
+/// existing rule instead of creating a duplicate.
 pub fn insert_rule(conn: &Connection, input: &InsertRuleInput) -> Result<GenerationRule, String> {
+    // Dedup guard: skip insert if a rule with the same source_fix_id already exists
+    if let Some(ref fix_id) = input.source_fix_id {
+        let existing: Option<GenerationRule> = conn
+            .query_row(
+                "SELECT id, agent, section, rule_number, title, content, condition, status, provenance, source_fix_id, created_at, updated_at
+                 FROM generation_rules WHERE source_fix_id = ?1 LIMIT 1",
+                params![fix_id],
+                |row| {
+                    Ok(GenerationRule {
+                        id: row.get(0)?,
+                        agent: row.get(1)?,
+                        section: row.get(2)?,
+                        rule_number: row.get(3)?,
+                        title: row.get(4)?,
+                        content: row.get(5)?,
+                        condition: row.get(6)?,
+                        status: row.get(7)?,
+                        provenance: row.get(8)?,
+                        source_fix_id: row.get(9)?,
+                        created_at: row.get(10)?,
+                        updated_at: row.get(11)?,
+                    })
+                },
+            )
+            .ok();
+
+        if let Some(rule) = existing {
+            warn!(
+                "Skipping duplicate generation rule insert: source_fix_id={} already exists as rule={}",
+                fix_id, rule.id
+            );
+            return Ok(rule);
+        }
+    }
+
     let id = format!("rule-{}", Uuid::new_v4());
     let now = Utc::now().to_rfc3339();
 

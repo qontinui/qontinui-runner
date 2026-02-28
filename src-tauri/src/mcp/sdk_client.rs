@@ -23,6 +23,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use super::types::{ApiResponse, ApiState};
+use super::ui_bridge::ui_bridge_request_sync;
 
 // =============================================================================
 // Types
@@ -624,13 +625,25 @@ async fn handle_element_action(
 }
 
 /// GET /ui-bridge/sdk/snapshot — Full UI snapshot
+///
+/// Falls back to the runner's own control endpoint when no SDK app is connected.
 async fn handle_snapshot(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
     match sdk_request(&state, Method::GET, "/control/snapshot", None).await {
         Ok(data) => (StatusCode::OK, Json(data)),
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({ "success": false, "error": e })),
-        ),
+        Err(_sdk_err) => {
+            // No SDK app connected — fall back to the runner's own UI via control endpoint
+            debug!("SDK snapshot unavailable, falling back to control endpoint");
+            match ui_bridge_request_sync(&state, "get_snapshot", serde_json::json!({})).await {
+                Ok(data) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "success": true, "data": data })),
+                ),
+                Err(e) => (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({ "success": false, "error": e })),
+                ),
+            }
+        }
     }
 }
 
@@ -1315,6 +1328,99 @@ async fn handle_delete_cached_specs(
 }
 
 // =============================================================================
+// Design Review Handlers
+// =============================================================================
+
+/// GET /ui-bridge/sdk/design/element/:id/styles — Extended computed styles for one element
+async fn handle_design_element_styles(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let path = format!("/design/element/{}/styles", id);
+    match sdk_request(&state, Method::GET, &path, None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/design/element/:id/state-styles — Styles across interaction states
+async fn handle_design_element_state_styles(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    body: Option<Json<serde_json::Value>>,
+) -> Json<serde_json::Value> {
+    let path = format!("/design/element/{}/state-styles", id);
+    match sdk_request(&state, Method::POST, &path, body.map(|b| b.0)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/design/snapshot — Design data for all/filtered elements
+async fn handle_design_snapshot(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/design/snapshot", body.map(|b| b.0)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/design/responsive — Snapshots at multiple viewports
+async fn handle_design_responsive(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/design/responsive", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/design/audit — Run style audit against style guide
+async fn handle_design_audit(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/design/audit", body.map(|b| b.0)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/design/style-guide/load — Load a style guide
+async fn handle_design_load_style_guide(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::POST, "/design/style-guide/load", Some(body)).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// GET /ui-bridge/sdk/design/style-guide — Get loaded style guide
+async fn handle_design_get_style_guide(
+    State(state): State<Arc<ApiState>>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/design/style-guide", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// DELETE /ui-bridge/sdk/design/style-guide — Clear loaded style guide
+async fn handle_design_clear_style_guide(
+    State(state): State<Arc<ApiState>>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::DELETE, "/design/style-guide", None).await {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+// =============================================================================
 // Router
 // =============================================================================
 
@@ -1398,5 +1504,31 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route(
             "/ui-bridge/sdk/discover-and-cache",
             post(handle_discover_and_cache),
+        )
+        // Design review
+        .route(
+            "/ui-bridge/sdk/design/element/:id/styles",
+            get(handle_design_element_styles),
+        )
+        .route(
+            "/ui-bridge/sdk/design/element/:id/state-styles",
+            post(handle_design_element_state_styles),
+        )
+        .route(
+            "/ui-bridge/sdk/design/snapshot",
+            post(handle_design_snapshot),
+        )
+        .route(
+            "/ui-bridge/sdk/design/responsive",
+            post(handle_design_responsive),
+        )
+        .route("/ui-bridge/sdk/design/audit", post(handle_design_audit))
+        .route(
+            "/ui-bridge/sdk/design/style-guide/load",
+            post(handle_design_load_style_guide),
+        )
+        .route(
+            "/ui-bridge/sdk/design/style-guide",
+            get(handle_design_get_style_guide).delete(handle_design_clear_style_guide),
         )
 }

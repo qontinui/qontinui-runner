@@ -58,10 +58,8 @@ pub async fn wait_for_port_ready(port: u16, timeout: Duration) -> bool {
 /// Returns true if a process was found and kill was attempted.
 #[cfg(windows)]
 pub async fn kill_port_process(port: u16) -> bool {
-    use std::process::Command;
-
     // Find PID using netstat
-    let output = match Command::new("cmd")
+    let output = match crate::process_helpers::cmd_no_window()
         .args([
             "/C",
             &format!("netstat -ano | findstr LISTENING | findstr :{}", port),
@@ -78,7 +76,7 @@ pub async fn kill_port_process(port: u16) -> bool {
         if let Some(pid_str) = parts.last() {
             if let Ok(pid) = pid_str.parse::<u32>() {
                 if pid > 0 {
-                    let _ = Command::new("taskkill")
+                    let _ = crate::process_helpers::no_window("taskkill")
                         .args(["/F", "/PID", &pid.to_string()])
                         .output();
                     return true;
@@ -92,9 +90,7 @@ pub async fn kill_port_process(port: u16) -> bool {
 
 #[cfg(not(windows))]
 pub async fn kill_port_process(port: u16) -> bool {
-    use std::process::Command;
-
-    let output = match Command::new("lsof")
+    let output = match crate::process_helpers::no_window("lsof")
         .args(["-ti", &format!(":{}", port)])
         .output()
     {
@@ -106,7 +102,9 @@ pub async fn kill_port_process(port: u16) -> bool {
     for line in stdout.lines() {
         if let Ok(pid) = line.trim().parse::<u32>() {
             if pid > 0 {
-                let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+                let _ = crate::process_helpers::no_window("kill")
+                    .args(["-9", &pid.to_string()])
+                    .output();
                 return true;
             }
         }

@@ -6,7 +6,6 @@
 
 use super::types::{AssertionResult, TestDefinition, TestExecutionResult, TestType};
 use std::fs;
-use std::process::Command;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -249,12 +248,12 @@ pub fn execute_playwright_test(test_def: &TestDefinition) -> TestExecutionResult
 
     // Execute the test
     let output = if cfg!(target_os = "windows") {
-        Command::new("cmd.exe")
+        crate::process_helpers::cmd_no_window()
             .args(["/c", &npx_args])
             .current_dir(&test_scripts_dir)
             .output()
     } else {
-        Command::new("npx")
+        crate::process_helpers::no_window("npx")
             .args([
                 "playwright",
                 "test",

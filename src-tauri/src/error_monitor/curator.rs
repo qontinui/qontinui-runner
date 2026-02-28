@@ -814,6 +814,7 @@ mod tests {
             log_source_id: Some(1),
             log_source_name: "test".to_string(),
             task_run_id: None,
+            workflow_name: None,
             workflow_step_id: None,
             log_timestamp: None,
             captured_at: "2024-01-15T10:00:00Z".to_string(),

@@ -77,6 +77,7 @@ fn default_is_critical() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowStage {
     /// Unique identifier (UUID v4)
+    #[serde(default)]
     pub id: String,
     /// Display name for this stage
     pub name: String,
@@ -113,6 +114,7 @@ pub struct WorkflowStage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnifiedWorkflow {
     /// Unique identifier (UUID v4)
+    #[serde(default)]
     pub id: String,
     /// Display name
     pub name: String,
@@ -256,9 +258,10 @@ pub struct UnifiedWorkflow {
     pub reflection_mode: bool,
 
     /// ISO 8601 timestamp of creation
+    #[serde(default)]
     pub created_at: String,
     /// ISO 8601 timestamp of last modification (serialized as "modified_at" to match frontend)
-    #[serde(rename = "modified_at")]
+    #[serde(rename = "modified_at", default)]
     pub updated_at: String,
 }
 

@@ -97,6 +97,8 @@ export interface StoredErrorEvent {
   logSourceName: string;
   /** Task run this error belongs to (if collected during workflow) */
   taskRunId?: string;
+  /** Workflow name (from the task_runs table) */
+  workflowName?: string;
   /** Workflow step ID */
   workflowStepId?: string;
   /** Timestamp from log entry */

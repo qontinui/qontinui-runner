@@ -168,7 +168,7 @@ impl SemanticSearch {
                 "Using Poetry to run semantic search from: {:?}",
                 python_bridge_dir
             );
-            let mut cmd = Command::new("poetry");
+            let mut cmd = crate::process_helpers::no_window("poetry");
             cmd.current_dir(python_bridge_dir);
             cmd.arg("run");
             cmd.arg("python");
@@ -180,7 +180,7 @@ impl SemanticSearch {
                 "Poetry not found, using system Python: {:?}",
                 self.python_path
             );
-            let mut cmd = Command::new(&self.python_path);
+            let mut cmd = crate::process_helpers::no_window(&self.python_path);
             cmd.arg("-u"); // Unbuffered output
             cmd.arg(&self.script_path);
             cmd

@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::process::Stdio;
-use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 use tracing::{error, info, warn};
 
@@ -294,16 +293,16 @@ async fn execute_shell_command(
     // Build the command
     let mut cmd = if cfg!(target_os = "windows") {
         if is_powershell {
-            let mut c = Command::new("powershell");
+            let mut c = crate::process_helpers::tokio_no_window("powershell");
             c.args(["-NoProfile", "-NonInteractive", "-Command", &command]);
             c
         } else {
-            let mut c = Command::new("cmd");
+            let mut c = crate::process_helpers::tokio_cmd_no_window();
             c.args(["/C", &command]);
             c
         }
     } else {
-        let mut c = Command::new("sh");
+        let mut c = crate::process_helpers::tokio_no_window("sh");
         c.args(["-c", &command]);
         c
     };
@@ -618,7 +617,7 @@ test('Flow Designer Test', async ({{ page }}) => {{
         .unwrap();
 
     // Build the Playwright command
-    let mut cmd = Command::new("npx");
+    let mut cmd = crate::process_helpers::tokio_no_window("npx");
     cmd.args([
         "playwright",
         "test",

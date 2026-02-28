@@ -5,7 +5,7 @@
 //! - Launching Chrome with remote debugging enabled
 
 use crate::settings::{self, AccessibilitySettings};
-use std::process::Command;
+
 use tracing::info;
 
 use super::CommandResponse;
@@ -184,12 +184,12 @@ pub fn launch_chrome_debug(
 
     // Launch Chrome
     let child = if cfg!(target_os = "windows") {
-        Command::new(&chrome_path)
+        crate::process_helpers::no_window(&chrome_path)
             .args(&args)
             .spawn()
             .map_err(|e| format!("Failed to launch Chrome: {}", e))?
     } else {
-        Command::new(&chrome_path)
+        crate::process_helpers::no_window(&chrome_path)
             .args(&args)
             .spawn()
             .map_err(|e| format!("Failed to launch Chrome: {}", e))?

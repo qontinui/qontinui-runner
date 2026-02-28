@@ -192,7 +192,7 @@ interface ResolvedNavigationItem {
   hasChildren?: boolean;
   selectsFirstChild?: boolean;
   badge?: { type: string; value?: string | number; variant?: string };
-  hidden?: boolean; // For showing "HIDDEN" badge in dev mode
+  hiddenInProd?: boolean; // For showing "dev" badge on items hidden in production
 }
 
 interface ResolvedNavigationGroup {
@@ -214,7 +214,7 @@ function transformItem(item: SharedNavigationItem): ResolvedNavigationItem {
     description: item.description,
     hasChildren: item.hasChildren,
     selectsFirstChild: item.selectsFirstChild,
-    hidden: item.hidden,
+    hiddenInProd: item.hiddenInProd,
   };
 }
 
@@ -370,9 +370,9 @@ function NavItem({
       {!collapsed && (
         <>
           <span className="truncate flex-1 text-left">{item.label}</span>
-          {item.hidden && (
+          {item.hiddenInProd && (
             <span className="text-[9px] font-bold uppercase px-1 py-0.5 rounded bg-gray-500/20 text-gray-400 border border-gray-500/30">
-              hidden
+              dev
             </span>
           )}
           {item.hasChildren && <ChevronRight className="w-3 h-3 opacity-50" />}
@@ -440,9 +440,9 @@ function FlyoutItem({ item, isActive, onClick, index }: FlyoutItemProps) {
           >
             {item.label}
           </span>
-          {item.hidden && (
+          {item.hiddenInProd && (
             <span className="text-[9px] font-bold uppercase px-1 py-0.5 rounded bg-gray-500/20 text-gray-400 border border-gray-500/30">
-              hidden
+              dev
             </span>
           )}
         </div>

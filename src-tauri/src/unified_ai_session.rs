@@ -544,6 +544,34 @@ impl UnifiedAiSessionExecutor {
                     self.save_ai_output_event(config, &session_id, &output, duration_ms);
                 }
 
+                // Persist AI output to task_run_output_chunks for the /output endpoint.
+                // The agentic phase is already persisted by the loop_controller with
+                // iteration headers, so only persist setup and completion here.
+                if !output.is_empty()
+                    && matches!(
+                        config.phase,
+                        WorkflowPhase::Setup | WorkflowPhase::Completion
+                    )
+                {
+                    let phase_label = config.phase.as_str();
+                    let formatted = format!(
+                        "\n--- AI {} Output ({}) ---\n{}\n",
+                        phase_label, config.step_name, output
+                    );
+                    let task_run_id = get_parent_task_id(&config.task_run_id);
+                    if let Err(e) = self.app_state.checkpoint_db.append_task_output_ex(
+                        &task_run_id,
+                        &formatted,
+                        false,
+                        false,
+                    ) {
+                        warn!(
+                            "Failed to persist {} AI output to chunks: {}",
+                            phase_label, e
+                        );
+                    }
+                }
+
                 AiSessionResult {
                     success,
                     output,

@@ -7,7 +7,6 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashMap;
 use std::process::Stdio;
-use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 use tracing::{info, warn};
 
@@ -291,7 +290,10 @@ impl ShellCommandHandler {
             }
         }
         // Try to find via `where.exe git` and derive bash path
-        if let Ok(output) = std::process::Command::new("where.exe").arg("git").output() {
+        if let Ok(output) = crate::process_helpers::no_window("where.exe")
+            .arg("git")
+            .output()
+        {
             if let Ok(stdout) = String::from_utf8(output.stdout) {
                 if let Some(git_path) = stdout.lines().next() {
                     // git.exe is typically at Git/cmd/git.exe; bash is at Git/usr/bin/bash.exe
@@ -473,7 +475,7 @@ impl ShellCommandHandler {
         // Build the command
         let mut cmd = if cfg!(target_os = "windows") {
             if is_powershell {
-                let mut c = Command::new("powershell");
+                let mut c = crate::process_helpers::tokio_no_window("powershell");
                 c.args(["-NoProfile", "-NonInteractive", "-Command", command]);
                 c
             } else if is_bash {
@@ -482,7 +484,7 @@ impl ShellCommandHandler {
                 // bash.exe (C:\Windows\System32\bash.exe) which can fail with
                 // "execvpe(/bin/bash) failed" when WSL has no distro installed.
                 let bash_path = Self::find_git_bash().unwrap_or_else(|| "bash".to_string());
-                let mut c = Command::new(&bash_path);
+                let mut c = crate::process_helpers::tokio_no_window(&bash_path);
                 c.args(["-c", command]);
                 c
             } else {
@@ -491,7 +493,7 @@ impl ShellCommandHandler {
                 let stripped = command.replace('\'', "");
                 // Extract Unix-style KEY=VALUE env prefixes that cmd.exe can't handle
                 let (extra_envs, actual_cmd) = Self::extract_env_prefix_for_cmd(&stripped);
-                let mut c = Command::new("cmd");
+                let mut c = crate::process_helpers::tokio_cmd_no_window();
                 c.args(["/C", &actual_cmd]);
                 for (key, value) in extra_envs {
                     c.env(key, value);
@@ -499,7 +501,7 @@ impl ShellCommandHandler {
                 c
             }
         } else {
-            let mut c = Command::new("sh");
+            let mut c = crate::process_helpers::tokio_no_window("sh");
             c.args(["-c", command]);
             c
         };

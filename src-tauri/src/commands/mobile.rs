@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use tauri::State;
-use tokio::process::Command;
+
 use tracing::{debug, info, warn};
 
 // ============================================================================
@@ -186,7 +186,7 @@ async fn run_adb_command(args: &[&str]) -> Result<String, String> {
 
     debug!("Running ADB command: {:?} {:?}", adb_path, args);
 
-    let output = Command::new(&adb_path)
+    let output = crate::process_helpers::tokio_no_window(&adb_path)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

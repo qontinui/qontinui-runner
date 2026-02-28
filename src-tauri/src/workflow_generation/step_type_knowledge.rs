@@ -261,10 +261,46 @@ pub fn get_knowledge(conn: &Connection, id: &str) -> Result<Option<StepTypeKnowl
 }
 
 /// Insert a new knowledge entry.
+/// If `source_fix_id` is provided and an entry with that source already exists, returns the
+/// existing entry instead of creating a duplicate.
 pub fn insert_knowledge(
     conn: &Connection,
     input: &InsertKnowledgeInput,
 ) -> Result<StepTypeKnowledge, String> {
+    // Dedup guard: skip insert if an entry with the same source_fix_id already exists
+    if let Some(ref fix_id) = input.source_fix_id {
+        let existing: Option<StepTypeKnowledge> = conn
+            .query_row(
+                "SELECT id, step_type, layer, title, content, priority, status, provenance, source_fix_id, created_at, updated_at
+                 FROM step_type_knowledge WHERE source_fix_id = ?1 LIMIT 1",
+                params![fix_id],
+                |row| {
+                    Ok(StepTypeKnowledge {
+                        id: row.get(0)?,
+                        step_type: row.get(1)?,
+                        layer: row.get(2)?,
+                        title: row.get(3)?,
+                        content: row.get(4)?,
+                        priority: row.get(5)?,
+                        status: row.get(6)?,
+                        provenance: row.get(7)?,
+                        source_fix_id: row.get(8)?,
+                        created_at: row.get(9)?,
+                        updated_at: row.get(10)?,
+                    })
+                },
+            )
+            .ok();
+
+        if let Some(entry) = existing {
+            warn!(
+                "Skipping duplicate step type knowledge insert: source_fix_id={} already exists as entry={}",
+                fix_id, entry.id
+            );
+            return Ok(entry);
+        }
+    }
+
     let id = format!("stk-{}", Uuid::new_v4());
     let now = Utc::now().to_rfc3339();
 

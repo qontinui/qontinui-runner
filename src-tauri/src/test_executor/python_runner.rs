@@ -21,7 +21,6 @@ use crate::api_request::types::ApiRequestConfig;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
-use std::process::Command;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -396,7 +395,7 @@ pub fn execute_python_script(test_def: &TestDefinition) -> TestExecutionResult {
     };
 
     // Execute the script
-    let output = Command::new(python_cmd)
+    let output = crate::process_helpers::no_window(python_cmd)
         .arg(&script_path)
         .envs(&env_vars)
         .output();

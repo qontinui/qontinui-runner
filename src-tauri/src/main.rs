@@ -40,6 +40,8 @@ mod findings;
 mod follow_up;
 mod health_monitor;
 mod iteration_bundle;
+#[cfg(windows)]
+mod job_object;
 mod log_consolidation;
 mod log_migration;
 mod logging;
@@ -52,6 +54,7 @@ mod orchestrator;
 mod paths;
 mod playwright;
 mod process_capture;
+mod process_helpers;
 mod prompt_snippets;
 mod prompts;
 mod rag;
@@ -86,6 +89,7 @@ mod unified_workflows;
 mod video_recorder;
 mod workflow_generation;
 mod workflow_state;
+mod zombie_sweep;
 
 use commands::AppState;
 use database::CheckpointDb;
@@ -133,6 +137,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start health monitoring to detect resource exhaustion
     health_monitor::start_health_monitor();
+
+    // Initialize Windows Job Object so spawned AI processes are auto-killed
+    // if the runner crashes (safety net for the explicit taskkill in shutdown).
+    #[cfg(windows)]
+    job_object::init_job_object();
 
     info!("Starting Qontinui Runner v{}", env!("CARGO_PKG_VERSION"));
 
@@ -276,6 +285,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             crate::step_executor::handlers::ui_bridge::UiBridgeFailureTracker::new(),
         process_capture_manager: TokioMutex::new(None), // Initialized in setup()
         api_ready: AtomicBool::new(false),              // Set when MCP API server binds
+        ai_pid_tracker: Arc::new(std::sync::Mutex::new(Vec::new())),
     });
     let mcp_app_state = shared_app_state.clone();
     let mcp_rag_state = rag_state.clone();
@@ -1109,6 +1119,45 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     window.try_state::<Arc<claude_session::SessionManager>>()
                 {
                     sm.close_all_sessions();
+                }
+
+                // Kill any orphaned AI (Claude CLI) processes tracked by the PID tracker.
+                // This catches processes that survived session close (e.g., cmd.exe /c claude).
+                {
+                    let pids_to_kill: Vec<u32> = {
+                        if let Ok(mut pids) = app_state.ai_pid_tracker.lock() {
+                            let copy = pids.clone();
+                            pids.clear();
+                            copy
+                        } else {
+                            Vec::new()
+                        }
+                    };
+                    if !pids_to_kill.is_empty() {
+                        info!(
+                            "Killing {} orphaned AI process(es) on shutdown: {:?}",
+                            pids_to_kill.len(),
+                            pids_to_kill
+                        );
+                        for pid in &pids_to_kill {
+                            let result = std::process::Command::new("taskkill")
+                                .args(["/F", "/T", "/PID", &pid.to_string()])
+                                .output();
+                            match result {
+                                Ok(output) => {
+                                    if output.status.success() {
+                                        info!("Killed AI process tree for PID {}", pid);
+                                    } else {
+                                        // Process may have already exited — not an error
+                                        info!("AI process PID {} already exited", pid);
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Failed to taskkill PID {}: {}", pid, e);
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Stop all managed processes

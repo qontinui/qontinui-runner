@@ -184,9 +184,20 @@ export function useChatSession() {
         return;
       }
 
-      // Text arriving — clear tool activity and accumulate
+      // System notes (e.g., workflow generation notification)
+      if (source === "system_note") {
+        setMessages((prev) => [
+          ...prev,
+          { role: "system", content: line, timestamp: new Date().toISOString() },
+        ]);
+        return;
+      }
+
+      // Text arriving — clear tool activity and accumulate.
+      // The Rust backend strips the \n delimiter when reading stdout line-by-line,
+      // so we restore it here to preserve paragraph breaks in markdown.
       setToolActivity(null);
-      streamingBufferRef.current += line;
+      streamingBufferRef.current += line + "\n";
       setStreamingContent(streamingBufferRef.current);
     }).then((fn) => {
       if (cancelled) {
@@ -209,10 +220,22 @@ export function useChatSession() {
         const content = streamingBufferRef.current;
         streamingBufferRef.current = "";
         setStreamingContent("");
-        setMessages((prev) => [
-          ...prev,
-          { role: "ai", content, timestamp: new Date().toISOString() },
-        ]);
+        setMessages((prev) => {
+          // If the last message is also from AI (no user message in between),
+          // merge content into that message instead of creating a new bubble.
+          // This prevents a wall of repeated messages when Claude's agentic
+          // loop cycles multiple turns without user interaction.
+          const last = prev[prev.length - 1];
+          if (last && last.role === "ai") {
+            const merged = [...prev];
+            merged[merged.length - 1] = {
+              ...last,
+              content: last.content + "\n\n" + content,
+            };
+            return merged;
+          }
+          return [...prev, { role: "ai", content, timestamp: new Date().toISOString() }];
+        });
       }
 
       // Clear tool activity on state transitions

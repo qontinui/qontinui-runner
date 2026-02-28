@@ -766,15 +766,21 @@ async fn handle_relay_command(
             let doctor_handle = api_state.doctor_handle.clone();
             let db2 = api_state.app_state.checkpoint_db.clone();
             let trid = task_run_id.clone();
+            let artifact_task_run_id = task_run_id.clone();
 
             let gen_result = tokio::task::spawn_blocking(move || {
                 let gen_result = db2.with_conn(|conn| {
-                    Ok(crate::workflow_generation::generate_workflow(
+                    let (response, mut artifact) = crate::workflow_generation::generate_workflow(
                         request,
                         doctor_handle.as_ref(),
                         Some(conn),
                         None,
-                    ))
+                    );
+                    artifact.task_run_id = Some(artifact_task_run_id.clone());
+                    if let Err(e) = db2.save_pipeline_artifact(&artifact) {
+                        tracing::warn!("Failed to save pipeline artifact: {}", e);
+                    }
+                    Ok(response)
                 });
                 match gen_result {
                     Ok(response) => response,

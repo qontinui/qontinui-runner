@@ -81,7 +81,7 @@ impl ProcessManager {
                     custom_path
                 );
                 let bridge_script = self.find_bridge_script()?;
-                let mut cmd = Command::new(&custom_path);
+                let mut cmd = crate::process_helpers::no_window(&custom_path);
                 cmd.arg("-u"); // Unbuffered output
                 cmd.arg(&bridge_script);
                 return self.spawn_with_command(cmd);
@@ -270,7 +270,7 @@ impl ProcessManager {
 
         if poetry_available {
             info!("Using Poetry to run Python from: {:?}", python_bridge_dir);
-            let mut cmd = Command::new("poetry");
+            let mut cmd = crate::process_helpers::no_window("poetry");
             cmd.current_dir(python_bridge_dir);
             cmd.arg("run");
             cmd.arg("python");
@@ -284,7 +284,7 @@ impl ProcessManager {
 
         if let Some(venv_path) = venv_python {
             info!("Using venv Python: {:?}", venv_path);
-            let mut cmd = Command::new(venv_path);
+            let mut cmd = crate::process_helpers::no_window(venv_path);
             cmd.arg("-u"); // Unbuffered output
             cmd.arg(bridge_script);
             return Ok(cmd);
@@ -300,7 +300,7 @@ impl ProcessManager {
         };
 
         info!("Using system {}", python_cmd);
-        let mut cmd = Command::new(python_cmd);
+        let mut cmd = crate::process_helpers::no_window(python_cmd);
         cmd.arg("-u"); // Unbuffered output
         cmd.arg(bridge_script);
         Ok(cmd)
@@ -438,6 +438,6 @@ impl ProcessManager {
     /// Builds a command for the bundled executor
     fn build_bundled_command(&self, executor_path: &PathBuf) -> Command {
         info!("Using bundled executor: {:?}", executor_path);
-        Command::new(executor_path)
+        crate::process_helpers::no_window(executor_path)
     }
 }

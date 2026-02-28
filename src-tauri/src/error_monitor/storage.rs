@@ -388,14 +388,16 @@ impl ErrorEventStorage {
     pub fn get_by_id(conn: &Connection, id: i64) -> Result<Option<StoredErrorEvent>, String> {
         conn.query_row(
             r#"
-            SELECT id, log_source_id, log_source_name, task_run_id, workflow_step_id,
-                   log_timestamp, captured_at, severity, error_type, error_code,
-                   message, stack_trace, context_lines, raw_entry,
-                   file_path, line_number, column_number, function_name,
-                   signature_hash, occurrence_count, first_seen_at, last_seen_at,
-                   status, finding_id, resolved_by_task_run_id, resolution_notes,
-                   acknowledged_at, resolved_at
-            FROM error_events WHERE id = ?1
+            SELECT e.id, e.log_source_id, e.log_source_name, e.task_run_id, e.workflow_step_id,
+                   e.log_timestamp, e.captured_at, e.severity, e.error_type, e.error_code,
+                   e.message, e.stack_trace, e.context_lines, e.raw_entry,
+                   e.file_path, e.line_number, e.column_number, e.function_name,
+                   e.signature_hash, e.occurrence_count, e.first_seen_at, e.last_seen_at,
+                   e.status, e.finding_id, e.resolved_by_task_run_id, e.resolution_notes,
+                   e.acknowledged_at, e.resolved_at, tr.workflow_name
+            FROM error_events e
+            LEFT JOIN task_runs tr ON e.task_run_id = tr.id
+            WHERE e.id = ?1
             "#,
             params![id],
             Self::row_to_stored_event,
@@ -408,26 +410,31 @@ impl ErrorEventStorage {
     pub fn query(conn: &Connection, query: &ErrorQuery) -> Result<Vec<StoredErrorEvent>, String> {
         let mut sql = String::from(
             r#"
-            SELECT id, log_source_id, log_source_name, task_run_id, workflow_step_id,
-                   log_timestamp, captured_at, severity, error_type, error_code,
-                   message, stack_trace, context_lines, raw_entry,
-                   file_path, line_number, column_number, function_name,
-                   signature_hash, occurrence_count, first_seen_at, last_seen_at,
-                   status, finding_id, resolved_by_task_run_id, resolution_notes,
-                   acknowledged_at, resolved_at
-            FROM error_events WHERE 1=1
+            SELECT e.id, e.log_source_id, e.log_source_name, e.task_run_id, e.workflow_step_id,
+                   e.log_timestamp, e.captured_at, e.severity, e.error_type, e.error_code,
+                   e.message, e.stack_trace, e.context_lines, e.raw_entry,
+                   e.file_path, e.line_number, e.column_number, e.function_name,
+                   e.signature_hash, e.occurrence_count, e.first_seen_at, e.last_seen_at,
+                   e.status, e.finding_id, e.resolved_by_task_run_id, e.resolution_notes,
+                   e.acknowledged_at, e.resolved_at, tr.workflow_name
+            FROM error_events e
+            LEFT JOIN task_runs tr ON e.task_run_id = tr.id
+            WHERE 1=1
             "#,
         );
 
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
         if let Some(ref task_run_id) = query.task_run_id {
-            sql.push_str(&format!(" AND task_run_id = ?{}", params_vec.len() + 1));
+            sql.push_str(&format!(" AND e.task_run_id = ?{}", params_vec.len() + 1));
             params_vec.push(Box::new(task_run_id.clone()));
         }
 
         if let Some(ref source_name) = query.log_source_name {
-            sql.push_str(&format!(" AND log_source_name = ?{}", params_vec.len() + 1));
+            sql.push_str(&format!(
+                " AND e.log_source_name = ?{}",
+                params_vec.len() + 1
+            ));
             params_vec.push(Box::new(source_name.clone()));
         }
 
@@ -438,7 +445,7 @@ impl ErrorEventStorage {
                     .enumerate()
                     .map(|(i, _)| format!("?{}", params_vec.len() + i + 1))
                     .collect();
-                sql.push_str(&format!(" AND status IN ({})", placeholders.join(",")));
+                sql.push_str(&format!(" AND e.status IN ({})", placeholders.join(",")));
                 for status in statuses {
                     params_vec.push(Box::new(status.as_str().to_string()));
                 }
@@ -452,7 +459,7 @@ impl ErrorEventStorage {
                     .enumerate()
                     .map(|(i, _)| format!("?{}", params_vec.len() + i + 1))
                     .collect();
-                sql.push_str(&format!(" AND severity IN ({})", placeholders.join(",")));
+                sql.push_str(&format!(" AND e.severity IN ({})", placeholders.join(",")));
                 for severity in severities {
                     params_vec.push(Box::new(severity.as_str().to_string()));
                 }
@@ -460,17 +467,17 @@ impl ErrorEventStorage {
         }
 
         if let Some(ref error_type) = query.error_type {
-            sql.push_str(&format!(" AND error_type = ?{}", params_vec.len() + 1));
+            sql.push_str(&format!(" AND e.error_type = ?{}", params_vec.len() + 1));
             params_vec.push(Box::new(error_type.clone()));
         }
 
         if let Some(ref after) = query.captured_after {
-            sql.push_str(&format!(" AND captured_at > ?{}", params_vec.len() + 1));
+            sql.push_str(&format!(" AND e.captured_at > ?{}", params_vec.len() + 1));
             params_vec.push(Box::new(after.clone()));
         }
 
         if let Some(ref before) = query.captured_before {
-            sql.push_str(&format!(" AND captured_at < ?{}", params_vec.len() + 1));
+            sql.push_str(&format!(" AND e.captured_at < ?{}", params_vec.len() + 1));
             params_vec.push(Box::new(before.clone()));
         }
 
@@ -478,9 +485,9 @@ impl ErrorEventStorage {
         sql.push_str(
             r#"
             ORDER BY
-                CASE severity WHEN 'critical' THEN 0 WHEN 'error' THEN 1 ELSE 2 END,
-                occurrence_count DESC,
-                last_seen_at DESC
+                CASE e.severity WHEN 'critical' THEN 0 WHEN 'error' THEN 1 ELSE 2 END,
+                e.occurrence_count DESC,
+                e.last_seen_at DESC
             "#,
         );
 
@@ -795,8 +802,9 @@ impl ErrorEventStorage {
                        e.file_path, e.line_number, e.column_number, e.function_name,
                        e.signature_hash, e.occurrence_count, e.first_seen_at, e.last_seen_at,
                        e.status, e.finding_id, e.resolved_by_task_run_id, e.resolution_notes,
-                       e.acknowledged_at, e.resolved_at
+                       e.acknowledged_at, e.resolved_at, tr.workflow_name
                 FROM error_events e
+                LEFT JOIN task_runs tr ON e.task_run_id = tr.id
                 JOIN error_events_fts fts ON e.id = fts.rowid
                 WHERE error_events_fts MATCH ?1
                 ORDER BY rank
@@ -839,6 +847,7 @@ impl ErrorEventStorage {
             log_source_id: row.get(1)?,
             log_source_name: row.get(2)?,
             task_run_id: row.get(3)?,
+            workflow_name: row.get(28)?,
             workflow_step_id: row.get(4)?,
             log_timestamp: row.get(5)?,
             captured_at: row.get(6)?,

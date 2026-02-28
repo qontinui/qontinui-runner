@@ -6,7 +6,7 @@
 
 use crate::settings::{self, AiProvider, CliExecutionMode, GlobalLogSource};
 use serde_json::Value;
-use std::process::Command;
+
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -92,7 +92,7 @@ fn find_setup_mcp_src_dir() -> Option<std::path::PathBuf> {
 /// Automatically sets PYTHONPATH to include the qontinui-setup-mcp source
 /// directory so the module can be found without requiring pip installation.
 fn run_setup_cli(args: &[&str]) -> Result<Value, String> {
-    let mut cmd = Command::new("python");
+    let mut cmd = crate::process_helpers::no_window("python");
     cmd.args(
         std::iter::once("-m")
             .chain(std::iter::once("qontinui_setup_mcp.cli"))

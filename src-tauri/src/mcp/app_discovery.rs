@@ -291,7 +291,7 @@ async fn list_adb_devices() -> Vec<MobileDevice> {
         None => return Vec::new(),
     };
 
-    let output = match tokio::process::Command::new(&adb_path)
+    let output = match crate::process_helpers::tokio_no_window(&adb_path)
         .args(["devices", "-l"])
         .output()
         .await
@@ -356,7 +356,7 @@ async fn check_device_ui_bridge(device_id: &str) -> Option<DiscoveredApp> {
 
     // Forward a local port to the device's UI Bridge port
     // Use tcp:0 to let the OS pick a free local port
-    let output = tokio::process::Command::new(&adb_path)
+    let output = crate::process_helpers::tokio_no_window(&adb_path)
         .args(["-s", device_id, "forward", "tcp:0", "tcp:9876"])
         .output()
         .await
@@ -379,7 +379,7 @@ async fn check_device_ui_bridge(device_id: &str) -> Option<DiscoveredApp> {
     let result = check_port(&client, local_port).await;
 
     // Remove the port forward
-    let _ = tokio::process::Command::new(&adb_path)
+    let _ = crate::process_helpers::tokio_no_window(&adb_path)
         .args([
             "-s",
             device_id,
@@ -498,7 +498,7 @@ async fn forward_device(
     })?;
 
     // Use tcp:0 to let the OS pick a free local port
-    let output = tokio::process::Command::new(&adb_path)
+    let output = crate::process_helpers::tokio_no_window(&adb_path)
         .args([
             "-s",
             &req.device_id,

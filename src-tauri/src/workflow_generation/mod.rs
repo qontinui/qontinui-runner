@@ -3,12 +3,14 @@
 //! This module provides functionality to generate UnifiedWorkflows from
 //! natural language descriptions using AI.
 
+pub mod benchmark;
 pub mod discovery_tools;
 pub mod example_workflows;
 pub mod feedback;
 pub mod generator;
 pub mod hardener;
 pub mod meta_workflow;
+pub mod pipeline_artifacts;
 pub mod relevance_filter;
 pub mod rules;
 pub mod schema_context;

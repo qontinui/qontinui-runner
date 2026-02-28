@@ -1052,6 +1052,21 @@ impl SetupExecutor {
                                 step_name,
                                 output.len()
                             );
+                            // Persist AI output to chunks for the /output endpoint
+                            if !output.is_empty() {
+                                let formatted = format!(
+                                    "\n--- AI Setup Output ({}) ---\n{}\n",
+                                    step_name, output
+                                );
+                                if let Err(e) = self.checkpoint_db.append_task_output_ex(
+                                    execution_id,
+                                    &formatted,
+                                    false,
+                                    false,
+                                ) {
+                                    warn!("Failed to persist setup response-mode AI output to chunks: {}", e);
+                                }
+                            }
                             // Save completion checkpoint
                             let mut resp_checkpoint = StepCheckpoint::new(
                                 execution_id,
@@ -2631,6 +2646,21 @@ impl CompletionExecutor {
                                 step_name,
                                 output.len()
                             );
+                            // Persist AI output to chunks for the /output endpoint
+                            if !output.is_empty() {
+                                let formatted = format!(
+                                    "\n--- AI Completion Output ({}) ---\n{}\n",
+                                    step_name, output
+                                );
+                                if let Err(e) = self.checkpoint_db.append_task_output_ex(
+                                    execution_id,
+                                    &formatted,
+                                    false,
+                                    false,
+                                ) {
+                                    warn!("Failed to persist completion response-mode AI output to chunks: {}", e);
+                                }
+                            }
                             // Save completion checkpoint
                             let mut resp_checkpoint = StepCheckpoint::new(
                                 execution_id,

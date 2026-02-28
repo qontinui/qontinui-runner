@@ -3141,15 +3141,21 @@ pub async fn generate_workflow_from_chat(
 
     let doctor_handle = state.doctor_handle.clone();
     let db2 = state.app_state.checkpoint_db.clone();
+    let artifact_task_run_id = id.clone();
 
     let gen_result = tokio::task::spawn_blocking(move || {
         let gen_result = db2.with_conn(|conn| {
-            Ok(crate::workflow_generation::generate_workflow(
+            let (response, mut artifact) = crate::workflow_generation::generate_workflow(
                 request,
                 doctor_handle.as_ref(),
                 Some(conn),
                 None,
-            ))
+            );
+            artifact.task_run_id = Some(artifact_task_run_id.clone());
+            if let Err(e) = db2.save_pipeline_artifact(&artifact) {
+                tracing::warn!("Failed to save pipeline artifact: {}", e);
+            }
+            Ok(response)
         });
         match gen_result {
             Ok(response) => response,
@@ -3172,6 +3178,26 @@ pub async fn generate_workflow_from_chat(
             format!("Generation task failed: {}", e),
         )
     })?;
+
+    // Store generated_workflow_id in result_data (mirrors Tauri IPC command behavior)
+    if gen_result.success {
+        if let Some(ref workflow) = gen_result.workflow {
+            let result_data = serde_json::json!({
+                "generated_workflow_id": &workflow.id,
+                "generated_workflow_name": &workflow.name,
+            });
+            let db3 = state.app_state.checkpoint_db.clone();
+            let trid = id.clone();
+            let rd_str = result_data.to_string();
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || db3.update_task_run_result_data(&trid, &rd_str))
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()))
+            {
+                tracing::warn!("Failed to update chat task run result_data: {}", e);
+            }
+        }
+    }
 
     Ok(Json(serde_json::json!({
         "success": gen_result.success,

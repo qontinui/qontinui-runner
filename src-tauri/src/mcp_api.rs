@@ -118,6 +118,7 @@ pub fn create_router(
         config_storage.clone(),
     ));
 
+    let current_ai_pids = app_state.ai_pid_tracker.clone();
     let api_state = Arc::new(ApiState {
         app_state,
         rag_state,
@@ -125,7 +126,7 @@ pub fn create_router(
         current_config_id: std::sync::Mutex::new(None),
         config_storage,
         action_service,
-        current_ai_pids: Arc::new(std::sync::Mutex::new(Vec::new())),
+        current_ai_pids,
         extraction_state: Arc::new(crate::mcp::extraction::ExtractionState::new()),
         sdk_connection: Arc::new(tokio::sync::Mutex::new(
             crate::mcp::sdk_client::SdkConnectionManager::new(),
@@ -272,6 +273,17 @@ pub fn create_router(
         });
     }
 
+    // Start zombie task run sweep (detects and cleans up stale "running" tasks)
+    {
+        let sweep_db = api_state.app_state.checkpoint_db.clone();
+        let sweep_handle = app_handle.clone();
+        let sweep_sm: Arc<crate::claude_session::SessionManager> = app_handle
+            .state::<Arc<crate::claude_session::SessionManager>>()
+            .inner()
+            .clone();
+        crate::zombie_sweep::start_zombie_sweep(sweep_db, sweep_sm, sweep_handle);
+    }
+
     // CORS: Permissive (allow any origin) is intentional.
     // This localhost-only API (port 9876) must be accessible from:
     //   - The Tauri webview (tauri://localhost origin)
@@ -307,6 +319,7 @@ pub fn create_router(
         .merge(crate::mcp::extraction::routes())
         .merge(crate::mcp::findings_api::routes())
         .merge(crate::mcp::generation_rules_api::routes())
+        .merge(crate::mcp::generator_eval::routes())
         .merge(crate::mcp::hooks::routes())
         .merge(crate::mcp::interaction_recording::routes())
         .merge(crate::mcp::log_sources::routes())

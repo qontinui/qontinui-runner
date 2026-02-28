@@ -304,7 +304,7 @@ pub(crate) fn spawn_python_with_console(
     args: &[&std::ffi::OsStr],
     working_dir: &std::path::Path,
 ) -> std::io::Result<std::process::Child> {
-    let mut cmd = std::process::Command::new(python_path);
+    let mut cmd = crate::process_helpers::no_window(python_path);
     cmd.args(args).current_dir(working_dir);
 
     #[cfg(target_os = "windows")]

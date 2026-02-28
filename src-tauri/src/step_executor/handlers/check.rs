@@ -7,7 +7,6 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::{info, warn};
 
@@ -142,17 +141,23 @@ impl StepHandler for CheckHandler {
         let (timestamp, sequence) =
             Self::emit_started(context, &action_id, &action_name, metadata).await;
 
+        // Fix nested double-quote issues in python -c "..." commands before shell execution.
+        // AI-generated commands often use double quotes for Python string literals inside a
+        // double-quoted -c argument (e.g., `python -c "d.get("data",...)"`) which bash misparses.
+        // This extracts the Python code to a temp file to avoid quoting conflicts.
+        let (shell_command, python_temp_file) = Self::fix_python_inline_quoting(&final_command);
+
         // Build the command
         // On Windows, detect PowerShell syntax and run directly via PowerShell
         // This avoids cmd.exe quote escaping issues that cause "string is missing terminator" errors
-        let is_powershell = Self::is_powershell_syntax(&final_command);
+        let is_powershell = Self::is_powershell_syntax(&shell_command);
         let is_bash = !is_powershell
-            && super::shell_command::ShellCommandHandler::is_bash_command(&final_command);
+            && super::shell_command::ShellCommandHandler::is_bash_command(&shell_command);
         let mut cmd = if cfg!(target_os = "windows") {
             if is_powershell {
                 // PowerShell syntax detected - run directly via PowerShell
-                let mut c = Command::new("powershell");
-                c.args(["-NoProfile", "-NonInteractive", "-Command", &final_command]);
+                let mut c = crate::process_helpers::tokio_no_window("powershell");
+                c.args(["-NoProfile", "-NonInteractive", "-Command", &shell_command]);
                 c
             } else if is_bash {
                 // Bash/Unix syntax detected (curl, pipes with single quotes, etc.)
@@ -160,17 +165,17 @@ impl StepHandler for CheckHandler {
                 // which strips them and breaks inline Python/jq commands.
                 let bash_path = super::shell_command::ShellCommandHandler::find_git_bash()
                     .unwrap_or_else(|| "bash".to_string());
-                let mut c = Command::new(&bash_path);
-                c.args(["-c", &final_command]);
+                let mut c = crate::process_helpers::tokio_no_window(&bash_path);
+                c.args(["-c", &shell_command]);
                 c
             } else {
                 // cmd.exe doesn't understand single quotes as string delimiters —
                 // strip them so tools receive unquoted paths (e.g., Next.js route groups
                 // like src/app/(app)/... work correctly).
-                let stripped = final_command.replace('\'', "");
+                let stripped = shell_command.replace('\'', "");
                 // Extract Unix-style KEY=VALUE env prefixes that cmd.exe can't handle
                 let (extra_envs, actual_cmd) = Self::extract_env_prefix_for_cmd(&stripped);
-                let mut c = Command::new("cmd");
+                let mut c = crate::process_helpers::tokio_cmd_no_window();
                 c.args(["/C", &actual_cmd]);
                 for (key, value) in extra_envs {
                     c.env(key, value);
@@ -178,8 +183,8 @@ impl StepHandler for CheckHandler {
                 c
             }
         } else {
-            let mut c = Command::new("sh");
-            c.args(["-c", &final_command]);
+            let mut c = crate::process_helpers::tokio_no_window("sh");
+            c.args(["-c", &shell_command]);
             c
         };
 
@@ -240,6 +245,11 @@ impl StepHandler for CheckHandler {
                 }
             }
         };
+
+        // Clean up temp file if we extracted Python code
+        if let Some(ref temp_path) = python_temp_file {
+            let _ = std::fs::remove_file(temp_path);
+        }
 
         // Emit completion event
         let total_duration_ms = start.elapsed().as_millis() as u64;
@@ -315,6 +325,71 @@ impl CheckHandler {
             remaining = after_eq[value_end..].trim_start();
         }
         (envs, remaining.to_string())
+    }
+
+    /// Fix nested double-quote issues in `python -c "..."` commands for bash execution.
+    ///
+    /// When AI generates commands like:
+    ///   curl ... | python -c "import sys; d.get("data",{})"
+    /// the inner double quotes conflict with the outer double quotes when bash parses
+    /// the command. Bash sees `d.get(` then bare word `data` then `,{})` etc.
+    ///
+    /// This function detects such commands, extracts the Python code, writes it to a
+    /// temp file, and returns a modified command that references the temp file instead.
+    fn fix_python_inline_quoting(command: &str) -> (String, Option<std::path::PathBuf>) {
+        // Look for `python -c "` or `python3 -c "` pattern
+        let python_c_patterns = ["python -c \"", "python3 -c \""];
+
+        for pattern in &python_c_patterns {
+            if let Some(start_idx) = command.find(pattern) {
+                let code_start = start_idx + pattern.len();
+
+                // Find the matching closing quote for the Python code.
+                // The Python code ends at the last `"` in the command (since the
+                // outer python -c "..." wraps the entire code block).
+                if let Some(rel_end) = command[code_start..].rfind('"') {
+                    let code_end = code_start + rel_end;
+                    let python_code = &command[code_start..code_end];
+
+                    // Only apply the fix if the Python code contains inner double quotes
+                    // that would conflict with bash's quote parsing
+                    if !python_code.contains('"') {
+                        return (command.to_string(), None);
+                    }
+
+                    // Write Python code to a temp file
+                    let temp_dir = std::env::temp_dir();
+                    let temp_file =
+                        temp_dir.join(format!("qontinui-check-{}.py", uuid::Uuid::new_v4()));
+
+                    if let Ok(()) = std::fs::write(&temp_file, python_code) {
+                        // Get the python executable name from the pattern
+                        let python_exe = if pattern.starts_with("python3") {
+                            "python3"
+                        } else {
+                            "python"
+                        };
+
+                        // Build the new command: replace `python -c "..."` with `python /tmp/file.py`
+                        let before = &command[..start_idx];
+                        let after = &command[code_end + 1..]; // skip the closing quote
+                        let temp_path_str = temp_file.to_string_lossy();
+                        // Use forward slashes for bash on Windows
+                        let temp_path_unix = temp_path_str.replace('\\', "/");
+                        let new_command =
+                            format!("{}{} \"{}\"{}", before, python_exe, temp_path_unix, after);
+
+                        info!(
+                            "fix_python_inline_quoting: extracted Python code to temp file: {}",
+                            temp_file.display()
+                        );
+                        return (new_command, Some(temp_file));
+                    }
+                }
+            }
+        }
+
+        (command.to_string(), None)
     }
 
     /// Check if a command uses PowerShell syntax.
@@ -1073,7 +1148,7 @@ impl CheckHandler {
             );
 
             let detect_result = tokio::time::timeout(Duration::from_secs(15), async {
-                Command::new("gh")
+                crate::process_helpers::tokio_no_window("gh")
                     .args([
                         "repo",
                         "view",
@@ -1270,7 +1345,7 @@ impl CheckHandler {
                 }
             }
 
-            let output = Command::new("gh")
+            let output = crate::process_helpers::tokio_no_window("gh")
                 .args(&args)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())

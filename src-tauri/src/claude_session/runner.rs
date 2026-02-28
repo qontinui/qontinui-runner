@@ -206,17 +206,25 @@ fn run_claude_session_inline(
         cli_args.push(&model_flag);
         info!("Using model override for session {}: {}", session_id, model);
     }
-    let mut child = std::process::Command::new("cmd.exe")
-        .args(&cli_args)
+    let mut cmd = crate::process_helpers::cmd_no_window();
+    cmd.args(&cli_args)
         .current_dir(working_dir)
         // Remove CLAUDECODE env var to prevent "nested session" detection.
         // The runner spawns Claude CLI as an automation tool, not as a nested session.
         .env_remove("CLAUDECODE")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn Claude CLI: {}", e))?;
+
+    // Assign to Windows Job Object for crash safety (auto-kill on runner exit)
+    #[cfg(target_os = "windows")]
+    crate::job_object::assign_process_to_job(
+        child.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE
+    );
 
     // Store child PID for stop functionality
     let child_pid = child.id();
@@ -1005,46 +1013,17 @@ fn run_claude_session_inline(
                                                 Err(e) => warn!("Failed to auto-apply fix as step type knowledge: {}", e),
                                             }
                                         } else {
-                                            // No step type detected — create generation rule entry (existing behavior)
-                                            let agent =
-                                                rules::infer_agent_from_fix(&fix.fix_description);
-                                            let section = rules::infer_section_from_fix(
-                                                &fix.fix_description,
-                                                &agent,
+                                            // No step type detected — skip generation rule creation.
+                                            // Reflection fixes about the reflection process itself
+                                            // (instruction_clarification, workflow_step_rewrite) would
+                                            // pollute schema_context/hardener/verification agents that
+                                            // generate USER workflows, not reflection prompts.
+                                            info!(
+                                                "Skipping generation rule creation for reflection fix {}: \
+                                                 reflection-scoped {} fixes without a step type target \
+                                                 are not applicable to user workflow generation",
+                                                fix.id, fix.fix_type
                                             );
-                                            let next_num =
-                                                rules::next_rule_number(&conn, &agent, &section);
-                                            let title =
-                                                rules::truncate_to_title(&fix.fix_description);
-
-                                            match rules::insert_rule(&conn, &rules::InsertRuleInput {
-                                                agent: agent.clone(),
-                                                section: section.clone(),
-                                                rule_number: next_num,
-                                                title: title.clone(),
-                                                content: fix.fix_description.clone(),
-                                                condition: None,
-                                                provenance: "reflection".to_string(),
-                                                source_fix_id: Some(fix.id.clone()),
-                                            }) {
-                                                Ok(rule) => {
-                                                    info!("Auto-applied reflection fix as generation rule: {} (agent={}, section={})", rule.id, agent, section);
-                                                    let auto_msg = format!(
-                                                        "Auto-applied fix as generation rule [{}/{}]: {}",
-                                                        agent, section, title
-                                                    );
-                                                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                                        emit_ai_output(
-                                                            &app_handle_reflection,
-                                                            &auto_msg,
-                                                            "reflection_auto_apply",
-                                                            None,
-                                                            session_ctx_for_reflection.as_ref(),
-                                                        );
-                                                    }));
-                                                }
-                                                Err(e) => warn!("Failed to auto-apply fix as generation rule: {}", e),
-                                            }
                                         }
                                     }
                                     _ => {}

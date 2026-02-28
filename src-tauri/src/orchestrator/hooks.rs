@@ -9,7 +9,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::process::Command;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
@@ -429,11 +428,11 @@ impl HookExecutor {
         info!("Executing hook command: {}", command);
 
         let mut cmd = if cfg!(target_os = "windows") {
-            let mut c = Command::new("cmd");
+            let mut c = crate::process_helpers::cmd_no_window();
             c.args(["/C", &command]);
             c
         } else {
-            let mut c = Command::new("sh");
+            let mut c = crate::process_helpers::no_window("sh");
             c.args(["-c", &command]);
             c
         };

@@ -41,6 +41,9 @@ pub struct ProcessConfig {
     /// Whether this config is enabled
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Regex patterns for errors to ignore (matched against error message and raw entry)
+    #[serde(default)]
+    pub ignore_patterns: Vec<String>,
 }
 
 fn default_category() -> String {

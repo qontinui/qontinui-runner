@@ -531,6 +531,7 @@ pub async fn get_chat_output(
 /// instructions and existing page specs.
 #[tauri::command]
 pub async fn generate_workflow_from_chat(
+    app_handle: tauri::AppHandle,
     app_state: tauri::State<'_, Arc<AppState>>,
     task_run_id: String,
     description: Option<String>,
@@ -608,18 +609,47 @@ pub async fn generate_workflow_from_chat(
         reflection_mode: None,
     };
 
+    // Emit a UI-only note that generation is starting (not sent to AI session —
+    // the AI would respond prematurely while generation is still running).
+    {
+        let start_note = "Generating workflow from conversation...";
+        let now = chrono::Utc::now().timestamp_millis();
+        let event = AiOutputEvent {
+            id: format!("sys-{}-{}", now, rand::random::<u32>()),
+            timestamp: now,
+            line: start_note.to_string(),
+            source: "system_note".to_string(),
+            action_id: None,
+            task_run_id: Some(task_run_id.clone()),
+            session_id: None,
+            session_name: None,
+            phase: None,
+            phase_iteration: None,
+        };
+        if let Err(e) = app_handle.emit("ai-output", &event) {
+            warn!("Failed to emit generation-start system note: {}", e);
+        }
+    }
+
     // Get doctor handle for health monitoring
     let doctor_handle = app_state.doctor_handle.lock().await.clone();
     let db2 = app_state.checkpoint_db.clone();
+    let artifact_task_run_id = task_run_id.clone();
 
     let gen_result = tokio::task::spawn_blocking(move || {
         let gen_result = db2.with_conn(|conn| {
-            Ok(crate::workflow_generation::generate_workflow(
+            let (response, mut artifact) = crate::workflow_generation::generate_workflow(
                 request,
                 doctor_handle.as_ref(),
                 Some(conn),
                 None,
-            ))
+            );
+            // Save pipeline artifact for generator evaluation
+            artifact.task_run_id = Some(artifact_task_run_id.clone());
+            if let Err(e) = db2.save_pipeline_artifact(&artifact) {
+                tracing::warn!("Failed to save pipeline artifact: {}", e);
+            }
+            Ok(response)
         });
         match gen_result {
             Ok(response) => response,
@@ -641,18 +671,206 @@ pub async fn generate_workflow_from_chat(
     .await;
 
     match gen_result {
-        Ok(response) => Ok(CommandResponse {
-            success: response.success,
-            message: response.error.clone(),
-            data: Some(serde_json::json!({
-                "task_run_id": task_run_id,
-                "success": response.success,
-                "workflow": response.workflow,
-                "error": response.error,
-                "validation_errors": response.validation_errors,
-                "model_used": response.model_used,
-            })),
-        }),
+        Ok(response) => {
+            // Save workflow to database and store reference in chat task run
+            if response.success {
+                if let Some(ref workflow) = response.workflow {
+                    // Persist to workflow library so it appears in the UI
+                    let create_req = crate::unified_workflows::CreateUnifiedWorkflowRequest {
+                        name: workflow.name.clone(),
+                        description: workflow.description.clone(),
+                        category: workflow.category.clone(),
+                        tags: workflow.tags.clone(),
+                        setup_steps: workflow.setup_steps.clone(),
+                        verification_steps: workflow.verification_steps.clone(),
+                        agentic_steps: workflow.agentic_steps.clone(),
+                        completion_steps: workflow.completion_steps.clone(),
+                        max_iterations: workflow.max_iterations,
+                        timeout_seconds: workflow.timeout_seconds,
+                        provider: workflow.provider.clone(),
+                        model: workflow.model.clone(),
+                        skip_ai_summary: false,
+                        log_source_selection: None,
+                        context_ids: None,
+                        disabled_context_ids: None,
+                        auto_include_contexts: Some(workflow.auto_include_contexts),
+                        prompt_template: workflow.prompt_template.clone(),
+                        log_watch_enabled: Some(workflow.log_watch_enabled),
+                        health_check_enabled: Some(workflow.health_check_enabled),
+                        health_check_urls: if workflow.health_check_urls.is_empty() {
+                            None
+                        } else {
+                            Some(workflow.health_check_urls.clone())
+                        },
+                        preflight_check_enabled: Some(workflow.preflight_check_enabled),
+                        enable_sweep: Some(workflow.enable_sweep),
+                        max_sweep_iterations: Some(workflow.max_sweep_iterations),
+                        targeted_error_ids: None,
+                        generated_by_task_run_id: Some(task_run_id.clone()),
+                        stages: if workflow.stages.is_empty() {
+                            None
+                        } else {
+                            Some(workflow.stages.clone())
+                        },
+                        stop_on_failure: Some(workflow.stop_on_failure),
+                        reflection_mode: Some(workflow.reflection_mode),
+                    };
+
+                    let db_save = app_state.checkpoint_db.clone();
+                    let save_result = tokio::task::spawn_blocking(move || {
+                        db_save.create_unified_workflow(&create_req)
+                    })
+                    .await;
+
+                    match save_result {
+                        Ok(Ok(saved)) => {
+                            info!(
+                                "Saved generated workflow '{}' to library (id={})",
+                                saved.name, saved.id
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            warn!("Failed to save generated workflow to library: {}", e);
+                        }
+                        Err(e) => {
+                            warn!("spawn_blocking failed saving workflow: {}", e);
+                        }
+                    }
+
+                    // Store generated_workflow_id in the chat task run's result_data
+                    {
+                        let wf_id = &workflow.id;
+                        let wf_name = &workflow.name;
+                        let result_data = serde_json::json!({
+                            "generated_workflow_id": wf_id,
+                            "generated_workflow_name": wf_name,
+                        });
+                        let db3 = app_state.checkpoint_db.clone();
+                        let trid = task_run_id.clone();
+                        let rd_str = result_data.to_string();
+                        if let Err(e) = tokio::task::spawn_blocking(move || {
+                            db3.update_task_run_result_data(&trid, &rd_str)
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()))
+                        {
+                            warn!("Failed to update chat task run result_data: {}", e);
+                        }
+                    }
+                }
+            }
+
+            // Notify the active Claude CLI session about the generated workflow
+            if response.success {
+                if let Some(ref workflow) = response.workflow {
+                    // Count steps including those inside stages
+                    let mut step_count = workflow.setup_steps.len()
+                        + workflow.verification_steps.len()
+                        + workflow.agentic_steps.len()
+                        + workflow.completion_steps.len();
+                    for stage in &workflow.stages {
+                        step_count += stage.setup_steps.len()
+                            + stage.verification_steps.len()
+                            + stage.agentic_steps.len()
+                            + stage.completion_steps.len();
+                    }
+                    let system_note = format!(
+                        "[SYSTEM NOTE: A workflow '{}' ({} steps) has been successfully generated from this conversation. \
+                         The conversation is now idle. Do NOT respond to this note — do not ask questions, do not \
+                         offer next steps, do not produce any output. Simply stop and wait silently. \
+                         If the user sends a new message later, respond to that message only.]",
+                        workflow.name, step_count
+                    );
+
+                    // Emit as ai-output event so it appears in chat UI
+                    {
+                        let now = chrono::Utc::now().timestamp_millis();
+                        let event = AiOutputEvent {
+                            id: format!("sys-{}-{}", now, rand::random::<u32>()),
+                            timestamp: now,
+                            line: system_note.clone(),
+                            source: "system_note".to_string(),
+                            action_id: None,
+                            task_run_id: Some(task_run_id.clone()),
+                            session_id: None,
+                            session_name: None,
+                            phase: None,
+                            phase_iteration: None,
+                        };
+                        if let Err(e) = app_handle.emit("ai-output", &event) {
+                            warn!("Failed to emit system note ai-output event: {}", e);
+                        }
+                    }
+
+                    // Persist to output_log
+                    if let Ok(db) = CheckpointDb::new() {
+                        let formatted =
+                            format!("\n[SYSTEM_NOTE]\n{}\n[/SYSTEM_NOTE]\n", system_note);
+                        if let Err(e) =
+                            db.append_task_output_ex(&task_run_id, &formatted, false, false)
+                        {
+                            warn!("Failed to persist system note to output_log: {}", e);
+                        }
+                    }
+
+                    // Do NOT send to the Claude CLI session — any message triggers
+                    // a response turn, and we want the session to stay idle.
+                    // The note is UI-only + persisted for session restore.
+                }
+            }
+
+            // Notify AI if generation failed
+            if !response.success {
+                let error_msg = response.error.as_deref().unwrap_or("unknown error");
+                let fail_note = format!(
+                    "[SYSTEM NOTE: Workflow generation failed: {}. \
+                     Do NOT respond to this note — do not ask questions or offer suggestions. \
+                     Wait silently for the user to send a message.]",
+                    error_msg
+                );
+
+                let now = chrono::Utc::now().timestamp_millis();
+                let event = AiOutputEvent {
+                    id: format!("sys-{}-{}", now, rand::random::<u32>()),
+                    timestamp: now,
+                    line: fail_note.clone(),
+                    source: "system_note".to_string(),
+                    action_id: None,
+                    task_run_id: Some(task_run_id.clone()),
+                    session_id: None,
+                    session_name: None,
+                    phase: None,
+                    phase_iteration: None,
+                };
+                if let Err(e) = app_handle.emit("ai-output", &event) {
+                    warn!("Failed to emit generation-failed system note: {}", e);
+                }
+
+                if let Ok(db) = CheckpointDb::new() {
+                    let formatted = format!("\n[SYSTEM_NOTE]\n{}\n[/SYSTEM_NOTE]\n", fail_note);
+                    if let Err(e) = db.append_task_output_ex(&task_run_id, &formatted, false, false)
+                    {
+                        warn!("Failed to persist generation-failed system note: {}", e);
+                    }
+                }
+
+                // Do NOT send to the Claude CLI session — any message triggers
+                // a response turn. The failure note is UI-only + persisted.
+            }
+
+            Ok(CommandResponse {
+                success: response.success,
+                message: response.error.clone(),
+                data: Some(serde_json::json!({
+                    "task_run_id": task_run_id,
+                    "success": response.success,
+                    "workflow": response.workflow,
+                    "error": response.error,
+                    "validation_errors": response.validation_errors,
+                    "model_used": response.model_used,
+                })),
+            })
+        }
         Err(e) => Ok(CommandResponse {
             success: false,
             message: Some(format!("Generation task failed: {}", e)),

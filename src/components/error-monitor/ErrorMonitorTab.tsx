@@ -17,6 +17,7 @@ import {
   Filter,
   FolderOpen,
   Info,
+  Play,
   RefreshCw,
   Search,
   Settings,
@@ -175,6 +176,12 @@ function ErrorItem({
               <FolderOpen className="w-3 h-3" />
               {error.logSourceName}
             </span>
+            {error.workflowName && (
+              <span className="flex items-center gap-1">
+                <Play className="w-3 h-3" />
+                {error.workflowName}
+              </span>
+            )}
             {error.location && (
               <span>
                 {error.location.filePath}
@@ -357,7 +364,8 @@ export function ErrorMonitorTab({
       (e) =>
         e.message.toLowerCase().includes(search) ||
         e.errorType?.toLowerCase().includes(search) ||
-        e.logSourceName.toLowerCase().includes(search),
+        e.logSourceName.toLowerCase().includes(search) ||
+        e.workflowName?.toLowerCase().includes(search),
     );
   }, [errors, searchText]);
 

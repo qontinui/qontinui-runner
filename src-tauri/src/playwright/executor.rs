@@ -14,7 +14,6 @@ use super::types::DisplayMode;
 use crate::executor::file_logger::{FileLogger, PlaywrightLogParams};
 use crate::settings;
 use std::fs;
-use std::process::Command;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -264,7 +263,7 @@ pub fn run_script(
             npx_args
         );
 
-        let mut cmd = Command::new("cmd.exe");
+        let mut cmd = crate::process_helpers::cmd_no_window();
         cmd.args(["/c", &npx_args]).current_dir(&runner_dir);
 
         // Set Playwright environment variables from settings
@@ -290,7 +289,7 @@ pub fn run_script(
             args.join(" ")
         );
 
-        let mut cmd = Command::new("npx");
+        let mut cmd = crate::process_helpers::no_window("npx");
         cmd.args(&args).current_dir(&runner_dir);
 
         // Set Playwright environment variables from settings
@@ -589,7 +588,7 @@ pub fn run_script_inline(
             npx_args
         );
 
-        let mut cmd = Command::new("cmd.exe");
+        let mut cmd = crate::process_helpers::cmd_no_window();
         cmd.args(["/c", &npx_args]).current_dir(&runner_dir);
 
         // Set Playwright environment variables from settings
@@ -615,7 +614,7 @@ pub fn run_script_inline(
             args.join(" ")
         );
 
-        let mut cmd = Command::new("npx");
+        let mut cmd = crate::process_helpers::no_window("npx");
         cmd.args(&args).current_dir(&runner_dir);
 
         if let Some(username) = &playwright_settings.test_username {

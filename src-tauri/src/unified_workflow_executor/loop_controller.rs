@@ -795,8 +795,13 @@ impl LoopController {
                         &UnifiedWorkflowState::agentic_complete(agentic_iteration),
                     );
 
-                    // Adjust starting_iteration so the loop continues after this agentic phase
+                    // Adjust starting_iteration so the loop continues after this agentic phase,
+                    // and reduce max_iterations by 1 to account for the session already consumed.
+                    // Without this, the total sessions = 1 (agentic-first) + max_iterations - 1
+                    // (loop iterations), which exceeds the intended budget by 1.
                     stage_loop_config.starting_iteration = agentic_iteration;
+                    stage_loop_config.max_iterations =
+                        stage_loop_config.max_iterations.saturating_sub(1);
 
                     if !injected_steps.is_empty() {
                         info!(
@@ -1759,7 +1764,7 @@ impl LoopController {
             // This helps the AI understand what it changed in the previous iteration.
             {
                 let parent_id = get_parent_task_id(&config.execution_id);
-                match tokio::process::Command::new("git")
+                match crate::process_helpers::tokio_no_window("git")
                     .args(["diff", "--stat"])
                     .output()
                     .await
@@ -1768,7 +1773,7 @@ impl LoopController {
                         let diff_stat = String::from_utf8_lossy(&output.stdout).trim().to_string();
                         if !diff_stat.is_empty() {
                             // Also capture the actual diff (truncated)
-                            let full_diff = match tokio::process::Command::new("git")
+                            let full_diff = match crate::process_helpers::tokio_no_window("git")
                                 .args(["diff"])
                                 .output()
                                 .await

@@ -160,6 +160,7 @@ import { HooksManagerPanel } from "./components/hooks";
 import { ErrorMonitorTab } from "./components/error-monitor";
 import { ProcessManagerTab } from "./components/process-manager";
 import { ReflectionDashboard } from "./components/reflection-dashboard/ReflectionDashboard";
+import { GeneratorEvalPage } from "./pages/GeneratorEvalPage";
 
 // Development tools
 import { PerformanceOverlay } from "./components/dev";
@@ -180,6 +181,7 @@ type MainTabId =
   | "error-monitor"
   | "processes"
   | "reflection"
+  | "generator-eval"
   // Observe group - new structure
   | "run-recap"
   | "run-actions"
@@ -243,6 +245,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "error-monitor",
   "processes",
   "reflection",
+  "generator-eval",
   // New observe tabs
   "run-recap",
   "run-actions",
@@ -515,6 +518,31 @@ function AppContent() {
     };
   }, []);
 
+  // Listen for zombie task cleanup events from the backend
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+
+    const setup = async () => {
+      unlisten = await listen<{
+        task_run_id: string;
+        task_name: string;
+        message: string;
+      }>("zombie-task-cleaned", (event) => {
+        const { task_name, message } = event.payload;
+        console.log("[APP] Zombie task cleaned:", event.payload);
+        setZombieTaskMessage(`${task_name}: ${message}`);
+        // Auto-dismiss after 8 seconds
+        setTimeout(() => setZombieTaskMessage(null), 8000);
+      });
+    };
+
+    setup();
+
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, []);
+
   // Workflow ID to edit (when navigating from Library to Workflow Builder)
   const [editWorkflowId, setEditWorkflowId] = useState<string | null>(null);
 
@@ -539,6 +567,9 @@ function AppContent() {
   // State for "Run Last Workflow" button
   const [isRunningLastWorkflow, setIsRunningLastWorkflow] = useState(false);
   const [runLastWorkflowError, setRunLastWorkflowError] = useState<string | null>(null);
+
+  // State for zombie task cleanup toast
+  const [zombieTaskMessage, setZombieTaskMessage] = useState<string | null>(null);
 
   // The last workflow can be re-run if we have a workflow_name
   const lastRunWorkflowId = lastRun?.workflow_name ?? null;
@@ -945,6 +976,13 @@ function AppContent() {
         return (
           <div className="h-full overflow-hidden">
             <ReflectionDashboard />
+          </div>
+        );
+
+      case "generator-eval":
+        return (
+          <div className="h-full overflow-hidden">
+            <GeneratorEvalPage />
           </div>
         );
 
@@ -1511,6 +1549,26 @@ function AppContent() {
               </div>
               <button
                 onClick={() => setRunLastWorkflowError(null)}
+                className="text-muted-foreground hover:text-foreground flex-shrink-0"
+              >
+                &times;
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Zombie task cleanup toast */}
+        {zombieTaskMessage && (
+          <div className="fixed bottom-4 right-4 p-4 rounded-lg shadow-lg border max-w-md z-toast bg-card border-yellow-500/50">
+            <div className="flex items-start gap-3">
+              <div className="flex-1 min-w-0">
+                <h4 className="font-medium text-sm text-yellow-600 dark:text-yellow-400">
+                  Task Stopped Automatically
+                </h4>
+                <p className="text-sm text-muted-foreground mt-1">{zombieTaskMessage}</p>
+              </div>
+              <button
+                onClick={() => setZombieTaskMessage(null)}
                 className="text-muted-foreground hover:text-foreground flex-shrink-0"
               >
                 &times;

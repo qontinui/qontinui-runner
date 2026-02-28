@@ -47,7 +47,7 @@ pub use types::{
 };
 
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
@@ -289,11 +289,11 @@ pub fn execute_check(check_def: &CheckDefinition) -> CheckExecutionResult {
         } else {
             format!("{} {}", program, args.join(" "))
         };
-        let mut c = Command::new("cmd");
+        let mut c = crate::process_helpers::cmd_no_window();
         c.args(["/C", &full_command]);
         c
     } else {
-        let mut c = Command::new(&program);
+        let mut c = crate::process_helpers::no_window(&program);
         c.args(&args);
         c
     };

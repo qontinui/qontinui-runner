@@ -193,10 +193,8 @@ fn check_extension_reachability() -> Result<bool, String> {
 /// Check if a Chrome/browser process is running
 #[cfg(target_os = "windows")]
 fn check_browser_process_running() -> bool {
-    use std::process::Command;
-
     // Use tasklist to check for chrome.exe - fast and reliable
-    match Command::new("tasklist")
+    match crate::process_helpers::no_window("tasklist")
         .args(["/FI", "IMAGENAME eq chrome.exe", "/NH", "/FO", "CSV"])
         .output()
     {
@@ -215,15 +213,16 @@ fn check_browser_process_running() -> bool {
 
 #[cfg(not(target_os = "windows"))]
 fn check_browser_process_running() -> bool {
-    use std::process::Command;
-
     // On Unix, use pgrep
-    match Command::new("pgrep").args(["-x", "chrome"]).output() {
+    match crate::process_helpers::no_window("pgrep")
+        .args(["-x", "chrome"])
+        .output()
+    {
         Ok(output) => output.status.success(),
         Err(e) => {
             warn!("Failed to check browser process: {}", e);
             // Try alternative with ps
-            match Command::new("ps")
+            match crate::process_helpers::no_window("ps")
                 .args(["aux"])
                 .output()
                 .map(|o| String::from_utf8_lossy(&o.stdout).contains("chrome"))

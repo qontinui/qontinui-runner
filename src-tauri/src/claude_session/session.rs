@@ -105,7 +105,7 @@ impl ClaudeSession {
         );
 
         // Spawn CLI with stream-json input AND output
-        let mut cmd = std::process::Command::new("cmd.exe");
+        let mut cmd = crate::process_helpers::cmd_no_window();
         cmd.args([
             "/c",
             "claude",
@@ -128,6 +128,12 @@ impl ClaudeSession {
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("Failed to spawn Claude CLI: {}", e))?;
+
+        // Assign to Windows Job Object for crash safety (auto-kill on runner exit)
+        #[cfg(target_os = "windows")]
+        crate::job_object::assign_process_to_job(
+            child.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE
+        );
 
         let child_pid = child.id();
         info!("Claude CLI spawned with PID {}", child_pid);

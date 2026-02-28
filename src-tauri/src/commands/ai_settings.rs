@@ -386,7 +386,7 @@ async fn test_claude_cli_connection(settings: &ClaudeCliSettings) -> Result<Stri
     let output = match effective_mode {
         CliExecutionMode::WindowsNative | CliExecutionMode::Auto => {
             // On Windows, use cmd.exe /c to handle .cmd files from npm install
-            tokio::process::Command::new("cmd.exe")
+            crate::process_helpers::tokio_cmd_no_window()
                 .args(["/c", claude_program, "--version"])
                 .output()
                 .await
@@ -397,12 +397,12 @@ async fn test_claude_cli_connection(settings: &ClaudeCliSettings) -> Result<Stri
                     )
                 })?
         }
-        CliExecutionMode::Wsl => tokio::process::Command::new("wsl")
+        CliExecutionMode::Wsl => crate::process_helpers::tokio_no_window("wsl")
             .args([claude_program, "--version"])
             .output()
             .await
             .map_err(|e| format!("Failed to execute claude via WSL: {}. Is WSL installed?", e))?,
-        CliExecutionMode::Native => tokio::process::Command::new(claude_program)
+        CliExecutionMode::Native => crate::process_helpers::tokio_no_window(claude_program)
             .args(["--version"])
             .output()
             .await
@@ -504,7 +504,7 @@ async fn test_gemini_cli_connection(settings: &GeminiCliSettings) -> Result<Stri
     let output = match effective_mode {
         CliExecutionMode::WindowsNative | CliExecutionMode::Auto => {
             // On Windows, use cmd.exe /c to handle .cmd files from npm install
-            tokio::process::Command::new("cmd.exe")
+            crate::process_helpers::tokio_cmd_no_window()
                 .args(["/c", gemini_program, "--version"])
                 .output()
                 .await
@@ -515,12 +515,12 @@ async fn test_gemini_cli_connection(settings: &GeminiCliSettings) -> Result<Stri
                     )
                 })?
         }
-        CliExecutionMode::Wsl => tokio::process::Command::new("wsl")
+        CliExecutionMode::Wsl => crate::process_helpers::tokio_no_window("wsl")
             .args([gemini_program, "--version"])
             .output()
             .await
             .map_err(|e| format!("Failed to execute gemini via WSL: {}. Is WSL installed?", e))?,
-        CliExecutionMode::Native => tokio::process::Command::new(gemini_program)
+        CliExecutionMode::Native => crate::process_helpers::tokio_no_window(gemini_program)
             .args(["--version"])
             .output()
             .await

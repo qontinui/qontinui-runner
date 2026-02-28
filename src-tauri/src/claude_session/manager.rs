@@ -71,6 +71,20 @@ impl SessionManager {
         self.get(task_run_id).map(|s| s.state())
     }
 
+    /// List all sessions with their task_run_id, current state, and PID.
+    /// Used by the zombie sweep to check session liveness.
+    pub fn list_all_with_state(&self) -> Vec<(String, SessionState, u32)> {
+        self.sessions
+            .lock()
+            .map(|guard| {
+                guard
+                    .iter()
+                    .map(|(k, s)| (k.clone(), s.state(), s.pid()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// List all active session task_run_ids.
     pub fn list_active(&self) -> Vec<String> {
         self.sessions

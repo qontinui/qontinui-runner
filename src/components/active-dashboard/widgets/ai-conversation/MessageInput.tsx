@@ -48,8 +48,8 @@ function SessionStateIndicator({ state, canSend }: { state: string | null; canSe
   }
   return (
     <div className="flex items-center gap-1.5">
-      <div className="w-2 h-2 rounded-full bg-muted-foreground/50" />
-      <span className="text-[10px] text-muted-foreground">Waiting for session</span>
+      <div className="w-2 h-2 rounded-full bg-red-500/60" />
+      <span className="text-[10px] text-red-400/80">No active session</span>
     </div>
   );
 }
@@ -118,11 +118,14 @@ export function MessageInput() {
   if (!isTaskRunning) return null;
 
   const isProcessing = state === "processing";
+  const noSession = state === null;
   const placeholder = canSendMessage
     ? "Send a message to the AI..."
     : isProcessing
       ? "Type a message (will be queued)..."
-      : "Type a message...";
+      : noSession
+        ? "No active AI session"
+        : "Waiting for AI session...";
 
   return (
     <div className="border-t border-border bg-background px-3 py-2 space-y-1.5">
@@ -141,7 +144,7 @@ export function MessageInput() {
           onChange={(e) => setMessage(e.target.value)}
           onKeyDown={handleKeyDown}
           placeholder={placeholder}
-          disabled={isSending}
+          disabled={isSending || noSession}
           rows={1}
           className={cn(
             "flex-1 resize-none rounded-md border border-border bg-muted/30 px-3 py-2 text-sm",

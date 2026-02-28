@@ -358,18 +358,13 @@ pub fn launch_reflection(
         reflection_task_run_id: reflection_id.clone(),
     };
 
-    let step_injection_ctx = crate::step_injection::types::StepInjectionContext {
-        execution_id: reflection_id.clone(),
-    };
-
     let mut controller = crate::unified_workflow_executor::LoopController::new(
         deps.app_state.clone(),
         deps.config_storage.clone(),
         deps.app_handle.clone(),
         deps.pid_tracker.clone(),
     )
-    .with_reflection_fix_ctx(reflection_fix_ctx)
-    .with_step_injection_ctx(step_injection_ctx);
+    .with_reflection_fix_ctx(reflection_fix_ctx);
 
     info!(
         "Spawning reflection workflow '{}' (id: {}) with {} setup steps",

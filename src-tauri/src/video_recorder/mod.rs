@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -214,7 +214,7 @@ impl VideoRecordingService {
         info!("Starting FFmpeg with args: {:?}", ffmpeg_args);
 
         // Start FFmpeg process
-        let mut command = Command::new("ffmpeg");
+        let mut command = crate::process_helpers::no_window("ffmpeg");
         command
             .args(&ffmpeg_args)
             .stdin(Stdio::piped())

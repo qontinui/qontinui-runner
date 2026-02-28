@@ -840,12 +840,17 @@ pub async fn generate_unified_workflow_handler(
     let result = tokio::task::spawn_blocking(move || {
         // Get DB connection for RAG examples + filtered schema context
         let gen_result = db.with_conn(|conn| {
-            Ok(workflow_generation::generate_workflow(
+            let (response, artifact) = workflow_generation::generate_workflow(
                 request,
                 doctor_handle.as_ref(),
                 Some(conn),
                 None, // Embedding computed lazily if embedding API is available
-            ))
+            );
+            // Save pipeline artifact for generator evaluation
+            if let Err(e) = db.save_pipeline_artifact(&artifact) {
+                tracing::warn!("Failed to save pipeline artifact: {}", e);
+            }
+            Ok(response)
         });
         match gen_result {
             Ok(response) => response,
@@ -854,8 +859,6 @@ pub async fn generate_unified_workflow_handler(
                     "DB access failed for workflow generation, falling back to no-DB path: {}",
                     e
                 );
-                // This shouldn't happen, but if it does, the request was already moved
-                // into the closure above, so we can't retry. Return an error response.
                 workflow_generation::GenerateWorkflowResponse {
                     workflow: None,
                     validation_errors: vec![],

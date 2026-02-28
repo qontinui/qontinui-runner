@@ -8,7 +8,6 @@ use super::types::{
     TestExecutionResult, TestStatus, TestSuiteSummary, TestType,
 };
 use std::fs;
-use std::process::Command;
 use tracing::info;
 
 /// Execute a repository test command and parse results
@@ -65,7 +64,7 @@ pub fn execute_repo_test(test_def: &TestDefinition) -> TestExecutionResult {
         // env vars and pass them via Command::env() instead.
         let (extra_envs, actual_command) = extract_env_prefix(&cmd_command);
 
-        let mut cmd = Command::new("cmd.exe");
+        let mut cmd = crate::process_helpers::cmd_no_window();
         cmd.args(["/c", &actual_command]);
         cmd.current_dir(&working_dir);
         cmd.envs(&config.environment);
@@ -74,7 +73,7 @@ pub fn execute_repo_test(test_def: &TestDefinition) -> TestExecutionResult {
         }
         cmd.output()
     } else {
-        Command::new("sh")
+        crate::process_helpers::no_window("sh")
             .args(["-c", &command])
             .current_dir(&working_dir)
             .envs(&config.environment)

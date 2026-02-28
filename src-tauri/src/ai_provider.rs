@@ -373,7 +373,7 @@ fn run_claude_cli_with_file(
                 )
             };
             spawn_and_wait_with_doctor(
-                Command::new("powershell.exe").args([
+                crate::process_helpers::no_window("powershell.exe").args([
                     "-NoProfile",
                     "-ExecutionPolicy",
                     "Bypass",
@@ -405,7 +405,7 @@ fn run_claude_cli_with_file(
                 )
             };
             spawn_and_wait_with_doctor(
-                Command::new("wsl").args(["bash", "-c", &wsl_prompt]),
+                crate::process_helpers::no_window("wsl").args(["bash", "-c", &wsl_prompt]),
                 "Claude CLI response (WSL file)",
                 doctor_handle,
             )
@@ -424,7 +424,7 @@ fn run_claude_cli_with_file(
                 )
             };
             spawn_and_wait_with_doctor(
-                Command::new("sh").args(["-c", &native_cmd]),
+                crate::process_helpers::no_window("sh").args(["-c", &native_cmd]),
                 "Claude CLI response (native file)",
                 doctor_handle,
             )
@@ -460,7 +460,7 @@ fn run_claude_cli_with_arg(
 ) -> AiResponse {
     let output_result = match effective_mode {
         CliExecutionMode::WindowsNative | CliExecutionMode::Auto => {
-            let mut cmd = Command::new("cmd.exe");
+            let mut cmd = crate::process_helpers::cmd_no_window();
             let mut args = vec!["/c", claude_program, "--print", "-p", prompt];
             if let Some(model) = model_override {
                 args.push("--model");
@@ -473,7 +473,7 @@ fn run_claude_cli_with_arg(
             spawn_and_wait_with_doctor(&mut cmd, "Claude CLI response (arg)", doctor_handle)
         }
         CliExecutionMode::Wsl => {
-            let mut cmd = Command::new("wsl");
+            let mut cmd = crate::process_helpers::no_window("wsl");
             let mut args = vec![claude_program, "--print", "-p", prompt];
             if let Some(model) = model_override {
                 args.push("--model");
@@ -486,7 +486,7 @@ fn run_claude_cli_with_arg(
             spawn_and_wait_with_doctor(&mut cmd, "Claude CLI response (WSL arg)", doctor_handle)
         }
         CliExecutionMode::Native => {
-            let mut cmd = Command::new(claude_program);
+            let mut cmd = crate::process_helpers::no_window(claude_program);
             let mut args = vec!["--print", "-p", prompt];
             if let Some(model) = model_override {
                 args.push("--model");
@@ -694,7 +694,7 @@ fn run_gemini_cli(
         CliExecutionMode::WindowsNative | CliExecutionMode::Auto => {
             // On Windows, use cmd.exe /c to handle .cmd files from npm install
             spawn_and_wait_with_doctor(
-                Command::new("cmd.exe").args([
+                crate::process_helpers::cmd_no_window().args([
                     "/c",
                     gemini_program,
                     "--model",
@@ -707,12 +707,19 @@ fn run_gemini_cli(
             )
         }
         CliExecutionMode::Wsl => spawn_and_wait_with_doctor(
-            Command::new("wsl").args([gemini_program, "--model", model, "-p", prompt]),
+            crate::process_helpers::no_window("wsl").args([
+                gemini_program,
+                "--model",
+                model,
+                "-p",
+                prompt,
+            ]),
             "Gemini CLI response (WSL)",
             doctor_handle,
         ),
         CliExecutionMode::Native => spawn_and_wait_with_doctor(
-            Command::new(gemini_program).args(["--model", model, "-p", prompt]),
+            crate::process_helpers::no_window(gemini_program)
+                .args(["--model", model, "-p", prompt]),
             "Gemini CLI response (native)",
             doctor_handle,
         ),

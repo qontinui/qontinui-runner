@@ -185,28 +185,48 @@ pub fn build_completion_steps(source_workflow_name: &str) -> Vec<ExecutionStepCo
 }
 
 /// Build the agentic phase prompt for the reflection AI.
+///
+/// Dispatches to a generation-specific or execution-specific prompt based on
+/// whether the source workflow was a generation meta-workflow ("AI Generate: ...").
 fn build_agentic_prompt(source_workflow_name: &str) -> String {
-    format!(
-        r#"You are a reflection agent analyzing the completed workflow run for "{}".
+    let is_generation = source_workflow_name.starts_with("AI Generate:");
 
-Your goal is to identify systemic issues and apply fixes that will improve subsequent runs.
+    let preamble = format!(
+        r#"You are a reflection agent analyzing the completed {} for "{}".
+
+{}
 
 ## CRITICAL: Analysis Only — No File System Access
 
 You MUST NOT use any file system tools (find, grep, cat, ls, read, glob, etc.) or explore the codebase.
 All the data you need has already been loaded into runtime variables below.
 Your job is to ANALYZE the provided data and produce REFLECTION_FIX markers — not to explore or modify files.
-Do NOT run any bash commands. Focus entirely on analyzing the data and writing your analysis.
+Do NOT run any bash commands. Focus entirely on analyzing the data and writing your analysis."#,
+        if is_generation {
+            "workflow generation run"
+        } else {
+            "workflow run"
+        },
+        source_workflow_name,
+        if is_generation {
+            "Your goal is to identify systemic issues in the workflow generation pipeline and apply fixes \
+             that will improve the quality of future generated workflows."
+        } else {
+            "Your goal is to identify systemic issues and apply fixes that will improve subsequent runs."
+        },
+    );
 
+    let data_section = r#"
 ## Data Available
 
 The setup phase loaded the following data into runtime variables:
-- `{{{{source_findings}}}}` — Categorized findings with signature hashes
-- `{{{{source_knowledge}}}}` — Observations, solutions, root causes recorded during execution
-- `{{{{source_ai_output}}}}` — The complete AI conversation output (CRITICAL — read this end-to-end)
-- `{{{{source_workflow_state}}}}` — Workflow execution state (phases, iterations, timing)
-- `{{{{previous_fixes}}}}` — Previous reflection fixes for this workflow (for effectiveness comparison)
+- `{{source_findings}}` — Categorized findings with signature hashes
+- `{{source_knowledge}}` — Observations, solutions, root causes recorded during execution
+- `{{source_ai_output}}` — The complete AI conversation output (CRITICAL — read this end-to-end)
+- `{{source_workflow_state}}` — Workflow execution state (phases, iterations, timing)
+- `{{previous_fixes}}` — Previous reflection fixes for this workflow (for effectiveness comparison)"#;
 
+    let marker_section = r#"
 ## Recording Fixes
 
 Use `[REFLECTION_FIX:...]` markers to record each fix you apply. These are parsed automatically
@@ -227,8 +247,37 @@ Finding: optional-source-finding-id
 **fix_type** must be one of: `knowledge_base_update`, `workflow_step_rewrite`, `selector_fix`, `tool_config_update`, `context_addition`, `instruction_clarification`
 (shortcuts: `kb_update`, `step_rewrite`, `selector`, `tool_config`, `context`, `clarification`)
 
-**confidence** must be one of: `high`, `medium`, `low`
+**confidence** must be one of: `high`, `medium`, `low`"#;
 
+    let analysis_steps = if is_generation {
+        build_generation_analysis_steps()
+    } else {
+        build_execution_analysis_steps()
+    };
+
+    let evaluation_section = r#"
+### Step 5: Evaluate Previous Fixes
+Compare the source run's findings against previously applied fixes:
+- If a fix's source finding signature does NOT appear in this run → fix was effective
+- If the signature DOES appear → fix was ineffective
+- If new findings appeared that weren't present before → possible regression
+
+Note: Batch effectiveness evaluation runs automatically in the completion phase.
+Focus your analysis on qualitative observations about which fixes helped and which didn't,
+and record any new fixes needed using `[REFLECTION_FIX:...]` markers."#;
+
+    format!(
+        "{}\n{}\n{}\n{}\n{}",
+        preamble, data_section, marker_section, analysis_steps, evaluation_section
+    )
+}
+
+/// Analysis steps for reflecting on a workflow execution run.
+///
+/// Focuses on runtime issues: tool failures, selector problems, missing context,
+/// wasted iterations, and decision quality during execution.
+fn build_execution_analysis_steps() -> String {
+    r#"
 ### Example
 
 ```
@@ -301,48 +350,87 @@ as they will only be recorded without creating knowledge entries.
 ### Deduplication
 Fixes are deduplicated by content hash (fix_type + description + old_value + new_value).
 If an identical fix already exists with status 'applied', the duplicate will be skipped.
-Only emit fixes for genuinely new insights — do NOT re-emit fixes from previous reflection runs.
+Only emit fixes for genuinely new insights — do NOT re-emit fixes from previous reflection runs."#
+        .to_string()
+}
 
-## Verification Steps
-
-For EACH fix you apply, also output a verification step using `[INJECT_STEP]...[/INJECT_STEP]` markers.
-The step should verify that the fix was correctly applied. Use JSON format with these step types:
-- `command`: Shell command (PREFERRED — use curl commands for checking runner data like knowledge, findings, rules)
-- `command` with `check_type: "ci_cd"`: Verify GitHub CI/CD pipeline passes (set `repository` to owner/repo or `working_directory` to a git repo root)
-- `prompt`: AI verification question (AVOID in reflection — no UI Bridge SDK connection is available, so prompt steps that depend on UI state will fail)
-
-These injected steps will be added to the verification phase to confirm your fixes work.
-
-**IMPORTANT: Prefer `command` steps with curl over `prompt` steps for verification.**
-Prompt-type verification steps require an active UI Bridge SDK connection, which is NOT available during reflection workflows.
-Use `command` steps with curl targeting the runner API at http://localhost:9876 to verify data stored in the runner (knowledge entries, findings, generation rules, etc.).
-Only use `prompt` steps for high-level semantic checks that cannot be expressed as command assertions.
-
+/// Analysis steps for reflecting on a workflow generation run.
+///
+/// Focuses on generation quality: prompt interpretation, step type selection,
+/// builder/verifier/fixer agent quality, and structural issues in the output workflow.
+fn build_generation_analysis_steps() -> String {
+    r#"
 ### Example
 
 ```
-[INJECT_STEP]
-{{"type": "command", "mode": "shell", "name": "Verify KB entry exists", "command": "curl -sf http://localhost:9876/task-runs/current/knowledge | grep expected_keyword"}}
-[/INJECT_STEP]
+[REFLECTION_FIX:instruction_clarification:high]
+Description: Builder agent consistently generates command steps with shell_command instead of using the prompt step type for AI-driven analysis tasks. The builder prompt should clarify when to use prompt vs command steps.
+Old: No guidance on prompt vs command step selection
+New: Added rule: use prompt steps when the task requires AI reasoning/analysis; use command steps only for deterministic shell operations
+[/REFLECTION_FIX]
 ```
 
-```
-[INJECT_STEP]
-{{"type": "command", "mode": "shell", "name": "Verify generation rule created", "command": "curl -sf 'http://localhost:9876/generation-rules?agent=schema_context&status=active' | grep rule_title_keyword"}}
-[/INJECT_STEP]
-```
+### API Fallback
 
-### Step 5: Evaluate Previous Fixes
-Compare the source run's findings against previously applied fixes:
-- If a fix's source finding signature does NOT appear in this run → fix was effective
-- If the signature DOES appear → fix was ineffective
-- If new findings appeared that weren't present before → possible regression
+If you need to make HTTP calls directly (e.g., to evaluate previous fix effectiveness),
+use the `api_request` MCP tool to call the runner API at http://localhost:9876.
 
-Note: Batch effectiveness evaluation runs automatically in the completion phase.
-Focus your analysis on qualitative observations about which fixes helped and which didn't,
-and record any new fixes needed using `[REFLECTION_FIX:...]` markers."#,
-        source_workflow_name
-    )
+## Analysis Steps
+
+The generation pipeline uses a 3-agent architecture: **Builder** (creates the initial workflow JSON), **Verifier** (reviews for correctness), and **Fixer** (corrects issues found by the verifier). Analyze each agent's performance.
+
+### Step 1: Builder Agent Analysis (PRIMARY)
+Read the AI conversation output end-to-end and evaluate the builder's decisions:
+- **Prompt interpretation** — Did the builder correctly understand the user's intent from the description? Did it miss key requirements or add unnecessary steps?
+- **Step type selection** — Were the right step types chosen (command vs prompt vs check)? Were there cases where a different step type would have been more appropriate?
+- **Step configuration quality** — Were steps well-configured with appropriate commands, selectors, timeouts, and expected values? Were there obvious misconfigurations?
+- **Workflow structure** — Is the phase organization logical (setup → verification → agentic → completion)? Are steps in the right phases?
+- **Missing steps** — Were important steps omitted that the workflow clearly needs?
+- **Unnecessary steps** — Were steps included that add no value or are redundant?
+
+### Step 2: Verifier Agent Analysis
+Evaluate the quality of the verifier's review:
+- **False positives** — Did the verifier flag issues that weren't actually problems, wasting fixer iterations?
+- **False negatives** — Did real issues slip through that the verifier should have caught?
+- **Feedback quality** — Was the verifier's feedback specific and actionable, or vague and unhelpful?
+- **Verification coverage** — Did the verifier check all important aspects (step types, configuration, phase assignments, naming)?
+
+### Step 3: Fixer Agent Analysis
+Evaluate the fixer's corrections:
+- **Fix quality** — Did fixes actually improve the workflow, or did they introduce new issues?
+- **Over-correction** — Did the fixer make unnecessary changes beyond what the verifier flagged?
+- **Under-correction** — Did the fixer fail to address issues the verifier identified?
+- **Iteration efficiency** — How many fix iterations were needed? Could the workflow have converged faster?
+
+### Step 4: Categorize Issues and Apply Fixes
+For each identified issue, determine the best fix type:
+
+- `instruction_clarification` (HIGH PRIORITY for generation) — Improvements to builder/verifier/fixer prompts. These become generation rules that directly improve future workflow generation.
+- `workflow_step_rewrite` (HIGH PRIORITY for generation) — Patterns about how specific step types should be generated. These become step-type-specific generation rules.
+- `knowledge_base_update` — Recurring generation anti-patterns that should be remembered across runs.
+- `context_addition` — Missing context that the generation agents needed (e.g., available step types, configuration schemas, platform capabilities).
+
+Record each fix using a `[REFLECTION_FIX:...]` marker. The source and reflection task run IDs are filled in automatically.
+
+**Confidence guidelines:**
+- `high` — Clear pattern seen in the output, straightforward prompt improvement
+- `medium` — Likely improvement but based on a single observation
+- `low` — Speculative, may need more data points
+
+### Auto-Applied Fix Types
+The following fix types are automatically applied by the system:
+- `knowledge_base_update` at high/medium confidence → Creates a recurring_pattern knowledge entry
+- `context_addition` at high confidence → Creates a context knowledge entry
+- `instruction_clarification` at high confidence → Creates a new generation rule for the relevant prompt agent (schema_context, hardener, or verification). **This is the most valuable fix type for generation reflection** — it directly improves the prompts used by the builder, verifier, and fixer agents.
+- `workflow_step_rewrite` at high confidence → Creates a new generation rule for the relevant prompt agent. Use this for patterns about how specific step types should be generated differently.
+
+All other fix types are recorded for manual review.
+
+### Deduplication
+Fixes are deduplicated by content hash (fix_type + description + old_value + new_value).
+If an identical fix already exists with status 'applied', the duplicate will be skipped.
+Only emit fixes for genuinely new insights — do NOT re-emit fixes from previous reflection runs."#
+        .to_string()
 }
 
 /// Helper: Build a command step that makes an HTTP request via curl.

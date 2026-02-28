@@ -19,7 +19,6 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Instant;
 use tauri::State;
-use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 use tracing::{error, info};
 use uuid::Uuid;
@@ -706,11 +705,11 @@ pub async fn execute_shell_command(
 
     // Build the command
     let mut cmd = if cfg!(target_os = "windows") {
-        let mut c = Command::new("cmd");
+        let mut c = crate::process_helpers::tokio_cmd_no_window();
         c.args(["/C", &command]);
         c
     } else {
-        let mut c = Command::new("sh");
+        let mut c = crate::process_helpers::tokio_no_window("sh");
         c.args(["-c", &command]);
         c
     };

@@ -2238,6 +2238,83 @@ CREATE TABLE IF NOT EXISTS process_session_output (
 
 CREATE INDEX IF NOT EXISTS idx_process_session_output_session ON process_session_output(session_id);
 
+-- ============================================================================
+-- Generator Evaluation
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS generation_pipeline_artifacts (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT,
+    task_run_id TEXT,
+    description TEXT NOT NULL,
+    category TEXT,
+    created_at TEXT NOT NULL,
+
+    -- Timing (milliseconds)
+    discovery_duration_ms INTEGER,
+    builder_duration_ms INTEGER,
+    autofix_duration_ms INTEGER,
+    verification_duration_ms INTEGER,
+    hardener_duration_ms INTEGER,
+    total_duration_ms INTEGER,
+
+    -- Intermediate snapshots (JSON)
+    discovery_calls TEXT,
+    builder_raw_output TEXT,
+    builder_parsed_json TEXT,
+    autofix_diff TEXT,
+    verification_iterations TEXT,
+    fixer_snapshots TEXT,
+    hardening_summary TEXT,
+    hardened_json TEXT,
+    final_json TEXT,
+    validation_errors TEXT,
+
+    -- Outcome
+    success INTEGER NOT NULL DEFAULT 1,
+    error_message TEXT,
+    model_used TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_pipeline_artifacts_workflow ON generation_pipeline_artifacts(workflow_id);
+CREATE INDEX IF NOT EXISTS idx_pipeline_artifacts_created ON generation_pipeline_artifacts(created_at);
+
+CREATE TABLE IF NOT EXISTS generator_benchmarks (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    category TEXT,
+    tags TEXT,
+    expected_structure TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS generator_benchmark_results (
+    id TEXT PRIMARY KEY,
+    benchmark_id TEXT NOT NULL REFERENCES generator_benchmarks(id),
+    artifact_id TEXT REFERENCES generation_pipeline_artifacts(id),
+    run_at TEXT NOT NULL,
+    model_used TEXT,
+
+    -- Scores (0.0 - 1.0)
+    structure_score REAL,
+    content_score REAL,
+    step_type_score REAL,
+    overall_score REAL,
+
+    -- Details
+    score_breakdown TEXT,
+    generated_json TEXT,
+    duration_ms INTEGER,
+    passed INTEGER NOT NULL DEFAULT 0,
+    notes TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_benchmark_results_benchmark ON generator_benchmark_results(benchmark_id);
+CREATE INDEX IF NOT EXISTS idx_benchmark_results_run_at ON generator_benchmark_results(run_at);
+
 -- Initialize singleton tables
 INSERT OR IGNORE INTO gui_lock (id, holder_session_id, acquired_at) VALUES (1, NULL, NULL);
 INSERT OR IGNORE INTO scheduler_settings (id) VALUES (1);

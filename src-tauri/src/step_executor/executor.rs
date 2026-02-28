@@ -48,7 +48,7 @@ use crate::orchestrator::context_propagation::{
 use crate::unified_workflow_executor::get_parent_task_id;
 
 // Handler system imports
-use super::handlers::{HandlerContext, HandlerRegistry};
+use super::handlers::{HandlerContext, HandlerRegistry, StepHandler};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -3256,6 +3256,33 @@ impl StepExecutor {
                     );
                             (true, None, None, None)
                         }
+                        "prompt" => {
+                            // AI Review verification step — dispatch via handler with iteration context
+                            let mut handler_ctx = self.create_handler_context();
+                            handler_ctx.iteration = Some(iteration);
+                            let handler = super::handlers::PromptStepHandler;
+                            let result = handler.execute(step, &handler_ctx).await;
+                            let details = VerificationStepDetails {
+                                step_id: step
+                                    .name
+                                    .clone()
+                                    .unwrap_or_else(|| format!("step-{}", index)),
+                                phase: "verification".to_string(),
+                                stdout: result
+                                    .output_data
+                                    .as_ref()
+                                    .and_then(|d| d.get("reasoning"))
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string()),
+                                ..Default::default()
+                            };
+                            (
+                                result.success,
+                                result.error,
+                                Some(details),
+                                result.output_data,
+                            )
+                        }
                         _ => {
                             // Generic handler for all other step types in verification.
                             // Output is captured by the post-match normalization block below.
@@ -3686,7 +3713,6 @@ impl StepExecutor {
         timeout_secs: Option<u64>,
     ) -> (bool, Option<String>, Option<String>) {
         use std::process::Stdio;
-        use tokio::process::Command;
         use tokio::time::{timeout, Duration};
 
         // Get the command template - either directly or by looking up shell_command_id from database
@@ -3869,12 +3895,12 @@ impl StepExecutor {
         // Unix-style commands, and cmd.exe as default on Windows
         let mut cmd = if cfg!(target_os = "windows") {
             if is_powershell {
-                let mut c = Command::new("powershell");
+                let mut c = crate::process_helpers::tokio_no_window("powershell");
                 c.args(["-NoProfile", "-NonInteractive", "-Command", &command]);
                 c
             } else if is_bash {
                 // Use bash for Unix-style commands (available via Git for Windows)
-                let mut c = Command::new("bash");
+                let mut c = crate::process_helpers::tokio_no_window("bash");
                 c.args(["-c", &command]);
                 c
             } else {
@@ -3883,7 +3909,7 @@ impl StepExecutor {
                 // cmd.exe doesn't support "KEY=VALUE command" syntax.
                 let stripped = command.replace('\'', "");
                 let (extra_envs, actual_cmd) = extract_env_prefix_for_cmd(&stripped);
-                let mut c = Command::new("cmd");
+                let mut c = crate::process_helpers::tokio_cmd_no_window();
                 c.args(["/C", &actual_cmd]);
                 for (key, value) in extra_envs {
                     c.env(key, value);
@@ -3891,7 +3917,7 @@ impl StepExecutor {
                 c
             }
         } else {
-            let mut c = Command::new("sh");
+            let mut c = crate::process_helpers::tokio_no_window("sh");
             c.args(["-c", &command]);
             c
         };
@@ -4096,7 +4122,6 @@ impl StepExecutor {
         timeout_secs: Option<u64>,
     ) -> (bool, Option<String>, Option<String>) {
         use std::process::Stdio;
-        use tokio::process::Command;
         use tokio::time::{timeout, Duration};
 
         // Debug logging to trace check_type values
@@ -4472,12 +4497,12 @@ impl StepExecutor {
         // Build the command
         let mut cmd = if cfg!(target_os = "windows") {
             if is_powershell {
-                let mut c = Command::new("powershell");
+                let mut c = crate::process_helpers::tokio_no_window("powershell");
                 c.args(["-NoProfile", "-NonInteractive", "-Command", &final_command]);
                 c
             } else if is_bash {
                 // Use bash for Unix-style commands (available via Git for Windows)
-                let mut c = Command::new("bash");
+                let mut c = crate::process_helpers::tokio_no_window("bash");
                 c.args(["-c", &final_command]);
                 c
             } else {
@@ -4486,7 +4511,7 @@ impl StepExecutor {
                 // cmd.exe doesn't support "KEY=VALUE command" syntax.
                 let stripped = final_command.replace('\'', "");
                 let (extra_envs, actual_cmd) = extract_env_prefix_for_cmd(&stripped);
-                let mut c = Command::new("cmd");
+                let mut c = crate::process_helpers::tokio_cmd_no_window();
                 c.args(["/C", &actual_cmd]);
                 for (key, value) in extra_envs {
                     c.env(key, value);
@@ -4494,7 +4519,7 @@ impl StepExecutor {
                 c
             }
         } else {
-            let mut c = Command::new("sh");
+            let mut c = crate::process_helpers::tokio_no_window("sh");
             c.args(["-c", &final_command]);
             c
         };

@@ -370,6 +370,8 @@ pub struct StoredErrorEvent {
     pub log_source_name: String,
     /// Task run ID (if captured during a workflow)
     pub task_run_id: Option<String>,
+    /// Workflow name (from joined task_runs table)
+    pub workflow_name: Option<String>,
     /// Workflow step ID (if applicable)
     pub workflow_step_id: Option<String>,
     /// Timestamp from the log entry

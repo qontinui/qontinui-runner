@@ -194,6 +194,8 @@ pub struct HandlerContext {
     /// Recursion guard for nested workflow execution.
     /// Tracks workflow IDs currently on the execution stack to detect circular references.
     pub workflow_recursion_stack: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Current verification iteration (set when executing verification steps).
+    pub iteration: Option<u32>,
 }
 
 impl HandlerContext {
@@ -223,6 +225,7 @@ impl HandlerContext {
             app_handle,
             pid_tracker: None,
             workflow_recursion_stack: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            iteration: None,
         }
     }
 
@@ -256,6 +259,7 @@ impl HandlerContext {
             app_handle,
             pid_tracker,
             workflow_recursion_stack: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            iteration: None,
         }
     }
 
@@ -448,11 +452,163 @@ impl StepHandler for PromptStepHandler {
             }
         );
 
+        // If we have an app_handle, use a full Claude CLI session with tool access.
+        // Otherwise, fall back to --print mode (no tools).
+        if let Some(ref app_handle) = context.app_handle {
+            self.execute_with_tools(step, context, app_handle, &prompt_content)
+                .await
+        } else {
+            self.execute_print_mode(context, &prompt_content).await
+        }
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Prompt"
+    }
+}
+
+impl PromptStepHandler {
+    /// Execute verification with full Claude CLI session (tool access).
+    ///
+    /// The AI gets a complete Claude session with tools (curl, file read, etc.)
+    /// so it can query the Runner API and UI Bridge SDK to gather evidence.
+    async fn execute_with_tools(
+        &self,
+        step: &ExecutionStepConfig,
+        context: &HandlerContext,
+        app_handle: &tauri::AppHandle,
+        prompt_content: &str,
+    ) -> StepHandlerResult {
+        let iteration = context.iteration.unwrap_or(1);
+        let task_run_id = context
+            .task_run_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // Build the evaluation prompt with tool docs
+        let eval_prompt = format_evaluation_prompt_with_tools(
+            prompt_content,
+            &task_run_id,
+            iteration,
+            step.name.as_deref(),
+        );
+
+        // Get workspace root for Claude CLI working directory
+        let workspace_root = crate::mcp::shared::get_workspace_paths_internal()
+            .map(|(root, _, _)| root.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+
+        // Build session ID and context
+        let session_id = format!("{}-verification-review-{}", task_run_id, iteration);
+        let session_ctx = Some(crate::execution_context::AiSessionContext::verification(
+            &task_run_id,
+            step.name.as_deref().unwrap_or("AI Review"),
+            iteration,
+        ));
+
+        // Get DoctorHandle
+        let doctor_handle = context.app_state.doctor_handle.lock().await.clone();
+        let pid_tracker = context.pid_tracker.clone();
+        let app_handle_clone = app_handle.clone();
+
+        // Run Claude CLI session with full tool access via spawn_blocking (sync function)
+        let ai_result = tokio::task::spawn_blocking(move || {
+            crate::claude_session::runner::run_claude_session_with_retry(
+                &workspace_root,
+                &eval_prompt,
+                &session_id,
+                &app_handle_clone,
+                session_ctx,
+                None, // finding_ctx
+                None, // progress_ctx
+                pid_tracker,
+                None, // retry_config — no retries, AI has tools to self-correct
+                doctor_handle.as_ref(),
+                None, // reflection_fix_ctx
+                None, // step_injection_ctx
+                None, // model_override
+            )
+        })
+        .await;
+
+        let (success, output) = match ai_result {
+            Ok(Ok((success, output, _retry_state, _injected_steps))) => (success, output),
+            Ok(Err(e)) => {
+                return StepHandlerResult::failure(format!(
+                    "AI verification session failed: {}",
+                    e
+                ));
+            }
+            Err(e) => {
+                return StepHandlerResult::failure(format!("AI verification task panicked: {}", e));
+            }
+        };
+
+        if !success {
+            tracing::warn!("AI verification session returned non-success");
+        }
+
+        // Parse PASS/FAIL from the AI output
+        match parse_pass_fail(&output) {
+            Some(true) => {
+                let reasoning = extract_reasoning(&output);
+                StepHandlerResult::success_with_data(serde_json::json!({
+                    "evaluation": "pass",
+                    "reasoning": reasoning,
+                    "mode": "full_session",
+                }))
+            }
+            Some(false) => {
+                let reasoning = extract_reasoning(&output);
+                StepHandlerResult::failure_with_data(
+                    format!("Verification failed: {}", reasoning),
+                    serde_json::json!({
+                        "evaluation": "fail",
+                        "reasoning": reasoning,
+                        "mode": "full_session",
+                    }),
+                )
+            }
+            None => {
+                // No clear verdict — default to FAIL (AI had tools to investigate)
+                tracing::warn!(
+                    "AI verification session did not produce PASS/FAIL verdict, defaulting to FAIL"
+                );
+                let reasoning = output
+                    .lines()
+                    .map(|l| l.trim())
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("No clear verdict produced")
+                    .to_string();
+                StepHandlerResult::failure_with_data(
+                    format!(
+                        "Verification inconclusive (defaulting to FAIL): {}",
+                        reasoning
+                    ),
+                    serde_json::json!({
+                        "evaluation": "fail",
+                        "reasoning": reasoning,
+                        "mode": "full_session",
+                        "no_verdict": true,
+                    }),
+                )
+            }
+        }
+    }
+
+    /// Fallback: execute verification via --print mode (no tools).
+    ///
+    /// Used when no app_handle is available (non-Tauri execution contexts).
+    async fn execute_print_mode(
+        &self,
+        context: &HandlerContext,
+        prompt_content: &str,
+    ) -> StepHandlerResult {
         // Gather UI context if SDK is available (best-effort)
         let ui_context = try_gather_ui_context().await;
 
         // Build evaluation prompt
-        let eval_prompt = format_evaluation_prompt(&prompt_content, &ui_context);
+        let eval_prompt = format_evaluation_prompt(prompt_content, &ui_context);
 
         // Run AI evaluation via spawn_blocking (run_prompt_with_routing is sync)
         let task_context = crate::ai_router::TaskContext::from_prompt(&eval_prompt);
@@ -491,6 +647,7 @@ impl StepHandler for PromptStepHandler {
                 StepHandlerResult::success_with_data(serde_json::json!({
                     "evaluation": "pass",
                     "reasoning": reasoning,
+                    "mode": "print",
                 }))
             }
             Some(false) => {
@@ -500,6 +657,7 @@ impl StepHandler for PromptStepHandler {
                     serde_json::json!({
                         "evaluation": "fail",
                         "reasoning": reasoning,
+                        "mode": "print",
                     }),
                 )
             }
@@ -530,6 +688,7 @@ impl StepHandler for PromptStepHandler {
                             "evaluation": "pass",
                             "reasoning": extract_reasoning(&resp.output),
                             "required_retry": true,
+                            "mode": "print",
                         })),
                         _ => StepHandlerResult::failure_with_data(
                             format!("Verification failed: {}", extract_reasoning(&resp.output)),
@@ -537,6 +696,7 @@ impl StepHandler for PromptStepHandler {
                                 "evaluation": "fail",
                                 "reasoning": extract_reasoning(&resp.output),
                                 "required_retry": true,
+                                "mode": "print",
                             }),
                         ),
                     },
@@ -546,10 +706,6 @@ impl StepHandler for PromptStepHandler {
                 }
             }
         }
-    }
-
-    fn display_name(&self) -> &'static str {
-        "Prompt"
     }
 }
 
@@ -654,6 +810,98 @@ fn format_evaluation_prompt(criteria: &str, ui_context: &Option<String>) -> Stri
     );
 
     prompt
+}
+
+/// Build the evaluation prompt for AI verification with full tool access.
+///
+/// Unlike `format_evaluation_prompt`, this version documents the available APIs
+/// and tools so the AI can actively gather evidence during its session.
+fn format_evaluation_prompt_with_tools(
+    criteria: &str,
+    task_run_id: &str,
+    iteration: u32,
+    step_name: Option<&str>,
+) -> String {
+    format!(
+        r#"# Verification Review — {step_name}
+
+You are a **REVIEWER** evaluating whether a verification criterion is satisfied.
+You are NOT an implementer. Do NOT fix anything, make code changes, or modify files.
+
+## Verification Criteria
+
+{criteria}
+
+## Your Role
+
+1. **Gather evidence** using the tools and APIs described below
+2. **Evaluate** whether the criteria are satisfied based on that evidence
+3. **Report** your verdict as PASS or FAIL
+
+## Available APIs (use curl to query)
+
+### Runner API (localhost:9876)
+
+Query workflow execution data:
+
+```bash
+# Get step checkpoints for this task run (shows pass/fail of each step)
+curl -s http://localhost:9876/task-runs/{task_run_id}/checkpoints
+
+# Get verification phase results for this iteration
+curl -s http://localhost:9876/task-runs/{task_run_id}/verification-phase-results
+
+# Get current workflow state (phase, iteration, status)
+curl -s http://localhost:9876/task-runs/{task_run_id}/workflow-state
+
+# Get accumulated AI output
+curl -s "http://localhost:9876/task-runs/{task_run_id}/output?tail_chars=5000"
+```
+
+### UI Bridge SDK (localhost:9876)
+
+Inspect the connected application's UI state:
+
+```bash
+# Get all visible elements (text content only — lightweight)
+curl -s "http://localhost:9876/ui-bridge/sdk/elements?contentOnly=true"
+
+# Search for specific elements by text or attribute
+curl -s "http://localhost:9876/ui-bridge/sdk/ai/search?q=<search_term>"
+
+# Get full element tree (more detailed, larger response)
+curl -s "http://localhost:9876/ui-bridge/sdk/elements"
+
+# Take a snapshot of the current page state
+curl -s "http://localhost:9876/ui-bridge/sdk/snapshot"
+```
+
+## Tool Usage Guidelines
+
+- Use tools ONLY when you cannot evaluate from available information
+- Start with lightweight queries (e.g., `contentOnly=true`) before heavier ones
+- You can read files if needed for verification (e.g., checking config, build output)
+- Do NOT make code changes, run builds, restart services, or modify any state
+
+## Task Context
+
+- Task Run ID: `{task_run_id}`
+- Iteration: {iteration}
+
+## Required Output Format
+
+After gathering evidence and evaluating, you MUST end your response with EXACTLY one of:
+
+PASS: <brief explanation of why the check passes>
+FAIL: <brief explanation of what is missing or wrong>
+
+You MUST output PASS or FAIL. No other format is acceptable.
+"#,
+        step_name = step_name.unwrap_or("AI Review"),
+        criteria = criteria,
+        task_run_id = task_run_id,
+        iteration = iteration,
+    )
 }
 
 /// Try to gather UI context from the UI Bridge SDK (best-effort).

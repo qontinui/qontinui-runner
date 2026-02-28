@@ -21,11 +21,15 @@ use crate::context;
 use crate::doctor::DoctorHandle;
 use crate::unified_workflows::UnifiedWorkflow;
 use crate::workflow_generation::hardener::{self, HardeningSummary};
+use crate::workflow_generation::pipeline_artifacts::{
+    compute_json_diff, PipelineArtifact, PipelineArtifactBuilder,
+};
 use crate::workflow_generation::rules;
 use crate::workflow_generation::schema_context::{build_schema_context, build_schema_context_full};
 use crate::workflow_generation::validation::{fix_workflow, validate_workflow};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
 // ============================================================================
@@ -93,6 +97,29 @@ fn default_true() -> Option<bool> {
     Some(true)
 }
 
+impl Default for GenerateWorkflowRequest {
+    fn default() -> Self {
+        Self {
+            description: String::new(),
+            category: None,
+            tags: None,
+            max_iterations: None,
+            provider: None,
+            model: None,
+            skip_ai_summary: None,
+            log_source_selection: None,
+            prompt_template: None,
+            auto_include_contexts: None,
+            context_ids: None,
+            inline_context: None,
+            max_fix_iterations: None,
+            discovery_mode: None,
+            include_ui_bridge_instructions: Some(true),
+            reflection_mode: Some(true),
+        }
+    }
+}
+
 /// One pass of the verification→fix loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationIteration {
@@ -145,15 +172,20 @@ pub fn generate_workflow(
     doctor_handle: Option<&DoctorHandle>,
     conn: Option<&Connection>,
     query_embedding: Option<&[f32]>,
-) -> GenerateWorkflowResponse {
+) -> (GenerateWorkflowResponse, PipelineArtifact) {
     info!(
         "Generating workflow from description: {}",
         &request.description[..request.description.len().min(100)]
     );
 
+    let pipeline_start = Instant::now();
+    let mut artifact_builder =
+        PipelineArtifactBuilder::new(&request.description, request.category.as_deref());
+
     let max_fix_iters = request.max_fix_iterations.unwrap_or(3);
 
     // ── Discovery Phase ──────────────────────────────────────────────────
+    let discovery_start = Instant::now();
     let discovery_mode = request.discovery_mode.as_deref().unwrap_or("auto");
     let (discovery_context, discovery_calls) = if discovery_mode != "disabled" {
         let config = super::discovery_tools::DiscoveryConfig::default();
@@ -171,8 +203,11 @@ pub fn generate_workflow(
         debug!("Discovery disabled by request");
         (String::new(), vec![])
     };
+    artifact_builder.discovery_duration_ms = Some(discovery_start.elapsed().as_millis() as u64);
+    artifact_builder.discovery_calls = serde_json::to_value(&discovery_calls).ok();
 
     // ── Step 1: Builder Agent ──────────────────────────────────────────────
+    let builder_start = Instant::now();
     let mut workflow = match run_builder_agent(
         &request,
         &discovery_context,
@@ -180,17 +215,40 @@ pub fn generate_workflow(
         conn,
         query_embedding,
     ) {
-        Ok(w) => w,
-        Err(resp) => return *resp,
+        Ok(w) => {
+            artifact_builder.builder_duration_ms = Some(builder_start.elapsed().as_millis() as u64);
+            artifact_builder.builder_parsed_json = serde_json::to_value(&w).ok();
+            w
+        }
+        Err(resp) => {
+            artifact_builder.builder_duration_ms = Some(builder_start.elapsed().as_millis() as u64);
+            artifact_builder.success = false;
+            artifact_builder.error_message = resp.error.clone();
+            let artifact = artifact_builder.build(pipeline_start.elapsed().as_millis() as u64);
+            return (*resp, artifact);
+        }
     };
 
     // Apply request overrides
     apply_request_options(&mut workflow, &request);
 
     // Deterministic auto-fix (UUIDs, timestamps, phase mismatches)
+    let autofix_start = Instant::now();
+    let before_autofix = serde_json::to_value(&workflow).ok();
     fix_workflow(&mut workflow);
+    let after_autofix = serde_json::to_value(&workflow).ok();
+    artifact_builder.autofix_duration_ms = Some(autofix_start.elapsed().as_millis() as u64);
+
+    // Compute autofix diff
+    if let (Some(ref before), Some(ref after)) = (&before_autofix, &after_autofix) {
+        let diff = compute_json_diff(before, after);
+        if diff.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
+            artifact_builder.autofix_diff = Some(diff);
+        }
+    }
 
     // ── Step 2–3: Verification ↔ Fixer loop ────────────────────────────────
+    let verification_start = Instant::now();
     let mut iterations: Vec<VerificationIteration> = Vec::new();
 
     if max_fix_iters > 0 {
@@ -252,6 +310,10 @@ pub fn generate_workflow(
                     workflow = fixed;
                     // Re-apply deterministic fixes on the corrected version
                     fix_workflow(&mut workflow);
+                    // Capture fixer snapshot
+                    if let Ok(snapshot) = serde_json::to_value(&workflow) {
+                        artifact_builder.fixer_snapshots.push(snapshot);
+                    }
                 }
                 Err(e) => {
                     warn!("Fixer agent failed: {}", e);
@@ -266,16 +328,25 @@ pub fn generate_workflow(
             }
         }
     }
+    artifact_builder.verification_duration_ms =
+        Some(verification_start.elapsed().as_millis() as u64);
+    artifact_builder.verification_iterations = serde_json::to_value(&iterations).ok();
 
     // ── Hardener Agent ───────────────────────────────────────────────────
+    let hardener_start = Instant::now();
     let (mut workflow, hardening_summary) =
         hardener::run_hardener_agent(&workflow, &request.description, doctor_handle, conn);
+    artifact_builder.hardener_duration_ms = Some(hardener_start.elapsed().as_millis() as u64);
+    artifact_builder.hardening_summary = serde_json::to_value(&hardening_summary).ok();
+    artifact_builder.hardened_json = serde_json::to_value(&workflow).ok();
 
     // Re-apply deterministic fixes after hardener (e.g. strip check-group setup/completion)
     fix_workflow(&mut workflow);
 
     // ── Final structural validation ────────────────────────────────────────
     let validation_errors = validate_workflow(&workflow);
+    artifact_builder.validation_errors = serde_json::to_value(&validation_errors).ok();
+    artifact_builder.final_json = serde_json::to_value(&workflow).ok();
 
     if !validation_errors.is_empty() {
         warn!(
@@ -284,17 +355,33 @@ pub fn generate_workflow(
         );
     }
 
+    let stage_step_count: usize = workflow
+        .stages
+        .iter()
+        .map(|s| {
+            s.setup_steps.len()
+                + s.verification_steps.len()
+                + s.agentic_steps.len()
+                + s.completion_steps.len()
+        })
+        .sum();
+    let top_level_count = workflow.setup_steps.len()
+        + workflow.verification_steps.len()
+        + workflow.agentic_steps.len()
+        + workflow.completion_steps.len();
+
     info!(
-        "Successfully generated workflow: {} ({} setup, {} verification, {} agentic, {} completion steps, {} verification iterations)",
+        "Successfully generated workflow: {} ({} top-level steps, {} stages with {} steps, {} verification iterations)",
         workflow.name,
-        workflow.setup_steps.len(),
-        workflow.verification_steps.len(),
-        workflow.agentic_steps.len(),
-        workflow.completion_steps.len(),
+        top_level_count,
+        workflow.stages.len(),
+        stage_step_count,
         iterations.len(),
     );
 
-    GenerateWorkflowResponse {
+    let artifact = artifact_builder.build(pipeline_start.elapsed().as_millis() as u64);
+
+    let response = GenerateWorkflowResponse {
         workflow: Some(workflow),
         validation_errors,
         success: true,
@@ -303,7 +390,9 @@ pub fn generate_workflow(
         verification_iterations: iterations,
         hardening_summary,
         discovery_calls,
-    }
+    };
+
+    (response, artifact)
 }
 
 // ============================================================================
@@ -363,6 +452,7 @@ Generate a complete UnifiedWorkflow JSON that accomplishes this task.
 - If the workflow targets a web application (localhost:3001, localhost:1420, or similar), include a setup step to connect via UI Bridge SDK (POST /ui-bridge/sdk/connect). Use SDK endpoints for element inspection and state checking instead of Playwright when possible.
 - Prompt steps that need to inspect or interact with web UI should reference SDK tools (sdk_elements, sdk_snapshot, sdk_ai_execute, sdk_ai_search) rather than Playwright for registered-element interactions.
 - To verify page text content (metrics, statuses, headings), use SDK content discovery (sdk_elements with contentOnly/contentTypes filters, or sdk_snapshot) instead of screenshots. Use sdk_page_refresh/sdk_page_navigate for page navigation.
+- When the task involves a style refactor, UX redesign, or layout improvement, ALL information and functionality from the original page MUST be preserved. Better presentation — not removal of content. If the original has N tabs, M metrics, or a table with K columns, the redesigned version must include all of them.
 
 Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
         description = request.description,

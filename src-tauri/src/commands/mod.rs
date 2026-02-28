@@ -164,6 +164,9 @@ pub struct AppState {
     /// Set by `mcp_api::start_server` after successful bind, checked by the
     /// `is_api_ready` Tauri command so the frontend can gate HTTP calls.
     pub api_ready: AtomicBool,
+    /// Shared PID tracker for spawned AI (Claude CLI) processes.
+    /// Shared between AppState (for shutdown cleanup) and ApiState (for stop endpoints).
+    pub ai_pid_tracker: Arc<Mutex<Vec<u32>>>,
 }
 
 /// Standard response structure for command handlers.

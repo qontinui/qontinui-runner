@@ -127,7 +127,7 @@ fn get_ui_bridge_timeout_ms() -> u64 {
 ///
 /// This creates a oneshot channel, stores the sender in the pending map,
 /// emits the request to the frontend, and waits for the response with a timeout.
-async fn ui_bridge_request_sync(
+pub async fn ui_bridge_request_sync(
     state: &Arc<ApiState>,
     request_type: &str,
     additional_payload: serde_json::Value,
@@ -955,6 +955,161 @@ pub async fn ui_bridge_annotated_screenshot_handler(
     }
 }
 
+// ============================================================================
+// Design Review Handlers (Control Mode)
+// ============================================================================
+
+/// Get extended computed styles for a single element.
+pub async fn ui_bridge_design_element_styles_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Design - get element styles for {}", id);
+
+    let payload = serde_json::json!({
+        "elementId": id
+    });
+
+    match ui_bridge_request_sync(&state, "design_get_element_styles", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: Design element styles failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Get styles across interaction states (hover, focus, active, disabled).
+pub async fn ui_bridge_design_state_styles_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Design - get state styles for {}", id);
+
+    let mut payload = serde_json::json!({
+        "elementId": id
+    });
+
+    if let Some(Json(body)) = body {
+        if let (Some(base), Some(extra)) = (payload.as_object_mut(), body.as_object()) {
+            for (key, value) in extra {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    match ui_bridge_request_sync(&state, "design_get_state_styles", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: Design state styles failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Get design snapshot for all or filtered elements.
+pub async fn ui_bridge_design_snapshot_handler(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Design - get design snapshot");
+
+    let payload = body.map(|Json(b)| b).unwrap_or(serde_json::json!({}));
+
+    match ui_bridge_request_sync(&state, "design_get_snapshot", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: Design snapshot failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Capture responsive snapshots at multiple viewport widths.
+pub async fn ui_bridge_design_responsive_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Design - get responsive snapshots");
+
+    match ui_bridge_request_sync(&state, "design_get_responsive", body).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: Design responsive failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Run a style audit against a loaded or provided style guide.
+pub async fn ui_bridge_design_audit_handler(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Design - run style audit");
+
+    let payload = body.map(|Json(b)| b).unwrap_or(serde_json::json!({}));
+
+    match ui_bridge_request_sync(&state, "design_run_audit", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: Design audit failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Load a style guide for subsequent audits.
+pub async fn ui_bridge_design_load_style_guide_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Design - load style guide");
+
+    match ui_bridge_request_sync(&state, "design_load_style_guide", body).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: Design load style guide failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Get the currently loaded style guide.
+pub async fn ui_bridge_design_get_style_guide_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Design - get style guide");
+
+    let payload = serde_json::json!({});
+
+    match ui_bridge_request_sync(&state, "design_get_style_guide", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: Design get style guide failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Clear the currently loaded style guide.
+pub async fn ui_bridge_design_clear_style_guide_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Design - clear style guide");
+
+    let payload = serde_json::json!({});
+
+    match ui_bridge_request_sync(&state, "design_clear_style_guide", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: Design clear style guide failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
 /// Create routes for this module.
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::{get, post};
@@ -1024,6 +1179,40 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/ui-bridge/control/page/forward",
             post(ui_bridge_page_go_forward_handler),
         )
+        // Design Review
+        .route(
+            "/ui-bridge/control/design/element/:id/styles",
+            get(ui_bridge_design_element_styles_handler),
+        )
+        .route(
+            "/ui-bridge/control/design/element/:id/state-styles",
+            post(ui_bridge_design_state_styles_handler),
+        )
+        .route(
+            "/ui-bridge/control/design/snapshot",
+            post(ui_bridge_design_snapshot_handler),
+        )
+        .route(
+            "/ui-bridge/control/design/responsive",
+            post(ui_bridge_design_responsive_handler),
+        )
+        .route(
+            "/ui-bridge/control/design/audit",
+            post(ui_bridge_design_audit_handler),
+        )
+        .route(
+            "/ui-bridge/control/design/style-guide/load",
+            post(ui_bridge_design_load_style_guide_handler),
+        )
+        .route(
+            "/ui-bridge/control/design/style-guide",
+            get(ui_bridge_design_get_style_guide_handler),
+        )
+        .route(
+            "/ui-bridge/control/design/style-guide/clear",
+            post(ui_bridge_design_clear_style_guide_handler),
+        )
+        // Exploration
         .route("/ui-bridge/explore", post(start_ui_bridge_exploration))
         .route(
             "/ui-bridge/explore/status",

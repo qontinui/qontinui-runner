@@ -9,7 +9,6 @@
 
 use serde::Deserialize;
 use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -514,20 +513,20 @@ impl DeterministicVerifier {
                 let bash_path =
                     ShellCommandHandler::find_git_bash().unwrap_or_else(|| "bash".to_string());
                 info!("Using Git Bash for verification command: {}", bash_path);
-                Command::new(&bash_path)
+                crate::process_helpers::no_window(&bash_path)
                     .args(["-c", command])
                     .current_dir(&self.working_directory)
                     .env("PATH", &enhanced_path)
                     .output()
             } else {
-                Command::new("cmd")
+                crate::process_helpers::cmd_no_window()
                     .args(["/C", command])
                     .current_dir(&self.working_directory)
                     .env("PATH", &enhanced_path)
                     .output()
             }
         } else {
-            Command::new("sh")
+            crate::process_helpers::no_window("sh")
                 .args(["-c", command])
                 .current_dir(&self.working_directory)
                 .env("PATH", &enhanced_path)
