@@ -10705,6 +10705,75 @@ impl CheckpointDb {
         Ok(())
     }
 
+    /// List reflection knowledge from previous runs of the same workflow.
+    ///
+    /// Joins `task_knowledge` with `task_runs` via `workflow_name` to find
+    /// reflection-created entries (recurring_pattern, context) from other runs.
+    /// This enables cross-run knowledge persistence.
+    pub fn list_workflow_knowledge(
+        &self,
+        workflow_name: &str,
+        exclude_task_run_id: &str,
+        categories: &[&str],
+        limit: u32,
+    ) -> Result<Vec<StoredTaskKnowledge>, String> {
+        let conn = self.get_conn()?;
+
+        if categories.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build placeholders for the IN clause: ?3, ?4, ...
+        let placeholders: Vec<String> = (0..categories.len())
+            .map(|i| format!("?{}", i + 3))
+            .collect();
+        let in_clause = placeholders.join(", ");
+
+        let sql = format!(
+            r#"
+            SELECT
+                tk.id, tk.task_run_id, tk.category, tk.agent_type, tk.iteration,
+                tk.content, tk.evidence, tk.confidence, tk.related_files,
+                tk.related_criterion_id, tk.is_resolved, tk.resolution_notes,
+                tk.resolved_at, tk.created_at
+            FROM task_knowledge tk
+            INNER JOIN task_runs tr ON tk.task_run_id = tr.id
+            WHERE tr.workflow_name = ?1
+              AND tk.task_run_id != ?2
+              AND tk.agent_type = 'reflection'
+              AND tk.category IN ({})
+            ORDER BY tk.created_at DESC
+            LIMIT ?{}
+            "#,
+            in_clause,
+            categories.len() + 3,
+        );
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("Failed to prepare workflow knowledge query: {}", e))?;
+
+        // Build params: workflow_name, exclude_task_run_id, categories..., limit
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        param_values.push(Box::new(workflow_name.to_string()));
+        param_values.push(Box::new(exclude_task_run_id.to_string()));
+        for cat in categories {
+            param_values.push(Box::new(cat.to_string()));
+        }
+        param_values.push(Box::new(limit));
+
+        let refs: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|v| v.as_ref()).collect();
+
+        let knowledge: Vec<StoredTaskKnowledge> = stmt
+            .query_map(refs.as_slice(), Self::row_to_task_knowledge)
+            .map_err(|e| format!("Failed to query workflow knowledge: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(knowledge)
+    }
+
     /// Helper function to convert a row to StoredTaskKnowledge.
     fn row_to_task_knowledge(row: &rusqlite::Row) -> rusqlite::Result<StoredTaskKnowledge> {
         Ok(StoredTaskKnowledge {

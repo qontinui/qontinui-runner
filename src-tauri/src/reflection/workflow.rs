@@ -196,12 +196,11 @@ fn build_agentic_prompt(source_workflow_name: &str) -> String {
 
 {}
 
-## CRITICAL: Analysis Only — No File System Access
+## Tool Access
 
-You MUST NOT use any file system tools (find, grep, cat, ls, read, glob, etc.) or explore the codebase.
-All the data you need has already been loaded into runtime variables below.
-Your job is to ANALYZE the provided data and produce REFLECTION_FIX markers — not to explore or modify files.
-Do NOT run any bash commands. Focus entirely on analyzing the data and writing your analysis."#,
+You have full tool access (file read/write, bash, grep, etc.). Your primary job is to analyze
+the loaded data and produce REFLECTION_FIX markers, but you may also explore the codebase
+when you need to investigate root causes, verify assumptions, or apply fixes directly."#,
         if is_generation {
             "workflow generation run"
         } else {

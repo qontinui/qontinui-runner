@@ -519,8 +519,35 @@ fn build_unified_iteration_context(
     current_iteration: u32,
     process_status_summary: Option<&str>,
     error_monitor_summary: Option<&str>,
+    workflow_name: Option<&str>,
 ) -> Option<String> {
     let mut sections = Vec::new();
+
+    // 0. Cross-run historical knowledge (from previous runs of the same workflow)
+    if let Some(wf_name) = workflow_name {
+        if let Ok(historical) = checkpoint_db.list_workflow_knowledge(
+            wf_name,
+            execution_id,
+            &["recurring_pattern", "context"],
+            10,
+        ) {
+            if !historical.is_empty() {
+                let mut lines = vec!["### Historical Knowledge (from previous runs)".to_string()];
+                lines.push(
+                    "These patterns were identified by reflection across previous runs of this workflow:".to_string(),
+                );
+                for entry in &historical {
+                    lines.push(format!(
+                        "- **[{}]** ({}): {}",
+                        entry.category.to_uppercase(),
+                        entry.confidence,
+                        truncate_str(&entry.content, 300),
+                    ));
+                }
+                sections.push(lines.join("\n"));
+            }
+        }
+    }
 
     // 1. Latest verification feedback from knowledge base (most actionable — show first)
     if let Ok(feedback) =
@@ -2141,6 +2168,7 @@ impl AgenticExecutor {
                 iteration,
                 process_status_summary.as_deref(),
                 error_monitor_summary.as_deref(),
+                Some(&config.workflow_name),
             ) {
                 Some(ctx) => {
                     let label = if iteration == 1 {
