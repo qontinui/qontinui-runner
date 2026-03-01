@@ -45,10 +45,10 @@ function MetricCard({ label, value, unit, color = "gray" }: MetricCardProps) {
 
   return (
     <div className="flex flex-col">
-      <span className="text-[10px] text-gray-500 uppercase">{label}</span>
+      <span className="text-[10px] text-muted-foreground uppercase">{label}</span>
       <span className={cn("text-sm font-mono", colorClasses[color])}>
         {value}
-        {unit && <span className="text-gray-500 text-[10px] ml-0.5">{unit}</span>}
+        {unit && <span className="text-muted-foreground text-[10px] ml-0.5">{unit}</span>}
       </span>
     </div>
   );
@@ -68,7 +68,9 @@ function TabButton({
       onClick={onClick}
       className={cn(
         "px-2 py-1 text-[10px] rounded transition-colors",
-        active ? "bg-gray-600 text-white" : "text-gray-400 hover:text-gray-200 hover:bg-gray-700",
+        active
+          ? "bg-muted/80 text-white"
+          : "text-muted-foreground hover:text-foreground hover:bg-muted/80",
       )}
     >
       {children}
@@ -88,7 +90,7 @@ function OverviewTab({
   networkStats: NetworkMonitorStats | null;
 }) {
   if (!metrics || !networkStats) {
-    return <div className="text-gray-500 text-xs">Collecting metrics...</div>;
+    return <div className="text-muted-foreground text-xs">Collecting metrics...</div>;
   }
 
   const formatUptime = (ms: number) => {
@@ -140,7 +142,7 @@ function OverviewTab({
 
 function NetworkTab({ networkStats }: { networkStats: NetworkMonitorStats | null }) {
   if (!networkStats) {
-    return <div className="text-gray-500 text-xs">No network data</div>;
+    return <div className="text-muted-foreground text-xs">No network data</div>;
   }
 
   const topEndpoints = Array.from(networkStats.endpointStats.entries())
@@ -165,14 +167,14 @@ function NetworkTab({ networkStats }: { networkStats: NetworkMonitorStats | null
 
       {topEndpoints.length > 0 && (
         <div className="mt-2">
-          <div className="text-[10px] text-gray-500 uppercase mb-1">Top Endpoints</div>
+          <div className="text-[10px] text-muted-foreground uppercase mb-1">Top Endpoints</div>
           <div className="space-y-1">
             {topEndpoints.map(([endpoint, stats]) => (
               <div key={endpoint} className="flex justify-between text-[10px] font-mono">
-                <span className="text-gray-400 truncate max-w-[120px]" title={endpoint}>
+                <span className="text-muted-foreground truncate max-w-[120px]" title={endpoint}>
                   {endpoint}
                 </span>
-                <span className="text-gray-300">
+                <span className="text-foreground">
                   {stats.requestCount}x / {Math.round(stats.averageLatency)}ms
                 </span>
               </div>
@@ -186,7 +188,7 @@ function NetworkTab({ networkStats }: { networkStats: NetworkMonitorStats | null
 
 function RendersTab({ renders }: { renders: Map<string, RenderMetrics> }) {
   if (renders.size === 0) {
-    return <div className="text-gray-500 text-xs">No render data</div>;
+    return <div className="text-muted-foreground text-xs">No render data</div>;
   }
 
   const renderList = Array.from(renders.values());
@@ -214,24 +216,28 @@ function RendersTab({ renders }: { renders: Map<string, RenderMetrics> }) {
       </div>
 
       <div>
-        <div className="text-[10px] text-gray-500 uppercase mb-1">Most Renders</div>
+        <div className="text-[10px] text-muted-foreground uppercase mb-1">Most Renders</div>
         <div className="space-y-1">
           {topRenderers.map((r) => (
             <div key={r.componentName} className="flex justify-between text-[10px] font-mono">
-              <span className="text-gray-400 truncate max-w-[120px]">{r.componentName}</span>
-              <span className="text-gray-300">{r.renderCount}x</span>
+              <span className="text-muted-foreground truncate max-w-[120px]">
+                {r.componentName}
+              </span>
+              <span className="text-foreground">{r.renderCount}x</span>
             </div>
           ))}
         </div>
       </div>
 
       <div>
-        <div className="text-[10px] text-gray-500 uppercase mb-1">Slowest</div>
+        <div className="text-[10px] text-muted-foreground uppercase mb-1">Slowest</div>
         <div className="space-y-1">
           {slowest.map((r) => (
             <div key={r.componentName} className="flex justify-between text-[10px] font-mono">
-              <span className="text-gray-400 truncate max-w-[120px]">{r.componentName}</span>
-              <span className={r.averageRenderTime > 16 ? "text-red-400" : "text-gray-300"}>
+              <span className="text-muted-foreground truncate max-w-[120px]">
+                {r.componentName}
+              </span>
+              <span className={r.averageRenderTime > 16 ? "text-red-400" : "text-foreground"}>
                 {r.averageRenderTime.toFixed(1)}ms
               </span>
             </div>
@@ -244,7 +250,7 @@ function RendersTab({ renders }: { renders: Map<string, RenderMetrics> }) {
 
 function WebSocketTab({ metrics }: { metrics: AggregatedMetrics | null }) {
   if (!metrics) {
-    return <div className="text-gray-500 text-xs">No WebSocket data</div>;
+    return <div className="text-muted-foreground text-xs">No WebSocket data</div>;
   }
 
   const ws = metrics.webSocket;
@@ -280,7 +286,7 @@ function WebSocketTab({ metrics }: { metrics: AggregatedMetrics | null }) {
 
 function VirtualScrollTab({ metrics }: { metrics: AggregatedMetrics | null }) {
   if (!metrics) {
-    return <div className="text-gray-500 text-xs">No scroll data</div>;
+    return <div className="text-muted-foreground text-xs">No scroll data</div>;
   }
 
   const scroll = metrics.virtualScroll;
@@ -417,14 +423,14 @@ export function PerformanceOverlay({
   return (
     <div
       className={cn(
-        "fixed z-[9999] bg-gray-900/95 backdrop-blur-sm rounded-lg shadow-2xl border border-gray-700",
+        "fixed z-[9999] bg-card/95 backdrop-blur-sm rounded-lg shadow-2xl border border-border",
         "text-white font-sans",
         positionClasses[position],
         isMinimized ? "w-auto" : "w-72",
       )}
     >
       {/* Header */}
-      <div className="flex items-center justify-between px-3 py-2 border-b border-gray-700">
+      <div className="flex items-center justify-between px-3 py-2 border-b border-border">
         <div className="flex items-center gap-2">
           <div className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
           <span className="text-xs font-semibold">Performance</span>
@@ -432,14 +438,14 @@ export function PerformanceOverlay({
         <div className="flex items-center gap-1">
           <button
             onClick={() => setIsMinimized((m) => !m)}
-            className="p-1 text-gray-400 hover:text-white transition-colors"
+            className="p-1 text-muted-foreground hover:text-white transition-colors"
             title={isMinimized ? "Expand" : "Minimize"}
           >
             {isMinimized ? "+" : "-"}
           </button>
           <button
             onClick={() => setIsVisible(false)}
-            className="p-1 text-gray-400 hover:text-white transition-colors"
+            className="p-1 text-muted-foreground hover:text-white transition-colors"
             title="Close (Ctrl+Shift+P)"
           >
             x
@@ -450,7 +456,7 @@ export function PerformanceOverlay({
       {!isMinimized && (
         <>
           {/* Tabs */}
-          <div className="flex gap-1 px-2 py-1 border-b border-gray-700 overflow-x-auto">
+          <div className="flex gap-1 px-2 py-1 border-b border-border overflow-x-auto">
             <TabButton active={activeTab === "overview"} onClick={() => setActiveTab("overview")}>
               Overview
             </TabButton>
@@ -480,16 +486,16 @@ export function PerformanceOverlay({
           </div>
 
           {/* Actions */}
-          <div className="flex gap-1 px-2 py-2 border-t border-gray-700">
+          <div className="flex gap-1 px-2 py-2 border-t border-border">
             <button
               onClick={handleReset}
-              className="flex-1 px-2 py-1 text-[10px] bg-gray-700 hover:bg-gray-600 rounded transition-colors"
+              className="flex-1 px-2 py-1 text-[10px] bg-muted/80 hover:bg-muted rounded transition-colors"
             >
               Reset
             </button>
             <button
               onClick={handleLogSummary}
-              className="flex-1 px-2 py-1 text-[10px] bg-gray-700 hover:bg-gray-600 rounded transition-colors"
+              className="flex-1 px-2 py-1 text-[10px] bg-muted/80 hover:bg-muted rounded transition-colors"
             >
               Log
             </button>

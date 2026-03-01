@@ -723,7 +723,7 @@ Work through ALL findings systematically. Fix each one and report your resolutio
                 data-ui-id="findings-fix-all-btn"
                 onClick={handleAnalyzeAll}
                 disabled={isAnalyzingAll}
-                className={`flex items-center gap-1.5 px-3 py-1.5 text-sm ${getAccentColors("purple").bgSolid} hover:bg-purple-600 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors`}
+                className={`flex items-center gap-1.5 px-3 py-1.5 text-sm ${getAccentColors("purple").bgSolid} hover:bg-purple-600 disabled:bg-muted disabled:cursor-not-allowed text-white rounded-lg transition-colors`}
                 title={`Fix ${summary.autoFixable} auto-fixable findings (code bugs, security, tests, docs)`}
               >
                 {isAnalyzingAll ? (

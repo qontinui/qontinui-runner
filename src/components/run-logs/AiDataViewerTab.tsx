@@ -3821,7 +3821,7 @@ function ProcessSessionOutputSection({
           >
             {filteredLines.map((line) => (
               <div key={line.id} className={line.stream === "stderr" ? "text-red-400" : ""}>
-                <span className="text-gray-500 select-none">
+                <span className="text-muted-foreground select-none">
                   {new Date(line.timestamp).toLocaleTimeString()}{" "}
                 </span>
                 {line.line}

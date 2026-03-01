@@ -495,6 +495,44 @@ impl LoopController {
                 };
             }
 
+            // Check global max_sessions budget before starting a new stage
+            if let Some(max) = config.max_sessions {
+                if let Ok(Some(task_run)) = self.checkpoint_db.get_task_run(&config.execution_id) {
+                    if task_run.sessions_count >= max {
+                        warn!(
+                            "Global max_sessions ({}) reached before stage {}/{} (sessions_count={}) - stopping workflow",
+                            max, stage_num, total_stages, task_run.sessions_count
+                        );
+                        self.persist_workflow_state(
+                            &config.execution_id,
+                            &UnifiedWorkflowState::failed_in_phase(
+                                format!(
+                                    "Max sessions ({}) reached before stage {}",
+                                    max, stage_num
+                                ),
+                                "stage",
+                                None,
+                            ),
+                        );
+                        self.mark_task_failed(
+                            &config.execution_id,
+                            &format!(
+                                "Max sessions ({}) exhausted after {} sessions (before stage {}/{})",
+                                max, task_run.sessions_count, stage_num, total_stages
+                            ),
+                        )
+                        .await;
+                        return WorkflowResult {
+                            success: false,
+                            verification_passed: false,
+                            step_results: all_step_results,
+                            duration_ms: start.elapsed().as_millis() as u64,
+                            loop_result: last_loop_result,
+                        };
+                    }
+                }
+            }
+
             // Append stage header to output
             let separator = "=".repeat(60);
             let stage_header = format!(
@@ -709,6 +747,7 @@ impl LoopController {
                     provider_override: stage.provider.clone(),
                     model_override: stage.model.clone(),
                     stage_index: Some(stage_idx as u32),
+                    max_sessions: config.max_sessions,
                 };
 
                 // Handle agentic-first: run the agentic phase before the verification loop.
@@ -1195,6 +1234,29 @@ impl LoopController {
                     unfixable_errors: false,
                     iteration_results,
                 };
+            }
+
+            // Check global max_sessions budget (across all stages).
+            // sessions_count is incremented in the database on each agentic session,
+            // so this enforces the overall session budget even in multi-stage workflows.
+            if let Some(max) = config.max_sessions {
+                if let Ok(Some(task_run)) = self.checkpoint_db.get_task_run(&config.execution_id) {
+                    if task_run.sessions_count >= max {
+                        warn!(
+                            "Global max_sessions ({}) reached (sessions_count={}) - exiting loop",
+                            max, task_run.sessions_count
+                        );
+                        return LoopResult {
+                            iterations_run: iteration - 1,
+                            verification_passed: false,
+                            max_iterations_reached: true,
+                            critical_failure: false,
+                            was_stopped: false,
+                            unfixable_errors: false,
+                            iteration_results,
+                        };
+                    }
+                }
             }
 
             // CRITICAL: Reset task status to "running" at the start of each iteration
@@ -2522,6 +2584,7 @@ pub async fn resume_interrupted_workflows(
                                 provider_override: None,
                                 model_override: None,
                                 stage_index: None,
+                                max_sessions: Some(workflow.max_iterations),
                             };
 
                             controller
@@ -2655,6 +2718,7 @@ pub async fn resume_interrupted_workflows(
                                 provider_override: None,
                                 model_override: None,
                                 stage_index: None,
+                                max_sessions: Some(workflow.max_iterations),
                             };
 
                             controller

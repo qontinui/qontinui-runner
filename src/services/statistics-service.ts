@@ -254,7 +254,7 @@ export function getAnomalySeverityColor(severity: string): string {
     case "low":
       return "text-blue-500";
     default:
-      return "text-text-muted";
+      return "text-muted-foreground";
   }
 }
 
@@ -272,8 +272,8 @@ export function getRunStatusColor(status: string): string {
     case "timeout":
       return "text-orange-500";
     case "cancelled":
-      return "text-text-muted";
+      return "text-muted-foreground";
     default:
-      return "text-text-muted";
+      return "text-muted-foreground";
   }
 }

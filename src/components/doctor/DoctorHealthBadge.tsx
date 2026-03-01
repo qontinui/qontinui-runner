@@ -109,7 +109,7 @@ export function DoctorHealthBadge({ className }: DoctorHealthBadgeProps) {
           <div className="fixed inset-0 z-40" onClick={() => setShowDropdown(false)} />
 
           <div className="absolute top-full mt-2 right-0 z-50 w-80 bg-card border border-border rounded-lg shadow-lg overflow-hidden">
-            <div className="px-3 py-2 border-b border-border bg-surface-raised">
+            <div className="px-3 py-2 border-b border-border bg-card">
               <div className="flex items-center justify-between">
                 <span className="text-sm font-semibold text-foreground">Process Health</span>
                 <button

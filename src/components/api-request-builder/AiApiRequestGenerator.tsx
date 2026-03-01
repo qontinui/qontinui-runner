@@ -129,17 +129,17 @@ export function AiApiRequestGenerator({
   }, []);
 
   return (
-    <div className="flex flex-col h-full bg-neutral-900 rounded-lg border border-neutral-700 overflow-hidden">
+    <div className="flex flex-col h-full bg-card rounded-lg border border-border overflow-hidden">
       {/* Header */}
-      <div className="flex items-center justify-between p-3 border-b border-neutral-700">
+      <div className="flex items-center justify-between p-3 border-b border-border">
         <div className="flex items-center gap-2">
           <Sparkles className="w-4 h-4 text-indigo-400" />
-          <span className="text-sm font-medium text-neutral-200">AI API Request Generator</span>
+          <span className="text-sm font-medium text-foreground">AI API Request Generator</span>
         </div>
         {onCancel && (
           <button
             onClick={onCancel}
-            className="p-1 text-neutral-500 hover:text-neutral-300 transition-colors"
+            className="p-1 text-muted-foreground hover:text-foreground transition-colors"
           >
             <X className="w-4 h-4" />
           </button>
@@ -151,13 +151,13 @@ export function AiApiRequestGenerator({
         {/* Template quick picks */}
         {!generatedRequest && (
           <div className="mb-4">
-            <label className="block text-xs text-neutral-400 mb-2">Quick Templates</label>
+            <label className="block text-xs text-muted-foreground mb-2">Quick Templates</label>
             <div className="flex flex-wrap gap-2">
               {PROMPT_TEMPLATES.map((template) => (
                 <button
                   key={template.label}
                   onClick={() => handleApplyTemplate(template)}
-                  className="px-2 py-1 text-xs bg-neutral-800 text-neutral-300 rounded hover:bg-neutral-700 transition-colors"
+                  className="px-2 py-1 text-xs bg-muted text-foreground rounded hover:bg-muted/80 transition-colors"
                 >
                   {template.label}
                 </button>
@@ -171,26 +171,28 @@ export function AiApiRequestGenerator({
           <>
             {/* Base URL (optional) */}
             <div className="mb-4">
-              <label className="block text-xs text-neutral-400 mb-2">Base URL (optional)</label>
+              <label className="block text-xs text-muted-foreground mb-2">
+                Base URL (optional)
+              </label>
               <input
                 type="text"
                 value={baseUrl}
                 onChange={(e) => setBaseUrl(e.target.value)}
                 placeholder="https://api.example.com"
-                className="w-full px-3 py-2 bg-neutral-800 border border-neutral-700 rounded text-sm text-neutral-200 placeholder-neutral-500 focus:outline-none focus:border-indigo-500"
+                className="w-full px-3 py-2 bg-muted border border-border rounded text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-indigo-500"
               />
             </div>
 
             {/* Prompt textarea */}
             <div className="flex-1 flex flex-col min-h-0">
-              <label className="block text-xs text-neutral-400 mb-2">
+              <label className="block text-xs text-muted-foreground mb-2">
                 Describe the API request you need
               </label>
               <textarea
                 value={prompt}
                 onChange={(e) => setPrompt(e.target.value)}
                 placeholder="Example: POST request to create a new user with name, email, and password fields, including proper Content-Type header"
-                className="flex-1 px-3 py-2 bg-neutral-800 border border-neutral-700 rounded text-sm text-neutral-200 placeholder-neutral-500 resize-none focus:outline-none focus:border-indigo-500 min-h-[100px]"
+                className="flex-1 px-3 py-2 bg-muted border border-border rounded text-sm text-foreground placeholder:text-muted-foreground resize-none focus:outline-none focus:border-indigo-500 min-h-[100px]"
               />
             </div>
 
@@ -231,36 +233,34 @@ export function AiApiRequestGenerator({
                 >
                   {generatedRequest.method}
                 </span>
-                <span className="text-sm font-medium text-neutral-200">
-                  {generatedRequest.name}
-                </span>
+                <span className="text-sm font-medium text-foreground">{generatedRequest.name}</span>
               </div>
 
               {/* Description */}
               {generatedRequest.description && (
                 <div className="mb-4">
-                  <label className="block text-xs text-neutral-400 mb-1">Description</label>
-                  <p className="text-sm text-neutral-300">{generatedRequest.description}</p>
+                  <label className="block text-xs text-muted-foreground mb-1">Description</label>
+                  <p className="text-sm text-foreground">{generatedRequest.description}</p>
                 </div>
               )}
 
               {/* URL */}
               <div className="mb-4">
-                <label className="block text-xs text-neutral-400 mb-1">URL</label>
-                <div className="p-2 bg-neutral-950 rounded border border-neutral-700">
-                  <code className="text-sm font-mono text-neutral-300">{generatedRequest.url}</code>
+                <label className="block text-xs text-muted-foreground mb-1">URL</label>
+                <div className="p-2 bg-background rounded border border-border">
+                  <code className="text-sm font-mono text-foreground">{generatedRequest.url}</code>
                 </div>
               </div>
 
               {/* Headers */}
               {Object.keys(generatedRequest.headers).length > 0 && (
                 <div className="mb-4">
-                  <label className="block text-xs text-neutral-400 mb-1">Headers</label>
-                  <div className="p-2 bg-neutral-950 rounded border border-neutral-700 space-y-1">
+                  <label className="block text-xs text-muted-foreground mb-1">Headers</label>
+                  <div className="p-2 bg-background rounded border border-border space-y-1">
                     {Object.entries(generatedRequest.headers).map(([key, value]) => (
                       <div key={key} className="flex gap-2 text-xs font-mono">
                         <span className="text-indigo-400">{key}:</span>
-                        <span className="text-neutral-300">{value}</span>
+                        <span className="text-foreground">{value}</span>
                       </div>
                     ))}
                   </div>
@@ -270,11 +270,11 @@ export function AiApiRequestGenerator({
               {/* Body */}
               {generatedRequest.body && (
                 <div className="mb-4 flex-1 min-h-0">
-                  <label className="block text-xs text-neutral-400 mb-1">
+                  <label className="block text-xs text-muted-foreground mb-1">
                     Body ({generatedRequest.body_content_type})
                   </label>
-                  <div className="max-h-[150px] overflow-auto p-3 bg-neutral-950 rounded border border-neutral-700">
-                    <pre className="text-sm font-mono text-neutral-300 whitespace-pre-wrap">
+                  <div className="max-h-[150px] overflow-auto p-3 bg-background rounded border border-border">
+                    <pre className="text-sm font-mono text-foreground whitespace-pre-wrap">
                       {generatedRequest.body}
                     </pre>
                   </div>
@@ -283,8 +283,8 @@ export function AiApiRequestGenerator({
 
               {/* Timeout */}
               <div className="mb-4">
-                <label className="block text-xs text-neutral-400 mb-1">Timeout</label>
-                <span className="text-sm text-neutral-300">{generatedRequest.timeout_ms}ms</span>
+                <label className="block text-xs text-muted-foreground mb-1">Timeout</label>
+                <span className="text-sm text-foreground">{generatedRequest.timeout_ms}ms</span>
               </div>
             </div>
 
@@ -294,7 +294,7 @@ export function AiApiRequestGenerator({
                 onClick={() => {
                   setGeneratedRequest(null);
                 }}
-                className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-neutral-700 text-white rounded hover:bg-neutral-600 transition-colors"
+                className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-muted/80 text-white rounded hover:bg-muted transition-colors"
               >
                 <RefreshCw className="w-4 h-4" />
                 Try Again
@@ -312,7 +312,7 @@ export function AiApiRequestGenerator({
       </div>
 
       {/* Footer */}
-      <div className="p-2 border-t border-neutral-700 text-xs text-neutral-500">
+      <div className="p-2 border-t border-border text-xs text-muted-foreground">
         AI-generated requests should be reviewed before saving
       </div>
     </div>

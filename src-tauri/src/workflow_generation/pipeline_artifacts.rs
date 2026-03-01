@@ -19,12 +19,16 @@ pub struct PipelineArtifact {
     pub created_at: String,
 
     // Timing (milliseconds)
+    pub investigation_duration_ms: Option<u64>,
     pub discovery_duration_ms: Option<u64>,
     pub builder_duration_ms: Option<u64>,
     pub autofix_duration_ms: Option<u64>,
     pub verification_duration_ms: Option<u64>,
     pub hardener_duration_ms: Option<u64>,
     pub total_duration_ms: Option<u64>,
+
+    // Investigation
+    pub investigation_enriched_description: Option<String>,
 
     // Intermediate snapshots
     pub discovery_calls: Option<serde_json::Value>,
@@ -68,6 +72,8 @@ pub struct PipelineArtifactBuilder {
     pub description: String,
     pub category: Option<String>,
 
+    pub investigation_duration_ms: Option<u64>,
+    pub investigation_enriched_description: Option<String>,
     pub discovery_duration_ms: Option<u64>,
     pub builder_duration_ms: Option<u64>,
     pub autofix_duration_ms: Option<u64>,
@@ -110,6 +116,8 @@ impl PipelineArtifactBuilder {
             category: self.category,
             created_at: Utc::now().to_rfc3339(),
 
+            investigation_duration_ms: self.investigation_duration_ms,
+            investigation_enriched_description: self.investigation_enriched_description,
             discovery_duration_ms: self.discovery_duration_ms,
             builder_duration_ms: self.builder_duration_ms,
             autofix_duration_ms: self.autofix_duration_ms,

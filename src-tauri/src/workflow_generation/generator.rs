@@ -17,10 +17,12 @@
 
 use crate::ai_provider::{run_prompt_with_routing, AiResponse};
 use crate::ai_router::TaskContext;
+use crate::commands::logging::AiOutputEntry;
 use crate::context;
 use crate::doctor::DoctorHandle;
 use crate::unified_workflows::UnifiedWorkflow;
 use crate::workflow_generation::hardener::{self, HardeningSummary};
+use crate::workflow_generation::investigator;
 use crate::workflow_generation::pipeline_artifacts::{
     compute_json_diff, PipelineArtifact, PipelineArtifactBuilder,
 };
@@ -91,6 +93,10 @@ pub struct GenerateWorkflowRequest {
     /// Whether to enable reflection mode for agentic iterations (default: true)
     #[serde(default = "default_true")]
     pub reflection_mode: Option<bool>,
+
+    /// Whether to run an AI investigation step before the builder agent (default: true)
+    #[serde(default = "default_true")]
+    pub investigate_codebase: Option<bool>,
 }
 
 fn default_true() -> Option<bool> {
@@ -116,6 +122,7 @@ impl Default for GenerateWorkflowRequest {
             discovery_mode: None,
             include_ui_bridge_instructions: Some(true),
             reflection_mode: Some(true),
+            investigate_codebase: Some(true),
         }
     }
 }
@@ -206,10 +213,107 @@ pub fn generate_workflow(
     artifact_builder.discovery_duration_ms = Some(discovery_start.elapsed().as_millis() as u64);
     artifact_builder.discovery_calls = serde_json::to_value(&discovery_calls).ok();
 
+    // ── Investigation Phase ────────────────────────────────────────────────
+    // Resolve contexts once (shared between investigation and builder).
+    let resolved_contexts = {
+        let mut ctx = String::new();
+        if let Some(ref ids) = request.context_ids {
+            if !ids.is_empty() {
+                let resolved = context::resolve_contexts(ids, false, "", &[], &[]);
+                if let Some(formatted) = context::format_contexts_for_prompt(&resolved) {
+                    ctx.push_str(&formatted);
+                }
+            }
+        }
+        if let Some(ref inline) = request.inline_context {
+            if !inline.is_empty() {
+                ctx.push_str(&format!(
+                    "<context name=\"User-Provided Context\">\n{}\n</context>\n\n",
+                    inline
+                ));
+            }
+        }
+        ctx
+    };
+
+    let effective_request =
+        if request.investigate_codebase.unwrap_or(true) && !discovery_context.is_empty() {
+            info!("Running pre-generation investigation step...");
+            let investigation = investigator::run_investigation(
+                &request.description,
+                &discovery_context,
+                &resolved_contexts,
+                doctor_handle,
+            );
+            artifact_builder.investigation_duration_ms = Some(investigation.duration_ms);
+
+            // Persist investigation output to ai-output.jsonl for debugging visibility
+            {
+                let status = if investigation.success {
+                    "success"
+                } else {
+                    "failed"
+                };
+                let log_line = format!(
+                    "[Investigation {} in {}ms] {}",
+                    status,
+                    investigation.duration_ms,
+                    if investigation.success {
+                        &investigation.enriched_description
+                    } else {
+                        "(fell back to original description)"
+                    }
+                );
+                let entry = AiOutputEntry {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    timestamp: chrono::Utc::now().timestamp_millis(),
+                    line: log_line,
+                    source: "workflow-generator".to_string(),
+                    action_id: None,
+                    task_run_id: None,
+                    session_id: None,
+                    session_name: Some(format!(
+                        "Generate: {}",
+                        &request.description[..request.description.len().min(60)]
+                    )),
+                    phase: Some("investigation".to_string()),
+                    phase_iteration: None,
+                    screenshot_path: None,
+                    screenshot_width: None,
+                    screenshot_height: None,
+                };
+                let log_response = crate::commands::logging::append_ai_output_log(entry);
+                if !log_response.success {
+                    warn!(
+                        "Failed to persist investigation AI output log: {}",
+                        log_response.message.unwrap_or_default()
+                    );
+                }
+            }
+
+            if investigation.success {
+                artifact_builder.investigation_enriched_description =
+                    Some(investigation.enriched_description.clone());
+                let mut enriched_request = request.clone();
+                enriched_request.description = investigation.enriched_description;
+                enriched_request
+            } else {
+                info!("Investigation failed, falling back to original description");
+                request.clone()
+            }
+        } else {
+            if request.investigate_codebase.unwrap_or(true) {
+                debug!("Investigation skipped: no discovery context available");
+            } else {
+                debug!("Investigation disabled by request");
+            }
+            request.clone()
+        };
+
     // ── Step 1: Builder Agent ──────────────────────────────────────────────
     let builder_start = Instant::now();
     let mut workflow = match run_builder_agent(
-        &request,
+        &effective_request,
         &discovery_context,
         doctor_handle,
         conn,

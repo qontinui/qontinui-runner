@@ -103,10 +103,10 @@ export function DomDiffModal({
         <Dialog.Overlay className="fixed inset-0 bg-black/70 z-50" />
         <Dialog.Content
           data-ui-id="dialog-dom-diff"
-          className="fixed inset-4 bg-gray-900 rounded-lg shadow-2xl z-50 flex flex-col overflow-hidden"
+          className="fixed inset-4 bg-card rounded-lg shadow-2xl z-50 flex flex-col overflow-hidden"
         >
           {/* Header */}
-          <div className="flex items-center justify-between p-4 border-b border-gray-700">
+          <div className="flex items-center justify-between p-4 border-b border-border">
             <div className="flex items-center gap-4">
               <Dialog.Title className="text-lg font-semibold text-white">
                 DOM Comparison
@@ -114,19 +114,19 @@ export function DomDiffModal({
               <div className="flex items-center gap-2 text-sm">
                 <span className="text-green-400">+{stats.additions}</span>
                 <span className="text-red-400">-{stats.deletions}</span>
-                <span className="text-gray-400">{stats.unchanged} unchanged</span>
+                <span className="text-muted-foreground">{stats.unchanged} unchanged</span>
               </div>
             </div>
 
             <div className="flex items-center gap-2">
               {/* View mode toggle */}
-              <div className="flex rounded-md overflow-hidden border border-gray-600">
+              <div className="flex rounded-md overflow-hidden border border-border">
                 <button
                   onClick={() => setViewMode("unified")}
                   className={`px-3 py-1.5 text-sm flex items-center gap-1 ${
                     viewMode === "unified"
                       ? "bg-blue-600 text-white"
-                      : "bg-gray-800 text-gray-300 hover:bg-gray-700"
+                      : "bg-muted text-foreground hover:bg-muted/80"
                   }`}
                 >
                   <Layers className="w-4 h-4" />
@@ -137,7 +137,7 @@ export function DomDiffModal({
                   className={`px-3 py-1.5 text-sm flex items-center gap-1 ${
                     viewMode === "split"
                       ? "bg-blue-600 text-white"
-                      : "bg-gray-800 text-gray-300 hover:bg-gray-700"
+                      : "bg-muted text-foreground hover:bg-muted/80"
                   }`}
                 >
                   <ChevronLeft className="w-3 h-3" />
@@ -147,26 +147,26 @@ export function DomDiffModal({
               </div>
 
               {/* Show only changes toggle */}
-              <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+              <label className="flex items-center gap-2 text-sm text-foreground cursor-pointer">
                 <input
                   type="checkbox"
                   checked={showOnlyChanges}
                   onChange={(e) => setShowOnlyChanges(e.target.checked)}
-                  className="rounded border-gray-600 bg-gray-800 text-blue-500 focus:ring-blue-500"
+                  className="rounded border-border bg-muted text-blue-500 focus:ring-blue-500"
                 />
                 Show only changes
               </label>
 
               <button
                 onClick={copyDiff}
-                className="p-2 text-gray-400 hover:text-white hover:bg-gray-700 rounded"
+                className="p-2 text-muted-foreground hover:text-white hover:bg-muted/80 rounded"
                 title="Copy diff to clipboard"
               >
                 <Copy className="w-4 h-4" />
               </button>
               <button
                 onClick={downloadDiff}
-                className="p-2 text-gray-400 hover:text-white hover:bg-gray-700 rounded"
+                className="p-2 text-muted-foreground hover:text-white hover:bg-muted/80 rounded"
                 title="Download diff file"
               >
                 <Download className="w-4 h-4" />
@@ -174,7 +174,7 @@ export function DomDiffModal({
               <Dialog.Close asChild>
                 <button
                   data-ui-id="dialog-dom-diff-close-btn"
-                  className="p-2 text-gray-400 hover:text-white hover:bg-gray-700 rounded"
+                  className="p-2 text-muted-foreground hover:text-white hover:bg-muted/80 rounded"
                   title="Close"
                 >
                   <X className="w-4 h-4" />
@@ -184,19 +184,23 @@ export function DomDiffModal({
           </div>
 
           {/* File headers */}
-          <div className="flex border-b border-gray-700 text-sm">
+          <div className="flex border-b border-border text-sm">
             <div
-              className={`flex-1 px-4 py-2 bg-red-900/20 text-red-300 ${viewMode === "split" ? "border-r border-gray-700" : ""}`}
+              className={`flex-1 px-4 py-2 bg-red-900/20 text-red-300 ${viewMode === "split" ? "border-r border-border" : ""}`}
             >
               <ChevronLeft className="w-4 h-4 inline mr-1" />
               {leftTitle}
-              {leftTimestamp && <span className="text-gray-500 ml-2">({leftTimestamp})</span>}
+              {leftTimestamp && (
+                <span className="text-muted-foreground ml-2">({leftTimestamp})</span>
+              )}
             </div>
             {viewMode === "split" && (
               <div className="flex-1 px-4 py-2 bg-green-900/20 text-green-300">
                 <ChevronRight className="w-4 h-4 inline mr-1" />
                 {rightTitle}
-                {rightTimestamp && <span className="text-gray-500 ml-2">({rightTimestamp})</span>}
+                {rightTimestamp && (
+                  <span className="text-muted-foreground ml-2">({rightTimestamp})</span>
+                )}
               </div>
             )}
           </div>
@@ -242,10 +246,10 @@ function UnifiedDiffView({ diffResult, showOnlyChanges }: DiffViewProps) {
             ];
             lineNumber += lines.length;
             return (
-              <div key={partIndex} className="text-gray-500">
+              <div key={partIndex} className="text-muted-foreground">
                 {contextLines.map((line, i) => (
-                  <div key={i} className="px-4 py-0.5 hover:bg-gray-800/50">
-                    <span className="inline-block w-12 text-gray-600 text-right mr-4 select-none">
+                  <div key={i} className="px-4 py-0.5 hover:bg-muted/50">
+                    <span className="inline-block w-12 text-muted-foreground/50 text-right mr-4 select-none">
                       {i === 3 ? "" : ""}
                     </span>
                     {line}
@@ -269,13 +273,13 @@ function UnifiedDiffView({ diffResult, showOnlyChanges }: DiffViewProps) {
                 ? "text-green-300"
                 : part.removed
                   ? "text-red-300"
-                  : "text-gray-300";
+                  : "text-foreground";
 
               const prefix = part.added ? "+" : part.removed ? "-" : " ";
 
               return (
-                <div key={lineIndex} className={`px-4 py-0.5 hover:bg-gray-800/50 ${bgClass}`}>
-                  <span className="inline-block w-12 text-gray-600 text-right mr-4 select-none">
+                <div key={lineIndex} className={`px-4 py-0.5 hover:bg-muted/50 ${bgClass}`}>
+                  <span className="inline-block w-12 text-muted-foreground/50 text-right mr-4 select-none">
                     {!part.removed ? lineNumber : ""}
                   </span>
                   <span
@@ -284,7 +288,7 @@ function UnifiedDiffView({ diffResult, showOnlyChanges }: DiffViewProps) {
                         ? "text-green-500"
                         : part.removed
                           ? "text-red-500"
-                          : "text-gray-600"
+                          : "text-muted-foreground/50"
                     }`}
                   >
                     {prefix}
@@ -371,23 +375,16 @@ function SplitDiffView({ diffResult, showOnlyChanges }: DiffViewProps) {
   return (
     <div className="flex font-mono text-sm">
       {/* Left side */}
-      <div className="flex-1 border-r border-gray-700">
+      <div className="flex-1 border-r border-border">
         {displayLines.map(({ left, index }) => {
           const bgClass =
-            left.type === "removed"
-              ? "bg-red-900/30"
-              : left.type === "empty"
-                ? "bg-gray-800/30"
-                : "";
+            left.type === "removed" ? "bg-red-900/30" : left.type === "empty" ? "bg-muted/30" : "";
 
-          const textClass = left.type === "removed" ? "text-red-300" : "text-gray-300";
+          const textClass = left.type === "removed" ? "text-red-300" : "text-foreground";
 
           return (
-            <div
-              key={index}
-              className={`px-4 py-0.5 hover:bg-gray-800/50 ${bgClass} min-h-[1.5rem]`}
-            >
-              <span className="inline-block w-8 text-gray-600 text-right mr-4 select-none">
+            <div key={index} className={`px-4 py-0.5 hover:bg-muted/50 ${bgClass} min-h-[1.5rem]`}>
+              <span className="inline-block w-8 text-muted-foreground/50 text-right mr-4 select-none">
                 {left.type !== "empty" ? index + 1 : ""}
               </span>
               <span className={textClass}>{left.line || " "}</span>
@@ -403,17 +400,14 @@ function SplitDiffView({ diffResult, showOnlyChanges }: DiffViewProps) {
             right.type === "added"
               ? "bg-green-900/30"
               : right.type === "empty"
-                ? "bg-gray-800/30"
+                ? "bg-muted/30"
                 : "";
 
-          const textClass = right.type === "added" ? "text-green-300" : "text-gray-300";
+          const textClass = right.type === "added" ? "text-green-300" : "text-foreground";
 
           return (
-            <div
-              key={index}
-              className={`px-4 py-0.5 hover:bg-gray-800/50 ${bgClass} min-h-[1.5rem]`}
-            >
-              <span className="inline-block w-8 text-gray-600 text-right mr-4 select-none">
+            <div key={index} className={`px-4 py-0.5 hover:bg-muted/50 ${bgClass} min-h-[1.5rem]`}>
+              <span className="inline-block w-8 text-muted-foreground/50 text-right mr-4 select-none">
                 {right.type !== "empty" ? index + 1 : ""}
               </span>
               <span className={textClass}>{right.line || " "}</span>

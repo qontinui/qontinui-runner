@@ -164,35 +164,32 @@ pub fn refetch_unified_workflow_steps(
                 })
             };
 
-            // Add setup steps (mark as setup phase)
-            for step in &workflow.setup_steps {
-                if let Some(mut config) = convert_step(step) {
-                    config.phase = Some("setup".to_string());
-                    all_steps.push(config);
+            // Normalize to stages to handle both flat and multi-stage workflows
+            let normalized_stages = workflow.normalize_to_stages();
+            for stage in &normalized_stages {
+                for step in &stage.setup_steps {
+                    if let Some(mut config) = convert_step(step) {
+                        config.phase = Some("setup".to_string());
+                        all_steps.push(config);
+                    }
                 }
-            }
-
-            // Add verification steps
-            for step in &workflow.verification_steps {
-                if let Some(mut config) = convert_step(step) {
-                    config.phase = Some("verification".to_string());
-                    all_steps.push(config);
+                for step in &stage.verification_steps {
+                    if let Some(mut config) = convert_step(step) {
+                        config.phase = Some("verification".to_string());
+                        all_steps.push(config);
+                    }
                 }
-            }
-
-            // Add agentic steps
-            for step in &workflow.agentic_steps {
-                if let Some(mut config) = convert_step(step) {
-                    config.phase = Some("agentic".to_string());
-                    all_steps.push(config);
+                for step in &stage.agentic_steps {
+                    if let Some(mut config) = convert_step(step) {
+                        config.phase = Some("agentic".to_string());
+                        all_steps.push(config);
+                    }
                 }
-            }
-
-            // Add completion steps (mark as completion phase)
-            for step in &workflow.completion_steps {
-                if let Some(mut config) = convert_step(step) {
-                    config.phase = Some("completion".to_string());
-                    all_steps.push(config);
+                for step in &stage.completion_steps {
+                    if let Some(mut config) = convert_step(step) {
+                        config.phase = Some("completion".to_string());
+                        all_steps.push(config);
+                    }
                 }
             }
 
@@ -1113,6 +1110,7 @@ pub async fn generate_unified_workflow_async_handler(
             provider_override: None,
             model_override: None,
             stage_index: None,
+            max_sessions: Some(saved_workflow.max_iterations),
         };
 
         // Clone state fields for the background task
@@ -1230,6 +1228,9 @@ pub struct ExecuteInlineWorkflowRequest {
     /// Workflow settings (optional, extracted from generated workflow)
     #[serde(default)]
     settings: Option<serde_json::Value>,
+    /// Optional stages for multi-stage workflows
+    #[serde(default)]
+    stages: Vec<crate::unified_workflows::WorkflowStage>,
 }
 
 pub fn default_max_iterations() -> u32 {
@@ -1441,6 +1442,7 @@ pub async fn run_unified_workflow(
             provider_override: None,
             model_override: None,
             stage_index: None,
+            max_sessions: Some(workflow.max_iterations),
         };
 
         let checkpoint_db = state.app_state.checkpoint_db.clone();
@@ -1716,7 +1718,7 @@ pub async fn execute_inline_workflow(
         enable_sweep: false,
         max_sweep_iterations: 5,
         generated_by_task_run_id: None,
-        stages: Vec::new(),
+        stages: request.stages,
         stop_on_failure: false,
         reflection_mode: false,
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -1829,34 +1831,65 @@ pub async fn execute_inline_workflow(
             provider_override: None,
             model_override: None,
             stage_index: None,
+            max_sessions: Some(workflow.max_iterations),
         };
 
-        let session_manager: Arc<crate::claude_session::SessionManager> = state
-            .app_handle
-            .state::<Arc<crate::claude_session::SessionManager>>()
-            .inner()
-            .clone();
-        let mut controller = crate::unified_workflow_executor::LoopController::new(
-            state.app_state.clone(),
-            state.config_storage.clone(),
-            state.app_handle.clone(),
-            state.current_ai_pids.clone(),
-        )
-        .with_session_manager(session_manager);
+        // Spawn in background (non-blocking) — same pattern as run_unified_workflow
+        let checkpoint_db = state.app_state.checkpoint_db.clone();
+        let execution_id_for_guard = execution_id.clone();
+        let workflow_name_for_guard = workflow.name.clone();
+        let app_state = state.app_state.clone();
+        let config_storage = state.config_storage.clone();
+        let app_handle = state.app_handle.clone();
+        let pid_tracker = state.current_ai_pids.clone();
 
-        let result = controller
-            .run(
-                loop_config,
-                Vec::new(), // No top-level steps — all in stages
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            )
-            .await;
+        crate::unified_workflow_executor::spawn_workflow_with_panic_guard(
+            checkpoint_db,
+            execution_id_for_guard,
+            workflow_name_for_guard,
+            None,
+            async move {
+                let session_manager: Arc<crate::claude_session::SessionManager> = app_handle
+                    .state::<Arc<crate::claude_session::SessionManager>>()
+                    .inner()
+                    .clone();
+                let mut controller = crate::unified_workflow_executor::LoopController::new(
+                    app_state,
+                    config_storage,
+                    app_handle,
+                    pid_tracker,
+                )
+                .with_session_manager(session_manager);
 
-        return Ok(Json(ApiResponse::success(result.to_execution_result())));
+                controller
+                    .run(
+                        loop_config,
+                        Vec::new(), // No top-level steps — all in stages
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                    .await
+            },
+        );
+
+        return Ok(Json(ApiResponse::success(
+            crate::step_executor::ExecutionResult {
+                success: true,
+                total_steps: 0,
+                successful_steps: 0,
+                failed_steps: 0,
+                total_duration_ms: 0,
+                steps: vec![],
+                captured_logs: None,
+                captured_runner_logs: None,
+                verification_passed: None,
+                loop_result: None,
+                task_summary: None,
+            },
+        )));
     }
 
     // No prompt steps - automation-only workflow
@@ -2226,6 +2259,7 @@ pub async fn run_composed_workflow(
                 provider_override: None,
                 model_override: None,
                 stage_index: None,
+                max_sessions: Some(10), // Default budget for composed workflows
             };
 
             // Run the LoopController once with all stages

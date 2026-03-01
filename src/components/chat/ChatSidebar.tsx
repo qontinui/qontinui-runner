@@ -80,7 +80,7 @@ export function ChatSidebar({
       <div className="p-3 border-b border-border">
         <button
           onClick={onNewChat}
-          className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg bg-brand-primary hover:bg-brand-primary/90 text-white text-sm font-medium transition-colors"
+          className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg bg-primary hover:bg-primary/90 text-white text-sm font-medium transition-colors"
         >
           <svg
             className="size-4"
@@ -112,7 +112,7 @@ export function ChatSidebar({
                   onClick={() => onSelectSession(session.id)}
                   className={`w-full text-left px-3 py-2.5 transition-colors ${
                     isActive
-                      ? "bg-brand-primary/15 border-l-2 border-brand-primary"
+                      ? "bg-primary/15 border-l-2 border-primary"
                       : "hover:bg-foreground/5 border-l-2 border-transparent"
                   }`}
                 >

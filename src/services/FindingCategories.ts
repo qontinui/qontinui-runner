@@ -392,10 +392,10 @@ export function getCategoryColorClasses(color: string): {
 
   return (
     colorMap[color] || {
-      bg: "bg-surface-raised/50",
-      text: "text-text-muted",
-      border: "border-border-subtle",
-      badgeBg: "bg-surface-raised",
+      bg: "bg-card/50",
+      text: "text-muted-foreground",
+      border: "border-border",
+      badgeBg: "bg-card",
     }
   );
 }

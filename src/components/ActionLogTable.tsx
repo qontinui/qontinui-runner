@@ -752,7 +752,7 @@ export default function ActionLogTable({
 
   if (actions.length === 0) {
     return (
-      <div className="text-center text-text-muted py-8">
+      <div className="text-center text-muted-foreground py-8">
         <p>No actions to display</p>
       </div>
     );
@@ -769,7 +769,7 @@ export default function ActionLogTable({
           id="level-filter"
           value={maxLevel}
           onChange={(e) => setMaxLevel(Number(e.target.value))}
-          className="px-3 py-1 bg-surface-raised text-foreground border border-border-default rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+          className="px-3 py-1 bg-card text-foreground border border-border rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
         >
           {Array.from({ length: maxAvailableLevel + 1 }, (_, i) => (
             <option key={i} value={i}>
@@ -777,38 +777,38 @@ export default function ActionLogTable({
             </option>
           ))}
         </select>
-        <span className="text-xs text-text-muted">(Showing levels 0-{maxLevel})</span>
+        <span className="text-xs text-muted-foreground">(Showing levels 0-{maxLevel})</span>
       </div>
 
       <table className="w-full border-collapse">
         {/* Fixed Header */}
-        <thead className="sticky top-0 bg-surface-raised text-foreground z-10">
+        <thead className="sticky top-0 bg-card text-foreground z-10">
           <tr>
-            <th className="px-3 py-2 text-center text-sm font-semibold border-b-2 border-border-default w-16">
+            <th className="px-3 py-2 text-center text-sm font-semibold border-b-2 border-border w-16">
               Level
             </th>
-            <th className="px-3 py-2 text-left text-sm font-semibold border-b-2 border-border-default w-8">
+            <th className="px-3 py-2 text-left text-sm font-semibold border-b-2 border-border w-8">
               {/* Expand/collapse column */}
             </th>
             <th
-              className="px-3 py-2 text-left text-sm font-semibold border-b-2 border-border-default"
+              className="px-3 py-2 text-left text-sm font-semibold border-b-2 border-border"
               style={{ minWidth: `${typeColumnWidth}rem` }}
             >
               Action Type
             </th>
-            <th className="px-3 py-2 text-left text-sm font-semibold border-b-2 border-border-default">
+            <th className="px-3 py-2 text-left text-sm font-semibold border-b-2 border-border">
               Target
             </th>
-            <th className="px-3 py-2 text-left text-sm font-semibold border-b-2 border-border-default min-w-[200px]">
+            <th className="px-3 py-2 text-left text-sm font-semibold border-b-2 border-border min-w-[200px]">
               Result
             </th>
-            <th className="px-3 py-2 text-left text-sm font-semibold border-b-2 border-border-default">
+            <th className="px-3 py-2 text-left text-sm font-semibold border-b-2 border-border">
               Active States
             </th>
-            <th className="px-3 py-2 text-right text-sm font-semibold border-b-2 border-border-default">
+            <th className="px-3 py-2 text-right text-sm font-semibold border-b-2 border-border">
               Timestamp
             </th>
-            <th className="px-3 py-2 text-right text-sm font-semibold border-b-2 border-border-default">
+            <th className="px-3 py-2 text-right text-sm font-semibold border-b-2 border-border">
               Duration
             </th>
           </tr>
@@ -864,7 +864,7 @@ export default function ActionLogTable({
                 className={`
                   cursor-pointer transition-colors
                   hover:bg-primary/10
-                  ${isEven ? "bg-surface-canvas/20" : "bg-surface-canvas/5"}
+                  ${isEven ? "bg-background/20" : "bg-background/5"}
                 `}
               >
                 {/* Level Badge */}
@@ -914,7 +914,7 @@ export default function ActionLogTable({
                   style={{ maxWidth: `${typeColumnWidth}rem` }}
                   title={`${treePrefix}${action.action_type}`}
                 >
-                  <span className="text-text-muted" style={{ whiteSpace: "pre" }}>
+                  <span className="text-muted-foreground" style={{ whiteSpace: "pre" }}>
                     {treePrefix}
                   </span>
                   {action.action_type}
@@ -932,7 +932,7 @@ export default function ActionLogTable({
 
                 {/* Active States */}
                 <td
-                  className="px-3 py-1 text-sm font-mono text-text-muted"
+                  className="px-3 py-1 text-sm font-mono text-muted-foreground"
                   onClick={() => onRowClick(action)}
                 >
                   {formatActiveStates(action)}
@@ -940,7 +940,7 @@ export default function ActionLogTable({
 
                 {/* Timestamp */}
                 <td
-                  className="px-3 py-1 text-sm font-mono text-right text-text-muted"
+                  className="px-3 py-1 text-sm font-mono text-right text-muted-foreground"
                   onClick={() => onRowClick(action)}
                 >
                   {formatTimestamp(action.timestamp, workflowStartTime)}
@@ -948,7 +948,7 @@ export default function ActionLogTable({
 
                 {/* Duration */}
                 <td
-                  className="px-3 py-1 text-sm font-mono text-right text-text-muted"
+                  className="px-3 py-1 text-sm font-mono text-right text-muted-foreground"
                   onClick={() => onRowClick(action)}
                 >
                   {formatDuration(action.duration)}

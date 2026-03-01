@@ -125,10 +125,10 @@ export function StateLibraryPicker({ isOpen, onClose, onSelect, phase }: StateLi
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
       <div
         data-ui-id="dialog-state-library-picker"
-        className="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl w-[700px] max-w-[90vw] max-h-[80vh] flex flex-col"
+        className="bg-card border border-border rounded-lg shadow-2xl w-[700px] max-w-[90vw] max-h-[80vh] flex flex-col"
       >
         {/* Header */}
-        <div className="flex items-center justify-between px-4 py-3 border-b border-neutral-700">
+        <div className="flex items-center justify-between px-4 py-3 border-b border-border">
           <div>
             <h2 className="text-lg font-semibold">Select State to Navigate</h2>
             <p className="text-sm text-muted-foreground">
@@ -137,7 +137,7 @@ export function StateLibraryPicker({ isOpen, onClose, onSelect, phase }: StateLi
           </div>
           <button
             onClick={onClose}
-            className="p-1.5 hover:bg-neutral-700 rounded-md transition-colors"
+            className="p-1.5 hover:bg-muted/80 rounded-md transition-colors"
             data-ui-id="workflow-builder-state-picker-close-btn"
           >
             <X className="w-5 h-5" />
@@ -145,7 +145,7 @@ export function StateLibraryPicker({ isOpen, onClose, onSelect, phase }: StateLi
         </div>
 
         {/* Search */}
-        <div className="flex items-center gap-3 px-4 py-3 border-b border-neutral-800">
+        <div className="flex items-center gap-3 px-4 py-3 border-b border-border">
           <div className="relative flex-1">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
             <input
@@ -153,7 +153,7 @@ export function StateLibraryPicker({ isOpen, onClose, onSelect, phase }: StateLi
               placeholder="Search states..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full pl-9 pr-3 py-2 text-sm bg-neutral-800 border border-neutral-700 rounded-md
+              className="w-full pl-9 pr-3 py-2 text-sm bg-muted border border-border rounded-md
                        focus:outline-none focus:ring-2 focus:ring-cyan-500/50"
               autoFocus
               data-ui-id="workflow-builder-state-picker-search-input"
@@ -194,7 +194,7 @@ export function StateLibraryPicker({ isOpen, onClose, onSelect, phase }: StateLi
                       ${
                         isSelected
                           ? "bg-cyan-500/15 border-2 border-cyan-500"
-                          : "bg-neutral-800/50 border-2 border-transparent hover:bg-neutral-800 hover:border-neutral-600"
+                          : "bg-muted/50 border-2 border-transparent hover:bg-muted hover:border-border"
                       }
                     `}
                     data-ui-id={`workflow-builder-state-picker-item-${state.id}`}
@@ -204,7 +204,7 @@ export function StateLibraryPicker({ isOpen, onClose, onSelect, phase }: StateLi
                         <CheckIcon className="w-4 h-4 text-cyan-400" />
                       </div>
                     )}
-                    <div className="p-2 rounded-md bg-neutral-900 text-purple-400">
+                    <div className="p-2 rounded-md bg-card text-purple-400">
                       <Navigation className="w-4 h-4" />
                     </div>
                     <div className="flex-1 min-w-0">
@@ -227,7 +227,7 @@ export function StateLibraryPicker({ isOpen, onClose, onSelect, phase }: StateLi
                         </p>
                       )}
                       <div className="flex items-center gap-2 mt-1.5 text-xs text-muted-foreground">
-                        <span className="font-mono text-neutral-500">{state.id}</span>
+                        <span className="font-mono text-muted-foreground">{state.id}</span>
                       </div>
                       {/* Show tags */}
                       {state.tags && state.tags.length > 0 && (
@@ -235,7 +235,7 @@ export function StateLibraryPicker({ isOpen, onClose, onSelect, phase }: StateLi
                           {state.tags.slice(0, 5).map((tag) => (
                             <span
                               key={tag}
-                              className="text-xs px-1.5 py-0.5 bg-neutral-700 rounded flex items-center gap-1"
+                              className="text-xs px-1.5 py-0.5 bg-muted/80 rounded flex items-center gap-1"
                             >
                               <Tag className="w-2.5 h-2.5" />
                               {tag}
@@ -257,7 +257,7 @@ export function StateLibraryPicker({ isOpen, onClose, onSelect, phase }: StateLi
         </div>
 
         {/* Footer */}
-        <div className="flex items-center justify-between px-4 py-3 border-t border-neutral-700 bg-neutral-800/50">
+        <div className="flex items-center justify-between px-4 py-3 border-t border-border bg-muted/50">
           <span
             data-content-role="metric"
             data-content-label="available state count"
@@ -268,7 +268,7 @@ export function StateLibraryPicker({ isOpen, onClose, onSelect, phase }: StateLi
           <div className="flex items-center gap-2">
             <button
               onClick={onClose}
-              className="px-4 py-2 text-sm rounded-md hover:bg-neutral-700 transition-colors"
+              className="px-4 py-2 text-sm rounded-md hover:bg-muted/80 transition-colors"
               data-ui-id="workflow-builder-state-picker-cancel-btn"
             >
               Cancel

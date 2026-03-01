@@ -115,12 +115,12 @@ export function SpecFileLoader({ onLoad, currentFile }: SpecFileLoaderProps) {
         className={`border-2 border-dashed rounded-lg p-6 text-center cursor-pointer transition-colors ${
           isDragging
             ? "border-blue-500 bg-blue-500/10"
-            : "border-neutral-600 hover:border-neutral-500 bg-neutral-800/30"
+            : "border-border hover:border-border bg-muted/30"
         }`}
       >
-        <Upload className="w-8 h-8 text-neutral-500 mx-auto mb-2" />
-        <p className="text-sm text-neutral-300">Drop a spec file here, or click to browse</p>
-        <p className="text-xs text-neutral-500 mt-1">
+        <Upload className="w-8 h-8 text-muted-foreground mx-auto mb-2" />
+        <p className="text-sm text-foreground">Drop a spec file here, or click to browse</p>
+        <p className="text-xs text-muted-foreground mt-1">
           Supports .spec.uibridge.json and legacy test spec JSON formats
         </p>
         <input

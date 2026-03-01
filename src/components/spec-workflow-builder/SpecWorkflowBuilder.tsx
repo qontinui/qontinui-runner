@@ -187,7 +187,7 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
   return (
     <div className="flex flex-col h-full">
       {/* Step indicator */}
-      <div className="flex items-center gap-1 px-4 py-3 border-b border-neutral-700 bg-neutral-800/50">
+      <div className="flex items-center gap-1 px-4 py-3 border-b border-border bg-muted/50">
         {steps.map((step, i) => (
           <div key={step.id} className="flex items-center">
             <button
@@ -198,18 +198,18 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
               className={`flex items-center gap-2 px-3 py-1.5 text-xs rounded-md transition-colors ${
                 currentStep === step.id
                   ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30"
-                  : "text-neutral-400 hover:text-neutral-200 disabled:opacity-30"
+                  : "text-muted-foreground hover:text-foreground disabled:opacity-30"
               }`}
             >
               {step.icon}
               {step.label}
             </button>
-            {i < steps.length - 1 && <span className="text-neutral-600 mx-1">&rsaquo;</span>}
+            {i < steps.length - 1 && <span className="text-border mx-1">&rsaquo;</span>}
           </div>
         ))}
 
         {loadedData && (
-          <span className="text-xs text-neutral-500 ml-auto">
+          <span className="text-xs text-muted-foreground ml-auto">
             {generatorType === "snapshot"
               ? "Snapshot"
               : generatorType === "navigation"
@@ -230,7 +230,7 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
           <div className="flex flex-col h-full">
             {/* Navigation graph preview for Tier 2 */}
             {generatorType === "navigation" && states.length > 0 && (
-              <div className="border-b border-neutral-700 max-h-[200px] overflow-auto">
+              <div className="border-b border-border max-h-[200px] overflow-auto">
                 <NavigationGraphPreview states={states} transitions={transitions} />
               </div>
             )}
@@ -243,7 +243,7 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
                 onDeselectAll={deselectAll}
               />
             </div>
-            <div className="px-4 py-3 border-t border-neutral-700 bg-neutral-800/50">
+            <div className="px-4 py-3 border-t border-border bg-muted/50">
               <button
                 onClick={() => setCurrentStep("configure")}
                 disabled={selectedSpecIds.size === 0}
@@ -267,7 +267,7 @@ export function SpecWorkflowBuilder({ onApplyWorkflow }: SpecWorkflowBuilderProp
                 onElementSourceChange={setElementSource}
               />
             </div>
-            <div className="px-4 py-3 border-t border-neutral-700 bg-neutral-800/50">
+            <div className="px-4 py-3 border-t border-border bg-muted/50">
               <button
                 onClick={() => setCurrentStep("preview")}
                 className="px-4 py-2 text-sm font-medium bg-emerald-600 text-white rounded-md hover:bg-emerald-700 transition-colors"

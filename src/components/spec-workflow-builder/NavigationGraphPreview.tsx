@@ -18,7 +18,7 @@ export function NavigationGraphPreview({ states, transitions }: NavigationGraphP
 
   return (
     <div className="p-4 space-y-3">
-      <div className="flex items-center gap-2 text-sm font-medium text-neutral-200">
+      <div className="flex items-center gap-2 text-sm font-medium text-foreground">
         <GitBranch className="w-4 h-4 text-emerald-400" />
         Navigation Flow ({states.length} states, {transitions.length} transitions)
       </div>
@@ -27,17 +27,14 @@ export function NavigationGraphPreview({ states, transitions }: NavigationGraphP
         {states.map((state) => {
           const outgoing = transitions.filter((t) => t.fromStateId === state.id);
           return (
-            <div
-              key={state.id}
-              className="p-3 bg-neutral-800/50 rounded-lg border border-neutral-700"
-            >
+            <div key={state.id} className="p-3 bg-muted/50 rounded-lg border border-border">
               <div className="flex items-center gap-2">
                 <Circle className="w-3 h-3 text-emerald-400 fill-emerald-400" />
-                <span className="text-sm font-medium text-neutral-200">{state.name}</span>
+                <span className="text-sm font-medium text-foreground">{state.name}</span>
                 {state.pageUrl && (
                   <span className="text-xs text-blue-400 truncate">{state.pageUrl}</span>
                 )}
-                <span className="text-xs text-neutral-500 ml-auto">
+                <span className="text-xs text-muted-foreground ml-auto">
                   {state.elementIds.length} elements
                 </span>
               </div>
@@ -48,12 +45,12 @@ export function NavigationGraphPreview({ states, transitions }: NavigationGraphP
                     const target = states.find((s) => s.id === t.toStateId);
                     return (
                       <div key={t.id} className="flex items-center gap-2 text-xs">
-                        <ArrowRight className="w-3 h-3 text-neutral-500" />
+                        <ArrowRight className="w-3 h-3 text-muted-foreground" />
                         <span className="text-yellow-400">{t.triggerAction}</span>
-                        <span className="text-neutral-400">
+                        <span className="text-muted-foreground">
                           {t.triggerLabel || t.triggerElementId}
                         </span>
-                        <ArrowRight className="w-2 h-2 text-neutral-600" />
+                        <ArrowRight className="w-2 h-2 text-border" />
                         <span className="text-blue-400">{target?.name || t.toStateId}</span>
                       </div>
                     );

@@ -175,16 +175,40 @@ pub fn build_meta_workflow_template(
         category: "meta".to_string(),
         tags: vec!["meta".to_string(), "generation".to_string()],
 
-        // Phase 1: Builder agent generates initial workflow JSON
-        setup_steps: vec![json!({
-            "id": Uuid::new_v4().to_string(),
-            "name": "Generate workflow from description",
-            "type": "prompt",
-            "phase": "setup",
-            "prompt_mode": "response",
-            "content": builder_prompt,
-            "output_path": "{{artifact_dir}}/workflow.json"
-        })],
+        // Phase 1: Optional investigation + Builder agent generates initial workflow JSON
+        setup_steps: {
+            let mut steps = Vec::new();
+
+            if request.investigate_codebase.unwrap_or(true) {
+                let investigation_prompt = build_investigation_setup_prompt(&request.description);
+                steps.push(json!({
+                    "id": Uuid::new_v4().to_string(),
+                    "name": "Investigate codebase for generation context",
+                    "type": "prompt",
+                    "phase": "setup",
+                    "prompt_mode": "response",
+                    "content": investigation_prompt,
+                    "output_path": "{{artifact_dir}}/investigation.md"
+                }));
+            }
+
+            steps.push(json!({
+                "id": Uuid::new_v4().to_string(),
+                "name": "Generate workflow from description",
+                "type": "prompt",
+                "phase": "setup",
+                "prompt_mode": "response",
+                "content": builder_prompt,
+                "input_path": if request.investigate_codebase.unwrap_or(true) {
+                    "{{artifact_dir}}/investigation.md"
+                } else {
+                    ""
+                },
+                "output_path": "{{artifact_dir}}/workflow.json"
+            }));
+
+            steps
+        },
 
         // Phase 2: AI semantic review of the generated workflow
         verification_steps: vec![json!({
@@ -611,6 +635,34 @@ Output the workflow JSON now:
     );
 
     prompt
+}
+
+/// Build the prompt for the investigation setup step in the meta-workflow.
+///
+/// This prompt instructs the AI to analyze the codebase in context of the
+/// user's task and produce an enriched description for the builder agent.
+fn build_investigation_setup_prompt(description: &str) -> String {
+    format!(
+        r#"You are a codebase investigation AI. Your job is to analyze the user's task description in context of the project and produce an enriched, technically-grounded version.
+
+## User's Original Task Description
+
+{description}
+
+## Your Task
+
+Analyze the user's intent in context of the project structure (from discovery context) and produce an **enriched task description**:
+
+1. **Preserve the original intent** — do not change what the user wants to accomplish
+2. **Identify relevant components** — name specific files, directories, modules, and patterns relevant to the task
+3. **Note technical context** — mention frameworks, build tools, test runners, and conventions
+4. **Flag potential issues** — dead code paths, missing implementations, broken data flows
+5. **Specify concrete targets** — replace vague references with specific file paths and component names
+6. **Mention verification approaches** — suggest what should be checked to verify the work
+
+Output ONLY the enriched task description as plain text. No JSON, no code blocks, no prefixes."#,
+        description = description,
+    )
 }
 
 /// Build the prompt for the hardener completion step.

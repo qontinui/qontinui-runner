@@ -145,22 +145,10 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
 
   return (
     <div className="relative">
-      {/* Beta Badge */}
-      {isBeta && (
-        <div className="fixed top-4 right-4 z-50">
-          <span
-            data-content-role="badge"
-            className="px-3 py-1 text-xs font-semibold bg-gradient-to-r from-purple-500 to-indigo-500 text-white rounded-full shadow-lg"
-          >
-            BETA
-          </span>
-        </div>
-      )}
-
       {/* Status Bar */}
-      <div className="flex items-center gap-4 px-4 py-2 bg-surface-raised border-b border-border-subtle">
+      <div className="flex items-center gap-4 px-4 py-2 bg-card border-b border-border">
         {/* Title */}
-        <div className="flex items-center gap-2 pr-3 border-r border-border-default">
+        <div className="flex items-center gap-2 pr-3 border-r border-border">
           <div
             className={`w-2 h-2 rounded-full ${pythonStatus === "running" ? getAccentColors("green").bgSolid : "bg-muted-foreground"}`}
           />
@@ -171,11 +159,19 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
           >
             Qontinui Runner
           </span>
+          {isBeta && (
+            <span
+              data-content-role="badge"
+              className="px-1.5 py-0.5 text-[10px] font-semibold bg-purple-500/20 text-purple-400 rounded"
+            >
+              BETA
+            </span>
+          )}
         </div>
 
         {/* Runner Name */}
         {runnerName && (
-          <div className="flex items-center gap-2 pr-3 border-r border-border-default">
+          <div className="flex items-center gap-2 pr-3 border-r border-border">
             <Tag className="w-4 h-4 text-primary" />
             <span
               data-content-role="label"
@@ -189,7 +185,7 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
 
         {/* Selected Project */}
         {projectName && (
-          <div className="flex items-center gap-2 pr-3 border-r border-border-default">
+          <div className="flex items-center gap-2 pr-3 border-r border-border">
             <FolderKanban className={`w-4 h-4 ${getAccentColors("blue").text}`} />
             <span
               data-content-role="label"
@@ -214,7 +210,7 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
         {/* Active Processes Section - Only shown when there is activity */}
         {(executionActive || backgroundActivities.length > 0) && (
           <>
-            <div className="h-4 w-px bg-border-default" />
+            <div className="h-4 w-px bg-border" />
             <div className="flex items-center gap-3">
               {/* GUI Automation - Only shown when active */}
               {executionActive && (
@@ -240,7 +236,7 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
                 return (
                   <div
                     key={activity.id}
-                    className="flex items-center gap-1.5 px-2 py-0.5 bg-surface-raised rounded-full"
+                    className="flex items-center gap-1.5 px-2 py-0.5 bg-card rounded-full"
                     title={activity.detail || activity.label}
                   >
                     <Icon className={`w-3.5 h-3.5 ${colorClass} animate-pulse`} />
@@ -254,7 +250,7 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
                       <span
                         data-content-role="metric"
                         data-content-label={`${activity.label} progress`}
-                        className="text-xs text-text-muted"
+                        className="text-xs text-muted-foreground"
                       >
                         {activity.progress}%
                       </span>

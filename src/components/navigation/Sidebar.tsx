@@ -700,14 +700,56 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
 
   const [focusedItemId, setFocusedItemId] = useState<string | null>(null);
 
+  // Keep a ref to navState so effects can read it without depending on it
+  const navStateRef = useRef(navState);
+  navStateRef.current = navState;
+
   // Persist state changes
   useEffect(() => {
     localStorage.setItem(STORAGE_KEYS.state, serializeState(navState));
   }, [navState]);
 
-  const toggleGroup = useCallback((groupId: string) => {
-    dispatch(navigationActions.toggleGroup(groupId));
-  }, []);
+  // Auto-expand the group containing the active tab (accordion-aware).
+  // Uses navStateRef to read current state without creating a dependency cycle
+  // (this effect dispatches actions that update navState).
+  useEffect(() => {
+    if (collapsed) return;
+    const currentState = navStateRef.current;
+    const activeGroup = navigationGroups.find((g) =>
+      g.items.some(
+        (item) =>
+          item.id === activeTab ||
+          (item.hasChildren && getChildItems(item.id).some((child) => child.id === activeTab)),
+      ),
+    );
+    if (activeGroup && !isGroupExpanded(currentState, activeGroup.id)) {
+      // Collapse all other groups, then expand the active one
+      navigationGroups.forEach((g) => {
+        if (g.id !== activeGroup.id && isGroupExpanded(currentState, g.id)) {
+          dispatch(navigationActions.collapseGroup(g.id));
+        }
+      });
+      dispatch(navigationActions.expandGroup(activeGroup.id));
+    }
+  }, [activeTab, collapsed, navigationGroups]);
+
+  const toggleGroup = useCallback(
+    (groupId: string) => {
+      const isCurrentlyExpanded = isGroupExpanded(navState, groupId);
+
+      if (!isCurrentlyExpanded) {
+        // Accordion: collapse all other groups before expanding this one
+        navigationGroups.forEach((g) => {
+          if (g.id !== groupId && isGroupExpanded(navState, g.id)) {
+            dispatch(navigationActions.collapseGroup(g.id));
+          }
+        });
+      }
+
+      dispatch(navigationActions.toggleGroup(groupId));
+    },
+    [navState, navigationGroups],
+  );
 
   const openFlyoutSidebar = useCallback((item: ResolvedNavigationItem) => {
     const children = getChildItems(item.id);

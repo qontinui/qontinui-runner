@@ -533,6 +533,7 @@ pub async fn get_chat_output(
 pub async fn generate_workflow_from_chat(
     app_handle: tauri::AppHandle,
     app_state: tauri::State<'_, Arc<AppState>>,
+    session_manager: tauri::State<'_, Arc<SessionManager>>,
     task_run_id: String,
     description: Option<String>,
     include_ui_bridge: Option<bool>,
@@ -607,6 +608,7 @@ pub async fn generate_workflow_from_chat(
         discovery_mode: None,
         include_ui_bridge_instructions: include_ui_bridge,
         reflection_mode: None,
+        investigate_codebase: Some(true),
     };
 
     // Emit a UI-only note that generation is starting (not sent to AI session —
@@ -763,17 +765,17 @@ pub async fn generate_workflow_from_chat(
             // Notify the active Claude CLI session about the generated workflow
             if response.success {
                 if let Some(ref workflow) = response.workflow {
-                    // Count steps including those inside stages
-                    let mut step_count = workflow.setup_steps.len()
-                        + workflow.verification_steps.len()
-                        + workflow.agentic_steps.len()
-                        + workflow.completion_steps.len();
-                    for stage in &workflow.stages {
-                        step_count += stage.setup_steps.len()
-                            + stage.verification_steps.len()
-                            + stage.agentic_steps.len()
-                            + stage.completion_steps.len();
-                    }
+                    // Count steps via normalize_to_stages (handles both flat and staged)
+                    let step_count: usize = workflow
+                        .normalize_to_stages()
+                        .iter()
+                        .map(|s| {
+                            s.setup_steps.len()
+                                + s.verification_steps.len()
+                                + s.agentic_steps.len()
+                                + s.completion_steps.len()
+                        })
+                        .sum();
                     let system_note = format!(
                         "[SYSTEM NOTE: A workflow '{}' ({} steps) has been successfully generated from this conversation. \
                          The conversation is now idle. Do NOT respond to this note — do not ask questions, do not \
@@ -813,9 +815,22 @@ pub async fn generate_workflow_from_chat(
                         }
                     }
 
-                    // Do NOT send to the Claude CLI session — any message triggers
-                    // a response turn, and we want the session to stay idle.
-                    // The note is UI-only + persisted for session restore.
+                    // Send to the Claude CLI session so it knows to stop responding.
+                    // If Processing (mid-turn), it will be queued and sent when the
+                    // current turn finishes.
+                    if let Some(session) = session_manager.get(&task_run_id) {
+                        match session.send_user_message(&system_note) {
+                            Ok(immediate) => {
+                                info!(
+                                    "Sent system note to Claude session (immediate={})",
+                                    immediate
+                                );
+                            }
+                            Err(e) => {
+                                warn!("Failed to send system note to Claude session: {}", e);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -854,8 +869,20 @@ pub async fn generate_workflow_from_chat(
                     }
                 }
 
-                // Do NOT send to the Claude CLI session — any message triggers
-                // a response turn. The failure note is UI-only + persisted.
+                // Send failure note to Claude CLI session too
+                if let Some(session) = session_manager.get(&task_run_id) {
+                    match session.send_user_message(&fail_note) {
+                        Ok(immediate) => {
+                            info!(
+                                "Sent failure note to Claude session (immediate={})",
+                                immediate
+                            );
+                        }
+                        Err(e) => {
+                            warn!("Failed to send failure note to Claude session: {}", e);
+                        }
+                    }
+                }
             }
 
             Ok(CommandResponse {

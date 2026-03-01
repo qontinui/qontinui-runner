@@ -1,13 +1,16 @@
 //! Chat session resume support.
 //!
-//! Parses conversation history from the output_log (persisted [USER_MESSAGE] and
-//! [AI_RESPONSE] blocks) and builds a replay prompt for resuming interrupted sessions.
+//! Parses conversation history from the output_log (persisted [USER_MESSAGE],
+//! [AI_RESPONSE], and [SYSTEM_NOTE] blocks) and builds a replay prompt for
+//! resuming interrupted sessions.
 
 /// Role of a conversation turn.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TurnRole {
     User,
     Assistant,
+    /// System-injected note (e.g., workflow generation results, idle markers).
+    SystemNote,
 }
 
 /// A single turn in a conversation.
@@ -17,7 +20,7 @@ pub struct ConversationTurn {
     pub content: String,
 }
 
-/// Parse [USER_MESSAGE] and [AI_RESPONSE] blocks from an output_log string.
+/// Parse [USER_MESSAGE], [AI_RESPONSE], and [SYSTEM_NOTE] blocks from an output_log string.
 ///
 /// Returns turns in the order they appear. Ignores any text outside of
 /// recognized marker blocks (e.g., [SESSION_START] markers, stray text).
@@ -29,55 +32,52 @@ pub fn parse_conversation(output_log: &str) -> Vec<ConversationTurn> {
         // Find the next marker — whichever comes first
         let user_pos = remaining.find("[USER_MESSAGE]");
         let ai_pos = remaining.find("[AI_RESPONSE]");
+        let note_pos = remaining.find("[SYSTEM_NOTE]");
 
-        match (user_pos, ai_pos) {
-            (Some(up), Some(ap)) if up < ap => {
-                // User message comes first
-                if let Some(turn) = extract_block(remaining, "[USER_MESSAGE]", "[/USER_MESSAGE]") {
-                    turns.push(ConversationTurn {
-                        role: TurnRole::User,
-                        content: turn.content,
-                    });
-                    remaining = turn.rest;
+        // Find the earliest marker position
+        let earliest = [user_pos, ai_pos, note_pos].iter().filter_map(|p| *p).min();
+
+        match earliest {
+            None => break,
+            Some(pos) => {
+                if user_pos == Some(pos) {
+                    if let Some(turn) =
+                        extract_block(remaining, "[USER_MESSAGE]", "[/USER_MESSAGE]")
+                    {
+                        turns.push(ConversationTurn {
+                            role: TurnRole::User,
+                            content: turn.content,
+                        });
+                        remaining = turn.rest;
+                    } else {
+                        break;
+                    }
+                } else if ai_pos == Some(pos) {
+                    if let Some(turn) = extract_block(remaining, "[AI_RESPONSE]", "[/AI_RESPONSE]")
+                    {
+                        turns.push(ConversationTurn {
+                            role: TurnRole::Assistant,
+                            content: turn.content,
+                        });
+                        remaining = turn.rest;
+                    } else {
+                        break;
+                    }
+                } else if note_pos == Some(pos) {
+                    if let Some(turn) = extract_block(remaining, "[SYSTEM_NOTE]", "[/SYSTEM_NOTE]")
+                    {
+                        turns.push(ConversationTurn {
+                            role: TurnRole::SystemNote,
+                            content: turn.content,
+                        });
+                        remaining = turn.rest;
+                    } else {
+                        break;
+                    }
                 } else {
                     break;
                 }
             }
-            (Some(_up), Some(_ap)) => {
-                // AI response comes first (or at same position)
-                if let Some(turn) = extract_block(remaining, "[AI_RESPONSE]", "[/AI_RESPONSE]") {
-                    turns.push(ConversationTurn {
-                        role: TurnRole::Assistant,
-                        content: turn.content,
-                    });
-                    remaining = turn.rest;
-                } else {
-                    break;
-                }
-            }
-            (Some(_), None) => {
-                if let Some(turn) = extract_block(remaining, "[USER_MESSAGE]", "[/USER_MESSAGE]") {
-                    turns.push(ConversationTurn {
-                        role: TurnRole::User,
-                        content: turn.content,
-                    });
-                    remaining = turn.rest;
-                } else {
-                    break;
-                }
-            }
-            (None, Some(_)) => {
-                if let Some(turn) = extract_block(remaining, "[AI_RESPONSE]", "[/AI_RESPONSE]") {
-                    turns.push(ConversationTurn {
-                        role: TurnRole::Assistant,
-                        content: turn.content,
-                    });
-                    remaining = turn.rest;
-                } else {
-                    break;
-                }
-            }
-            (None, None) => break,
         }
     }
 
@@ -132,6 +132,7 @@ pub fn build_replay_prompt(turns: &[ConversationTurn], max_chars: Option<usize>)
             let tag = match turn.role {
                 TurnRole::User => "user",
                 TurnRole::Assistant => "assistant",
+                TurnRole::SystemNote => "system_note",
             };
             format!("<{}>\n{}\n</{}>", tag, turn.content, tag)
         })
@@ -174,6 +175,11 @@ pub fn build_replay_prompt(turns: &[ConversationTurn], max_chars: Option<usize>)
 fn format_replay_prompt(history: &str, turns: &[ConversationTurn]) -> String {
     let last_role_instruction = match turns.last().map(|t| &t.role) {
         Some(TurnRole::User) => "The last message was from the user — respond to it.",
+        Some(TurnRole::SystemNote) => {
+            "The last entry is a system note indicating the conversation is idle. \
+             Do NOT produce any output. Do NOT ask questions, offer next steps, or \
+             summarize anything. Simply wait silently for the user to send a new message."
+        }
         Some(TurnRole::Assistant) | None => {
             "The last message was from you. Wait for the user's next message."
         }
@@ -287,5 +293,42 @@ mod tests {
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].content, "Hello");
         assert_eq!(turns[1].content, "World");
+    }
+
+    #[test]
+    fn test_parse_system_notes() {
+        let log = "[USER_MESSAGE]\nCreate a workflow\n[/USER_MESSAGE]\n\
+                   [AI_RESPONSE]\nHere's the workflow plan...\n[/AI_RESPONSE]\n\
+                   [SYSTEM_NOTE]\n[SYSTEM NOTE: Workflow generated. Conversation is idle.]\n[/SYSTEM_NOTE]\n";
+
+        let turns = parse_conversation(log);
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[0].role, TurnRole::User);
+        assert_eq!(turns[1].role, TurnRole::Assistant);
+        assert_eq!(turns[2].role, TurnRole::SystemNote);
+        assert!(turns[2].content.contains("idle"));
+    }
+
+    #[test]
+    fn test_replay_prompt_system_note_idle() {
+        let turns = vec![
+            ConversationTurn {
+                role: TurnRole::User,
+                content: "Create a workflow".to_string(),
+            },
+            ConversationTurn {
+                role: TurnRole::Assistant,
+                content: "Here's the plan...".to_string(),
+            },
+            ConversationTurn {
+                role: TurnRole::SystemNote,
+                content: "Workflow generated. Conversation is idle.".to_string(),
+            },
+        ];
+
+        let prompt = build_replay_prompt(&turns, None);
+        assert!(prompt.contains("<system_note>"));
+        assert!(prompt.contains("Do NOT produce any output"));
+        assert!(prompt.contains("wait silently"));
     }
 }

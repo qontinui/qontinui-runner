@@ -141,10 +141,10 @@ export function TestLibraryPicker({ isOpen, onClose, onSelect, phase }: TestLibr
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
       <div
         data-ui-id="dialog-test-library-picker"
-        className="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl w-[700px] max-w-[90vw] max-h-[80vh] flex flex-col"
+        className="bg-card border border-border rounded-lg shadow-2xl w-[700px] max-w-[90vw] max-h-[80vh] flex flex-col"
       >
         {/* Header */}
-        <div className="flex items-center justify-between px-4 py-3 border-b border-neutral-700">
+        <div className="flex items-center justify-between px-4 py-3 border-b border-border">
           <div>
             <h2 className="text-lg font-semibold">Select Test from Library</h2>
             <p className="text-sm text-muted-foreground">
@@ -153,7 +153,7 @@ export function TestLibraryPicker({ isOpen, onClose, onSelect, phase }: TestLibr
           </div>
           <button
             onClick={onClose}
-            className="p-1.5 hover:bg-neutral-700 rounded-md transition-colors"
+            className="p-1.5 hover:bg-muted/80 rounded-md transition-colors"
             data-ui-id="workflow-builder-test-picker-close-btn"
           >
             <X className="w-5 h-5" />
@@ -161,7 +161,7 @@ export function TestLibraryPicker({ isOpen, onClose, onSelect, phase }: TestLibr
         </div>
 
         {/* Search and Filter */}
-        <div className="flex items-center gap-3 px-4 py-3 border-b border-neutral-800">
+        <div className="flex items-center gap-3 px-4 py-3 border-b border-border">
           <div className="relative flex-1">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
             <input
@@ -169,7 +169,7 @@ export function TestLibraryPicker({ isOpen, onClose, onSelect, phase }: TestLibr
               placeholder="Search tests..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full pl-9 pr-3 py-2 text-sm bg-neutral-800 border border-neutral-700 rounded-md
+              className="w-full pl-9 pr-3 py-2 text-sm bg-muted border border-border rounded-md
                        focus:outline-none focus:ring-2 focus:ring-green-500/50"
               autoFocus
               data-ui-id="workflow-builder-test-picker-search-input"
@@ -178,7 +178,7 @@ export function TestLibraryPicker({ isOpen, onClose, onSelect, phase }: TestLibr
           <select
             value={filterType || ""}
             onChange={(e) => setFilterType(e.target.value || null)}
-            className="px-3 py-2 text-sm bg-neutral-800 border border-neutral-700 rounded-md
+            className="px-3 py-2 text-sm bg-muted border border-border rounded-md
                      focus:outline-none focus:ring-2 focus:ring-green-500/50"
             data-ui-id="workflow-builder-test-picker-type-select"
           >
@@ -218,7 +218,7 @@ export function TestLibraryPicker({ isOpen, onClose, onSelect, phase }: TestLibr
                       ${
                         isSelected
                           ? "bg-green-500/15 border-2 border-green-500"
-                          : "bg-neutral-800/50 border-2 border-transparent hover:bg-neutral-800 hover:border-neutral-600"
+                          : "bg-muted/50 border-2 border-transparent hover:bg-muted hover:border-border"
                       }
                     `}
                     data-ui-id={`workflow-builder-test-picker-item-${test.id}`}
@@ -228,7 +228,7 @@ export function TestLibraryPicker({ isOpen, onClose, onSelect, phase }: TestLibr
                         <CheckIcon className="w-4 h-4 text-green-400" />
                       </div>
                     )}
-                    <div className={`p-2 rounded-md bg-neutral-900 ${colorClass}`}>
+                    <div className={`p-2 rounded-md bg-card ${colorClass}`}>
                       <Icon className="w-4 h-4" />
                     </div>
                     <div className="flex-1 min-w-0">
@@ -254,11 +254,11 @@ export function TestLibraryPicker({ isOpen, onClose, onSelect, phase }: TestLibr
                         <span>{TEST_TYPE_LABELS[test.test_type] || test.test_type}</span>
                         {test.category && (
                           <>
-                            <span className="text-neutral-600">|</span>
+                            <span className="text-border">|</span>
                             <span className="capitalize">{test.category}</span>
                           </>
                         )}
-                        <span className="text-neutral-600">|</span>
+                        <span className="text-border">|</span>
                         <span>{test.timeout_seconds}s timeout</span>
                       </div>
                     </div>
@@ -270,7 +270,7 @@ export function TestLibraryPicker({ isOpen, onClose, onSelect, phase }: TestLibr
         </div>
 
         {/* Footer */}
-        <div className="flex items-center justify-between px-4 py-3 border-t border-neutral-700 bg-neutral-800/50">
+        <div className="flex items-center justify-between px-4 py-3 border-t border-border bg-muted/50">
           <span
             data-content-role="metric"
             data-content-label="available test count"
@@ -281,7 +281,7 @@ export function TestLibraryPicker({ isOpen, onClose, onSelect, phase }: TestLibr
           <div className="flex items-center gap-2">
             <button
               onClick={onClose}
-              className="px-4 py-2 text-sm rounded-md hover:bg-neutral-700 transition-colors"
+              className="px-4 py-2 text-sm rounded-md hover:bg-muted/80 transition-colors"
               data-ui-id="workflow-builder-test-picker-cancel-btn"
             >
               Cancel

@@ -200,7 +200,7 @@ export function HtmlViewerModal({ capture, onClose }: Props) {
             <div className="flex">
               {/* Line numbers */}
               {showLineNumbers && (
-                <div className="flex-shrink-0 select-none text-right pr-4 py-4 text-xs text-gray-500 bg-[#1a1a1a] border-r border-gray-700">
+                <div className="flex-shrink-0 select-none text-right pr-4 py-4 text-xs text-muted-foreground bg-[#1a1a1a] border-r border-border">
                   {filteredLines.map((_, i) => (
                     <div key={i} className="px-2 leading-5">
                       {searchQuery ? i + 1 : i + 1}
@@ -212,7 +212,7 @@ export function HtmlViewerModal({ capture, onClose }: Props) {
               {/* Code content */}
               <pre
                 ref={contentRef}
-                className="flex-1 p-4 text-xs font-mono text-gray-300 overflow-x-auto leading-5"
+                className="flex-1 p-4 text-xs font-mono text-foreground overflow-x-auto leading-5"
               >
                 {filteredLines.map((line, i) => (
                   <div

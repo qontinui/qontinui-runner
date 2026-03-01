@@ -2250,6 +2250,10 @@ CREATE TABLE IF NOT EXISTS generation_pipeline_artifacts (
     category TEXT,
     created_at TEXT NOT NULL,
 
+    -- Investigation
+    investigation_duration_ms INTEGER,
+    investigation_enriched_description TEXT,
+
     -- Timing (milliseconds)
     discovery_duration_ms INTEGER,
     builder_duration_ms INTEGER,

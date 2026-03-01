@@ -129,16 +129,16 @@ export function AiExplorationAdvisor({
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div className="bg-neutral-900 rounded-lg border border-neutral-700 w-full max-w-2xl max-h-[80vh] flex flex-col overflow-hidden">
+      <div className="bg-card rounded-lg border border-border w-full max-w-2xl max-h-[80vh] flex flex-col overflow-hidden">
         {/* Header */}
-        <div className="flex items-center justify-between p-4 border-b border-neutral-700">
+        <div className="flex items-center justify-between p-4 border-b border-border">
           <div className="flex items-center gap-2">
             <Sparkles className="w-5 h-5 text-emerald-400" />
-            <span className="text-lg font-medium text-neutral-200">AI Exploration Advisor</span>
+            <span className="text-lg font-medium text-foreground">AI Exploration Advisor</span>
           </div>
           <button
             onClick={onClose}
-            className="p-1 text-neutral-500 hover:text-neutral-300 transition-colors"
+            className="p-1 text-muted-foreground hover:text-foreground transition-colors"
           >
             <X className="w-5 h-5" />
           </button>
@@ -147,13 +147,13 @@ export function AiExplorationAdvisor({
         {/* Main content */}
         <div className="flex-1 overflow-auto p-4">
           {/* Config summary */}
-          <div className="mb-4 p-3 bg-neutral-800/50 rounded-lg border border-neutral-700">
-            <div className="flex items-center gap-2 text-sm text-neutral-300 mb-2">
+          <div className="mb-4 p-3 bg-muted/50 rounded-lg border border-border">
+            <div className="flex items-center gap-2 text-sm text-foreground mb-2">
               <Compass className="w-4 h-4 text-emerald-400" />
               <span className="font-medium">Configuration Summary</span>
             </div>
             {hasConfig ? (
-              <div className="flex gap-4 text-xs text-neutral-400">
+              <div className="flex gap-4 text-xs text-muted-foreground">
                 <span>{availableStates.length} states loaded</span>
                 <span>{availableTransitions.length} transitions loaded</span>
               </div>
@@ -171,20 +171,20 @@ export function AiExplorationAdvisor({
             <>
               {/* Goal input */}
               <div className="mb-4">
-                <label className="block text-sm font-medium text-neutral-300 mb-2">
+                <label className="block text-sm font-medium text-foreground mb-2">
                   What's your exploration goal?
                 </label>
                 <textarea
                   value={goal}
                   onChange={(e) => setGoal(e.target.value)}
                   placeholder="Example: Test all login-related paths thoroughly, including error states and edge cases"
-                  className="w-full px-3 py-2 bg-neutral-800 border border-neutral-700 rounded-lg text-sm text-neutral-200 placeholder-neutral-500 resize-none focus:outline-none focus:border-emerald-500 min-h-[100px]"
+                  className="w-full px-3 py-2 bg-muted border border-border rounded-lg text-sm text-foreground placeholder:text-muted-foreground resize-none focus:outline-none focus:border-emerald-500 min-h-[100px]"
                 />
               </div>
 
               {/* Example goals */}
               <div className="mb-4">
-                <label className="block text-xs text-neutral-400 mb-2">Example goals</label>
+                <label className="block text-xs text-muted-foreground mb-2">Example goals</label>
                 <div className="flex flex-wrap gap-2">
                   {[
                     "Test all login-related paths",
@@ -196,7 +196,7 @@ export function AiExplorationAdvisor({
                     <button
                       key={example}
                       onClick={() => setGoal(example)}
-                      className="px-2 py-1 text-xs bg-neutral-800 text-neutral-400 rounded hover:bg-neutral-700 hover:text-neutral-300 transition-colors"
+                      className="px-2 py-1 text-xs bg-muted text-muted-foreground rounded hover:bg-muted/80 hover:text-foreground transition-colors"
                     >
                       {example}
                     </button>
@@ -217,7 +217,7 @@ export function AiExplorationAdvisor({
               <div className="space-y-4">
                 {/* Strategy */}
                 <div>
-                  <label className="block text-xs text-neutral-400 mb-1">
+                  <label className="block text-xs text-muted-foreground mb-1">
                     Recommended Strategy
                   </label>
                   <div className="p-3 bg-emerald-900/20 border border-emerald-700 rounded-lg">
@@ -227,7 +227,7 @@ export function AiExplorationAdvisor({
                         {STRATEGY_INFO[suggestion.strategy].name}
                       </span>
                     </div>
-                    <p className="text-xs text-neutral-400 mt-1">
+                    <p className="text-xs text-muted-foreground mt-1">
                       {STRATEGY_INFO[suggestion.strategy].description}
                     </p>
                   </div>
@@ -235,16 +235,16 @@ export function AiExplorationAdvisor({
 
                 {/* Rationale */}
                 <div>
-                  <label className="block text-xs text-neutral-400 mb-1">Rationale</label>
-                  <div className="p-3 bg-neutral-800 rounded-lg">
-                    <p className="text-sm text-neutral-300">{suggestion.rationale}</p>
+                  <label className="block text-xs text-muted-foreground mb-1">Rationale</label>
+                  <div className="p-3 bg-muted rounded-lg">
+                    <p className="text-sm text-foreground">{suggestion.rationale}</p>
                   </div>
                 </div>
 
                 {/* Target states */}
                 {suggestion.strategy === "targeted" && suggestion.target_state_ids.length > 0 && (
                   <div>
-                    <label className="block text-xs text-neutral-400 mb-1">
+                    <label className="block text-xs text-muted-foreground mb-1">
                       Target States ({suggestion.target_state_ids.length})
                     </label>
                     <div className="flex flex-wrap gap-1">
@@ -267,7 +267,7 @@ export function AiExplorationAdvisor({
                 {suggestion.strategy === "targeted" &&
                   suggestion.target_transition_ids.length > 0 && (
                     <div>
-                      <label className="block text-xs text-neutral-400 mb-1">
+                      <label className="block text-xs text-muted-foreground mb-1">
                         Target Transitions ({suggestion.target_transition_ids.length})
                       </label>
                       <div className="flex flex-wrap gap-1">
@@ -291,17 +291,17 @@ export function AiExplorationAdvisor({
                 {/* Limits */}
                 <div className="grid grid-cols-2 gap-4">
                   <div>
-                    <label className="block text-xs text-neutral-400 mb-1">Max States</label>
-                    <div className="p-2 bg-neutral-800 rounded">
-                      <span className="text-sm text-neutral-300">
+                    <label className="block text-xs text-muted-foreground mb-1">Max States</label>
+                    <div className="p-2 bg-muted rounded">
+                      <span className="text-sm text-foreground">
                         {suggestion.max_states === 0 ? "Unlimited" : suggestion.max_states}
                       </span>
                     </div>
                   </div>
                   <div>
-                    <label className="block text-xs text-neutral-400 mb-1">Max Duration</label>
-                    <div className="p-2 bg-neutral-800 rounded">
-                      <span className="text-sm text-neutral-300">
+                    <label className="block text-xs text-muted-foreground mb-1">Max Duration</label>
+                    <div className="p-2 bg-muted rounded">
+                      <span className="text-sm text-foreground">
                         {suggestion.max_duration_seconds === 0
                           ? "Unlimited"
                           : `${suggestion.max_duration_seconds} seconds`}
@@ -315,12 +315,12 @@ export function AiExplorationAdvisor({
         </div>
 
         {/* Footer */}
-        <div className="flex justify-end gap-2 p-4 border-t border-neutral-700">
+        <div className="flex justify-end gap-2 p-4 border-t border-border">
           {!suggestion ? (
             <>
               <button
                 onClick={onClose}
-                className="px-4 py-2 text-sm bg-neutral-700 text-white rounded-lg hover:bg-neutral-600 transition-colors"
+                className="px-4 py-2 text-sm bg-muted/80 text-white rounded-lg hover:bg-muted transition-colors"
               >
                 Cancel
               </button>
@@ -346,7 +346,7 @@ export function AiExplorationAdvisor({
             <>
               <button
                 onClick={() => setSuggestion(null)}
-                className="px-4 py-2 text-sm bg-neutral-700 text-white rounded-lg hover:bg-neutral-600 transition-colors"
+                className="px-4 py-2 text-sm bg-muted/80 text-white rounded-lg hover:bg-muted transition-colors"
               >
                 Try Again
               </button>

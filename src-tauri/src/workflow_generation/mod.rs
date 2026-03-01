@@ -9,6 +9,7 @@ pub mod example_workflows;
 pub mod feedback;
 pub mod generator;
 pub mod hardener;
+pub mod investigator;
 pub mod meta_workflow;
 pub mod pipeline_artifacts;
 pub mod relevance_filter;

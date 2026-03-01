@@ -191,6 +191,7 @@ export function AiGeneratePanel({
   const [model, setModel] = useState("");
   const [maxFixIterations, setMaxFixIterations] = useState("");
   const [autoIncludeContexts, setAutoIncludeContexts] = useState(true);
+  const [investigateCodebase, setInvestigateCodebase] = useState(true);
   const [discoveryMode, setDiscoveryMode] = useState<"auto" | "enabled" | "disabled">("auto");
 
   // Context section
@@ -418,6 +419,7 @@ export function AiGeneratePanel({
     if (model.trim()) request.model = model.trim();
     if (maxFixIterations) request.max_fix_iterations = parseInt(maxFixIterations, 10);
     request.auto_include_contexts = autoIncludeContexts;
+    request.investigate_codebase = investigateCodebase;
     if (discoveryMode !== "auto") request.discovery_mode = discoveryMode;
 
     return request;
@@ -431,6 +433,7 @@ export function AiGeneratePanel({
     model,
     maxFixIterations,
     autoIncludeContexts,
+    investigateCodebase,
     discoveryMode,
     hasSpecs,
   ]);
@@ -1004,6 +1007,25 @@ export function AiGeneratePanel({
                         <span className="absolute bottom-full left-1/2 -translate-x-1/2 mb-1 hidden group-hover:block w-48 p-2 bg-zinc-700 border border-zinc-600 rounded text-[10px] text-zinc-300 z-50 shadow-lg">
                           Automatically matches and includes relevant knowledge base documents based
                           on keywords in your description.
+                        </span>
+                      </span>
+                    </label>
+                  </div>
+                  <div className="flex items-end pb-1">
+                    <label className="flex items-center gap-2 text-sm text-zinc-300 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={investigateCodebase}
+                        onChange={(e) => setInvestigateCodebase(e.target.checked)}
+                        className="w-4 h-4 rounded border-zinc-600 bg-zinc-800"
+                      />
+                      Investigate codebase
+                      <span className="relative group">
+                        <Info className="w-3 h-3 text-zinc-500 cursor-help" />
+                        <span className="absolute bottom-full left-1/2 -translate-x-1/2 mb-1 hidden group-hover:block w-52 p-2 bg-zinc-700 border border-zinc-600 rounded text-[10px] text-zinc-300 z-50 shadow-lg">
+                          Run an AI investigation step before generating the workflow. Analyzes
+                          project structure to produce a more targeted workflow. Adds ~30s to
+                          generation time.
                         </span>
                       </span>
                     </label>

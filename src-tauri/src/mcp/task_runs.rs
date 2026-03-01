@@ -1138,6 +1138,7 @@ pub async fn resume_task_run(
         provider_override: None,
         model_override: None,
         stage_index: None,
+        max_sessions: Some(workflow.max_iterations),
     };
 
     // Spawn the workflow execution in background with panic protection
@@ -3137,6 +3138,7 @@ pub async fn generate_workflow_from_chat(
         discovery_mode: None,
         include_ui_bridge_instructions: include_ui_bridge,
         reflection_mode: Some(true),
+        investigate_codebase: Some(true),
     };
 
     let doctor_handle = state.doctor_handle.clone();

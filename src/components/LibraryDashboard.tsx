@@ -454,37 +454,37 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
   }, [typeCounts]);
 
   return (
-    <div className="h-full flex flex-col bg-neutral-900">
+    <div className="h-full flex flex-col bg-card">
       {/* Header */}
-      <div className="p-4 border-b border-neutral-700">
+      <div className="p-4 border-b border-border">
         <div className="flex items-center justify-between mb-4">
           <div>
             <h2 className="text-xl font-semibold flex items-center gap-2">
-              <Clock className="w-5 h-5 text-neutral-400" />
+              <Clock className="w-5 h-5 text-muted-foreground" />
               Library Dashboard
             </h2>
-            <p className="text-sm text-neutral-400 mt-1">
+            <p className="text-sm text-muted-foreground mt-1">
               Recently modified items across all categories
             </p>
           </div>
-          <div className="text-sm text-neutral-500">{items.length} total items</div>
+          <div className="text-sm text-muted-foreground">{items.length} total items</div>
         </div>
 
         {/* Search */}
         <div className="relative mb-4">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-neutral-400" />
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
           <input
             type="text"
             placeholder="Search across all categories..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full pl-10 pr-4 py-2.5 bg-neutral-800 border border-neutral-700 rounded-lg text-sm focus:outline-none focus:border-neutral-600"
+            className="w-full pl-10 pr-4 py-2.5 bg-muted border border-border rounded-lg text-sm focus:outline-none focus:border-border"
           />
         </div>
 
         {/* Type filters */}
         <div className="flex items-center gap-2 overflow-x-auto pb-1">
-          <Filter className="w-4 h-4 text-neutral-500 flex-shrink-0" />
+          <Filter className="w-4 h-4 text-muted-foreground flex-shrink-0" />
           {availableTypes.map((type) => {
             const isAll = type === "all";
             const config = isAll ? null : CATEGORY_CONFIG[type];
@@ -497,13 +497,13 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
                 onClick={() => setTypeFilter(type)}
                 className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium transition-colors whitespace-nowrap ${
                   isActive
-                    ? "bg-neutral-700 text-white"
-                    : "bg-neutral-800 text-neutral-400 hover:bg-neutral-750 hover:text-neutral-300"
+                    ? "bg-muted/80 text-white"
+                    : "bg-muted text-muted-foreground hover:bg-muted/80 hover:text-foreground"
                 }`}
               >
                 {Icon && <Icon className="w-3.5 h-3.5" />}
                 {isAll ? "All" : config?.label}
-                <span className="text-neutral-500">({typeCounts[type]})</span>
+                <span className="text-muted-foreground">({typeCounts[type]})</span>
               </button>
             );
           })}
@@ -514,10 +514,10 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
       <div className="flex-1 overflow-y-auto">
         {loading ? (
           <div className="flex items-center justify-center py-12">
-            <Loader2 className="w-8 h-8 animate-spin text-neutral-400" />
+            <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
           </div>
         ) : filteredItems.length === 0 ? (
-          <div className="text-center py-12 text-neutral-400">
+          <div className="text-center py-12 text-muted-foreground">
             <Clock className="w-12 h-12 mx-auto mb-3 opacity-30" />
             <p className="text-lg mb-1">No items found</p>
             <p className="text-sm">
@@ -527,7 +527,7 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
             </p>
           </div>
         ) : (
-          <div className="divide-y divide-neutral-800">
+          <div className="divide-y divide-muted">
             {filteredItems.map((item) => {
               const config = CATEGORY_CONFIG[item.type];
               const Icon = config.icon;
@@ -537,7 +537,7 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
                 <button
                   key={`${item.type}-${item.id}`}
                   onClick={() => handleItemClick(item)}
-                  className="w-full text-left px-4 py-3 hover:bg-neutral-800/50 transition-colors group"
+                  className="w-full text-left px-4 py-3 hover:bg-muted/50 transition-colors group"
                 >
                   <div className="flex items-start gap-3">
                     {/* Icon */}
@@ -563,22 +563,22 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
                         </span>
                       </div>
                       {item.description && (
-                        <p className="text-xs text-neutral-400 truncate mt-0.5">
+                        <p className="text-xs text-muted-foreground truncate mt-0.5">
                           {item.description}
                         </p>
                       )}
                       <div className="flex items-center gap-3 mt-1.5">
                         {item.category && (
-                          <span className="text-xs text-neutral-500">{item.category}</span>
+                          <span className="text-xs text-muted-foreground">{item.category}</span>
                         )}
-                        <span className="text-xs text-neutral-500">
+                        <span className="text-xs text-muted-foreground">
                           {formatRelativeTime(item.modifiedAt || item.createdAt)}
                         </span>
                       </div>
                     </div>
 
                     {/* Arrow */}
-                    <ChevronRight className="w-4 h-4 text-neutral-600 group-hover:text-neutral-400 transition-colors flex-shrink-0 mt-1" />
+                    <ChevronRight className="w-4 h-4 text-border group-hover:text-muted-foreground transition-colors flex-shrink-0 mt-1" />
                   </div>
                 </button>
               );

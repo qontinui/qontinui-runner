@@ -3376,6 +3376,7 @@ impl Executor for AgenticExecutor {
             provider_override: None,
             model_override: None,
             stage_index: None,
+            max_sessions: None,
         };
 
         let (outcome, _injected_steps) = self

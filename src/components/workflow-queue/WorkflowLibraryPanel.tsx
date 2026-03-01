@@ -36,11 +36,11 @@ export function WorkflowLibraryPanel({
     <div className="w-1/2 border-r border-white/10 flex flex-col">
       {/* Header */}
       <div className="px-4 py-3 border-b border-white/10">
-        <h2 className="text-h3 text-gray-300 mb-3">Workflow Library</h2>
+        <h2 className="text-h3 text-foreground mb-3">Workflow Library</h2>
 
         {/* Search */}
         <div className="relative mb-3">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500" />
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
           <input
             type="text"
             placeholder="Search workflows..."
@@ -59,7 +59,7 @@ export function WorkflowLibraryPanel({
               className={`px-3 py-1 rounded-full text-label-sm transition-colors ${
                 category === cat
                   ? "bg-cyan-500/20 text-cyan-400 border border-cyan-500/50"
-                  : "bg-white/5 text-gray-400 border border-transparent hover:bg-white/10"
+                  : "bg-white/5 text-muted-foreground border border-transparent hover:bg-white/10"
               }`}
             >
               {cat === "all" ? "All" : cat.charAt(0).toUpperCase() + cat.slice(1)}
@@ -75,7 +75,7 @@ export function WorkflowLibraryPanel({
             <Loader2 className="w-6 h-6 text-cyan-400 animate-spin" />
           </div>
         ) : workflows.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-32 text-gray-500">
+          <div className="flex flex-col items-center justify-center h-32 text-muted-foreground">
             <Inbox className="w-8 h-8 mb-2" />
             <p className="text-body-sm">
               {search || category !== "all"

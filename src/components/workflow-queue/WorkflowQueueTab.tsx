@@ -218,10 +218,10 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
   const queuedIds = new Set(queue.map((q) => q.workflow.id));
 
   return (
-    <div className="h-full flex flex-col bg-gray-950">
+    <div className="h-full flex flex-col bg-background">
       {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-white/10">
-        <h1 className="text-h2 text-white">Workflow Queue</h1>
+      <div className="flex items-center justify-between px-4 py-3 border-b border-border">
+        <h1 className="text-h2 text-foreground">Workflow Queue</h1>
         <button
           onClick={fetchWorkflows}
           disabled={loading}
@@ -252,8 +252,8 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
       </div>
 
       {/* Bottom bar */}
-      <div className="flex items-center justify-between px-4 py-3 border-t border-white/10 bg-gray-900/50">
-        <div className="text-body-sm text-gray-400">
+      <div className="flex items-center justify-between px-4 py-3 border-t border-border bg-card/50">
+        <div className="text-body-sm text-muted-foreground">
           Queue: {queue.length} workflow{queue.length !== 1 ? "s" : ""}
           {queue.length > 0 && ` • ${totalSteps} total steps`}
         </div>
@@ -264,8 +264,8 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
               onClick={() => setShowOptions(!showOptions)}
               className={`p-2 rounded-lg transition-colors ${
                 showOptions
-                  ? "bg-cyan-500/20 text-cyan-400"
-                  : "text-gray-400 hover:text-gray-300 hover:bg-white/5"
+                  ? "bg-primary/20 text-primary"
+                  : "text-muted-foreground hover:text-foreground hover:bg-white/5"
               }`}
               title="Execution options"
             >
@@ -275,17 +275,17 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
             {/* Options dropdown */}
             {showOptions && (
               <div className="absolute bottom-full right-0 mb-2 w-64 card p-3 shadow-xl">
-                <h4 className="text-label text-gray-300 mb-2">Execution Options</h4>
-                <label className="flex items-center gap-2 text-body-sm text-gray-400 cursor-pointer">
+                <h4 className="text-label text-foreground mb-2">Execution Options</h4>
+                <label className="flex items-center gap-2 text-body-sm text-muted-foreground cursor-pointer">
                   <input
                     type="checkbox"
                     checked={stopOnFailure}
                     onChange={(e) => setStopOnFailure(e.target.checked)}
-                    className="w-4 h-4 rounded border-gray-600 bg-gray-800 text-cyan-500 focus:ring-cyan-500"
+                    className="w-4 h-4 rounded border-border bg-muted text-primary focus:ring-primary"
                   />
                   Stop on failure
                 </label>
-                <p className="text-label-sm text-gray-500 mt-1 ml-6">
+                <p className="text-label-sm text-muted-foreground mt-1 ml-6">
                   Stop the sequence if any workflow fails
                 </p>
               </div>

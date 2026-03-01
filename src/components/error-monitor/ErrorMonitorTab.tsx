@@ -403,7 +403,7 @@ export function ErrorMonitorTab({
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
-      <div className="px-4 py-3 border-b border-border bg-surface-raised">
+      <div className="px-4 py-3 border-b border-border bg-card">
         <div className="flex items-center justify-between mb-3">
           <div className="flex items-center gap-2">
             <Bug className="w-5 h-5 text-primary" />

@@ -27,13 +27,22 @@
 
 import { useEffect, useCallback, useRef } from "react";
 import { listen, emit, type UnlistenFn } from "@tauri-apps/api/event";
-import { useUIBridge, getGlobalSpecStore } from "ui-bridge";
+import {
+  useUIBridge,
+  getGlobalSpecStore,
+  getElementDesignData,
+  captureResponsiveSnapshots,
+  runStyleAudit,
+} from "ui-bridge";
 import type {
   RegisteredElement,
   RegisteredComponent,
   ElementIdentifier,
   ElementState,
   BridgeSnapshot,
+  ElementDesignData,
+  StyleGuideConfig,
+  DesignRegistryLike,
 } from "ui-bridge";
 
 /**
@@ -55,7 +64,13 @@ type UIBridgeRequestType =
   | "page_refresh"
   | "page_navigate"
   | "page_go_back"
-  | "page_go_forward";
+  | "page_go_forward"
+  | "design_get_snapshot"
+  | "design_get_responsive"
+  | "design_run_audit"
+  | "design_load_style_guide"
+  | "design_get_style_guide"
+  | "design_clear_style_guide";
 
 /**
  * Payload structure for UI Bridge requests from Rust
@@ -80,6 +95,10 @@ interface UIBridgeRequestPayload {
   specId?: string;
   url?: string;
   params?: Record<string, unknown>;
+  guide?: StyleGuideConfig;
+  elementIds?: string[];
+  includePseudoElements?: boolean;
+  viewports?: Record<string, number>;
   options?: {
     root?: string;
     interactiveOnly?: boolean;
@@ -179,6 +198,7 @@ function serializeComponent(component: RegisteredComponent): SerializedComponent
 export function useUIBridgeEventHandler(): void {
   const bridge = useUIBridge();
   const bridgeRef = useRef(bridge);
+  const loadedStyleGuideRef = useRef<StyleGuideConfig | null>(null);
 
   // Keep bridge ref updated to avoid stale closures
   useEffect(() => {
@@ -563,6 +583,150 @@ export function useUIBridgeEventHandler(): void {
               type,
               success: true,
               data: { success: true, url: window.location.href },
+              timestamp: Date.now(),
+            });
+            break;
+          }
+
+          case "design_get_snapshot": {
+            const allElements = currentBridge.elements;
+            const targetIds = payload.elementIds;
+            const filtered = targetIds
+              ? allElements.filter((el) => targetIds.includes(el.id))
+              : allElements;
+
+            const designData: ElementDesignData[] = filtered
+              .filter((el) => el.element instanceof HTMLElement)
+              .map((el) =>
+                getElementDesignData(el.element as HTMLElement, {
+                  elementId: el.id,
+                  label: el.label,
+                  type: el.type,
+                  includePseudoElements: payload.includePseudoElements,
+                }),
+              );
+
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: { elements: designData, timestamp: Date.now() },
+              timestamp: Date.now(),
+            });
+            break;
+          }
+
+          case "design_get_responsive": {
+            const registry = {
+              getAllElements: () => currentBridge.elements,
+            };
+            const viewports = (payload.viewports ??
+              payload.params?.viewports ?? { mobile: 375, tablet: 768, desktop: 1280 }) as Record<
+              string,
+              number
+            >;
+            const snapshots = await captureResponsiveSnapshots(
+              registry as DesignRegistryLike,
+              viewports,
+            );
+
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: snapshots,
+              timestamp: Date.now(),
+            });
+            break;
+          }
+
+          case "design_run_audit": {
+            const auditElements = currentBridge.elements;
+            const auditTargetIds =
+              payload.elementIds ?? (payload.params?.elementIds as string[] | undefined);
+            const auditFiltered = auditTargetIds
+              ? auditElements.filter((el) => auditTargetIds.includes(el.id))
+              : auditElements;
+
+            const auditDesignData: ElementDesignData[] = auditFiltered
+              .filter((el) => el.element instanceof HTMLElement)
+              .map((el) =>
+                getElementDesignData(el.element as HTMLElement, {
+                  elementId: el.id,
+                  label: el.label,
+                  type: el.type,
+                }),
+              );
+
+            const guide =
+              payload.guide ??
+              (payload.params?.guide as StyleGuideConfig | undefined) ??
+              loadedStyleGuideRef.current;
+            if (!guide) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error:
+                  "No style guide provided or loaded. Load one with design_load_style_guide first, or pass a guide in the request.",
+                timestamp: Date.now(),
+              });
+              return;
+            }
+
+            const report = runStyleAudit(auditDesignData, guide);
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: report,
+              timestamp: Date.now(),
+            });
+            break;
+          }
+
+          case "design_load_style_guide": {
+            const guideToLoad =
+              payload.guide ?? (payload.params?.guide as StyleGuideConfig | undefined);
+            if (!guideToLoad) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: "guide is required",
+                timestamp: Date.now(),
+              });
+              return;
+            }
+            loadedStyleGuideRef.current = guideToLoad;
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: { loaded: true },
+              timestamp: Date.now(),
+            });
+            break;
+          }
+
+          case "design_get_style_guide": {
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: loadedStyleGuideRef.current,
+              timestamp: Date.now(),
+            });
+            break;
+          }
+
+          case "design_clear_style_guide": {
+            loadedStyleGuideRef.current = null;
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: { cleared: true },
               timestamp: Date.now(),
             });
             break;

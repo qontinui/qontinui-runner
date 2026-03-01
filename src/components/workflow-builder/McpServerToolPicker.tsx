@@ -207,15 +207,15 @@ export function McpServerToolPicker({
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
       <div
         data-ui-id="dialog-mcp-server-tool-picker"
-        className="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl w-[700px] max-w-[90vw] max-h-[80vh] flex flex-col"
+        className="bg-card border border-border rounded-lg shadow-2xl w-[700px] max-w-[90vw] max-h-[80vh] flex flex-col"
       >
         {/* Header */}
-        <div className="flex items-center justify-between px-4 py-3 border-b border-neutral-700">
+        <div className="flex items-center justify-between px-4 py-3 border-b border-border">
           <div className="flex items-center gap-3">
             {mode === "tools" && (
               <button
                 onClick={handleBack}
-                className="p-1.5 hover:bg-neutral-700 rounded-md transition-colors"
+                className="p-1.5 hover:bg-muted/80 rounded-md transition-colors"
                 data-ui-id="workflow-builder-mcp-picker-back-btn"
               >
                 <ArrowLeft className="w-4 h-4" />
@@ -236,7 +236,7 @@ export function McpServerToolPicker({
           </div>
           <button
             onClick={onClose}
-            className="p-1.5 hover:bg-neutral-700 rounded-md transition-colors"
+            className="p-1.5 hover:bg-muted/80 rounded-md transition-colors"
             data-ui-id="workflow-builder-mcp-picker-close-btn"
           >
             <X className="w-5 h-5" />
@@ -244,7 +244,7 @@ export function McpServerToolPicker({
         </div>
 
         {/* Search */}
-        <div className="flex items-center gap-3 px-4 py-3 border-b border-neutral-800">
+        <div className="flex items-center gap-3 px-4 py-3 border-b border-border">
           <div className="relative flex-1">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
             <input
@@ -252,7 +252,7 @@ export function McpServerToolPicker({
               placeholder={mode === "servers" ? "Search servers..." : "Search tools..."}
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full pl-9 pr-3 py-2 text-sm bg-neutral-800 border border-neutral-700 rounded-md
+              className="w-full pl-9 pr-3 py-2 text-sm bg-muted border border-border rounded-md
                        focus:outline-none focus:ring-2 focus:ring-cyan-500/50"
               autoFocus
               data-ui-id="workflow-builder-mcp-picker-search-input"
@@ -292,16 +292,16 @@ export function McpServerToolPicker({
                     key={server.id}
                     onClick={() => handleServerSelect(server)}
                     className="relative flex items-start gap-3 p-3 rounded-lg text-left transition-all
-                             bg-neutral-800/50 border-2 border-transparent hover:bg-neutral-800 hover:border-neutral-600"
+                             bg-muted/50 border-2 border-transparent hover:bg-muted hover:border-border"
                     data-ui-id={`workflow-builder-mcp-picker-server-item-${server.id}`}
                   >
-                    <div className="p-2 rounded-md bg-neutral-900 text-indigo-400">
+                    <div className="p-2 rounded-md bg-card text-indigo-400">
                       <Server className="w-4 h-4" />
                     </div>
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2">
                         <span className="font-medium">{server.name}</span>
-                        <span className="text-xs px-1.5 py-0.5 bg-neutral-700 text-neutral-400 rounded">
+                        <span className="text-xs px-1.5 py-0.5 bg-muted/80 text-muted-foreground rounded">
                           {server.server_type}
                         </span>
                       </div>
@@ -319,7 +319,7 @@ export function McpServerToolPicker({
                         )}
                       </div>
                     </div>
-                    <Plug className="w-4 h-4 text-neutral-500" />
+                    <Plug className="w-4 h-4 text-muted-foreground" />
                   </button>
                 ))}
               </div>
@@ -346,7 +346,7 @@ export function McpServerToolPicker({
                         ${
                           isSelected
                             ? "bg-cyan-500/15 border-2 border-cyan-500"
-                            : "bg-neutral-800/50 border-2 border-transparent hover:bg-neutral-800 hover:border-neutral-600"
+                            : "bg-muted/50 border-2 border-transparent hover:bg-muted hover:border-border"
                         }
                       `}
                     data-ui-id={`workflow-builder-mcp-picker-tool-item-${tool.name}`}
@@ -356,7 +356,7 @@ export function McpServerToolPicker({
                         <CheckIcon className="w-4 h-4 text-cyan-400" />
                       </div>
                     )}
-                    <div className="p-2 rounded-md bg-neutral-900 text-amber-400">
+                    <div className="p-2 rounded-md bg-card text-amber-400">
                       <Wrench className="w-4 h-4" />
                     </div>
                     <div className="flex-1 min-w-0">
@@ -368,7 +368,7 @@ export function McpServerToolPicker({
                       )}
                       {tool.input_schema && (
                         <div className="mt-1.5 text-xs text-muted-foreground">
-                          <span className="text-neutral-500">
+                          <span className="text-muted-foreground">
                             {Object.keys(tool.input_schema.properties || {}).length} parameters
                           </span>
                         </div>
@@ -382,7 +382,7 @@ export function McpServerToolPicker({
         </div>
 
         {/* Footer */}
-        <div className="flex items-center justify-between px-4 py-3 border-t border-neutral-700 bg-neutral-800/50">
+        <div className="flex items-center justify-between px-4 py-3 border-t border-border bg-muted/50">
           <span
             data-content-role="metric"
             data-content-label="available item count"
@@ -395,7 +395,7 @@ export function McpServerToolPicker({
           <div className="flex items-center gap-2">
             <button
               onClick={onClose}
-              className="px-4 py-2 text-sm rounded-md hover:bg-neutral-700 transition-colors"
+              className="px-4 py-2 text-sm rounded-md hover:bg-muted/80 transition-colors"
               data-ui-id="workflow-builder-mcp-picker-cancel-btn"
             >
               Cancel

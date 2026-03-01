@@ -708,7 +708,7 @@ function ChatBubble({ group, isAnimated }: { group: MessageGroup; isAnimated?: b
       {/* Message content */}
       <div
         className={cn(
-          "flex-1 max-w-[80%] rounded-lg px-4 py-2 border bg-background",
+          "flex-1 max-w-[80%] rounded-lg px-4 py-2 border",
           bubbleColors.bg,
           bubbleColors.border,
         )}

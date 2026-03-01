@@ -175,6 +175,9 @@ pub struct LoopConfig {
     pub model_override: Option<String>,
     /// Stage index when running as part of a multi-stage workflow (None = single-stage).
     pub stage_index: Option<u32>,
+    /// Maximum total AI sessions across all stages (None = unlimited).
+    /// Checked against the task_run's sessions_count in the database.
+    pub max_sessions: Option<u32>,
 }
 
 /// Result of the completion sweep phase.

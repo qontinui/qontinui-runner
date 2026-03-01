@@ -125,17 +125,17 @@ export function AiTaskGenerator({
   }, []);
 
   return (
-    <div className="flex flex-col h-full bg-neutral-900 rounded-lg border border-neutral-700 overflow-hidden">
+    <div className="flex flex-col h-full bg-card rounded-lg border border-border overflow-hidden">
       {/* Header */}
-      <div className="flex items-center justify-between p-3 border-b border-neutral-700">
+      <div className="flex items-center justify-between p-3 border-b border-border">
         <div className="flex items-center gap-2">
           <Sparkles className="w-4 h-4 text-amber-400" />
-          <span className="text-sm font-medium text-neutral-200">AI Task Generator</span>
+          <span className="text-sm font-medium text-foreground">AI Task Generator</span>
         </div>
         {onCancel && (
           <button
             onClick={onCancel}
-            className="p-1 text-neutral-500 hover:text-neutral-300 transition-colors"
+            className="p-1 text-muted-foreground hover:text-foreground transition-colors"
           >
             <X className="w-4 h-4" />
           </button>
@@ -146,7 +146,7 @@ export function AiTaskGenerator({
       <div className="flex-1 flex flex-col min-h-0 overflow-hidden p-4">
         {/* Mode selector */}
         <div className="mb-4">
-          <label className="block text-xs text-neutral-400 mb-2">Mode</label>
+          <label className="block text-xs text-muted-foreground mb-2">Mode</label>
           <div className="flex gap-2">
             <button
               onClick={() => {
@@ -158,7 +158,7 @@ export function AiTaskGenerator({
               className={`flex-1 flex items-center justify-center gap-2 px-3 py-2 text-xs rounded transition-colors ${
                 mode === "generate"
                   ? "bg-amber-600 text-white"
-                  : "bg-neutral-800 text-neutral-400 hover:bg-neutral-700"
+                  : "bg-muted text-muted-foreground hover:bg-muted/80"
               }`}
             >
               <Wand2 className="w-3.5 h-3.5" />
@@ -174,7 +174,7 @@ export function AiTaskGenerator({
               className={`flex-1 flex items-center justify-center gap-2 px-3 py-2 text-xs rounded transition-colors ${
                 mode === "improve"
                   ? "bg-amber-600 text-white"
-                  : "bg-neutral-800 text-neutral-400 hover:bg-neutral-700"
+                  : "bg-muted text-muted-foreground hover:bg-muted/80"
               }`}
             >
               <Pencil className="w-3.5 h-3.5" />
@@ -186,13 +186,13 @@ export function AiTaskGenerator({
         {/* Template quick picks (only in generate mode) */}
         {!generatedTask && mode === "generate" && (
           <div className="mb-4">
-            <label className="block text-xs text-neutral-400 mb-2">Quick Templates</label>
+            <label className="block text-xs text-muted-foreground mb-2">Quick Templates</label>
             <div className="flex flex-wrap gap-2">
               {PROMPT_TEMPLATES.map((template) => (
                 <button
                   key={template.label}
                   onClick={() => handleApplyTemplate(template)}
-                  className="px-2 py-1 text-xs bg-neutral-800 text-neutral-300 rounded hover:bg-neutral-700 transition-colors"
+                  className="px-2 py-1 text-xs bg-muted text-foreground rounded hover:bg-muted/80 transition-colors"
                 >
                   {template.label}
                 </button>
@@ -206,7 +206,7 @@ export function AiTaskGenerator({
           <>
             {/* Prompt textarea */}
             <div className="flex-1 flex flex-col min-h-0">
-              <label className="block text-xs text-neutral-400 mb-2">
+              <label className="block text-xs text-muted-foreground mb-2">
                 {mode === "generate"
                   ? "Describe the task you want to create"
                   : "Paste the prompt you want to improve"}
@@ -219,7 +219,7 @@ export function AiTaskGenerator({
                     ? "Example: Create a task that analyzes error logs and suggests fixes based on common patterns"
                     : "Paste your existing prompt here to improve its structure and clarity..."
                 }
-                className="flex-1 px-3 py-2 bg-neutral-800 border border-neutral-700 rounded text-sm text-neutral-200 placeholder-neutral-500 resize-none focus:outline-none focus:border-amber-500 min-h-[120px] font-mono"
+                className="flex-1 px-3 py-2 bg-muted border border-border rounded text-sm text-foreground placeholder:text-muted-foreground resize-none focus:outline-none focus:border-amber-500 min-h-[120px] font-mono"
               />
             </div>
 
@@ -255,25 +255,25 @@ export function AiTaskGenerator({
             <div className="flex-1 flex flex-col min-h-0 overflow-auto">
               {/* Name */}
               <div className="mb-4">
-                <label className="block text-xs text-neutral-400 mb-1">Name</label>
-                <div className="p-2 bg-neutral-800 rounded border border-neutral-700">
-                  <span className="text-sm font-medium text-neutral-200">{generatedTask.name}</span>
+                <label className="block text-xs text-muted-foreground mb-1">Name</label>
+                <div className="p-2 bg-muted rounded border border-border">
+                  <span className="text-sm font-medium text-foreground">{generatedTask.name}</span>
                 </div>
               </div>
 
               {/* Description */}
               {generatedTask.description && (
                 <div className="mb-4">
-                  <label className="block text-xs text-neutral-400 mb-1">Description</label>
-                  <p className="text-sm text-neutral-300">{generatedTask.description}</p>
+                  <label className="block text-xs text-muted-foreground mb-1">Description</label>
+                  <p className="text-sm text-foreground">{generatedTask.description}</p>
                 </div>
               )}
 
               {/* Content (the actual prompt) */}
               <div className="mb-4 flex-1 min-h-0">
-                <label className="block text-xs text-neutral-400 mb-1">Prompt Content</label>
-                <div className="h-full max-h-[200px] overflow-auto p-3 bg-neutral-950 rounded border border-neutral-700">
-                  <pre className="text-sm font-mono text-neutral-300 whitespace-pre-wrap">
+                <label className="block text-xs text-muted-foreground mb-1">Prompt Content</label>
+                <div className="h-full max-h-[200px] overflow-auto p-3 bg-background rounded border border-border">
+                  <pre className="text-sm font-mono text-foreground whitespace-pre-wrap">
                     {generatedTask.content}
                   </pre>
                 </div>
@@ -282,8 +282,8 @@ export function AiTaskGenerator({
               {/* Category */}
               {generatedTask.category && (
                 <div className="mb-4">
-                  <label className="block text-xs text-neutral-400 mb-1">Category</label>
-                  <span className="px-2 py-1 text-xs bg-neutral-800 text-neutral-300 rounded">
+                  <label className="block text-xs text-muted-foreground mb-1">Category</label>
+                  <span className="px-2 py-1 text-xs bg-muted text-foreground rounded">
                     {generatedTask.category}
                   </span>
                 </div>
@@ -292,7 +292,7 @@ export function AiTaskGenerator({
               {/* Tags */}
               {generatedTask.tags.length > 0 && (
                 <div className="mb-4">
-                  <label className="block text-xs text-neutral-400 mb-1">Tags</label>
+                  <label className="block text-xs text-muted-foreground mb-1">Tags</label>
                   <div className="flex flex-wrap gap-1">
                     {generatedTask.tags.map((tag) => (
                       <span
@@ -313,7 +313,7 @@ export function AiTaskGenerator({
                 onClick={() => {
                   setGeneratedTask(null);
                 }}
-                className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-neutral-700 text-white rounded hover:bg-neutral-600 transition-colors"
+                className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-muted/80 text-white rounded hover:bg-muted transition-colors"
               >
                 <RefreshCw className="w-4 h-4" />
                 Try Again
@@ -331,7 +331,7 @@ export function AiTaskGenerator({
       </div>
 
       {/* Footer */}
-      <div className="p-2 border-t border-neutral-700 text-xs text-neutral-500">
+      <div className="p-2 border-t border-border text-xs text-muted-foreground">
         AI-generated prompts should be reviewed and tested before use
       </div>
     </div>

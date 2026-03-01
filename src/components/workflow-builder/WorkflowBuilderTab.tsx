@@ -1508,9 +1508,9 @@ function WorkflowBuilderContent({
   return (
     <div className="h-full flex">
       {/* Left Panel - Workflow List */}
-      <div className="w-80 border-r border-neutral-700 flex flex-col bg-neutral-900">
+      <div className="w-80 border-r border-border flex flex-col bg-card">
         {/* Header */}
-        <div className="p-4 border-b border-neutral-700">
+        <div className="p-4 border-b border-border">
           {/* Title row */}
           <div className="flex items-center justify-between mb-2">
             <h2
@@ -1555,13 +1555,13 @@ function WorkflowBuilderContent({
 
           {/* Search */}
           <div className="relative">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-neutral-400" />
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
             <input
               type="text"
               placeholder="Search workflows..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full pl-9 pr-3 py-2 bg-neutral-800 border border-neutral-700 rounded-lg text-sm focus:outline-none focus:border-neutral-600"
+              className="w-full pl-9 pr-3 py-2 bg-muted border border-border rounded-lg text-sm focus:outline-none focus:border-border"
               data-ui-id="workflow-builder-search-input"
             />
           </div>
@@ -1583,7 +1583,7 @@ function WorkflowBuilderContent({
               )}
               <button
                 onClick={exitWorkflowSelectionMode}
-                className="px-3 py-1 text-sm text-neutral-400 hover:text-neutral-200 transition-colors"
+                className="px-3 py-1 text-sm text-muted-foreground hover:text-foreground transition-colors"
               >
                 Cancel
               </button>
@@ -1595,10 +1595,10 @@ function WorkflowBuilderContent({
         <div className="flex-1 overflow-y-auto p-2">
           {workflowsLoading ? (
             <div className="flex items-center justify-center py-8">
-              <Loader2 className="w-6 h-6 animate-spin text-neutral-400" />
+              <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
             </div>
           ) : filteredWorkflows.length === 0 ? (
-            <div className="text-center py-8 text-neutral-400">
+            <div className="text-center py-8 text-muted-foreground">
               <Sparkles className="w-8 h-8 mx-auto mb-2 opacity-50" />
               <p className="text-sm">No workflows found</p>
             </div>
@@ -1619,8 +1619,8 @@ function WorkflowBuilderContent({
                     isWorkflowSelectionMode && selectedWorkflowIds.has(workflow.id)
                       ? "bg-red-500/20 border border-red-500/50"
                       : state.workflow.id === workflow.id
-                        ? "bg-neutral-700"
-                        : "hover:bg-neutral-800"
+                        ? "bg-muted/80"
+                        : "hover:bg-muted"
                   } ${isWorkflowSelectionMode ? "border" : ""} ${
                     isWorkflowSelectionMode && !selectedWorkflowIds.has(workflow.id)
                       ? "border-transparent"
@@ -1633,7 +1633,7 @@ function WorkflowBuilderContent({
                       className={`flex-shrink-0 w-5 h-5 mt-0.5 rounded border-2 flex items-center justify-center transition-colors ${
                         selectedWorkflowIds.has(workflow.id)
                           ? "bg-red-500 border-red-500"
-                          : "border-neutral-500"
+                          : "border-muted-foreground"
                       }`}
                     >
                       {selectedWorkflowIds.has(workflow.id) && (
@@ -1644,16 +1644,16 @@ function WorkflowBuilderContent({
                   <div className="flex-1 min-w-0">
                     <div className="font-medium text-sm truncate">{workflow.name}</div>
                     {workflow.description && (
-                      <div className="text-xs text-neutral-400 truncate mt-0.5">
+                      <div className="text-xs text-muted-foreground truncate mt-0.5">
                         {workflow.description}
                       </div>
                     )}
                     <div className="flex items-center gap-2 mt-1.5">
-                      <span className="text-xs text-neutral-500">
+                      <span className="text-xs text-muted-foreground">
                         {getStepCount(workflow)} steps
                       </span>
                       {workflow.category && (
-                        <span className="text-xs px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400">
+                        <span className="text-xs px-1.5 py-0.5 rounded bg-muted text-muted-foreground">
                           {workflow.category}
                         </span>
                       )}

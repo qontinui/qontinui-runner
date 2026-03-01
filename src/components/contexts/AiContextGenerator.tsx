@@ -112,17 +112,17 @@ export function AiContextGenerator({ onContextGenerated, onCancel }: AiContextGe
   }, []);
 
   return (
-    <div className="flex flex-col h-full bg-neutral-900 rounded-lg border border-neutral-700 overflow-hidden">
+    <div className="flex flex-col h-full bg-card rounded-lg border border-border overflow-hidden">
       {/* Header */}
-      <div className="flex items-center justify-between p-3 border-b border-neutral-700">
+      <div className="flex items-center justify-between p-3 border-b border-border">
         <div className="flex items-center gap-2">
           <Sparkles className="w-4 h-4 text-blue-400" />
-          <span className="text-sm font-medium text-neutral-200">AI Context Generator</span>
+          <span className="text-sm font-medium text-foreground">AI Context Generator</span>
         </div>
         {onCancel && (
           <button
             onClick={onCancel}
-            className="p-1 text-neutral-500 hover:text-neutral-300 transition-colors"
+            className="p-1 text-muted-foreground hover:text-foreground transition-colors"
           >
             <X className="w-4 h-4" />
           </button>
@@ -134,13 +134,13 @@ export function AiContextGenerator({ onContextGenerated, onCancel }: AiContextGe
         {/* Template quick picks */}
         {!generatedContext && (
           <div className="mb-4">
-            <label className="block text-xs text-neutral-400 mb-2">Quick Templates</label>
+            <label className="block text-xs text-muted-foreground mb-2">Quick Templates</label>
             <div className="flex flex-wrap gap-2">
               {PROMPT_TEMPLATES.map((template) => (
                 <button
                   key={template.label}
                   onClick={() => handleApplyTemplate(template)}
-                  className="px-2 py-1 text-xs bg-neutral-800 text-neutral-300 rounded hover:bg-neutral-700 transition-colors"
+                  className="px-2 py-1 text-xs bg-muted text-foreground rounded hover:bg-muted/80 transition-colors"
                 >
                   {template.label}
                 </button>
@@ -154,14 +154,14 @@ export function AiContextGenerator({ onContextGenerated, onCancel }: AiContextGe
           <>
             {/* Prompt textarea */}
             <div className="flex-1 flex flex-col min-h-0">
-              <label className="block text-xs text-neutral-400 mb-2">
+              <label className="block text-xs text-muted-foreground mb-2">
                 Describe the topic for the knowledge base entry
               </label>
               <textarea
                 value={prompt}
                 onChange={(e) => setPrompt(e.target.value)}
                 placeholder="Example: Best practices for handling network timeouts in Playwright tests, including retry strategies and timeout configuration"
-                className="flex-1 px-3 py-2 bg-neutral-800 border border-neutral-700 rounded text-sm text-neutral-200 placeholder-neutral-500 resize-none focus:outline-none focus:border-blue-500 min-h-[100px]"
+                className="flex-1 px-3 py-2 bg-muted border border-border rounded text-sm text-foreground placeholder:text-muted-foreground resize-none focus:outline-none focus:border-blue-500 min-h-[100px]"
               />
             </div>
 
@@ -197,9 +197,9 @@ export function AiContextGenerator({ onContextGenerated, onCancel }: AiContextGe
             <div className="flex-1 flex flex-col min-h-0 overflow-auto">
               {/* Name */}
               <div className="mb-4">
-                <label className="block text-xs text-neutral-400 mb-1">Name</label>
-                <div className="p-2 bg-neutral-800 rounded border border-neutral-700">
-                  <span className="text-sm font-medium text-neutral-200">
+                <label className="block text-xs text-muted-foreground mb-1">Name</label>
+                <div className="p-2 bg-muted rounded border border-border">
+                  <span className="text-sm font-medium text-foreground">
                     {generatedContext.name}
                   </span>
                 </div>
@@ -207,9 +207,11 @@ export function AiContextGenerator({ onContextGenerated, onCancel }: AiContextGe
 
               {/* Content */}
               <div className="mb-4 flex-1 min-h-0">
-                <label className="block text-xs text-neutral-400 mb-1">Content (Markdown)</label>
-                <div className="h-full max-h-[200px] overflow-auto p-3 bg-neutral-950 rounded border border-neutral-700">
-                  <pre className="text-sm font-mono text-neutral-300 whitespace-pre-wrap">
+                <label className="block text-xs text-muted-foreground mb-1">
+                  Content (Markdown)
+                </label>
+                <div className="h-full max-h-[200px] overflow-auto p-3 bg-background rounded border border-border">
+                  <pre className="text-sm font-mono text-foreground whitespace-pre-wrap">
                     {generatedContext.content}
                   </pre>
                 </div>
@@ -218,8 +220,8 @@ export function AiContextGenerator({ onContextGenerated, onCancel }: AiContextGe
               {/* Category */}
               {generatedContext.category && (
                 <div className="mb-4">
-                  <label className="block text-xs text-neutral-400 mb-1">Category</label>
-                  <span className="px-2 py-1 text-xs bg-neutral-800 text-neutral-300 rounded">
+                  <label className="block text-xs text-muted-foreground mb-1">Category</label>
+                  <span className="px-2 py-1 text-xs bg-muted text-foreground rounded">
                     {generatedContext.category}
                   </span>
                 </div>
@@ -228,7 +230,7 @@ export function AiContextGenerator({ onContextGenerated, onCancel }: AiContextGe
               {/* Tags */}
               {generatedContext.tags.length > 0 && (
                 <div className="mb-4">
-                  <label className="block text-xs text-neutral-400 mb-1">Tags</label>
+                  <label className="block text-xs text-muted-foreground mb-1">Tags</label>
                   <div className="flex flex-wrap gap-1">
                     {generatedContext.tags.map((tag) => (
                       <span
@@ -245,7 +247,7 @@ export function AiContextGenerator({ onContextGenerated, onCancel }: AiContextGe
               {/* Task mentions */}
               {generatedContext.taskMentions.length > 0 && (
                 <div className="mb-4">
-                  <label className="block text-xs text-neutral-400 mb-1">
+                  <label className="block text-xs text-muted-foreground mb-1">
                     Auto-include Keywords
                   </label>
                   <div className="flex flex-wrap gap-1">
@@ -268,7 +270,7 @@ export function AiContextGenerator({ onContextGenerated, onCancel }: AiContextGe
                 onClick={() => {
                   setGeneratedContext(null);
                 }}
-                className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-neutral-700 text-white rounded hover:bg-neutral-600 transition-colors"
+                className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-muted/80 text-white rounded hover:bg-muted transition-colors"
               >
                 <RefreshCw className="w-4 h-4" />
                 Try Again
@@ -286,7 +288,7 @@ export function AiContextGenerator({ onContextGenerated, onCancel }: AiContextGe
       </div>
 
       {/* Footer */}
-      <div className="p-2 border-t border-neutral-700 text-xs text-neutral-500">
+      <div className="p-2 border-t border-border text-xs text-muted-foreground">
         AI-generated content should be reviewed before saving
       </div>
     </div>

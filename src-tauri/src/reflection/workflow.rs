@@ -36,6 +36,7 @@ pub fn build_reflection_config(
         provider_override: None,
         model_override: None,
         stage_index: None,
+        max_sessions: Some(3),
     }
 }
 

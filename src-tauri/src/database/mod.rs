@@ -5525,6 +5525,23 @@ impl CheckpointDb {
             info!("Successfully migrated to version 73 (generator_benchmarks)");
         }
 
+        // Version 74: Add investigation columns to generation_pipeline_artifacts
+        if current_version < 74 {
+            info!("Migrating to version 74 (add investigation columns to pipeline_artifacts)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE generation_pipeline_artifacts ADD COLUMN investigation_duration_ms INTEGER;
+                ALTER TABLE generation_pipeline_artifacts ADD COLUMN investigation_enriched_description TEXT;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (74, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 74: {}", e))?;
+
+            info!("Successfully migrated to version 74 (investigation columns)");
+        }
+
         Ok(())
     }
 
@@ -17750,6 +17767,7 @@ impl CheckpointDb {
         conn.execute(
             r#"INSERT INTO generation_pipeline_artifacts
                 (id, workflow_id, task_run_id, description, category, created_at,
+                 investigation_duration_ms, investigation_enriched_description,
                  discovery_duration_ms, builder_duration_ms, autofix_duration_ms,
                  verification_duration_ms, hardener_duration_ms, total_duration_ms,
                  discovery_calls, builder_raw_output, builder_parsed_json, autofix_diff,
@@ -17757,7 +17775,7 @@ impl CheckpointDb {
                  hardened_json, final_json, validation_errors,
                  success, error_message, model_used)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                    ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)"#,
+                    ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)"#,
             params![
                 artifact.id,
                 artifact.workflow_id,
@@ -17765,6 +17783,8 @@ impl CheckpointDb {
                 artifact.description,
                 artifact.category,
                 artifact.created_at,
+                artifact.investigation_duration_ms.map(|v| v as i64),
+                artifact.investigation_enriched_description,
                 artifact.discovery_duration_ms.map(|v| v as i64),
                 artifact.builder_duration_ms.map(|v| v as i64),
                 artifact.autofix_duration_ms.map(|v| v as i64),
@@ -17805,6 +17825,7 @@ impl CheckpointDb {
         let conn = self.get_conn()?;
         let result = conn.query_row(
             r#"SELECT id, workflow_id, task_run_id, description, category, created_at,
+                      investigation_duration_ms, investigation_enriched_description,
                       discovery_duration_ms, builder_duration_ms, autofix_duration_ms,
                       verification_duration_ms, hardener_duration_ms, total_duration_ms,
                       discovery_calls, builder_raw_output, builder_parsed_json, autofix_diff,
@@ -17889,6 +17910,7 @@ impl CheckpointDb {
         let conn = self.get_conn()?;
         let result = conn.query_row(
             r#"SELECT id, workflow_id, task_run_id, description, category, created_at,
+                      investigation_duration_ms, investigation_enriched_description,
                       discovery_duration_ms, builder_duration_ms, autofix_duration_ms,
                       verification_duration_ms, hardener_duration_ms, total_duration_ms,
                       discovery_calls, builder_raw_output, builder_parsed_json, autofix_diff,
@@ -17937,43 +17959,48 @@ impl CheckpointDb {
             description: row.get(3).unwrap_or_default(),
             category: row.get(4).unwrap_or(None),
             created_at: row.get(5).unwrap_or_default(),
-            discovery_duration_ms: row
+            investigation_duration_ms: row
                 .get::<_, Option<i64>>(6)
                 .unwrap_or(None)
                 .map(|v| v as u64),
-            builder_duration_ms: row
-                .get::<_, Option<i64>>(7)
-                .unwrap_or(None)
-                .map(|v| v as u64),
-            autofix_duration_ms: row
+            investigation_enriched_description: row.get(7).unwrap_or(None),
+            discovery_duration_ms: row
                 .get::<_, Option<i64>>(8)
                 .unwrap_or(None)
                 .map(|v| v as u64),
-            verification_duration_ms: row
+            builder_duration_ms: row
                 .get::<_, Option<i64>>(9)
                 .unwrap_or(None)
                 .map(|v| v as u64),
-            hardener_duration_ms: row
+            autofix_duration_ms: row
                 .get::<_, Option<i64>>(10)
                 .unwrap_or(None)
                 .map(|v| v as u64),
-            total_duration_ms: row
+            verification_duration_ms: row
                 .get::<_, Option<i64>>(11)
                 .unwrap_or(None)
                 .map(|v| v as u64),
-            discovery_calls: parse_json(row.get(12).unwrap_or(None)),
-            builder_raw_output: row.get(13).unwrap_or(None),
-            builder_parsed_json: parse_json(row.get(14).unwrap_or(None)),
-            autofix_diff: parse_json(row.get(15).unwrap_or(None)),
-            verification_iterations: parse_json(row.get(16).unwrap_or(None)),
-            fixer_snapshots: parse_json_vec(row.get(17).unwrap_or(None)),
-            hardening_summary: parse_json(row.get(18).unwrap_or(None)),
-            hardened_json: parse_json(row.get(19).unwrap_or(None)),
-            final_json: parse_json(row.get(20).unwrap_or(None)),
-            validation_errors: parse_json(row.get(21).unwrap_or(None)),
-            success: row.get(22).unwrap_or(true),
-            error_message: row.get(23).unwrap_or(None),
-            model_used: row.get(24).unwrap_or(None),
+            hardener_duration_ms: row
+                .get::<_, Option<i64>>(12)
+                .unwrap_or(None)
+                .map(|v| v as u64),
+            total_duration_ms: row
+                .get::<_, Option<i64>>(13)
+                .unwrap_or(None)
+                .map(|v| v as u64),
+            discovery_calls: parse_json(row.get(14).unwrap_or(None)),
+            builder_raw_output: row.get(15).unwrap_or(None),
+            builder_parsed_json: parse_json(row.get(16).unwrap_or(None)),
+            autofix_diff: parse_json(row.get(17).unwrap_or(None)),
+            verification_iterations: parse_json(row.get(18).unwrap_or(None)),
+            fixer_snapshots: parse_json_vec(row.get(19).unwrap_or(None)),
+            hardening_summary: parse_json(row.get(20).unwrap_or(None)),
+            hardened_json: parse_json(row.get(21).unwrap_or(None)),
+            final_json: parse_json(row.get(22).unwrap_or(None)),
+            validation_errors: parse_json(row.get(23).unwrap_or(None)),
+            success: row.get(24).unwrap_or(true),
+            error_message: row.get(25).unwrap_or(None),
+            model_used: row.get(26).unwrap_or(None),
         }
     }
 

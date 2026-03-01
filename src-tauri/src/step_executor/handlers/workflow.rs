@@ -159,6 +159,7 @@ impl StepHandler for WorkflowStepHandler {
             provider_override: workflow.provider.clone(),
             model_override: workflow.model.clone(),
             stage_index: None,
+            max_sessions: Some(workflow.max_iterations),
         };
 
         // 8. Create LoopController and get session manager

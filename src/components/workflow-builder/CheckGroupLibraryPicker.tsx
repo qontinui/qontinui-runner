@@ -140,10 +140,10 @@ export function CheckGroupLibraryPicker({
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
       <div
         data-ui-id="dialog-check-group-library-picker"
-        className="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl w-[700px] max-w-[90vw] max-h-[80vh] flex flex-col"
+        className="bg-card border border-border rounded-lg shadow-2xl w-[700px] max-w-[90vw] max-h-[80vh] flex flex-col"
       >
         {/* Header */}
-        <div className="flex items-center justify-between px-4 py-3 border-b border-neutral-700">
+        <div className="flex items-center justify-between px-4 py-3 border-b border-border">
           <div>
             <h2 className="text-lg font-semibold">Select Check Group</h2>
             <p className="text-sm text-muted-foreground">
@@ -152,7 +152,7 @@ export function CheckGroupLibraryPicker({
           </div>
           <button
             onClick={onClose}
-            className="p-1.5 hover:bg-neutral-700 rounded-md transition-colors"
+            className="p-1.5 hover:bg-muted/80 rounded-md transition-colors"
             data-ui-id="workflow-builder-check-group-picker-close-btn"
           >
             <X className="w-5 h-5" />
@@ -160,7 +160,7 @@ export function CheckGroupLibraryPicker({
         </div>
 
         {/* Search */}
-        <div className="flex items-center gap-3 px-4 py-3 border-b border-neutral-800">
+        <div className="flex items-center gap-3 px-4 py-3 border-b border-border">
           <div className="relative flex-1">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
             <input
@@ -168,7 +168,7 @@ export function CheckGroupLibraryPicker({
               placeholder="Search check groups..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full pl-9 pr-3 py-2 text-sm bg-neutral-800 border border-neutral-700 rounded-md
+              className="w-full pl-9 pr-3 py-2 text-sm bg-muted border border-border rounded-md
                        focus:outline-none focus:ring-2 focus:ring-cyan-500/50"
               autoFocus
               data-ui-id="workflow-builder-check-group-picker-search-input"
@@ -202,7 +202,7 @@ export function CheckGroupLibraryPicker({
                       ${
                         isSelected
                           ? "bg-cyan-500/15 border-2 border-cyan-500"
-                          : "bg-neutral-800/50 border-2 border-transparent hover:bg-neutral-800 hover:border-neutral-600"
+                          : "bg-muted/50 border-2 border-transparent hover:bg-muted hover:border-border"
                       }
                     `}
                     data-ui-id={`workflow-builder-check-group-picker-item-${group.id}`}
@@ -213,7 +213,7 @@ export function CheckGroupLibraryPicker({
                       </div>
                     )}
                     <div
-                      className="p-2 rounded-md bg-neutral-900"
+                      className="p-2 rounded-md bg-card"
                       style={{ color: group.color || "#6366f1" }}
                     >
                       <FolderOpen className="w-4 h-4" />
@@ -248,7 +248,7 @@ export function CheckGroupLibraryPicker({
                           {checks.slice(0, 5).map((check) => (
                             <span
                               key={check.id}
-                              className="text-xs px-1.5 py-0.5 bg-neutral-700 rounded"
+                              className="text-xs px-1.5 py-0.5 bg-muted/80 rounded"
                             >
                               {check.name}
                             </span>
@@ -269,7 +269,7 @@ export function CheckGroupLibraryPicker({
         </div>
 
         {/* Footer */}
-        <div className="flex items-center justify-between px-4 py-3 border-t border-neutral-700 bg-neutral-800/50">
+        <div className="flex items-center justify-between px-4 py-3 border-t border-border bg-muted/50">
           <span
             data-content-role="metric"
             data-content-label="available group count"
@@ -280,7 +280,7 @@ export function CheckGroupLibraryPicker({
           <div className="flex items-center gap-2">
             <button
               onClick={onClose}
-              className="px-4 py-2 text-sm rounded-md hover:bg-neutral-700 transition-colors"
+              className="px-4 py-2 text-sm rounded-md hover:bg-muted/80 transition-colors"
               data-ui-id="workflow-builder-check-group-picker-cancel-btn"
             >
               Cancel

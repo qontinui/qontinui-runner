@@ -38,10 +38,10 @@ export function AgenticPromptEditor({
     <div className="p-4 space-y-4">
       <div className="flex items-center gap-2">
         <Bot className="w-4 h-4 text-purple-400" />
-        <h3 className="text-sm font-medium text-neutral-200">Agentic Configuration</h3>
+        <h3 className="text-sm font-medium text-foreground">Agentic Configuration</h3>
       </div>
 
-      <p className="text-xs text-neutral-400">
+      <p className="text-xs text-muted-foreground">
         This prompt runs when a verification step fails. The AI agent will attempt to fix the
         application state so verification passes.
       </p>
@@ -49,14 +49,14 @@ export function AgenticPromptEditor({
       {/* Element source selector */}
       {elementSource && onElementSourceChange && (
         <div>
-          <label className="block text-xs text-neutral-400 mb-2">Element Source</label>
+          <label className="block text-xs text-muted-foreground mb-2">Element Source</label>
           <div className="flex gap-2">
             <button
               onClick={() => onElementSourceChange("control")}
               className={`flex items-center gap-2 px-3 py-2 text-xs rounded-md border transition-colors ${
                 elementSource === "control"
                   ? "bg-blue-500/20 border-blue-500/40 text-blue-300"
-                  : "bg-neutral-800 border-neutral-600 text-neutral-400 hover:text-neutral-200"
+                  : "bg-muted border-border text-muted-foreground hover:text-foreground"
               }`}
             >
               <Monitor className="w-3.5 h-3.5" />
@@ -67,14 +67,14 @@ export function AgenticPromptEditor({
               className={`flex items-center gap-2 px-3 py-2 text-xs rounded-md border transition-colors ${
                 elementSource === "external"
                   ? "bg-emerald-500/20 border-emerald-500/40 text-emerald-300"
-                  : "bg-neutral-800 border-neutral-600 text-neutral-400 hover:text-neutral-200"
+                  : "bg-muted border-border text-muted-foreground hover:text-foreground"
               }`}
             >
               <Globe className="w-3.5 h-3.5" />
               Browser Tab
             </button>
           </div>
-          <p className="text-[10px] text-neutral-500 mt-1">
+          <p className="text-[10px] text-muted-foreground mt-1">
             {elementSource === "control"
               ? "Specs run against the runner's own UI elements"
               : "Specs run against an external browser tab via SDK connection"}
@@ -83,26 +83,28 @@ export function AgenticPromptEditor({
       )}
 
       <div>
-        <label className="block text-xs text-neutral-400 mb-1">Agentic Prompt</label>
+        <label className="block text-xs text-muted-foreground mb-1">Agentic Prompt</label>
         <textarea
           value={prompt || DEFAULT_PROMPT}
           onChange={(e) => onPromptChange(e.target.value)}
           rows={8}
-          className="w-full px-3 py-2 text-sm bg-neutral-900 border border-neutral-600 rounded-md text-neutral-200 placeholder:text-neutral-500 focus:outline-none focus:border-purple-500 font-mono resize-y"
+          className="w-full px-3 py-2 text-sm bg-card border border-border rounded-md text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-purple-500 font-mono resize-y"
         />
       </div>
 
       <div className="flex items-center gap-3">
-        <label className="text-xs text-neutral-400">Max Iterations</label>
+        <label className="text-xs text-muted-foreground">Max Iterations</label>
         <input
           type="number"
           value={maxIterations}
           onChange={(e) => onMaxIterationsChange(Number(e.target.value))}
           min={1}
           max={20}
-          className="w-20 px-2 py-1 text-sm bg-neutral-900 border border-neutral-600 rounded text-neutral-200 focus:outline-none focus:border-purple-500"
+          className="w-20 px-2 py-1 text-sm bg-card border border-border rounded text-foreground focus:outline-none focus:border-purple-500"
         />
-        <span className="text-xs text-neutral-500">verification-agentic loops before stopping</span>
+        <span className="text-xs text-muted-foreground">
+          verification-agentic loops before stopping
+        </span>
       </div>
     </div>
   );

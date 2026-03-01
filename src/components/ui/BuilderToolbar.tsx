@@ -74,8 +74,8 @@ function ActionButton({ action }: { action: BuilderToolbarAction }) {
           onClick={() => fileInputRef.current?.click()}
           disabled={action.disabled}
           className={`flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg
-            hover:bg-neutral-800 transition-colors text-xs
-            text-neutral-400 hover:text-neutral-200 disabled:opacity-50
+            hover:bg-muted transition-colors text-xs
+            text-muted-foreground hover:text-foreground disabled:opacity-50
             ${action.className || ""}`}
           title={action.title || action.label}
         >
@@ -95,7 +95,7 @@ function ActionButton({ action }: { action: BuilderToolbarAction }) {
         rel="noopener noreferrer"
         className={`flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg
           transition-colors text-xs no-underline
-          ${action.className || "flex-1 hover:bg-neutral-800 text-neutral-400 hover:text-neutral-200"}
+          ${action.className || "flex-1 hover:bg-muted text-muted-foreground hover:text-foreground"}
           ${!showLabel ? "p-1.5 flex-none" : "flex-1"}`}
         title={action.title || action.label}
       >
@@ -116,7 +116,7 @@ function ActionButton({ action }: { action: BuilderToolbarAction }) {
           action.active
             ? "bg-red-500/20 text-red-400"
             : action.className ||
-              "flex-1 hover:bg-neutral-800 text-neutral-400 hover:text-neutral-200"
+              "flex-1 hover:bg-muted text-muted-foreground hover:text-foreground"
         }
         ${!showLabel ? "p-1.5 flex-none" : "flex-1"}`}
       title={action.title || action.label}
@@ -164,7 +164,7 @@ export const toolbarActions = {
     label: "AI",
     onClick,
     disabled,
-    className: "text-blue-400 hover:text-blue-300 hover:bg-neutral-800",
+    className: "text-blue-400 hover:text-blue-300 hover:bg-muted",
     title: "Generate with AI",
   }),
 
@@ -174,7 +174,7 @@ export const toolbarActions = {
     icon: Sparkles,
     label: "AI",
     disabled: true,
-    className: "text-neutral-600 cursor-not-allowed",
+    className: "text-muted-foreground cursor-not-allowed",
     title: "AI generation coming soon",
   }),
 
@@ -185,7 +185,7 @@ export const toolbarActions = {
     label: "States",
     onClick,
     disabled,
-    className: "text-emerald-400 hover:text-emerald-300 hover:bg-neutral-800",
+    className: "text-emerald-400 hover:text-emerald-300 hover:bg-muted",
     title: "Generate from loaded state machine",
   }),
 
@@ -196,7 +196,7 @@ export const toolbarActions = {
     label: "+State",
     onClick,
     disabled,
-    className: "text-purple-400 hover:text-purple-300 hover:bg-neutral-800",
+    className: "text-purple-400 hover:text-purple-300 hover:bg-muted",
     title: "Add verification and agentic steps from a state",
   }),
 
@@ -207,7 +207,7 @@ export const toolbarActions = {
     label: "Live",
     onClick,
     disabled,
-    className: "text-cyan-400 hover:text-cyan-300 hover:bg-neutral-800",
+    className: "text-cyan-400 hover:text-cyan-300 hover:bg-muted",
     title: "Live Browser Mode - connect to open pages without config",
   }),
 
@@ -253,7 +253,7 @@ export const toolbarActions = {
     onClick,
     active,
     showLabel: false,
-    className: active ? "" : "hover:bg-neutral-800 text-neutral-400 hover:text-red-400",
+    className: active ? "" : "hover:bg-muted text-muted-foreground hover:text-red-400",
     title: active ? "Cancel selection" : "Select items to delete",
   }),
 
@@ -263,7 +263,7 @@ export const toolbarActions = {
     icon: ExternalLink,
     label: "Web",
     href: `http://localhost:3001${webPath}`,
-    className: "text-indigo-400 hover:text-indigo-300 hover:bg-neutral-800",
+    className: "text-indigo-400 hover:text-indigo-300 hover:bg-muted",
     title: "Edit in Web (opens browser)",
   }),
 };
