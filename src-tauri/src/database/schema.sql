@@ -1,5 +1,5 @@
 -- SQLite Schema for qontinui-runner
--- Version: 68
+-- Version: 76
 --
 -- This schema provides persistent storage for task runs, settings,
 -- prompts, and scheduler state.
@@ -2322,4 +2322,64 @@ CREATE INDEX IF NOT EXISTS idx_benchmark_results_run_at ON generator_benchmark_r
 -- Initialize singleton tables
 INSERT OR IGNORE INTO gui_lock (id, holder_session_id, acquired_at) VALUES (1, NULL, NULL);
 INSERT OR IGNORE INTO scheduler_settings (id) VALUES (1);
-INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (68, datetime('now'));
+-- ============================================================================
+-- Workflow Triggers (event-driven automation)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS workflow_triggers (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    trigger_type TEXT NOT NULL,         -- webhook, file_watch, workflow_chain, git_event, health_check
+    trigger_config TEXT NOT NULL,       -- Type-specific JSON (serde tagged enum)
+    workflow_id TEXT NOT NULL,          -- FK to unified_workflows
+    workflow_overrides TEXT,            -- Optional JSON overrides (max_iterations, model, etc.)
+    conditions TEXT DEFAULT '[]',       -- JSON array of conditions
+    debounce_ms INTEGER DEFAULT 1000,
+    cooldown_seconds INTEGER DEFAULT 60,
+    max_concurrent INTEGER DEFAULT 1,
+    enabled BOOLEAN DEFAULT 1,
+    last_triggered_at TEXT,
+    last_execution_id TEXT,
+    trigger_count INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (workflow_id) REFERENCES unified_workflows(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_triggers_type ON workflow_triggers(trigger_type);
+CREATE INDEX IF NOT EXISTS idx_workflow_triggers_enabled ON workflow_triggers(enabled);
+
+CREATE TABLE IF NOT EXISTS trigger_history (
+    id TEXT PRIMARY KEY,
+    trigger_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,           -- webhook_received, file_changed, workflow_completed, etc.
+    event_data TEXT DEFAULT '{}',       -- JSON payload
+    action TEXT NOT NULL,               -- executed, debounced, throttled, condition_failed, error
+    task_run_id TEXT,                   -- FK to task_runs (if workflow was spawned)
+    error_message TEXT,
+    triggered_at TEXT NOT NULL,
+    FOREIGN KEY (trigger_id) REFERENCES workflow_triggers(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_trigger_history_trigger_id ON trigger_history(trigger_id);
+CREATE INDEX IF NOT EXISTS idx_trigger_history_triggered_at ON trigger_history(triggered_at);
+
+-- Canvas Panels (A2UI agent-to-UI structured panels)
+-- Version 76: Canvas panels for rich visual content from AI agent
+CREATE TABLE IF NOT EXISTS canvas_panels (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    component TEXT NOT NULL,
+    title TEXT NOT NULL,
+    data_json TEXT NOT NULL,
+    priority INTEGER DEFAULT 50,
+    size TEXT DEFAULT 'normal',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_canvas_panels_task_run_id ON canvas_panels(task_run_id);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (76, datetime('now'));

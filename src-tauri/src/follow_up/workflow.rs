@@ -36,6 +36,7 @@ pub fn build_follow_up_config(
         model_override: None,
         stage_index: None,
         max_sessions: Some(5),
+        auto_run_generated: false,
     }
 }
 

@@ -220,4 +220,8 @@ export const defaultDetectors: Record<ActivityType, (info: TaskActivityInfo) => 
     // Show flow execution widget when a flow is running
     return info.activities.includes("flow_execution");
   },
+  canvas: (info) => {
+    // Show canvas widget when agent has created canvas panels
+    return info.activities.includes("canvas");
+  },
 };

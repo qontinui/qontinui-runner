@@ -1139,6 +1139,7 @@ pub async fn resume_task_run(
         model_override: None,
         stage_index: None,
         max_sessions: Some(workflow.max_iterations),
+        auto_run_generated: false,
     };
 
     // Spawn the workflow execution in background with panic protection
@@ -2418,20 +2419,38 @@ pub async fn send_message_to_session(
         warn!("Failed to persist user message to output_log: {}", e);
     }
 
-    // If this is the first user interaction, prepend a context switch note
-    let effective_message = if !session.has_user_interacted() {
+    // Build the effective message by prepending any pending context (system notes
+    // from workflow generation, etc.) and the first-interaction note if applicable.
+    let mut prefix_parts: Vec<String> = Vec::new();
+
+    // Drain pending context (system notes queued since last user message)
+    if let Some(pending) = session_manager.drain_pending_context(&id) {
+        info!(
+            "Prepending pending context to user message for task_run_id={}",
+            id
+        );
+        prefix_parts.push(pending);
+    }
+
+    // First-interaction context switch
+    if !session.has_user_interacted() {
         info!(
             "First user interaction detected for task_run_id={}, injecting context switch note",
             id
         );
-        format!(
+        prefix_parts.push(
             "[SYSTEM NOTE: A user is now watching and interacting with this session. \
              Please acknowledge their message and respond conversationally while continuing \
-             your work. The user's message follows.]\n\n{}",
-            req.message
-        )
-    } else {
+             your work. The user's message follows.]"
+                .to_string(),
+        );
+    }
+
+    let effective_message = if prefix_parts.is_empty() {
         req.message.clone()
+    } else {
+        prefix_parts.push(req.message.clone());
+        prefix_parts.join("\n\n")
     };
 
     match session.send_user_message(&effective_message) {
@@ -3139,6 +3158,8 @@ pub async fn generate_workflow_from_chat(
         include_ui_bridge_instructions: include_ui_bridge,
         reflection_mode: Some(true),
         investigate_codebase: Some(true),
+        include_design_guidance: None,
+        auto_run: None,
     };
 
     let doctor_handle = state.doctor_handle.clone();

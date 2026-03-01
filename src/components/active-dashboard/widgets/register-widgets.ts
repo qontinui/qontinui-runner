@@ -62,6 +62,9 @@ import {
 // Import Flow Execution widget
 import { FlowExecutionWidget, FlowExecutionSummary, useFlowExecutionData } from "./flow-execution";
 
+// Import Canvas widget
+import { CanvasWidget, CanvasSummary, useCanvasData } from "./canvas";
+
 /**
  * Register all dashboard widgets.
  * Call this once at app initialization.
@@ -252,6 +255,20 @@ export function registerAllWidgets(): void {
     detectActivity: defaultDetectors.mcp_call,
     defaultPriority: 24,
     detailRoute: "/logs/mcp",
+  });
+
+  // Canvas - Agent-rendered rich panels
+  widgetRegistry.register({
+    id: "canvas",
+    displayName: "Canvas",
+    icon: "LayoutDashboard",
+    accentColor: "rose",
+    FullComponent: CanvasWidget,
+    SummaryComponent: CanvasSummary,
+    useData: useCanvasData,
+    detectActivity: defaultDetectors.canvas,
+    defaultPriority: 3,
+    detailRoute: "/canvas",
   });
 
   // Mark registry as initialized

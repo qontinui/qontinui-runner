@@ -141,6 +141,24 @@ fn parse_action(action_type: &str, config: serde_json::Value) -> Result<HookActi
 
             Ok(HookAction::Notification { title, body })
         }
+        "run_workflow" => {
+            let workflow_id = config
+                .get("workflow_id")
+                .and_then(|v| v.as_str())
+                .ok_or("RunWorkflow action requires 'workflow_id' field")?
+                .to_string();
+            let pass_context = config
+                .get("pass_context")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let override_config = config.get("override_config").cloned();
+
+            Ok(HookAction::RunWorkflow {
+                workflow_id,
+                pass_context,
+                override_config,
+            })
+        }
         _ => Err(format!("Unknown action type: {}", action_type)),
     }
 }
@@ -151,6 +169,7 @@ fn action_to_type_string(action: &HookAction) -> String {
         HookAction::Webhook { .. } => "webhook",
         HookAction::Log { .. } => "log",
         HookAction::Notification { .. } => "notification",
+        HookAction::RunWorkflow { .. } => "run_workflow",
     }
     .to_string()
 }
@@ -210,6 +229,21 @@ fn action_to_config(action: &HookAction) -> serde_json::Value {
                 "title": title,
                 "body": body,
             })
+        }
+        HookAction::RunWorkflow {
+            workflow_id,
+            pass_context,
+            override_config,
+        } => {
+            let mut config = serde_json::json!({
+                "type": "run_workflow",
+                "workflow_id": workflow_id,
+                "pass_context": pass_context,
+            });
+            if let Some(oc) = override_config {
+                config["override_config"] = oc.clone();
+            }
+            config
         }
     }
 }

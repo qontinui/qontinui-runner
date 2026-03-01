@@ -23,6 +23,7 @@ import {
   GitBranch,
   Plug,
   ListOrdered,
+  LayoutDashboard,
   Clock,
 } from "lucide-react";
 import { cn } from "../../lib/utils";
@@ -68,6 +69,7 @@ const activityIcons: Record<ActivityType, React.ComponentType<{ className?: stri
   mcp_call: Plug,
   execution_timeline: ListOrdered,
   flow_execution: GitBranch,
+  canvas: LayoutDashboard,
 };
 
 /**

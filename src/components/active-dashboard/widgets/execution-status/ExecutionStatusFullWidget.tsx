@@ -25,10 +25,10 @@ import { CompressionStatusSection } from "../../../execution-status/CompressionS
 import { HookExecutionSection } from "../../../execution-status/HookExecutionSection";
 import { SubStepProgressWidget } from "../sub-step-progress";
 import { EmptyState } from "../shared";
-import { getStatusColors, getAccentColors } from "@/design-system";
+import { getAccentColors } from "@/design-system";
+import { getStatusInfo } from "./utils";
 import type { BaseWidgetProps } from "../../../../types/dashboard/widget-props";
 import type { ExecutionStatusWidgetData } from "./types";
-import type { ExecutionStatus as ExecutionStatusType } from "../../../../types/executionStatus";
 
 interface ExecutionStatusFullWidgetProps extends BaseWidgetProps {
   data: ExecutionStatusWidgetData;
@@ -72,42 +72,6 @@ function CollapsibleSection({
       {!isCollapsed && <div className="px-4 pb-4">{children}</div>}
     </div>
   );
-}
-
-function getStatusInfo(status: ExecutionStatusType["status"]) {
-  switch (status) {
-    case "running":
-      return {
-        color: getStatusColors("running"),
-        label: "Running",
-        dotClass: "bg-green-500 animate-pulse",
-      };
-    case "completed":
-      return {
-        color: getStatusColors("success"),
-        label: "Completed",
-        dotClass: "bg-green-500",
-      };
-    case "failed":
-      return {
-        color: getStatusColors("error"),
-        label: "Failed",
-        dotClass: "bg-red-500",
-      };
-    case "paused":
-      return {
-        color: getStatusColors("warning"),
-        label: "Paused",
-        dotClass: "bg-amber-500",
-      };
-    case "idle":
-    default:
-      return {
-        color: { bg: "bg-muted/50", text: "text-muted-foreground", border: "border-muted" },
-        label: "Idle",
-        dotClass: "bg-muted-foreground",
-      };
-  }
 }
 
 export function ExecutionStatusFullWidget({ data }: ExecutionStatusFullWidgetProps) {

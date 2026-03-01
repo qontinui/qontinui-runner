@@ -147,21 +147,40 @@ pub async fn send_user_message(
         }
     }
 
-    // If this is the first user interaction, prepend a context note so the AI
-    // switches from terse autonomous output to conversational responses.
-    let effective_message = if !session.has_user_interacted() {
+    // Build the effective message by prepending any pending context (system notes
+    // from workflow generation, etc.) and the first-interaction note if applicable.
+    // Pending context is delivered WITH the next user message rather than as a
+    // standalone message, so Claude doesn't produce an unwanted response turn.
+    let mut prefix_parts: Vec<String> = Vec::new();
+
+    // Drain pending context (system notes queued since last user message)
+    if let Some(pending) = session_manager.drain_pending_context(&task_run_id) {
+        info!(
+            "Prepending pending context to user message for task_run_id={}",
+            task_run_id
+        );
+        prefix_parts.push(pending);
+    }
+
+    // First-interaction context switch
+    if !session.has_user_interacted() {
         info!(
             "First user interaction detected for task_run_id={}, injecting context switch note",
             task_run_id
         );
-        format!(
+        prefix_parts.push(
             "[SYSTEM NOTE: A user is now watching and interacting with this session. \
              Please acknowledge their message and respond conversationally while continuing \
-             your work. The user's message follows.]\n\n{}",
-            message
-        )
-    } else {
+             your work. The user's message follows.]"
+                .to_string(),
+        );
+    }
+
+    let effective_message = if prefix_parts.is_empty() {
         message.clone()
+    } else {
+        prefix_parts.push(message.clone());
+        prefix_parts.join("\n\n")
     };
 
     match session.send_user_message(&effective_message) {
@@ -609,6 +628,8 @@ pub async fn generate_workflow_from_chat(
         include_ui_bridge_instructions: include_ui_bridge,
         reflection_mode: None,
         investigate_codebase: Some(true),
+        include_design_guidance: None,
+        auto_run: None,
     };
 
     // Emit a UI-only note that generation is starting (not sent to AI session —
@@ -815,22 +836,12 @@ pub async fn generate_workflow_from_chat(
                         }
                     }
 
-                    // Send to the Claude CLI session so it knows to stop responding.
-                    // If Processing (mid-turn), it will be queued and sent when the
-                    // current turn finishes.
-                    if let Some(session) = session_manager.get(&task_run_id) {
-                        match session.send_user_message(&system_note) {
-                            Ok(immediate) => {
-                                info!(
-                                    "Sent system note to Claude session (immediate={})",
-                                    immediate
-                                );
-                            }
-                            Err(e) => {
-                                warn!("Failed to send system note to Claude session: {}", e);
-                            }
-                        }
-                    }
+                    // Queue as pending context — will be prepended to the next user
+                    // message so Claude learns about the generation without triggering
+                    // an extra response turn (every standalone message to Claude
+                    // triggers a response, which is why VS Code CLI doesn't have this
+                    // problem — it never injects automated messages).
+                    session_manager.push_pending_context(&task_run_id, system_note);
                 }
             }
 
@@ -869,20 +880,8 @@ pub async fn generate_workflow_from_chat(
                     }
                 }
 
-                // Send failure note to Claude CLI session too
-                if let Some(session) = session_manager.get(&task_run_id) {
-                    match session.send_user_message(&fail_note) {
-                        Ok(immediate) => {
-                            info!(
-                                "Sent failure note to Claude session (immediate={})",
-                                immediate
-                            );
-                        }
-                        Err(e) => {
-                            warn!("Failed to send failure note to Claude session: {}", e);
-                        }
-                    }
-                }
+                // Queue as pending context for next user message
+                session_manager.push_pending_context(&task_run_id, fail_note);
             }
 
             Ok(CommandResponse {

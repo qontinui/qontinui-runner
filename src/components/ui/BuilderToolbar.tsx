@@ -80,7 +80,7 @@ function ActionButton({ action }: { action: BuilderToolbarAction }) {
           title={action.title || action.label}
         >
           <Icon className="w-3.5 h-3.5" />
-          {showLabel && <span>{action.label}</span>}
+          {showLabel && <span className="whitespace-nowrap">{action.label}</span>}
         </button>
       </>
     );
@@ -100,7 +100,7 @@ function ActionButton({ action }: { action: BuilderToolbarAction }) {
         title={action.title || action.label}
       >
         <Icon className="w-3.5 h-3.5" />
-        {showLabel && <span>{action.label}</span>}
+        {showLabel && <span className="whitespace-nowrap">{action.label}</span>}
       </a>
     );
   }
@@ -122,7 +122,7 @@ function ActionButton({ action }: { action: BuilderToolbarAction }) {
       title={action.title || action.label}
     >
       <Icon className="w-3.5 h-3.5" />
-      {showLabel && <span>{action.label}</span>}
+      {showLabel && <span className="whitespace-nowrap">{action.label}</span>}
     </button>
   );
 }
@@ -145,7 +145,7 @@ function ActionButton({ action }: { action: BuilderToolbarAction }) {
  */
 export function BuilderToolbar({ actions, className = "" }: BuilderToolbarProps) {
   return (
-    <div className={`flex items-center gap-1 ${className}`}>
+    <div className={`flex items-center gap-2 ${className}`}>
       {actions.map((action) => (
         <ActionButton key={action.key} action={action} />
       ))}
@@ -217,7 +217,7 @@ export const toolbarActions = {
     icon: Plus,
     label,
     onClick,
-    title: `Create new ${label.toLowerCase()}`,
+    title: label === "New" ? "Create new" : `Create new ${label.toLowerCase()}`,
   }),
 
   /** Import action with file input */

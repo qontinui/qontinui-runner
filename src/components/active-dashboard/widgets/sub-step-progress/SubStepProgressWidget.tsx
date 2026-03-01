@@ -5,7 +5,6 @@
  * Shows current step, progress bar, and completed steps list.
  */
 
-import React from "react";
 import {
   ChevronDown,
   ChevronRight,

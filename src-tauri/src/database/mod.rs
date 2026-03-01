@@ -5542,6 +5542,86 @@ impl CheckpointDb {
             info!("Successfully migrated to version 74 (investigation columns)");
         }
 
+        if current_version < 75 {
+            info!("Migrating to version 75 (workflow triggers system)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS workflow_triggers (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT,
+                    trigger_type TEXT NOT NULL,
+                    trigger_config TEXT NOT NULL,
+                    workflow_id TEXT NOT NULL,
+                    workflow_overrides TEXT,
+                    conditions TEXT DEFAULT '[]',
+                    debounce_ms INTEGER DEFAULT 1000,
+                    cooldown_seconds INTEGER DEFAULT 60,
+                    max_concurrent INTEGER DEFAULT 1,
+                    enabled BOOLEAN DEFAULT 1,
+                    last_triggered_at TEXT,
+                    last_execution_id TEXT,
+                    trigger_count INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (workflow_id) REFERENCES unified_workflows(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_workflow_triggers_type ON workflow_triggers(trigger_type);
+                CREATE INDEX IF NOT EXISTS idx_workflow_triggers_enabled ON workflow_triggers(enabled);
+
+                CREATE TABLE IF NOT EXISTS trigger_history (
+                    id TEXT PRIMARY KEY,
+                    trigger_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    event_data TEXT DEFAULT '{}',
+                    action TEXT NOT NULL,
+                    task_run_id TEXT,
+                    error_message TEXT,
+                    triggered_at TEXT NOT NULL,
+                    FOREIGN KEY (trigger_id) REFERENCES workflow_triggers(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_trigger_history_trigger_id ON trigger_history(trigger_id);
+                CREATE INDEX IF NOT EXISTS idx_trigger_history_triggered_at ON trigger_history(triggered_at);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (75, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 75: {}", e))?;
+
+            info!("Successfully migrated to version 75 (workflow triggers system)");
+        }
+
+        if current_version < 76 {
+            info!("Migrating to version 76 (canvas panels)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS canvas_panels (
+                    id TEXT PRIMARY KEY,
+                    task_run_id TEXT NOT NULL,
+                    component TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    data_json TEXT NOT NULL,
+                    priority INTEGER DEFAULT 50,
+                    size TEXT DEFAULT 'normal',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_canvas_panels_task_run_id ON canvas_panels(task_run_id);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (76, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 76: {}", e))?;
+
+            info!("Successfully migrated to version 76 (canvas panels)");
+        }
+
         Ok(())
     }
 
@@ -18556,6 +18636,110 @@ impl CheckpointDb {
         )
         .map_err(|e| format!("Failed to update example_status: {}", e))?;
         Ok(())
+    }
+
+    // ========================================================================
+    // Canvas Panels (A2UI)
+    // ========================================================================
+
+    /// Insert or update a canvas panel.
+    pub fn insert_or_update_canvas_panel(
+        &self,
+        panel: &crate::mcp::canvas::StoredPanel,
+    ) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        let data_json = panel.data.to_string();
+
+        conn.execute(
+            r#"
+            INSERT INTO canvas_panels (id, task_run_id, component, title, data_json, priority, size, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(id) DO UPDATE SET
+                component = ?3,
+                title = ?4,
+                data_json = ?5,
+                priority = ?6,
+                size = ?7,
+                updated_at = ?9
+            "#,
+            params![
+                panel.panel_id,
+                panel.task_run_id,
+                panel.component,
+                panel.title,
+                data_json,
+                panel.priority,
+                panel.size,
+                panel.created_at,
+                panel.updated_at,
+            ],
+        )
+        .map_err(|e| format!("Failed to upsert canvas panel: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Get all canvas panels for a task run.
+    pub fn get_canvas_panels_for_task_run(
+        &self,
+        task_run_id: &str,
+    ) -> Result<Vec<crate::mcp::canvas::StoredPanel>, String> {
+        let conn = self.get_conn()?;
+
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT id, task_run_id, component, title, data_json, priority, size, created_at, updated_at
+                FROM canvas_panels
+                WHERE task_run_id = ?1
+                ORDER BY priority ASC, created_at ASC
+                "#,
+            )
+            .map_err(|e| format!("Failed to prepare canvas panels query: {}", e))?;
+
+        let panels = stmt
+            .query_map(params![task_run_id], |row| {
+                let data_json: String = row.get(4)?;
+                let data: serde_json::Value =
+                    serde_json::from_str(&data_json).unwrap_or(serde_json::json!({}));
+                Ok(crate::mcp::canvas::StoredPanel {
+                    panel_id: row.get(0)?,
+                    task_run_id: row.get(1)?,
+                    component: row.get(2)?,
+                    title: row.get(3)?,
+                    data,
+                    priority: row.get(5)?,
+                    size: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                })
+            })
+            .map_err(|e| format!("Failed to query canvas panels: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(panels)
+    }
+
+    /// Delete a single canvas panel.
+    pub fn delete_canvas_panel(&self, panel_id: &str) -> Result<bool, String> {
+        let conn = self.get_conn()?;
+        let rows = conn
+            .execute("DELETE FROM canvas_panels WHERE id = ?1", params![panel_id])
+            .map_err(|e| format!("Failed to delete canvas panel: {}", e))?;
+        Ok(rows > 0)
+    }
+
+    /// Clear all canvas panels for a task run.
+    pub fn clear_canvas_panels_for_task_run(&self, task_run_id: &str) -> Result<usize, String> {
+        let conn = self.get_conn()?;
+        let rows = conn
+            .execute(
+                "DELETE FROM canvas_panels WHERE task_run_id = ?1",
+                params![task_run_id],
+            )
+            .map_err(|e| format!("Failed to clear canvas panels: {}", e))?;
+        Ok(rows)
     }
 }
 

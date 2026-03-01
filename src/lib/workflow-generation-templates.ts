@@ -21,6 +21,7 @@ export interface WorkflowGenerationTemplate {
     discoveryMode?: "auto" | "enabled" | "disabled";
     category?: string;
     tags?: string;
+    includeDesignGuidance?: boolean;
   };
 }
 
@@ -302,6 +303,105 @@ List endpoints (or leave blank to auto-discover from OpenAPI/swagger):
 6. Generate a deployment health report with pass/fail per flow`,
     advancedDefaults: {
       category: "testing",
+    },
+  },
+  {
+    id: "design-quality-review",
+    name: "Design Quality Review",
+    icon: "Palette",
+    description: "Evaluate UX and visual polish using UI Bridge quality metrics + AI analysis",
+    content: `Evaluate a page's design quality in two phases: UX first, then visual polish.
+
+## Application
+- URL: [APP_URL, e.g. http://localhost:3001]
+- Page: [PAGE_PATH, e.g. /admin, /dashboard]
+
+## Phase 1: UX Evaluation (Do This First)
+Run the quality evaluator and focus on UX metrics:
+1. Connect to the app via UI Bridge
+2. Navigate to the target page
+3. Run sdk_design_evaluate with context "general"
+4. Review UX-category metrics: contentOverflow, aboveFoldRatio, informationDensity, containerEfficiency, viewportUtilization
+5. For each UX issue found, create a verification step that checks the specific metric
+
+Ask yourself:
+- Can the user see the most important content without scrolling?
+- Is screen space used efficiently, or are containers oversized for their data?
+- Is content reachable? What percentage is below the fold?
+- Does the layout use the full viewport, or waste large regions?
+
+## Phase 2: Visual Polish (After UX Is Addressed)
+Only focus on polish after UX metrics score well (>70):
+1. Re-run sdk_design_evaluate
+2. Review polish metrics: spacing, color, typography, consistency
+3. Also review qualitatively — things metrics can't catch:
+   - Does the visual hierarchy match importance hierarchy?
+   - Are related items grouped logically?
+   - Is the page scannable? Can you find key info in 3 seconds?
+   - Are interactive elements clearly distinguishable from static content?
+   - Is there a clear primary action on the page?
+
+## Critical Constraint: Preserve All Information
+When implementing style or layout refactors, ALL information and functionality from the original page MUST be retained. A UX improvement means better presentation of the same data — never removal of content. If the original page shows 8 tabs, 6 metrics, or a table with 7 columns, the redesigned version must include all of them. Reformat, reorganize, and restyle freely, but do not drop features, sections, or data fields.
+
+## Phase 3: Recommendations
+For each finding, generate an agentic prompt step that:
+- Describes the specific issue with element IDs
+- Explains why it hurts usability or polish
+- Suggests a concrete fix within the existing design system
+- Ensures all original information and features are preserved in the fix`,
+    advancedDefaults: {
+      discoveryMode: "enabled",
+      category: "review",
+      includeDesignGuidance: true,
+    },
+  },
+  {
+    id: "frontend-design-implementation",
+    name: "Frontend Design Implementation",
+    icon: "Paintbrush",
+    description:
+      "Implement or redesign a frontend page with intentional design direction and quality verification",
+    content: `Implement or redesign a frontend page with a specific design direction, ensuring high visual quality and UX.
+
+## Project
+- Path: [PROJECT_PATH, e.g. C:\\Users\\me\\my-app]
+- Framework: [FRAMEWORK, e.g. Next.js 15, Vite + React]
+- App URL when running: [APP_URL, e.g. http://localhost:3000]
+
+## Design Brief
+- Page/Route: [PAGE_PATH, e.g. /dashboard, /landing, /settings]
+- Purpose: [What this page does and who it's for]
+- Key content: [List the main content sections, data displays, or interactive elements]
+
+## Aesthetic Direction
+Pick one (or describe your own):
+- [ ] Brutalist — raw, bold, monospace, harsh contrasts
+- [ ] Minimalist — generous whitespace, single accent, typography-driven
+- [ ] Retro-futuristic — neon accents, dark backgrounds, tech-inspired
+- [ ] Editorial — magazine-like layouts, dramatic type scale, asymmetric
+- [ ] Organic — soft curves, natural colors, flowing layouts
+- [ ] Industrial — exposed structure, monochrome with accent, dense information
+- [ ] Custom: [DESCRIBE_YOUR_DIRECTION]
+
+## Typography & Color Preferences (optional)
+- Font pairing: [e.g. "Space Grotesk for headings, Inter for body" or "surprise me"]
+- Color mood: [e.g. "warm earth tones", "cool professional blues", "high-contrast dark mode"]
+- Inspirations: [Any reference sites, styles, or moods to draw from]
+
+## Instructions
+1. Analyze the current page state (if it exists) via UI Bridge
+2. Implement the design following the aesthetic direction above
+3. Apply the design guidance principles (typography hierarchy, color cohesion, spatial composition, motion)
+4. Ensure all original content and functionality is preserved if redesigning
+5. Run sdk_design_evaluate to verify design quality scores
+6. Iterate on any metrics scoring below 70
+7. Add data-ui-id attributes and UI Bridge instrumentation to new elements`,
+    advancedDefaults: {
+      discoveryMode: "enabled",
+      category: "design",
+      tags: "frontend, design",
+      includeDesignGuidance: true,
     },
   },
   {

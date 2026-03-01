@@ -187,6 +187,17 @@ pub enum AppEvent {
     },
 
     // ========================================================================
+    // Canvas Events
+    // ========================================================================
+    /// Canvas panel created, updated, or removed.
+    CanvasUpdate {
+        action: String,
+        panel_id: String,
+        panel: Option<serde_json::Value>,
+        task_run_id: Option<String>,
+    },
+
+    // ========================================================================
     // Generic Events
     // ========================================================================
     /// Generic error event.
@@ -236,6 +247,9 @@ impl AppEvent {
             AppEvent::OrchestratorStateChange { .. } => "orchestrator-state-change",
             AppEvent::StepProgress { .. } => "step-progress",
             AppEvent::TaskRunUpdate { .. } => "task-run-update",
+
+            // Canvas events
+            AppEvent::CanvasUpdate { .. } => "canvas-update",
 
             // Generic events
             AppEvent::Error { .. } => "error",

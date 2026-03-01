@@ -192,20 +192,21 @@ pub fn build_meta_workflow_template(
                 }));
             }
 
-            steps.push(json!({
-                "id": Uuid::new_v4().to_string(),
-                "name": "Generate workflow from description",
-                "type": "prompt",
-                "phase": "setup",
-                "prompt_mode": "response",
-                "content": builder_prompt,
-                "input_path": if request.investigate_codebase.unwrap_or(true) {
-                    "{{artifact_dir}}/investigation.md"
-                } else {
-                    ""
-                },
-                "output_path": "{{artifact_dir}}/workflow.json"
-            }));
+            {
+                let mut step = json!({
+                    "id": Uuid::new_v4().to_string(),
+                    "name": "Generate workflow from description",
+                    "type": "prompt",
+                    "phase": "setup",
+                    "prompt_mode": "response",
+                    "content": builder_prompt,
+                    "output_path": "{{artifact_dir}}/workflow.json"
+                });
+                if request.investigate_codebase.unwrap_or(true) {
+                    step["input_path"] = json!("{{artifact_dir}}/investigation.md");
+                }
+                steps.push(step);
+            }
 
             steps
         },

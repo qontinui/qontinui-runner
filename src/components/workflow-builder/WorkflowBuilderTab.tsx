@@ -1607,6 +1607,7 @@ function WorkflowBuilderContent({
               {filteredWorkflows.map((workflow) => (
                 <button
                   key={workflow.id}
+                  aria-label={`${isWorkflowSelectionMode ? "Select" : "Open"} workflow: ${workflow.name}`}
                   data-ui-id={`workflow-builder-list-item-${workflow.id}`}
                   onClick={() => {
                     if (isWorkflowSelectionMode) {
@@ -1738,7 +1739,7 @@ function WorkflowBuilderContent({
                 onClick={handleRun}
                 disabled={isEmpty}
                 className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-blue-600 hover:bg-blue-500 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                title="Run workflow"
+                title={isEmpty ? "Add steps to run this workflow" : "Run workflow"}
                 data-ui-id="workflow-builder-run-btn"
               >
                 <Play className="w-4 h-4" />

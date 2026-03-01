@@ -748,6 +748,7 @@ impl LoopController {
                     model_override: stage.model.clone(),
                     stage_index: Some(stage_idx as u32),
                     max_sessions: config.max_sessions,
+                    auto_run_generated: false,
                 };
 
                 // Handle agentic-first: run the agentic phase before the verification loop.
@@ -1159,6 +1160,37 @@ impl LoopController {
             });
         }
 
+        // Auto-run generated workflow (for "Generate & Run" flow)
+        if config.auto_run_generated && overall_passed {
+            let deps = super::auto_run::AutoRunDeps {
+                app_state: self.app_state.clone(),
+                config_storage: self.config_storage.clone(),
+                app_handle: self.app_handle.clone(),
+                pid_tracker: self.pid_tracker.clone(),
+            };
+            let meta_task_run_id = config.execution_id.clone();
+
+            tokio::spawn(async move {
+                // Delay to allow result_data to be fully written
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+                match super::auto_run::launch_generated_workflow(deps, &meta_task_run_id) {
+                    Ok(task_run_id) => {
+                        info!(
+                            "Auto-run launched generated workflow {} for {}",
+                            task_run_id, meta_task_run_id
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to auto-run generated workflow for {}: {}",
+                            meta_task_run_id, e
+                        );
+                    }
+                }
+            });
+        }
+
         WorkflowResult {
             success: overall_passed,
             verification_passed: overall_passed,
@@ -1252,7 +1284,7 @@ impl LoopController {
                             max_iterations_reached: true,
                             critical_failure: false,
                             was_stopped: false,
-                            unfixable_errors: false,
+                            unfixable_errors: true,
                             iteration_results,
                         };
                     }
@@ -1289,7 +1321,7 @@ impl LoopController {
                     max_iterations_reached: true,
                     critical_failure: false,
                     was_stopped: false,
-                    unfixable_errors: false,
+                    unfixable_errors: true,
                     iteration_results,
                 };
             }
@@ -2585,6 +2617,7 @@ pub async fn resume_interrupted_workflows(
                                 model_override: None,
                                 stage_index: None,
                                 max_sessions: Some(workflow.max_iterations),
+                                auto_run_generated: false,
                             };
 
                             controller
@@ -2719,6 +2752,7 @@ pub async fn resume_interrupted_workflows(
                                 model_override: None,
                                 stage_index: None,
                                 max_sessions: Some(workflow.max_iterations),
+                                auto_run_generated: false,
                             };
 
                             controller

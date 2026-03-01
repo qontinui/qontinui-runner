@@ -126,8 +126,11 @@ export function RetryStatusSection({ retry }: RetryStatusSectionProps) {
             {state.errorHistory
               .slice()
               .reverse()
-              .map((attempt, index) => (
-                <div key={index} className="text-xs bg-muted/30 rounded px-2 py-1.5 space-y-0.5">
+              .map((attempt) => (
+                <div
+                  key={attempt.attemptNumber}
+                  className="text-xs bg-muted/30 rounded px-2 py-1.5 space-y-0.5"
+                >
                   <div className="flex items-center justify-between">
                     <span className="font-medium text-foreground">
                       Attempt {attempt.attemptNumber}

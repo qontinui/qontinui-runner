@@ -67,6 +67,7 @@ mod scheduler;
 mod scheduler_service;
 mod secure_storage;
 mod settings;
+mod skills;
 mod state_explorer;
 mod step_event_builder;
 mod step_executor;
@@ -83,6 +84,7 @@ mod test_orchestrator;
 mod tiered_info;
 mod timeout_config;
 mod tracing_layers;
+mod trigger_system;
 mod unified_ai_session;
 mod unified_workflow_executor;
 mod unified_workflows;
@@ -286,6 +288,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         process_capture_manager: TokioMutex::new(None), // Initialized in setup()
         api_ready: AtomicBool::new(false),              // Set when MCP API server binds
         ai_pid_tracker: Arc::new(std::sync::Mutex::new(Vec::new())),
+        canvas_state: Arc::new(tokio::sync::RwLock::new(
+            crate::mcp::canvas::CanvasState::new(),
+        )),
     });
     let mcp_app_state = shared_app_state.clone();
     let mcp_rag_state = rag_state.clone();

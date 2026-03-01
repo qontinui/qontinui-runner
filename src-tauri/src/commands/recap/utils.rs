@@ -247,7 +247,12 @@ pub fn extract_output_summary(output_log: &str) -> Option<String> {
                 || trimmed.starts_with("[FINDING:")
                 || trimmed == "[/FINDING]"
                 || trimmed.starts_with("---")
-                || trimmed.starts_with("==="))
+                || trimmed.starts_with("===")
+                // Filter raw step execution log lines
+                || trimmed.starts_with("Steps:")
+                || trimmed.starts_with("Success:")
+                || trimmed.starts_with("[OK]")
+                || trimmed.starts_with("[FAIL]"))
         })
         .collect();
 

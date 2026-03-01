@@ -217,8 +217,8 @@ export function HookExecutionSection({ hooks }: HookExecutionSectionProps) {
             {executionHistory
               .slice()
               .reverse()
-              .map((result, index) => (
-                <HookResultItem key={index} result={result} />
+              .map((result) => (
+                <HookResultItem key={`${result.hookId}-${result.timestamp}`} result={result} />
               ))}
           </div>
         </div>

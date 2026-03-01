@@ -10,12 +10,17 @@ use super::state::SessionState;
 /// Manages active Claude CLI sessions, keyed by task_run_id.
 pub struct SessionManager {
     sessions: Mutex<HashMap<String, Arc<ClaudeSession>>>,
+    /// Pending context to prepend to the next user message for a given task_run_id.
+    /// Used for system notes that should be delivered with the next user message
+    /// rather than sent as standalone messages (which would trigger unwanted response turns).
+    pending_context: Mutex<HashMap<String, Vec<String>>>,
 }
 
 impl SessionManager {
     pub fn new() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            pending_context: Mutex::new(HashMap::new()),
         }
     }
 
@@ -109,6 +114,44 @@ impl SessionManager {
                 info!("SessionManager: cleaned up {} closed sessions", removed);
             }
         }
+    }
+
+    /// Add pending context that will be prepended to the next user message.
+    /// This is used for system notes that Claude should see but that should NOT
+    /// trigger a standalone response turn.
+    pub fn push_pending_context(&self, task_run_id: &str, context: String) {
+        if let Ok(mut guard) = self.pending_context.lock() {
+            let len = context.len();
+            guard
+                .entry(task_run_id.to_string())
+                .or_default()
+                .push(context);
+            info!(
+                "SessionManager: queued pending context for {} ({} chars)",
+                task_run_id, len
+            );
+        }
+    }
+
+    /// Drain all pending context for a task_run_id, returning it as a single
+    /// string to prepend to the next user message. Returns None if no pending context.
+    pub fn drain_pending_context(&self, task_run_id: &str) -> Option<String> {
+        if let Ok(mut guard) = self.pending_context.lock() {
+            if let Some(contexts) = guard.remove(task_run_id) {
+                if contexts.is_empty() {
+                    return None;
+                }
+                let combined = contexts.join("\n\n");
+                info!(
+                    "SessionManager: drained {} pending context(s) for {} ({} chars)",
+                    contexts.len(),
+                    task_run_id,
+                    combined.len()
+                );
+                return Some(combined);
+            }
+        }
+        None
     }
 
     /// Close and remove all active sessions (used during app shutdown or stop-all).

@@ -34,7 +34,8 @@ export type ActivityType =
   | "workflow_ref"
   | "mcp_call"
   | "execution_timeline"
-  | "flow_execution";
+  | "flow_execution"
+  | "canvas";
 
 /**
  * Status of an individual activity.
@@ -198,6 +199,12 @@ export const ACTIVITY_DISPLAY_CONFIG: Record<ActivityType, ActivityDisplayConfig
     accentColor: "emerald",
     detailRoute: "/flow-designer",
   },
+  canvas: {
+    displayName: "Canvas",
+    icon: "LayoutDashboard",
+    accentColor: "rose",
+    detailRoute: "/canvas",
+  },
 };
 
 /**
@@ -217,6 +224,7 @@ export const ACTIVITY_PRIORITIES: Record<ActivityType, number> = {
   verification: 27,
   findings: 30,
   execution_status: 35,
+  canvas: 3,
 };
 
 /**

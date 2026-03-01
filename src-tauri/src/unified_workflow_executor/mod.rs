@@ -56,6 +56,7 @@
 //! }
 //! ```
 
+pub(crate) mod auto_run;
 mod loop_controller;
 mod phase_configs;
 mod phases;

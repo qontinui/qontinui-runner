@@ -97,6 +97,15 @@ pub struct GenerateWorkflowRequest {
     /// Whether to run an AI investigation step before the builder agent (default: true)
     #[serde(default = "default_true")]
     pub investigate_codebase: Option<bool>,
+
+    /// Whether to include frontend design quality guidance in the builder prompt (default: false)
+    #[serde(default)]
+    pub include_design_guidance: Option<bool>,
+
+    /// Whether to automatically run the generated workflow after the meta-workflow completes.
+    /// When true, the backend will spawn the generated workflow without relying on frontend polling.
+    #[serde(default)]
+    pub auto_run: Option<bool>,
 }
 
 fn default_true() -> Option<bool> {
@@ -123,6 +132,8 @@ impl Default for GenerateWorkflowRequest {
             include_ui_bridge_instructions: Some(true),
             reflection_mode: Some(true),
             investigate_codebase: Some(true),
+            include_design_guidance: None,
+            auto_run: None,
         }
     }
 }
@@ -578,6 +589,9 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
     if request.include_ui_bridge_instructions.unwrap_or(true) {
         sections.push(UI_BRIDGE_INSTRUCTIONS.to_string());
     }
+    if request.include_design_guidance.unwrap_or(false) {
+        sections.push(FRONTEND_DESIGN_INSTRUCTIONS.to_string());
+    }
     sections.push(user_prompt.clone());
     let full_prompt = sections.join("\n\n");
 
@@ -890,6 +904,65 @@ For verification steps that check the frontend, prefer UI Bridge SDK endpoints o
 - Use `sdk_page_navigate` / `sdk_page_refresh` for navigation
 
 These instructions enable the runner to discover, inspect, and control the frontend programmatically for automated testing and verification."#;
+
+/// Frontend design quality guidance injected into the builder prompt
+/// when `include_design_guidance` is true (opt-in, default false).
+const FRONTEND_DESIGN_INSTRUCTIONS: &str = r#"## Frontend Design Quality Guidance
+
+When generating agentic prompts that create or modify frontend UI, include these design principles to ensure high-quality, distinctive results.
+
+### Anti-AI-Slop Rules
+Avoid these hallmarks of generic AI-generated UIs:
+- Default system fonts with no typographic personality
+- Purple/blue gradient backgrounds used decoratively
+- Scattered micro-interactions with no purpose
+- Perfectly symmetric grid layouts with equal-weight cards
+- Generic hero sections with stock-style placeholder text
+- Overuse of rounded corners and soft shadows on everything
+
+### Typography
+- Choose distinctive fonts that match the project's personality — not just Inter/system-ui
+- Pair fonts strategically: one for headings, one for body (max two families)
+- Use extreme weight variation (e.g., 900 for headings, 300 for body) to create hierarchy
+- Size hierarchy should be meaningful: if everything is 14-16px, nothing stands out
+
+### Color
+- Build a cohesive palette (3-5 colors max) with intentional relationships
+- Define colors as CSS custom properties for consistency
+- Consider emotional tone: warm palettes feel approachable, cool palettes feel professional
+- Backgrounds should be intentional — not just white/gray/dark. Subtle tints create atmosphere
+
+### Motion & Transitions
+- Orchestrate transitions so elements enter in a logical sequence, not all at once
+- Use staggered reveals for lists and grids (50-100ms delay between items)
+- Animation should communicate state changes, not just decorate
+- Prefer CSS transitions over JavaScript animation libraries for simple effects
+
+### Spatial Composition
+- Break out of symmetric grids — use asymmetric layouts for visual interest
+- Negative space is a design tool, not wasted space. Let content breathe
+- Think in terms of composition (focal point, flow, balance) not just constraint grids
+- Vary content density across sections to create rhythm
+
+### Visual Atmosphere
+- Layer multiple shadow values for realistic depth (not just `shadow-lg`)
+- Subtle textures, noise, or gradients add warmth and reduce flatness
+- Consider backdrop-filter (blur, saturate) for glass-morphism effects where appropriate
+- Depth should serve hierarchy: elevated elements are more important
+
+### Aesthetic Directions (pick one that fits the project)
+- **Brutalist**: Raw, bold, intentionally rough. Monospace fonts, harsh contrasts, visible structure
+- **Minimalist**: Maximum restraint. Generous whitespace, single accent color, typography-driven
+- **Retro-futuristic**: Neon accents, dark backgrounds, tech-inspired typography, scan lines
+- **Editorial**: Magazine-like layouts, dramatic type scale, asymmetric image placement
+- **Organic**: Soft curves, natural color palettes, hand-drawn elements, flowing layouts
+- **Industrial**: Exposed structure, monochrome with accent, dense information display
+
+### Verification Integration
+Pair design implementation with `sdk_design_evaluate` verification steps to measure spacing consistency, color usage, typography hierarchy, and overall design quality scores.
+
+### Preservation Constraint
+When redesigning or restyling existing pages, ALL original information, features, data fields, and functionality MUST be retained. Design improvements mean better presentation of the same content — never removal of content."#;
 
 /// Hardcoded fallback verification checks, used when no DB connection is available.
 const FALLBACK_VERIFICATION_CHECKS: &str = r#"## What to check

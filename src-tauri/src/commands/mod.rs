@@ -167,6 +167,9 @@ pub struct AppState {
     /// Shared PID tracker for spawned AI (Claude CLI) processes.
     /// Shared between AppState (for shutdown cleanup) and ApiState (for stop endpoints).
     pub ai_pid_tracker: Arc<Mutex<Vec<u32>>>,
+    /// In-memory canvas state for A2UI panels.
+    /// Agent sends structured JSON panels via HTTP; frontend renders them.
+    pub canvas_state: Arc<tokio::sync::RwLock<crate::mcp::canvas::CanvasState>>,
 }
 
 /// Standard response structure for command handlers.

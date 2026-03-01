@@ -27,6 +27,8 @@ import {
   Rocket,
   ListOrdered,
   Plug,
+  Palette,
+  Paintbrush,
   X,
   Save,
   AlertCircle,
@@ -53,6 +55,8 @@ const TEMPLATE_ICONS: Record<string, LucideIcon> = {
   Rocket,
   ListOrdered,
   Plug,
+  Palette,
+  Paintbrush,
 };
 
 // Provider and model constants
@@ -192,6 +196,7 @@ export function AiGeneratePanel({
   const [maxFixIterations, setMaxFixIterations] = useState("");
   const [autoIncludeContexts, setAutoIncludeContexts] = useState(true);
   const [investigateCodebase, setInvestigateCodebase] = useState(true);
+  const [includeDesignGuidance, setIncludeDesignGuidance] = useState(false);
   const [discoveryMode, setDiscoveryMode] = useState<"auto" | "enabled" | "disabled">("auto");
 
   // Context section
@@ -321,6 +326,7 @@ export function AiGeneratePanel({
       if (d.discoveryMode) setDiscoveryMode(d.discoveryMode);
       if (d.category) setCategory(d.category);
       if (d.tags) setTagsInput(d.tags);
+      if (d.includeDesignGuidance !== undefined) setIncludeDesignGuidance(d.includeDesignGuidance);
       setShowAdvanced(true);
     }
     setShowTemplates(false);
@@ -420,6 +426,7 @@ export function AiGeneratePanel({
     if (maxFixIterations) request.max_fix_iterations = parseInt(maxFixIterations, 10);
     request.auto_include_contexts = autoIncludeContexts;
     request.investigate_codebase = investigateCodebase;
+    if (includeDesignGuidance) request.include_design_guidance = true;
     if (discoveryMode !== "auto") request.discovery_mode = discoveryMode;
 
     return request;
@@ -434,6 +441,7 @@ export function AiGeneratePanel({
     maxFixIterations,
     autoIncludeContexts,
     investigateCodebase,
+    includeDesignGuidance,
     discoveryMode,
     hasSpecs,
   ]);
@@ -547,28 +555,14 @@ export function AiGeneratePanel({
     setError(null);
     try {
       if (isBatchMode) {
-        const requests = buildBatchRequests();
+        const requests = buildBatchRequests().map((r, i) =>
+          i === 0 ? { ...r, auto_run: true } : r,
+        );
         const results = await Promise.all(requests.map(fireGenerateRequest));
-        // Signal auto-run for the first workflow; others are generate-only
-        if (results.length > 0) {
-          localStorage.setItem(
-            AUTO_RUN_AFTER_GENERATE_KEY,
-            JSON.stringify({
-              taskRunId: results[0],
-              timestamp: Date.now(),
-            } satisfies AutoRunAfterGenerate),
-          );
-        }
         console.log(`[AiGeneratePanel] Batch Generate & Run started: ${results.length} pages`);
       } else {
-        const taskRunId = await fireGenerateRequest(buildGenerateRequest());
-        localStorage.setItem(
-          AUTO_RUN_AFTER_GENERATE_KEY,
-          JSON.stringify({
-            taskRunId,
-            timestamp: Date.now(),
-          } satisfies AutoRunAfterGenerate),
-        );
+        const request = { ...buildGenerateRequest(), auto_run: true };
+        const taskRunId = await fireGenerateRequest(request);
         console.log("[AiGeneratePanel] Generate & Run started:", taskRunId);
       }
       if (description.trim()) {
@@ -1026,6 +1020,25 @@ export function AiGeneratePanel({
                           Run an AI investigation step before generating the workflow. Analyzes
                           project structure to produce a more targeted workflow. Adds ~30s to
                           generation time.
+                        </span>
+                      </span>
+                    </label>
+                  </div>
+                  <div className="flex items-end pb-1">
+                    <label className="flex items-center gap-2 text-sm text-zinc-300 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={includeDesignGuidance}
+                        onChange={(e) => setIncludeDesignGuidance(e.target.checked)}
+                        className="w-4 h-4 rounded border-zinc-600 bg-zinc-800"
+                      />
+                      Design guidance
+                      <span className="relative group">
+                        <Info className="w-3 h-3 text-zinc-500 cursor-help" />
+                        <span className="absolute bottom-full left-1/2 -translate-x-1/2 mb-1 hidden group-hover:block w-52 p-2 bg-zinc-700 border border-zinc-600 rounded text-[10px] text-zinc-300 z-50 shadow-lg">
+                          Include frontend design quality guidance (typography, color, motion,
+                          spatial composition, anti-AI-slop rules) in generated workflows. Enable
+                          for design-focused frontend tasks.
                         </span>
                       </span>
                     </label>

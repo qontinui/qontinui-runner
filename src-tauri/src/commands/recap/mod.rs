@@ -139,8 +139,10 @@ pub async fn get_task_run_recap(
         None
     };
 
-    // Extract summary from output log
-    let summary = utils::extract_output_summary(&task_run.output_log);
+    // Use AI-generated summary only. When absent, the frontend shows
+    // "No AI summary available" with a "Generate Summary" button — much better
+    // than the heuristic extraction which often returns raw AI conversation text.
+    let summary = task_run.summary.clone();
 
     let recap = RecapData {
         task_run_id: task_run.id.clone(),

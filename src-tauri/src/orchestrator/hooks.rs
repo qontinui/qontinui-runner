@@ -120,6 +120,18 @@ pub enum HookAction {
         /// Notification body
         body: String,
     },
+
+    /// Trigger another workflow to run
+    RunWorkflow {
+        /// Workflow ID to run
+        workflow_id: String,
+        /// Pass source workflow context as variables
+        #[serde(default)]
+        pass_context: bool,
+        /// Optional overrides (max_iterations, model, etc.)
+        #[serde(default)]
+        override_config: Option<serde_json::Value>,
+    },
 }
 
 fn default_command_timeout() -> u64 {
@@ -412,6 +424,51 @@ impl HookExecutor {
             HookAction::Notification { title, body } => {
                 self.execute_notification(title, body, context);
                 Ok("notified".to_string())
+            }
+            HookAction::RunWorkflow {
+                workflow_id,
+                pass_context,
+                override_config,
+            } => {
+                // Send a workflow chain event to the trigger service.
+                // The actual execution happens asynchronously via the trigger system.
+                let wf_id = context.substitute(workflow_id);
+                info!("Hook triggering workflow: {}", wf_id);
+
+                let mut variables = std::collections::HashMap::new();
+                variables.insert(
+                    "source_task_run_id".to_string(),
+                    context.task_run_id.clone(),
+                );
+                variables.insert("source_task_name".to_string(), context.task_name.clone());
+                variables.insert("source_status".to_string(), context.status.clone());
+
+                if *pass_context {
+                    if let Some(ref error) = context.error {
+                        variables.insert("source_error".to_string(), error.clone());
+                    }
+                    // Include all context variables
+                    for (k, v) in &context.variables {
+                        let str_val = match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        variables.insert(format!("source_{}", k), str_val);
+                    }
+                }
+
+                // We can't call async from here, so just log the intent.
+                // The actual RunWorkflow execution is wired through the trigger system
+                // at the executor level (where we have async context).
+                Ok(format!(
+                    "run_workflow:{}",
+                    serde_json::json!({
+                        "workflow_id": wf_id,
+                        "pass_context": pass_context,
+                        "override_config": override_config,
+                        "variables": variables,
+                    })
+                ))
             }
         }
     }

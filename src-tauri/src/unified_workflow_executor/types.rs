@@ -178,6 +178,10 @@ pub struct LoopConfig {
     /// Maximum total AI sessions across all stages (None = unlimited).
     /// Checked against the task_run's sessions_count in the database.
     pub max_sessions: Option<u32>,
+    /// Whether to auto-run the generated workflow after a meta-workflow completes.
+    /// When true, the backend reads `result_data.generated_workflow_id` and spawns
+    /// the generated workflow without relying on frontend polling.
+    pub auto_run_generated: bool,
 }
 
 /// Result of the completion sweep phase.

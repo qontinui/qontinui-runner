@@ -147,9 +147,9 @@ export function RoutingStatusSection({ routing }: RoutingStatusSectionProps) {
         <div className="space-y-2">
           <span className="text-xs text-muted-foreground">Decision Factors</span>
           <div className="space-y-1">
-            {decision.factors.map((factor, index) => (
+            {decision.factors.map((factor) => (
               <div
-                key={index}
+                key={factor}
                 className="text-xs bg-muted/30 rounded px-2 py-1 text-muted-foreground"
               >
                 {factor}

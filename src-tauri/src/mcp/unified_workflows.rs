@@ -1111,6 +1111,7 @@ pub async fn generate_unified_workflow_async_handler(
             model_override: None,
             stage_index: None,
             max_sessions: Some(saved_workflow.max_iterations),
+            auto_run_generated: request.auto_run.unwrap_or(false),
         };
 
         // Clone state fields for the background task
@@ -1443,6 +1444,7 @@ pub async fn run_unified_workflow(
             model_override: None,
             stage_index: None,
             max_sessions: Some(workflow.max_iterations),
+            auto_run_generated: false,
         };
 
         let checkpoint_db = state.app_state.checkpoint_db.clone();
@@ -1832,6 +1834,7 @@ pub async fn execute_inline_workflow(
             model_override: None,
             stage_index: None,
             max_sessions: Some(workflow.max_iterations),
+            auto_run_generated: false,
         };
 
         // Spawn in background (non-blocking) — same pattern as run_unified_workflow
@@ -2260,6 +2263,7 @@ pub async fn run_composed_workflow(
                 model_override: None,
                 stage_index: None,
                 max_sessions: Some(10), // Default budget for composed workflows
+                auto_run_generated: false,
             };
 
             // Run the LoopController once with all stages

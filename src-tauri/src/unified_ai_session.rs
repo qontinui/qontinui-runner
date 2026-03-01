@@ -259,6 +259,26 @@ The user will review all findings after the workflow completes. Focus on complet
 "#
 }
 
+/// Build canvas API documentation for the AI agent.
+///
+/// This documents the A2UI canvas panel API so the agent can render
+/// rich visual content in the user's dashboard during execution.
+fn build_canvas_api_docs() -> &'static str {
+    r##"## Canvas Panels
+Render rich visual panels in the user's dashboard:
+
+```bash
+curl -s -X POST http://localhost:9876/canvas/panels \
+  -H "Content-Type: application/json" \
+  -d '{"panel_id":"my-panel","component":"Table","title":"Issues Found","data":{"columns":["File","Issue","Severity"],"rows":[["app.ts","Missing null check","high"]]}}'
+```
+
+Components: Markdown, CodeDiff, Table, KeyValue, Terminal, Alert, Timeline, ProgressChart, Checklist
+
+Update in-place by reusing the same panel_id. Delete: `curl -s -X DELETE http://localhost:9876/canvas/panels/my-panel`
+"##
+}
+
 /// Strip [TASK_COMPLETE] and similar completion marker instructions from prompts.
 ///
 /// In unified workflows, verification determines completion, not the AI.
@@ -799,6 +819,11 @@ impl UnifiedAiSessionExecutor {
         if config.add_autonomous_context {
             let autonomous_context = build_autonomous_execution_context();
             result = format!("{}{}", autonomous_context, result);
+        }
+
+        // Append canvas API documentation for agentic phases
+        if config.add_autonomous_context {
+            result = format!("{}\n\n{}", result, build_canvas_api_docs());
         }
 
         // Append finding instructions if configured

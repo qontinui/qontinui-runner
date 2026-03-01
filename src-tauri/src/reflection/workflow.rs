@@ -37,6 +37,7 @@ pub fn build_reflection_config(
         model_override: None,
         stage_index: None,
         max_sessions: Some(3),
+        auto_run_generated: false,
     }
 }
 

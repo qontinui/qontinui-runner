@@ -284,6 +284,25 @@ pub fn create_router(
         crate::zombie_sweep::start_zombie_sweep(sweep_db, sweep_sm, sweep_handle);
     }
 
+    // Start trigger service (event-driven workflow automation)
+    {
+        let trigger_app_state = api_state.app_state.clone();
+        let trigger_config_storage = api_state.config_storage.clone();
+        let trigger_handle = app_handle.clone();
+        let trigger_pids = api_state.current_ai_pids.clone();
+        tokio::spawn(async move {
+            // Wait for server to be ready
+            tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
+            crate::trigger_system::start_trigger_service(
+                trigger_app_state,
+                trigger_config_storage,
+                trigger_handle,
+                trigger_pids,
+            )
+            .await;
+        });
+    }
+
     // CORS: Permissive (allow any origin) is intentional.
     // This localhost-only API (port 9876) must be accessible from:
     //   - The Tauri webview (tauri://localhost origin)
@@ -306,6 +325,7 @@ pub fn create_router(
         .route("/awas/actions", get(awas_list_actions))
         .route("/awas/extract-elements", post(awas_extract_elements))
         // Module routes
+        .merge(crate::mcp::canvas::routes())
         .merge(crate::mcp::ai_generation::routes())
         .merge(crate::mcp::api_requests::routes())
         .merge(crate::mcp::app_discovery::routes())
@@ -347,6 +367,7 @@ pub fn create_router(
         .merge(crate::mcp::step_type_metadata_api::routes())
         .merge(crate::mcp::task_runs::routes())
         .merge(crate::mcp::testing::routes())
+        .merge(crate::mcp::triggers::routes())
         .merge(crate::mcp::ui_bridge::routes())
         .merge(crate::mcp::unified_workflows::routes())
         .merge(crate::mcp::verification_tests::routes())

@@ -132,6 +132,7 @@ import {
 import { StepBuildersPage } from "./components/StepBuildersPage";
 import { HelpTab } from "./components/HelpTab";
 import { SchedulerTab } from "./components/scheduler";
+import { TriggersTab } from "./components/triggers";
 import { Sidebar } from "./components/navigation";
 import { WorkflowBuilderTab } from "./components/workflow-builder";
 import { ActiveDashboardPage } from "./components/active-dashboard";
@@ -216,6 +217,7 @@ type MainTabId =
   | "config-log-sources"
   | "config-findings"
   | "config-hooks"
+  | "triggers"
   | "tasks"
   | "settings"
   | "settings-account"
@@ -280,6 +282,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "config-log-sources",
   "config-findings",
   "config-hooks",
+  "triggers",
   "tasks",
   "settings",
   "settings-account",
@@ -1399,6 +1402,9 @@ function AppContent() {
             <CaptureTab onLog={addLog} />
           </div>
         );
+
+      case "triggers":
+        return <TriggersTab />;
 
       case "tasks":
         return <SchedulerTab />;
