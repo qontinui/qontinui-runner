@@ -328,7 +328,7 @@ impl SchedulerService {
 
         // Build the request to run workflow via HTTP API
         let client = reqwest::Client::new();
-        let base_url = "http://localhost:9876";
+        let base_url = crate::mcp::types::get_self_base_url_from_env();
 
         // Load config if specified
         if let Some(path) = config_path {
@@ -403,7 +403,7 @@ impl SchedulerService {
 
         // Run prompt via HTTP API
         let client = reqwest::Client::new();
-        let base_url = "http://localhost:9876";
+        let base_url = crate::mcp::types::get_self_base_url_from_env();
 
         let mut request_body = serde_json::json!({
             "prompt_id": prompt_id
@@ -458,7 +458,7 @@ impl SchedulerService {
 
         // Trigger auto-fix via HTTP API
         let client = reqwest::Client::new();
-        let base_url = "http://localhost:9876";
+        let base_url = crate::mcp::types::get_self_base_url_from_env();
 
         // Build the auto-fix prompt (similar to handleAnalyzeAll in ExecutionReport.tsx)
         let prompt = if check_findings {
@@ -599,7 +599,8 @@ After making fixes, run tests if applicable to verify the fixes work."#
     /// Check if runner is idle (not executing workflows or AI tasks)
     async fn check_idle(&self) -> bool {
         let client = reqwest::Client::new();
-        match client.get("http://localhost:9876/status").send().await {
+        let status_url = format!("{}/status", crate::mcp::types::get_self_base_url_from_env());
+        match client.get(&status_url).send().await {
             Ok(resp) => {
                 if let Ok(json) = resp.json::<serde_json::Value>().await {
                     let executor_state = json

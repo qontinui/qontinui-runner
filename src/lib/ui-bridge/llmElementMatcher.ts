@@ -6,6 +6,7 @@
  */
 
 import type { ExternalElement } from "../../types/ui-bridge-types";
+import { getApiBase } from "@/lib/runner-api";
 
 // =============================================================================
 // Types
@@ -235,8 +236,6 @@ If the command is ambiguous, use "click" as default action with lower confidence
 // LLM API Calls
 // =============================================================================
 
-const RUNNER_API = "http://localhost:9876";
-
 interface SimpleQueryRequest {
   prompt: string;
   timeout_seconds?: number;
@@ -257,7 +256,7 @@ async function callLLM(prompt: string, timeoutMs: number): Promise<string | null
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
-    const response = await fetch(`${RUNNER_API}/ai/simple-query`, {
+    const response = await fetch(`${getApiBase()}/ai/simple-query`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -519,7 +518,7 @@ export async function isLLMAvailable(): Promise<boolean> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 5000);
 
-    const response = await fetch(`${RUNNER_API}/health`, {
+    const response = await fetch(`${getApiBase()}/health`, {
       method: "GET",
       signal: controller.signal,
     });

@@ -50,6 +50,8 @@ import {
   createDefaultWorkflow,
   isWorkflowEmpty,
 } from "../../types";
+import { registerUserSkills } from "@qontinui/workflow-utils";
+import { getApiBase } from "@/lib/runner-api";
 
 // Re-export shared types for consumers that may need them
 export type { SharedBuilderState, SharedBuilderAction, SharedBuilderContextValue };
@@ -60,8 +62,6 @@ export type { SharedBuilderState, SharedBuilderAction, SharedBuilderContextValue
 
 const STORAGE_KEY = "qontinui-workflow-builder-draft";
 const STORAGE_KEY_ORIGINAL = "qontinui-workflow-builder-original";
-const API_BASE = "http://localhost:9876";
-
 // Singleton data adapter instance
 const runnerDataAdapter = createRunnerDataAdapter();
 
@@ -710,6 +710,20 @@ function RunnerWorkflowBuilderInner({ children, initialWorkflow }: WorkflowBuild
     saveOriginalToStorage(state.originalWorkflow);
   }, [state.originalWorkflow]);
 
+  // Load user-created skills into the registry on mount
+  const refreshSkills = useCallback(async () => {
+    try {
+      const skills = (await runnerDataAdapter.fetchSkills?.()) ?? [];
+      registerUserSkills(skills);
+    } catch {
+      // Skills loading is non-critical
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshSkills();
+  }, [refreshSkills]);
+
   // Computed values
   const features = useMemo(() => detectWorkflowFeatures(state.workflow), [state.workflow]);
 
@@ -869,11 +883,12 @@ function RunnerWorkflowBuilderInner({ children, initialWorkflow }: WorkflowBuild
         stages: workflow.stages,
         stop_on_failure: workflow.stop_on_failure,
         reflection_mode: workflow.reflection_mode,
+        model_overrides: workflow.model_overrides,
       };
 
       const url = isNew
-        ? `${API_BASE}/unified-workflows`
-        : `${API_BASE}/unified-workflows/${workflow.id}`;
+        ? `${getApiBase()}/unified-workflows`
+        : `${getApiBase()}/unified-workflows/${workflow.id}`;
       const method = isNew ? "POST" : "PUT";
 
       const response = await fetch(url, {
@@ -907,7 +922,7 @@ function RunnerWorkflowBuilderInner({ children, initialWorkflow }: WorkflowBuild
     dispatch({ type: "SET_ERROR", payload: null });
 
     try {
-      const response = await fetch(`${API_BASE}/unified-workflows/${id}`);
+      const response = await fetch(`${getApiBase()}/unified-workflows/${id}`);
       const data = await response.json();
 
       if (data.success && data.data) {
@@ -933,7 +948,7 @@ function RunnerWorkflowBuilderInner({ children, initialWorkflow }: WorkflowBuild
     dispatch({ type: "SET_ERROR", payload: null });
 
     try {
-      const response = await fetch(`${API_BASE}/unified-workflows/${id}/export`);
+      const response = await fetch(`${getApiBase()}/unified-workflows/${id}/export`);
       const data = await response.json();
 
       if (data.success && data.data) {
@@ -962,7 +977,7 @@ function RunnerWorkflowBuilderInner({ children, initialWorkflow }: WorkflowBuild
       dispatch({ type: "SET_ERROR", payload: null });
 
       try {
-        const response = await fetch(`${API_BASE}/unified-workflows/import`, {
+        const response = await fetch(`${getApiBase()}/unified-workflows/import`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({

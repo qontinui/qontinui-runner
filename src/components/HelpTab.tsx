@@ -148,7 +148,7 @@ const TROUBLESHOOTING_ITEMS: TroubleshootingItem[] = [
     title: "SDK app not connecting",
     description: "An SDK-integrated app won't connect to the runner via UI Bridge.",
     solution: [
-      "Check that the runner is running (port 9876 must be active)",
+      "Check that the runner is running (its HTTP API port must be active)",
       "Verify the SDK app is running and has the UI Bridge SDK initialized",
       "Check the SDK app console for connection errors",
       "Try refreshing the SDK app and reconnecting",

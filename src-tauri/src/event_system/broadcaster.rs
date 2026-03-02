@@ -235,6 +235,72 @@ impl EventBroadcaster {
         ));
     }
 
+    /// Broadcast an approval required event.
+    pub fn approval_required(
+        &self,
+        task_run_id: &str,
+        approval_id: &str,
+        iteration: u32,
+        prompt: &str,
+    ) {
+        self.broadcast_or_warn(AppEvent::approval_required(
+            task_run_id,
+            approval_id,
+            iteration,
+            prompt,
+        ));
+    }
+
+    /// Broadcast an approval resolved event.
+    pub fn approval_resolved(
+        &self,
+        task_run_id: &str,
+        approval_id: &str,
+        approved: bool,
+        action: &str,
+    ) {
+        self.broadcast_or_warn(AppEvent::approval_resolved(
+            task_run_id,
+            approval_id,
+            approved,
+            action,
+        ));
+    }
+
+    /// Broadcast an AI output chunk event for real-time streaming.
+    pub fn ai_output_chunk(&self, task_run_id: &str, chunk: &str, accumulated_length: usize) {
+        self.broadcast_or_warn(AppEvent::ai_output_chunk(
+            task_run_id,
+            chunk,
+            accumulated_length,
+        ));
+    }
+
+    /// Broadcast an iteration metrics event for convergence tracking.
+    #[allow(clippy::too_many_arguments)]
+    pub fn iteration_metrics(
+        &self,
+        task_run_id: &str,
+        iteration: u32,
+        failed_step_count: u32,
+        passed_step_count: u32,
+        skipped_step_count: u32,
+        new_failures: u32,
+        repeated_failures: u32,
+        is_stalled: bool,
+    ) {
+        self.broadcast_or_warn(AppEvent::iteration_metrics(
+            task_run_id,
+            iteration,
+            failed_step_count,
+            passed_step_count,
+            skipped_step_count,
+            new_failures,
+            repeated_failures,
+            is_stalled,
+        ));
+    }
+
     /// Broadcast a generic error event.
     pub fn error(&self, message: impl Into<String>) {
         self.broadcast_or_warn(AppEvent::error(message));

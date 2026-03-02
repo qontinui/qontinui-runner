@@ -26,8 +26,7 @@ import { getAccentColors } from "@/design-system";
 import { cn } from "../../lib/utils";
 import type { SavedMacro } from "../../types";
 import type { Config } from "../../contexts/ExecutionContext";
-
-const API_BASE = "http://localhost:9876";
+import { getApiBase } from "@/lib/runner-api";
 
 type ActionType = "click" | "double_click" | "right_click" | "type" | "hotkey" | "go_to_state";
 type LogLevel = "info" | "warning" | "error" | "success";
@@ -126,7 +125,7 @@ export function AutomationToolkitSidebar({
 
     setRunningAction(clickAction);
     try {
-      const response = await fetch(`${API_BASE}/execute-action`, {
+      const response = await fetch(`${getApiBase()}/execute-action`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -158,7 +157,7 @@ export function AutomationToolkitSidebar({
 
     setRunningAction("type");
     try {
-      const response = await fetch(`${API_BASE}/execute-action`, {
+      const response = await fetch(`${getApiBase()}/execute-action`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -189,7 +188,7 @@ export function AutomationToolkitSidebar({
 
     setRunningAction("hotkey");
     try {
-      const response = await fetch(`${API_BASE}/execute-action`, {
+      const response = await fetch(`${getApiBase()}/execute-action`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -223,7 +222,7 @@ export function AutomationToolkitSidebar({
 
     setRunningAction("go_to_state");
     try {
-      const response = await fetch(`${API_BASE}/go-to-state`, {
+      const response = await fetch(`${getApiBase()}/go-to-state`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

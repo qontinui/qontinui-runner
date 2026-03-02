@@ -354,6 +354,8 @@ pub fn generate_task_summary(
     db: &CheckpointDb,
     task_run_id: &str,
     doctor_handle: Option<&DoctorHandle>,
+    model_override: Option<&str>,
+    provider_override: Option<&str>,
 ) -> Result<SummaryResult, String> {
     info!("Generating summary for task run: {}", task_run_id);
 
@@ -432,8 +434,18 @@ pub fn generate_task_summary(
     // Build task context for routing (summary generation is typically simple)
     let task_context = TaskContext::from_prompt(&prompt);
 
-    // Use the AI provider module to run the prompt with routing
-    let response = ai_provider::run_prompt_with_routing(&prompt, &task_context, doctor_handle);
+    // Use the AI provider module to run the prompt with model override support
+    let response = ai_provider::run_prompt_with_model_override(
+        &prompt,
+        &task_context,
+        doctor_handle,
+        model_override,
+        provider_override,
+        None,
+        None,
+        None,
+        None,
+    );
 
     if !response.success {
         let err = response
@@ -544,9 +556,17 @@ pub async fn generate_task_summary_async(
     db: Arc<CheckpointDb>,
     task_run_id: String,
     doctor_handle: Option<DoctorHandle>,
+    model_override: Option<String>,
+    provider_override: Option<String>,
 ) -> Result<SummaryResult, String> {
     tokio::task::spawn_blocking(move || {
-        generate_task_summary(&db, &task_run_id, doctor_handle.as_ref())
+        generate_task_summary(
+            &db,
+            &task_run_id,
+            doctor_handle.as_ref(),
+            model_override.as_deref(),
+            provider_override.as_deref(),
+        )
     })
     .await
     .map_err(|e| format!("Task spawn error: {}", e))?

@@ -27,6 +27,7 @@ import {
   Play,
   Loader2,
   Target,
+  LayoutDashboard,
 } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { useRunSelectionOptional } from "../../contexts/RunSelectionContext";
@@ -44,6 +45,8 @@ import { KnowledgeTab } from "./KnowledgeTab";
 // import { AutomationTab } from "./AutomationTab";
 import { ContextTab } from "./ContextTab";
 import { ErrorMonitorTab } from "../error-monitor/ErrorMonitorTab";
+import { CanvasRecapTab } from "./CanvasRecapTab";
+import { UsageSection } from "./UsageSection";
 import { useErrorBadge } from "../../hooks/useErrorMonitor";
 import { getAccentColors, getStatusColors } from "@/design-system";
 
@@ -133,6 +136,9 @@ export function RunRecapTab({ onNavigateToAiOutput }: RunRecapTabProps = {}) {
         status={data.status}
         onSummaryGenerated={() => refetch()}
       />
+
+      {/* Token Usage */}
+      <UsageSection taskRunId={taskRunId} />
 
       {/* Status Banner */}
       <StatusBanner
@@ -261,6 +267,14 @@ export function RunRecapTab({ onNavigateToAiOutput }: RunRecapTabProps = {}) {
             Context
           </TabsTrigger>
           <TabsTrigger
+            data-ui-id="recap-tab-canvas"
+            value="canvas"
+            className="flex items-center gap-1.5"
+          >
+            <LayoutDashboard className="w-3.5 h-3.5" />
+            Canvas
+          </TabsTrigger>
+          <TabsTrigger
             data-ui-id="recap-tab-errors"
             value="errors"
             className="flex items-center gap-1.5"
@@ -305,6 +319,11 @@ export function RunRecapTab({ onNavigateToAiOutput }: RunRecapTabProps = {}) {
         {/* Context Tab */}
         <TabsContent value="context">
           <ContextTab taskRunId={taskRunId} />
+        </TabsContent>
+
+        {/* Canvas Tab */}
+        <TabsContent value="canvas">
+          <CanvasRecapTab taskRunId={taskRunId} />
         </TabsContent>
 
         {/* Errors Tab */}

@@ -6,6 +6,7 @@
  */
 
 import { useState, useCallback, useRef } from "react";
+import { getApiBase } from "@/lib/runner-api";
 
 // ============================================================================
 // Types
@@ -69,8 +70,6 @@ export interface UseAppDiscoveryReturn {
 // Constants
 // ============================================================================
 
-const RUNNER_API_BASE = "http://localhost:9876";
-
 // ============================================================================
 // Hook
 // ============================================================================
@@ -115,7 +114,7 @@ export function useAppDiscovery(): UseAppDiscoveryReturn {
 
     try {
       const result = await fetchJson<DiscoveryResult>(
-        `${RUNNER_API_BASE}/ui-bridge/apps/scan`,
+        `${getApiBase()}/ui-bridge/apps/scan`,
         abortRef.current.signal,
       );
       setWebApps(result.web);
@@ -137,7 +136,7 @@ export function useAppDiscovery(): UseAppDiscoveryReturn {
     setIsScanningWeb(true);
     setError(null);
     try {
-      const apps = await fetchJson<DiscoveredApp[]>(`${RUNNER_API_BASE}/ui-bridge/apps/scan/web`);
+      const apps = await fetchJson<DiscoveredApp[]>(`${getApiBase()}/ui-bridge/apps/scan/web`);
       setWebApps(apps);
       setLastScanAt(Date.now());
     } catch (err) {
@@ -154,9 +153,7 @@ export function useAppDiscovery(): UseAppDiscoveryReturn {
     setIsScanningDesktop(true);
     setError(null);
     try {
-      const apps = await fetchJson<DiscoveredApp[]>(
-        `${RUNNER_API_BASE}/ui-bridge/apps/scan/desktop`,
-      );
+      const apps = await fetchJson<DiscoveredApp[]>(`${getApiBase()}/ui-bridge/apps/scan/desktop`);
       setDesktopApps(apps);
       setLastScanAt(Date.now());
     } catch (err) {
@@ -173,9 +170,7 @@ export function useAppDiscovery(): UseAppDiscoveryReturn {
     setIsScanningMobile(true);
     setError(null);
     try {
-      const devices = await fetchJson<MobileDevice[]>(
-        `${RUNNER_API_BASE}/ui-bridge/apps/scan/mobile`,
-      );
+      const devices = await fetchJson<MobileDevice[]>(`${getApiBase()}/ui-bridge/apps/scan/mobile`);
       setMobileDevices(devices);
       setLastScanAt(Date.now());
     } catch (err) {
@@ -189,7 +184,7 @@ export function useAppDiscovery(): UseAppDiscoveryReturn {
   const forwardDevice = useCallback(
     async (deviceId: string, remotePort: number = 9876): Promise<ForwardDeviceResult | null> => {
       try {
-        const response = await fetch(`${RUNNER_API_BASE}/ui-bridge/apps/forward-device`, {
+        const response = await fetch(`${getApiBase()}/ui-bridge/apps/forward-device`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ deviceId, remotePort }),

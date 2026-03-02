@@ -162,9 +162,12 @@ import { ErrorMonitorTab } from "./components/error-monitor";
 import { ProcessManagerTab } from "./components/process-manager";
 import { ReflectionDashboard } from "./components/reflection-dashboard/ReflectionDashboard";
 import { GeneratorEvalPage } from "./pages/GeneratorEvalPage";
+import { TerminalPage } from "./components/terminal";
 
 // Development tools
 import { PerformanceOverlay } from "./components/dev";
+
+import { getApiBase } from "@/lib/runner-api";
 
 // Styles
 import "./index.css";
@@ -233,8 +236,10 @@ type MainTabId =
   | "settings-general"
   | "settings-storage"
   | "settings-backup"
+  | "settings-instances"
   | "settings-debug"
   | "settings-updates"
+  | "terminal"
   | "help";
 
 const VALID_TAB_IDS: MainTabId[] = [
@@ -298,8 +303,10 @@ const VALID_TAB_IDS: MainTabId[] = [
   "settings-general",
   "settings-storage",
   "settings-backup",
+  "settings-instances",
   "settings-debug",
   "settings-updates",
+  "terminal",
   "help",
 ];
 
@@ -391,7 +398,7 @@ function AppContent() {
       .catch(() => setSetupCompleted(true));
   }, []);
 
-  // HTTP API readiness (port 9876)
+  // HTTP API readiness
   const isApiReady = useApiReady();
 
   // Execution state from context
@@ -586,7 +593,7 @@ function AppContent() {
     try {
       // Search for the unified workflow by name in the database
       const searchResponse = await fetch(
-        `http://127.0.0.1:9876/unified-workflows/search?q=${encodeURIComponent(lastRun.workflow_name)}`,
+        `${getApiBase()}/unified-workflows/search?q=${encodeURIComponent(lastRun.workflow_name)}`,
       );
 
       if (!searchResponse.ok) {
@@ -602,7 +609,7 @@ function AppContent() {
 
       if (workflow?.id) {
         // Found in DB — run via the /run endpoint
-        fetch(`http://127.0.0.1:9876/unified-workflows/${workflow.id}/run`, {
+        fetch(`${getApiBase()}/unified-workflows/${workflow.id}/run`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({}),
@@ -621,9 +628,7 @@ function AppContent() {
         // If not in the React ref, try fetching from the backend's last-inline store
         if (!inlinePayload || inlinePayload.name !== rawName) {
           try {
-            const inlineResponse = await fetch(
-              "http://127.0.0.1:9876/unified-workflows/last-inline",
-            );
+            const inlineResponse = await fetch(`${getApiBase()}/unified-workflows/last-inline`);
             if (inlineResponse.ok) {
               const inlineResult = await inlineResponse.json();
               if (inlineResult.data?.name === rawName) {
@@ -637,7 +642,7 @@ function AppContent() {
 
         if (inlinePayload && inlinePayload.name === rawName) {
           // Re-execute the inline workflow
-          fetch("http://127.0.0.1:9876/unified-workflows/execute-inline", {
+          fetch(`${getApiBase()}/unified-workflows/execute-inline`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(inlinePayload),
@@ -1423,6 +1428,7 @@ function AppContent() {
       case "settings-general":
       case "settings-storage":
       case "settings-backup":
+      case "settings-instances":
       case "settings-debug":
       case "settings-updates": {
         // Map main tab ID to settings sub-tab
@@ -1441,6 +1447,7 @@ function AppContent() {
           "settings-general": "general",
           "settings-storage": "storage",
           "settings-backup": "backup",
+          "settings-instances": "instances",
           "settings-debug": "advanced",
           "settings-updates": "updates",
         };
@@ -1473,6 +1480,18 @@ function AppContent() {
           </div>
         );
       }
+
+      case "terminal":
+        return (
+          <div className="h-full overflow-hidden">
+            <TerminalPage
+              onNavigateToWorkflow={(workflowId) => {
+                setEditWorkflowId(workflowId);
+                setActiveTab("unified-workflow-builder");
+              }}
+            />
+          </div>
+        );
 
       case "help":
         return <HelpTab />;

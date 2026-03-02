@@ -15,11 +15,12 @@
 //! Steps 2–3 loop until the verification agent reports zero issues or
 //! `max_fix_iterations` is reached.
 
-use crate::ai_provider::{run_prompt_with_routing, AiResponse};
+use crate::ai_provider::AiResponse;
 use crate::ai_router::TaskContext;
 use crate::commands::logging::AiOutputEntry;
 use crate::context;
 use crate::doctor::DoctorHandle;
+use crate::skills::SkillRegistry;
 use crate::unified_workflows::UnifiedWorkflow;
 use crate::workflow_generation::hardener::{self, HardeningSummary};
 use crate::workflow_generation::investigator;
@@ -27,7 +28,9 @@ use crate::workflow_generation::pipeline_artifacts::{
     compute_json_diff, PipelineArtifact, PipelineArtifactBuilder,
 };
 use crate::workflow_generation::rules;
-use crate::workflow_generation::schema_context::{build_schema_context, build_schema_context_full};
+use crate::workflow_generation::schema_context::{
+    build_schema_context, build_schema_context_full, format_skills_for_generator,
+};
 use crate::workflow_generation::validation::{fix_workflow, validate_workflow};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -58,6 +61,10 @@ pub struct GenerateWorkflowRequest {
     /// Model override (depends on provider)
     #[serde(default)]
     pub model: Option<String>,
+    /// Per-phase model overrides
+    #[serde(default)]
+    pub model_overrides:
+        Option<std::collections::HashMap<String, crate::unified_workflows::ModelOverrideConfig>>,
     /// Skip AI summary generation at the end (default: false)
     #[serde(default)]
     pub skip_ai_summary: Option<bool>,
@@ -121,6 +128,7 @@ impl Default for GenerateWorkflowRequest {
             max_iterations: None,
             provider: None,
             model: None,
+            model_overrides: None,
             skip_ai_summary: None,
             log_source_selection: None,
             prompt_template: None,
@@ -224,6 +232,44 @@ pub fn generate_workflow(
     artifact_builder.discovery_duration_ms = Some(discovery_start.elapsed().as_millis() as u64);
     artifact_builder.discovery_calls = serde_json::to_value(&discovery_calls).ok();
 
+    // ── Resolve per-phase model overrides for generation pipeline ────────
+    let generation_model: Option<&str> = request
+        .model_overrides
+        .as_ref()
+        .and_then(|m| m.get("generation"))
+        .and_then(|c| c.model.as_deref())
+        .or(request.model.as_deref());
+    let generation_provider: Option<&str> = request
+        .model_overrides
+        .as_ref()
+        .and_then(|m| m.get("generation"))
+        .and_then(|c| c.provider.as_deref())
+        .or(request.provider.as_deref());
+    let investigation_model: Option<&str> = request
+        .model_overrides
+        .as_ref()
+        .and_then(|m| m.get("investigation"))
+        .and_then(|c| c.model.as_deref())
+        .or(generation_model);
+    let investigation_provider: Option<&str> = request
+        .model_overrides
+        .as_ref()
+        .and_then(|m| m.get("investigation"))
+        .and_then(|c| c.provider.as_deref())
+        .or(generation_provider);
+    let verification_model: Option<&str> = request
+        .model_overrides
+        .as_ref()
+        .and_then(|m| m.get("verification"))
+        .and_then(|c| c.model.as_deref())
+        .or(generation_model);
+    let verification_provider: Option<&str> = request
+        .model_overrides
+        .as_ref()
+        .and_then(|m| m.get("verification"))
+        .and_then(|c| c.provider.as_deref())
+        .or(generation_provider);
+
     // ── Investigation Phase ────────────────────────────────────────────────
     // Resolve contexts once (shared between investigation and builder).
     let resolved_contexts = {
@@ -255,6 +301,8 @@ pub fn generate_workflow(
                 &discovery_context,
                 &resolved_contexts,
                 doctor_handle,
+                investigation_model,
+                investigation_provider,
             );
             artifact_builder.investigation_duration_ms = Some(investigation.duration_ms);
 
@@ -329,6 +377,8 @@ pub fn generate_workflow(
         doctor_handle,
         conn,
         query_embedding,
+        generation_model,
+        generation_provider,
     ) {
         Ok(w) => {
             artifact_builder.builder_duration_ms = Some(builder_start.elapsed().as_millis() as u64);
@@ -362,6 +412,9 @@ pub fn generate_workflow(
         }
     }
 
+    // ── Load skill registry once (built-in + user skills from DB) ───────
+    let skill_registry = SkillRegistry::with_db(conn);
+
     // ── Step 2–3: Verification ↔ Fixer loop ────────────────────────────────
     let verification_start = Instant::now();
     let mut iterations: Vec<VerificationIteration> = Vec::new();
@@ -377,6 +430,9 @@ pub fn generate_workflow(
                 &discovery_context,
                 doctor_handle,
                 conn,
+                verification_model,
+                verification_provider,
+                &skill_registry,
             );
 
             let issue_count = issues.len();
@@ -414,7 +470,14 @@ pub fn generate_workflow(
             }
 
             // Run fixer agent
-            match run_fixer_agent(&workflow, &issues, &request.description, doctor_handle) {
+            match run_fixer_agent(
+                &workflow,
+                &issues,
+                &request.description,
+                doctor_handle,
+                generation_model,
+                generation_provider,
+            ) {
                 Ok(fixed) => {
                     iterations.push(VerificationIteration {
                         iteration: iter_num,
@@ -449,14 +512,24 @@ pub fn generate_workflow(
 
     // ── Hardener Agent ───────────────────────────────────────────────────
     let hardener_start = Instant::now();
-    let (mut workflow, hardening_summary) =
-        hardener::run_hardener_agent(&workflow, &request.description, doctor_handle, conn);
+    let (mut workflow, hardening_summary) = hardener::run_hardener_agent(
+        &workflow,
+        &request.description,
+        doctor_handle,
+        conn,
+        generation_model,
+        generation_provider,
+        &skill_registry,
+    );
     artifact_builder.hardener_duration_ms = Some(hardener_start.elapsed().as_millis() as u64);
     artifact_builder.hardening_summary = serde_json::to_value(&hardening_summary).ok();
     artifact_builder.hardened_json = serde_json::to_value(&workflow).ok();
 
     // Re-apply deterministic fixes after hardener (e.g. strip check-group setup/completion)
     fix_workflow(&mut workflow);
+
+    // ── Annotate steps with skill_origin where they match known skills ────
+    crate::skills::annotate_skill_origins(&mut workflow, &skill_registry);
 
     // ── Final structural validation ────────────────────────────────────────
     let validation_errors = validate_workflow(&workflow);
@@ -521,6 +594,8 @@ fn run_builder_agent(
     doctor_handle: Option<&DoctorHandle>,
     conn: Option<&Connection>,
     query_embedding: Option<&[f32]>,
+    model_override: Option<&str>,
+    provider_override: Option<&str>,
 ) -> Result<UnifiedWorkflow, Box<GenerateWorkflowResponse>> {
     let schema_context = if conn.is_some() || query_embedding.is_some() {
         build_schema_context_full(&request.description, conn, query_embedding)
@@ -592,11 +667,29 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
     if request.include_design_guidance.unwrap_or(false) {
         sections.push(FRONTEND_DESIGN_INSTRUCTIONS.to_string());
     }
+
+    // Inject skill catalog context (built-in + user skills from DB)
+    let skill_registry = SkillRegistry::with_db(conn);
+    let skills_section = format_skills_for_generator(&skill_registry);
+    if !skills_section.is_empty() {
+        sections.push(skills_section);
+    }
+
     sections.push(user_prompt.clone());
     let full_prompt = sections.join("\n\n");
 
     let task_context = TaskContext::from_prompt(&full_prompt);
-    let ai_result: AiResponse = run_prompt_with_routing(&full_prompt, &task_context, doctor_handle);
+    let ai_result: AiResponse = crate::ai_provider::run_prompt_with_model_override(
+        &full_prompt,
+        &task_context,
+        doctor_handle,
+        model_override,
+        provider_override,
+        None,
+        None,
+        None,
+        None,
+    );
 
     if !ai_result.success {
         error!(
@@ -656,6 +749,9 @@ fn run_verification_agent(
     discovery_context: &str,
     doctor_handle: Option<&DoctorHandle>,
     conn: Option<&Connection>,
+    model_override: Option<&str>,
+    provider_override: Option<&str>,
+    skill_registry: &SkillRegistry,
 ) -> Vec<String> {
     let workflow_json = match serde_json::to_string_pretty(workflow) {
         Ok(j) => j,
@@ -668,10 +764,25 @@ fn run_verification_agent(
         }
     };
 
-    let prompt =
-        build_verification_prompt(&workflow_json, user_description, discovery_context, conn);
+    let prompt = build_verification_prompt(
+        &workflow_json,
+        user_description,
+        discovery_context,
+        conn,
+        skill_registry,
+    );
     let task_context = TaskContext::from_prompt(&prompt);
-    let ai_result: AiResponse = run_prompt_with_routing(&prompt, &task_context, doctor_handle);
+    let ai_result: AiResponse = crate::ai_provider::run_prompt_with_model_override(
+        &prompt,
+        &task_context,
+        doctor_handle,
+        model_override,
+        provider_override,
+        None,
+        None,
+        None,
+        None,
+    );
 
     if !ai_result.success {
         warn!(
@@ -691,6 +802,7 @@ fn build_verification_prompt(
     user_description: &str,
     discovery_context: &str,
     conn: Option<&Connection>,
+    skill_registry: &SkillRegistry,
 ) -> String {
     // Load check rules from DB if available
     let check_rules_section = if let Some(conn) = conn {
@@ -719,6 +831,16 @@ fn build_verification_prompt(
         )
     };
 
+    let skills_section = format_skills_for_generator(skill_registry);
+    let skills_context = if skills_section.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n{}\nWhen verifying steps, check that step configurations are consistent with the skill catalog above. Flag steps that claim to use a skill but have incompatible parameters or phase assignments.\n",
+            skills_section
+        )
+    };
+
     format!(
         r#"You are a workflow verification agent for Qontinui Runner.
 Your job is to review a generated UnifiedWorkflow JSON and find semantic errors in the deterministic steps — WITHOUT running anything.
@@ -726,7 +848,7 @@ Your job is to review a generated UnifiedWorkflow JSON and find semantic errors 
 {checks}
 
 Steps match the user's original request: "{user_description}"
-{discovery_section}
+{discovery_section}{skills_context}
 ## Output format
 
 If you find issues, return a JSON array of strings, one per issue. Each issue should identify the step by name/index and describe the problem clearly.
@@ -745,6 +867,7 @@ Examples:
         checks = checks,
         user_description = user_description,
         discovery_section = discovery_section,
+        skills_context = skills_context,
         workflow_json = workflow_json,
     )
 }
@@ -1076,13 +1199,25 @@ fn run_fixer_agent(
     issues: &[String],
     user_description: &str,
     doctor_handle: Option<&DoctorHandle>,
+    model_override: Option<&str>,
+    provider_override: Option<&str>,
 ) -> Result<UnifiedWorkflow, String> {
     let workflow_json = serde_json::to_string_pretty(workflow)
         .map_err(|e| format!("Failed to serialize workflow: {}", e))?;
 
     let prompt = build_fix_prompt(&workflow_json, issues, user_description);
     let task_context = TaskContext::from_prompt(&prompt);
-    let ai_result: AiResponse = run_prompt_with_routing(&prompt, &task_context, doctor_handle);
+    let ai_result: AiResponse = crate::ai_provider::run_prompt_with_model_override(
+        &prompt,
+        &task_context,
+        doctor_handle,
+        model_override,
+        provider_override,
+        None,
+        None,
+        None,
+        None,
+    );
 
     if !ai_result.success {
         return Err(format!(
@@ -1178,6 +1313,9 @@ fn apply_request_options(workflow: &mut UnifiedWorkflow, request: &GenerateWorkf
     }
     if let Some(reflection_mode) = request.reflection_mode {
         workflow.reflection_mode = reflection_mode;
+    }
+    if let Some(ref overrides) = request.model_overrides {
+        workflow.model_overrides = overrides.clone();
     }
 }
 

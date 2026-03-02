@@ -83,6 +83,10 @@ pub struct AiSessionConfig {
     /// Optional model override from stage config (e.g., "claude-sonnet-4-5-20250514").
     /// When set, the AI CLI will be invoked with --model <model>.
     pub model_override: Option<String>,
+    /// Optional temperature override for API providers (0.0–1.0).
+    pub temperature_override: Option<f32>,
+    /// Optional max output tokens override for API providers.
+    pub max_tokens_override: Option<u32>,
 }
 
 impl AiSessionConfig {
@@ -106,6 +110,8 @@ impl AiSessionConfig {
             reflection_fix_ctx: None,
             step_injection_ctx: None,
             model_override: None,
+            temperature_override: None,
+            max_tokens_override: None,
         }
     }
 
@@ -129,6 +135,8 @@ impl AiSessionConfig {
             reflection_fix_ctx: None,
             step_injection_ctx: None,
             model_override: None,
+            temperature_override: None,
+            max_tokens_override: None,
         }
     }
 
@@ -153,6 +161,8 @@ impl AiSessionConfig {
             reflection_fix_ctx: None,
             step_injection_ctx: None,
             model_override: None,
+            temperature_override: None,
+            max_tokens_override: None,
         }
     }
 
@@ -203,6 +213,18 @@ impl AiSessionConfig {
         self.model_override = model;
         self
     }
+
+    /// Set a temperature override for API providers.
+    pub fn with_temperature(mut self, temperature: Option<f32>) -> Self {
+        self.temperature_override = temperature;
+        self
+    }
+
+    /// Set a max_tokens override for API providers.
+    pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
+        self.max_tokens_override = max_tokens;
+        self
+    }
 }
 
 /// Result of an AI session execution.
@@ -220,6 +242,10 @@ pub struct AiSessionResult {
     /// Error message when the session failed (e.g., CLI spawn failure, timeout).
     /// Empty string if no error occurred.
     pub error: String,
+    /// Input tokens consumed (available for API providers only, None for CLI).
+    pub input_tokens: Option<u64>,
+    /// Output tokens generated (available for API providers only, None for CLI).
+    pub output_tokens: Option<u64>,
 }
 
 // =============================================================================
@@ -259,23 +285,76 @@ The user will review all findings after the workflow completes. Focus on complet
 "#
 }
 
+/// Build trigger API documentation for the AI agent.
+///
+/// This documents the trigger management API so the agent can create
+/// event-driven workflow automation during execution.
+fn build_trigger_api_docs() -> &'static str {
+    r##"## Workflow Triggers
+Create event-driven triggers that automatically run workflows:
+
+```bash
+# Create a file-watch trigger (runs workflow when files change)
+curl -s -X POST http://localhost:9876/triggers \
+  -H "Content-Type: application/json" \
+  -d '{"name":"On src change","trigger_config":{"type":"file_watch","paths":["/path/to/src"],"patterns":["*.ts","*.rs"],"ignore_patterns":["node_modules/**"],"recursive":true},"workflow_id":"WORKFLOW_UUID"}'
+```
+
+Trigger types: webhook, file_watch, workflow_chain, git_event, health_check, schedule
+
+```bash
+# List triggers
+curl -s http://localhost:9876/triggers
+# Test a trigger (dry run)
+curl -s -X POST http://localhost:9876/triggers/TRIGGER_ID/test
+# Delete a trigger
+curl -s -X DELETE http://localhost:9876/triggers/TRIGGER_ID
+```
+"##
+}
+
 /// Build canvas API documentation for the AI agent.
 ///
 /// This documents the A2UI canvas panel API so the agent can render
 /// rich visual content in the user's dashboard during execution.
 fn build_canvas_api_docs() -> &'static str {
     r##"## Canvas Panels
-Render rich visual panels in the user's dashboard:
 
+Use canvas panels to show structured data visually in the user's dashboard instead of dumping raw text into the conversation. Panels persist across messages and can be updated in-place.
+
+### API Reference
+
+**Create or update** (POST — reuse panel_id to update in-place):
 ```bash
 curl -s -X POST http://localhost:9876/canvas/panels \
   -H "Content-Type: application/json" \
-  -d '{"panel_id":"my-panel","component":"Table","title":"Issues Found","data":{"columns":["File","Issue","Severity"],"rows":[["app.ts","Missing null check","high"]]}}'
+  -d '{"panel_id":"my-panel","component":"Table","title":"Results","data":{...}}'
 ```
 
-Components: Markdown, CodeDiff, Table, KeyValue, Terminal, Alert, Timeline, ProgressChart, Checklist
+Optional fields: `"priority":10` (lower=first, default 50), `"size":"compact"|"normal"|"large"`, `"group":"Analysis"` (section header).
 
-Update in-place by reusing the same panel_id. Delete: `curl -s -X DELETE http://localhost:9876/canvas/panels/my-panel`
+**Delete:** `curl -s -X DELETE http://localhost:9876/canvas/panels/my-panel`
+
+### Component Schemas
+
+- **Markdown** — `{"content":"# Heading\nParagraph with **bold**"}` — Rich text, summaries, explanations
+- **Table** — `{"columns":["File","Issue"],"rows":[["app.ts","Null check"]],"sortable":true}` — Comparisons, data grids
+- **CodeDiff** — `{"file_path":"src/app.ts","language":"typescript","unified_diff":"@@ -1,3 +1,3 @@\n-old\n+new"}` — Code changes, before/after
+- **FileTree** — `{"root":"src/","entries":[{"path":"app.ts","type":"file","status":"modified"}]}` — File listings with status
+- **KeyValue** — `{"pairs":[{"key":"Status","value":"OK","style":"success"}]}` — Config, metadata (styles: default/success/warning/error)
+- **Terminal** — `{"lines":["$ npm test","PASS 42 tests"]}` — Command output, logs
+- **Alert** — `{"severity":"warning","message":"Deprecated API","details":"Use v2 endpoint"}` — Notices (info/success/warning/error)
+- **Timeline** — `{"events":[{"title":"Build","status":"success"},{"title":"Deploy","status":"running"}]}` — Step progress (pending/running/success/failed)
+- **ProgressChart** — `{"segments":[{"label":"Pass","value":42,"color":"green"},{"label":"Fail","value":3,"color":"red"}]}` — Metric breakdowns
+- **FindingList** — `{"findings":[{"title":"SQL injection","severity":"high","location":"auth.ts:42"}]}` — Issues, audit results (info/low/medium/high/critical)
+- **Checklist** — `{"items":[{"id":"1","label":"Fix imports","checked":true},{"id":"2","label":"Add tests","checked":false}]}` — Task tracking
+
+### Best Practices
+
+- Prefer **updating** an existing panel (same panel_id) over creating many similar panels
+- Use **Table** for comparisons, **CodeDiff** for changes, **Checklist** for progress tracking
+- Use **group** to organize related panels under section headers (e.g., group:"Analysis", group:"Results")
+- Use **priority** to control display order — important panels first (priority:10), supplementary last (priority:90)
 "##
 }
 
@@ -598,6 +677,8 @@ impl UnifiedAiSessionExecutor {
                     duration_ms,
                     injected_steps,
                     error: String::new(),
+                    input_tokens: None,
+                    output_tokens: None,
                 }
             }
             Ok(Err(e)) => {
@@ -621,6 +702,8 @@ impl UnifiedAiSessionExecutor {
                     duration_ms,
                     injected_steps: Vec::new(),
                     error: e.to_string(),
+                    input_tokens: None,
+                    output_tokens: None,
                 }
             }
             Err(e) => {
@@ -645,6 +728,8 @@ impl UnifiedAiSessionExecutor {
                     duration_ms,
                     injected_steps: Vec::new(),
                     error: error_msg,
+                    input_tokens: None,
+                    output_tokens: None,
                 }
             }
         }
@@ -821,9 +906,14 @@ impl UnifiedAiSessionExecutor {
             result = format!("{}{}", autonomous_context, result);
         }
 
-        // Append canvas API documentation for agentic phases
+        // Append canvas and trigger API documentation for agentic phases
         if config.add_autonomous_context {
-            result = format!("{}\n\n{}", result, build_canvas_api_docs());
+            result = format!(
+                "{}\n\n{}\n\n{}",
+                result,
+                build_canvas_api_docs(),
+                build_trigger_api_docs()
+            );
         }
 
         // Append finding instructions if configured

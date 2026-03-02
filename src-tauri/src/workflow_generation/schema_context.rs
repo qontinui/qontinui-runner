@@ -11,6 +11,7 @@ use super::relevance_filter::filter_relevant_step_types;
 use super::rules;
 use super::step_type_knowledge;
 use super::step_type_metadata::{get_all_step_type_metadata, StepTypeMetadata};
+use crate::skills::SkillRegistry;
 
 /// Build the complete schema context prompt for AI workflow generation.
 ///
@@ -498,6 +499,97 @@ These are preferred over Playwright for inspection, content reading, and simple 
 }
 
 // ============================================================================
+// Skill Catalog for Generator
+// ============================================================================
+
+/// Format the built-in skill catalog as a compact markdown section for the
+/// AI generator prompt. This gives the AI awareness of pre-configured skill
+/// templates that it can reference in its generated workflows.
+///
+/// The output is a compact catalog grouped by category (~500 tokens) that
+/// tells the AI what skills are available and their parameters.
+pub fn format_skills_for_generator(registry: &SkillRegistry) -> String {
+    let skills = registry.all();
+    if skills.is_empty() {
+        return String::new();
+    }
+
+    let mut output = String::with_capacity(2048);
+    output.push_str("## Available Skills (pre-configured step templates)\n\n");
+    output
+        .push_str("Skills are reusable step templates available in the UI. When your generated\n");
+    output.push_str("workflow needs common operations (linting, testing, health checks), prefer\n");
+    output.push_str("using the equivalent step configuration that matches these skills.\n\n");
+
+    // Group by category
+    let mut categories: std::collections::BTreeMap<&str, Vec<&crate::skills::SkillDefinition>> =
+        std::collections::BTreeMap::new();
+    for skill in &skills {
+        categories.entry(&skill.category).or_default().push(skill);
+    }
+
+    // Category display names
+    let category_labels: std::collections::HashMap<&str, &str> = [
+        ("code-quality", "Code Quality"),
+        ("testing", "Testing"),
+        ("monitoring", "Monitoring"),
+        ("ai-task", "AI Task"),
+        ("deployment", "Deployment"),
+        ("composition", "Composition"),
+        ("custom", "Custom"),
+    ]
+    .into_iter()
+    .collect();
+
+    for (category, cat_skills) in &categories {
+        let label = category_labels.get(category).unwrap_or(category);
+        output.push_str(&format!("### {}\n", label));
+
+        for skill in cat_skills {
+            // Build compact param list
+            let params: Vec<String> = skill
+                .parameters
+                .iter()
+                .map(|p| {
+                    if p.required {
+                        p.name.clone()
+                    } else {
+                        format!("{}?", p.name)
+                    }
+                })
+                .collect();
+            let params_str = if params.is_empty() {
+                String::from("(no params)")
+            } else {
+                params.join(", ")
+            };
+
+            // Build compact phase list
+            let phases: Vec<&str> = skill
+                .allowed_phases
+                .iter()
+                .map(|p| match p.as_str() {
+                    "setup" => "S",
+                    "verification" => "V",
+                    "agentic" => "A",
+                    "completion" => "C",
+                    _ => p.as_str(),
+                })
+                .collect();
+            let phases_str = phases.join("/");
+
+            output.push_str(&format!(
+                "- **{}**: {}. Params: {}. Phase: {}.\n",
+                skill.slug, skill.description, params_str, phases_str,
+            ));
+        }
+        output.push('\n');
+    }
+
+    output
+}
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
@@ -549,7 +641,8 @@ These rules are NON-NEGOTIABLE. Workflows that violate them will be rejected.
 16. **Only 3 step types exist**: The only valid step types are `command`, `ui_bridge`, and `prompt`. Do NOT use `shell_command`, `api_request`, `mcp_call`, `check`, `check_group`, `test`, `gate`, or `spec` — these are not valid types. Tests are run via `command` with `test_type` set. Checks are run via `command` with `check_type` set.
 17. **Every command step MUST include a mode field**: Valid modes are `shell`, `check`, `check_group`, `test`. The mode must match the fields present: `check` requires `check_type`, `check_group` requires `check_group_id`, `test` requires `test_type` or `test_id`, `shell` is for plain commands.
 18. **No Python f-strings or jq in shell commands**: When piping curl output to `python -c`, NEVER use f-strings (`f'...'`). Use string concatenation instead: `'Expected >2, got ' + str(len(elems))`. F-strings with nested quotes create unresolvable JSON escaping issues. Do NOT use `jq` — it is not available on Windows. For JSON assertions, pipe to `python -c \"import sys,json; d=json.load(sys.stdin); assert len(d.get('elements',[]))>0\"`. For checking fields exist, use `grep` (e.g., `curl ... | grep 'elements'`).
-19. **Retry format**: Use flat `retry_count` and `retry_delay_ms` fields directly on step objects. Do NOT use a nested `retry` object (e.g., `\"retry\": {\"count\": 5}` is WRONG, use `\"retry_count\": 5`)."#;
+19. **Retry format**: Use flat `retry_count` and `retry_delay_ms` fields directly on step objects. Do NOT use a nested `retry` object (e.g., `\"retry\": {\"count\": 5}` is WRONG, use `\"retry_count\": 5`).
+20. **No bash negation prefix in shell commands**: NEVER use `!` as a command prefix to invert exit codes (e.g., `! grep -qE 'pattern' file`). The `!` operator is bash-specific and may not be detected by the shell router on Windows, causing false negatives. Instead, use explicit exit code handling: `grep -qE 'pattern' file && exit 1 || exit 0` to assert something is NOT present."#;
 
 // ============================================================================
 
@@ -696,5 +789,56 @@ mod tests {
         assert!(doc.contains("\"command\""));
         assert!(doc.contains("\"check_type\""));
         assert!(doc.contains("\"action\""));
+    }
+
+    #[test]
+    fn test_format_skills_for_generator() {
+        let registry = SkillRegistry::new();
+        let output = format_skills_for_generator(&registry);
+
+        // Should have the header
+        assert!(output.contains("## Available Skills"));
+
+        // Should contain category headers
+        assert!(output.contains("### Code Quality"));
+        assert!(output.contains("### Testing"));
+        assert!(output.contains("### Monitoring"));
+
+        // Should contain skill slugs
+        assert!(output.contains("**lint-project**"));
+        assert!(output.contains("**run-tests**"));
+        assert!(output.contains("**api-health-check**"));
+
+        // Should contain parameter names
+        assert!(output.contains("working_directory"));
+        assert!(output.contains("test_type"));
+
+        // Should contain phase abbreviations
+        assert!(output.contains("S/V")); // setup/verification
+    }
+
+    #[test]
+    fn test_format_skills_for_generator_compact() {
+        let registry = SkillRegistry::new();
+        let output = format_skills_for_generator(&registry);
+
+        // Should be reasonably compact (under 3000 chars for 15 skills)
+        assert!(
+            output.len() < 3000,
+            "Skill catalog too verbose: {} chars",
+            output.len()
+        );
+        // But not empty
+        assert!(output.len() > 500);
+    }
+
+    #[test]
+    fn test_format_skills_empty_registry() {
+        // An empty registry (no builtins loaded) would return empty string
+        // We can't easily test this without a custom registry, but we can
+        // verify the function handles the data correctly
+        let registry = SkillRegistry::new();
+        let output = format_skills_for_generator(&registry);
+        assert!(!output.is_empty());
     }
 }

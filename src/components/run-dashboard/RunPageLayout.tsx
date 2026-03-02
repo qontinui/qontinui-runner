@@ -10,6 +10,7 @@ import { LucideIcon, Activity, ExternalLink, RotateCw } from "lucide-react";
 import { RunSelector } from "../run-selection/RunSelector";
 import { useRunSelectionOptional } from "../../contexts/RunSelectionContext";
 import { getStatusColors } from "@/design-system";
+import { getApiBase } from "@/lib/runner-api";
 
 /** Maps runner page titles to web run-detail tab names */
 const TAB_MAPPING: Record<string, string> = {
@@ -40,8 +41,6 @@ interface RunPageLayoutProps {
 /**
  * RunPageLayout - Wrapper for run subpages with shared RunSelector header
  */
-const API_BASE = "http://localhost:9876";
-
 export function RunPageLayout({
   children,
   title,
@@ -59,7 +58,7 @@ export function RunPageLayout({
     try {
       // Look up the workflow by name
       const searchRes = await fetch(
-        `${API_BASE}/unified-workflows/search?q=${encodeURIComponent(selectedRun.workflow_name)}`,
+        `${getApiBase()}/unified-workflows/search?q=${encodeURIComponent(selectedRun.workflow_name)}`,
       );
       const searchData = await searchRes.json();
       const workflows = searchData?.data;
@@ -74,7 +73,7 @@ export function RunPageLayout({
             w.name.toLowerCase() === selectedRun.workflow_name!.toLowerCase(),
         ) || workflows[0];
       // Run the workflow
-      await fetch(`${API_BASE}/unified-workflows/${workflow.id}/run`, {
+      await fetch(`${getApiBase()}/unified-workflows/${workflow.id}/run`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ monitor_index: 0 }),

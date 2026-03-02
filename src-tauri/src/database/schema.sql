@@ -1,5 +1,5 @@
 -- SQLite Schema for qontinui-runner
--- Version: 76
+-- Version: 84
 --
 -- This schema provides persistent storage for task runs, settings,
 -- prompts, and scheduler state.
@@ -275,6 +275,26 @@ CREATE INDEX IF NOT EXISTS idx_task_runs_parent_task_run_id ON task_runs(parent_
 CREATE INDEX IF NOT EXISTS idx_task_runs_root_task_run_id ON task_runs(root_task_run_id);
 -- Bridge ID index for multi-bridge queries
 CREATE INDEX IF NOT EXISTS idx_task_runs_bridge_id ON task_runs(bridge_id);
+
+-- Per-phase token usage tracking for cost analysis.
+-- Records input/output tokens and estimated cost for each AI call in a workflow.
+CREATE TABLE IF NOT EXISTS phase_token_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_run_id TEXT NOT NULL,
+    phase TEXT NOT NULL,           -- setup, verification, agentic, completion, investigation, summary, generation
+    stage_index INTEGER,           -- NULL for single-stage workflows
+    iteration INTEGER,             -- iteration number within the loop
+    model_used TEXT,               -- e.g. "claude-sonnet-4-20250514"
+    provider_used TEXT,            -- e.g. "claude_api"
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_cents INTEGER NOT NULL DEFAULT 0,  -- estimated cost in hundredths of cents (microdollars * 100)
+    duration_ms INTEGER,           -- AI call wall-clock time
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_phase_token_usage_task_run ON phase_token_usage(task_run_id);
 
 -- Task Run Output Chunks (for efficient O(1) appending)
 -- Instead of concatenating to output_log column (O(n)), we insert chunks (O(1))
@@ -859,7 +879,9 @@ CREATE TABLE IF NOT EXISTS unified_workflows (
     -- Multi-stage workflow configuration
     stages TEXT DEFAULT '[]',  -- JSON array of WorkflowStage objects
     stop_on_failure INTEGER DEFAULT 0,  -- 0 = continue on failure (default), 1 = stop
+    approval_gate INTEGER DEFAULT 0,  -- 0 = disabled (default), 1 = pause for human approval
     reflection_mode INTEGER DEFAULT 1,  -- 0 = disabled, 1 = enabled (default)
+    model_overrides TEXT DEFAULT '{}',  -- JSON map of phase → {provider, model} overrides
 
     -- Generation tracking (for workflows created by meta-workflows)
     generated_by_task_run_id TEXT,  -- Links back to the meta-workflow task_run that created this
@@ -2338,6 +2360,8 @@ CREATE TABLE IF NOT EXISTS workflow_triggers (
     debounce_ms INTEGER DEFAULT 1000,
     cooldown_seconds INTEGER DEFAULT 60,
     max_concurrent INTEGER DEFAULT 1,
+    retry_count INTEGER DEFAULT 0,
+    retry_delay_seconds INTEGER DEFAULT 30,
     enabled BOOLEAN DEFAULT 1,
     last_triggered_at TEXT,
     last_execution_id TEXT,
@@ -2375,6 +2399,7 @@ CREATE TABLE IF NOT EXISTS canvas_panels (
     data_json TEXT NOT NULL,
     priority INTEGER DEFAULT 50,
     size TEXT DEFAULT 'normal',
+    group_name TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
@@ -2382,4 +2407,56 @@ CREATE TABLE IF NOT EXISTS canvas_panels (
 
 CREATE INDEX IF NOT EXISTS idx_canvas_panels_task_run_id ON canvas_panels(task_run_id);
 
-INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (76, datetime('now'));
+-- Approval Gates (human-in-the-loop audit trail)
+-- Version 78: Approval gate records for workflow pause/resume decisions
+CREATE TABLE IF NOT EXISTS approval_gates (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    iteration INTEGER NOT NULL,
+    prompt TEXT NOT NULL,
+    context_json TEXT DEFAULT '{}',     -- ApprovalContext as JSON (summary, files_modified, diffs)
+    action TEXT,                         -- approve, reject, abort (NULL while pending)
+    comment TEXT,                        -- reviewer comment
+    status TEXT NOT NULL DEFAULT 'pending', -- pending, approved, rejected, aborted
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    resolved_at TEXT,
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_approval_gates_task_run_id ON approval_gates(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_approval_gates_status ON approval_gates(status);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (78, datetime('now'));
+
+-- User-created skills (parameterized step templates)
+-- Built-in skills are embedded in the binary; only user skills are stored here.
+CREATE TABLE IF NOT EXISTS user_skills (
+    id TEXT PRIMARY KEY,                    -- "user:<slug>"
+    name TEXT NOT NULL,
+    slug TEXT NOT NULL UNIQUE,
+    description TEXT DEFAULT '',
+    category TEXT DEFAULT 'custom',         -- code-quality, testing, monitoring, ai-task, deployment, composition, custom
+    tags TEXT DEFAULT '[]',                 -- JSON array of tag strings
+    icon TEXT DEFAULT 'puzzle',
+    color TEXT DEFAULT 'gray',
+    allowed_phases TEXT NOT NULL DEFAULT '["setup"]',  -- JSON array of phase strings
+    parameters TEXT DEFAULT '[]',           -- JSON array of SkillParameter objects
+    template TEXT NOT NULL,                 -- JSON SkillTemplate (single_step or multi_step)
+    source TEXT NOT NULL DEFAULT 'user',    -- "user" | "community"
+    version TEXT DEFAULT '1.0.0',          -- semantic version of the skill
+    author TEXT DEFAULT NULL,              -- JSON SkillAuthor object
+    checksum TEXT DEFAULT NULL,            -- SHA-256 of skill content
+    depends_on TEXT DEFAULT '[]',          -- JSON array of skill IDs this skill depends on
+    usage_count INTEGER DEFAULT 0,         -- number of times this skill has been instantiated
+    approval_status TEXT DEFAULT NULL,     -- "pending" | "approved" | "rejected" (org context)
+    forked_from TEXT DEFAULT NULL,         -- ID of the skill this was forked from
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_skills_slug ON user_skills(slug);
+CREATE INDEX IF NOT EXISTS idx_user_skills_category ON user_skills(category);
+CREATE INDEX IF NOT EXISTS idx_user_skills_updated_at ON user_skills(updated_at);
+CREATE INDEX IF NOT EXISTS idx_user_skills_source ON user_skills(source);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (84, datetime('now'));

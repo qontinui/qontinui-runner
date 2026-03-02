@@ -257,6 +257,7 @@ impl StepExecutorAdapter {
                 required: None,
                 resolved_inputs: None,
                 extracted_values: None,
+                failure_category: None,
             }
         }
     }
@@ -611,6 +612,7 @@ mod tests {
                 required: None,
                 resolved_inputs: None,
                 extracted_values: None,
+                failure_category: None,
             },
             StepExecutionResult {
                 step_index: 1,
@@ -629,6 +631,7 @@ mod tests {
                 required: None,
                 resolved_inputs: None,
                 extracted_values: None,
+                failure_category: None,
             },
         ];
 

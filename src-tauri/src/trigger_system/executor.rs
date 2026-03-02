@@ -155,9 +155,15 @@ pub fn execute_triggered_workflow(
         reflection_mode,
         provider_override,
         model_override,
+        model_overrides: workflow.model_overrides.clone(),
         stage_index: None,
         max_sessions: Some(max_iterations),
         auto_run_generated: false,
+        approval_gate: workflow.approval_gate,
+        max_context_tokens: 100_000,
+        cross_workflow_learning: true,
+        verification_history: std::collections::HashMap::new(),
+        routing_context: Default::default(),
     };
 
     // 7. Spawn the workflow
@@ -213,12 +219,14 @@ pub fn execute_triggered_workflow(
 
 /// Substitute {{variable}} patterns in a template string.
 fn substitute_variables(template: &str, variables: &HashMap<String, String>) -> String {
-    let mut result = template.to_string();
-    let pattern = regex::Regex::new(r"\{\{([^}]+)\}\}").unwrap();
+    static PATTERN: once_cell::sync::Lazy<regex::Regex> =
+        once_cell::sync::Lazy::new(|| regex::Regex::new(r"\{\{([^}]+)\}\}").expect("valid regex"));
 
-    for cap in pattern.captures_iter(template) {
-        let full_match = cap.get(0).unwrap().as_str();
-        let var_name = cap.get(1).unwrap().as_str().trim();
+    let mut result = template.to_string();
+
+    for cap in PATTERN.captures_iter(template) {
+        let full_match = cap.get(0).expect("match group 0").as_str();
+        let var_name = cap.get(1).expect("match group 1").as_str().trim();
 
         if let Some(value) = variables.get(var_name) {
             result = result.replace(full_match, value);

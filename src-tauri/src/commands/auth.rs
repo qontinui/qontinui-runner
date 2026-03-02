@@ -893,11 +893,20 @@ pub async fn send_device_heartbeat(
     Ok(heartbeat_response)
 }
 
-/// Check if the HTTP API server (port 9876) is ready to accept requests.
+/// Check if the HTTP API server is ready to accept requests.
 ///
 /// The frontend calls this on mount to detect if the API server started
 /// before the event listener was set up (e.g., after a page refresh).
 #[tauri::command]
 pub fn is_api_ready(app_state: tauri::State<'_, Arc<AppState>>) -> bool {
     app_state.api_ready.load(Ordering::Relaxed)
+}
+
+/// Get the actual port the HTTP API server is listening on.
+///
+/// Returns the port the server bound to (may differ from default 9876 if
+/// `QONTINUI_PORT` env var was set or if the primary port was occupied).
+#[tauri::command]
+pub fn get_api_port(app_state: tauri::State<'_, Arc<AppState>>) -> u16 {
+    app_state.api_port.load(Ordering::Relaxed)
 }

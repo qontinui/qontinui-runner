@@ -9,8 +9,8 @@ import { useState, useEffect, useCallback, useMemo } from "react";
 import type { VerificationData, CheckStep, VerificationTestType } from "./types";
 import type { StepStats, StepExecutionStatus } from "../shared/types";
 import { DEFAULT_VERIFICATION_DATA } from "./types";
+import { getApiBase } from "@/lib/runner-api";
 
-const API_BASE = "http://localhost:9876";
 const POLL_INTERVAL_MS = 2000;
 
 /**
@@ -96,7 +96,7 @@ export function useVerificationData(): VerificationData {
   const fetchCheckSteps = useCallback(async () => {
     try {
       // Fetch command and check steps
-      const response = await fetch(`${API_BASE}/current-execution/steps?step_type=check`);
+      const response = await fetch(`${getApiBase()}/current-execution/steps?step_type=check`);
       if (response.ok) {
         const apiData: CurrentExecutionStepsResponse = await response.json();
         if (apiData.success && apiData.executions) {
@@ -130,7 +130,7 @@ export function useVerificationData(): VerificationData {
   // Fetch verification log data
   const fetchVerificationLog = useCallback(async () => {
     try {
-      const response = await fetch(`${API_BASE}/logs/verification`);
+      const response = await fetch(`${getApiBase()}/logs/verification`);
 
       if (!response.ok) {
         if (response.status === 404) {

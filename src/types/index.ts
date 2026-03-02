@@ -307,6 +307,9 @@ export type {
   WorkflowImportResult,
   // Stage types
   WorkflowStage,
+  // Per-phase model override types
+  ModelOverrideConfig,
+  ModelOverrides,
 } from "./unified-workflow";
 
 // Re-export unified workflow types with original names for internal use

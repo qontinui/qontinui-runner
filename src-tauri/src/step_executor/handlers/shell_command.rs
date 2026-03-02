@@ -338,9 +338,27 @@ impl ShellCommandHandler {
         let bash_commands = [
             "test", "export", "source", "[", "[[", "unset", "eval", "which", "xargs", "wc", "tr",
             "tee", "sort", "head", "tail", "grep", "sed", "awk", "cut", "basename", "dirname",
-            "curl",
+            "curl", "cat", "rm", "ls", "cp", "mv", "touch", "mkdir", "echo", "printf", "find",
+            "diff", "chmod", "chown", "ln", "readlink", "stat", "file", "tar", "gzip", "gunzip",
         ];
         if bash_commands.contains(&first_word) {
+            return true;
+        }
+
+        // For piped commands, also check subsequent pipe segments.
+        // e.g. `cat foo | grep bar` — if any segment starts with a bash command, use bash.
+        if trimmed.contains(" | ") {
+            for segment in trimmed.split(" | ").skip(1) {
+                let seg_first = segment.split_whitespace().next().unwrap_or("");
+                if bash_commands.contains(&seg_first) {
+                    return true;
+                }
+            }
+        }
+
+        // Bash negation prefix: `! command` inverts the exit code.
+        // This is exclusively bash syntax — cmd.exe cannot handle it.
+        if first_word == "!" {
             return true;
         }
 
@@ -485,6 +503,17 @@ impl ShellCommandHandler {
                 // "execvpe(/bin/bash) failed" when WSL has no distro installed.
                 let bash_path = Self::find_git_bash().unwrap_or_else(|| "bash".to_string());
                 let mut c = crate::process_helpers::tokio_no_window(&bash_path);
+                // Ensure MSYS2 /usr/bin is on PATH so tools like cat, grep, sed
+                // are available even when bash is invoked non-interactively.
+                if let Some(usr_bin) = std::path::Path::new(&bash_path).parent()
+                // e.g. C:\Program Files\Git\usr\bin
+                {
+                    let usr_bin_str = usr_bin.to_string_lossy();
+                    let current_path = std::env::var("PATH").unwrap_or_default();
+                    if !current_path.contains(&*usr_bin_str) {
+                        c.env("PATH", format!("{};{}", usr_bin_str, current_path));
+                    }
+                }
                 c.args(["-c", command]);
                 c
             } else {
@@ -494,7 +523,14 @@ impl ShellCommandHandler {
                 // Extract Unix-style KEY=VALUE env prefixes that cmd.exe can't handle
                 let (extra_envs, actual_cmd) = Self::extract_env_prefix_for_cmd(&stripped);
                 let mut c = crate::process_helpers::tokio_cmd_no_window();
-                c.args(["/C", &actual_cmd]);
+                // Use raw_arg to avoid Rust's automatic MSVC-style escaping of double
+                // quotes (\" instead of ""). cmd.exe doesn't understand \" and passes
+                // the literal backslash-quote to child processes, breaking quoted paths.
+                c.arg("/C");
+                #[cfg(windows)]
+                c.raw_arg(&actual_cmd);
+                #[cfg(not(windows))]
+                c.arg(&actual_cmd);
                 for (key, value) in extra_envs {
                     c.env(key, value);
                 }
@@ -601,12 +637,39 @@ mod tests {
             "curl -sf -X GET 'http://localhost:9876/reflection-fixes?workflow_name=test&status=applied'"
         ));
 
+        // Bash negation prefix
+        assert!(ShellCommandHandler::is_bash_command(
+            "! grep -qE 'pattern' file.txt"
+        ));
+        assert!(ShellCommandHandler::is_bash_command("! test -f /tmp/file"));
+
         // Bash syntax patterns
         assert!(ShellCommandHandler::is_bash_command("echo $(git status)"));
         assert!(ShellCommandHandler::is_bash_command("echo ${HOME}"));
         assert!(ShellCommandHandler::is_bash_command("cmd >/dev/null 2>&1"));
         assert!(ShellCommandHandler::is_bash_command(
             "if test -z \"out\"; then echo ok; fi"
+        ));
+
+        // Common Unix file commands
+        assert!(ShellCommandHandler::is_bash_command("cat /tmp/file.txt"));
+        assert!(ShellCommandHandler::is_bash_command("rm -rf /tmp/test"));
+        assert!(ShellCommandHandler::is_bash_command("ls -la /home"));
+        assert!(ShellCommandHandler::is_bash_command("cp src dst"));
+        assert!(ShellCommandHandler::is_bash_command("mv old new"));
+        assert!(ShellCommandHandler::is_bash_command("touch /tmp/marker"));
+        assert!(ShellCommandHandler::is_bash_command("mkdir -p /tmp/dir"));
+        assert!(ShellCommandHandler::is_bash_command("find . -name '*.rs'"));
+
+        // Piped commands where first word isn't in list but later segments are
+        assert!(ShellCommandHandler::is_bash_command(
+            "cat /tmp/file.txt | grep -q 'SMOKE_TEST_PASSED'"
+        ));
+        assert!(ShellCommandHandler::is_bash_command(
+            "git log --oneline | head -5"
+        ));
+        assert!(ShellCommandHandler::is_bash_command(
+            "cargo test 2>&1 | grep FAILED | wc -l"
         ));
 
         // Not bash - regular commands

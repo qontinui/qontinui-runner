@@ -149,6 +149,7 @@ mod tests {
             required: None,
             resolved_inputs: None,
             extracted_values: None,
+            failure_category: None,
         }
     }
 
@@ -170,6 +171,7 @@ mod tests {
             required: None,
             resolved_inputs: None,
             extracted_values: None,
+            failure_category: None,
         }
     }
 

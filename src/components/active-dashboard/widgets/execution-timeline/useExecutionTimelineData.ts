@@ -23,8 +23,8 @@ import type { StepExecutionStatus, StepStats } from "../shared/types";
 import type { WorkflowStage } from "../../../../types/dashboard/activity-types";
 import { useWorkflowExecutionOptional } from "../../../../contexts/WorkflowExecutionContext";
 import { mapStepType, mapPhase } from "../shared/utils";
+import { getApiBase } from "@/lib/runner-api";
 
-const API_BASE = "http://localhost:9876";
 const POLL_INTERVAL_MS = 1000; // Poll every 1 second to catch running steps
 
 /**
@@ -121,7 +121,7 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
   const fetchSteps = useCallback(async () => {
     try {
       // Fetch all steps (no step_type filter)
-      const response = await fetch(`${API_BASE}/current-execution/steps`);
+      const response = await fetch(`${getApiBase()}/current-execution/steps`);
       if (response.ok) {
         const data: CurrentExecutionStepsResponse = await response.json();
         if (data.success && data.executions) {
@@ -137,7 +137,7 @@ export function useExecutionTimelineData(): ExecutionTimelineData {
             // Fetch orchestrator state to get the current workflow stage
             try {
               const orchResponse = await fetch(
-                `${API_BASE}/task-runs/${data.task_run_id}/orchestrator-state`,
+                `${getApiBase()}/task-runs/${data.task_run_id}/orchestrator-state`,
               );
               if (orchResponse.ok) {
                 const orchData: OrchestratorStateResponse = await orchResponse.json();

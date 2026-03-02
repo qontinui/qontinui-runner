@@ -9,8 +9,7 @@ import type {
   DomCaptureApiResponse,
   CaptureFromExtensionRequest,
 } from "../types/domCapture";
-
-const API_BASE = "http://localhost:9876";
+import { getApiBase } from "@/lib/runner-api";
 
 /**
  * Service for DOM capture operations via HTTP API.
@@ -21,7 +20,7 @@ export const domCaptureService = {
    * Returns captures sorted by timestamp (most recent first).
    */
   async listCaptures(): Promise<DomCapture[]> {
-    const response = await fetch(`${API_BASE}/dom/captures`);
+    const response = await fetch(`${getApiBase()}/dom/captures`);
     if (!response.ok) {
       throw new Error(`Failed to list DOM captures: ${response.statusText}`);
     }
@@ -37,7 +36,7 @@ export const domCaptureService = {
    * @param id - DOM capture ID
    */
   async getCapture(id: string): Promise<DomCapture> {
-    const response = await fetch(`${API_BASE}/dom/captures/${id}`);
+    const response = await fetch(`${getApiBase()}/dom/captures/${id}`);
     if (!response.ok) {
       throw new Error(`Failed to get DOM capture: ${response.statusText}`);
     }
@@ -53,7 +52,7 @@ export const domCaptureService = {
    * @param id - DOM capture ID
    */
   async getCaptureHtml(id: string): Promise<string> {
-    const response = await fetch(`${API_BASE}/dom/captures/${id}/html`);
+    const response = await fetch(`${getApiBase()}/dom/captures/${id}/html`);
     if (!response.ok) {
       throw new Error(`Failed to get DOM capture HTML: ${response.statusText}`);
     }
@@ -66,7 +65,7 @@ export const domCaptureService = {
    * @param request - Capture request with HTML content
    */
   async submitFromExtension(request: CaptureFromExtensionRequest): Promise<DomCapture> {
-    const response = await fetch(`${API_BASE}/dom/receive`, {
+    const response = await fetch(`${getApiBase()}/dom/receive`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",

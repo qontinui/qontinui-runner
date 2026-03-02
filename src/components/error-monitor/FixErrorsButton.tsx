@@ -8,8 +8,7 @@ import { useState } from "react";
 import { Wrench, Loader2, AlertCircle, CheckCircle, ChevronDown } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { useFixWorkflow } from "../../hooks/useErrorMonitor";
-
-const API_BASE = "http://localhost:9876";
+import { getApiBase } from "@/lib/runner-api";
 
 interface FixErrorsButtonProps {
   /** Task run ID to scope errors to */
@@ -95,7 +94,7 @@ export function FixErrorsButton({
 
       // Execute the workflow inline without saving to the library
       // This prevents cluttering the workflow library with auto-generated fix workflows
-      const runResponse = await fetch(`${API_BASE}/unified-workflows/execute-inline`, {
+      const runResponse = await fetch(`${getApiBase()}/unified-workflows/execute-inline`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -158,7 +157,7 @@ export function FixErrorsButton({
         (workflowJson.settings as Record<string, unknown>)?.max_agentic_iterations || 10,
     };
 
-    const response = await fetch(`${API_BASE}/unified-workflows`, {
+    const response = await fetch(`${getApiBase()}/unified-workflows`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(createRequest),

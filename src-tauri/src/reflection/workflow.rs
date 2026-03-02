@@ -35,9 +35,15 @@ pub fn build_reflection_config(
         reflection_mode: true,
         provider_override: None,
         model_override: None,
+        model_overrides: std::collections::HashMap::new(),
         stage_index: None,
         max_sessions: Some(3),
         auto_run_generated: false,
+        approval_gate: false,
+        max_context_tokens: 100_000,
+        cross_workflow_learning: true,
+        verification_history: std::collections::HashMap::new(),
+        routing_context: Default::default(),
     }
 }
 
@@ -46,7 +52,7 @@ pub fn build_setup_steps(
     source_task_run_id: &str,
     source_workflow_name: &str,
 ) -> Vec<ExecutionStepConfig> {
-    let base_url = "http://localhost:9876";
+    let base_url = crate::mcp::types::get_self_base_url_from_env();
 
     vec![
         // Step 1: Load findings from source run
@@ -110,7 +116,7 @@ pub fn build_setup_steps(
 
 /// Build verification steps for the reflection workflow.
 pub fn build_verification_steps(source_task_run_id: &str) -> Vec<ExecutionStepConfig> {
-    let base_url = "http://localhost:9876";
+    let base_url = crate::mcp::types::get_self_base_url_from_env();
 
     vec![
         // Step 1: Verify reflection fixes were recorded via API
@@ -150,7 +156,7 @@ If any issues are found, report them. Otherwise, confirm the reflection is safe.
 
 /// Build completion steps for the reflection workflow.
 pub fn build_completion_steps(source_workflow_name: &str) -> Vec<ExecutionStepConfig> {
-    let base_url = "http://localhost:9876";
+    let base_url = crate::mcp::types::get_self_base_url_from_env();
 
     vec![
         // Step 1: Batch evaluate previous fixes (automation step)

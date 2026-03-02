@@ -187,6 +187,33 @@ pub enum AppEvent {
     },
 
     // ========================================================================
+    // Approval Events
+    // ========================================================================
+    /// Approval required — workflow is paused waiting for human review.
+    ApprovalRequired {
+        /// Task run ID
+        task_run_id: String,
+        /// Approval request ID
+        approval_id: String,
+        /// Current iteration
+        iteration: u32,
+        /// Prompt shown to the reviewer
+        prompt: String,
+    },
+
+    /// Approval resolved — human responded to approval request.
+    ApprovalResolved {
+        /// Task run ID
+        task_run_id: String,
+        /// Approval request ID
+        approval_id: String,
+        /// Whether approved
+        approved: bool,
+        /// Action taken
+        action: String,
+    },
+
+    // ========================================================================
     // Canvas Events
     // ========================================================================
     /// Canvas panel created, updated, or removed.
@@ -195,6 +222,65 @@ pub enum AppEvent {
         panel_id: String,
         panel: Option<serde_json::Value>,
         task_run_id: Option<String>,
+    },
+
+    // ========================================================================
+    // AI Output Streaming Events
+    // ========================================================================
+    /// Real-time AI output chunk for live streaming to the frontend.
+    AiOutputChunk {
+        /// Task run ID this output belongs to
+        task_run_id: String,
+        /// The text chunk received from the AI
+        chunk: String,
+        /// Total accumulated output length so far
+        accumulated_length: usize,
+    },
+
+    // ========================================================================
+    // Convergence Tracking Events
+    // ========================================================================
+    /// Per-iteration metrics for tracking convergence of the verification-agentic loop.
+    IterationMetrics {
+        /// Task run ID
+        task_run_id: String,
+        /// Current iteration number (1-indexed)
+        iteration: u32,
+        /// Number of verification steps that failed
+        failed_step_count: u32,
+        /// Number of verification steps that passed
+        passed_step_count: u32,
+        /// Number of verification steps that were skipped
+        skipped_step_count: u32,
+        /// Failures not present in the previous iteration
+        new_failures: u32,
+        /// Failures that were also present in the previous iteration
+        repeated_failures: u32,
+        /// True if failed_step_count has not decreased in 3 consecutive iterations
+        is_stalled: bool,
+    },
+
+    // ========================================================================
+    // Queue Events
+    // ========================================================================
+    /// Workflow has been added to the execution queue.
+    WorkflowQueued {
+        /// Task run ID for the queued workflow.
+        task_run_id: String,
+        /// Human-readable workflow name.
+        workflow_name: String,
+        /// Position in the queue (0-indexed).
+        queue_position: usize,
+    },
+
+    /// Workflow has been dequeued and is starting execution.
+    WorkflowDequeued {
+        /// Task run ID for the dequeued workflow.
+        task_run_id: String,
+        /// Human-readable workflow name.
+        workflow_name: String,
+        /// Time spent waiting in the queue, in milliseconds.
+        wait_time_ms: u64,
     },
 
     // ========================================================================
@@ -248,8 +334,22 @@ impl AppEvent {
             AppEvent::StepProgress { .. } => "step-progress",
             AppEvent::TaskRunUpdate { .. } => "task-run-update",
 
+            // Approval events
+            AppEvent::ApprovalRequired { .. } => "approval-required",
+            AppEvent::ApprovalResolved { .. } => "approval-resolved",
+
             // Canvas events
             AppEvent::CanvasUpdate { .. } => "canvas-update",
+
+            // AI output streaming events
+            AppEvent::AiOutputChunk { .. } => "ai-output-chunk",
+
+            // Convergence tracking events
+            AppEvent::IterationMetrics { .. } => "iteration-metrics",
+
+            // Queue events
+            AppEvent::WorkflowQueued { .. } => "workflow-queued",
+            AppEvent::WorkflowDequeued { .. } => "workflow-dequeued",
 
             // Generic events
             AppEvent::Error { .. } => "error",
@@ -427,6 +527,68 @@ impl AppEvent {
         }
     }
 
+    /// Create a workflow queued event.
+    pub fn workflow_queued(
+        task_run_id: impl Into<String>,
+        workflow_name: impl Into<String>,
+        queue_position: usize,
+    ) -> Self {
+        AppEvent::WorkflowQueued {
+            task_run_id: task_run_id.into(),
+            workflow_name: workflow_name.into(),
+            queue_position,
+        }
+    }
+
+    /// Create a workflow dequeued event.
+    pub fn workflow_dequeued(
+        task_run_id: impl Into<String>,
+        workflow_name: impl Into<String>,
+        wait_time_ms: u64,
+    ) -> Self {
+        AppEvent::WorkflowDequeued {
+            task_run_id: task_run_id.into(),
+            workflow_name: workflow_name.into(),
+            wait_time_ms,
+        }
+    }
+
+    /// Create an AI output chunk event for real-time streaming.
+    pub fn ai_output_chunk(
+        task_run_id: impl Into<String>,
+        chunk: impl Into<String>,
+        accumulated_length: usize,
+    ) -> Self {
+        AppEvent::AiOutputChunk {
+            task_run_id: task_run_id.into(),
+            chunk: chunk.into(),
+            accumulated_length,
+        }
+    }
+
+    /// Create an iteration metrics event for convergence tracking.
+    pub fn iteration_metrics(
+        task_run_id: impl Into<String>,
+        iteration: u32,
+        failed_step_count: u32,
+        passed_step_count: u32,
+        skipped_step_count: u32,
+        new_failures: u32,
+        repeated_failures: u32,
+        is_stalled: bool,
+    ) -> Self {
+        AppEvent::IterationMetrics {
+            task_run_id: task_run_id.into(),
+            iteration,
+            failed_step_count,
+            passed_step_count,
+            skipped_step_count,
+            new_failures,
+            repeated_failures,
+            is_stalled,
+        }
+    }
+
     /// Create a generic error event.
     pub fn error(message: impl Into<String>) -> Self {
         AppEvent::Error {
@@ -440,6 +602,36 @@ impl AppEvent {
         AppEvent::Error {
             message: message.into(),
             context: Some(context.into()),
+        }
+    }
+
+    /// Create an approval required event.
+    pub fn approval_required(
+        task_run_id: impl Into<String>,
+        approval_id: impl Into<String>,
+        iteration: u32,
+        prompt: impl Into<String>,
+    ) -> Self {
+        AppEvent::ApprovalRequired {
+            task_run_id: task_run_id.into(),
+            approval_id: approval_id.into(),
+            iteration,
+            prompt: prompt.into(),
+        }
+    }
+
+    /// Create an approval resolved event.
+    pub fn approval_resolved(
+        task_run_id: impl Into<String>,
+        approval_id: impl Into<String>,
+        approved: bool,
+        action: impl Into<String>,
+    ) -> Self {
+        AppEvent::ApprovalResolved {
+            task_run_id: task_run_id.into(),
+            approval_id: approval_id.into(),
+            approved,
+            action: action.into(),
         }
     }
 

@@ -20,6 +20,29 @@ use crate::doctor::DoctorHandle;
 /// Default port for the MCP API server
 pub const MCP_API_PORT: u16 = 9876;
 
+/// Get the MCP API port, checking `QONTINUI_PORT` env var first.
+pub fn get_mcp_api_port() -> u16 {
+    std::env::var("QONTINUI_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(MCP_API_PORT)
+}
+
+/// Returns the base URL for this runner instance (e.g., "http://localhost:9877").
+/// Reads the actual bound port from AppState.
+pub fn get_self_base_url(app_state: &crate::commands::AppState) -> String {
+    let port = app_state
+        .api_port
+        .load(std::sync::atomic::Ordering::Relaxed);
+    format!("http://localhost:{}", port)
+}
+
+/// Returns the base URL using the configured port (env var or default).
+/// Use this in code paths that don't have access to AppState.
+pub fn get_self_base_url_from_env() -> String {
+    format!("http://localhost:{}", get_mcp_api_port())
+}
+
 /// Shared state for the API server (authoritative definition)
 pub struct ApiState {
     pub app_state: Arc<AppState>,

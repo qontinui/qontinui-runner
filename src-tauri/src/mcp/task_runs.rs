@@ -736,6 +736,12 @@ pub fn compute_resume_point(
                     from_step: Some(from_stage as usize),
                     description: resume_point.description(),
                 },
+                ResumePoint::ApprovalPhase { iteration, .. } => ResumePointData {
+                    resume_type: "approval_phase".to_string(),
+                    iteration: Some(iteration),
+                    from_step: None,
+                    description: resume_point.description(),
+                },
             }
         }
         Err(e) => {
@@ -923,7 +929,7 @@ pub async fn generate_task_summary(
     let doctor_handle = state.doctor_handle.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        summary_generator::generate_task_summary(&db, &task_id, doctor_handle.as_ref())
+        summary_generator::generate_task_summary(&db, &task_id, doctor_handle.as_ref(), None, None)
     })
     .await
     .map_err(|e| {
@@ -1137,9 +1143,15 @@ pub async fn resume_task_run(
         reflection_mode: workflow.reflection_mode,
         provider_override: None,
         model_override: None,
+        model_overrides: workflow.model_overrides.clone(),
         stage_index: None,
         max_sessions: Some(workflow.max_iterations),
         auto_run_generated: false,
+        approval_gate: workflow.approval_gate,
+        max_context_tokens: 100_000,
+        cross_workflow_learning: true,
+        verification_history: std::collections::HashMap::new(),
+        routing_context: Default::default(),
     };
 
     // Spawn the workflow execution in background with panic protection
@@ -3160,6 +3172,7 @@ pub async fn generate_workflow_from_chat(
         investigate_codebase: Some(true),
         include_design_guidance: None,
         auto_run: None,
+        model_overrides: None,
     };
 
     let doctor_handle = state.doctor_handle.clone();
@@ -3269,6 +3282,102 @@ pub async fn rename_task_run(
 }
 
 // ============================================================================
+// Approval Gate Endpoints
+// ============================================================================
+
+/// List pending approvals for a task run.
+pub async fn list_approvals(
+    axum::extract::Path(task_run_id): axum::extract::Path<String>,
+) -> Result<
+    Json<Vec<crate::unified_workflow_executor::approval::ApprovalRequest>>,
+    (StatusCode, String),
+> {
+    let registry = crate::unified_workflow_executor::approval::get_approval_registry();
+    let pending = registry.get_pending_for_execution(&task_run_id).await;
+    Ok(Json(pending))
+}
+
+/// Get a specific approval request.
+pub async fn get_approval(
+    axum::extract::Path((task_run_id, approval_id)): axum::extract::Path<(String, String)>,
+) -> Result<Json<crate::unified_workflow_executor::approval::ApprovalRequest>, (StatusCode, String)>
+{
+    let registry = crate::unified_workflow_executor::approval::get_approval_registry();
+    match registry.get_pending(&approval_id).await {
+        Some(request) if request.execution_id == task_run_id => Ok(Json(request)),
+        Some(_) => Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "Approval '{}' not found for task run '{}'",
+                approval_id, task_run_id
+            ),
+        )),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            format!("No pending approval found with ID '{}'", approval_id),
+        )),
+    }
+}
+
+/// Request body for responding to an approval.
+#[derive(Debug, Deserialize)]
+pub struct ApprovalResponseBody {
+    pub action: String, // "approve", "reject", "abort"
+    pub comment: Option<String>,
+}
+
+/// Respond to a pending approval request.
+pub async fn respond_to_approval(
+    axum::extract::Path((_task_run_id, approval_id)): axum::extract::Path<(String, String)>,
+    Json(body): Json<ApprovalResponseBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let approved = body.action == "approve";
+    let response = crate::unified_workflow_executor::approval::ApprovalResponse {
+        approved,
+        action: body.action.clone(),
+        comment: body.comment,
+    };
+
+    let registry = crate::unified_workflow_executor::approval::get_approval_registry();
+    registry
+        .resolve(&approval_id, response)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, e))?;
+
+    Ok(Json(serde_json::json!({
+        "status": "resolved",
+        "approval_id": approval_id,
+        "action": body.action,
+        "approved": approved,
+    })))
+}
+
+/// Get approval gate history (resolved approvals) for a task run.
+pub async fn get_approval_gates(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(task_run_id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let db = state.app_state.checkpoint_db.clone();
+    let id = task_run_id.clone();
+    let gates = tokio::task::spawn_blocking(move || db.get_approval_gates_for_task_run(&id))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Task failed: {}", e),
+            )
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("DB error: {}", e),
+            )
+        })?;
+
+    Ok(Json(serde_json::json!(gates)))
+}
+
+// ============================================================================
 // End Task Run HTTP API Handlers
 // ============================================================================
 
@@ -3334,8 +3443,50 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/task-runs/:id/stream/ai-output",
             get(sse_ai_output_for_task_run),
         )
+        .route("/task-runs/:id/approvals", get(list_approvals))
+        .route("/task-runs/:id/approvals/:aid", get(get_approval))
+        .route(
+            "/task-runs/:id/approvals/:aid/respond",
+            post(respond_to_approval),
+        )
+        .route("/task-runs/:id/approval-gates", get(get_approval_gates))
         .route("/current-execution/steps", get(get_current_execution_steps))
         .route("/current-execution/batch", get(get_current_execution_batch))
+        .route("/task-runs/:id/usage", get(get_task_run_usage))
+}
+
+/// Get per-phase token usage breakdown for a task run.
+async fn get_task_run_usage(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let db = state.app_state.checkpoint_db.clone();
+    let task_run_id = id.clone();
+
+    let usage = tokio::task::spawn_blocking(move || db.get_phase_token_usage(&task_run_id))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("spawn_blocking error: {}", e),
+            )
+        })?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Compute totals
+    let total_input: u64 = usage.iter().map(|u| u.input_tokens).sum();
+    let total_output: u64 = usage.iter().map(|u| u.output_tokens).sum();
+    let total_cost: u64 = usage.iter().map(|u| u.cost_cents).sum();
+
+    Ok(Json(serde_json::json!({
+        "task_run_id": id,
+        "phases": usage,
+        "totals": {
+            "input_tokens": total_input,
+            "output_tokens": total_output,
+            "cost_cents": total_cost,
+        }
+    })))
 }
 
 #[cfg(test)]

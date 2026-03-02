@@ -9,8 +9,8 @@ import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { ActivityType } from "../../types/dashboard/activity-types";
 import type { TaskActivityInfo } from "../../types/dashboard/widget-registry";
+import { getApiBase } from "@/lib/runner-api";
 
-const API_BASE = "http://localhost:9876";
 // Polling is now fallback only - real-time events provide instant updates
 const POLL_INTERVAL_MS = 5000;
 // Number of consecutive empty polls required before declaring idle
@@ -268,6 +268,11 @@ function detectActivities(task: RunningTaskData): ActivityType[] {
     activities.push("findings");
   }
 
+  // Canvas is available during agentic AI phases (agent can post rich panels)
+  if (task.prompt || hasAiTask) {
+    activities.push("canvas");
+  }
+
   return activities;
 }
 
@@ -335,7 +340,7 @@ export function useTaskDetection(options?: UseTaskDetectionOptions): UseTaskDete
    */
   const refresh = useCallback(async () => {
     try {
-      const response = await fetch(`${API_BASE}/task-runs/running`);
+      const response = await fetch(`${getApiBase()}/task-runs/running`);
 
       if (!response.ok) {
         // API not available or no running tasks - increment empty counter

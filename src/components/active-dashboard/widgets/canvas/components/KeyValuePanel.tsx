@@ -5,7 +5,6 @@
  */
 
 import { cn } from "../../../../../lib/utils";
-import { Badge } from "../../../../ui";
 import type { CanvasPanelComponentProps } from "./CanvasComponentRegistry";
 
 interface KVPair {

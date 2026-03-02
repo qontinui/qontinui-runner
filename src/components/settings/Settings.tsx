@@ -21,6 +21,7 @@ import { CloudRelaySettings } from "./CloudRelaySettings";
 import { LogSourcesSettings } from "./LogSourcesSettings";
 import { McpSettings } from "./McpSettings";
 import { ExecutionVariablesSettings } from "./ExecutionVariablesSettings";
+import { RunnerInstancesSettings } from "./RunnerInstancesSettings";
 import type { Project, ConnectionInfo } from "../../types/auth";
 
 interface WebSocketState {
@@ -58,6 +59,7 @@ type SettingsTab =
   | "general"
   | "storage"
   | "backup"
+  | "instances"
   | "advanced"
   | "updates";
 
@@ -77,6 +79,7 @@ const VALID_TABS = [
   "general",
   "storage",
   "backup",
+  "instances",
   "advanced",
   "updates",
 ] as const;
@@ -157,6 +160,8 @@ export function Settings({
         return <StorageSettings onLog={onLog} />;
       case "backup":
         return <BackupSettings onLog={onLog} />;
+      case "instances":
+        return <RunnerInstancesSettings onLog={onLog} />;
       case "advanced":
         return <AdvancedSettings onLog={onLog} onDebugModeChange={onDebugModeChange} />;
       case "updates":

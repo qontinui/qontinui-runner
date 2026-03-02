@@ -39,7 +39,7 @@ use crate::storage::LocalStorage;
 use crate::tiered_info::RunRecordingHandler;
 use crate::video_recorder::VideoRecordingService;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU16};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 use tokio::sync::Mutex as TokioMutex;
@@ -69,6 +69,7 @@ pub mod findings;
 pub mod flow; // Flow designer commands
 pub mod global_log_sources; // Global log source management
 pub mod hooks;
+pub mod instances; // Runner instance management (dev feature)
 pub mod interaction;
 pub mod issues;
 pub mod learning; // Learning insights dashboard commands
@@ -92,9 +93,11 @@ pub mod state_machine;
 pub mod step_outputs; // Step output collection for test builder
 pub mod storage;
 pub mod task_sync; // renamed from ai_task_reporting
+pub mod terminal;
 pub mod test_orchestrator; // AI-driven multi-step API test orchestration
 pub mod testing;
 pub mod tiered_info;
+pub mod transcript; // Claude Code transcript import and standalone workflow generation
 pub mod ui_bridge; // UI Bridge for AI-driven UI automation
 pub mod verification;
 pub mod video;
@@ -160,10 +163,13 @@ pub struct AppState {
     /// Process capture manager for spawning and managing child processes.
     /// Captures stdout/stderr and feeds errors into the Error Monitor.
     pub process_capture_manager: TokioMutex<Option<Arc<ProcessCaptureManager>>>,
-    /// Flag indicating the HTTP API server (port 9876) has bound and is ready.
+    /// Flag indicating the HTTP API server has bound and is ready.
     /// Set by `mcp_api::start_server` after successful bind, checked by the
     /// `is_api_ready` Tauri command so the frontend can gate HTTP calls.
     pub api_ready: AtomicBool,
+    /// Actual port the HTTP API server bound to.
+    /// Set by `mcp_api::start_server` after successful bind.
+    pub api_port: AtomicU16,
     /// Shared PID tracker for spawned AI (Claude CLI) processes.
     /// Shared between AppState (for shutdown cleanup) and ApiState (for stop endpoints).
     pub ai_pid_tracker: Arc<Mutex<Vec<u32>>>,

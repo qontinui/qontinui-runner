@@ -206,6 +206,25 @@ pub fn emit_ai_output(
         crate::event_system::broadcast_ws_notification(app_handle, "ai-output", &json);
     }
 
+    // Emit the structured ai-output-chunk event for the streaming widget.
+    // This provides a task_run_id-keyed stream that the frontend can filter by run.
+    if let Some(ctx) = session_ctx {
+        if source == "claude" {
+            let chunk_event = crate::event_system::AppEvent::ai_output_chunk(
+                ctx.task_run_id(),
+                line,
+                line.len(), // approximate; the frontend accumulates its own total
+            );
+            let chunk_event_name = chunk_event.event_name();
+            if let Err(e) = app_handle.emit(chunk_event_name, &chunk_event) {
+                warn!("Failed to emit ai-output-chunk event: {}", e);
+            }
+            if let Ok(json) = serde_json::to_value(&chunk_event) {
+                crate::event_system::broadcast_ws_notification(app_handle, chunk_event_name, &json);
+            }
+        }
+    }
+
     // Persist directly to ai-output.jsonl (don't rely on frontend round-trip)
     let entry = crate::commands::logging::AiOutputEntry {
         id: event.id,

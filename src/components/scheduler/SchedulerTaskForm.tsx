@@ -17,6 +17,7 @@ import type {
   RepositoryWatch,
 } from "../../types/scheduler";
 import { useExecution } from "../../contexts";
+import { getApiBase } from "@/lib/runner-api";
 
 interface WorkflowOption {
   id: string;
@@ -173,7 +174,7 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
     const fetchPrompts = async () => {
       setLoadingPrompts(true);
       try {
-        const response = await fetch("http://localhost:9876/prompts", {
+        const response = await fetch(`${getApiBase()}/prompts`, {
           signal: controller.signal,
         });
         const result = await response.json();

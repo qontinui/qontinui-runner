@@ -93,7 +93,7 @@ fn extract_origin(url: &str) -> String {
         return url.to_string();
     }
     // Fallback
-    "http://localhost:9876".to_string()
+    crate::mcp::types::get_self_base_url_from_env()
 }
 
 // ---------------------------------------------------------------------------
@@ -192,23 +192,22 @@ impl StepHandler for UiBridgeHandler {
         context: &HandlerContext,
     ) -> StepHandlerResult {
         let action = step.ui_bridge_action.as_deref().unwrap_or("snapshot");
-        let raw_url = step
-            .ui_bridge_url
-            .as_deref()
-            .unwrap_or("http://localhost:9876/ui-bridge");
+        let self_base = crate::mcp::types::get_self_base_url(&context.app_state);
+        let default_ui_bridge = format!("{}/ui-bridge", self_base);
+        let raw_url = step.ui_bridge_url.as_deref().unwrap_or(&default_ui_bridge);
 
         // SDK operations (navigate, execute, assert) always go through the runner's SDK proxy.
         // The `ui_bridge_url` may be a page URL (e.g., "http://localhost:3001/build/page-sweep")
         // rather than a UI Bridge API base — detect this and use the runner proxy instead.
         let base_url: &str = if matches!(action, "navigate" | "execute" | "assert") {
             // Always use runner SDK proxy for SDK operations
-            "http://localhost:9876/ui-bridge"
+            &default_ui_bridge
         } else if raw_url.contains("/ui-bridge") {
             // URL already contains UI Bridge path — use as-is
             raw_url
         } else {
             // Fallback: use runner SDK proxy
-            "http://localhost:9876/ui-bridge"
+            &default_ui_bridge
         };
 
         let timeout_ms =

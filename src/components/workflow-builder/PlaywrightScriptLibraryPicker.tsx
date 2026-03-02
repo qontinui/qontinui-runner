@@ -17,6 +17,7 @@ import {
   FolderOpen,
 } from "lucide-react";
 import type { WorkflowPhase } from "../../types/unified-workflow";
+import { getApiBase } from "@/lib/runner-api";
 
 // PlaywrightScript type from script storage
 interface PlaywrightScript {
@@ -42,8 +43,6 @@ interface PlaywrightScriptLibraryPickerProps {
   phase: WorkflowPhase;
 }
 
-const API_BASE = "http://localhost:9876";
-
 export function PlaywrightScriptLibraryPicker({
   isOpen,
   onClose,
@@ -66,7 +65,7 @@ export function PlaywrightScriptLibraryPicker({
     const fetchScripts = async () => {
       setIsLoading(true);
       try {
-        const response = await fetch(`${API_BASE}/playwright/tests`, {
+        const response = await fetch(`${getApiBase()}/playwright/tests`, {
           signal: controller.signal,
         });
         if (response.ok) {

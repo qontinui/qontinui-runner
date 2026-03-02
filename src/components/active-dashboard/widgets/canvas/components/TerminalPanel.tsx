@@ -18,18 +18,27 @@ export function TerminalPanel({ data, size }: CanvasPanelComponentProps) {
     return <p className="text-sm text-muted-foreground italic">No output</p>;
   }
 
+  const truncated = lines.length > maxLines;
+
   return (
-    <pre
-      className={cn(
-        "font-mono bg-black/80 text-green-400 rounded p-3 overflow-auto",
-        isCompact ? "text-[10px] max-h-[150px]" : "text-xs max-h-[400px]",
+    <div className="space-y-1">
+      {truncated && (
+        <p className="text-[10px] text-muted-foreground">
+          Showing last {maxLines} of {lines.length} lines
+        </p>
       )}
-    >
-      {displayLines.map((line, idx) => (
-        <div key={idx} className="whitespace-pre-wrap break-all">
-          {line}
-        </div>
-      ))}
-    </pre>
+      <pre
+        className={cn(
+          "font-mono bg-black/80 text-green-400 rounded p-3 overflow-auto",
+          isCompact ? "text-[10px] max-h-[150px]" : "text-xs max-h-[400px]",
+        )}
+      >
+        {displayLines.map((line, idx) => (
+          <div key={idx} className="whitespace-pre-wrap break-all">
+            {line}
+          </div>
+        ))}
+      </pre>
+    </div>
   );
 }

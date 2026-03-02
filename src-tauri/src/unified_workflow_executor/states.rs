@@ -71,6 +71,19 @@ pub enum UnifiedWorkflowState {
         stage_index: u32,
     },
 
+    /// Waiting for human approval before proceeding.
+    ApprovalPending {
+        /// Current iteration (1-indexed).
+        iteration: u32,
+        /// Stage index for multi-stage workflows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stage_index: Option<u32>,
+        /// Unique ID of the approval request.
+        approval_id: String,
+        /// Prompt shown to the human reviewer.
+        prompt: String,
+    },
+
     /// Completion phase is running.
     CompletionRunning,
 
@@ -107,6 +120,7 @@ impl WorkflowState for UnifiedWorkflowState {
             UnifiedWorkflowState::AgenticRunning { .. } => "agentic_running",
             UnifiedWorkflowState::AgenticComplete { .. } => "agentic_complete",
             UnifiedWorkflowState::StageComplete { .. } => "stage_complete",
+            UnifiedWorkflowState::ApprovalPending { .. } => "approval_pending",
             UnifiedWorkflowState::CompletionRunning => "completion_running",
             UnifiedWorkflowState::CompletionComplete => "completion_complete",
             UnifiedWorkflowState::Failed { .. } => "failed",
@@ -124,12 +138,13 @@ impl WorkflowState for UnifiedWorkflowState {
     }
 
     fn is_resumable(&self) -> bool {
-        // We can resume from any "running" state
+        // We can resume from any "running" state or when waiting for approval
         matches!(
             self,
             UnifiedWorkflowState::SetupRunning
                 | UnifiedWorkflowState::VerificationRunning { .. }
                 | UnifiedWorkflowState::AgenticRunning { .. }
+                | UnifiedWorkflowState::ApprovalPending { .. }
                 | UnifiedWorkflowState::CompletionRunning
         )
     }
@@ -145,6 +160,7 @@ impl WorkflowState for UnifiedWorkflowState {
             UnifiedWorkflowState::AgenticRunning { .. }
             | UnifiedWorkflowState::AgenticComplete { .. } => Some("agentic"),
             UnifiedWorkflowState::StageComplete { .. } => None,
+            UnifiedWorkflowState::ApprovalPending { .. } => Some("agentic"),
             UnifiedWorkflowState::CompletionRunning | UnifiedWorkflowState::CompletionComplete => {
                 Some("completion")
             }
@@ -172,7 +188,8 @@ impl WorkflowState for UnifiedWorkflowState {
             UnifiedWorkflowState::VerificationRunning { iteration, .. }
             | UnifiedWorkflowState::VerificationComplete { iteration, .. }
             | UnifiedWorkflowState::AgenticRunning { iteration, .. }
-            | UnifiedWorkflowState::AgenticComplete { iteration, .. } => Some(*iteration),
+            | UnifiedWorkflowState::AgenticComplete { iteration, .. }
+            | UnifiedWorkflowState::ApprovalPending { iteration, .. } => Some(*iteration),
             UnifiedWorkflowState::Failed { iteration, .. }
             | UnifiedWorkflowState::Stopped { iteration, .. } => *iteration,
             _ => None,
@@ -265,6 +282,21 @@ impl UnifiedWorkflowState {
     /// Create a StageComplete state.
     pub fn stage_complete(stage_index: u32) -> Self {
         UnifiedWorkflowState::StageComplete { stage_index }
+    }
+
+    /// Create an ApprovalPending state.
+    pub fn approval_pending(
+        iteration: u32,
+        stage_index: Option<u32>,
+        approval_id: impl Into<String>,
+        prompt: impl Into<String>,
+    ) -> Self {
+        UnifiedWorkflowState::ApprovalPending {
+            iteration,
+            stage_index,
+            approval_id: approval_id.into(),
+            prompt: prompt.into(),
+        }
     }
 
     /// Create a CompletionRunning state.
@@ -403,6 +435,21 @@ impl std::fmt::Display for UnifiedWorkflowState {
             }
             UnifiedWorkflowState::StageComplete { stage_index } => {
                 write!(f, "Stage {} Complete", stage_index)
+            }
+            UnifiedWorkflowState::ApprovalPending {
+                iteration,
+                stage_index,
+                ..
+            } => {
+                if let Some(si) = stage_index {
+                    write!(
+                        f,
+                        "Approval Pending (stage {}, iteration {})",
+                        si, iteration
+                    )
+                } else {
+                    write!(f, "Approval Pending (iteration {})", iteration)
+                }
             }
             UnifiedWorkflowState::CompletionRunning => write!(f, "Completion Running"),
             UnifiedWorkflowState::CompletionComplete => write!(f, "Completion Complete"),

@@ -12,6 +12,7 @@ import { autoNameFromMessage } from "@qontinui/workflow-utils";
 import { useChatSession } from "../../hooks/useChatSession";
 import { CHAT_MARKDOWN_COMPONENTS } from "../markdown/shared-components";
 import { ChatSidebar } from "./ChatSidebar";
+import { getApiBase } from "@/lib/runner-api";
 
 interface ChatPageProps {
   onNavigateToBuilder?: () => void;
@@ -139,7 +140,7 @@ export function ChatPage({ onNavigateToBuilder, onNavigateToActive }: ChatPagePr
   const handleSaveWorkflow = useCallback(async () => {
     if (!generatedWorkflow) return;
     try {
-      await fetch("http://127.0.0.1:9876/unified-workflows", {
+      await fetch(`${getApiBase()}/unified-workflows`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(generatedWorkflow),
@@ -153,7 +154,7 @@ export function ChatPage({ onNavigateToBuilder, onNavigateToActive }: ChatPagePr
     if (!generatedWorkflow) return;
     try {
       close();
-      await fetch("http://127.0.0.1:9876/unified-workflows/execute-inline", {
+      await fetch(`${getApiBase()}/unified-workflows/execute-inline`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(generatedWorkflow),

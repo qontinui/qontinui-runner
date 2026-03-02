@@ -74,6 +74,15 @@ pub enum TriggerConfig {
         #[serde(default = "default_consecutive_failures")]
         consecutive_failures: u32,
     },
+
+    /// Cron-based schedule trigger
+    Schedule {
+        /// Cron expression (e.g., "0 */6 * * *" for every 6 hours)
+        cron_expression: String,
+        /// Timezone for schedule evaluation (e.g., "UTC", "America/New_York")
+        #[serde(default = "default_timezone")]
+        timezone: String,
+    },
 }
 
 /// A URL target for health checking.
@@ -113,6 +122,10 @@ fn default_health_timeout() -> u64 {
     10
 }
 
+fn default_timezone() -> String {
+    "UTC".to_string()
+}
+
 // ============================================================================
 // Trigger Definition
 // ============================================================================
@@ -142,6 +155,12 @@ pub struct WorkflowTrigger {
     /// Maximum concurrent workflow executions from this trigger
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: u32,
+    /// Number of times to retry on execution failure (0 = no retries)
+    #[serde(default)]
+    pub retry_count: u32,
+    /// Base delay between retries in seconds (doubled on each retry)
+    #[serde(default = "default_retry_delay")]
+    pub retry_delay_seconds: u64,
     pub enabled: bool,
     pub last_triggered_at: Option<String>,
     pub last_execution_id: Option<String>,
@@ -161,6 +180,10 @@ fn default_cooldown() -> u64 {
 
 fn default_max_concurrent() -> u32 {
     1
+}
+
+fn default_retry_delay() -> u64 {
+    30
 }
 
 /// A condition that must be met before a trigger fires.
@@ -234,6 +257,10 @@ pub struct CreateTriggerRequest {
     pub cooldown_seconds: u64,
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: u32,
+    #[serde(default)]
+    pub retry_count: u32,
+    #[serde(default = "default_retry_delay")]
+    pub retry_delay_seconds: u64,
 }
 
 /// Request to update an existing trigger.
@@ -248,6 +275,8 @@ pub struct UpdateTriggerRequest {
     pub debounce_ms: Option<u64>,
     pub cooldown_seconds: Option<u64>,
     pub max_concurrent: Option<u32>,
+    pub retry_count: Option<u32>,
+    pub retry_delay_seconds: Option<u64>,
 }
 
 /// Request to enable/disable a trigger.
@@ -264,6 +293,8 @@ pub struct TriggerSystemStatus {
     pub enabled_triggers: u64,
     pub active_watchers: u64,
     pub active_executions: u64,
+    #[serde(default)]
+    pub dropped_events: u64,
 }
 
 // ============================================================================
@@ -357,6 +388,49 @@ mod tests {
             } => {
                 assert_eq!(check_interval_seconds, 30);
                 assert_eq!(consecutive_failures, 3);
+            }
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_schedule_config() {
+        let config = TriggerConfig::Schedule {
+            cron_expression: "0 */6 * * *".to_string(),
+            timezone: "UTC".to_string(),
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("schedule"));
+        let deserialized: TriggerConfig = serde_json::from_str(&json).unwrap();
+
+        match deserialized {
+            TriggerConfig::Schedule {
+                cron_expression,
+                timezone,
+            } => {
+                assert_eq!(cron_expression, "0 */6 * * *");
+                assert_eq!(timezone, "UTC");
+            }
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_schedule_config_default_timezone() {
+        let json = r#"{
+            "type": "schedule",
+            "cron_expression": "* * * * *"
+        }"#;
+
+        let config: TriggerConfig = serde_json::from_str(json).unwrap();
+        match config {
+            TriggerConfig::Schedule {
+                cron_expression,
+                timezone,
+            } => {
+                assert_eq!(cron_expression, "* * * * *");
+                assert_eq!(timezone, "UTC");
             }
             _ => panic!("Wrong variant"),
         }

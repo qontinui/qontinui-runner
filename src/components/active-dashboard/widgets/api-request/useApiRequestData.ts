@@ -8,8 +8,8 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import type { ApiRequestData } from "./types";
 import type { ApiRequestExecution, StepStats } from "../shared/types";
+import { getApiBase } from "@/lib/runner-api";
 
-const API_BASE = "http://localhost:9876";
 const POLL_INTERVAL_MS = 2000;
 
 /**
@@ -47,7 +47,7 @@ export function useApiRequestData(): ApiRequestData {
   // Fetch API request executions from /current-execution/steps
   const fetchRequests = useCallback(async () => {
     try {
-      const response = await fetch(`${API_BASE}/current-execution/steps?step_type=api_request`);
+      const response = await fetch(`${getApiBase()}/current-execution/steps?step_type=api_request`);
       if (response.ok) {
         const data: CurrentExecutionStepsResponse = await response.json();
         if (data.success && data.executions) {

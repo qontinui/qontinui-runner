@@ -56,8 +56,12 @@
 //! }
 //! ```
 
+pub mod agentic_output;
+pub mod approval;
 pub(crate) mod auto_run;
+pub mod conditional_routing;
 mod loop_controller;
+pub mod output_parser;
 mod phase_configs;
 mod phases;
 mod resume;
@@ -71,6 +75,8 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 // Core types used by external code
+#[allow(unused_imports)]
+pub use conditional_routing::RoutingContext;
 pub use loop_controller::{
     // Phase-aware versions (preferred for unified workflows)
     convert_all_json_steps_with_phase,

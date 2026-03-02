@@ -1556,6 +1556,27 @@ export function StepConfigPanel({ onClose, onOpenWorkflowPicker }: StepConfigPan
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto p-4">
+        {/* Skill Origin Badge */}
+        {selectedStep.skill_origin && (
+          <div className="mb-3 flex items-center justify-between gap-2 px-2.5 py-1.5 bg-zinc-800/50 border border-zinc-700/50 rounded-md">
+            <span className="text-xs text-zinc-400">
+              From skill:{" "}
+              <span className="text-zinc-300 font-medium">
+                {selectedStep.skill_origin.skill_slug}
+              </span>
+            </span>
+            <button
+              className="text-[10px] text-zinc-500 hover:text-zinc-300 transition-colors"
+              onClick={() =>
+                handleUpdate({ skill_origin: undefined } as unknown as Partial<UnifiedStep>)
+              }
+              title="Detach from skill — converts to raw step"
+            >
+              Detach
+            </button>
+          </div>
+        )}
+
         {/* Common fields */}
         <div className="mb-4">
           <label className="block text-sm font-medium text-zinc-400 mb-1">Step Name</label>

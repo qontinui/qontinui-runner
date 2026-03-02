@@ -9,13 +9,12 @@ import { useState, useEffect, useCallback, useMemo } from "react";
 import type { Finding, FindingsData, FindingSeverity, FindingStatus } from "./types";
 import { getSeverityColors, getStatusColors } from "@/design-system";
 import { useCurrentTaskRunId } from "@/contexts";
+import { getApiBase } from "@/lib/runner-api";
 
 /** Polling interval for findings data (5 seconds - less frequent than other widgets) */
 const POLL_INTERVAL_MS = 5000;
 
 /** API base URL for findings */
-const FINDINGS_API_BASE = "http://localhost:9876/findings/summary";
-
 /**
  * Backend finding format (from Rust API).
  */
@@ -132,8 +131,8 @@ export function useFindingsData(): FindingsData {
     try {
       // Build URL with optional task_run_id filter
       const url = currentTaskRunId
-        ? `${FINDINGS_API_BASE}?task_run_id=${encodeURIComponent(currentTaskRunId)}`
-        : FINDINGS_API_BASE;
+        ? `${getApiBase()}/findings/summary?task_run_id=${encodeURIComponent(currentTaskRunId)}`
+        : `${getApiBase()}/findings/summary`;
 
       const response = await fetch(url);
       if (!response.ok) {

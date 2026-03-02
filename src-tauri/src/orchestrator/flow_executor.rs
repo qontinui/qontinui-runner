@@ -972,7 +972,8 @@ impl FlowExecutor {
         };
 
         // The runner's MCP API endpoint for tool execution
-        let url = format!("http://localhost:9876/api/mcp/tools/{}/execute", tool_id);
+        let base_url = crate::mcp::types::get_self_base_url_from_env();
+        let url = format!("{}/api/mcp/tools/{}/execute", base_url, tool_id);
 
         match client.post(&url).json(inputs).send().await {
             Ok(response) => {

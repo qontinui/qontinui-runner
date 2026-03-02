@@ -3,6 +3,14 @@ import { Plus, Trash2, ChevronUp, ChevronDown, Settings2 } from "lucide-react";
 import { Button } from "../ui/Button";
 import { Badge } from "../ui/Badge";
 import { useWorkflowBuilder } from "./WorkflowBuilderContext";
+import type { ModelOverrideConfig, ModelOverrides } from "../../types";
+import {
+  PROVIDER_OPTIONS,
+  MODELS_BY_PROVIDER,
+  MODEL_OVERRIDE_PHASES,
+  MODEL_PRESETS,
+  detectPreset,
+} from "@qontinui/workflow-utils";
 
 /**
  * StageSelector — renders a stage tab bar when the workflow has stages.
@@ -284,10 +292,48 @@ function StageSettings({
   stage,
   onUpdate,
 }: {
-  stage: { description?: string; max_iterations?: number; provider?: string; model?: string };
+  stage: {
+    description?: string;
+    max_iterations?: number;
+    provider?: string;
+    model?: string;
+    model_overrides?: ModelOverrides;
+  };
   onUpdate: (updates: Record<string, unknown>) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const [overridesExpanded, setOverridesExpanded] = useState(false);
+
+  const selectClass =
+    "w-full h-7 px-2 text-xs bg-zinc-800/50 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-1 focus:ring-zinc-600";
+
+  const stageOverrides: ModelOverrides = (stage.model_overrides as ModelOverrides) ?? {};
+  const hasPhaseOverrides = MODEL_OVERRIDE_PHASES.some((phase) => {
+    const cfg = stageOverrides[phase.key as keyof ModelOverrides];
+    return cfg?.provider || cfg?.model;
+  });
+
+  const updateStagePhaseOverride = (
+    phaseKey: string,
+    field: "provider" | "model",
+    value: string,
+  ) => {
+    const current = { ...stageOverrides };
+    const phaseCfg: ModelOverrideConfig = {
+      ...(current[phaseKey as keyof ModelOverrides] ?? {}),
+    };
+    if (value) {
+      phaseCfg[field] = value;
+    } else {
+      delete phaseCfg[field];
+    }
+    if (!phaseCfg.provider && !phaseCfg.model) {
+      delete current[phaseKey as keyof ModelOverrides];
+    } else {
+      (current as Record<string, ModelOverrideConfig>)[phaseKey] = phaseCfg;
+    }
+    onUpdate({ model_overrides: Object.keys(current).length > 0 ? current : undefined });
+  };
 
   return (
     <div className="px-3 pb-1.5">
@@ -297,45 +343,180 @@ function StageSettings({
       >
         <Settings2 className="size-2.5" />
         Phase settings
+        {hasPhaseOverrides && (
+          <span className="px-1 py-0.5 text-[8px] font-medium bg-purple-500/20 text-purple-400 rounded">
+            Overrides
+          </span>
+        )}
       </button>
       {expanded && (
-        <div className="mt-1.5 grid grid-cols-2 gap-2">
-          <div className="col-span-2">
-            <input
-              value={stage.description ?? ""}
-              onChange={(e) => onUpdate({ description: e.target.value })}
-              placeholder="Phase description"
-              className="w-full h-7 px-2 text-xs bg-zinc-800/50 border border-zinc-700 rounded-md text-zinc-200 placeholder:text-zinc-500 focus:outline-none focus:ring-1 focus:ring-zinc-600"
-            />
+        <div className="mt-1.5 space-y-2">
+          <div className="grid grid-cols-2 gap-2">
+            <div className="col-span-2">
+              <input
+                value={stage.description ?? ""}
+                onChange={(e) => onUpdate({ description: e.target.value })}
+                placeholder="Phase description"
+                className="w-full h-7 px-2 text-xs bg-zinc-800/50 border border-zinc-700 rounded-md text-zinc-200 placeholder:text-zinc-500 focus:outline-none focus:ring-1 focus:ring-zinc-600"
+              />
+            </div>
+            <div>
+              <label className="text-[10px] text-zinc-500">Max iterations</label>
+              <input
+                type="number"
+                value={stage.max_iterations ?? 10}
+                onChange={(e) => onUpdate({ max_iterations: parseInt(e.target.value) || 10 })}
+                className="w-full h-7 px-2 text-xs bg-zinc-800/50 border border-zinc-700 rounded-md text-zinc-200 placeholder:text-zinc-500 focus:outline-none focus:ring-1 focus:ring-zinc-600"
+                min={1}
+                max={100}
+              />
+            </div>
+            <div>
+              <label className="text-[10px] text-zinc-500">Provider override</label>
+              <select
+                value={stage.provider ?? ""}
+                onChange={(e) => onUpdate({ provider: e.target.value || undefined })}
+                className={selectClass}
+              >
+                <option value="">Inherit from workflow</option>
+                {PROVIDER_OPTIONS.filter((p) => p.value !== "").map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="text-[10px] text-zinc-500">Model override</label>
+              {stage.provider && MODELS_BY_PROVIDER[stage.provider] ? (
+                <select
+                  value={stage.model ?? ""}
+                  onChange={(e) => onUpdate({ model: e.target.value || undefined })}
+                  className={selectClass}
+                >
+                  <option value="">Inherit from workflow</option>
+                  {MODELS_BY_PROVIDER[stage.provider]!.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <input
+                  value={stage.model ?? ""}
+                  onChange={(e) => onUpdate({ model: e.target.value || undefined })}
+                  placeholder="(inherit)"
+                  className="w-full h-7 px-2 text-xs bg-zinc-800/50 border border-zinc-700 rounded-md text-zinc-200 placeholder:text-zinc-500 focus:outline-none focus:ring-1 focus:ring-zinc-600"
+                />
+              )}
+            </div>
           </div>
-          <div>
-            <label className="text-[10px] text-zinc-500">Max iterations</label>
-            <input
-              type="number"
-              value={stage.max_iterations ?? 10}
-              onChange={(e) => onUpdate({ max_iterations: parseInt(e.target.value) || 10 })}
-              className="w-full h-7 px-2 text-xs bg-zinc-800/50 border border-zinc-700 rounded-md text-zinc-200 placeholder:text-zinc-500 focus:outline-none focus:ring-1 focus:ring-zinc-600"
-              min={1}
-              max={100}
-            />
-          </div>
-          <div>
-            <label className="text-[10px] text-zinc-500">Provider override</label>
-            <input
-              value={stage.provider ?? ""}
-              onChange={(e) => onUpdate({ provider: e.target.value || undefined })}
-              placeholder="(inherit)"
-              className="w-full h-7 px-2 text-xs bg-zinc-800/50 border border-zinc-700 rounded-md text-zinc-200 placeholder:text-zinc-500 focus:outline-none focus:ring-1 focus:ring-zinc-600"
-            />
-          </div>
-          <div>
-            <label className="text-[10px] text-zinc-500">Model override</label>
-            <input
-              value={stage.model ?? ""}
-              onChange={(e) => onUpdate({ model: e.target.value || undefined })}
-              placeholder="(inherit)"
-              className="w-full h-7 px-2 text-xs bg-zinc-800/50 border border-zinc-700 rounded-md text-zinc-200 placeholder:text-zinc-500 focus:outline-none focus:ring-1 focus:ring-zinc-600"
-            />
+
+          {/* Per-phase model overrides for this stage */}
+          <div className="bg-zinc-800/30 rounded-md overflow-hidden">
+            <button
+              type="button"
+              onClick={() => setOverridesExpanded(!overridesExpanded)}
+              className="w-full flex items-center gap-1.5 px-2 py-1.5 text-[10px] text-zinc-500 hover:text-zinc-400"
+            >
+              <Settings2 className="size-2.5" />
+              Stage Per-Phase Overrides
+              {hasPhaseOverrides && (
+                <span className="px-1 py-0.5 text-[8px] font-medium bg-purple-500/20 text-purple-400 rounded">
+                  Active
+                </span>
+              )}
+            </button>
+            {overridesExpanded && (
+              <div className="px-2 pb-2 space-y-1.5">
+                <p className="text-[9px] text-zinc-600">
+                  Override provider/model per phase within this stage. Empty = inherit from stage or
+                  workflow level.
+                </p>
+                <div className="flex items-center gap-1.5">
+                  <select
+                    value={detectPreset(stageOverrides)}
+                    onChange={(e) => {
+                      if (e.target.value === "custom") return;
+                      const preset = MODEL_PRESETS.find((p) => p.id === e.target.value);
+                      if (preset)
+                        onUpdate({
+                          model_overrides:
+                            Object.keys(preset.overrides).length > 0 ? preset.overrides : undefined,
+                        });
+                    }}
+                    className="flex-1 h-6 px-1.5 text-[10px] bg-zinc-800 border border-zinc-700 rounded text-zinc-200 focus:outline-none focus:ring-1 focus:ring-zinc-600"
+                  >
+                    <option value="custom">Custom</option>
+                    {MODEL_PRESETS.map((preset) => (
+                      <option key={preset.id} value={preset.id}>
+                        {preset.name}
+                      </option>
+                    ))}
+                  </select>
+                  {hasPhaseOverrides && (
+                    <button
+                      type="button"
+                      onClick={() => onUpdate({ model_overrides: undefined })}
+                      className="h-6 px-1.5 text-[10px] text-zinc-400 hover:text-red-400 border border-zinc-700 rounded"
+                    >
+                      Reset
+                    </button>
+                  )}
+                </div>
+                {MODEL_OVERRIDE_PHASES.filter((p) =>
+                  ["setup", "agentic", "completion", "verification"].includes(p.key),
+                ).map((phase) => {
+                  const cfg = stageOverrides[phase.key as keyof ModelOverrides];
+                  const provider = cfg?.provider ?? "";
+                  const model = cfg?.model ?? "";
+                  return (
+                    <div key={phase.key} className="flex items-center gap-1.5">
+                      <span
+                        className="text-[10px] text-zinc-500 w-20 flex-shrink-0 truncate"
+                        title={phase.label}
+                      >
+                        {phase.label}
+                      </span>
+                      <select
+                        value={provider}
+                        onChange={(e) => {
+                          updateStagePhaseOverride(phase.key, "provider", e.target.value);
+                          if (e.target.value !== provider) {
+                            updateStagePhaseOverride(phase.key, "model", "");
+                          }
+                        }}
+                        className="flex-1 h-6 px-1.5 text-[10px] bg-zinc-800 border border-zinc-700 rounded text-zinc-200 focus:outline-none focus:ring-1 focus:ring-zinc-600"
+                      >
+                        <option value="">Inherit</option>
+                        {PROVIDER_OPTIONS.filter((p) => p.value !== "").map((opt) => (
+                          <option key={opt.value} value={opt.value}>
+                            {opt.label}
+                          </option>
+                        ))}
+                      </select>
+                      {provider && MODELS_BY_PROVIDER[provider] ? (
+                        <select
+                          value={model}
+                          onChange={(e) =>
+                            updateStagePhaseOverride(phase.key, "model", e.target.value)
+                          }
+                          className="flex-1 h-6 px-1.5 text-[10px] bg-zinc-800 border border-zinc-700 rounded text-zinc-200 focus:outline-none focus:ring-1 focus:ring-zinc-600"
+                        >
+                          {MODELS_BY_PROVIDER[provider]!.map((opt) => (
+                            <option key={opt.value} value={opt.value}>
+                              {opt.label}
+                            </option>
+                          ))}
+                        </select>
+                      ) : (
+                        <div className="flex-1" />
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
         </div>
       )}

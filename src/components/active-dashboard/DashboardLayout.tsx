@@ -31,6 +31,11 @@ import { useWorkflowRefData } from "./widgets/workflow-ref";
 import { useMcpCallData } from "./widgets/mcp-call";
 import { useExecutionTimelineData } from "./widgets/execution-timeline";
 import { useFlowExecutionData } from "./widgets/flow-execution";
+import { useCanvasData } from "./widgets/canvas";
+
+// Standalone widgets (not registry-based — they auto-show when events arrive)
+import { ConvergenceWidget } from "./widgets/convergence";
+import { AiStreamWidget } from "./widgets/ai-stream";
 
 /**
  * Props for DashboardLayout.
@@ -775,6 +780,48 @@ const FlowExecutionRenderer = memo(function FlowExecutionRenderer({
 });
 
 /**
+ * Canvas widget renderer - calls useCanvasData statically.
+ */
+const CanvasRenderer = memo(function CanvasRenderer({
+  status,
+  onNavigateToDetail,
+}: WidgetRendererProps) {
+  const config = widgetRegistry.get("canvas")!;
+  const data = useCanvasData();
+  const FullComponent = config.FullComponent;
+  const borderClasses = getWidgetBorderClasses(config.accentColor, status, true);
+
+  return (
+    <div
+      className={cn(
+        "h-full rounded-xl border-2 overflow-hidden bg-background",
+        "transition-colors duration-200",
+        borderClasses,
+      )}
+    >
+      <WidgetHeader
+        title={config.displayName}
+        icon={config.icon}
+        accentColor={config.accentColor}
+        status={status}
+        isActive={true}
+        detailRoute={config.detailRoute}
+        onViewAll={onNavigateToDetail}
+      />
+      <div className="h-[calc(100%-48px)] overflow-hidden">
+        <FullComponent
+          isActive={true}
+          isSummary={false}
+          status={status}
+          data={data}
+          onNavigateToDetail={onNavigateToDetail}
+        />
+      </div>
+    </div>
+  );
+});
+
+/**
  * Active widget dispatcher - renders the correct type-specific component.
  * Each type has its own component with static hook calls.
  * Memoized to prevent unnecessary re-renders when parent state changes.
@@ -816,6 +863,8 @@ const ActiveWidget = memo(function ActiveWidget({
       return <ExecutionTimelineRenderer status={status} onNavigateToDetail={onNavigateToDetail} />;
     case "flow_execution":
       return <FlowExecutionRenderer status={status} onNavigateToDetail={onNavigateToDetail} />;
+    case "canvas":
+      return <CanvasRenderer status={status} onNavigateToDetail={onNavigateToDetail} />;
     default:
       return (
         <div className="flex items-center justify-center h-full text-muted-foreground">
@@ -1067,6 +1116,15 @@ const FlowExecutionSummaryRenderer = memo(function FlowExecutionSummaryRenderer(
 });
 
 /**
+ * Canvas summary renderer.
+ */
+const CanvasSummaryRenderer = memo(function CanvasSummaryRenderer(props: SummaryRendererProps) {
+  const config = widgetRegistry.get("canvas")!;
+  const data = useCanvasData();
+  return <SummaryContainer {...props} config={config} data={data} />;
+});
+
+/**
  * Summary widget dispatcher - renders the correct type-specific component.
  * Memoized to prevent unnecessary re-renders when parent state changes.
  */
@@ -1123,6 +1181,8 @@ const SummaryWidget = memo(function SummaryWidget({
       return <ExecutionTimelineSummaryRenderer {...sharedProps} />;
     case "flow_execution":
       return <FlowExecutionSummaryRenderer {...sharedProps} />;
+    case "canvas":
+      return <CanvasSummaryRenderer {...sharedProps} />;
     default:
       return null;
   }
@@ -1385,6 +1445,11 @@ export function DashboardLayout({
             Restore to Active Process
           </button>
         )}
+
+        {/* Standalone widgets: convergence tracking and AI output stream */}
+        <ConvergenceWidget />
+        <AiStreamWidget />
+
         {summaryWidgets.map((type) => (
           <SummaryWidget
             key={type}

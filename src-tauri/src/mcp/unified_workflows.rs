@@ -10,7 +10,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tracing::{error, info, warn};
 
 use crate::database::CreateTaskRunInput;
@@ -372,7 +372,9 @@ pub async fn get_unified_workflow(
                 max_sweep_iterations: Some(workflow.max_sweep_iterations),
                 stages: Some(workflow.stages.clone()),
                 stop_on_failure: Some(workflow.stop_on_failure),
+                approval_gate: Some(workflow.approval_gate),
                 reflection_mode: Some(workflow.reflection_mode),
+                model_overrides: Some(workflow.model_overrides.clone()),
             };
             if let Err(e) = state
                 .app_state
@@ -775,7 +777,9 @@ pub async fn import_unified_workflow(
         max_sweep_iterations: Some(workflow.max_sweep_iterations),
         stages: Some(workflow.stages.clone()),
         stop_on_failure: Some(workflow.stop_on_failure),
+        approval_gate: Some(workflow.approval_gate),
         reflection_mode: Some(workflow.reflection_mode),
+        model_overrides: Some(workflow.model_overrides.clone()),
     };
 
     // Use the database's create function but with our custom ID
@@ -991,7 +995,9 @@ pub async fn generate_unified_workflow_async_handler(
         max_sweep_iterations: Some(meta_workflow.max_sweep_iterations),
         stages: Some(meta_workflow.stages.clone()),
         stop_on_failure: Some(meta_workflow.stop_on_failure),
+        approval_gate: Some(meta_workflow.approval_gate),
         reflection_mode: Some(meta_workflow.reflection_mode),
+        model_overrides: Some(meta_workflow.model_overrides.clone()),
     };
 
     let saved_workflow = match state
@@ -1109,9 +1115,15 @@ pub async fn generate_unified_workflow_async_handler(
             reflection_mode: saved_workflow.reflection_mode,
             provider_override: None,
             model_override: None,
+            model_overrides: saved_workflow.model_overrides.clone(),
             stage_index: None,
             max_sessions: Some(saved_workflow.max_iterations),
             auto_run_generated: request.auto_run.unwrap_or(false),
+            approval_gate: saved_workflow.approval_gate,
+            max_context_tokens: 100_000,
+            cross_workflow_learning: true,
+            verification_history: std::collections::HashMap::new(),
+            routing_context: Default::default(),
         };
 
         // Clone state fields for the background task
@@ -1406,6 +1418,24 @@ pub async fn run_unified_workflow(
             workflow.name, total_stages
         );
 
+        // Clear canvas state from previous run
+        {
+            let mut canvas = state.app_state.canvas_state.write().await;
+            canvas.clear();
+        }
+        let clear_event = crate::event_system::AppEvent::CanvasUpdate {
+            action: "clear".to_string(),
+            panel_id: String::new(),
+            panel: None,
+            task_run_id: Some(execution_id.clone()),
+        };
+        if let Err(e) = state
+            .app_handle
+            .emit(clear_event.event_name(), &clear_event)
+        {
+            warn!("Failed to emit canvas-clear event: {}", e);
+        }
+
         // Create task_run for tracking
         let input = CreateTaskRunInput::new(&execution_id, &workflow.name)
             .with_prompt(&combined_prompt)
@@ -1442,9 +1472,15 @@ pub async fn run_unified_workflow(
             reflection_mode: workflow.reflection_mode,
             provider_override: None,
             model_override: None,
+            model_overrides: workflow.model_overrides.clone(),
             stage_index: None,
             max_sessions: Some(workflow.max_iterations),
             auto_run_generated: false,
+            approval_gate: workflow.approval_gate,
+            max_context_tokens: 100_000,
+            cross_workflow_learning: true,
+            verification_history: std::collections::HashMap::new(),
+            routing_context: Default::default(),
         };
 
         let checkpoint_db = state.app_state.checkpoint_db.clone();
@@ -1508,6 +1544,24 @@ pub async fn run_unified_workflow(
             .collect();
         serde_json::to_string(&all_auto_steps).ok()
     };
+
+    // Clear canvas state from previous run
+    {
+        let mut canvas = state.app_state.canvas_state.write().await;
+        canvas.clear();
+    }
+    let clear_event = crate::event_system::AppEvent::CanvasUpdate {
+        action: "clear".to_string(),
+        panel_id: String::new(),
+        panel: None,
+        task_run_id: Some(execution_id.clone()),
+    };
+    if let Err(e) = state
+        .app_handle
+        .emit(clear_event.event_name(), &clear_event)
+    {
+        warn!("Failed to emit canvas-clear event: {}", e);
+    }
 
     let mut input = CreateTaskRunInput::new(&execution_id, &workflow.name)
         .with_task_type("automation")
@@ -1722,7 +1776,9 @@ pub async fn execute_inline_workflow(
         generated_by_task_run_id: None,
         stages: request.stages,
         stop_on_failure: false,
+        approval_gate: false,
         reflection_mode: false,
+        model_overrides: std::collections::HashMap::new(),
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
     };
@@ -1832,9 +1888,15 @@ pub async fn execute_inline_workflow(
             reflection_mode: workflow.reflection_mode,
             provider_override: None,
             model_override: None,
+            model_overrides: workflow.model_overrides.clone(),
             stage_index: None,
             max_sessions: Some(workflow.max_iterations),
             auto_run_generated: false,
+            approval_gate: workflow.approval_gate,
+            max_context_tokens: 100_000,
+            cross_workflow_learning: true,
+            verification_history: std::collections::HashMap::new(),
+            routing_context: Default::default(),
         };
 
         // Spawn in background (non-blocking) — same pattern as run_unified_workflow
@@ -2261,9 +2323,15 @@ pub async fn run_composed_workflow(
                 reflection_mode: false,
                 provider_override: None,
                 model_override: None,
+                model_overrides: std::collections::HashMap::new(),
                 stage_index: None,
                 max_sessions: Some(10), // Default budget for composed workflows
                 auto_run_generated: false,
+                approval_gate: false,
+                max_context_tokens: 100_000,
+                cross_workflow_learning: true,
+                verification_history: std::collections::HashMap::new(),
+                routing_context: Default::default(),
             };
 
             // Run the LoopController once with all stages
@@ -2304,6 +2372,8 @@ pub async fn run_composed_workflow(
                     db,
                     exec_id.clone(),
                     doctor_handle,
+                    None,
+                    None,
                 )
                 .await
                 {

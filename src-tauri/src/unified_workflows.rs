@@ -5,6 +5,64 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
+
+/// A conditional routing rule that selects model/provider based on runtime context.
+///
+/// Rules are evaluated in order; the first matching rule wins.
+/// Condition syntax: `"<variable> <op> <value>"` where:
+/// - Variables: `verification_failures`, `iteration`, `stage_index`
+/// - Operators: `>=`, `>`, `<=`, `<`, `==`, `!=`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingRule {
+    /// Condition expression, e.g. "verification_failures >= 2"
+    pub condition: String,
+    /// Model to use when this rule matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Provider to use when this rule matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Temperature override when this rule matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    /// Max tokens override when this rule matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+}
+
+/// Per-phase model override configuration.
+/// Each phase can independently specify a provider and/or model,
+/// along with optional temperature, max_tokens, fallback config,
+/// and conditional routing rules.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ModelOverrideConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Temperature override for this phase (0.0–1.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    /// Max output tokens override for this phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// Fallback provider if the primary fails with a retryable error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_provider: Option<String>,
+    /// Fallback model if the primary fails with a retryable error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_model: Option<String>,
+    /// Conditional routing rules evaluated at runtime.
+    /// First matching rule wins; unmatched falls back to this config's static fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_rules: Option<Vec<RoutingRule>>,
+}
+
+/// Map of phase name → model override config.
+/// Valid keys: "setup", "agentic", "completion", "verification",
+///             "investigation", "summary", "generation"
+pub type ModelOverrides = HashMap<String, ModelOverrideConfig>;
 
 /// Deserialize a Vec field that might be null in JSON (e.g., from Python's `None`).
 /// Returns an empty Vec for null, or the actual Vec for a valid array.
@@ -69,6 +127,33 @@ fn default_is_critical() -> bool {
     true
 }
 
+/// Condition for conditional stage execution.
+///
+/// When attached to a `WorkflowStage`, the stage is skipped if the condition
+/// evaluates to "should skip". All condition fields are optional and combine
+/// with AND semantics — all specified conditions must be met for the stage to run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StageCondition {
+    /// Run this stage only if the previous stage had this outcome.
+    /// - `"passed"`: run only if previous stage verification passed
+    /// - `"failed"`: run only if previous stage verification failed
+    /// - `"any"`: always run regardless of previous outcome (default behavior)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_previous: Option<String>,
+
+    /// Run this stage only after this many loop iterations have occurred
+    /// (across all stages). Useful for "escalation" stages that only kick in
+    /// after initial attempts have failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_iteration: Option<u32>,
+
+    /// Skip this stage if the total number of failed stages so far is below
+    /// this threshold. Useful for "recovery" stages that only run when
+    /// multiple prior stages have failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_failures: Option<u32>,
+}
+
 /// A workflow stage — a self-contained unit of execution with its own
 /// setup/verification/agentic/completion steps and verification-agentic loop.
 ///
@@ -108,6 +193,17 @@ pub struct WorkflowStage {
     /// Model override for this stage
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Per-phase model overrides for this stage
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub model_overrides: ModelOverrides,
+    /// Whether to pause for human approval after each agentic phase.
+    #[serde(default)]
+    pub approval_gate: bool,
+    /// Optional condition for stage execution.
+    /// When set, the stage is evaluated against this condition before running.
+    /// If the condition is not met, the stage is skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<StageCondition>,
 }
 
 /// A unified workflow with steps organized by phase
@@ -159,6 +255,10 @@ pub struct UnifiedWorkflow {
     /// Model override
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+
+    /// Per-phase model overrides
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub model_overrides: ModelOverrides,
 
     /// Skip AI summary generation at the end (default: false, meaning AI summary is generated)
     #[serde(default)]
@@ -251,6 +351,10 @@ pub struct UnifiedWorkflow {
     #[serde(default)]
     pub stop_on_failure: bool,
 
+    /// Whether to pause for human approval after each agentic phase.
+    #[serde(default)]
+    pub approval_gate: bool,
+
     /// Whether to enable reflection mode during agentic iterations.
     /// When true, the AI investigates root causes before fixing failures.
     /// Default: true for user-created workflows.
@@ -297,6 +401,9 @@ impl UnifiedWorkflow {
             timeout_seconds: self.timeout_seconds,
             provider: self.provider.clone(),
             model: self.model.clone(),
+            model_overrides: self.model_overrides.clone(),
+            approval_gate: self.approval_gate,
+            condition: None,
         }]
     }
 }
@@ -363,6 +470,8 @@ pub struct CreateUnifiedWorkflowRequest {
     pub provider: Option<String>,
     pub model: Option<String>,
     #[serde(default)]
+    pub model_overrides: Option<ModelOverrides>,
+    #[serde(default)]
     pub skip_ai_summary: bool,
     #[serde(default)]
     pub log_source_selection: Option<LogSourceSelection>,
@@ -404,6 +513,9 @@ pub struct CreateUnifiedWorkflowRequest {
     /// Whether to stop execution if a stage fails verification
     #[serde(default)]
     pub stop_on_failure: Option<bool>,
+    /// Whether to pause for human approval after each agentic phase
+    #[serde(default)]
+    pub approval_gate: Option<bool>,
     /// Whether to enable reflection mode during agentic iterations
     #[serde(default)]
     pub reflection_mode: Option<bool>,
@@ -428,6 +540,7 @@ pub struct UpdateUnifiedWorkflowRequest {
     pub timeout_seconds: Option<Option<u64>>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub model_overrides: Option<ModelOverrides>,
     pub skip_ai_summary: Option<bool>,
     pub log_source_selection: Option<LogSourceSelection>,
     pub context_ids: Option<Vec<String>>,
@@ -451,6 +564,8 @@ pub struct UpdateUnifiedWorkflowRequest {
     pub stages: Option<Vec<WorkflowStage>>,
     /// Whether to stop execution if a stage fails verification
     pub stop_on_failure: Option<bool>,
+    /// Whether to pause for human approval after each agentic phase
+    pub approval_gate: Option<bool>,
     /// Whether to enable reflection mode during agentic iterations
     pub reflection_mode: Option<bool>,
 }
@@ -659,7 +774,10 @@ pub fn workflow_to_stage_config(
         max_iterations: workflow.max_iterations,
         provider: workflow.provider.clone(),
         model: workflow.model.clone(),
+        model_overrides: workflow.model_overrides.clone(),
         timeout_seconds: workflow.timeout_seconds,
+        approval_gate: workflow.approval_gate,
+        condition: None, // Top-level workflows have no stage condition
     }
 }
 
@@ -712,6 +830,9 @@ pub fn stage_to_stage_config(
         max_iterations: stage.max_iterations,
         provider: stage.provider.clone(),
         model: stage.model.clone(),
+        model_overrides: stage.model_overrides.clone(),
         timeout_seconds: stage.timeout_seconds,
+        approval_gate: stage.approval_gate,
+        condition: stage.condition.clone(),
     }
 }

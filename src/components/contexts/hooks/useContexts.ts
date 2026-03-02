@@ -17,14 +17,13 @@ import type {
   UpdateContextRequest,
   WebSyncStatus,
 } from "../../../types/context";
+import { getApiBase } from "@/lib/runner-api";
 
 interface CommandResponse {
   success: boolean;
   message?: string;
   data?: unknown;
 }
-
-const API_BASE = "http://localhost:9876";
 
 interface ApiResponse<T> {
   success: boolean;
@@ -129,7 +128,7 @@ export function useContexts(autoRefresh = false, refreshInterval = 30000): UseCo
         options.body = JSON.stringify(body);
       }
 
-      const response = await fetch(`${API_BASE}${endpoint}`, options);
+      const response = await fetch(`${getApiBase()}${endpoint}`, options);
       const result: ApiResponse<T> = await response.json();
 
       if (!result.success) {

@@ -18,6 +18,7 @@
  */
 
 import { useState, useEffect, useCallback, useRef } from "react";
+import { getWsBase } from "@/lib/runner-api";
 
 // ============================================================================
 // Types
@@ -96,7 +97,7 @@ export type ExecutorEventCallback = (payload: ExecutorEventPayload) => void;
 
 /** Options for the useWebSocketEvents hook */
 export interface UseWebSocketEventsOptions {
-  /** WebSocket URL (default: ws://localhost:9876/ws/events) */
+  /** WebSocket URL (default: `${getWsBase()}/ws/events`) */
   url?: string;
   /** Whether to enable the WebSocket connection (defaults to true) */
   enabled?: boolean;
@@ -173,13 +174,11 @@ export function isTauriEnvironment(): boolean {
 // Hook Implementation
 // ============================================================================
 
-const DEFAULT_WS_URL = "ws://localhost:9876/ws/events";
-
 export function useWebSocketEvents(
   options: UseWebSocketEventsOptions = {},
 ): UseWebSocketEventsReturn {
   const {
-    url = DEFAULT_WS_URL,
+    url = `${getWsBase()}/ws/events`,
     enabled = true,
     autoReconnect = true,
     maxReconnectAttempts = 10,

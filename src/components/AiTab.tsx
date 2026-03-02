@@ -45,6 +45,7 @@ import { useAutoContinue } from "../contexts";
 import { useRunSelectionOptional } from "../contexts/RunSelectionContext";
 import { getAccentColors, getStatusColors } from "@/design-system";
 import { PageTutorialMenu } from "./tutorial";
+import { getApiBase } from "@/lib/runner-api";
 
 // localStorage key for stats panel collapse
 const STORAGE_KEY_STATS_COLLAPSED = "aiTab.statsCollapsed";
@@ -303,7 +304,7 @@ export function AiTab({
 
     const loadAutoFixSetting = async () => {
       try {
-        const response = await fetch("http://localhost:9876/session/auto-fix", {
+        const response = await fetch(`${getApiBase()}/session/auto-fix`, {
           signal: controller.signal,
         });
         const result = await response.json();
@@ -329,7 +330,7 @@ export function AiTab({
 
     setAutoFixLoading(true);
     try {
-      const response = await fetch("http://localhost:9876/session/auto-fix", {
+      const response = await fetch(`${getApiBase()}/session/auto-fix`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ enabled: !autoFixEnabled }),
@@ -358,7 +359,7 @@ export function AiTab({
     const loadRunAutoContinue = async () => {
       try {
         const response = await fetch(
-          `http://localhost:9876/task-runs/${selectedSessionId}/auto-continue`,
+          `${getApiBase()}/task-runs/${selectedSessionId}/auto-continue`,
           { signal: controller.signal },
         );
         const result = await response.json();
@@ -391,14 +392,11 @@ export function AiTab({
 
     setRunAutoContinueLoading(true);
     try {
-      const response = await fetch(
-        `http://localhost:9876/task-runs/${selectedSessionId}/auto-continue`,
-        {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ auto_continue: !runAutoContinue }),
-        },
-      );
+      const response = await fetch(`${getApiBase()}/task-runs/${selectedSessionId}/auto-continue`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ auto_continue: !runAutoContinue }),
+      });
       const result = await response.json();
       if (result.success) {
         setRunAutoContinue(result.auto_continue);
@@ -417,7 +415,7 @@ export function AiTab({
 
     const checkStatus = async () => {
       try {
-        const response = await fetch("http://localhost:9876/workflow/resumable", {
+        const response = await fetch(`${getApiBase()}/workflow/resumable`, {
           signal: controller.signal,
         });
         const result = await response.json();
@@ -475,7 +473,7 @@ export function AiTab({
 
     setIsResuming(true);
     try {
-      const response = await fetch("http://localhost:9876/workflow/resume", {
+      const response = await fetch(`${getApiBase()}/workflow/resume`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
       });
@@ -514,7 +512,7 @@ export function AiTab({
         requestBody.task_run_id = currentLoop.sessionId;
       }
 
-      const response = await fetch("http://localhost:9876/workflow/force-continue", {
+      const response = await fetch(`${getApiBase()}/workflow/force-continue`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(requestBody),
@@ -549,7 +547,7 @@ export function AiTab({
   const handleStopAi = useCallback(async () => {
     setIsStopping(true);
     try {
-      const response = await fetch("http://localhost:9876/stop-ai-analysis", {
+      const response = await fetch(`${getApiBase()}/stop-ai-analysis`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
       });

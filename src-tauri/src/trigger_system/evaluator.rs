@@ -43,8 +43,8 @@ impl EvalResult {
             EvalResult::Debounced => "debounced",
             EvalResult::Throttled { .. } => "throttled",
             EvalResult::ConditionFailed { .. } => "condition_failed",
-            EvalResult::ChainDepthExceeded => "condition_failed",
-            EvalResult::Disabled => "condition_failed",
+            EvalResult::ChainDepthExceeded => "chain_depth_exceeded",
+            EvalResult::Disabled => "disabled",
         }
     }
 
@@ -177,6 +177,18 @@ impl TriggerEvaluator {
         active.values().map(|v| *v as u64).sum()
     }
 
+    /// Clear all evaluator state for a trigger (debounce, cooldown, active count).
+    pub async fn clear_trigger_state(&self, trigger_id: &str) {
+        let mut last_events = self.last_event_times.write().await;
+        last_events.remove(trigger_id);
+
+        let mut last_execs = self.last_execution_times.write().await;
+        last_execs.remove(trigger_id);
+
+        let mut active = self.active_executions.write().await;
+        active.remove(trigger_id);
+    }
+
     /// Check a single condition.
     async fn check_condition(&self, condition: &TriggerCondition, event: &TriggerEvent) -> bool {
         match condition.condition_type.as_str() {
@@ -199,6 +211,7 @@ impl TriggerEvaluator {
                     true
                 }
             }
+            "time_window" => self.check_time_window_condition(condition),
             _ => {
                 debug!(
                     "Unknown condition type '{}', passing",
@@ -212,8 +225,9 @@ impl TriggerEvaluator {
     /// Check if the runner is idle (no workflows running).
     async fn check_idle_condition(&self) -> bool {
         let client = reqwest::Client::new();
+        let status_url = format!("{}/status", crate::mcp::types::get_self_base_url_from_env());
         match client
-            .get("http://localhost:9876/status")
+            .get(&status_url)
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
@@ -233,8 +247,77 @@ impl TriggerEvaluator {
                     false
                 }
             }
-            Err(_) => false,
+            Err(e) => {
+                debug!("Idle condition check failed: {}", e);
+                false
+            }
         }
+    }
+
+    /// Check a time window condition.
+    ///
+    /// Config format: `{"days": [1,2,3,4,5], "start_hour": 9, "end_hour": 17, "timezone": "Local"}`
+    /// - days: 0=Sunday, 1=Monday, ..., 6=Saturday (defaults to all days)
+    /// - start_hour: start of window (inclusive, 0-23, defaults to 0)
+    /// - end_hour: end of window (exclusive, 0-23, defaults to 24)
+    /// - timezone: "UTC" or "Local" (defaults to "Local")
+    fn check_time_window_condition(&self, condition: &TriggerCondition) -> bool {
+        let config = &condition.config;
+
+        let use_utc = config
+            .get("timezone")
+            .and_then(|v| v.as_str())
+            .map(|s| s.eq_ignore_ascii_case("utc"))
+            .unwrap_or(false);
+
+        let (hour, weekday_number) = if use_utc {
+            let now = chrono::Utc::now();
+            (
+                chrono::Timelike::hour(&now),
+                chrono::Datelike::weekday(&now).num_days_from_sunday(),
+            )
+        } else {
+            let now = chrono::Local::now();
+            (
+                chrono::Timelike::hour(&now),
+                chrono::Datelike::weekday(&now).num_days_from_sunday(),
+            )
+        };
+
+        // Check day-of-week filter
+        if let Some(days) = config.get("days").and_then(|v| v.as_array()) {
+            let allowed_days: Vec<u32> = days
+                .iter()
+                .filter_map(|d| d.as_u64().map(|n| n as u32))
+                .collect();
+            if !allowed_days.is_empty() && !allowed_days.contains(&weekday_number) {
+                debug!(
+                    "Time window: weekday {} not in allowed days {:?}",
+                    weekday_number, allowed_days
+                );
+                return false;
+            }
+        }
+
+        // Check hour range
+        let start_hour = config
+            .get("start_hour")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let end_hour = config
+            .get("end_hour")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(24) as u32;
+
+        if hour < start_hour || hour >= end_hour {
+            debug!(
+                "Time window: hour {} outside [{}, {})",
+                hour, start_hour, end_hour
+            );
+            return false;
+        }
+
+        true
     }
 }
 
@@ -274,6 +357,8 @@ mod tests {
             debounce_ms,
             cooldown_seconds: cooldown,
             max_concurrent,
+            retry_count: 0,
+            retry_delay_seconds: 30,
             enabled: true,
             last_triggered_at: None,
             last_execution_id: None,
@@ -302,7 +387,7 @@ mod tests {
 
         let result = eval.evaluate(&trigger, &event).await;
         assert!(!result.should_execute());
-        assert_eq!(result.action_name(), "condition_failed");
+        assert_eq!(result.action_name(), "disabled");
     }
 
     #[tokio::test]

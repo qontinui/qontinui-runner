@@ -14,8 +14,7 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { useExecution } from "../../contexts";
 import type { ExecutionStatus, ExecutionState, ActionItem, ScreenshotsResult } from "./types";
-
-const API_BASE = "http://localhost:9876";
+import { getApiBase } from "@/lib/runner-api";
 
 interface RunningTask {
   id: string;
@@ -88,7 +87,7 @@ export function useDashboardState(): DashboardState {
   // Fetch running tasks
   const fetchRunningTasks = useCallback(async () => {
     try {
-      const response = await fetch(`${API_BASE}/task-runs/running`);
+      const response = await fetch(`${getApiBase()}/task-runs/running`);
       if (response.ok) {
         const tasks = await response.json();
         const taskList = Array.isArray(tasks) ? tasks : [];
@@ -113,7 +112,7 @@ export function useDashboardState(): DashboardState {
   // Fetch action log
   const fetchActionLog = useCallback(async () => {
     try {
-      const response = await fetch(`${API_BASE}/action-log/view`);
+      const response = await fetch(`${getApiBase()}/action-log/view`);
       if (response.ok) {
         const data = await response.json();
         setActionLogData(data);
@@ -126,7 +125,7 @@ export function useDashboardState(): DashboardState {
   // Fetch screenshots
   const fetchScreenshots = useCallback(async () => {
     try {
-      const response = await fetch(`${API_BASE}/screenshots/list`);
+      const response = await fetch(`${getApiBase()}/screenshots/list`);
       if (response.ok) {
         const data = await response.json();
         if (data.success) {
@@ -271,7 +270,7 @@ export function useDashboardState(): DashboardState {
     try {
       // Stop AI tasks
       if (runningTasks.length > 0) {
-        await fetch(`${API_BASE}/stop-ai-analysis`, {
+        await fetch(`${getApiBase()}/stop-ai-analysis`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
         });

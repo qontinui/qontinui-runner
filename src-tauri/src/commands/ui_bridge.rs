@@ -679,7 +679,7 @@ pub async fn ui_bridge_run_exploration(
 
         // Build parameters for Python
         let params = json!({
-            "runner_url": runner_url.unwrap_or_else(|| "http://localhost:9876".to_string()),
+            "runner_url": runner_url.unwrap_or_else(|| crate::mcp::types::get_self_base_url(&state)),
             "config": config.map(|c| json!({
                 "max_depth": c.max_depth.unwrap_or(2),
                 "max_elements_per_page": c.max_elements_per_page.unwrap_or(20),

@@ -21,6 +21,7 @@ pub fn get_all_triggers(db: &Arc<CheckpointDb>) -> Result<Vec<WorkflowTrigger>, 
             r#"SELECT id, name, description, trigger_type, trigger_config,
                       workflow_id, workflow_overrides, conditions,
                       debounce_ms, cooldown_seconds, max_concurrent,
+                      retry_count, retry_delay_seconds,
                       enabled, last_triggered_at, last_execution_id,
                       trigger_count, created_at, updated_at
                FROM workflow_triggers
@@ -46,6 +47,7 @@ pub fn get_trigger(db: &Arc<CheckpointDb>, id: &str) -> Result<Option<WorkflowTr
             r#"SELECT id, name, description, trigger_type, trigger_config,
                       workflow_id, workflow_overrides, conditions,
                       debounce_ms, cooldown_seconds, max_concurrent,
+                      retry_count, retry_delay_seconds,
                       enabled, last_triggered_at, last_execution_id,
                       trigger_count, created_at, updated_at
                FROM workflow_triggers WHERE id = ?1"#,
@@ -67,6 +69,7 @@ pub fn get_enabled_triggers(db: &Arc<CheckpointDb>) -> Result<Vec<WorkflowTrigge
             r#"SELECT id, name, description, trigger_type, trigger_config,
                       workflow_id, workflow_overrides, conditions,
                       debounce_ms, cooldown_seconds, max_concurrent,
+                      retry_count, retry_delay_seconds,
                       enabled, last_triggered_at, last_execution_id,
                       trigger_count, created_at, updated_at
                FROM workflow_triggers WHERE enabled = 1"#,
@@ -98,9 +101,10 @@ pub fn create_trigger(db: &Arc<CheckpointDb>, trigger: &WorkflowTrigger) -> Resu
            (id, name, description, trigger_type, trigger_config,
             workflow_id, workflow_overrides, conditions,
             debounce_ms, cooldown_seconds, max_concurrent,
+            retry_count, retry_delay_seconds,
             enabled, last_triggered_at, last_execution_id,
             trigger_count, created_at, updated_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"#,
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)"#,
         params![
             trigger.id,
             trigger.name,
@@ -113,6 +117,8 @@ pub fn create_trigger(db: &Arc<CheckpointDb>, trigger: &WorkflowTrigger) -> Resu
             trigger.debounce_ms,
             trigger.cooldown_seconds,
             trigger.max_concurrent,
+            trigger.retry_count,
+            trigger.retry_delay_seconds,
             trigger.enabled,
             trigger.last_triggered_at,
             trigger.last_execution_id,
@@ -143,8 +149,9 @@ pub fn update_trigger(db: &Arc<CheckpointDb>, trigger: &WorkflowTrigger) -> Resu
            name = ?1, description = ?2, trigger_type = ?3, trigger_config = ?4,
            workflow_id = ?5, workflow_overrides = ?6, conditions = ?7,
            debounce_ms = ?8, cooldown_seconds = ?9, max_concurrent = ?10,
-           enabled = ?11, updated_at = ?12
-           WHERE id = ?13"#,
+           retry_count = ?11, retry_delay_seconds = ?12,
+           enabled = ?13, updated_at = ?14
+           WHERE id = ?15"#,
         params![
             trigger.name,
             trigger.description,
@@ -156,6 +163,8 @@ pub fn update_trigger(db: &Arc<CheckpointDb>, trigger: &WorkflowTrigger) -> Resu
             trigger.debounce_ms,
             trigger.cooldown_seconds,
             trigger.max_concurrent,
+            trigger.retry_count,
+            trigger.retry_delay_seconds,
             trigger.enabled,
             trigger.updated_at,
             trigger.id,
@@ -248,21 +257,71 @@ pub fn get_trigger_history(
     trigger_id: &str,
     limit: u32,
 ) -> Result<Vec<TriggerHistoryEntry>, String> {
+    get_trigger_history_filtered(db, trigger_id, limit, None, None, None)
+}
+
+/// Get trigger history entries with optional filtering.
+pub fn get_trigger_history_filtered(
+    db: &Arc<CheckpointDb>,
+    trigger_id: &str,
+    limit: u32,
+    action_filter: Option<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
+) -> Result<Vec<TriggerHistoryEntry>, String> {
     let conn = db.get_conn()?;
 
+    // Build dynamic WHERE clause
+    let mut conditions = vec!["trigger_id = ?1".to_string()];
+    let mut param_index = 2u32;
+
+    if action_filter.is_some() {
+        conditions.push(format!("action = ?{}", param_index));
+        param_index += 1;
+    }
+    if since.is_some() {
+        conditions.push(format!("triggered_at >= ?{}", param_index));
+        param_index += 1;
+    }
+    if until.is_some() {
+        conditions.push(format!("triggered_at <= ?{}", param_index));
+        param_index += 1;
+    }
+
+    let query = format!(
+        r#"SELECT id, trigger_id, event_type, event_data, action,
+                  task_run_id, error_message, triggered_at
+           FROM trigger_history
+           WHERE {}
+           ORDER BY triggered_at DESC
+           LIMIT ?{}"#,
+        conditions.join(" AND "),
+        param_index
+    );
+
     let mut stmt = conn
-        .prepare(
-            r#"SELECT id, trigger_id, event_type, event_data, action,
-                      task_run_id, error_message, triggered_at
-               FROM trigger_history
-               WHERE trigger_id = ?1
-               ORDER BY triggered_at DESC
-               LIMIT ?2"#,
-        )
+        .prepare(&query)
         .map_err(|e| format!("Failed to prepare history query: {}", e))?;
 
+    // Build params dynamically
+    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    param_values.push(Box::new(trigger_id.to_string()));
+    if let Some(action) = action_filter {
+        param_values.push(Box::new(action.to_string()));
+    }
+    if let Some(since_val) = since {
+        param_values.push(Box::new(since_val.to_string()));
+    }
+    if let Some(until_val) = until {
+        param_values.push(Box::new(until_val.to_string()));
+    }
+    param_values.push(Box::new(limit));
+
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        param_values.iter().map(|p| p.as_ref()).collect();
+
     let entries = stmt
-        .query_map(params![trigger_id, limit], |row| {
+        .query_map(param_refs.as_slice(), |row| {
             let event_data_str: String = row.get(3)?;
             Ok(TriggerHistoryEntry {
                 id: row.get(0)?,
@@ -314,12 +373,17 @@ fn row_to_trigger(row: &Row) -> WorkflowTrigger {
     let conditions_str: String = row.get(7).unwrap_or_default();
     let overrides_str: Option<String> = row.get(6).unwrap_or(None);
 
-    let trigger_config: TriggerConfig =
-        serde_json::from_str(&config_str).unwrap_or(TriggerConfig::Webhook {
+    let trigger_config: TriggerConfig = serde_json::from_str(&config_str).unwrap_or_else(|e| {
+        tracing::error!(
+            "Failed to deserialize trigger_config (falling back to empty Webhook): {}",
+            e
+        );
+        TriggerConfig::Webhook {
             secret: None,
             payload_filter: None,
             variable_mapping: std::collections::HashMap::new(),
-        });
+        }
+    });
 
     let conditions: Vec<TriggerCondition> =
         serde_json::from_str(&conditions_str).unwrap_or_default();
@@ -339,11 +403,13 @@ fn row_to_trigger(row: &Row) -> WorkflowTrigger {
         debounce_ms: row.get::<_, i64>(8).unwrap_or(1000) as u64,
         cooldown_seconds: row.get::<_, i64>(9).unwrap_or(60) as u64,
         max_concurrent: row.get::<_, i32>(10).unwrap_or(1) as u32,
-        enabled: row.get(11).unwrap_or(true),
-        last_triggered_at: row.get(12).unwrap_or(None),
-        last_execution_id: row.get(13).unwrap_or(None),
-        trigger_count: row.get::<_, i64>(14).unwrap_or(0) as u64,
-        created_at: row.get(15).unwrap_or_default(),
-        updated_at: row.get(16).unwrap_or_default(),
+        retry_count: row.get::<_, i32>(11).unwrap_or(0) as u32,
+        retry_delay_seconds: row.get::<_, i64>(12).unwrap_or(30) as u64,
+        enabled: row.get(13).unwrap_or(true),
+        last_triggered_at: row.get(14).unwrap_or(None),
+        last_execution_id: row.get(15).unwrap_or(None),
+        trigger_count: row.get::<_, i64>(16).unwrap_or(0) as u64,
+        created_at: row.get(17).unwrap_or_default(),
+        updated_at: row.get(18).unwrap_or_default(),
     }
 }

@@ -18,6 +18,7 @@ import {
 } from "lucide-react";
 import type { UnifiedWorkflow } from "../../types";
 import { getAccentColors } from "@/design-system";
+import { getApiBase } from "@/lib/runner-api";
 
 const AI_PROVIDERS = [
   { value: "", label: "Default (from settings)" },
@@ -32,8 +33,6 @@ const LOG_SOURCE_OPTIONS = [
   { value: "ai", label: "AI (auto-select)" },
   { value: "all", label: "All enabled sources" },
 ];
-
-const API_BASE = "http://localhost:9876";
 
 interface DiscoveryCall {
   tool_name: string;
@@ -140,7 +139,7 @@ export function AiGenerateWorkflowModal({
         requestBody.discovery_mode = discoveryMode;
       }
 
-      const response = await fetch(`${API_BASE}/unified-workflows/generate`, {
+      const response = await fetch(`${getApiBase()}/unified-workflows/generate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(requestBody),

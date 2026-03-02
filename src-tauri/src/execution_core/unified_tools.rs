@@ -755,9 +755,10 @@ async fn execute_mcp_call(step_id: &str, inputs: &HashMap<String, Value>) -> Ste
     };
 
     // Call the runner's MCP tool execution endpoint
+    let base_url = crate::mcp::types::get_self_base_url_from_env();
     let url = format!(
-        "http://localhost:9876/api/mcp/servers/{}/tools/{}/execute",
-        server_id, tool_name
+        "{}/api/mcp/servers/{}/tools/{}/execute",
+        base_url, server_id, tool_name
     );
 
     let start = std::time::Instant::now();

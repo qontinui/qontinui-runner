@@ -1,55 +1,28 @@
 //! Webhook trigger utilities: HMAC verification and payload extraction.
 
+use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::collections::HashMap;
 use tracing::debug;
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// Verify HMAC-SHA256 signature for webhook payloads.
 ///
 /// Compares the `X-Hub-Signature-256` header against the computed HMAC
 /// of the request body using the configured secret.
 pub fn verify_hmac_signature(secret: &str, body: &[u8], signature_header: &str) -> bool {
-    use sha2::Digest;
-
     // GitHub sends: sha256=<hex>
     let expected_hex = signature_header
         .strip_prefix("sha256=")
         .unwrap_or(signature_header);
 
-    // Compute HMAC-SHA256 manually using sha2 (we don't have hmac crate)
-    // Use the standard HMAC construction: H((K ^ opad) || H((K ^ ipad) || message))
-    let key = secret.as_bytes();
-    let block_size = 64; // SHA-256 block size
-
-    // If key is longer than block size, hash it first
-    let key_padded = if key.len() > block_size {
-        let mut hasher = Sha256::new();
-        hasher.update(key);
-        let hash = hasher.finalize();
-        let mut padded = vec![0u8; block_size];
-        padded[..hash.len()].copy_from_slice(&hash);
-        padded
-    } else {
-        let mut padded = vec![0u8; block_size];
-        padded[..key.len()].copy_from_slice(key);
-        padded
+    let mut mac = match HmacSha256::new_from_slice(secret.as_bytes()) {
+        Ok(m) => m,
+        Err(_) => return false,
     };
-
-    // Inner hash: H((K ^ ipad) || message)
-    let ipad: Vec<u8> = key_padded.iter().map(|b| b ^ 0x36).collect();
-    let mut inner_hasher = Sha256::new();
-    inner_hasher.update(&ipad);
-    inner_hasher.update(body);
-    let inner_hash = inner_hasher.finalize();
-
-    // Outer hash: H((K ^ opad) || inner_hash)
-    let opad: Vec<u8> = key_padded.iter().map(|b| b ^ 0x5c).collect();
-    let mut outer_hasher = Sha256::new();
-    outer_hasher.update(&opad);
-    outer_hasher.update(inner_hash);
-    let result = outer_hasher.finalize();
-
-    let computed_hex = hex::encode(result);
+    mac.update(body);
+    let computed_hex = hex::encode(mac.finalize().into_bytes());
 
     // Constant-time comparison
     if computed_hex.len() != expected_hex.len() {
@@ -214,23 +187,10 @@ mod tests {
     }
 
     fn compute_test_hmac(secret: &str, body: &[u8]) -> String {
-        use sha2::Digest;
-        let key = secret.as_bytes();
-        let block_size = 64;
-        let mut key_padded = vec![0u8; block_size];
-        key_padded[..key.len()].copy_from_slice(key);
-
-        let ipad: Vec<u8> = key_padded.iter().map(|b| b ^ 0x36).collect();
-        let mut inner = Sha256::new();
-        inner.update(&ipad);
-        inner.update(body);
-        let inner_hash = inner.finalize();
-
-        let opad: Vec<u8> = key_padded.iter().map(|b| b ^ 0x5c).collect();
-        let mut outer = Sha256::new();
-        outer.update(&opad);
-        outer.update(&inner_hash);
-        hex::encode(outer.finalize())
+        use hmac::Mac;
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body);
+        hex::encode(mac.finalize().into_bytes())
     }
 
     #[test]

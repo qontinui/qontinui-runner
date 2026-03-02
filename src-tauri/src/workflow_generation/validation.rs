@@ -838,7 +838,9 @@ mod tests {
             targeted_error_ids: vec![],
             stages: Vec::new(),
             stop_on_failure: false,
+            approval_gate: false,
             reflection_mode: false,
+            model_overrides: std::collections::HashMap::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -951,7 +953,9 @@ mod tests {
             targeted_error_ids: vec![],
             stages: Vec::new(),
             stop_on_failure: false,
+            approval_gate: false,
             reflection_mode: false,
+            model_overrides: std::collections::HashMap::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         }
@@ -1075,7 +1079,9 @@ mod tests {
             targeted_error_ids: vec![],
             stages: Vec::new(),
             stop_on_failure: false,
+            approval_gate: false,
             reflection_mode: false,
+            model_overrides: std::collections::HashMap::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -1145,7 +1151,9 @@ mod tests {
             targeted_error_ids: vec![],
             stages: Vec::new(),
             stop_on_failure: false,
+            approval_gate: false,
             reflection_mode: false,
+            model_overrides: std::collections::HashMap::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -1487,7 +1495,9 @@ mod tests {
             targeted_error_ids: vec![],
             stages: Vec::new(),
             stop_on_failure: false,
+            approval_gate: false,
             reflection_mode: false,
+            model_overrides: std::collections::HashMap::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };

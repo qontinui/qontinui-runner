@@ -8,8 +8,8 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import type { TaskRun, RunPromptRequest, RunPromptResponse } from "../types/taskRun";
 import { isTaskFinished } from "../types/taskRun";
+import { getApiBase } from "@/lib/runner-api";
 
-const API_BASE = "http://localhost:9876";
 // Polling is now fallback only - real-time events provide instant updates
 const DEFAULT_POLL_INTERVAL_MS = 5000;
 const DEFAULT_TIMEOUT_MS = 600000; // 10 minutes
@@ -79,7 +79,7 @@ export function useAiTaskPolling(options: UseAiTaskPollingOptions = {}): UseAiTa
    */
   const fetchTaskRun = useCallback(async (taskId: string): Promise<TaskRun | null> => {
     try {
-      const response = await fetch(`${API_BASE}/task-runs/${taskId}`);
+      const response = await fetch(`${getApiBase()}/task-runs/${taskId}`);
       if (!response.ok) {
         console.error(`[useAiTaskPolling] Failed to fetch task ${taskId}: ${response.status}`);
         return null;
@@ -171,7 +171,7 @@ export function useAiTaskPolling(options: UseAiTaskPollingOptions = {}): UseAiTa
       setIsRunning(true);
 
       try {
-        const response = await fetch(`${API_BASE}/prompts/run`, {
+        const response = await fetch(`${getApiBase()}/prompts/run`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(request),
@@ -243,7 +243,7 @@ export function useAiTaskPolling(options: UseAiTaskPollingOptions = {}): UseAiTa
     if (!taskId) {
       // No task running, try to stop via legacy endpoint
       try {
-        const response = await fetch(`${API_BASE}/stop-ai-analysis`, {
+        const response = await fetch(`${getApiBase()}/stop-ai-analysis`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
         });
@@ -256,7 +256,7 @@ export function useAiTaskPolling(options: UseAiTaskPollingOptions = {}): UseAiTa
     }
 
     try {
-      const response = await fetch(`${API_BASE}/task-runs/${taskId}/stop`, {
+      const response = await fetch(`${getApiBase()}/task-runs/${taskId}/stop`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
       });
@@ -294,7 +294,7 @@ export async function executeAiTask(
   const { pollIntervalMs = DEFAULT_POLL_INTERVAL_MS, timeoutMs = DEFAULT_TIMEOUT_MS } = options;
 
   // Trigger the task
-  const triggerResponse = await fetch(`${API_BASE}/prompts/run`, {
+  const triggerResponse = await fetch(`${getApiBase()}/prompts/run`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(request),
@@ -313,7 +313,7 @@ export async function executeAiTask(
 
     // Poll until complete or timeout
     while (Date.now() - startTime < timeoutMs) {
-      const taskResponse = await fetch(`${API_BASE}/task-runs/${taskId}`);
+      const taskResponse = await fetch(`${getApiBase()}/task-runs/${taskId}`);
       if (!taskResponse.ok) {
         throw new Error(`Failed to fetch task: ${taskResponse.status}`);
       }

@@ -4,13 +4,27 @@
 
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::Json,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{info, warn};
+
+/// Query parameters for history filtering.
+#[derive(Debug, serde::Deserialize)]
+pub struct HistoryQuery {
+    #[serde(default = "default_history_limit")]
+    pub limit: u32,
+    pub action: Option<String>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+}
+
+fn default_history_limit() -> u32 {
+    100
+}
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::trigger_system::storage;
@@ -69,6 +83,7 @@ async fn create_trigger(
         TriggerConfig::WorkflowChain { .. } => "workflow_chain",
         TriggerConfig::GitEvent { .. } => "git_event",
         TriggerConfig::HealthCheck { .. } => "health_check",
+        TriggerConfig::Schedule { .. } => "schedule",
     };
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -84,6 +99,8 @@ async fn create_trigger(
         debounce_ms: request.debounce_ms,
         cooldown_seconds: request.cooldown_seconds,
         max_concurrent: request.max_concurrent,
+        retry_count: request.retry_count,
+        retry_delay_seconds: request.retry_delay_seconds,
         enabled: true,
         last_triggered_at: None,
         last_execution_id: None,
@@ -151,6 +168,7 @@ async fn update_trigger(
             TriggerConfig::WorkflowChain { .. } => "workflow_chain".to_string(),
             TriggerConfig::GitEvent { .. } => "git_event".to_string(),
             TriggerConfig::HealthCheck { .. } => "health_check".to_string(),
+            TriggerConfig::Schedule { .. } => "schedule".to_string(),
         };
         trigger.trigger_config = config;
     }
@@ -172,11 +190,27 @@ async fn update_trigger(
     if let Some(max_concurrent) = request.max_concurrent {
         trigger.max_concurrent = max_concurrent;
     }
+    if let Some(retry_count) = request.retry_count {
+        trigger.retry_count = retry_count;
+    }
+    if let Some(retry_delay_seconds) = request.retry_delay_seconds {
+        trigger.retry_delay_seconds = retry_delay_seconds;
+    }
 
     trigger.updated_at = chrono::Utc::now().to_rfc3339();
 
     match storage::update_trigger(db, &trigger) {
-        Ok(()) => Json(ApiResponse::success(trigger)),
+        Ok(()) => {
+            // Re-register watcher if trigger is enabled (config may have changed)
+            if trigger.enabled {
+                if let Some(service) = crate::trigger_system::get_trigger_service().await {
+                    if let Err(e) = service.register_watcher(&trigger).await {
+                        warn!("Failed to re-register watcher after update: {}", e);
+                    }
+                }
+            }
+            Json(ApiResponse::success(trigger))
+        }
         Err(e) => Json(ApiResponse::error(format!(
             "Failed to update trigger: {}",
             e
@@ -190,6 +224,11 @@ async fn delete_trigger(
     Path(id): Path<String>,
 ) -> Json<ApiResponse<()>> {
     let db = &state.app_state.checkpoint_db;
+
+    // Unregister the watcher first
+    if let Some(service) = crate::trigger_system::get_trigger_service().await {
+        service.unregister_watcher(&id).await;
+    }
 
     match storage::delete_trigger(db, &id) {
         Ok(()) => Json(ApiResponse::success(())),
@@ -219,6 +258,22 @@ async fn set_enabled(
                     "disabled"
                 }
             );
+
+            // Register or unregister watcher based on enabled state
+            if let Some(service) = crate::trigger_system::get_trigger_service().await {
+                if request.enabled {
+                    // Re-register the watcher
+                    if let Ok(Some(trigger)) = storage::get_trigger(db, &id) {
+                        if let Err(e) = service.register_watcher(&trigger).await {
+                            warn!("Failed to register watcher after enable: {}", e);
+                        }
+                    }
+                } else {
+                    // Unregister the watcher
+                    service.unregister_watcher(&id).await;
+                }
+            }
+
             Json(ApiResponse::success(()))
         }
         Err(e) => Json(ApiResponse::error(format!(
@@ -270,14 +325,22 @@ async fn test_trigger(
     Json(ApiResponse::success(result))
 }
 
-/// Get trigger execution history.
+/// Get trigger execution history with optional filtering.
 async fn get_history(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
+    Query(query): Query<HistoryQuery>,
 ) -> Json<ApiResponse<Vec<TriggerHistoryEntry>>> {
     let db = &state.app_state.checkpoint_db;
 
-    match storage::get_trigger_history(db, &id, 100) {
+    match storage::get_trigger_history_filtered(
+        db,
+        &id,
+        query.limit,
+        query.action.as_deref(),
+        query.since.as_deref(),
+        query.until.as_deref(),
+    ) {
         Ok(entries) => Json(ApiResponse::success(entries)),
         Err(e) => Json(ApiResponse::error(format!("Failed to get history: {}", e))),
     }
@@ -332,10 +395,11 @@ async fn webhook_ingestion(
 
     // Verify HMAC signature if secret is configured
     if let Some(ref secret) = secret {
+        // HTTP headers are case-insensitive per RFC 7230
         let signature = headers
-            .get("x-hub-signature-256")
-            .or_else(|| headers.get("X-Hub-Signature-256"))
-            .and_then(|v| v.to_str().ok());
+            .iter()
+            .find(|(name, _)| name.as_str().eq_ignore_ascii_case("x-hub-signature-256"))
+            .and_then(|(_, value)| value.to_str().ok());
 
         match signature {
             Some(sig) => {
@@ -431,6 +495,7 @@ async fn get_status(State(_state): State<Arc<ApiState>>) -> Json<ApiResponse<Tri
             enabled_triggers: 0,
             active_watchers: 0,
             active_executions: 0,
+            dropped_events: 0,
         })),
     }
 }

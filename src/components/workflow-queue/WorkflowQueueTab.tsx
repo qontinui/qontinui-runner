@@ -13,8 +13,8 @@ import { WorkflowQueuePanel } from "./WorkflowQueuePanel";
 import type { WorkflowWithStats, QueuedWorkflow, WorkflowStats } from "./types";
 import type { UnifiedWorkflow } from "../../types/unified-workflow";
 import { getTotalStepCount } from "../../types/unified-workflow";
+import { getApiBase } from "@/lib/runner-api";
 
-const API_BASE = "http://localhost:9876";
 const STORAGE_KEY = "qontinui-workflow-queue";
 const OPTIONS_STORAGE_KEY = "qontinui-workflow-queue-options";
 
@@ -71,7 +71,7 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
     setLoading(true);
     try {
       // Fetch workflows
-      const workflowsResponse = await fetch(`${API_BASE}/unified-workflows`);
+      const workflowsResponse = await fetch(`${getApiBase()}/unified-workflows`);
       const workflowsResult = await workflowsResponse.json();
 
       if (!workflowsResult.success) {
@@ -84,7 +84,9 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
       const workflowsWithStats: WorkflowWithStats[] = await Promise.all(
         rawWorkflows.map(async (workflow) => {
           try {
-            const statsResponse = await fetch(`${API_BASE}/unified-workflows/${workflow.id}/stats`);
+            const statsResponse = await fetch(
+              `${getApiBase()}/unified-workflows/${workflow.id}/stats`,
+            );
             const statsResult = await statsResponse.json();
 
             if (statsResult.success && statsResult.data) {
@@ -175,7 +177,7 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
 
     setIsExecuting(true);
     try {
-      const response = await fetch(`${API_BASE}/unified-workflows/run-composed`, {
+      const response = await fetch(`${getApiBase()}/unified-workflows/run-composed`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

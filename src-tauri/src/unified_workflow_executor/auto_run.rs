@@ -135,9 +135,15 @@ pub fn launch_generated_workflow(
         reflection_mode: workflow.reflection_mode,
         provider_override: None,
         model_override: None,
+        model_overrides: workflow.model_overrides.clone(),
         stage_index: None,
         max_sessions: Some(workflow.max_iterations),
         auto_run_generated: false, // Don't cascade auto-run
+        approval_gate: workflow.approval_gate,
+        max_context_tokens: 100_000,
+        cross_workflow_learning: true,
+        verification_history: std::collections::HashMap::new(),
+        routing_context: Default::default(),
     };
 
     // 6. Spawn the workflow

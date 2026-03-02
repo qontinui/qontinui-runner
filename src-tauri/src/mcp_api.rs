@@ -352,6 +352,7 @@ pub fn create_router(
         .merge(crate::mcp::processes::routes())
         .merge(crate::mcp::prompts::routes())
         .merge(crate::mcp::query_tool::routes())
+        .merge(crate::mcp::queue::routes())
         .merge(crate::mcp::rag::routes())
         .merge(crate::mcp::recordings::routes())
         .merge(crate::mcp::reflection_api::routes())
@@ -361,6 +362,7 @@ pub fn create_router(
         .merge(crate::mcp::prompt_snippets::routes())
         .merge(crate::mcp::settings::routes())
         .merge(crate::mcp::shell_commands::routes())
+        .merge(crate::mcp::skills::routes())
         .merge(crate::mcp::state_explorer::routes())
         .merge(crate::mcp::state_machine::routes())
         .merge(crate::mcp::step_type_knowledge_api::routes())
@@ -439,12 +441,33 @@ pub async fn start_server(
                 }
                 info!("MCP API server listening on port {}", try_port);
 
+                // Store the actual bound port in AppState
+                api_ready_flag.api_port.store(try_port, Ordering::Relaxed);
+
                 // Signal that the API is ready for requests
                 api_ready_flag.api_ready.store(true, Ordering::Relaxed);
                 if let Err(e) = emitter.emit("api-ready", try_port) {
                     warn!("Failed to emit api-ready event: {}", e);
                 } else {
                     info!("Emitted api-ready event (port {})", try_port);
+                }
+
+                // Update window title if using non-default port or instance name
+                let default_port = crate::mcp::types::MCP_API_PORT;
+                let instance_name = std::env::var("QONTINUI_INSTANCE_NAME").ok();
+                let needs_title_update = try_port != default_port || instance_name.is_some();
+                if needs_title_update {
+                    let title = match instance_name {
+                        Some(name) => format!("Qontinui Runner — {} [:{}]", name, try_port),
+                        None => format!("Qontinui Runner [:{}]", try_port),
+                    };
+                    if let Some(window) = emitter.get_webview_window("main") {
+                        if let Err(e) = window.set_title(&title) {
+                            warn!("Failed to set window title: {}", e);
+                        } else {
+                            info!("Window title set to: {}", title);
+                        }
+                    }
                 }
 
                 axum::serve(listener, router).await?;

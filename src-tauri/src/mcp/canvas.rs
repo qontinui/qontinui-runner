@@ -70,6 +70,8 @@ pub struct StoredPanel {
     pub data: serde_json::Value,
     pub priority: i32,
     pub size: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     pub task_run_id: String,
     pub created_at: String,
     pub updated_at: String,
@@ -92,6 +94,9 @@ pub struct CreatePanelRequest {
     /// Panel size: "compact" | "normal" | "large".
     #[serde(default)]
     pub size: Option<String>,
+    /// Optional group name for organizing panels into sections.
+    #[serde(default)]
+    pub group: Option<String>,
     /// Optional task run ID (auto-detected from running task if not provided).
     #[serde(default)]
     pub task_run_id: Option<String>,
@@ -102,6 +107,12 @@ pub struct CreatePanelRequest {
 
 fn default_priority() -> Option<i32> {
     Some(50)
+}
+
+/// Request body for patching panel data (e.g., interactive checklist updates).
+#[derive(Debug, Deserialize)]
+pub struct PatchPanelRequest {
+    pub data: serde_json::Value,
 }
 
 /// Response for a panel operation.
@@ -168,6 +179,7 @@ async fn create_or_update_panel(
         data: request.data,
         priority,
         size,
+        group: request.group,
         task_run_id: task_run_id.clone(),
         created_at: now.clone(),
         updated_at: now,
@@ -331,6 +343,84 @@ async fn clear_panels(State(state): State<Arc<ApiState>>) -> Json<ApiResponse<Pa
     }))
 }
 
+/// Patch panel data (e.g., for interactive checklist updates from the frontend).
+async fn patch_panel_data(
+    State(state): State<Arc<ApiState>>,
+    Path(panel_id): Path<String>,
+    Json(request): Json<PatchPanelRequest>,
+) -> Json<ApiResponse<PanelResponse>> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let task_run_id;
+    let updated_panel;
+
+    {
+        let mut canvas = state.app_state.canvas_state.write().await;
+        let panel = match canvas.panels.get_mut(&panel_id) {
+            Some(p) => p,
+            None => {
+                return Json(ApiResponse::error(format!(
+                    "Panel '{}' not found",
+                    panel_id
+                )));
+            }
+        };
+
+        panel.data = request.data;
+        panel.updated_at = now;
+        task_run_id = Some(panel.task_run_id.clone());
+        updated_panel = panel.clone();
+    }
+
+    // Persist to SQLite
+    let db = state.app_state.checkpoint_db.clone();
+    let panel_for_db = updated_panel.clone();
+    if let Err(e) =
+        tokio::task::spawn_blocking(move || db.insert_or_update_canvas_panel(&panel_for_db))
+            .await
+            .unwrap_or_else(|e| Err(format!("spawn_blocking error: {}", e)))
+    {
+        warn!("Failed to persist patched canvas panel to SQLite: {}", e);
+    }
+
+    // Emit canvas-update event
+    let event = AppEvent::CanvasUpdate {
+        action: "update".to_string(),
+        panel_id: panel_id.clone(),
+        panel: Some(serde_json::to_value(&updated_panel).unwrap_or_default()),
+        task_run_id,
+    };
+    if let Err(e) = state.app_handle.emit(event.event_name(), &event) {
+        warn!("Failed to emit canvas-update event for patch: {}", e);
+    }
+
+    Json(ApiResponse::success(PanelResponse {
+        panel_id,
+        action: "update".to_string(),
+    }))
+}
+
+/// Get historical panels for a completed task run (from SQLite).
+async fn get_historical_panels(
+    State(state): State<Arc<ApiState>>,
+    Path(task_run_id): Path<String>,
+) -> Json<ApiResponse<Vec<StoredPanel>>> {
+    let db = state.app_state.checkpoint_db.clone();
+    let trid = task_run_id.clone();
+    match tokio::task::spawn_blocking(move || db.get_canvas_panels_for_task_run(&trid))
+        .await
+        .unwrap_or_else(|e| Err(format!("spawn_blocking error: {}", e)))
+    {
+        Ok(panels) => Json(ApiResponse::success(panels)),
+        Err(e) => {
+            warn!("Failed to get historical canvas panels: {}", e);
+            Json(ApiResponse::error(format!(
+                "Failed to get panels for task run {}: {}",
+                task_run_id, e
+            )))
+        }
+    }
+}
+
 /// Define routes for the canvas module.
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
@@ -341,8 +431,12 @@ pub fn routes() -> Router<Arc<ApiState>> {
                 .delete(clear_panels),
         )
         .route(
+            "/canvas/panels/history/{task_run_id}",
+            get(get_historical_panels),
+        )
+        .route(
             "/canvas/panels/{panel_id}",
-            get(get_panel).delete(delete_panel),
+            get(get_panel).delete(delete_panel).patch(patch_panel_data),
         )
 }
 
@@ -370,6 +464,7 @@ mod tests {
                 data: serde_json::json!({"content": "hello"}),
                 priority: 50,
                 size: "normal".to_string(),
+                group: None,
                 task_run_id: "task-1".to_string(),
                 created_at: "2024-01-01".to_string(),
                 updated_at: "2024-01-01".to_string(),

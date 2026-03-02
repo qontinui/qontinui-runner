@@ -29,7 +29,6 @@ use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{debug, info, instrument, warn};
 
-use crate::ai_provider::run_prompt_with_routing;
 use crate::ai_router::TaskContext;
 use crate::config_storage::ConfigStorage;
 use crate::database::{CheckpointDb, CreateTaskRunEventInput};
@@ -57,6 +56,49 @@ use super::phase_configs::{
 use super::types::{get_parent_task_id, AgenticOutcome, LoopConfig};
 
 use crate::mcp::types::MCP_API_PORT;
+
+// =============================================================================
+// Token Usage Tracking
+// =============================================================================
+
+/// Record token usage for a phase to the database.
+/// Silently ignores errors (best-effort tracking).
+fn record_phase_token_usage(
+    db: &CheckpointDb,
+    task_run_id: &str,
+    phase: &str,
+    stage_index: Option<u32>,
+    iteration: Option<u32>,
+    model_used: Option<&str>,
+    provider_used: Option<&str>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    duration_ms: Option<u64>,
+) {
+    let input = input_tokens.unwrap_or(0);
+    let output = output_tokens.unwrap_or(0);
+    // Only record if we have actual token data
+    if input == 0 && output == 0 {
+        return;
+    }
+    // Simple cost estimation (cents): rough per-token pricing
+    // This is approximate — actual cost depends on model
+    let cost_cents = 0u64; // Cost calculation deferred to a pricing table
+    if let Err(e) = db.create_phase_token_usage(
+        task_run_id,
+        phase,
+        stage_index,
+        iteration,
+        model_used,
+        provider_used,
+        input,
+        output,
+        cost_cents,
+        duration_ms,
+    ) {
+        warn!("Failed to record phase token usage: {}", e);
+    }
+}
 
 // =============================================================================
 // Reflection Mode Preamble
@@ -325,12 +367,28 @@ fn format_duration_ms(ms: i64) -> String {
 /// Findings ([FINDING:...] markers) in the AI response are parsed and stored
 /// in the database. Finding markers are stripped from the output before saving
 /// to output_path so the saved artifact contains clean content.
+/// Result of a prompt-response mode execution, including token usage.
+struct PromptResponseResult {
+    /// The AI output text.
+    output: String,
+    /// Input tokens consumed (API providers only).
+    input_tokens: Option<u64>,
+    /// Output tokens generated (API providers only).
+    output_tokens: Option<u64>,
+}
+
 async fn execute_prompt_response_mode(
     step: &ExecutionStepConfig,
     db: &CheckpointDb,
     task_run_id: Option<&str>,
     doctor_handle: Option<DoctorHandle>,
-) -> Result<String, String> {
+    model_override: Option<String>,
+    provider_override: Option<String>,
+    temperature_override: Option<f32>,
+    max_tokens_override: Option<u32>,
+    fallback_model: Option<String>,
+    fallback_provider: Option<String>,
+) -> Result<PromptResponseResult, String> {
     // Build the prompt content
     let mut prompt = step.prompt_content.clone().unwrap_or_default();
 
@@ -338,7 +396,10 @@ async fn execute_prompt_response_mode(
     if let Some(ref input_path) = step.input_path {
         match std::fs::read_to_string(input_path) {
             Ok(content) => {
-                prompt = format!("{}\n\n## Input File Content\n\n{}", prompt, content);
+                prompt = format!(
+                    "{}\n\n## Input File Content (Supplementary Context)\n\n{}\n\n---\nREMINDER: The above is supplementary context from a prior step. Stay focused on your primary task and output format.",
+                    prompt, content
+                );
             }
             Err(e) => {
                 return Err(format!("Failed to read input file '{}': {}", input_path, e));
@@ -353,9 +414,19 @@ async fn execute_prompt_response_mode(
     // Build task context for AI routing
     let task_context = TaskContext::from_prompt(&prompt);
 
-    // Run in blocking task since run_prompt_with_routing is sync
+    // Run in blocking task since run_prompt_with_model_override is sync
     let result = tokio::task::spawn_blocking(move || {
-        run_prompt_with_routing(&prompt, &task_context, doctor_handle.as_ref())
+        crate::ai_provider::run_prompt_with_model_override(
+            &prompt,
+            &task_context,
+            doctor_handle.as_ref(),
+            model_override.as_deref(),
+            provider_override.as_deref(),
+            temperature_override,
+            max_tokens_override,
+            fallback_model.as_deref(),
+            fallback_provider.as_deref(),
+        )
     })
     .await
     .map_err(|e| format!("Prompt execution task panicked: {}", e))?;
@@ -367,6 +438,8 @@ async fn execute_prompt_response_mode(
         ));
     }
 
+    let input_tokens = result.input_tokens;
+    let output_tokens = result.output_tokens;
     let output_text = result.output;
 
     // Detect empty AI response — Claude CLI can exit 0 with no output
@@ -377,6 +450,40 @@ async fn execute_prompt_response_mode(
              Try running again."
                 .to_string(),
         );
+    }
+
+    // Detect AI misunderstanding: if the response is mostly asking for permission or
+    // clarification, the AI likely interpreted its instructions as a task to execute
+    // rather than a prompt to respond to. This is a common failure mode for meta-workflows.
+    {
+        let lower = output_text.to_lowercase();
+        let permission_patterns = [
+            "could you please approve",
+            "i need your approval",
+            "can you confirm",
+            "could you approve",
+            "please approve the",
+            "i need permission",
+            "could you please confirm",
+        ];
+        let question_density = output_text.matches('?').count();
+        let is_short = output_text.trim().len() < 500;
+        let has_permission_pattern = permission_patterns.iter().any(|p| lower.contains(p));
+
+        if has_permission_pattern && is_short {
+            warn!(
+                "Response mode: AI output appears to be asking for permission ({} bytes, {} questions). \
+                 This suggests the AI misinterpreted its role. Treating as failure.",
+                output_text.len(),
+                question_density
+            );
+            return Err(format!(
+                "AI misinterpreted its task and asked for permission instead of producing the expected output. \
+                 This typically happens when the task description is phrased as an imperative instruction. \
+                 The AI should be generating content, not executing actions. Output: {}",
+                &output_text[..output_text.len().min(200)]
+            ));
+        }
     }
 
     // Parse findings from the AI response and store them
@@ -441,7 +548,11 @@ async fn execute_prompt_response_mode(
         );
     }
 
-    Ok(output_text)
+    Ok(PromptResponseResult {
+        output: output_text,
+        input_tokens,
+        output_tokens,
+    })
 }
 
 /// Parse [FINDING:...] markers from a response-mode AI output.
@@ -499,57 +610,67 @@ fn store_parsed_findings(db: &CheckpointDb, task_run_id: &str, findings: &[Parse
 }
 
 // =============================================================================
+// Token Budget Helpers
+// =============================================================================
+
+/// Rough token estimate: ~4 chars per token for English text.
+///
+/// This is intentionally approximate -- we don't need a real tokenizer here.
+/// The goal is to prevent context from growing unbounded, not to hit an
+/// exact token count.
+fn estimate_tokens(text: &str) -> usize {
+    text.len() / 4
+}
+
+// =============================================================================
 // Iteration Context Builder
 // =============================================================================
 
 /// Build context from previous iterations for the AI to reference.
 ///
-/// Includes:
-/// - Latest verification feedback from knowledge base
-/// - Findings from the findings database
-/// - Previous verification results (pass/fail history)
-/// - Managed process status (if provided by caller)
-/// - Error monitor summary (if provided by caller)
-/// - Accumulated knowledge entries (unresolved issues, solutions, observations)
-/// - Available data APIs for deeper investigation
-/// - Tool priority guidance (UI Bridge vs Playwright)
-fn build_unified_iteration_context(
+/// Includes (in priority order for token budgeting):
+/// 1. **Critical** (always include): Latest verification feedback, error messages
+/// 2. **High** (include if budget allows): Findings, recent iteration details (last 2-3)
+/// 3. **Medium**: Older iteration summaries, knowledge base entries, cross-workflow insights
+/// 4. **Low**: Historical patterns, data API docs, tool priority guidance
+///
+/// ## Token budgeting
+///
+/// Each section is added only if the remaining token budget allows. When a section
+/// would exceed 80% of the remaining budget, it is truncated. Sections that exceed
+/// the remaining budget entirely are skipped.
+///
+/// ## Tiered compression
+///
+/// To prevent prompt bloat on iterations 4+, this function applies tiered compression:
+/// - **Current iteration (N):** Full failure context (handled separately via `failure_context` param)
+/// - **Recent iteration (N-1):** Full verification feedback, findings, git diff stat + truncated diff
+/// - **Old iterations (1..N-2):** ~400 chars each -- pass/fail summary, failed step names,
+///   diff stat, one-sentence fix description
+fn build_compressed_iteration_history(
     checkpoint_db: &CheckpointDb,
     execution_id: &str,
     current_iteration: u32,
     process_status_summary: Option<&str>,
     error_monitor_summary: Option<&str>,
     workflow_name: Option<&str>,
+    max_context_tokens: usize,
+    cross_workflow_learning: bool,
 ) -> Option<String> {
     let mut sections = Vec::new();
+    let mut budget_remaining = max_context_tokens;
+    let mut sections_included: usize = 0;
+    let mut sections_truncated: usize = 0;
+    let mut sections_skipped: usize = 0;
 
-    // 0. Cross-run historical knowledge (from previous runs of the same workflow)
-    if let Some(wf_name) = workflow_name {
-        if let Ok(historical) = checkpoint_db.list_workflow_knowledge(
-            wf_name,
-            execution_id,
-            &["recurring_pattern", "context"],
-            10,
-        ) {
-            if !historical.is_empty() {
-                let mut lines = vec!["### Historical Knowledge (from previous runs)".to_string()];
-                lines.push(
-                    "These patterns were identified by reflection across previous runs of this workflow:".to_string(),
-                );
-                for entry in &historical {
-                    lines.push(format!(
-                        "- **[{}]** ({}): {}",
-                        entry.category.to_uppercase(),
-                        entry.confidence,
-                        truncate_str(&entry.content, 300),
-                    ));
-                }
-                sections.push(lines.join("\n"));
-            }
-        }
-    }
+    // Compression budget: recent iteration gets full fidelity, old ones get summarized
+    let full_fidelity_iterations: u32 = 1; // N-1 gets full detail
+    let max_per_old_iteration_chars: usize = 400;
 
-    // 1. Latest verification feedback from knowledge base (most actionable — show first)
+    // === CRITICAL PRIORITY: Always included ===
+
+    // 1. Latest verification feedback from knowledge base (most actionable -- show first)
+    // Priority: CRITICAL -- always included regardless of budget
     if let Ok(feedback) =
         checkpoint_db.list_task_knowledge(execution_id, Some("verification_feedback"), false)
     {
@@ -557,11 +678,18 @@ fn build_unified_iteration_context(
             let mut lines = vec!["### Last Verification Feedback".to_string()];
             lines.push(String::new());
             lines.push(latest.content.clone());
-            sections.push(lines.join("\n"));
+            let section = lines.join("\n");
+            let tokens = estimate_tokens(&section);
+            budget_remaining = budget_remaining.saturating_sub(tokens);
+            sections.push(section);
+            sections_included += 1;
         }
     }
 
+    // === HIGH PRIORITY: Include if budget allows ===
+
     // 2. Collect findings from the findings database (task_run_findings table)
+    // Priority: HIGH
     if let Ok(findings) = checkpoint_db.get_findings_for_task(execution_id) {
         if !findings.is_empty() {
             let mut findings_lines = vec!["### Findings from Previous Iterations".to_string()];
@@ -577,16 +705,55 @@ fn build_unified_iteration_context(
                     findings_lines.push(format!("  {}", desc));
                 }
             }
-            sections.push(findings_lines.join("\n"));
+            let section = findings_lines.join("\n");
+            let tokens = estimate_tokens(&section);
+            if tokens <= budget_remaining {
+                budget_remaining -= tokens;
+                sections.push(section);
+                sections_included += 1;
+            } else if budget_remaining > 100 {
+                // Truncate to fit within 80% of remaining budget
+                let max_chars = (budget_remaining * 4 * 80) / 100;
+                sections.push(truncate_str(&section, max_chars));
+                budget_remaining = budget_remaining.saturating_sub(max_chars / 4);
+                sections_included += 1;
+                sections_truncated += 1;
+            } else {
+                sections_skipped += 1;
+            }
         }
     }
 
-    // 3. Collect previous verification results (pass/fail history per iteration)
-    let mut verification_lines = vec!["### Previous Verification Results".to_string()];
-    let mut has_prev_results = false;
-    for iter in 1..current_iteration {
-        if let Ok(Some(result)) = checkpoint_db.get_verification_phase_result(execution_id, iter) {
-            has_prev_results = true;
+    // 3. Tiered iteration history -- compressed for old, full for recent
+    //
+    // Old iterations (1..N-1-full_fidelity) get compressed to ~400 chars each.
+    // Recent iterations (N-1) get full verification feedback + findings + diff.
+    let recent_cutoff = current_iteration.saturating_sub(full_fidelity_iterations);
+
+    // Load all observations once for efficient per-iteration lookup
+    let all_observations = checkpoint_db
+        .list_task_knowledge(execution_id, Some("observation"), false)
+        .unwrap_or_default();
+
+    // Load all solutions for fix descriptions
+    let all_solutions = checkpoint_db
+        .list_task_knowledge(execution_id, Some("solution"), false)
+        .unwrap_or_default();
+
+    // --- 3a. Recent iteration (full fidelity) ---
+    // Priority: HIGH -- recent iteration details are critical for the AI
+    if recent_cutoff >= 1 && current_iteration > 1 {
+        let recent_iter = current_iteration - 1;
+        let mut recent_lines = vec![format!(
+            "### Last Iteration Details (Iteration {})",
+            recent_iter
+        )];
+        recent_lines.push(String::new());
+
+        // Full verification results for recent iteration
+        if let Ok(Some(result)) =
+            checkpoint_db.get_verification_phase_result(execution_id, recent_iter)
+        {
             let passed = result
                 .get("passed_steps")
                 .and_then(|v| v.as_u64())
@@ -609,111 +776,356 @@ fn build_unified_iteration_context(
             } else {
                 format!("{}/{} passed, {} failed", passed, total, failed)
             };
-            verification_lines.push(format!("- Iteration {}: {}", iter, status));
+            recent_lines.push(format!("**Verification:** {}", status));
 
-            // List failed step names from previous iterations
+            // List all step results with pass/fail
             if let Some(step_results) = result.get("step_results").and_then(|v| v.as_array()) {
-                let failed_names: Vec<_> = step_results
-                    .iter()
-                    .filter(|s| s.get("success").and_then(|v| v.as_bool()) == Some(false))
-                    .filter_map(|s| s.get("step_name").and_then(|v| v.as_str()))
-                    .collect();
-                if !failed_names.is_empty() {
-                    verification_lines.push(format!("  Failed: {}", failed_names.join(", ")));
+                for step in step_results {
+                    let name = step
+                        .get("step_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let success = step
+                        .get("success")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let icon = if success { "PASS" } else { "FAIL" };
+                    recent_lines.push(format!("- [{}] {}", icon, name));
                 }
+            }
+            recent_lines.push(String::new());
+        }
+
+        // Full observations (including git diff) for recent iteration
+        for obs in all_observations
+            .iter()
+            .filter(|o| o.iteration == recent_iter)
+        {
+            recent_lines.push(truncate_str(&obs.content, 4000));
+        }
+
+        if recent_lines.len() > 2 {
+            let section = recent_lines.join("\n");
+            let tokens = estimate_tokens(&section);
+            if tokens <= budget_remaining {
+                budget_remaining -= tokens;
+                sections.push(section);
+                sections_included += 1;
+            } else if budget_remaining > 200 {
+                let max_chars = (budget_remaining * 4 * 80) / 100;
+                sections.push(truncate_str(&section, max_chars));
+                budget_remaining = budget_remaining.saturating_sub(max_chars / 4);
+                sections_included += 1;
+                sections_truncated += 1;
+            } else {
+                sections_skipped += 1;
             }
         }
     }
-    if has_prev_results {
-        sections.push(verification_lines.join("\n"));
-    }
 
-    // 3b. Managed process status (pre-built by caller)
-    if let Some(summary) = process_status_summary {
-        sections.push(summary.to_string());
-    }
+    // --- 3b. Old iterations (compressed) ---
+    // Priority: HIGH (but compressed, so smaller token footprint)
+    if recent_cutoff > 1 && budget_remaining > 200 {
+        let mut compressed_lines = vec!["### Iteration History (Compressed)".to_string()];
+        compressed_lines.push(String::new());
 
-    // 3c. Error monitor summary (pre-built by caller)
-    if let Some(summary) = error_monitor_summary {
-        sections.push(summary.to_string());
-    }
+        // Track previous iteration's failed steps for regression detection
+        let mut prev_failed_names: Vec<String> = Vec::new();
 
-    // 4. Collect accumulated knowledge entries (task_knowledge table)
-    if let Ok(all_knowledge) = checkpoint_db.list_task_knowledge(execution_id, None, false) {
-        if !all_knowledge.is_empty() {
-            let unresolved: Vec<_> = all_knowledge
-                .iter()
-                .filter(|k| {
-                    !k.is_resolved
-                        && k.category != "verification_feedback"
-                        && k.category != "observation"
-                })
-                .collect();
+        for iter in 1..recent_cutoff {
+            let mut iter_parts: Vec<String> = Vec::new();
+            let mut current_failed_names: Vec<String> = Vec::new();
 
-            let solutions: Vec<_> = all_knowledge
-                .iter()
-                .filter(|k| k.category == "solution")
-                .collect();
+            // Verification pass/fail summary
+            if let Ok(Some(result)) =
+                checkpoint_db.get_verification_phase_result(execution_id, iter)
+            {
+                let passed = result
+                    .get("passed_steps")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let total = result
+                    .get("total_steps")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let failed = result
+                    .get("failed_steps")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let all_passed = result
+                    .get("all_passed")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
 
-            let observations: Vec<_> = all_knowledge
-                .iter()
-                .filter(|k| k.category == "observation")
-                .collect();
+                let status = if all_passed {
+                    "ALL PASSED".to_string()
+                } else {
+                    format!("{}/{} passed, {} failed", passed, total, failed)
+                };
+                iter_parts.push(format!("**Iteration {}:** {}", iter, status));
 
-            // Show unresolved findings/root causes
-            if !unresolved.is_empty() {
-                let mut lines = vec!["### Accumulated Knowledge (Unresolved)".to_string()];
-                for entry in unresolved.iter().take(10) {
-                    lines.push(format!(
-                        "- **[{}]** (iter {}, {}): {}",
-                        entry.category.to_uppercase(),
-                        entry.iteration,
-                        entry.confidence,
-                        truncate_str(&entry.content, 300),
-                    ));
-                    if let Some(ref evidence) = entry.evidence {
-                        lines.push(format!("  Evidence: {}", truncate_str(evidence, 150)));
+                // Extract failed step names
+                if let Some(step_results) = result.get("step_results").and_then(|v| v.as_array()) {
+                    current_failed_names = step_results
+                        .iter()
+                        .filter(|s| s.get("success").and_then(|v| v.as_bool()) == Some(false))
+                        .filter_map(|s| {
+                            s.get("step_name")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .collect();
+
+                    if !current_failed_names.is_empty() {
+                        iter_parts.push(format!("  Failed: {}", current_failed_names.join(", ")));
                     }
                 }
-                sections.push(lines.join("\n"));
+
+                // Detect regressions (newly failing steps) and fixes
+                if iter > 1 && !prev_failed_names.is_empty() {
+                    let newly_passing: Vec<_> = prev_failed_names
+                        .iter()
+                        .filter(|name| !current_failed_names.contains(name))
+                        .collect();
+                    if !newly_passing.is_empty() {
+                        iter_parts.push(format!(
+                            "  Fixed: {}",
+                            newly_passing
+                                .iter()
+                                .map(|s| s.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                    }
+                    let regressions: Vec<_> = current_failed_names
+                        .iter()
+                        .filter(|name| !prev_failed_names.contains(name))
+                        .collect();
+                    if !regressions.is_empty() {
+                        iter_parts.push(format!(
+                            "  REGRESSION: {} (was passing)",
+                            regressions
+                                .iter()
+                                .map(|s| s.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                    }
+                }
             }
 
-            // Show previous solutions attempted
-            if !solutions.is_empty() {
-                let mut lines = vec!["### Previous Solution Attempts".to_string()];
-                for entry in solutions.iter().take(5) {
-                    let status = if entry.is_resolved {
-                        "resolved"
-                    } else {
-                        "unresolved"
-                    };
-                    lines.push(format!(
-                        "- [iter {}, {}] {}",
-                        entry.iteration,
-                        status,
-                        truncate_str(&entry.content, 300),
-                    ));
-                }
-                sections.push(lines.join("\n"));
+            // Extract fix description from solutions for this iteration
+            if let Some(solution) = all_solutions.iter().find(|s| s.iteration == iter) {
+                iter_parts.push(format!("  Tried: {}", truncate_str(&solution.content, 120)));
             }
 
-            // Show recent observations (last 3)
-            if !observations.is_empty() {
-                let mut lines = vec!["### Recent Observations".to_string()];
-                for entry in observations.iter().rev().take(3) {
-                    lines.push(format!(
-                        "- (iter {}) {}",
-                        entry.iteration,
-                        truncate_str(&entry.content, 200),
-                    ));
+            // Extract git diff stat from observations for this iteration
+            for obs in all_observations.iter().filter(|o| o.iteration == iter) {
+                if let Some(diff_stat) = extract_diff_stat_from_observation(&obs.content) {
+                    iter_parts.push(format!("  Changes: {}", diff_stat));
+                    break;
                 }
-                sections.push(lines.join("\n"));
+            }
+
+            if !iter_parts.is_empty() {
+                // Enforce per-iteration char budget
+                let joined = iter_parts.join("\n");
+                if joined.len() > max_per_old_iteration_chars {
+                    compressed_lines.push(truncate_str(&joined, max_per_old_iteration_chars));
+                } else {
+                    compressed_lines.push(joined);
+                }
+                compressed_lines.push(String::new());
+            }
+
+            prev_failed_names = current_failed_names;
+        }
+
+        if compressed_lines.len() > 2 {
+            let section = compressed_lines.join("\n");
+            let tokens = estimate_tokens(&section);
+            if tokens <= budget_remaining {
+                budget_remaining -= tokens;
+                sections.push(section);
+                sections_included += 1;
+            } else {
+                sections_skipped += 1;
             }
         }
     }
 
+    // 3c. Managed process status (pre-built by caller)
+    // Priority: HIGH -- directly relevant to current execution
+    if let Some(summary) = process_status_summary {
+        let tokens = estimate_tokens(summary);
+        if tokens <= budget_remaining {
+            budget_remaining -= tokens;
+            sections.push(summary.to_string());
+            sections_included += 1;
+        } else {
+            sections_skipped += 1;
+        }
+    }
+
+    // 3d. Error monitor summary (pre-built by caller)
+    // Priority: HIGH -- errors are actionable
+    if let Some(summary) = error_monitor_summary {
+        let tokens = estimate_tokens(summary);
+        if tokens <= budget_remaining {
+            budget_remaining -= tokens;
+            sections.push(summary.to_string());
+            sections_included += 1;
+        } else {
+            sections_skipped += 1;
+        }
+    }
+
+    // === MEDIUM PRIORITY: Include if budget allows ===
+
+    // 4. Accumulated knowledge (unresolved only -- deduped against iteration history above)
+    // Priority: MEDIUM
+    if budget_remaining > 200 {
+        if let Ok(all_knowledge) = checkpoint_db.list_task_knowledge(execution_id, None, false) {
+            if !all_knowledge.is_empty() {
+                let unresolved: Vec<_> = all_knowledge
+                    .iter()
+                    .filter(|k| {
+                        !k.is_resolved
+                            && k.category != "verification_feedback"
+                            && k.category != "observation"
+                    })
+                    .collect();
+
+                let solutions: Vec<_> = all_knowledge
+                    .iter()
+                    .filter(|k| k.category == "solution" && !k.is_resolved)
+                    .collect();
+
+                // Show unresolved findings/root causes
+                if !unresolved.is_empty() {
+                    let mut lines = vec!["### Accumulated Knowledge (Unresolved)".to_string()];
+                    for entry in unresolved.iter().take(10) {
+                        lines.push(format!(
+                            "- **[{}]** (iter {}, {}): {}",
+                            entry.category.to_uppercase(),
+                            entry.iteration,
+                            entry.confidence,
+                            truncate_str(&entry.content, 300),
+                        ));
+                        if let Some(ref evidence) = entry.evidence {
+                            lines.push(format!("  Evidence: {}", truncate_str(evidence, 150)));
+                        }
+                    }
+                    let section = lines.join("\n");
+                    let tokens = estimate_tokens(&section);
+                    if tokens <= budget_remaining {
+                        budget_remaining -= tokens;
+                        sections.push(section);
+                        sections_included += 1;
+                    } else {
+                        sections_skipped += 1;
+                    }
+                }
+
+                // Show unresolved solution attempts (resolved ones are already proven working)
+                if !solutions.is_empty() && budget_remaining > 100 {
+                    let mut lines = vec!["### Previous Solution Attempts (Unresolved)".to_string()];
+                    for entry in solutions.iter().take(5) {
+                        lines.push(format!(
+                            "- [iter {}] {}",
+                            entry.iteration,
+                            truncate_str(&entry.content, 300),
+                        ));
+                    }
+                    let section = lines.join("\n");
+                    let tokens = estimate_tokens(&section);
+                    if tokens <= budget_remaining {
+                        budget_remaining -= tokens;
+                        sections.push(section);
+                        sections_included += 1;
+                    } else {
+                        sections_skipped += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // 4b. Cross-run historical knowledge (from previous runs of the same workflow)
+    // Priority: MEDIUM
+    if budget_remaining > 200 {
+        if let Some(wf_name) = workflow_name {
+            if let Ok(historical) = checkpoint_db.list_workflow_knowledge(
+                wf_name,
+                execution_id,
+                &["recurring_pattern", "context"],
+                10,
+            ) {
+                if !historical.is_empty() {
+                    let mut lines =
+                        vec!["### Historical Knowledge (from previous runs)".to_string()];
+                    lines.push(
+                        "These patterns were identified by reflection across previous runs of this workflow:".to_string(),
+                    );
+                    for entry in &historical {
+                        lines.push(format!(
+                            "- **[{}]** ({}): {}",
+                            entry.category.to_uppercase(),
+                            entry.confidence,
+                            truncate_str(&entry.content, 300),
+                        ));
+                    }
+                    let section = lines.join("\n");
+                    let tokens = estimate_tokens(&section);
+                    if tokens <= budget_remaining {
+                        budget_remaining -= tokens;
+                        sections.push(section);
+                        sections_included += 1;
+                    } else {
+                        sections_skipped += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // 4c. Cross-workflow learning (insights from similar but different workflows)
+    // Priority: MEDIUM -- only on first iteration when cross_workflow_learning is enabled
+    if cross_workflow_learning && current_iteration <= 1 && budget_remaining > 200 {
+        if let Some(wf_name) = workflow_name {
+            if let Ok(insights) =
+                checkpoint_db.get_cross_workflow_knowledge(wf_name, execution_id, 3)
+            {
+                if !insights.is_empty() {
+                    let mut lines = vec!["## Insights from similar workflows".to_string()];
+                    lines.push(String::new());
+                    for (source_wf_name, knowledge_text) in &insights {
+                        lines.push(format!(
+                            "From '{}': {}",
+                            source_wf_name,
+                            truncate_str(knowledge_text, 400),
+                        ));
+                        lines.push(String::new());
+                    }
+                    let section = lines.join("\n");
+                    let tokens = estimate_tokens(&section);
+                    if tokens <= budget_remaining {
+                        budget_remaining -= tokens;
+                        sections.push(section);
+                        sections_included += 1;
+                    } else {
+                        sections_skipped += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // === LOW PRIORITY: Include only if plenty of budget remains ===
+
     // 5. Available data APIs (so AI can drill deeper when needed)
-    {
+    // Priority: LOW -- static reference content
+    if budget_remaining > 500 {
         let mut api_lines = vec!["### Available Data APIs".to_string()];
         api_lines.push(String::new());
         api_lines.push(
@@ -770,11 +1182,22 @@ fn build_unified_iteration_context(
         api_lines.push(
             "Use these APIs when you need more detail than provided in this context.".to_string(),
         );
-        sections.push(api_lines.join("\n"));
+        let section = api_lines.join("\n");
+        let tokens = estimate_tokens(&section);
+        if tokens <= budget_remaining {
+            budget_remaining -= tokens;
+            sections.push(section);
+            sections_included += 1;
+        } else {
+            sections_skipped += 1;
+        }
+    } else {
+        sections_skipped += 1;
     }
 
     // 6. Tool priority guidance
-    {
+    // Priority: LOW -- static reference content
+    if budget_remaining > 200 {
         let mut tool_lines = vec!["### Verification Tool Priority".to_string()];
         tool_lines.push(String::new());
         tool_lines.push(
@@ -795,8 +1218,25 @@ fn build_unified_iteration_context(
             "Check `GET /ui-bridge/sdk/status` to see if an SDK app is already connected."
                 .to_string(),
         );
-        sections.push(tool_lines.join("\n"));
+        let section = tool_lines.join("\n");
+        let tokens = estimate_tokens(&section);
+        if tokens <= budget_remaining {
+            budget_remaining = budget_remaining.saturating_sub(tokens);
+            sections.push(section);
+            sections_included += 1;
+        } else {
+            sections_skipped += 1;
+        }
+    } else {
+        sections_skipped += 1;
     }
+
+    // Log budget summary
+    let tokens_used = max_context_tokens.saturating_sub(budget_remaining);
+    info!(
+        "CONTEXT-BUDGET: {}/{} tokens used ({} sections included, {} truncated, {} skipped)",
+        tokens_used, max_context_tokens, sections_included, sections_truncated, sections_skipped
+    );
 
     if sections.is_empty() {
         return None;
@@ -806,6 +1246,34 @@ fn build_unified_iteration_context(
         "---\n\n## Previous Iteration Context\n\n{}\n\n---\n\nUse this context to avoid repeating mistakes and build on previous progress.",
         sections.join("\n\n")
     ))
+}
+
+/// Extract the git diff --stat summary line from an observation that follows the format:
+/// "Git changes after iteration N:\n<stat lines>\n\n<full diff>"
+///
+/// Returns the last stat line (the summary like "3 files changed, +12, -5").
+fn extract_diff_stat_from_observation(content: &str) -> Option<String> {
+    if !content.starts_with("Git changes after iteration") {
+        return None;
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() < 2 {
+        return None;
+    }
+    // Collect stat lines until the first empty line or diff header
+    let mut stat_lines = Vec::new();
+    for line in &lines[1..] {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        stat_lines.push(trimmed);
+    }
+    if stat_lines.is_empty() {
+        return None;
+    }
+    // The last stat line is the summary (e.g., "3 files changed, 12 insertions(+), 5 deletions(-)")
+    Some(stat_lines.last().unwrap().to_string())
 }
 
 /// Truncate a string to max_len characters, appending "..." if truncated.
@@ -905,6 +1373,8 @@ impl SetupExecutor {
         workflow_name: &str,
         logger: &StepEventLogger,
         stage_index: Option<u32>,
+        model_override: Option<String>,
+        provider_override: Option<String>,
     ) -> (bool, Vec<StepExecutionResult>) {
         let mut all_results = Vec::new();
         let mut overall_success = true;
@@ -1064,16 +1534,38 @@ impl SetupExecutor {
 
                     let doctor_handle = self.app_state.doctor_handle.lock().await.clone();
                     let start = std::time::Instant::now();
+                    // Step-level overrides take precedence over phase-level
+                    let step_model = step.model.clone().or_else(|| model_override.clone());
+                    let step_provider = step.provider.clone().or_else(|| provider_override.clone());
                     match execute_prompt_response_mode(
                         step,
                         &self.checkpoint_db,
                         Some(execution_id),
                         doctor_handle,
+                        step_model.clone(),
+                        step_provider.clone(),
+                        None,
+                        None,
+                        None,
+                        None,
                     )
                     .await
                     {
-                        Ok(output) => {
+                        Ok(resp) => {
                             let duration_ms = start.elapsed().as_millis() as u64;
+                            record_phase_token_usage(
+                                &self.checkpoint_db,
+                                execution_id,
+                                "setup",
+                                stage_index,
+                                Some(0),
+                                step_model.as_deref(),
+                                step_provider.as_deref(),
+                                resp.input_tokens,
+                                resp.output_tokens,
+                                Some(duration_ms),
+                            );
+                            let output = resp.output;
                             info!(
                                 "SETUP-PHASE: Response-mode step '{}' completed successfully ({} bytes)",
                                 step_name,
@@ -1143,6 +1635,7 @@ impl SetupExecutor {
                                 required: None,
                                 resolved_inputs: None,
                                 extracted_values: None,
+                                failure_category: None,
                             });
                         }
                         Err(e) => {
@@ -1201,6 +1694,7 @@ impl SetupExecutor {
                                 required: None,
                                 resolved_inputs: None,
                                 extracted_values: None,
+                                failure_category: None,
                             });
                             return (false, all_results);
                         }
@@ -1261,7 +1755,8 @@ impl SetupExecutor {
                     // Use the unified AI session executor with sub-step metadata
                     let config = AiSessionConfig::setup(execution_id, workflow_name, &step_name)
                         .with_checkpoint_id(&ai_checkpoint.id)
-                        .with_sub_step_metadata(sub_step_metadata);
+                        .with_sub_step_metadata(sub_step_metadata)
+                        .with_model_override(model_override.clone());
 
                     let (result, duration_ms) = timeout_helper::timed_result_async(
                         self.ai_executor.execute(&config, &setup_prompt, logger),
@@ -1362,6 +1857,8 @@ impl SetupExecutor {
                 &config.workflow_name,
                 logger,
                 None,
+                config.model_override.clone(),
+                config.provider_override.clone(),
             )
             .await;
 
@@ -1836,16 +2333,44 @@ impl AgenticExecutor {
 
                 let doctor_handle = self.app_state.doctor_handle.lock().await.clone();
                 let start = std::time::Instant::now();
+                // Step-level overrides take precedence over phase-level
+                let step_model = modified_step
+                    .model
+                    .clone()
+                    .or_else(|| config.resolve_model_for_phase("agentic"));
+                let step_provider = modified_step
+                    .provider
+                    .clone()
+                    .or_else(|| config.resolve_provider_for_phase("agentic"));
                 match execute_prompt_response_mode(
                     &modified_step,
                     &self.checkpoint_db,
                     Some(&config.execution_id),
                     doctor_handle,
+                    step_model.clone(),
+                    step_provider.clone(),
+                    config.resolve_temperature_for_phase("agentic"),
+                    config.resolve_max_tokens_for_phase("agentic"),
+                    config.resolve_fallback_model_for_phase("agentic"),
+                    config.resolve_fallback_provider_for_phase("agentic"),
                 )
                 .await
                 {
-                    Ok(output) => {
+                    Ok(resp) => {
                         let duration_ms = start.elapsed().as_millis() as u64;
+                        record_phase_token_usage(
+                            &self.checkpoint_db,
+                            &config.execution_id,
+                            "agentic",
+                            config.stage_index,
+                            Some(iteration),
+                            step_model.as_deref(),
+                            step_provider.as_deref(),
+                            resp.input_tokens,
+                            resp.output_tokens,
+                            Some(duration_ms),
+                        );
+                        let output = resp.output;
                         info!(
                             "AGENTIC-PHASE: Response-mode step '{}' completed ({} bytes, {}ms)",
                             step_name,
@@ -1900,7 +2425,17 @@ impl AgenticExecutor {
                                 e
                             );
                         }
-                        return (AgenticOutcome::Success { output }, Vec::new());
+                        // Response-mode steps produce raw text output without structured
+                        // agentic markers, so there is no AgenticPhaseOutput to parse.
+                        // The loop controller handles `parsed: None` gracefully by falling
+                        // back to raw marker checks for unfixable errors, etc.
+                        return (
+                            AgenticOutcome::Success {
+                                output,
+                                parsed: None,
+                            },
+                            Vec::new(),
+                        );
                     }
                     Err(e) => {
                         let duration_ms = start.elapsed().as_millis() as u64;
@@ -2120,8 +2655,10 @@ impl AgenticExecutor {
             }
         };
 
-        // Pre-build error monitor summary for iteration context
-        let error_monitor_summary = {
+        // Pre-build error monitor summary for iteration context.
+        // Only inject when the workflow is specifically targeting errors (error-fix workflows),
+        // otherwise it distracts the AI from its actual task.
+        let error_monitor_summary = if !config.targeted_error_ids.is_empty() {
             match self.app_state.checkpoint_db.get_conn() {
                 Ok(conn) => {
                     match crate::error_monitor::ErrorEventStorage::get_unresolved(&conn, None, 20) {
@@ -2154,6 +2691,8 @@ impl AgenticExecutor {
                 }
                 Err(_) => None,
             }
+        } else {
+            None
         };
 
         // For iteration 2+, add context from previous iterations (findings + verification results)
@@ -2162,13 +2701,15 @@ impl AgenticExecutor {
         let needs_iteration_context =
             iteration > 1 || config.stage_index.is_some_and(|idx| idx > 0);
         let enhanced_prompt = if needs_iteration_context {
-            match build_unified_iteration_context(
+            match build_compressed_iteration_history(
                 &self.checkpoint_db,
                 &config.execution_id,
                 iteration,
                 process_status_summary.as_deref(),
                 error_monitor_summary.as_deref(),
                 Some(&config.workflow_name),
+                config.max_context_tokens,
+                config.cross_workflow_learning,
             ) {
                 Some(ctx) => {
                     let label = if iteration == 1 {
@@ -2188,20 +2729,26 @@ impl AgenticExecutor {
             enhanced_prompt
         };
 
-        // Append safety instructions to prevent AI from modifying runner internals
+        // Append safety and focus instructions
         let enhanced_prompt = format!(
             "{}\n\n## Important Constraints\n\n\
+            - **STAY FOCUSED**: ONLY work on fixing the failed verification checks listed above. Do NOT investigate, diagnose, or fix unrelated errors, warnings, or issues you find in log files or elsewhere.\n\
             - Do NOT modify the runner's SQLite database directly. Configuration changes must go through the runner UI or API.\n\
             - Do NOT modify workflow JSON files in the parent directory. Fix the application code instead.\n\
-            - Focus on fixing the source code that the verification tests are checking.",
+            - Focus exclusively on the source code that the verification checks are testing. When all checks pass, your work is done.",
             enhanced_prompt
         );
 
         // Use the unified AI session executor with timing
+        // Step-level model override takes precedence over phase-level
+        let agentic_model = agentic_steps
+            .first()
+            .and_then(|s| s.model.clone())
+            .or_else(|| config.resolve_model_for_phase("agentic"));
         let mut ai_config =
             AiSessionConfig::agentic(&config.execution_id, &config.workflow_name, iteration)
                 .with_checkpoint_id(&checkpoint.id)
-                .with_model_override(config.model_override.clone());
+                .with_model_override(agentic_model);
 
         // Attach reflection fix context if this is a reflection workflow
         if let Some(ref ctx) = self.reflection_fix_ctx {
@@ -2234,10 +2781,19 @@ impl AgenticExecutor {
         .with_stage_index(config.stage_index);
 
         let injected_steps = result.injected_steps;
+
+        // Parse structured output from the AI response
+        let parsed_output = if !result.output.is_empty() {
+            Some(super::output_parser::parse_agentic_output(&result.output))
+        } else {
+            None
+        };
+
         let outcome = if result.success {
             completion_checkpoint.mark_success(Some(result.output.clone()), duration_ms);
             AgenticOutcome::Success {
                 output: result.output,
+                parsed: parsed_output,
             }
         } else if result.output.is_empty() {
             let error_msg = if result.error.is_empty() {
@@ -2257,6 +2813,7 @@ impl AgenticExecutor {
             AgenticOutcome::Failed {
                 output: result.output,
                 error: error_msg,
+                parsed: parsed_output,
             }
         };
 
@@ -2464,6 +3021,8 @@ impl CompletionExecutor {
         iterations_run: u32,
         logger: &StepEventLogger,
         stage_index: Option<u32>,
+        model_override: Option<String>,
+        provider_override: Option<String>,
     ) -> (bool, Vec<StepExecutionResult>) {
         let mut all_results = Vec::new();
         let mut overall_success = true;
@@ -2659,16 +3218,38 @@ impl CompletionExecutor {
 
                     let doctor_handle = self.app_state.doctor_handle.lock().await.clone();
                     let start = std::time::Instant::now();
+                    // Step-level overrides take precedence over phase-level
+                    let step_model = step.model.clone().or_else(|| model_override.clone());
+                    let step_provider = step.provider.clone().or_else(|| provider_override.clone());
                     match execute_prompt_response_mode(
                         step,
                         &self.checkpoint_db,
                         Some(execution_id),
                         doctor_handle,
+                        step_model.clone(),
+                        step_provider.clone(),
+                        None,
+                        None,
+                        None,
+                        None,
                     )
                     .await
                     {
-                        Ok(output) => {
+                        Ok(resp) => {
                             let duration_ms = start.elapsed().as_millis() as u64;
+                            record_phase_token_usage(
+                                &self.checkpoint_db,
+                                execution_id,
+                                "completion",
+                                stage_index,
+                                None,
+                                step_model.as_deref(),
+                                step_provider.as_deref(),
+                                resp.input_tokens,
+                                resp.output_tokens,
+                                Some(duration_ms),
+                            );
+                            let output = resp.output;
                             info!(
                                 "COMPLETION-PHASE: Response-mode step '{}' completed successfully ({} bytes)",
                                 step_name,
@@ -2738,6 +3319,7 @@ impl CompletionExecutor {
                                 required: None,
                                 resolved_inputs: None,
                                 extracted_values: None,
+                                failure_category: None,
                             });
                         }
                         Err(e) => {
@@ -2797,6 +3379,7 @@ impl CompletionExecutor {
                                 required: None,
                                 resolved_inputs: None,
                                 extracted_values: None,
+                                failure_category: None,
                             });
                             // Completion failures are non-fatal - don't return early
                             overall_success = false;
@@ -2876,7 +3459,8 @@ impl CompletionExecutor {
                         iterations_run,
                     )
                     .with_checkpoint_id(&ai_checkpoint.id)
-                    .with_sub_step_metadata(sub_step_metadata);
+                    .with_sub_step_metadata(sub_step_metadata)
+                    .with_model_override(model_override.clone());
 
                     let (result, duration_ms) = timeout_helper::timed_result_async(
                         self.ai_executor
@@ -2978,6 +3562,8 @@ impl CompletionExecutor {
                 config.iterations_run,
                 logger,
                 None,
+                config.model_override.clone(),
+                config.provider_override.clone(),
             )
             .await;
 
@@ -3308,6 +3894,8 @@ impl Executor for SetupExecutor {
                 &config.workflow_name,
                 &StepEventLogger::noop(),
                 None,
+                config.model_override.clone(),
+                config.provider_override.clone(),
             )
             .await;
 
@@ -3375,9 +3963,15 @@ impl Executor for AgenticExecutor {
             reflection_mode: false,
             provider_override: None,
             model_override: None,
+            model_overrides: std::collections::HashMap::new(),
             stage_index: None,
             max_sessions: None,
             auto_run_generated: false,
+            approval_gate: false,
+            max_context_tokens: 100_000,
+            cross_workflow_learning: true,
+            verification_history: std::collections::HashMap::new(),
+            routing_context: Default::default(),
         };
 
         let (outcome, _injected_steps) = self
@@ -3414,6 +4008,8 @@ impl Executor for CompletionExecutor {
                 config.iterations_run,
                 &StepEventLogger::noop(),
                 None,
+                config.model_override.clone(),
+                config.provider_override.clone(),
             )
             .await;
 

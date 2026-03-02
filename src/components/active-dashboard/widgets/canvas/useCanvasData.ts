@@ -9,8 +9,8 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { listen } from "@tauri-apps/api/event";
 import type { CanvasData, CanvasPanel, CanvasUpdateEvent } from "./types";
+import { getApiBase } from "@/lib/runner-api";
 
-const API_BASE = "http://localhost:9876";
 const POLL_INTERVAL_MS = 5000;
 
 /**
@@ -19,12 +19,12 @@ const POLL_INTERVAL_MS = 5000;
 export function useCanvasData(): CanvasData {
   const [panelMap, setPanelMap] = useState<Map<string, CanvasPanel>>(new Map());
   const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [error] = useState<string | null>(null);
 
   // Fetch all panels from API (for reconnection/initial load)
   const fetchPanels = useCallback(async () => {
     try {
-      const response = await fetch(`${API_BASE}/canvas/panels`);
+      const response = await fetch(`${getApiBase()}/canvas/panels`);
       if (response.ok) {
         const result = await response.json();
         if (result.success && result.data) {

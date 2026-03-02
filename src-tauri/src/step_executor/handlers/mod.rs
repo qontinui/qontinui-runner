@@ -81,6 +81,7 @@ pub mod restart_process;
 mod save_workflow_artifact;
 pub(crate) mod ui_bridge;
 mod workflow;
+mod workflow_ref;
 
 // Re-export handlers for registration
 use command::CommandHandler;
@@ -88,6 +89,7 @@ use restart_process::RestartProcessHandler;
 use save_workflow_artifact::SaveWorkflowArtifactHandler;
 use ui_bridge::UiBridgeHandler;
 use workflow::WorkflowStepHandler;
+use workflow_ref::WorkflowRefHandler;
 
 /// Result of executing a step handler.
 ///
@@ -372,7 +374,7 @@ impl HandlerRegistry {
     /// Create a registry pre-populated with all standard handlers.
     ///
     /// This is the recommended way to create a registry for production use.
-    /// 6 active handlers: command (incl. test dispatch), ui_bridge, prompt, restart_process, save_workflow_artifact, workflow
+    /// 7 active handlers: command (incl. test dispatch), ui_bridge, prompt, restart_process, save_workflow_artifact, workflow, workflow_ref
     pub fn with_standard_handlers() -> Self {
         let mut registry = Self::new();
 
@@ -382,6 +384,7 @@ impl HandlerRegistry {
         registry.register(SaveWorkflowArtifactHandler);
         registry.register(UiBridgeHandler);
         registry.register(WorkflowStepHandler);
+        registry.register(WorkflowRefHandler);
 
         registry
     }

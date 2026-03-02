@@ -26,6 +26,7 @@ mod config_storage;
 mod context;
 mod database;
 mod debug_lifecycle;
+mod demo_workflows;
 mod discoveries;
 mod display;
 mod doctor;
@@ -39,6 +40,7 @@ mod executor;
 mod findings;
 mod follow_up;
 mod health_monitor;
+mod instance_manager;
 mod iteration_bundle;
 #[cfg(windows)]
 mod job_object;
@@ -79,6 +81,7 @@ mod steps;
 mod storage;
 mod summary_generator;
 mod task_recorder;
+mod terminal;
 mod test_executor;
 mod test_orchestrator;
 mod tiered_info;
@@ -90,6 +93,7 @@ mod unified_workflow_executor;
 mod unified_workflows;
 mod video_recorder;
 mod workflow_generation;
+mod workflow_queue;
 mod workflow_state;
 mod zombie_sweep;
 
@@ -100,7 +104,7 @@ use display::DisplayProcessor;
 use doctor::{start_doctor_async, DoctorConfig};
 use error_monitor::{start_error_monitor_async, ErrorMonitorConfig};
 use logging::{init_logging, setup_panic_handler, LoggingConfig};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU16};
 use std::sync::{Arc, Mutex};
 use storage::LocalStorage;
 use tauri::Manager;
@@ -265,8 +269,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Create MCP client manager for calling external MCP servers
     let mcp_client_manager = mcp_client::McpClientManager::new(checkpoint_db.clone());
 
+    // Create instance manager for multi-instance dev workflows
+    let instance_manager = Arc::new(instance_manager::InstanceManager::new());
+
     // Create session manager for interactive Claude CLI sessions
     let session_manager = Arc::new(claude_session::SessionManager::new());
+
+    // Create terminal manager for embedded PTY terminals
+    let terminal_manager = Arc::new(terminal::TerminalManager::new());
 
     // Create shared AppState for both Tauri and MCP API
     let shared_app_state = Arc::new(AppState {
@@ -287,6 +297,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             crate::step_executor::handlers::ui_bridge::UiBridgeFailureTracker::new(),
         process_capture_manager: TokioMutex::new(None), // Initialized in setup()
         api_ready: AtomicBool::new(false),              // Set when MCP API server binds
+        api_port: AtomicU16::new(crate::mcp::types::get_mcp_api_port()), // Updated when server binds
         ai_pid_tracker: Arc::new(std::sync::Mutex::new(Vec::new())),
         canvas_state: Arc::new(tokio::sync::RwLock::new(
             crate::mcp::canvas::CanvasState::new(),
@@ -305,7 +316,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(shared_app_state)
         .manage(rag_state)
+        .manage(instance_manager) // For multi-instance management (dev feature)
         .manage(session_manager) // For interactive AI chat commands
+        .manage(terminal_manager) // For embedded PTY terminal sessions
         .manage(checkpoint_db.clone()) // For error_monitor commands that need direct db access
         .invoke_handler(tauri::generate_handler![
             // Interactive AI chat commands (send messages, interrupt, query state)
@@ -329,6 +342,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::auth::get_access_token_for_websocket,
             commands::auth::send_device_heartbeat,
             commands::auth::is_api_ready,
+            commands::auth::get_api_port,
             // Configuration commands
             commands::config::load_configuration,
             commands::config::get_current_configuration,
@@ -912,6 +926,24 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             process_capture::commands::delete_process_config,
             process_capture::commands::get_process_sessions_from_db,
             process_capture::commands::get_process_session_output_from_db,
+            // Embedded terminal commands (PTY-backed shell sessions)
+            commands::terminal::terminal_create,
+            commands::terminal::terminal_write,
+            commands::terminal::terminal_resize,
+            commands::terminal::terminal_close,
+            commands::terminal::terminal_list,
+            commands::terminal::terminal_ack,
+            // Runner instance management commands (dev feature)
+            commands::instances::get_runner_instances,
+            commands::instances::save_runner_instance,
+            commands::instances::delete_runner_instance,
+            commands::instances::launch_runner_instance,
+            commands::instances::stop_runner_instance,
+            // Claude Code transcript import commands
+            commands::transcript::transcript_list_sessions,
+            commands::transcript::transcript_read_session,
+            commands::transcript::transcript_get_latest,
+            commands::transcript::generate_workflow_standalone,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");
@@ -923,6 +955,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
             // Seed default log sources if none configured
             settings::seed_default_log_sources_if_empty();
+
+            // Seed demo workflows on first launch (if no demo workflows exist)
+            {
+                let seed_db = app
+                    .state::<Arc<crate::database::CheckpointDb>>()
+                    .inner()
+                    .clone();
+                demo_workflows::seed_demo_workflows_if_needed(&seed_db);
+            }
 
             // Window starts maximized via tauri.conf.json
 
@@ -982,11 +1023,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             drop(extraction_lock);
 
             // Start MCP API server in background using the shared AppState
-            info!("Starting MCP API server on port {}", crate::mcp::types::MCP_API_PORT);
+            let api_port = crate::mcp::types::get_mcp_api_port();
+            info!("Starting MCP API server on port {}", api_port);
             let mcp_app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 info!("MCP API server task starting...");
-                match mcp_api::start_server(mcp_app_state, mcp_rag_state, mcp_app_handle, crate::mcp::types::MCP_API_PORT).await {
+                match mcp_api::start_server(mcp_app_state, mcp_rag_state, mcp_app_handle, api_port).await {
                     Ok(_) => info!("MCP API server stopped normally"),
                     Err(e) => error!("MCP API server error: {}", e),
                 }
@@ -1126,6 +1168,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     sm.close_all_sessions();
                 }
 
+                // Close all embedded terminal sessions
+                if let Some(tm) =
+                    window.try_state::<Arc<terminal::TerminalManager>>()
+                {
+                    tm.close_all();
+                }
+
                 // Kill any orphaned AI (Claude CLI) processes tracked by the PID tracker.
                 // This catches processes that survived session close (e.g., cmd.exe /c claude).
                 {
@@ -1202,6 +1251,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             info!("Doctor service stopped");
                         }
                     }
+                });
+
+                // Stop trigger service
+                tauri::async_runtime::spawn(async move {
+                    crate::trigger_system::stop_trigger_service().await;
                 });
             }
         })

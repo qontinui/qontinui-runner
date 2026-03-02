@@ -8,8 +8,13 @@
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-/// Extension endpoint for diagnostic checks
-const EXTENSION_ENDPOINT: &str = "http://localhost:9876/extension/command";
+/// Extension endpoint for diagnostic checks (uses default port; runtime code should use dynamic port)
+fn extension_endpoint() -> String {
+    format!(
+        "{}/extension/command",
+        crate::mcp::types::get_self_base_url_from_env()
+    )
+}
 
 /// Diagnostic information collected when a test times out
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,7 +143,7 @@ fn check_extension_reachability() -> Result<bool, String> {
         "timeout_secs": 3
     });
 
-    match client.post(EXTENSION_ENDPOINT).json(&request_body).send() {
+    match client.post(extension_endpoint()).json(&request_body).send() {
         Ok(response) => {
             let status = response.status();
             if status.is_success() {

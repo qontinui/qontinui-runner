@@ -783,6 +783,21 @@ pub struct Settings {
     /// Cloud relay settings for remote mobile access via backend WebSocket
     #[serde(default)]
     pub cloud_relay: CloudRelaySettings,
+    /// Configured runner instances for multi-instance dev workflows
+    #[serde(default)]
+    pub runner_instances: Vec<RunnerInstanceConfig>,
+}
+
+// ============================================================================
+// Runner Instance Configuration (Dev Feature)
+// ============================================================================
+
+/// Configuration for a secondary runner instance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunnerInstanceConfig {
+    pub id: String,
+    pub name: String,
+    pub port: u16,
 }
 
 fn default_auto_load_last_config() -> bool {
@@ -1447,4 +1462,36 @@ pub fn get_resolved_custom_variables() -> HashMap<String, String> {
     }
 
     resolved
+}
+
+// ============================================================================
+// Runner Instance CRUD Helpers
+// ============================================================================
+
+/// Get all configured runner instances.
+pub fn get_runner_instances() -> Vec<RunnerInstanceConfig> {
+    load_settings().runner_instances
+}
+
+/// Save or update a runner instance configuration.
+pub fn save_runner_instance(config: RunnerInstanceConfig) -> Result<(), String> {
+    let mut settings = load_settings();
+    if let Some(existing) = settings
+        .runner_instances
+        .iter_mut()
+        .find(|i| i.id == config.id)
+    {
+        existing.name = config.name;
+        existing.port = config.port;
+    } else {
+        settings.runner_instances.push(config);
+    }
+    save_settings(&settings)
+}
+
+/// Delete a runner instance configuration by ID.
+pub fn delete_runner_instance(id: &str) -> Result<(), String> {
+    let mut settings = load_settings();
+    settings.runner_instances.retain(|i| i.id != id);
+    save_settings(&settings)
 }

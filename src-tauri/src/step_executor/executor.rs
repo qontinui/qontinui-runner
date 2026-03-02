@@ -429,6 +429,14 @@ pub struct ExecutionStepConfig {
     #[serde(alias = "inputPath", alias = "input_path")]
     pub input_path: Option<String>,
 
+    /// Per-step model override (takes precedence over phase-level override).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
+    /// Per-step provider override (takes precedence over phase-level override).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+
     // ========================================================================
     // Check Group Step Fields
     // ========================================================================
@@ -511,6 +519,26 @@ pub struct ExecutionStepConfig {
     /// so the handler reads the name from the loaded workflow instead.
     #[serde(alias = "refWorkflowName")]
     pub ref_workflow_name: Option<String>,
+
+    /// Input variables for workflow_ref steps.
+    /// Keys are variable names; values are substituted into the child workflow's
+    /// prompt using `{{key}}` template syntax.
+    #[serde(
+        alias = "refWorkflowInputs",
+        alias = "ref_workflow_inputs",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ref_workflow_inputs: Option<HashMap<String, String>>,
+
+    /// Whether to inherit model overrides from the parent workflow context.
+    /// Only used by workflow_ref steps. Default: true.
+    #[serde(
+        alias = "refInheritModelOverrides",
+        alias = "ref_inherit_model_overrides",
+        default
+    )]
+    pub ref_inherit_model_overrides: Option<bool>,
 
     // ========================================================================
     // Restart Process Step Fields
@@ -683,6 +711,10 @@ pub struct StepExecutionResult {
     /// Extracted values from step output (for debugging data flow)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extracted_values: Option<HashMap<String, serde_json::Value>>,
+    /// Auto-detected failure category based on output patterns.
+    /// Categories: "infrastructure", "setup_issue", "test_failure", "unknown"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_category: Option<String>,
 }
 
 /// Verification-specific details for test and check steps
@@ -934,10 +966,68 @@ fn extract_text_from_output_data(output_data: &Option<serde_json::Value>) -> Opt
     }
 }
 
+/// Categorize a verification step failure based on output patterns.
+///
+/// Returns a category string that helps the AI understand the nature of the failure:
+/// - "infrastructure" — connectivity, timeout, or service availability issues
+/// - "setup_issue" — missing files, modules, or configuration
+/// - "test_failure" — assertion failures or test expectation mismatches
+/// - "unknown" — no recognized pattern
+pub fn categorize_failure(output: &str) -> &'static str {
+    let lower = output.to_lowercase();
+
+    // Infrastructure issues: connectivity, timeouts, service unavailability
+    if lower.contains("connection refused")
+        || lower.contains("econnrefused")
+        || lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("econnreset")
+        || lower.contains("enotfound")
+        || lower.contains("ehostunreach")
+        || lower.contains("network error")
+        || lower.contains("socket hang up")
+    {
+        return "infrastructure";
+    }
+
+    // Setup issues: missing files, modules, configuration
+    if lower.contains("no such file")
+        || lower.contains("not found")
+        || lower.contains("missing module")
+        || lower.contains("module not found")
+        || lower.contains("cannot find module")
+        || lower.contains("modulenotfounderror")
+        || lower.contains("importerror")
+        || lower.contains("command not found")
+        || lower.contains("is not recognized")
+        || lower.contains("no such command")
+    {
+        return "setup_issue";
+    }
+
+    // Test failures: assertions, expectations, test framework errors
+    if lower.contains("assertionerror")
+        || lower.contains("assert_eq")
+        || lower.contains("assert_ne")
+        || lower.contains("expected")
+        || lower.contains("assertion failed")
+        || lower.contains("test failed")
+        || lower.contains("expect(")
+        || lower.contains("tobetruthy")
+        || lower.contains("toequal")
+        || lower.contains("tomatch")
+    {
+        return "test_failure";
+    }
+
+    "unknown"
+}
+
 impl VerificationPhaseResult {
     /// Build a failure context string for the agentic phase
     ///
     /// This summarizes what failed so the AI knows what to work on.
+    /// Includes detailed per-step output, command info, and failure categorization.
     pub fn build_failure_context(&self) -> String {
         if self.all_passed {
             return String::new();
@@ -950,14 +1040,30 @@ impl VerificationPhaseResult {
             self.passed_steps, self.total_steps
         ));
 
-        // List failed steps with details
+        // List failed steps with details including command and failure category
         context.push_str("### Failed Steps\n\n");
         for result in &self.step_results {
             if !result.success {
+                // Include failure category prefix if available
+                let category_prefix = if let Some(ref cat) = result.failure_category {
+                    if cat != "unknown" {
+                        format!("[{}] ", cat)
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+
                 context.push_str(&format!(
-                    "#### {} ({})\n",
-                    result.step_name, result.step_type
+                    "#### {}{} ({})\n",
+                    category_prefix, result.step_name, result.step_type
                 ));
+
+                // Include the command that was run (if available)
+                if let Some(ref cmd) = result.config.command {
+                    context.push_str(&format!("**Command:** `{}`\n", cmd));
+                }
 
                 if let Some(error) = &result.error {
                     context.push_str(&format!("**Error:** {}\n", error));
@@ -1956,6 +2062,7 @@ impl StepExecutor {
                 required: step.required,
                 resolved_inputs: None,
                 extracted_values: None,
+                failure_category: None,
             });
         }
 
@@ -2711,7 +2818,8 @@ impl StepExecutor {
         script_id: &str,
     ) -> (bool, Option<String>, Option<String>) {
         let client = reqwest::Client::new();
-        let url = format!("http://localhost:9876/playwright/tests/{}/run", script_id);
+        let base_url = crate::mcp::types::get_self_base_url_from_env();
+        let url = format!("{}/playwright/tests/{}/run", base_url, script_id);
 
         match client
             .post(&url)
@@ -3010,6 +3118,7 @@ impl StepExecutor {
                     required: step.required,
                     resolved_inputs: None,
                     extracted_values: None,
+                    failure_category: None,
                 };
                 step_results.push(result);
                 skipped_steps += 1;
@@ -3400,6 +3509,23 @@ impl StepExecutor {
 
             let step_ended_at = chrono::Utc::now().to_rfc3339();
 
+            // Auto-detect failure category from step output
+            let failure_category = if !success {
+                let output_text = verification_details
+                    .as_ref()
+                    .and_then(|d| d.stdout.as_deref())
+                    .unwrap_or("")
+                    .to_string()
+                    + verification_details
+                        .as_ref()
+                        .and_then(|d| d.stderr.as_deref())
+                        .unwrap_or("")
+                    + error.as_deref().unwrap_or("");
+                Some(categorize_failure(&output_text).to_string())
+            } else {
+                None
+            };
+
             let result = StepExecutionResult {
                 step_index: index,
                 step_name,
@@ -3431,6 +3557,7 @@ impl StepExecutor {
                 required: step.required,
                 resolved_inputs: None,
                 extracted_values: None,
+                failure_category,
             };
 
             // Emit completion event for this step (real-time UI update)
@@ -3899,8 +4026,22 @@ impl StepExecutor {
                 c.args(["-NoProfile", "-NonInteractive", "-Command", &command]);
                 c
             } else if is_bash {
-                // Use bash for Unix-style commands (available via Git for Windows)
-                let mut c = crate::process_helpers::tokio_no_window("bash");
+                // Use Git Bash for Unix-style commands on Windows.
+                // Resolve the full path to avoid accidentally picking up WSL's
+                // bash.exe which can fail when no WSL distro is installed.
+                let bash_path =
+                    super::handlers::shell_command::ShellCommandHandler::find_git_bash()
+                        .unwrap_or_else(|| "bash".to_string());
+                let mut c = crate::process_helpers::tokio_no_window(&bash_path);
+                // Ensure MSYS2 /usr/bin is on PATH so tools like cat, grep, sed
+                // are available even when bash is invoked non-interactively.
+                if let Some(usr_bin) = std::path::Path::new(&bash_path).parent() {
+                    let usr_bin_str = usr_bin.to_string_lossy();
+                    let current_path = std::env::var("PATH").unwrap_or_default();
+                    if !current_path.contains(&*usr_bin_str) {
+                        c.env("PATH", format!("{};{}", usr_bin_str, current_path));
+                    }
+                }
                 c.args(["-c", &command]);
                 c
             } else {
@@ -4501,8 +4642,19 @@ impl StepExecutor {
                 c.args(["-NoProfile", "-NonInteractive", "-Command", &final_command]);
                 c
             } else if is_bash {
-                // Use bash for Unix-style commands (available via Git for Windows)
-                let mut c = crate::process_helpers::tokio_no_window("bash");
+                // Use Git Bash for Unix-style commands on Windows.
+                let bash_path =
+                    super::handlers::shell_command::ShellCommandHandler::find_git_bash()
+                        .unwrap_or_else(|| "bash".to_string());
+                let mut c = crate::process_helpers::tokio_no_window(&bash_path);
+                // Ensure MSYS2 /usr/bin is on PATH for cat, grep, etc.
+                if let Some(usr_bin) = std::path::Path::new(&bash_path).parent() {
+                    let usr_bin_str = usr_bin.to_string_lossy();
+                    let current_path = std::env::var("PATH").unwrap_or_default();
+                    if !current_path.contains(&*usr_bin_str) {
+                        c.env("PATH", format!("{};{}", usr_bin_str, current_path));
+                    }
+                }
                 c.args(["-c", &final_command]);
                 c
             } else {
@@ -5456,6 +5608,7 @@ mod tests {
                     required: None,
                     resolved_inputs: None,
                     extracted_values: None,
+                    failure_category: None,
                 },
                 StepExecutionResult {
                     step_index: 1,
@@ -5474,6 +5627,7 @@ mod tests {
                     required: None,
                     resolved_inputs: None,
                     extracted_values: None,
+                    failure_category: None,
                 },
             ],
             captured_logs: None,

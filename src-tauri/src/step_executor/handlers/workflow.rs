@@ -158,9 +158,15 @@ impl StepHandler for WorkflowStepHandler {
             reflection_mode: false,
             provider_override: workflow.provider.clone(),
             model_override: workflow.model.clone(),
+            model_overrides: workflow.model_overrides.clone(),
             stage_index: None,
             max_sessions: Some(workflow.max_iterations),
             auto_run_generated: false,
+            approval_gate: false,
+            max_context_tokens: 100_000,
+            cross_workflow_learning: true,
+            verification_history: std::collections::HashMap::new(),
+            routing_context: Default::default(),
         };
 
         // 8. Create LoopController and get session manager

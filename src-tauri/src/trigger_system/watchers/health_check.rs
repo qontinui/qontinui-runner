@@ -25,11 +25,15 @@ pub fn start_health_check(
     // Enforce minimum interval
     let interval = check_interval_seconds.max(10);
 
+    // Re-trigger interval: after initial fire, allow re-firing every
+    // (consecutive_failures_threshold * interval) seconds of continued failure.
+    let re_trigger_secs = (consecutive_failures_threshold as u64) * interval;
+
     tokio::spawn(async move {
         // Track consecutive failures per URL
         let mut failure_counts: HashMap<String, u32> = HashMap::new();
-        // Track whether we've already fired for a URL (avoid re-firing on continued failure)
-        let mut fired: HashMap<String, bool> = HashMap::new();
+        // Track when we last fired for each URL (for re-trigger interval)
+        let mut last_fired: HashMap<String, std::time::Instant> = HashMap::new();
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -52,7 +56,6 @@ pub fn start_health_check(
                 };
 
                 let count = failure_counts.entry(target.url.clone()).or_insert(0);
-                let already_fired = fired.entry(target.url.clone()).or_insert(false);
 
                 if healthy {
                     if *count > 0 {
@@ -62,7 +65,7 @@ pub fn start_health_check(
                         );
                     }
                     *count = 0;
-                    *already_fired = false;
+                    last_fired.remove(&target.url);
                 } else {
                     *count += 1;
                     debug!(
@@ -70,37 +73,54 @@ pub fn start_health_check(
                         target.url, count, consecutive_failures_threshold
                     );
 
-                    if *count >= consecutive_failures_threshold && !*already_fired {
-                        info!(
-                            "Health check trigger '{}': {} failed {} consecutive times",
-                            trigger_id, target.url, count
-                        );
-
-                        let mut variables = HashMap::new();
-                        variables.insert("failed_url".to_string(), target.url.clone());
-                        variables.insert("failure_count".to_string(), count.to_string());
-                        variables.insert(
-                            "expected_status".to_string(),
-                            target.expected_status.to_string(),
-                        );
-
-                        let event = TriggerEvent {
-                            trigger_id: trigger_id.clone(),
-                            event_type: "health_check_failed".to_string(),
-                            event_data: serde_json::json!({
-                                "url": target.url,
-                                "consecutive_failures": *count,
-                                "expected_status": target.expected_status,
-                            }),
-                            variables,
-                            chain_depth: 0,
+                    if *count >= consecutive_failures_threshold {
+                        // Fire if: never fired, or re-trigger interval has elapsed
+                        let should_fire = match last_fired.get(&target.url) {
+                            None => true,
+                            Some(t) => t.elapsed().as_secs() >= re_trigger_secs,
                         };
 
-                        if let Err(e) = tx.send(event).await {
-                            warn!("Failed to send health check event: {}", e);
-                        }
+                        if should_fire {
+                            let is_retrigger = last_fired.contains_key(&target.url);
+                            info!(
+                                "Health check trigger '{}': {} failed {} consecutive times{}",
+                                trigger_id,
+                                target.url,
+                                count,
+                                if is_retrigger { " (re-trigger)" } else { "" }
+                            );
 
-                        *already_fired = true;
+                            let mut variables = HashMap::new();
+                            variables.insert("failed_url".to_string(), target.url.clone());
+                            variables.insert("failure_count".to_string(), count.to_string());
+                            variables.insert(
+                                "expected_status".to_string(),
+                                target.expected_status.to_string(),
+                            );
+
+                            let event = TriggerEvent {
+                                trigger_id: trigger_id.clone(),
+                                event_type: if is_retrigger {
+                                    "health_check_still_failing".to_string()
+                                } else {
+                                    "health_check_failed".to_string()
+                                },
+                                event_data: serde_json::json!({
+                                    "url": target.url,
+                                    "consecutive_failures": *count,
+                                    "expected_status": target.expected_status,
+                                    "is_retrigger": is_retrigger,
+                                }),
+                                variables,
+                                chain_depth: 0,
+                            };
+
+                            if let Err(e) = tx.send(event).await {
+                                warn!("Failed to send health check event: {}", e);
+                            }
+
+                            last_fired.insert(target.url.clone(), std::time::Instant::now());
+                        }
                     }
                 }
             }

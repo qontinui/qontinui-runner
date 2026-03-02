@@ -44,12 +44,12 @@ import {
   type ExecutorEventPayload,
 } from "../hooks/useUnifiedEvents";
 import { useActiveRunsOptional } from "./ActiveRunsContext";
+import { getApiBase } from "@/lib/runner-api";
 
 // =============================================================================
 // API Constants
 // =============================================================================
 
-const API_BASE = "http://localhost:9876";
 const POLL_INTERVAL_MS = 5000; // Fallback polling interval (events provide instant updates)
 
 // =============================================================================
@@ -752,10 +752,10 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
     try {
       // Fetch full state and workflow state in parallel
       const [fullStateResponse, workflowStateResponse] = await Promise.all([
-        fetch(`${API_BASE}/task-runs/${taskId}/full-state`, {
+        fetch(`${getApiBase()}/task-runs/${taskId}/full-state`, {
           signal: controller.signal,
         }),
-        fetch(`${API_BASE}/task-runs/${taskId}/workflow-state`, {
+        fetch(`${getApiBase()}/task-runs/${taskId}/workflow-state`, {
           signal: controller.signal,
         }).catch(() => null), // workflow-state is supplementary; don't fail if unavailable
       ]);

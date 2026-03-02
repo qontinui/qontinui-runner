@@ -8,6 +8,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { FolderOpen, RefreshCw, Loader2, Check, AlertCircle } from "lucide-react";
 import { getStatusColors } from "@/design-system";
+import { getApiBase } from "@/lib/runner-api";
 
 interface RAGProject {
   project_id: string;
@@ -25,8 +26,6 @@ interface ProjectSelectorProps {
   onLog?: (level: "info" | "warning" | "error" | "debug" | "success", message: string) => void;
 }
 
-const RUNNER_API_URL = "http://localhost:9876";
-
 export function ProjectSelector({ onProjectLoad, onLog }: ProjectSelectorProps) {
   const [projects, setProjects] = useState<RAGProject[]>([]);
   const [loading, setLoading] = useState(false);
@@ -40,7 +39,7 @@ export function ProjectSelector({ onProjectLoad, onLog }: ProjectSelectorProps) 
     setError(null);
 
     try {
-      const response = await fetch(`${RUNNER_API_URL}/rag/list`);
+      const response = await fetch(`${getApiBase()}/rag/list`);
       if (!response.ok) {
         throw new Error(`Failed to fetch projects: ${response.statusText}`);
       }
@@ -73,7 +72,7 @@ export function ProjectSelector({ onProjectLoad, onLog }: ProjectSelectorProps) 
       setError(null);
 
       try {
-        const response = await fetch(`${RUNNER_API_URL}/rag/${project.project_id}/load`, {
+        const response = await fetch(`${getApiBase()}/rag/${project.project_id}/load`, {
           method: "POST",
         });
 

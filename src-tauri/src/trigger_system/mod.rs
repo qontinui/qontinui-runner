@@ -35,4 +35,4 @@ pub mod storage;
 pub mod types;
 pub mod watchers;
 
-pub use service::{get_trigger_service, start_trigger_service};
+pub use service::{get_trigger_service, start_trigger_service, stop_trigger_service};

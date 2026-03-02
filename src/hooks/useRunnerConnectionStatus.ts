@@ -6,6 +6,7 @@
  */
 
 import { useState, useEffect, useCallback } from "react";
+import { getApiBase } from "@/lib/runner-api";
 
 export interface ConnectionStatus {
   isConnected: boolean;
@@ -13,7 +14,6 @@ export interface ConnectionStatus {
   lastCheckedAt: number | null;
 }
 
-const API_BASE = "http://localhost:9876";
 const HEALTH_POLL_INTERVAL = 10_000; // 10 seconds
 const HEALTH_TIMEOUT = 5_000; // 5 second timeout
 
@@ -30,7 +30,7 @@ export function useRunnerConnectionStatus(): ConnectionStatus {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), HEALTH_TIMEOUT);
 
-      const response = await fetch(`${API_BASE}/health`, {
+      const response = await fetch(`${getApiBase()}/health`, {
         signal: controller.signal,
       });
       clearTimeout(timeout);

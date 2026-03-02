@@ -10,9 +10,11 @@
 //! - Search and lookup functionality
 //! - Skill instantiation (template → concrete step configs)
 
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use tracing::warn;
 
 // =============================================================================
 // Types
@@ -22,6 +24,15 @@ use std::collections::HashMap;
 pub struct SkillParameterOption {
     pub label: String,
     pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillAuthor {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +49,27 @@ pub struct SkillParameter {
     pub options: Option<Vec<SkillParameterOption>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placeholder: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depends_on: Option<ParameterDependency>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParameterDependency {
+    pub param: String,
+    pub value: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillRef {
+    pub skill_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameter_overrides: Option<HashMap<String, Value>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +79,8 @@ pub enum SkillTemplate {
     SingleStep { step: HashMap<String, Value> },
     #[serde(rename = "multi_step")]
     MultiStep { steps: Vec<HashMap<String, Value>> },
+    #[serde(rename = "composition")]
+    Composition { skill_refs: Vec<SkillRef> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,7 +96,21 @@ pub struct SkillDefinition {
     pub allowed_phases: Vec<String>, // "setup" | "verification" | "agentic" | "completion"
     pub parameters: Vec<SkillParameter>,
     pub template: SkillTemplate,
-    pub source: String, // "builtin" | "user"
+    pub source: String, // "builtin" | "user" | "community"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<SkillAuthor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depends_on: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<String>,
 }
 
 /// Tracks that a step was created from a skill
@@ -74,6 +122,71 @@ pub struct SkillOrigin {
 }
 
 // =============================================================================
+// Export / Import Types
+// =============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillExportManifest {
+    pub version: String,
+    pub exported_at: String,
+    pub app_version: String,
+    pub content_type: String,
+    pub skill_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillExport {
+    pub manifest: SkillExportManifest,
+    pub skills: Vec<SkillDefinition>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SkillImportResult {
+    pub imported: usize,
+    pub skipped: usize,
+    pub overwritten: usize,
+    pub errors: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+/// Compute a SHA-256 checksum of a skill's content for integrity verification.
+pub fn compute_skill_checksum(skill: &SkillDefinition) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    // Hash deterministic fields only (not usage_count, approval_status, etc.)
+    hasher.update(skill.name.as_bytes());
+    hasher.update(skill.slug.as_bytes());
+    hasher.update(skill.description.as_bytes());
+    hasher.update(skill.category.as_bytes());
+    for tag in &skill.tags {
+        hasher.update(tag.as_bytes());
+    }
+    if let Ok(template_json) = serde_json::to_string(&skill.template) {
+        hasher.update(template_json.as_bytes());
+    }
+    if let Ok(params_json) = serde_json::to_string(&skill.parameters) {
+        hasher.update(params_json.as_bytes());
+    }
+    if let Some(v) = &skill.version {
+        hasher.update(v.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// Compute a checksum for an entire skill export.
+pub fn compute_export_checksum(skills: &[SkillDefinition]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for skill in skills {
+        hasher.update(compute_skill_checksum(skill).as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+// =============================================================================
 // Built-in Skills
 // =============================================================================
 
@@ -81,6 +194,82 @@ const BUILTIN_SKILLS_JSON: &str = include_str!("builtin.json");
 
 fn load_builtin_skills() -> Vec<SkillDefinition> {
     serde_json::from_str(BUILTIN_SKILLS_JSON).expect("Failed to parse built-in skills JSON")
+}
+
+/// Load user-created skills directly from a raw SQLite connection.
+///
+/// This mirrors `CheckpointDb::list_user_skills()` but works with the raw
+/// `Connection` passed through the generator pipeline (same pattern as
+/// `rules::load_rules`).
+pub fn load_user_skills_from_conn(conn: &Connection) -> Vec<SkillDefinition> {
+    let mut stmt = match conn.prepare(
+        r#"SELECT id, name, slug, description, category, tags, icon, color,
+                  allowed_phases, parameters, template, source,
+                  version, author, checksum, depends_on, usage_count,
+                  approval_status, forked_from
+           FROM user_skills
+           ORDER BY updated_at DESC"#,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Failed to prepare user_skills query: {}", e);
+            return vec![];
+        }
+    };
+
+    let rows = stmt.query_map([], |row| {
+        let tags_json: String = row.get::<_, String>(5).unwrap_or_else(|_| "[]".to_string());
+        let phases_json: String = row
+            .get::<_, String>(8)
+            .unwrap_or_else(|_| "[\"setup\"]".to_string());
+        let params_json: String = row.get::<_, String>(9).unwrap_or_else(|_| "[]".to_string());
+        let template_json: String = row.get(10)?;
+
+        Ok(SkillDefinition {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            slug: row.get(2)?,
+            description: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            category: row
+                .get::<_, Option<String>>(4)?
+                .unwrap_or_else(|| "custom".to_string()),
+            tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+            icon: row
+                .get::<_, Option<String>>(6)?
+                .unwrap_or_else(|| "puzzle".to_string()),
+            color: row
+                .get::<_, Option<String>>(7)?
+                .unwrap_or_else(|| "gray".to_string()),
+            allowed_phases: serde_json::from_str(&phases_json)
+                .unwrap_or_else(|_| vec!["setup".to_string()]),
+            parameters: serde_json::from_str(&params_json).unwrap_or_default(),
+            template: serde_json::from_str(&template_json).unwrap_or(SkillTemplate::SingleStep {
+                step: HashMap::new(),
+            }),
+            source: row
+                .get::<_, Option<String>>(11)?
+                .unwrap_or_else(|| "user".to_string()),
+            version: row.get::<_, Option<String>>(12)?,
+            author: row
+                .get::<_, Option<String>>(13)?
+                .and_then(|s| serde_json::from_str(&s).ok()),
+            checksum: row.get::<_, Option<String>>(14)?,
+            depends_on: row
+                .get::<_, Option<String>>(15)?
+                .and_then(|s| serde_json::from_str(&s).ok()),
+            usage_count: row.get::<_, Option<u64>>(16)?,
+            approval_status: row.get::<_, Option<String>>(17)?,
+            forked_from: row.get::<_, Option<String>>(18)?,
+        })
+    });
+
+    match rows {
+        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Err(e) => {
+            warn!("Failed to query user skills: {}", e);
+            vec![]
+        }
+    }
 }
 
 // =============================================================================
@@ -106,6 +295,21 @@ impl SkillRegistry {
             builtin: load_builtin_skills(),
             user: Vec::new(),
         }
+    }
+
+    /// Create a registry with built-in skills + user skills loaded from DB.
+    ///
+    /// If `conn` is None or the query fails, only built-in skills are loaded.
+    pub fn with_db(conn: Option<&Connection>) -> Self {
+        let mut registry = Self::new();
+        if let Some(conn) = conn {
+            let user_skills = load_user_skills_from_conn(conn);
+            if !user_skills.is_empty() {
+                tracing::debug!("Loaded {} user skills from database", user_skills.len());
+                registry.user = user_skills;
+            }
+        }
+        registry
     }
 
     /// Register user-created skills (e.g., loaded from database).
@@ -155,7 +359,10 @@ impl SkillRegistry {
             .collect()
     }
 
-    /// Search skills by text query. Matches against name, description, slug, and tags.
+    /// Search skills by text query with relevance-ranked results.
+    ///
+    /// Scoring: exact name match (100), slug match (80), word in name (10 each),
+    /// word in description (5 each), word in tags (8 each).
     pub fn search(&self, query: &str) -> Vec<&SkillDefinition> {
         let query_lower = query.trim().to_lowercase();
         if query_lower.is_empty() {
@@ -164,25 +371,73 @@ impl SkillRegistry {
 
         let words: Vec<&str> = query_lower.split_whitespace().collect();
 
-        self.all()
+        let mut scored: Vec<(&SkillDefinition, i32)> = self
+            .all()
             .into_iter()
-            .filter(|skill| {
+            .filter_map(|skill| {
+                let name_lower = skill.name.to_lowercase();
+                let slug_lower = skill.slug.to_lowercase();
+                let desc_lower = skill.description.to_lowercase();
+                let tags_lower: Vec<String> = skill.tags.iter().map(|t| t.to_lowercase()).collect();
+
+                // All words must appear somewhere
                 let haystack = format!(
                     "{} {} {} {}",
-                    skill.name,
-                    skill.description,
-                    skill.slug,
-                    skill.tags.join(" ")
-                )
-                .to_lowercase();
-                words.iter().all(|word| haystack.contains(word))
+                    name_lower,
+                    desc_lower,
+                    slug_lower,
+                    tags_lower.join(" ")
+                );
+                if !words.iter().all(|word| haystack.contains(word)) {
+                    return None;
+                }
+
+                let mut score: i32 = 0;
+
+                // Exact name match
+                if name_lower == query_lower {
+                    score += 100;
+                }
+                // Exact slug match
+                if slug_lower == query_lower {
+                    score += 80;
+                }
+
+                for word in &words {
+                    if name_lower.contains(word) {
+                        score += 10;
+                    }
+                    if desc_lower.contains(word) {
+                        score += 5;
+                    }
+                    for tag in &tags_lower {
+                        if tag.contains(word) {
+                            score += 8;
+                        }
+                    }
+                }
+
+                Some((skill, score))
             })
-            .collect()
+            .collect();
+
+        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        scored.into_iter().map(|(s, _)| s).collect()
     }
 
     /// Get all built-in skill definitions as JSON (for AI generator context).
     pub fn builtin_as_json(&self) -> Value {
         serde_json::to_value(&self.builtin).unwrap_or(Value::Array(vec![]))
+    }
+
+    /// Increment the usage count for a skill (called after successful instantiation).
+    pub fn increment_usage(&mut self, skill_id: &str) {
+        for skill in &mut self.user {
+            if skill.id == skill_id {
+                skill.usage_count = Some(skill.usage_count.unwrap_or(0) + 1);
+                break;
+            }
+        }
     }
 }
 
@@ -295,6 +550,46 @@ pub fn instantiate_skill(
         }
     }
 
+    // Validate parameters
+    for param in &skill.parameters {
+        if let Some(val) = effective_params.get(&param.name) {
+            // Check min/max for numeric params
+            if let Some(min) = param.min {
+                if let Some(num) = val.as_f64() {
+                    if num < min {
+                        return Err(format!(
+                            "Parameter \"{}\" value {} is below minimum {}",
+                            param.name, num, min
+                        ));
+                    }
+                }
+            }
+            if let Some(max) = param.max {
+                if let Some(num) = val.as_f64() {
+                    if num > max {
+                        return Err(format!(
+                            "Parameter \"{}\" value {} exceeds maximum {}",
+                            param.name, num, max
+                        ));
+                    }
+                }
+            }
+            // Check regex pattern for string params
+            if let Some(pattern) = &param.pattern {
+                if let Some(s) = val.as_str() {
+                    if let Ok(re) = regex::Regex::new(pattern) {
+                        if !re.is_match(s) {
+                            return Err(format!(
+                                "Parameter \"{}\" value \"{}\" does not match pattern \"{}\"",
+                                param.name, s, pattern
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let origin = SkillOrigin {
         skill_id: skill.id.clone(),
         skill_slug: skill.slug.clone(),
@@ -304,6 +599,12 @@ pub fn instantiate_skill(
     let template_steps = match &skill.template {
         SkillTemplate::SingleStep { step } => vec![step.clone()],
         SkillTemplate::MultiStep { steps } => steps.clone(),
+        SkillTemplate::Composition { .. } => {
+            return Err(format!(
+                "Skill \"{}\" is a composition skill and cannot be directly instantiated",
+                skill.name
+            ));
+        }
     };
 
     let total = template_steps.len();
@@ -338,6 +639,212 @@ pub fn instantiate_skill(
     }
 
     Ok(result)
+}
+
+/// Instantiate a composition skill by resolving its skill_refs.
+///
+/// Each SkillRef is looked up in the registry and instantiated individually.
+/// Returns all resulting steps flattened.
+pub fn instantiate_composition(
+    skill: &SkillDefinition,
+    phase: &str,
+    param_values: &HashMap<String, Value>,
+    registry: &SkillRegistry,
+) -> Result<Vec<Value>, String> {
+    // Validate this skill's own dependencies
+    validate_dependencies(skill, registry)?;
+
+    let skill_refs = match &skill.template {
+        SkillTemplate::Composition { skill_refs } => skill_refs,
+        _ => {
+            return Err(format!(
+                "Skill \"{}\" is not a composition skill",
+                skill.name
+            ))
+        }
+    };
+
+    let mut all_steps = Vec::new();
+    for skill_ref in skill_refs {
+        let ref_skill = registry
+            .get(&skill_ref.skill_id)
+            .ok_or_else(|| format!("Referenced skill not found: {}", skill_ref.skill_id))?;
+
+        // Merge parent params with ref overrides
+        let mut merged_params = param_values.clone();
+        if let Some(overrides) = &skill_ref.parameter_overrides {
+            for (k, v) in overrides {
+                merged_params.insert(k.clone(), v.clone());
+            }
+        }
+
+        let steps = instantiate_skill(ref_skill, phase, &merged_params)?;
+        all_steps.extend(steps);
+    }
+
+    Ok(all_steps)
+}
+
+/// Validate that all skill dependencies are available in the registry.
+/// Returns Ok(()) if all deps exist, or Err with list of missing dependency IDs.
+pub fn validate_dependencies(
+    skill: &SkillDefinition,
+    registry: &SkillRegistry,
+) -> Result<(), String> {
+    if let Some(deps) = &skill.depends_on {
+        let missing: Vec<&String> = deps
+            .iter()
+            .filter(|dep_id| registry.get(dep_id).is_none())
+            .collect();
+
+        if !missing.is_empty() {
+            return Err(format!(
+                "Skill \"{}\" has missing dependencies: {}",
+                skill.name,
+                missing
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+// =============================================================================
+// Skill Matching (post-generation annotation)
+// =============================================================================
+
+/// Check if a template value is a literal (not a placeholder like "{{name}}").
+fn is_literal(value: &Value) -> bool {
+    match value {
+        Value::String(s) => !s.contains("{{"),
+        _ => true,
+    }
+}
+
+/// Try to match a generated step (as JSON Value) against a skill's template.
+///
+/// Returns `true` if all literal (non-placeholder) fields in the skill template
+/// match the corresponding fields in the step. Only considers `single_step`
+/// skills (multi-step matching is ambiguous for individual steps).
+fn step_matches_skill(step: &Value, skill: &SkillDefinition) -> bool {
+    let template_step = match &skill.template {
+        SkillTemplate::SingleStep { step } => step,
+        SkillTemplate::MultiStep { .. } => return false, // skip multi-step skills
+        SkillTemplate::Composition { .. } => return false, // skip composition skills
+    };
+
+    let step_obj = match step.as_object() {
+        Some(o) => o,
+        None => return false,
+    };
+
+    // All literal fields in the template must match the step
+    for (key, template_val) in template_step {
+        if !is_literal(template_val) {
+            continue; // skip placeholder fields
+        }
+
+        match step_obj.get(key) {
+            Some(step_val) if step_val == template_val => {}
+            _ => return false, // field missing or doesn't match
+        }
+    }
+
+    // Require at least 2 matching literal fields beyond just "type" to avoid
+    // overly broad matches (e.g., shell-command matches everything with type=command)
+    let literal_matches: usize = template_step
+        .iter()
+        .filter(|(key, val)| {
+            is_literal(val)
+                && *key != "type"
+                && step_obj
+                    .get(key.as_str())
+                    .map(|v| v == *val)
+                    .unwrap_or(false)
+        })
+        .count();
+
+    literal_matches >= 1
+}
+
+/// Extract parameter values from a step by reverse-matching against a skill template.
+///
+/// For each placeholder field `"{{param_name}}"` in the template, looks up the
+/// corresponding value in the step.
+fn extract_params_from_step(step: &Value, skill: &SkillDefinition) -> HashMap<String, Value> {
+    let template_step = match &skill.template {
+        SkillTemplate::SingleStep { step } => step,
+        SkillTemplate::MultiStep { .. } => return HashMap::new(),
+        SkillTemplate::Composition { .. } => return HashMap::new(),
+    };
+
+    let step_obj = match step.as_object() {
+        Some(o) => o,
+        None => return HashMap::new(),
+    };
+
+    let mut params = HashMap::new();
+    for (key, template_val) in template_step {
+        if let Value::String(s) = template_val {
+            if let Some(param_name) = s.strip_prefix("{{").and_then(|s| s.strip_suffix("}}")) {
+                let param_name = param_name.trim();
+                if let Some(step_val) = step_obj.get(key) {
+                    params.insert(param_name.to_string(), step_val.clone());
+                }
+            }
+        }
+    }
+    params
+}
+
+/// Annotate steps in a workflow with `skill_origin` where they match known skills.
+///
+/// Steps that already have `skill_origin` are skipped.
+/// Only steps in deterministic phases (setup, verification, completion) are checked.
+pub fn annotate_skill_origins(
+    workflow: &mut crate::unified_workflows::UnifiedWorkflow,
+    registry: &SkillRegistry,
+) {
+    let phases: &mut [(&str, &mut Vec<Value>)] = &mut [
+        ("setup", &mut workflow.setup_steps),
+        ("verification", &mut workflow.verification_steps),
+        ("completion", &mut workflow.completion_steps),
+    ];
+
+    let all_skills = registry.all();
+
+    for (phase, steps) in phases.iter_mut() {
+        for step in steps.iter_mut() {
+            // Skip steps that already have skill_origin
+            if step.get("skill_origin").is_some() {
+                continue;
+            }
+
+            // Try to match against all skills allowed in this phase
+            for skill in &all_skills {
+                if !skill.allowed_phases.iter().any(|p| p == *phase) {
+                    continue;
+                }
+
+                if step_matches_skill(step, skill) {
+                    let params = extract_params_from_step(step, skill);
+                    let origin = SkillOrigin {
+                        skill_id: skill.id.clone(),
+                        skill_slug: skill.slug.clone(),
+                        parameter_values: params,
+                    };
+                    if let Ok(origin_val) = serde_json::to_value(&origin) {
+                        step.as_object_mut()
+                            .map(|obj| obj.insert("skill_origin".to_string(), origin_val));
+                    }
+                    break; // first match wins
+                }
+            }
+        }
+    }
 }
 
 // =============================================================================
@@ -533,11 +1040,76 @@ mod tests {
                 },
             },
             source: "user".into(),
+            version: None,
+            author: None,
+            checksum: None,
+            depends_on: None,
+            usage_count: None,
+            approval_status: None,
+            forked_from: None,
         };
 
         registry.set_user_skills(vec![user_skill]);
         assert_eq!(registry.all().len(), 16);
         assert!(registry.get("user:my-skill").is_some());
+    }
+
+    #[test]
+    fn test_step_matches_lint_skill() {
+        let registry = SkillRegistry::new();
+        let skill = registry.get("builtin:lint-project").unwrap();
+
+        // Step that matches lint-project skill
+        let step = serde_json::json!({
+            "type": "command",
+            "mode": "check",
+            "check_type": "lint",
+            "command": "npm run lint",
+            "working_directory": "./frontend"
+        });
+        assert!(step_matches_skill(&step, skill));
+
+        // Step with wrong check_type
+        let wrong = serde_json::json!({
+            "type": "command",
+            "mode": "check",
+            "check_type": "typecheck",
+            "command": "tsc --noEmit"
+        });
+        assert!(!step_matches_skill(&wrong, skill));
+    }
+
+    #[test]
+    fn test_extract_params_from_step() {
+        let registry = SkillRegistry::new();
+        let skill = registry.get("builtin:lint-project").unwrap();
+
+        let step = serde_json::json!({
+            "type": "command",
+            "mode": "check",
+            "check_type": "lint",
+            "working_directory": "./frontend"
+        });
+
+        let params = extract_params_from_step(&step, skill);
+        // lint-project template has {{working_directory}} as the only placeholder
+        assert_eq!(params.get("working_directory").unwrap(), "./frontend");
+        assert!(params.get("command").is_none()); // no command placeholder in lint-project
+    }
+
+    #[test]
+    fn test_no_match_for_generic_shell() {
+        let registry = SkillRegistry::new();
+        let shell_skill = registry.get("builtin:shell-command").unwrap();
+
+        // A generic shell command should match shell-command skill
+        // (type=command, mode=shell are the template literals)
+        let step = serde_json::json!({
+            "type": "command",
+            "mode": "shell",
+            "command": "echo hello"
+        });
+        assert!(step_matches_skill(&step, shell_skill));
     }
 
     #[test]
@@ -562,5 +1134,64 @@ mod tests {
             parsed.parameter_values.get("working_directory").unwrap(),
             "./src"
         );
+    }
+
+    #[test]
+    fn test_composition_template_serde() {
+        let skill_def = SkillDefinition {
+            id: "user:comp".into(),
+            name: "Composed".into(),
+            slug: "composed".into(),
+            description: "A composition".into(),
+            category: "custom".into(),
+            tags: vec![],
+            icon: "layers".into(),
+            color: "blue".into(),
+            allowed_phases: vec!["setup".into()],
+            parameters: vec![],
+            template: SkillTemplate::Composition {
+                skill_refs: vec![
+                    SkillRef {
+                        skill_id: "builtin:lint-project".into(),
+                        parameter_overrides: None,
+                    },
+                    SkillRef {
+                        skill_id: "builtin:format-check".into(),
+                        parameter_overrides: None,
+                    },
+                ],
+            },
+            source: "user".into(),
+            version: Some("1.0.0".into()),
+            author: None,
+            checksum: None,
+            depends_on: None,
+            usage_count: None,
+            approval_status: None,
+            forked_from: None,
+        };
+
+        let json = serde_json::to_string(&skill_def).unwrap();
+        let parsed: SkillDefinition = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, "user:comp");
+        match &parsed.template {
+            SkillTemplate::Composition { skill_refs } => {
+                assert_eq!(skill_refs.len(), 2);
+                assert_eq!(skill_refs[0].skill_id, "builtin:lint-project");
+            }
+            _ => panic!("Expected Composition template"),
+        }
+    }
+
+    #[test]
+    fn test_checksum_computation() {
+        let registry = SkillRegistry::new();
+        let skill = registry.get("builtin:lint-project").unwrap();
+        let checksum = compute_skill_checksum(skill);
+        assert_eq!(checksum.len(), 64); // SHA-256 hex = 64 chars
+
+        // Same skill should produce same checksum
+        let checksum2 = compute_skill_checksum(skill);
+        assert_eq!(checksum, checksum2);
     }
 }

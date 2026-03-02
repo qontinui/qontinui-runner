@@ -44,6 +44,16 @@ pub enum ResumePoint {
         stage_index: Option<u32>,
     },
 
+    /// Resume from an approval gate (re-present the approval dialog).
+    ApprovalPhase {
+        /// Iteration number (1-indexed).
+        iteration: u32,
+        /// Stage index for multi-stage workflows (None = single-stage).
+        stage_index: Option<u32>,
+        /// The approval request ID to re-present.
+        approval_id: String,
+    },
+
     /// Resume from completion phase at a specific step.
     CompletionPhase {
         /// Step index to resume from.
@@ -98,6 +108,23 @@ impl ResumePoint {
                     format!("from agentic phase, iteration {}, stage {}", iteration, si)
                 } else {
                     format!("from agentic phase, iteration {}", iteration)
+                }
+            }
+            ResumePoint::ApprovalPhase {
+                iteration,
+                stage_index,
+                approval_id,
+            } => {
+                if let Some(si) = stage_index {
+                    format!(
+                        "from approval gate '{}', iteration {}, stage {}",
+                        approval_id, iteration, si
+                    )
+                } else {
+                    format!(
+                        "from approval gate '{}', iteration {}",
+                        approval_id, iteration
+                    )
                 }
             }
             ResumePoint::CompletionPhase { from_step } => {
@@ -275,6 +302,23 @@ impl ResumeManager {
                     self.count_completed_steps(execution_id, "completion", None)?;
                 Ok(ResumePoint::CompletionPhase {
                     from_step: completed_count,
+                })
+            }
+
+            "approval_pending" => {
+                // Was waiting for human approval — re-present the approval gate.
+                let iter = iteration.unwrap_or(1);
+                let approval_id = state_data
+                    .and_then(|data| {
+                        serde_json::from_str::<serde_json::Value>(data)
+                            .ok()
+                            .and_then(|v| v.get("approval_id")?.as_str().map(String::from))
+                    })
+                    .unwrap_or_default();
+                Ok(ResumePoint::ApprovalPhase {
+                    iteration: iter,
+                    stage_index,
+                    approval_id,
                 })
             }
 

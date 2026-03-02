@@ -5622,6 +5622,212 @@ impl CheckpointDb {
             info!("Successfully migrated to version 76 (canvas panels)");
         }
 
+        // Version 77: Add model_overrides to unified_workflows
+        if current_version < 77 {
+            info!("Migrating to version 77 (add model_overrides to unified_workflows)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE unified_workflows ADD COLUMN model_overrides TEXT DEFAULT '{}';
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (77, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 77: {}", e))?;
+
+            info!("Successfully migrated to version 77 (model_overrides)");
+        }
+
+        // Version 78: Add approval_gates table for human-in-the-loop audit trail
+        if current_version < 78 {
+            info!("Migrating to version 78 (approval_gates table)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS approval_gates (
+                    id TEXT PRIMARY KEY,
+                    task_run_id TEXT NOT NULL,
+                    iteration INTEGER NOT NULL,
+                    prompt TEXT NOT NULL,
+                    context_json TEXT DEFAULT '{}',
+                    action TEXT,
+                    comment TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    resolved_at TEXT,
+                    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_approval_gates_task_run_id ON approval_gates(task_run_id);
+                CREATE INDEX IF NOT EXISTS idx_approval_gates_status ON approval_gates(status);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (78, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 78: {}", e))?;
+
+            info!("Successfully migrated to version 78 (approval_gates)");
+        }
+
+        // Version 79: Add user_skills table for user-created skill definitions
+        if current_version < 79 {
+            info!("Migrating to version 79 (user_skills table)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS user_skills (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    slug TEXT NOT NULL UNIQUE,
+                    description TEXT DEFAULT '',
+                    category TEXT DEFAULT 'custom',
+                    tags TEXT DEFAULT '[]',
+                    icon TEXT DEFAULT 'puzzle',
+                    color TEXT DEFAULT 'gray',
+                    allowed_phases TEXT NOT NULL DEFAULT '["setup"]',
+                    parameters TEXT DEFAULT '[]',
+                    template TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_user_skills_slug ON user_skills(slug);
+                CREATE INDEX IF NOT EXISTS idx_user_skills_category ON user_skills(category);
+                CREATE INDEX IF NOT EXISTS idx_user_skills_updated_at ON user_skills(updated_at);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (79, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 79: {}", e))?;
+
+            info!("Successfully migrated to version 79 (user_skills)");
+        }
+
+        // Version 80: Add approval_gate column to unified_workflows
+        if current_version < 80 {
+            info!("Migrating to version 80 (add approval_gate to unified_workflows)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE unified_workflows ADD COLUMN approval_gate BOOLEAN DEFAULT 0;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (80, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 80: {}", e))?;
+
+            info!("Successfully migrated to version 80 (approval_gate)");
+        }
+
+        // Version 81: Add source column to user_skills for community skills
+        if current_version < 81 {
+            info!("Migrating to version 81 (add source column to user_skills)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE user_skills ADD COLUMN source TEXT NOT NULL DEFAULT 'user';
+
+                CREATE INDEX IF NOT EXISTS idx_user_skills_source ON user_skills(source);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (81, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 81: {}", e))?;
+
+            info!("Successfully migrated to version 81 (user_skills source column)");
+        }
+
+        if current_version < 82 {
+            info!("Migrating to version 82 (canvas panels group_name column)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE canvas_panels ADD COLUMN group_name TEXT;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (82, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 82: {}", e))?;
+
+            info!("Successfully migrated to version 82 (canvas panels group_name)");
+        }
+
+        if current_version < 83 {
+            info!("Migrating to version 83 (trigger retry columns)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE workflow_triggers ADD COLUMN retry_count INTEGER DEFAULT 0;
+                ALTER TABLE workflow_triggers ADD COLUMN retry_delay_seconds INTEGER DEFAULT 30;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (83, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 83: {}", e))?;
+
+            info!("Successfully migrated to version 83 (trigger retry columns)");
+        }
+
+        // Version 84: Extend user_skills with versioning, author, checksums, dependencies, approval
+        if current_version < 84 {
+            info!(
+                "Migrating to version 84 (extend user_skills for skill registry improvements)..."
+            );
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE user_skills ADD COLUMN version TEXT DEFAULT '1.0.0';
+                ALTER TABLE user_skills ADD COLUMN author TEXT DEFAULT NULL;
+                ALTER TABLE user_skills ADD COLUMN checksum TEXT DEFAULT NULL;
+                ALTER TABLE user_skills ADD COLUMN depends_on TEXT DEFAULT '[]';
+                ALTER TABLE user_skills ADD COLUMN usage_count INTEGER DEFAULT 0;
+                ALTER TABLE user_skills ADD COLUMN approval_status TEXT DEFAULT NULL;
+                ALTER TABLE user_skills ADD COLUMN forked_from TEXT DEFAULT NULL;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (84, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 84: {}", e))?;
+
+            info!("Successfully migrated to version 84 (skill registry improvements)");
+        }
+
+        // Version 85: Phase token usage tracking for cost analysis
+        if current_version < 85 {
+            info!("Migrating to version 85 (phase token usage tracking)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS phase_token_usage (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_run_id TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    stage_index INTEGER,
+                    iteration INTEGER,
+                    model_used TEXT,
+                    provider_used TEXT,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    cost_cents INTEGER NOT NULL DEFAULT 0,
+                    duration_ms INTEGER,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_phase_token_usage_task_run ON phase_token_usage(task_run_id);
+
+                ALTER TABLE task_runs ADD COLUMN total_input_tokens INTEGER DEFAULT 0;
+                ALTER TABLE task_runs ADD COLUMN total_output_tokens INTEGER DEFAULT 0;
+                ALTER TABLE task_runs ADD COLUMN total_cost_cents INTEGER DEFAULT 0;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (85, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 85: {}", e))?;
+
+            info!("Successfully migrated to version 85 (phase token usage tracking)");
+        }
+
         Ok(())
     }
 
@@ -10871,6 +11077,85 @@ impl CheckpointDb {
         Ok(knowledge)
     }
 
+    /// Query knowledge from OTHER workflows with similar names (cross-workflow learning).
+    ///
+    /// Splits the given workflow name into keywords and searches for knowledge entries
+    /// from task runs whose workflow_name contains any of those keywords, excluding the
+    /// current task run. Returns tuples of (workflow_name, knowledge_content).
+    ///
+    /// This enables learning from similar workflows — e.g., if you're running "fix-login-page",
+    /// you might benefit from knowledge discovered during "fix-signup-page".
+    pub fn get_cross_workflow_knowledge(
+        &self,
+        workflow_name: &str,
+        exclude_task_run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, String> {
+        let conn = self.get_conn()?;
+
+        // Extract meaningful keywords from workflow name (split on spaces, hyphens, underscores)
+        let keywords: Vec<&str> = workflow_name
+            .split([' ', '-', '_', '>'])
+            .map(|s| s.trim())
+            .filter(|s| s.len() >= 3) // Skip short words like "a", "to", etc.
+            .collect();
+
+        if keywords.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build LIKE conditions: workflow_name LIKE '%keyword1%' OR '%keyword2%' ...
+        let like_conditions: Vec<String> = keywords
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("tr.workflow_name LIKE ?{}", i + 3))
+            .collect();
+        let where_clause = like_conditions.join(" OR ");
+
+        let sql = format!(
+            r#"
+            SELECT DISTINCT tr.workflow_name, tk.content
+            FROM task_knowledge tk
+            INNER JOIN task_runs tr ON tk.task_run_id = tr.id
+            WHERE ({})
+              AND tk.task_run_id != ?1
+              AND tr.workflow_name != ?2
+              AND tk.category IN ('recurring_pattern', 'context', 'solution', 'root_cause')
+              AND tk.confidence IN ('high', 'medium')
+            ORDER BY tk.created_at DESC
+            LIMIT ?{}
+            "#,
+            where_clause,
+            keywords.len() + 3,
+        );
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("Failed to prepare cross-workflow knowledge query: {}", e))?;
+
+        // Build params: exclude_task_run_id, workflow_name (for exact exclusion), keyword LIKE patterns..., limit
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        param_values.push(Box::new(exclude_task_run_id.to_string()));
+        param_values.push(Box::new(workflow_name.to_string()));
+        for keyword in &keywords {
+            param_values.push(Box::new(format!("%{}%", keyword)));
+        }
+        param_values.push(Box::new(limit as u32));
+
+        let refs: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|v| v.as_ref()).collect();
+
+        let results: Vec<(String, String)> = stmt
+            .query_map(refs.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| format!("Failed to query cross-workflow knowledge: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(results)
+    }
+
     /// Helper function to convert a row to StoredTaskKnowledge.
     fn row_to_task_knowledge(row: &rusqlite::Row) -> rusqlite::Result<StoredTaskKnowledge> {
         Ok(StoredTaskKnowledge {
@@ -11772,7 +12057,7 @@ impl CheckpointDb {
                        context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                        log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
                        preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
-                       stages, stop_on_failure, reflection_mode
+                       stages, stop_on_failure, reflection_mode, model_overrides, approval_gate
                 FROM unified_workflows
                 ORDER BY updated_at DESC
                 "#,
@@ -11845,6 +12130,13 @@ impl CheckpointDb {
                         .unwrap_or_default(),
                     stop_on_failure: row.get::<_, Option<i32>>(29)?.unwrap_or(0) != 0,
                     reflection_mode: row.get::<_, Option<i32>>(30)?.unwrap_or(1) != 0,
+                    model_overrides: {
+                        let json_str: String = row
+                            .get::<_, Option<String>>(31)?
+                            .unwrap_or_else(|| "{}".to_string());
+                        serde_json::from_str(&json_str).unwrap_or_default()
+                    },
+                    approval_gate: row.get::<_, Option<i32>>(32)?.unwrap_or(0) != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -11871,7 +12163,7 @@ impl CheckpointDb {
                    context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                    log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
                    preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
-                   stages, stop_on_failure, reflection_mode
+                   stages, stop_on_failure, reflection_mode, model_overrides, approval_gate
             FROM unified_workflows
             WHERE id = ?1
             "#,
@@ -11941,6 +12233,11 @@ impl CheckpointDb {
                         .unwrap_or_default(),
                     stop_on_failure: row.get::<_, Option<i32>>(29)?.unwrap_or(0) != 0,
                     reflection_mode: row.get::<_, Option<i32>>(30)?.unwrap_or(1) != 0,
+                    model_overrides: {
+                        let json_str: String = row.get::<_, Option<String>>(31)?.unwrap_or_else(|| "{}".to_string());
+                        serde_json::from_str(&json_str).unwrap_or_default()
+                    },
+                    approval_gate: row.get::<_, Option<i32>>(32)?.unwrap_or(0) != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -11969,7 +12266,7 @@ impl CheckpointDb {
                    context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                    log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
                    preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
-                   stages, stop_on_failure, reflection_mode
+                   stages, stop_on_failure, reflection_mode, model_overrides, approval_gate
             FROM unified_workflows
             WHERE name = ?1
             ORDER BY updated_at DESC
@@ -12041,6 +12338,11 @@ impl CheckpointDb {
                         .unwrap_or_default(),
                     stop_on_failure: row.get::<_, Option<i32>>(29)?.unwrap_or(0) != 0,
                     reflection_mode: row.get::<_, Option<i32>>(30)?.unwrap_or(1) != 0,
+                    model_overrides: {
+                        let json_str: String = row.get::<_, Option<String>>(31)?.unwrap_or_else(|| "{}".to_string());
+                        serde_json::from_str(&json_str).unwrap_or_default()
+                    },
+                    approval_gate: row.get::<_, Option<i32>>(32)?.unwrap_or(0) != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -12106,8 +12408,8 @@ impl CheckpointDb {
                 context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                 log_watch_enabled, health_check_enabled, health_check_urls, preflight_check_enabled,
                 generated_by_task_run_id, enable_sweep, max_sweep_iterations,
-                stages, stop_on_failure, reflection_mode
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)
+                stages, stop_on_failure, reflection_mode, model_overrides, approval_gate
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
             "#,
             params![
                 id,
@@ -12141,6 +12443,8 @@ impl CheckpointDb {
                 serde_json::to_string(&request.stages).unwrap_or_else(|_| "[]".to_string()),
                 request.stop_on_failure.unwrap_or(false),
                 request.reflection_mode.unwrap_or(true),
+                serde_json::to_string(&request.model_overrides.clone().unwrap_or_default()).unwrap_or_else(|_| "{}".to_string()),
+                request.approval_gate.unwrap_or(false),
             ],
         )
         .map_err(|e| format!("Failed to create unified workflow: {}", e))?;
@@ -12201,8 +12505,8 @@ impl CheckpointDb {
                 context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                 log_watch_enabled, health_check_enabled, health_check_urls, preflight_check_enabled,
                 generated_by_task_run_id, enable_sweep, max_sweep_iterations,
-                stages, stop_on_failure, reflection_mode
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)
+                stages, stop_on_failure, reflection_mode, model_overrides, approval_gate
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
             "#,
             params![
                 id,
@@ -12236,6 +12540,8 @@ impl CheckpointDb {
                 serde_json::to_string(&request.stages).unwrap_or_else(|_| "[]".to_string()),
                 request.stop_on_failure.unwrap_or(false),
                 request.reflection_mode.unwrap_or(true),
+                serde_json::to_string(&request.model_overrides.clone().unwrap_or_default()).unwrap_or_else(|_| "{}".to_string()),
+                request.approval_gate.unwrap_or(false),
             ],
         )
         .map_err(|e| format!("Failed to create unified workflow: {}", e))?;
@@ -12335,7 +12641,12 @@ impl CheckpointDb {
             .unwrap_or(existing.max_sweep_iterations);
         let stages = request.stages.as_ref().unwrap_or(&existing.stages);
         let stop_on_failure = request.stop_on_failure.unwrap_or(existing.stop_on_failure);
+        let approval_gate = request.approval_gate.unwrap_or(existing.approval_gate);
         let reflection_mode = request.reflection_mode.unwrap_or(existing.reflection_mode);
+        let model_overrides = request
+            .model_overrides
+            .as_ref()
+            .unwrap_or(&existing.model_overrides);
 
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
         let setup_steps_json =
@@ -12355,6 +12666,8 @@ impl CheckpointDb {
         let health_check_urls_json =
             serde_json::to_string(health_check_urls).unwrap_or_else(|_| "[]".to_string());
         let stages_json = serde_json::to_string(stages).unwrap_or_else(|_| "[]".to_string());
+        let model_overrides_json =
+            serde_json::to_string(model_overrides).unwrap_or_else(|_| "{}".to_string());
 
         conn.execute(
             r#"
@@ -12386,8 +12699,10 @@ impl CheckpointDb {
                 max_sweep_iterations = ?25,
                 stages = ?26,
                 stop_on_failure = ?27,
-                reflection_mode = ?28
-            WHERE id = ?29
+                approval_gate = ?28,
+                reflection_mode = ?29,
+                model_overrides = ?30
+            WHERE id = ?31
             "#,
             params![
                 name,
@@ -12417,7 +12732,9 @@ impl CheckpointDb {
                 max_sweep_iterations as i64,
                 stages_json,
                 stop_on_failure,
+                approval_gate,
                 reflection_mode,
+                model_overrides_json,
                 id,
             ],
         )
@@ -12453,7 +12770,7 @@ impl CheckpointDb {
                    context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                    log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
                    preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
-                   stages, stop_on_failure, reflection_mode
+                   stages, stop_on_failure, reflection_mode, model_overrides, approval_gate
             FROM unified_workflows
             WHERE 1=1
             "#,
@@ -12555,6 +12872,13 @@ impl CheckpointDb {
                         .unwrap_or_default(),
                     stop_on_failure: row.get::<_, Option<i32>>(29)?.unwrap_or(0) != 0,
                     reflection_mode: row.get::<_, Option<i32>>(30)?.unwrap_or(1) != 0,
+                    model_overrides: {
+                        let json_str: String = row
+                            .get::<_, Option<String>>(31)?
+                            .unwrap_or_else(|| "{}".to_string());
+                        serde_json::from_str(&json_str).unwrap_or_default()
+                    },
+                    approval_gate: row.get::<_, Option<i32>>(32)?.unwrap_or(0) != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -12604,7 +12928,9 @@ impl CheckpointDb {
             max_sweep_iterations: Some(original.max_sweep_iterations),
             stages: Some(original.stages),
             stop_on_failure: Some(original.stop_on_failure),
+            approval_gate: Some(original.approval_gate),
             reflection_mode: Some(original.reflection_mode),
+            model_overrides: Some(original.model_overrides),
         };
 
         self.create_unified_workflow(&create_request)
@@ -12629,7 +12955,7 @@ impl CheckpointDb {
                        context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                        log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
                        preflight_check_enabled, generated_by_task_run_id, enable_sweep,
-                       max_sweep_iterations, stages, stop_on_failure, reflection_mode
+                       max_sweep_iterations, stages, stop_on_failure, reflection_mode, model_overrides, approval_gate
                 FROM unified_workflows
                 WHERE sync_pending = 1
                 "#,
@@ -12702,6 +13028,13 @@ impl CheckpointDb {
                         .unwrap_or_default(),
                     stop_on_failure: row.get::<_, Option<i32>>(29)?.unwrap_or(0) != 0,
                     reflection_mode: row.get::<_, Option<i32>>(30)?.unwrap_or(1) != 0,
+                    model_overrides: {
+                        let json_str: String = row
+                            .get::<_, Option<String>>(31)?
+                            .unwrap_or_else(|| "{}".to_string());
+                        serde_json::from_str(&json_str).unwrap_or_default()
+                    },
+                    approval_gate: row.get::<_, Option<i32>>(32)?.unwrap_or(0) != 0,
                     targeted_error_ids: vec![],
                 })
             })
@@ -15307,7 +15640,8 @@ impl CheckpointDb {
                        preflight_check_enabled, log_source_selection, context_ids,
                        disabled_context_ids, auto_include_contexts, prompt_template,
                        generated_by_task_run_id, enable_sweep, max_sweep_iterations,
-                       stages, stop_on_failure, reflection_mode, sync_pending, example_status
+                       stages, stop_on_failure, reflection_mode, sync_pending, example_status,
+                       model_overrides, approval_gate
                 FROM unified_workflows
                 ORDER BY updated_at DESC
                 "#,
@@ -15355,6 +15689,10 @@ impl CheckpointDb {
                 let stages: serde_json::Value = stages_str
                     .and_then(|s| serde_json::from_str(&s).ok())
                     .unwrap_or(serde_json::json!([]));
+                let model_overrides_str: Option<String> = row.get(33)?;
+                let model_overrides: serde_json::Value = model_overrides_str
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or(serde_json::json!({}));
 
                 Ok(serde_json::json!({
                     "id": row.get::<_, String>(0)?,
@@ -15390,6 +15728,8 @@ impl CheckpointDb {
                     "reflection_mode": row.get::<_, Option<i64>>(30)?,
                     "sync_pending": row.get::<_, Option<i64>>(31)?,
                     "example_status": row.get::<_, Option<String>>(32)?,
+                    "model_overrides": model_overrides,
+                    "approval_gate": row.get::<_, Option<i64>>(34)?,
                 }))
             })
             .map_err(|e| format!("Failed to export unified workflows: {}", e))?
@@ -15889,6 +16229,7 @@ impl CheckpointDb {
             let max_sweep_iterations = workflow["max_sweep_iterations"].as_i64().unwrap_or(5);
             let stages = serde_json::to_string(&workflow["stages"]).unwrap_or("[]".to_string());
             let stop_on_failure = workflow["stop_on_failure"].as_i64().unwrap_or(0);
+            let approval_gate = workflow["approval_gate"].as_i64().unwrap_or(0);
             let reflection_mode = workflow["reflection_mode"].as_i64().unwrap_or(1);
             let sync_pending = workflow["sync_pending"].as_i64().unwrap_or(0);
             let example_status = workflow["example_status"].as_str().unwrap_or("pending");
@@ -15903,12 +16244,12 @@ impl CheckpointDb {
                     preflight_check_enabled, log_source_selection, context_ids,
                     disabled_context_ids, auto_include_contexts, prompt_template,
                     generated_by_task_run_id, enable_sweep, max_sweep_iterations,
-                    stages, stop_on_failure, reflection_mode, sync_pending, example_status
+                    stages, stop_on_failure, approval_gate, reflection_mode, sync_pending, example_status
                 )
                 VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
-                    ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33
+                    ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34
                 )
                 "#,
                 params![
@@ -15942,6 +16283,7 @@ impl CheckpointDb {
                     max_sweep_iterations,
                     stages,
                     stop_on_failure,
+                    approval_gate,
                     reflection_mode,
                     sync_pending,
                     example_status
@@ -18652,15 +18994,16 @@ impl CheckpointDb {
 
         conn.execute(
             r#"
-            INSERT INTO canvas_panels (id, task_run_id, component, title, data_json, priority, size, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            INSERT INTO canvas_panels (id, task_run_id, component, title, data_json, priority, size, group_name, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             ON CONFLICT(id) DO UPDATE SET
                 component = ?3,
                 title = ?4,
                 data_json = ?5,
                 priority = ?6,
                 size = ?7,
-                updated_at = ?9
+                group_name = ?8,
+                updated_at = ?10
             "#,
             params![
                 panel.panel_id,
@@ -18670,6 +19013,7 @@ impl CheckpointDb {
                 data_json,
                 panel.priority,
                 panel.size,
+                panel.group,
                 panel.created_at,
                 panel.updated_at,
             ],
@@ -18689,7 +19033,7 @@ impl CheckpointDb {
         let mut stmt = conn
             .prepare(
                 r#"
-                SELECT id, task_run_id, component, title, data_json, priority, size, created_at, updated_at
+                SELECT id, task_run_id, component, title, data_json, priority, size, group_name, created_at, updated_at
                 FROM canvas_panels
                 WHERE task_run_id = ?1
                 ORDER BY priority ASC, created_at ASC
@@ -18710,8 +19054,9 @@ impl CheckpointDb {
                     data,
                     priority: row.get(5)?,
                     size: row.get(6)?,
-                    created_at: row.get(7)?,
-                    updated_at: row.get(8)?,
+                    group: row.get(7)?,
+                    created_at: row.get(8)?,
+                    updated_at: row.get(9)?,
                 })
             })
             .map_err(|e| format!("Failed to query canvas panels: {}", e))?
@@ -18741,6 +19086,852 @@ impl CheckpointDb {
             .map_err(|e| format!("Failed to clear canvas panels: {}", e))?;
         Ok(rows)
     }
+
+    // ========================================================================
+    // Approval Gate Operations
+    // ========================================================================
+
+    /// Record a new approval gate request (audit trail).
+    pub fn insert_approval_gate(
+        &self,
+        id: &str,
+        task_run_id: &str,
+        iteration: u32,
+        prompt: &str,
+        context_json: &str,
+    ) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        conn.execute(
+            "INSERT INTO approval_gates (id, task_run_id, iteration, prompt, context_json, status, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', datetime('now'))",
+            rusqlite::params![id, task_run_id, iteration as i64, prompt, context_json],
+        )
+        .map_err(|e| format!("Failed to insert approval gate: {}", e))?;
+        Ok(())
+    }
+
+    /// Resolve an approval gate (record human response).
+    pub fn resolve_approval_gate(
+        &self,
+        id: &str,
+        action: &str,
+        comment: Option<&str>,
+    ) -> Result<(), String> {
+        let status = match action {
+            "approve" => "approved",
+            "reject" => "rejected",
+            "abort" => "aborted",
+            _ => action,
+        };
+        let conn = self.get_conn()?;
+        conn.execute(
+            "UPDATE approval_gates SET action = ?1, comment = ?2, status = ?3, resolved_at = datetime('now') WHERE id = ?4",
+            rusqlite::params![action, comment, status, id],
+        )
+        .map_err(|e| format!("Failed to resolve approval gate: {}", e))?;
+        Ok(())
+    }
+
+    /// Get approval gate history for a task run.
+    pub fn get_approval_gates_for_task_run(
+        &self,
+        task_run_id: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, task_run_id, iteration, prompt, context_json, action, comment, status, created_at, resolved_at \
+                 FROM approval_gates WHERE task_run_id = ?1 ORDER BY created_at ASC",
+            )
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![task_run_id], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "task_run_id": row.get::<_, String>(1)?,
+                    "iteration": row.get::<_, i64>(2)?,
+                    "prompt": row.get::<_, String>(3)?,
+                    "context_json": row.get::<_, String>(4).unwrap_or_default(),
+                    "action": row.get::<_, Option<String>>(5)?,
+                    "comment": row.get::<_, Option<String>>(6)?,
+                    "status": row.get::<_, String>(7)?,
+                    "created_at": row.get::<_, String>(8)?,
+                    "resolved_at": row.get::<_, Option<String>>(9)?,
+                }))
+            })
+            .map_err(|e| format!("Failed to query approval gates: {}", e))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect approval gates: {}", e))?;
+
+        Ok(rows)
+    }
+
+    // ========================================================================
+    // User Skills CRUD
+    // ========================================================================
+
+    /// List all user-created skills.
+    pub fn list_user_skills(&self) -> Result<Vec<crate::skills::SkillDefinition>, String> {
+        let conn = self.get_conn()?;
+
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT id, name, slug, description, category, tags, icon, color,
+                       allowed_phases, parameters, template, source,
+                       version, author, checksum, depends_on, usage_count, approval_status, forked_from,
+                       created_at, updated_at
+                FROM user_skills
+                ORDER BY updated_at DESC
+                "#,
+            )
+            .map_err(|e| format!("Failed to prepare user_skills query: {}", e))?;
+
+        let skills = stmt
+            .query_map([], |row| {
+                let tags_json: String =
+                    row.get::<_, String>(5).unwrap_or_else(|_| "[]".to_string());
+                let allowed_phases_json: String = row
+                    .get::<_, String>(8)
+                    .unwrap_or_else(|_| "[\"setup\"]".to_string());
+                let parameters_json: String =
+                    row.get::<_, String>(9).unwrap_or_else(|_| "[]".to_string());
+                let template_json: String = row.get(10)?;
+
+                Ok(crate::skills::SkillDefinition {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    slug: row.get(2)?,
+                    description: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    category: row
+                        .get::<_, Option<String>>(4)?
+                        .unwrap_or_else(|| "custom".to_string()),
+                    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                    icon: row
+                        .get::<_, Option<String>>(6)?
+                        .unwrap_or_else(|| "puzzle".to_string()),
+                    color: row
+                        .get::<_, Option<String>>(7)?
+                        .unwrap_or_else(|| "gray".to_string()),
+                    allowed_phases: serde_json::from_str(&allowed_phases_json)
+                        .unwrap_or_else(|_| vec!["setup".to_string()]),
+                    parameters: serde_json::from_str(&parameters_json).unwrap_or_default(),
+                    template: serde_json::from_str(&template_json).unwrap_or(
+                        crate::skills::SkillTemplate::SingleStep {
+                            step: std::collections::HashMap::new(),
+                        },
+                    ),
+                    source: row
+                        .get::<_, Option<String>>(11)?
+                        .unwrap_or_else(|| "user".to_string()),
+                    version: row.get::<_, Option<String>>(12)?,
+                    author: row
+                        .get::<_, Option<String>>(13)?
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    checksum: row.get::<_, Option<String>>(14)?,
+                    depends_on: row
+                        .get::<_, Option<String>>(15)?
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    usage_count: row.get::<_, Option<u64>>(16)?,
+                    approval_status: row.get::<_, Option<String>>(17)?,
+                    forked_from: row.get::<_, Option<String>>(18)?,
+                })
+            })
+            .map_err(|e| format!("Failed to query user skills: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(skills)
+    }
+
+    /// Get a single user skill by ID.
+    pub fn get_user_skill(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::skills::SkillDefinition>, String> {
+        let conn = self.get_conn()?;
+
+        let result = conn.query_row(
+            r#"
+            SELECT id, name, slug, description, category, tags, icon, color,
+                   allowed_phases, parameters, template, source,
+                   version, author, checksum, depends_on, usage_count, approval_status, forked_from,
+                   created_at, updated_at
+            FROM user_skills
+            WHERE id = ?1
+            "#,
+            params![id],
+            |row| {
+                let tags_json: String =
+                    row.get::<_, String>(5).unwrap_or_else(|_| "[]".to_string());
+                let allowed_phases_json: String = row
+                    .get::<_, String>(8)
+                    .unwrap_or_else(|_| "[\"setup\"]".to_string());
+                let parameters_json: String =
+                    row.get::<_, String>(9).unwrap_or_else(|_| "[]".to_string());
+                let template_json: String = row.get(10)?;
+
+                Ok(crate::skills::SkillDefinition {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    slug: row.get(2)?,
+                    description: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    category: row
+                        .get::<_, Option<String>>(4)?
+                        .unwrap_or_else(|| "custom".to_string()),
+                    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                    icon: row
+                        .get::<_, Option<String>>(6)?
+                        .unwrap_or_else(|| "puzzle".to_string()),
+                    color: row
+                        .get::<_, Option<String>>(7)?
+                        .unwrap_or_else(|| "gray".to_string()),
+                    allowed_phases: serde_json::from_str(&allowed_phases_json)
+                        .unwrap_or_else(|_| vec!["setup".to_string()]),
+                    parameters: serde_json::from_str(&parameters_json).unwrap_or_default(),
+                    template: serde_json::from_str(&template_json).unwrap_or(
+                        crate::skills::SkillTemplate::SingleStep {
+                            step: std::collections::HashMap::new(),
+                        },
+                    ),
+                    source: row
+                        .get::<_, Option<String>>(11)?
+                        .unwrap_or_else(|| "user".to_string()),
+                    version: row.get::<_, Option<String>>(12)?,
+                    author: row
+                        .get::<_, Option<String>>(13)?
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    checksum: row.get::<_, Option<String>>(14)?,
+                    depends_on: row
+                        .get::<_, Option<String>>(15)?
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    usage_count: row.get::<_, Option<u64>>(16)?,
+                    approval_status: row.get::<_, Option<String>>(17)?,
+                    forked_from: row.get::<_, Option<String>>(18)?,
+                })
+            },
+        );
+
+        match result {
+            Ok(skill) => Ok(Some(skill)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!("Failed to get user skill: {}", e)),
+        }
+    }
+
+    /// Create a new user skill.
+    pub fn create_user_skill(
+        &self,
+        request: &crate::mcp::skills::CreateSkillRequest,
+    ) -> Result<crate::skills::SkillDefinition, String> {
+        let conn = self.get_conn()?;
+        let id = format!("user:{}", request.slug);
+        let now = Utc::now().to_rfc3339();
+
+        let tags_json = serde_json::to_string(&request.tags).unwrap_or_else(|_| "[]".to_string());
+        let allowed_phases_json =
+            serde_json::to_string(&request.allowed_phases).unwrap_or_else(|_| "[]".to_string());
+        let parameters_json =
+            serde_json::to_string(&request.parameters).unwrap_or_else(|_| "[]".to_string());
+        let template_json = serde_json::to_string(&request.template)
+            .map_err(|e| format!("Failed to serialize template: {}", e))?;
+
+        conn.execute(
+            r#"
+            INSERT INTO user_skills (
+                id, name, slug, description, category, tags, icon, color,
+                allowed_phases, parameters, template, source,
+                version, author, checksum, depends_on, usage_count, approval_status, forked_from,
+                created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
+            "#,
+            params![
+                id,
+                request.name,
+                request.slug,
+                request.description,
+                request.category,
+                tags_json,
+                request.icon,
+                request.color,
+                allowed_phases_json,
+                parameters_json,
+                template_json,
+                "user",
+                "1.0.0",                    // version
+                Option::<String>::None,      // author
+                Option::<String>::None,      // checksum
+                "[]",                        // depends_on
+                0i64,                        // usage_count
+                Option::<String>::None,      // approval_status
+                Option::<String>::None,      // forked_from
+                now,
+                now,
+            ],
+        )
+        .map_err(|e| format!("Failed to create user skill: {}", e))?;
+
+        self.get_user_skill(&id)?
+            .ok_or_else(|| "Failed to retrieve created skill".to_string())
+    }
+
+    /// Update a user skill.
+    pub fn update_user_skill(
+        &self,
+        id: &str,
+        request: &crate::mcp::skills::UpdateSkillRequest,
+    ) -> Result<crate::skills::SkillDefinition, String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        let current = self
+            .get_user_skill(id)?
+            .ok_or_else(|| format!("User skill not found: {}", id))?;
+
+        let name = request.name.as_ref().unwrap_or(&current.name);
+        let slug = request.slug.as_ref().unwrap_or(&current.slug);
+        let description = request.description.as_ref().unwrap_or(&current.description);
+        let category = request.category.as_ref().unwrap_or(&current.category);
+        let tags = request.tags.as_ref().unwrap_or(&current.tags);
+        let icon = request.icon.as_ref().unwrap_or(&current.icon);
+        let color = request.color.as_ref().unwrap_or(&current.color);
+        let allowed_phases = request
+            .allowed_phases
+            .as_ref()
+            .unwrap_or(&current.allowed_phases);
+        let parameters = request.parameters.as_ref().unwrap_or(&current.parameters);
+        let template = request.template.as_ref().unwrap_or(&current.template);
+
+        let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
+        let allowed_phases_json =
+            serde_json::to_string(allowed_phases).unwrap_or_else(|_| "[]".to_string());
+        let parameters_json =
+            serde_json::to_string(parameters).unwrap_or_else(|_| "[]".to_string());
+        let template_json = serde_json::to_string(template)
+            .map_err(|e| format!("Failed to serialize template: {}", e))?;
+
+        // Update the ID if slug changed
+        let new_id = format!("user:{}", slug);
+
+        conn.execute(
+            r#"
+            UPDATE user_skills SET
+                id = ?1, name = ?2, slug = ?3, description = ?4, category = ?5,
+                tags = ?6, icon = ?7, color = ?8, allowed_phases = ?9,
+                parameters = ?10, template = ?11, updated_at = ?12
+            WHERE id = ?13
+            "#,
+            params![
+                new_id,
+                name,
+                slug,
+                description,
+                category,
+                tags_json,
+                icon,
+                color,
+                allowed_phases_json,
+                parameters_json,
+                template_json,
+                now,
+                id,
+            ],
+        )
+        .map_err(|e| format!("Failed to update user skill: {}", e))?;
+
+        self.get_user_skill(&new_id)?
+            .ok_or_else(|| "Failed to retrieve updated skill".to_string())
+    }
+
+    /// Export user skills for sharing.
+    /// If `ids` is empty, exports all non-builtin skills.
+    pub fn export_user_skills(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<crate::skills::SkillDefinition>, String> {
+        if ids.is_empty() {
+            return self.list_user_skills();
+        }
+
+        let conn = self.get_conn()?;
+        let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{}", i)).collect();
+        let query = format!(
+            r#"SELECT id, name, slug, description, category, tags, icon, color,
+                      allowed_phases, parameters, template, source,
+                      version, author, checksum, depends_on, usage_count, approval_status, forked_from,
+                      created_at, updated_at
+               FROM user_skills
+               WHERE id IN ({})
+               ORDER BY updated_at DESC"#,
+            placeholders.join(", ")
+        );
+
+        let mut stmt = conn
+            .prepare(&query)
+            .map_err(|e| format!("Failed to prepare export query: {}", e))?;
+
+        let params: Vec<&dyn rusqlite::types::ToSql> = ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+
+        let skills = stmt
+            .query_map(params.as_slice(), |row| {
+                let tags_json: String =
+                    row.get::<_, String>(5).unwrap_or_else(|_| "[]".to_string());
+                let allowed_phases_json: String = row
+                    .get::<_, String>(8)
+                    .unwrap_or_else(|_| "[\"setup\"]".to_string());
+                let parameters_json: String =
+                    row.get::<_, String>(9).unwrap_or_else(|_| "[]".to_string());
+                let template_json: String = row.get(10)?;
+
+                Ok(crate::skills::SkillDefinition {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    slug: row.get(2)?,
+                    description: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    category: row
+                        .get::<_, Option<String>>(4)?
+                        .unwrap_or_else(|| "custom".to_string()),
+                    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                    icon: row
+                        .get::<_, Option<String>>(6)?
+                        .unwrap_or_else(|| "puzzle".to_string()),
+                    color: row
+                        .get::<_, Option<String>>(7)?
+                        .unwrap_or_else(|| "gray".to_string()),
+                    allowed_phases: serde_json::from_str(&allowed_phases_json)
+                        .unwrap_or_else(|_| vec!["setup".to_string()]),
+                    parameters: serde_json::from_str(&parameters_json).unwrap_or_default(),
+                    template: serde_json::from_str(&template_json).unwrap_or(
+                        crate::skills::SkillTemplate::SingleStep {
+                            step: std::collections::HashMap::new(),
+                        },
+                    ),
+                    source: row
+                        .get::<_, Option<String>>(11)?
+                        .unwrap_or_else(|| "user".to_string()),
+                    version: row.get::<_, Option<String>>(12)?,
+                    author: row
+                        .get::<_, Option<String>>(13)?
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    checksum: row.get::<_, Option<String>>(14)?,
+                    depends_on: row
+                        .get::<_, Option<String>>(15)?
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    usage_count: row.get::<_, Option<u64>>(16)?,
+                    approval_status: row.get::<_, Option<String>>(17)?,
+                    forked_from: row.get::<_, Option<String>>(18)?,
+                })
+            })
+            .map_err(|e| format!("Failed to export skills: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(skills)
+    }
+
+    /// Import skills from an export. Sets source to "community" and id to "community:<slug>".
+    /// `conflict_mode` is "skip" or "overwrite".
+    pub fn import_skills(
+        &self,
+        skills: &[crate::skills::SkillDefinition],
+        conflict_mode: &str,
+    ) -> Result<crate::skills::SkillImportResult, String> {
+        let conn = self.get_conn()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut imported = 0usize;
+        let mut skipped = 0usize;
+        let mut overwritten = 0usize;
+        let mut errors = Vec::new();
+
+        for skill in skills {
+            let slug = &skill.slug;
+            let id = format!("community:{}", slug);
+
+            let tags_json = serde_json::to_string(&skill.tags).unwrap_or_else(|_| "[]".to_string());
+            let allowed_phases_json =
+                serde_json::to_string(&skill.allowed_phases).unwrap_or_else(|_| "[]".to_string());
+            let parameters_json =
+                serde_json::to_string(&skill.parameters).unwrap_or_else(|_| "[]".to_string());
+            let template_json = match serde_json::to_string(&skill.template) {
+                Ok(j) => j,
+                Err(e) => {
+                    errors.push(format!(
+                        "Failed to serialize template for '{}': {}",
+                        slug, e
+                    ));
+                    continue;
+                }
+            };
+
+            // Check if slug already exists
+            let exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM user_skills WHERE slug = ?1",
+                    params![slug],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|count| count > 0)
+                .unwrap_or(false);
+
+            if exists {
+                if conflict_mode == "overwrite" {
+                    let overwrite_author_json = skill
+                        .author
+                        .as_ref()
+                        .map(|a| serde_json::to_string(a).unwrap_or_default());
+                    let overwrite_depends_on_json =
+                        serde_json::to_string(&skill.depends_on.as_deref().unwrap_or(&[]))
+                            .unwrap_or_else(|_| "[]".to_string());
+
+                    match conn.execute(
+                        r#"UPDATE user_skills SET
+                            id = ?1, name = ?2, description = ?3, category = ?4,
+                            tags = ?5, icon = ?6, color = ?7, allowed_phases = ?8,
+                            parameters = ?9, template = ?10, source = ?11, updated_at = ?12,
+                            version = ?13, author = ?14, checksum = ?15, depends_on = ?16,
+                            usage_count = ?17, approval_status = ?18, forked_from = ?19
+                        WHERE slug = ?20"#,
+                        params![
+                            id,
+                            skill.name,
+                            skill.description,
+                            skill.category,
+                            tags_json,
+                            skill.icon,
+                            skill.color,
+                            allowed_phases_json,
+                            parameters_json,
+                            template_json,
+                            "community",
+                            now,
+                            skill.version.as_deref().unwrap_or("1.0.0"),
+                            overwrite_author_json,
+                            skill.checksum.as_deref(),
+                            overwrite_depends_on_json,
+                            skill.usage_count.unwrap_or(0) as i64,
+                            skill.approval_status.as_deref(),
+                            skill.forked_from.as_deref(),
+                            slug,
+                        ],
+                    ) {
+                        Ok(_) => overwritten += 1,
+                        Err(e) => errors.push(format!("Failed to overwrite '{}': {}", slug, e)),
+                    }
+                } else {
+                    skipped += 1;
+                }
+            } else {
+                let author_json = skill
+                    .author
+                    .as_ref()
+                    .map(|a| serde_json::to_string(a).unwrap_or_default());
+                let depends_on_json =
+                    serde_json::to_string(&skill.depends_on.as_deref().unwrap_or(&[]))
+                        .unwrap_or_else(|_| "[]".to_string());
+
+                match conn.execute(
+                    r#"INSERT INTO user_skills (
+                        id, name, slug, description, category, tags, icon, color,
+                        allowed_phases, parameters, template, source,
+                        version, author, checksum, depends_on, usage_count, approval_status, forked_from,
+                        created_at, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)"#,
+                    params![
+                        id,
+                        skill.name,
+                        slug,
+                        skill.description,
+                        skill.category,
+                        tags_json,
+                        skill.icon,
+                        skill.color,
+                        allowed_phases_json,
+                        parameters_json,
+                        template_json,
+                        "community",
+                        skill.version.as_deref().unwrap_or("1.0.0"),
+                        author_json,
+                        skill.checksum.as_deref(),
+                        depends_on_json,
+                        skill.usage_count.unwrap_or(0) as i64,
+                        skill.approval_status.as_deref(),
+                        skill.forked_from.as_deref(),
+                        now,
+                        now,
+                    ],
+                ) {
+                    Ok(_) => imported += 1,
+                    Err(e) => errors.push(format!("Failed to import '{}': {}", slug, e)),
+                }
+            }
+        }
+
+        Ok(crate::skills::SkillImportResult {
+            imported,
+            skipped,
+            overwritten,
+            errors,
+            warnings: vec![],
+        })
+    }
+
+    /// Delete a user skill by ID.
+    pub fn delete_user_skill(&self, id: &str) -> Result<bool, String> {
+        let conn = self.get_conn()?;
+
+        let deleted = conn
+            .execute("DELETE FROM user_skills WHERE id = ?1", params![id])
+            .map_err(|e| format!("Failed to delete user skill: {}", e))?;
+
+        Ok(deleted > 0)
+    }
+
+    /// Update the approval status of a skill.
+    pub fn update_skill_approval(&self, skill_id: &str, status: &str) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        let rows = conn
+            .execute(
+                "UPDATE user_skills SET approval_status = ?1 WHERE id = ?2",
+                params![status, skill_id],
+            )
+            .map_err(|e| format!("Failed to update approval status: {}", e))?;
+
+        if rows == 0 {
+            return Err(format!("Skill not found: {}", skill_id));
+        }
+        Ok(())
+    }
+
+    /// Update the version and checksum of a skill.
+    pub fn update_skill_version(
+        &self,
+        skill_id: &str,
+        version: &str,
+        checksum: &str,
+    ) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        let rows = conn
+            .execute(
+                "UPDATE user_skills SET version = ?1, checksum = ?2, updated_at = datetime('now') WHERE id = ?3",
+                params![version, checksum, skill_id],
+            )
+            .map_err(|e| format!("Failed to update skill version: {}", e))?;
+
+        if rows == 0 {
+            return Err(format!("Skill not found: {}", skill_id));
+        }
+        Ok(())
+    }
+
+    /// Fork a skill by creating a copy with a new ID.
+    pub fn fork_skill(
+        &self,
+        skill_id: &str,
+        new_name: Option<&str>,
+    ) -> Result<crate::skills::SkillDefinition, String> {
+        let original = self
+            .get_user_skill(skill_id)?
+            .ok_or_else(|| format!("Skill not found: {}", skill_id))?;
+
+        let fork_name = new_name
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| format!("{} (fork)", original.name));
+        let fork_slug = format!(
+            "{}-fork-{}",
+            original.slug,
+            &uuid::Uuid::new_v4().to_string()[..8]
+        );
+        let fork_id = format!("user:{}", fork_slug);
+        let now = Utc::now().to_rfc3339();
+
+        let tags_json = serde_json::to_string(&original.tags).unwrap_or_else(|_| "[]".to_string());
+        let allowed_phases_json =
+            serde_json::to_string(&original.allowed_phases).unwrap_or_else(|_| "[]".to_string());
+        let parameters_json =
+            serde_json::to_string(&original.parameters).unwrap_or_else(|_| "[]".to_string());
+        let template_json = serde_json::to_string(&original.template)
+            .map_err(|e| format!("Failed to serialize template: {}", e))?;
+        let author_json = original
+            .author
+            .as_ref()
+            .map(|a| serde_json::to_string(a).unwrap_or_default());
+        let depends_on_json = serde_json::to_string(&original.depends_on.as_deref().unwrap_or(&[]))
+            .unwrap_or_else(|_| "[]".to_string());
+
+        let conn = self.get_conn()?;
+        conn.execute(
+            r#"INSERT INTO user_skills (
+                id, name, slug, description, category, tags, icon, color,
+                allowed_phases, parameters, template, source,
+                version, author, checksum, depends_on, usage_count, approval_status, forked_from,
+                created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)"#,
+            params![
+                fork_id,
+                fork_name,
+                fork_slug,
+                original.description,
+                original.category,
+                tags_json,
+                original.icon,
+                original.color,
+                allowed_phases_json,
+                parameters_json,
+                template_json,
+                "user",
+                "1.0.0",
+                author_json,
+                Option::<String>::None, // checksum
+                depends_on_json,
+                0i64,                   // usage_count
+                Option::<String>::None, // approval_status
+                skill_id,               // forked_from
+                now,
+                now,
+            ],
+        )
+        .map_err(|e| format!("Failed to create forked skill: {}", e))?;
+
+        self.get_user_skill(&fork_id)?
+            .ok_or_else(|| "Failed to retrieve forked skill".to_string())
+    }
+
+    /// Increment the usage count of a skill and return the new count.
+    pub fn increment_skill_usage(&self, skill_id: &str) -> Result<u64, String> {
+        let conn = self.get_conn()?;
+        let rows = conn
+            .execute(
+                "UPDATE user_skills SET usage_count = COALESCE(usage_count, 0) + 1 WHERE id = ?1",
+                params![skill_id],
+            )
+            .map_err(|e| format!("Failed to increment usage count: {}", e))?;
+
+        if rows == 0 {
+            return Err(format!("Skill not found: {}", skill_id));
+        }
+
+        let count: u64 = conn
+            .query_row(
+                "SELECT COALESCE(usage_count, 0) FROM user_skills WHERE id = ?1",
+                params![skill_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to read usage count: {}", e))?;
+
+        Ok(count)
+    }
+
+    // ========================================================================
+    // Phase Token Usage Operations
+    // ========================================================================
+
+    /// Record token usage for a single AI call within a workflow phase.
+    pub fn create_phase_token_usage(
+        &self,
+        task_run_id: &str,
+        phase: &str,
+        stage_index: Option<u32>,
+        iteration: Option<u32>,
+        model_used: Option<&str>,
+        provider_used: Option<&str>,
+        input_tokens: u64,
+        output_tokens: u64,
+        cost_cents: u64,
+        duration_ms: Option<u64>,
+    ) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        conn.execute(
+            r#"INSERT INTO phase_token_usage
+                (task_run_id, phase, stage_index, iteration, model_used, provider_used,
+                 input_tokens, output_tokens, cost_cents, duration_ms)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
+            params![
+                task_run_id,
+                phase,
+                stage_index.map(|v| v as i64),
+                iteration.map(|v| v as i64),
+                model_used,
+                provider_used,
+                input_tokens as i64,
+                output_tokens as i64,
+                cost_cents as i64,
+                duration_ms.map(|v| v as i64),
+            ],
+        )
+        .map_err(|e| format!("Failed to insert phase token usage: {}", e))?;
+        Ok(())
+    }
+
+    /// Get per-phase token usage breakdown for a task run.
+    pub fn get_phase_token_usage(
+        &self,
+        task_run_id: &str,
+    ) -> Result<Vec<PhaseTokenUsageRow>, String> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT phase, stage_index, iteration, model_used, provider_used,
+                       input_tokens, output_tokens, cost_cents, duration_ms, created_at
+                FROM phase_token_usage
+                WHERE task_run_id = ?1
+                ORDER BY created_at ASC"#,
+            )
+            .map_err(|e| format!("Failed to prepare phase token usage query: {}", e))?;
+
+        let rows = stmt
+            .query_map(params![task_run_id], |row| {
+                Ok(PhaseTokenUsageRow {
+                    phase: row.get(0)?,
+                    stage_index: row.get::<_, Option<i64>>(1)?.map(|v| v as u32),
+                    iteration: row.get::<_, Option<i64>>(2)?.map(|v| v as u32),
+                    model_used: row.get(3)?,
+                    provider_used: row.get(4)?,
+                    input_tokens: row.get::<_, i64>(5)? as u64,
+                    output_tokens: row.get::<_, i64>(6)? as u64,
+                    cost_cents: row.get::<_, i64>(7)? as u64,
+                    duration_ms: row.get::<_, Option<i64>>(8)?.map(|v| v as u64),
+                    created_at: row.get(9)?,
+                })
+            })
+            .map_err(|e| format!("Failed to query phase token usage: {}", e))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect phase token usage rows: {}", e))
+    }
+
+    /// Update the aggregate token totals on a task run.
+    pub fn update_task_run_token_totals(&self, task_run_id: &str) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        conn.execute(
+            r#"UPDATE task_runs SET
+                total_input_tokens = COALESCE((SELECT SUM(input_tokens) FROM phase_token_usage WHERE task_run_id = ?1), 0),
+                total_output_tokens = COALESCE((SELECT SUM(output_tokens) FROM phase_token_usage WHERE task_run_id = ?1), 0),
+                total_cost_cents = COALESCE((SELECT SUM(cost_cents) FROM phase_token_usage WHERE task_run_id = ?1), 0)
+            WHERE id = ?1"#,
+            params![task_run_id],
+        )
+        .map_err(|e| format!("Failed to update task run token totals: {}", e))?;
+        Ok(())
+    }
+}
+
+/// A row from the phase_token_usage table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhaseTokenUsageRow {
+    pub phase: String,
+    pub stage_index: Option<u32>,
+    pub iteration: Option<u32>,
+    pub model_used: Option<String>,
+    pub provider_used: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_cents: u64,
+    pub duration_ms: Option<u64>,
+    pub created_at: String,
 }
 
 // ========================================================================

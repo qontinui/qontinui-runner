@@ -287,7 +287,9 @@ pub fn build_meta_workflow_template(
         generated_by_task_run_id: None,
         stages: Vec::new(),
         stop_on_failure: false,
+        approval_gate: false,
         reflection_mode: false,
+        model_overrides: std::collections::HashMap::new(),
         created_at: now.clone(),
         updated_at: now,
     }
@@ -644,7 +646,12 @@ Output the workflow JSON now:
 /// user's task and produce an enriched description for the builder agent.
 fn build_investigation_setup_prompt(description: &str) -> String {
     format!(
-        r#"You are a codebase investigation AI. Your job is to analyze the user's task description in context of the project and produce an enriched, technically-grounded version.
+        r#"You are a codebase investigation AI preparing context for workflow generation.
+
+IMPORTANT: You are the first agent in a workflow generation pipeline. The task description below
+describes what a GENERATED WORKFLOW will do when executed by the runner. You are NOT executing
+this task — do NOT attempt to run commands, use APIs, interact with services, or take any actions.
+Your output feeds into a Builder agent that creates a UnifiedWorkflow JSON specification.
 
 ## User's Original Task Description
 
@@ -661,7 +668,9 @@ Analyze the user's intent in context of the project structure (from discovery co
 5. **Specify concrete targets** — replace vague references with specific file paths and component names
 6. **Mention verification approaches** — suggest what should be checked to verify the work
 
-Output ONLY the enriched task description as plain text. No JSON, no code blocks, no prefixes."#,
+CRITICAL: Do NOT run shell commands, make HTTP requests, use APIs, or interact with any system.
+Do NOT ask questions or request permission. You are a text-in, text-out analyst.
+Output ONLY the enriched task description as plain text. No JSON, no code blocks, no prefixes, no questions."#,
         description = description,
     )
 }

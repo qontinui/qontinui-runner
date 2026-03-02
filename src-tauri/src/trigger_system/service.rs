@@ -4,10 +4,11 @@
 //! AtomicBool stop signal, background tokio task.
 
 use once_cell::sync::Lazy;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config_storage::ConfigStorage;
 use crate::AppState;
@@ -22,10 +23,20 @@ use super::watchers;
 // Service
 // ============================================================================
 
+/// Handle to a registered watcher, keyed by trigger ID.
+enum WatcherHandle {
+    /// Async task (schedule, health check)
+    Task(tokio::task::JoinHandle<()>),
+    /// File-system watcher (must be kept alive)
+    FileWatcher(notify::RecommendedWatcher),
+}
+
 /// Background service that manages trigger watchers and processes events.
 pub struct TriggerService {
     /// Flag to stop the service
     stop_signal: Arc<AtomicBool>,
+    /// Per-watcher stop signals (so we can stop individual watchers)
+    watcher_stop_signals: RwLock<HashMap<String, Arc<AtomicBool>>>,
     /// Event channel sender (watchers send events here)
     event_tx: mpsc::Sender<TriggerEvent>,
     /// Event channel receiver (service processes events)
@@ -34,11 +45,10 @@ pub struct TriggerService {
     evaluator: Arc<TriggerEvaluator>,
     /// Dependencies for spawning workflows
     deps: TriggerExecutorDeps,
-    /// Active watcher handles (for cleanup)
-    watcher_handles: RwLock<Vec<tokio::task::JoinHandle<()>>>,
-    /// Active notify watchers (must be kept alive)
-    #[allow(dead_code)]
-    file_watchers: RwLock<Vec<notify::RecommendedWatcher>>,
+    /// Active watcher handles keyed by trigger ID (for lifecycle management)
+    watcher_handles: RwLock<HashMap<String, WatcherHandle>>,
+    /// Count of dropped events (channel overflow)
+    dropped_events: std::sync::atomic::AtomicU64,
 }
 
 impl TriggerService {
@@ -48,12 +58,13 @@ impl TriggerService {
 
         Self {
             stop_signal: Arc::new(AtomicBool::new(false)),
+            watcher_stop_signals: RwLock::new(HashMap::new()),
             event_tx,
             event_rx: Mutex::new(Some(event_rx)),
             evaluator: Arc::new(TriggerEvaluator::new()),
             deps,
-            watcher_handles: RwLock::new(Vec::new()),
-            file_watchers: RwLock::new(Vec::new()),
+            watcher_handles: RwLock::new(HashMap::new()),
+            dropped_events: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -111,13 +122,64 @@ impl TriggerService {
         info!("Stopping trigger service");
         self.stop_signal.store(true, Ordering::SeqCst);
 
-        // Abort watcher tasks
-        let handles = self.watcher_handles.try_read();
-        if let Ok(handles) = handles {
-            for handle in handles.iter() {
-                handle.abort();
+        // Signal all individual watchers to stop
+        if let Ok(signals) = self.watcher_stop_signals.try_read() {
+            for (id, signal) in signals.iter() {
+                debug!("Signaling watcher '{}' to stop", id);
+                signal.store(true, Ordering::SeqCst);
             }
         }
+
+        // Abort watcher tasks
+        if let Ok(handles) = self.watcher_handles.try_read() {
+            for (id, handle) in handles.iter() {
+                debug!("Aborting watcher handle for '{}'", id);
+                if let WatcherHandle::Task(h) = handle {
+                    h.abort();
+                }
+            }
+        }
+    }
+
+    /// Unregister a watcher for a specific trigger.
+    ///
+    /// Stops the watcher task and removes it from the handle map.
+    pub async fn unregister_watcher(&self, trigger_id: &str) {
+        // Signal the watcher to stop
+        {
+            let mut signals = self.watcher_stop_signals.write().await;
+            if let Some(signal) = signals.remove(trigger_id) {
+                signal.store(true, Ordering::SeqCst);
+            }
+        }
+
+        // Remove and drop the handle
+        let mut handles = self.watcher_handles.write().await;
+        if let Some(handle) = handles.remove(trigger_id) {
+            match handle {
+                WatcherHandle::Task(h) => {
+                    h.abort();
+                    info!("Unregistered async watcher for trigger '{}'", trigger_id);
+                }
+                WatcherHandle::FileWatcher(_w) => {
+                    // Dropping the RecommendedWatcher stops it
+                    info!("Unregistered file watcher for trigger '{}'", trigger_id);
+                }
+            }
+        }
+
+        // Clear evaluator state for this trigger
+        self.evaluator.clear_trigger_state(trigger_id).await;
+    }
+
+    /// Get the number of dropped events (channel overflow).
+    pub fn dropped_event_count(&self) -> u64 {
+        self.dropped_events.load(Ordering::Relaxed)
+    }
+
+    /// Increment the dropped event counter.
+    pub fn record_dropped_event(&self) {
+        self.dropped_events.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Register watchers for all enabled triggers.
@@ -143,9 +205,20 @@ impl TriggerService {
     }
 
     /// Register a watcher for a single trigger.
+    ///
+    /// If a watcher is already registered for this trigger, it is unregistered first.
     pub async fn register_watcher(&self, trigger: &WorkflowTrigger) -> Result<(), String> {
+        // Unregister existing watcher for this trigger (if any)
+        self.unregister_watcher(&trigger.id).await;
+
         let tx = self.event_tx.clone();
-        let stop = self.stop_signal.clone();
+
+        // Create a per-watcher stop signal (also responds to global stop)
+        let watcher_stop = Arc::new(AtomicBool::new(false));
+        {
+            let mut signals = self.watcher_stop_signals.write().await;
+            signals.insert(trigger.id.clone(), watcher_stop.clone());
+        }
 
         match &trigger.trigger_config {
             super::types::TriggerConfig::FileWatch {
@@ -161,11 +234,11 @@ impl TriggerService {
                     ignore_patterns.clone(),
                     *recursive,
                     tx,
-                    stop,
+                    watcher_stop,
                 )?;
 
-                let mut file_watchers = self.file_watchers.write().await;
-                file_watchers.push(watcher);
+                let mut handles = self.watcher_handles.write().await;
+                handles.insert(trigger.id.clone(), WatcherHandle::FileWatcher(watcher));
                 info!("Registered file watcher for trigger '{}'", trigger.name);
             }
 
@@ -180,11 +253,11 @@ impl TriggerService {
                     events.clone(),
                     branch_filter.clone(),
                     tx,
-                    stop,
+                    watcher_stop,
                 )?;
 
-                let mut file_watchers = self.file_watchers.write().await;
-                file_watchers.push(watcher);
+                let mut handles = self.watcher_handles.write().await;
+                handles.insert(trigger.id.clone(), WatcherHandle::FileWatcher(watcher));
                 info!("Registered git watcher for trigger '{}'", trigger.name);
             }
 
@@ -199,14 +272,34 @@ impl TriggerService {
                     *check_interval_seconds,
                     *consecutive_failures,
                     tx,
-                    stop,
+                    watcher_stop,
                 );
 
                 let mut handles = self.watcher_handles.write().await;
-                handles.push(handle);
+                handles.insert(trigger.id.clone(), WatcherHandle::Task(handle));
                 info!(
                     "Registered health check for trigger '{}' ({}s interval)",
                     trigger.name, check_interval_seconds
+                );
+            }
+
+            super::types::TriggerConfig::Schedule {
+                cron_expression,
+                timezone,
+            } => {
+                let handle = watchers::schedule::start_schedule(
+                    trigger.id.clone(),
+                    cron_expression.clone(),
+                    timezone.clone(),
+                    tx,
+                    watcher_stop,
+                )?;
+
+                let mut handles = self.watcher_handles.write().await;
+                handles.insert(trigger.id.clone(), WatcherHandle::Task(handle));
+                info!(
+                    "Registered schedule for trigger '{}' (cron: {}, tz: {})",
+                    trigger.name, cron_expression, timezone
                 );
             }
 
@@ -255,49 +348,102 @@ impl TriggerService {
         let action = eval_result.action_name().to_string();
 
         if eval_result.should_execute() {
-            // Execute: spawn the workflow
+            // Execute: spawn the workflow (with retry support)
             self.evaluator.record_execution_start(&trigger.id).await;
 
-            let exec_result = executor::execute_triggered_workflow(
-                &self.deps,
-                &trigger.workflow_id,
-                trigger.workflow_overrides.as_ref(),
-                &event.variables,
-                &trigger.name,
-                event.chain_depth,
-            );
+            let max_attempts = trigger.retry_count + 1; // retry_count=0 means 1 attempt
+            let mut last_error: Option<String> = None;
+            let mut succeeded = false;
 
-            match exec_result {
-                Ok(execution_id) => {
-                    // Record success
-                    if let Err(e) =
-                        storage::record_trigger_fired(db, &trigger.id, Some(&execution_id))
-                    {
-                        error!("Failed to record trigger fired: {}", e);
-                    }
-
-                    let history = TriggerHistoryEntry {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        trigger_id: trigger.id.clone(),
-                        event_type: event.event_type.clone(),
-                        event_data: event.event_data.clone(),
-                        action: "executed".to_string(),
-                        task_run_id: Some(execution_id.clone()),
-                        error_message: None,
-                        triggered_at: chrono::Utc::now().to_rfc3339(),
-                    };
-
-                    if let Err(e) = storage::record_history(db, &history) {
-                        error!("Failed to record trigger history: {}", e);
-                    }
-
+            for attempt in 0..max_attempts {
+                if attempt > 0 {
+                    // Exponential backoff: base_delay * 2^(attempt-1)
+                    let delay_secs = trigger.retry_delay_seconds * (1u64 << (attempt - 1));
                     info!(
-                        "Trigger '{}' executed -> task_run: {}",
-                        trigger.name, execution_id
+                        "Trigger '{}' retry {}/{} after {}s delay",
+                        trigger.name, attempt, trigger.retry_count, delay_secs
                     );
+                    tokio::time::sleep(tokio::time::Duration::from_secs(delay_secs)).await;
+
+                    // Check stop signal between retries
+                    if self.stop_signal.load(Ordering::SeqCst) {
+                        info!(
+                            "Trigger '{}' retries aborted: service stopping",
+                            trigger.name
+                        );
+                        break;
+                    }
                 }
-                Err(e) => {
-                    error!("Trigger '{}' execution failed: {}", trigger.name, e);
+
+                let exec_result = executor::execute_triggered_workflow(
+                    &self.deps,
+                    &trigger.workflow_id,
+                    trigger.workflow_overrides.as_ref(),
+                    &event.variables,
+                    &trigger.name,
+                    event.chain_depth,
+                );
+
+                match exec_result {
+                    Ok(execution_id) => {
+                        // Record success
+                        if let Err(e) =
+                            storage::record_trigger_fired(db, &trigger.id, Some(&execution_id))
+                        {
+                            error!("Failed to record trigger fired: {}", e);
+                        }
+
+                        let history = TriggerHistoryEntry {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            trigger_id: trigger.id.clone(),
+                            event_type: event.event_type.clone(),
+                            event_data: event.event_data.clone(),
+                            action: if attempt > 0 {
+                                format!("executed (retry {})", attempt)
+                            } else {
+                                "executed".to_string()
+                            },
+                            task_run_id: Some(execution_id.clone()),
+                            error_message: None,
+                            triggered_at: chrono::Utc::now().to_rfc3339(),
+                        };
+
+                        if let Err(e) = storage::record_history(db, &history) {
+                            error!("Failed to record trigger history: {}", e);
+                        }
+
+                        info!(
+                            "Trigger '{}' executed -> task_run: {}{}",
+                            trigger.name,
+                            execution_id,
+                            if attempt > 0 {
+                                format!(" (after {} retries)", attempt)
+                            } else {
+                                String::new()
+                            }
+                        );
+                        succeeded = true;
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Trigger '{}' execution failed (attempt {}/{}): {}",
+                            trigger.name,
+                            attempt + 1,
+                            max_attempts,
+                            e
+                        );
+                        last_error = Some(e);
+                    }
+                }
+            }
+
+            if !succeeded {
+                if let Some(e) = last_error {
+                    error!(
+                        "Trigger '{}' execution failed after {} attempt(s): {}",
+                        trigger.name, max_attempts, e
+                    );
 
                     let history = TriggerHistoryEntry {
                         id: uuid::Uuid::new_v4().to_string(),
@@ -306,7 +452,11 @@ impl TriggerService {
                         event_data: event.event_data.clone(),
                         action: "error".to_string(),
                         task_run_id: None,
-                        error_message: Some(e),
+                        error_message: Some(if max_attempts > 1 {
+                            format!("Failed after {} attempts: {}", max_attempts, e)
+                        } else {
+                            e
+                        }),
                         triggered_at: chrono::Utc::now().to_rfc3339(),
                     };
 
@@ -342,8 +492,7 @@ impl TriggerService {
         let (total, enabled) = storage::get_trigger_stats(db).unwrap_or((0, 0));
         let active_watchers = {
             let handles = self.watcher_handles.read().await;
-            let file_watchers = self.file_watchers.read().await;
-            (handles.len() + file_watchers.len()) as u64
+            handles.len() as u64
         };
         let active_executions = self.evaluator.get_total_active().await;
 
@@ -353,6 +502,7 @@ impl TriggerService {
             enabled_triggers: enabled,
             active_watchers,
             active_executions,
+            dropped_events: self.dropped_event_count(),
         }
     }
 }

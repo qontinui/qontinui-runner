@@ -8,6 +8,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { Search, X, Check as CheckIcon, Navigation, Tag, AlertCircle } from "lucide-react";
 import type { WorkflowPhase } from "../../types/unified-workflow";
+import { getApiBase } from "@/lib/runner-api";
 
 // State type from the state machine
 interface State {
@@ -25,8 +26,6 @@ interface StateLibraryPickerProps {
   onSelect: (state: State, phase: WorkflowPhase) => void;
   phase: WorkflowPhase;
 }
-
-const API_BASE = "http://localhost:9876";
 
 export function StateLibraryPicker({ isOpen, onClose, onSelect, phase }: StateLibraryPickerProps) {
   const [states, setStates] = useState<State[]>([]);
@@ -46,7 +45,7 @@ export function StateLibraryPicker({ isOpen, onClose, onSelect, phase }: StateLi
       setIsLoading(true);
       setError(null);
       try {
-        const response = await fetch(`${API_BASE}/testing/states`, {
+        const response = await fetch(`${getApiBase()}/testing/states`, {
           signal: controller.signal,
         });
         const result = await response.json();

@@ -22,6 +22,10 @@ pub struct SetupConfig {
     pub execution_id: String,
     /// Workflow name
     pub workflow_name: String,
+    /// Model override for setup phase AI calls
+    pub model_override: Option<String>,
+    /// Provider override for setup phase AI calls
+    pub provider_override: Option<String>,
 }
 
 impl SetupConfig {
@@ -32,6 +36,8 @@ impl SetupConfig {
             prompt_steps: Vec::new(),
             execution_id: execution_id.into(),
             workflow_name: workflow_name.into(),
+            model_override: None,
+            provider_override: None,
         }
     }
 
@@ -191,6 +197,10 @@ pub struct CompletionConfig {
     pub workflow_name: String,
     /// Number of verification-agentic iterations that ran
     pub iterations_run: u32,
+    /// Model override for completion phase AI calls
+    pub model_override: Option<String>,
+    /// Provider override for completion phase AI calls
+    pub provider_override: Option<String>,
 }
 
 impl CompletionConfig {
@@ -206,6 +216,8 @@ impl CompletionConfig {
             execution_id: execution_id.into(),
             workflow_name: workflow_name.into(),
             iterations_run,
+            model_override: None,
+            provider_override: None,
         }
     }
 

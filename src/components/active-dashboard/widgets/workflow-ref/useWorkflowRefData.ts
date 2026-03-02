@@ -8,8 +8,8 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import type { WorkflowRefData } from "./types";
 import type { WorkflowRefExecution, StepStats } from "../shared/types";
+import { getApiBase } from "@/lib/runner-api";
 
-const API_BASE = "http://localhost:9876";
 const POLL_INTERVAL_MS = 2000;
 
 /**
@@ -57,7 +57,7 @@ export function useWorkflowRefData(): WorkflowRefData {
   // Fetch workflow ref executions
   const fetchWorkflows = useCallback(async () => {
     try {
-      const response = await fetch(`${API_BASE}/step-executions?type=workflow_ref`);
+      const response = await fetch(`${getApiBase()}/step-executions?type=workflow_ref`);
       if (response.ok) {
         const data: StepExecutionResponse = await response.json();
         if (data.success && data.data?.executions) {

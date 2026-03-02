@@ -9,7 +9,7 @@
 //! needed by the Builder (e.g., which files contain the widget, what data
 //! sources exist, which event emitters are actually called).
 
-use crate::ai_provider::{run_prompt_with_routing, AiResponse};
+use crate::ai_provider::AiResponse;
 use crate::ai_router::TaskContext;
 use crate::doctor::DoctorHandle;
 use std::time::Instant;
@@ -36,13 +36,25 @@ pub fn run_investigation(
     discovery_context: &str,
     resolved_contexts: &str,
     doctor_handle: Option<&DoctorHandle>,
+    model_override: Option<&str>,
+    provider_override: Option<&str>,
 ) -> InvestigationResult {
     let start = Instant::now();
 
     let prompt =
         build_investigation_prompt(original_description, discovery_context, resolved_contexts);
     let task_context = TaskContext::from_prompt(&prompt);
-    let ai_result: AiResponse = run_prompt_with_routing(&prompt, &task_context, doctor_handle);
+    let ai_result: AiResponse = crate::ai_provider::run_prompt_with_model_override(
+        &prompt,
+        &task_context,
+        doctor_handle,
+        model_override,
+        provider_override,
+        None,
+        None,
+        None,
+        None,
+    );
 
     let duration_ms = start.elapsed().as_millis() as u64;
 

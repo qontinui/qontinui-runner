@@ -298,7 +298,9 @@ pub async fn sync_workflows_from_backend(
                     max_sweep_iterations: Some(workflow.max_sweep_iterations),
                     stages: Some(workflow.stages.clone()),
                     stop_on_failure: Some(workflow.stop_on_failure),
+                    approval_gate: Some(workflow.approval_gate),
                     reflection_mode: Some(workflow.reflection_mode),
+                    model_overrides: Some(workflow.model_overrides.clone()),
                 };
                 if let Err(e) = db.update_unified_workflow(&workflow.id, &update_req) {
                     warn!("Failed to update cached workflow {}: {}", workflow.id, e);
@@ -335,7 +337,9 @@ pub async fn sync_workflows_from_backend(
                     max_sweep_iterations: Some(workflow.max_sweep_iterations),
                     stages: Some(workflow.stages.clone()),
                     stop_on_failure: Some(workflow.stop_on_failure),
+                    approval_gate: Some(workflow.approval_gate),
                     reflection_mode: Some(workflow.reflection_mode),
+                    model_overrides: Some(workflow.model_overrides.clone()),
                 };
                 if let Err(e) = db.create_unified_workflow(&create_req) {
                     warn!("Failed to cache workflow {}: {}", workflow.id, e);

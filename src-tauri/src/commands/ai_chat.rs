@@ -630,6 +630,7 @@ pub async fn generate_workflow_from_chat(
         investigate_codebase: Some(true),
         include_design_guidance: None,
         auto_run: None,
+        model_overrides: None,
     };
 
     // Emit a UI-only note that generation is starting (not sent to AI session —
@@ -736,7 +737,9 @@ pub async fn generate_workflow_from_chat(
                             Some(workflow.stages.clone())
                         },
                         stop_on_failure: Some(workflow.stop_on_failure),
+                        approval_gate: Some(workflow.approval_gate),
                         reflection_mode: Some(workflow.reflection_mode),
+                        model_overrides: Some(workflow.model_overrides.clone()),
                     };
 
                     let db_save = app_state.checkpoint_db.clone();
@@ -1113,9 +1116,11 @@ async fn fetch_existing_specs() -> String {
 
     let mut specs_parts: Vec<String> = Vec::new();
 
+    let self_base = crate::mcp::types::get_self_base_url_from_env();
+
     // Fetch cached external app specs
     match client
-        .get("http://localhost:9876/ui-bridge/sdk/cached-specs")
+        .get(format!("{}/ui-bridge/sdk/cached-specs", self_base))
         .send()
         .await
     {
@@ -1133,7 +1138,7 @@ async fn fetch_existing_specs() -> String {
 
     // Fetch runner's own page specs
     match client
-        .get("http://localhost:9876/ui-bridge/control/specs")
+        .get(format!("{}/ui-bridge/control/specs", self_base))
         .send()
         .await
     {

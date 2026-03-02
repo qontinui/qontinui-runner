@@ -36,14 +36,18 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { getAccentColors } from "@/design-system";
+import {
+  PROVIDER_OPTIONS,
+  MODELS_BY_PROVIDER,
+  MODEL_OVERRIDE_PHASES,
+} from "@qontinui/workflow-utils";
 import { SpecSourceSection, type SpecSourceState } from "./SpecSourceSection";
 import { buildSpecPrompt } from "@/lib/spec-prompt-builder";
 import {
   GENERATION_TEMPLATES,
   type WorkflowGenerationTemplate,
 } from "@/lib/workflow-generation-templates";
-
-const API_BASE = "http://localhost:9876";
+import { getApiBase } from "@/lib/runner-api";
 
 // Icon lookup map for template icons
 const TEMPLATE_ICONS: Record<string, LucideIcon> = {
@@ -83,16 +87,6 @@ const GEMINI_MODELS = [
 ];
 
 // =============================================================================
-// Auto-run localStorage signal
-// =============================================================================
-
-export const AUTO_RUN_AFTER_GENERATE_KEY = "auto-run-after-generate";
-export interface AutoRunAfterGenerate {
-  taskRunId: string;
-  timestamp: number;
-}
-
-// =============================================================================
 // Types
 // =============================================================================
 
@@ -123,7 +117,7 @@ export interface AiGeneratePanelProps {
 
 async function autoSaveGenerationPrompt(promptText: string): Promise<void> {
   try {
-    const resp = await fetch(`${API_BASE}/prompts`);
+    const resp = await fetch(`${getApiBase()}/prompts`);
     const json = await resp.json();
     const existing: SavedPrompt[] = json.data ?? [];
     const trimmed = promptText.trim();
@@ -134,7 +128,7 @@ async function autoSaveGenerationPrompt(promptText: string): Promise<void> {
 
     const name = trimmed.length > 60 ? trimmed.substring(0, 57) + "..." : trimmed;
 
-    await fetch(`${API_BASE}/prompts`, {
+    await fetch(`${getApiBase()}/prompts`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -198,6 +192,9 @@ export function AiGeneratePanel({
   const [investigateCodebase, setInvestigateCodebase] = useState(true);
   const [includeDesignGuidance, setIncludeDesignGuidance] = useState(false);
   const [discoveryMode, setDiscoveryMode] = useState<"auto" | "enabled" | "disabled">("auto");
+  const [generationModelOverrides, setGenerationModelOverrides] = useState<
+    Record<string, { provider?: string; model?: string }> | undefined
+  >(undefined);
 
   // Context section
   const [showContext, setShowContext] = useState(false);
@@ -246,7 +243,7 @@ export function AiGeneratePanel({
 
     (async () => {
       try {
-        const resp = await fetch(`${API_BASE}/prompts`, { signal: controller.signal });
+        const resp = await fetch(`${getApiBase()}/prompts`, { signal: controller.signal });
         const json = await resp.json();
         if (!cancelled) setSavedPrompts(json.data ?? []);
       } catch {
@@ -255,7 +252,7 @@ export function AiGeneratePanel({
     })();
     (async () => {
       try {
-        const resp = await fetch(`${API_BASE}/contexts`, { signal: controller.signal });
+        const resp = await fetch(`${getApiBase()}/contexts`, { signal: controller.signal });
         const json = await resp.json();
         if (!cancelled) setSavedContexts(json.data ?? []);
       } catch {
@@ -277,7 +274,7 @@ export function AiGeneratePanel({
 
     (async () => {
       try {
-        const resp = await fetch(`${API_BASE}/settings/ai`, { signal: controller.signal });
+        const resp = await fetch(`${getApiBase()}/settings/ai`, { signal: controller.signal });
         const json = await resp.json();
         if (!cancelled) setAiSettings(json.data ?? null);
       } catch {
@@ -338,7 +335,7 @@ export function AiGeneratePanel({
     setIsSavingTemplate(true);
     try {
       const name = trimmed.length > 60 ? trimmed.substring(0, 57) + "..." : trimmed;
-      await fetch(`${API_BASE}/prompts`, {
+      await fetch(`${getApiBase()}/prompts`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -350,7 +347,7 @@ export function AiGeneratePanel({
         }),
       });
       // Refresh prompts
-      const resp = await fetch(`${API_BASE}/prompts`);
+      const resp = await fetch(`${getApiBase()}/prompts`);
       const json = await resp.json();
       setSavedPrompts(json.data ?? []);
     } catch {
@@ -363,7 +360,7 @@ export function AiGeneratePanel({
   const handleDeleteSavedTemplate = useCallback(async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
     try {
-      await fetch(`${API_BASE}/prompts/${id}`, { method: "DELETE" });
+      await fetch(`${getApiBase()}/prompts/${id}`, { method: "DELETE" });
       setSavedPrompts((prev) => prev.filter((p) => p.id !== id));
     } catch {
       // Failed to delete
@@ -375,7 +372,7 @@ export function AiGeneratePanel({
     setIsImportingFile(true);
     setImportFeedback(null);
     try {
-      const importResp = await fetch(`${API_BASE}/contexts/user/from-file`, {
+      const importResp = await fetch(`${getApiBase()}/contexts/user/from-file`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ file_path: filePath.trim() }),
@@ -387,7 +384,7 @@ export function AiGeneratePanel({
       setFilePath("");
       setImportFeedback({ type: "success", message: "Context imported successfully" });
       // Refresh contexts
-      const resp = await fetch(`${API_BASE}/contexts`);
+      const resp = await fetch(`${getApiBase()}/contexts`);
       const json = await resp.json();
       setSavedContexts(json.data ?? []);
       // Auto-dismiss success after 3s
@@ -428,6 +425,7 @@ export function AiGeneratePanel({
     request.investigate_codebase = investigateCodebase;
     if (includeDesignGuidance) request.include_design_guidance = true;
     if (discoveryMode !== "auto") request.discovery_mode = discoveryMode;
+    if (generationModelOverrides) request.model_overrides = generationModelOverrides;
 
     return request;
   }, [
@@ -444,6 +442,7 @@ export function AiGeneratePanel({
     includeDesignGuidance,
     discoveryMode,
     hasSpecs,
+    generationModelOverrides,
   ]);
 
   /** Build a single request (non-batch or fallback). */
@@ -510,7 +509,7 @@ export function AiGeneratePanel({
 
   /** Fire a single generate-async request and return the task_run_id. */
   const fireGenerateRequest = async (request: Record<string, unknown>): Promise<string> => {
-    const resp = await fetch(`${API_BASE}/unified-workflows/generate-async`, {
+    const resp = await fetch(`${getApiBase()}/unified-workflows/generate-async`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(request),
@@ -538,6 +537,13 @@ export function AiGeneratePanel({
       }
       if (description.trim()) {
         autoSaveGenerationPrompt(description); // fire-and-forget
+      }
+      // Persist generation overrides for "Copy from Last Generation" in workflow builder
+      if (generationModelOverrides && Object.keys(generationModelOverrides).length > 0) {
+        localStorage.setItem(
+          "last-generation-model-overrides",
+          JSON.stringify(generationModelOverrides),
+        );
       }
       onNavigateToActiveRuns();
     } catch (err) {
@@ -567,6 +573,13 @@ export function AiGeneratePanel({
       }
       if (description.trim()) {
         autoSaveGenerationPrompt(description); // fire-and-forget
+      }
+      // Persist generation overrides for "Copy from Last Generation" in workflow builder
+      if (generationModelOverrides && Object.keys(generationModelOverrides).length > 0) {
+        localStorage.setItem(
+          "last-generation-model-overrides",
+          JSON.stringify(generationModelOverrides),
+        );
       }
       onNavigateToActiveRuns();
     } catch (err) {
@@ -1042,6 +1055,114 @@ export function AiGeneratePanel({
                         </span>
                       </span>
                     </label>
+                  </div>
+                </div>
+
+                {/* Per-Phase Model Overrides */}
+                <div className="col-span-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      // Toggle visibility by setting/clearing overrides
+                      const el = document.getElementById("gen-phase-overrides");
+                      if (el) el.classList.toggle("hidden");
+                    }}
+                    className="flex items-center gap-2 text-xs text-zinc-400 hover:text-zinc-200 transition-colors mb-2"
+                  >
+                    <ChevronRight className="w-3.5 h-3.5" />
+                    Per-Phase Model Overrides
+                    {generationModelOverrides &&
+                      Object.keys(generationModelOverrides).length > 0 && (
+                        <span className="px-1.5 py-0.5 text-[10px] font-medium bg-purple-500/20 text-purple-400 rounded">
+                          Active
+                        </span>
+                      )}
+                  </button>
+                  <div id="gen-phase-overrides" className="hidden space-y-2 pl-1">
+                    <p className="text-[10px] text-zinc-500">
+                      Override provider/model for investigation and generation phases. Empty =
+                      inherit from the provider/model above.
+                    </p>
+                    {MODEL_OVERRIDE_PHASES.filter((p) =>
+                      ["investigation", "generation"].includes(p.key),
+                    ).map((phase) => {
+                      const cfg = generationModelOverrides?.[phase.key];
+                      const phaseProvider = cfg?.provider ?? "";
+                      const phaseModel = cfg?.model ?? "";
+                      const selectClass =
+                        "flex-1 h-7 px-2 rounded bg-zinc-800 border border-zinc-700 text-zinc-200 text-[11px] focus:outline-none focus:ring-2 focus:ring-blue-500/50";
+                      return (
+                        <div key={phase.key} className="flex items-center gap-2">
+                          <span
+                            className="text-[11px] text-zinc-400 w-24 flex-shrink-0 truncate"
+                            title={phase.label}
+                          >
+                            {phase.label}
+                          </span>
+                          <select
+                            className={selectClass}
+                            value={phaseProvider}
+                            onChange={(e) => {
+                              const current = { ...(generationModelOverrides ?? {}) };
+                              const phaseCfg = { ...(current[phase.key] ?? {}) };
+                              if (e.target.value) {
+                                phaseCfg.provider = e.target.value;
+                              } else {
+                                delete phaseCfg.provider;
+                              }
+                              // Reset model on provider change
+                              if (e.target.value !== phaseProvider) delete phaseCfg.model;
+                              if (!phaseCfg.provider && !phaseCfg.model) {
+                                delete current[phase.key];
+                              } else {
+                                current[phase.key] = phaseCfg;
+                              }
+                              setGenerationModelOverrides(
+                                Object.keys(current).length > 0 ? current : undefined,
+                              );
+                            }}
+                          >
+                            <option value="">Inherit</option>
+                            {PROVIDER_OPTIONS.filter((p) => p.value !== "").map((opt) => (
+                              <option key={opt.value} value={opt.value}>
+                                {opt.label}
+                              </option>
+                            ))}
+                          </select>
+                          {phaseProvider && MODELS_BY_PROVIDER[phaseProvider] ? (
+                            <select
+                              className={selectClass}
+                              value={phaseModel}
+                              onChange={(e) => {
+                                const current = { ...(generationModelOverrides ?? {}) };
+                                const phaseCfg = { ...(current[phase.key] ?? {}) };
+                                if (e.target.value) {
+                                  phaseCfg.model = e.target.value;
+                                } else {
+                                  delete phaseCfg.model;
+                                }
+                                if (!phaseCfg.provider && !phaseCfg.model) {
+                                  delete current[phase.key];
+                                } else {
+                                  current[phase.key] = phaseCfg;
+                                }
+                                setGenerationModelOverrides(
+                                  Object.keys(current).length > 0 ? current : undefined,
+                                );
+                              }}
+                            >
+                              {MODELS_BY_PROVIDER[phaseProvider]!.map((opt) => (
+                                <option key={opt.value} value={opt.value}>
+                                  {opt.label}
+                                </option>
+                              ))}
+                            </select>
+                          ) : (
+                            <div className="flex-1" />
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
               </div>

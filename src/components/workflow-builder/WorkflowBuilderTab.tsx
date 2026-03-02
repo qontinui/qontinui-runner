@@ -19,9 +19,24 @@ import {
   Trash2,
   Check,
   Download,
+  Upload,
   ChevronDown,
   ChevronUp,
   AlertCircle,
+  Terminal,
+  Puzzle,
+  Layers,
+  Zap,
+  Bot,
+  TestTube2,
+  Monitor,
+  Rocket,
+  Globe,
+  ShieldCheck,
+  CheckCircle2,
+  Activity,
+  ScanSearch,
+  HeartPulse,
 } from "lucide-react";
 import type {
   WorkflowPhase,
@@ -33,6 +48,8 @@ import type {
   SavedShellCommand,
   LogSourceSelection,
   HealthCheckUrl,
+  ModelOverrideConfig,
+  ModelOverrides,
 } from "../../types";
 import { generateStepId } from "../../types";
 import { useGlobalLogSources } from "../../hooks/useGlobalLogSources";
@@ -46,11 +63,15 @@ import {
   WORKFLOW_SETTINGS_CONFIG,
   PROVIDER_OPTIONS,
   MODELS_BY_PROVIDER,
+  MODEL_OVERRIDE_PHASES,
+  MODEL_PRESETS,
+  detectPreset,
   getVisibleSections,
   getBooleanDisplayValue,
   toBooleanStoredValue,
   getLogSourceValue as _getLogSourceValue,
   parseLogSourceValue as _parseLogSourceValue,
+  resolveModelForPhase,
 } from "@qontinui/workflow-utils";
 import { WorkflowBuilderProvider, useWorkflowBuilder } from "./WorkflowBuilderContext";
 import { PhaseSection } from "./PhaseSection";
@@ -75,8 +96,31 @@ import { PageTutorialMenu } from "../tutorial";
 import { getAccentColors } from "@/design-system";
 import { BatchDeleteDialog, ConfirmDialog } from "../ui";
 import { BuilderToolbar, toolbarActions } from "../ui/BuilderToolbar";
+import { registerUserSkills } from "@qontinui/workflow-utils";
+import { CompositionSkillBuilder } from "@qontinui/workflow-ui/components";
+import { getApiBase } from "@/lib/runner-api";
 
-const API_BASE = "http://localhost:9876";
+// Minimal icon resolver for composition builder (maps icon IDs to lucide components)
+const SKILL_ICON_MAP: Record<string, React.ComponentType<{ className?: string }>> = {
+  terminal: Terminal,
+  puzzle: Puzzle,
+  layers: Layers,
+  zap: Zap,
+  bot: Bot,
+  "test-tube-2": TestTube2,
+  monitor: Monitor,
+  rocket: Rocket,
+  globe: Globe,
+  "shield-check": ShieldCheck,
+  "check-circle-2": CheckCircle2,
+  activity: Activity,
+  "scan-search": ScanSearch,
+  "heart-pulse": HeartPulse,
+  sparkles: Sparkles,
+};
+function resolveSkillIcon(iconId: string): React.ComponentType<{ className?: string }> {
+  return SKILL_ICON_MAP[iconId] || Puzzle;
+}
 
 // EmptyState removed — replaced by AiGeneratePanel as the default empty view
 
@@ -393,6 +437,12 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
       case "context_management":
         return <ContextManagement key={def.key} />;
 
+      case "per_phase_model_select":
+        return <PerPhaseModelSelect key={def.key} />;
+
+      case "resolved_model_preview":
+        return <ResolvedModelPreview key={def.key} />;
+
       case "category_input":
         return (
           <div key={def.key}>
@@ -572,6 +622,248 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
   return (
     <div className="p-4 border-t border-zinc-700 space-y-4">
       {visibleSections.map(renderSection)}
+    </div>
+  );
+}
+
+// =============================================================================
+// Resolved Model Preview Component
+// =============================================================================
+
+function ResolvedModelPreview() {
+  const { state } = useWorkflowBuilder();
+  const { workflow } = state;
+  const overrides: ModelOverrides = (workflow.model_overrides as ModelOverrides) ?? {};
+
+  const rows = MODEL_OVERRIDE_PHASES.map((phase) => ({
+    ...phase,
+    resolved: resolveModelForPhase(phase.key, overrides, workflow.model, undefined),
+  }));
+
+  const badgeClass = (source: string) => {
+    switch (source) {
+      case "phase":
+        return "bg-purple-500/20 text-purple-400";
+      case "workflow":
+        return "bg-blue-500/20 text-blue-400";
+      case "smart":
+        return "bg-green-500/20 text-green-400";
+      default:
+        return "bg-zinc-500/20 text-zinc-400";
+    }
+  };
+
+  return (
+    <div className="bg-zinc-800/50 rounded-md p-3">
+      <p className="text-xs font-medium text-zinc-300 mb-2">Effective Model Preview</p>
+      <div className="space-y-1">
+        {rows.map((row) => (
+          <div key={row.key} className="flex items-center gap-2 text-xs">
+            <span className="text-zinc-400 w-28 flex-shrink-0 truncate">{row.label}</span>
+            <span className="text-zinc-200 flex-1 truncate">{row.resolved.model}</span>
+            <span
+              className={`px-1.5 py-0.5 text-[10px] font-medium rounded ${badgeClass(row.resolved.source)}`}
+            >
+              {row.resolved.source}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// =============================================================================
+// Per-Phase Model Select Component
+// =============================================================================
+
+function PerPhaseModelSelect() {
+  const { state, updateWorkflow } = useWorkflowBuilder();
+  const { workflow } = state;
+  const [isExpanded, setIsExpanded] = useState(false);
+
+  const overrides: ModelOverrides = (workflow.model_overrides as ModelOverrides) ?? {};
+  const hasOverrides = MODEL_OVERRIDE_PHASES.some((phase) => {
+    const cfg = overrides[phase.key as keyof ModelOverrides];
+    return cfg?.provider || cfg?.model;
+  });
+
+  const currentPreset = detectPreset(overrides);
+
+  const updatePhaseOverride = (phaseKey: string, field: "provider" | "model", value: string) => {
+    const current = { ...overrides };
+    const phaseCfg: ModelOverrideConfig = {
+      ...(current[phaseKey as keyof ModelOverrides] ?? {}),
+    };
+    if (value) {
+      phaseCfg[field] = value;
+    } else {
+      delete phaseCfg[field];
+    }
+    // Remove phase entry if both fields are empty
+    if (!phaseCfg.provider && !phaseCfg.model) {
+      delete current[phaseKey as keyof ModelOverrides];
+    } else {
+      (current as Record<string, ModelOverrideConfig>)[phaseKey] = phaseCfg;
+    }
+    updateWorkflow({ model_overrides: Object.keys(current).length > 0 ? current : undefined });
+  };
+
+  const applyPreset = (presetId: string) => {
+    if (presetId === "custom") return;
+    const preset = MODEL_PRESETS.find((p) => p.id === presetId);
+    if (preset) {
+      updateWorkflow({
+        model_overrides: Object.keys(preset.overrides).length > 0 ? preset.overrides : undefined,
+      });
+    }
+  };
+
+  const resetAll = () => {
+    updateWorkflow({ model_overrides: undefined });
+  };
+
+  const copyFromLastGeneration = () => {
+    try {
+      const stored = localStorage.getItem("last-generation-model-overrides");
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (parsed && typeof parsed === "object") {
+          updateWorkflow({ model_overrides: parsed });
+        }
+      }
+    } catch {
+      // Ignore invalid localStorage data
+    }
+  };
+
+  const hasLastGeneration = (() => {
+    try {
+      const stored = localStorage.getItem("last-generation-model-overrides");
+      return stored && Object.keys(JSON.parse(stored)).length > 0;
+    } catch {
+      return false;
+    }
+  })();
+
+  const selectClass =
+    "flex-1 px-2 py-1.5 bg-zinc-700 border border-zinc-600 rounded text-zinc-200 text-xs focus:outline-none focus:ring-2 focus:ring-purple-500/50";
+
+  return (
+    <div className="bg-zinc-800/50 rounded-md overflow-hidden">
+      <button
+        type="button"
+        onClick={() => setIsExpanded(!isExpanded)}
+        className="w-full flex items-center gap-2 p-3 hover:bg-zinc-700/30 transition-colors"
+      >
+        {isExpanded ? (
+          <ChevronUp className="w-4 h-4 text-zinc-400" />
+        ) : (
+          <ChevronDown className="w-4 h-4 text-zinc-400" />
+        )}
+        <span className="text-sm font-medium text-zinc-300">Per-Phase Model Selection</span>
+        {hasOverrides && (
+          <span className="px-1.5 py-0.5 text-[10px] font-medium bg-purple-500/20 text-purple-400 rounded">
+            {currentPreset !== "custom"
+              ? (MODEL_PRESETS.find((p) => p.id === currentPreset)?.name ?? "Active")
+              : "Custom"}
+          </span>
+        )}
+      </button>
+      {isExpanded && (
+        <div className="px-3 pb-3 space-y-2">
+          {/* Preset selector + Reset */}
+          <div className="flex items-center gap-2">
+            <select
+              value={currentPreset}
+              onChange={(e) => applyPreset(e.target.value)}
+              className="flex-1 px-2 py-1.5 bg-zinc-700 border border-zinc-600 rounded text-zinc-200 text-xs focus:outline-none focus:ring-2 focus:ring-purple-500/50"
+              data-ui-id="workflow-builder-model-preset"
+            >
+              <option value="custom">Custom</option>
+              {MODEL_PRESETS.map((preset) => (
+                <option key={preset.id} value={preset.id}>
+                  {preset.name} — {preset.description}
+                </option>
+              ))}
+            </select>
+            {hasLastGeneration && (
+              <button
+                type="button"
+                onClick={copyFromLastGeneration}
+                className="px-2 py-1.5 text-xs text-zinc-400 hover:text-blue-400 border border-zinc-600 rounded hover:border-blue-500/30 transition-colors"
+                title="Copy model overrides from the last AI generation run"
+              >
+                From Generation
+              </button>
+            )}
+            {hasOverrides && (
+              <button
+                type="button"
+                onClick={resetAll}
+                className="px-2 py-1.5 text-xs text-zinc-400 hover:text-red-400 border border-zinc-600 rounded hover:border-red-500/30 transition-colors"
+              >
+                Reset
+              </button>
+            )}
+          </div>
+
+          <p className="text-xs text-zinc-500">
+            Override provider/model for individual phases. Empty = inherit from workflow-level
+            setting.
+          </p>
+          {MODEL_OVERRIDE_PHASES.map((phase) => {
+            const cfg = overrides[phase.key as keyof ModelOverrides];
+            const provider = cfg?.provider ?? "";
+            const model = cfg?.model ?? "";
+            return (
+              <div key={phase.key} className="flex items-center gap-2">
+                <span
+                  className="text-xs text-zinc-400 w-28 flex-shrink-0 truncate"
+                  title={phase.label}
+                >
+                  {phase.label}
+                </span>
+                <select
+                  value={provider}
+                  onChange={(e) => {
+                    updatePhaseOverride(phase.key, "provider", e.target.value);
+                    // Clear model when provider changes
+                    if (e.target.value !== provider) {
+                      updatePhaseOverride(phase.key, "model", "");
+                    }
+                  }}
+                  className={selectClass}
+                  data-ui-id={`workflow-builder-phase-${phase.key}-provider`}
+                >
+                  <option value="">Inherit</option>
+                  {PROVIDER_OPTIONS.filter((p) => p.value !== "").map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+                {provider && MODELS_BY_PROVIDER[provider] ? (
+                  <select
+                    value={model}
+                    onChange={(e) => updatePhaseOverride(phase.key, "model", e.target.value)}
+                    className={selectClass}
+                    data-ui-id={`workflow-builder-phase-${phase.key}-model`}
+                  >
+                    {MODELS_BY_PROVIDER[provider]!.map((opt) => (
+                      <option key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <div className="flex-1" />
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
@@ -826,6 +1118,22 @@ function WorkflowBuilderContent({
   const [isExportingWorkflow, setIsExportingWorkflow] = useState(false);
   const [workflowImportError, setWorkflowImportError] = useState<string | null>(null);
 
+  // Skill import/export state
+  const [isExportingSkills, setIsExportingSkills] = useState(false);
+  const [isImportingSkills, setIsImportingSkills] = useState(false);
+  const skillFileInputRef = useRef<HTMLInputElement>(null);
+  const [showSkillImportDialog, setShowSkillImportDialog] = useState(false);
+  const [pendingImportSkills, setPendingImportSkills] = useState<unknown[] | null>(null);
+  const [importConflictMode, setImportConflictMode] = useState<"skip" | "overwrite">("skip");
+  const [showSkillExportDialog, setShowSkillExportDialog] = useState(false);
+  const [availableSkillsForExport, setAvailableSkillsForExport] = useState<
+    Array<{ id: string; name: string; source: string }>
+  >([]);
+  const [selectedSkillIdsForExport, setSelectedSkillIdsForExport] = useState<Set<string>>(
+    new Set(),
+  );
+  const [showCompositionBuilder, setShowCompositionBuilder] = useState(false);
+
   // Handle creating a new workflow with visual feedback
   const handleNewWorkflow = useCallback(() => {
     resetToNew();
@@ -843,7 +1151,7 @@ function WorkflowBuilderContent({
   const fetchWorkflows = useCallback(async () => {
     setWorkflowsLoading(true);
     try {
-      const response = await fetch(`${API_BASE}/unified-workflows`);
+      const response = await fetch(`${getApiBase()}/unified-workflows`);
       const result = await response.json();
       if (result.success && result.data) {
         setSavedWorkflows(result.data);
@@ -896,7 +1204,7 @@ function WorkflowBuilderContent({
     setIsDeletingWorkflows(true);
     try {
       const deletePromises = Array.from(selectedWorkflowIds).map((id) =>
-        fetch(`${API_BASE}/unified-workflows/${id}`, { method: "DELETE" }),
+        fetch(`${getApiBase()}/unified-workflows/${id}`, { method: "DELETE" }),
       );
       await Promise.all(deletePromises);
 
@@ -935,7 +1243,7 @@ function WorkflowBuilderContent({
 
     setIsExportingWorkflow(true);
     try {
-      const response = await fetch(`${API_BASE}/unified-workflows/${state.workflow.id}/export`);
+      const response = await fetch(`${getApiBase()}/unified-workflows/${state.workflow.id}/export`);
       const data = await response.json();
       if (data.success && data.data) {
         const exportData = data.data as WorkflowExport;
@@ -984,7 +1292,7 @@ function WorkflowBuilderContent({
         }
 
         // Call the import API
-        const response = await fetch(`${API_BASE}/unified-workflows/import`, {
+        const response = await fetch(`${getApiBase()}/unified-workflows/import`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -1013,6 +1321,188 @@ function WorkflowBuilderContent({
     },
     [fetchWorkflows, loadWorkflow],
   );
+
+  // Open the export dialog with a list of available skills
+  const handleOpenExportDialog = useCallback(async () => {
+    try {
+      const res = await fetch(`${getApiBase()}/skills`);
+      const data = await res.json();
+      const allSkills = data.data ?? data ?? [];
+      const nonBuiltin = allSkills
+        .filter((s: { source: string }) => s.source !== "builtin")
+        .map((s: { id: string; name: string; source: string }) => ({
+          id: s.id,
+          name: s.name,
+          source: s.source,
+        }));
+      if (nonBuiltin.length === 0) {
+        console.log("No user or community skills to export.");
+        return;
+      }
+      setAvailableSkillsForExport(nonBuiltin);
+      setSelectedSkillIdsForExport(new Set(nonBuiltin.map((s: { id: string }) => s.id)));
+      setShowSkillExportDialog(true);
+    } catch (error) {
+      console.error("Failed to load skills for export:", error);
+    }
+  }, []);
+
+  // Execute the export with selected skill IDs
+  const handleExportSkills = useCallback(async () => {
+    setIsExportingSkills(true);
+    setShowSkillExportDialog(false);
+    try {
+      const skillIds = Array.from(selectedSkillIdsForExport);
+      const response = await fetch(`${getApiBase()}/skills/export`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ skill_ids: skillIds }),
+      });
+      const data = await response.json();
+      if (data.success && data.data) {
+        const exportData = data.data;
+        const blob = new Blob([JSON.stringify(exportData, null, 2)], {
+          type: "application/json",
+        });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        const date = new Date().toISOString().split("T")[0];
+        a.download = `qontinui-skills-${date}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+      } else {
+        console.error("Failed to export skills:", data.error);
+      }
+    } catch (error) {
+      console.error("Failed to export skills:", error);
+    } finally {
+      setIsExportingSkills(false);
+    }
+  }, [selectedSkillIdsForExport]);
+
+  // Read the import file and show the conflict mode dialog
+  const handleImportFileSelected = useCallback(
+    async (event: React.ChangeEvent<HTMLInputElement>) => {
+      const file = event.target.files?.[0];
+      if (!file) return;
+
+      try {
+        const text = await file.text();
+        const data = JSON.parse(text);
+
+        if (!data.manifest || data.manifest.content_type !== "skills" || !data.skills) {
+          throw new Error("Invalid skill file format. Expected a skill export file.");
+        }
+
+        setPendingImportSkills(data.skills);
+        setImportConflictMode("skip");
+        setShowSkillImportDialog(true);
+      } catch (error) {
+        console.error("Failed to read skill file:", error);
+      } finally {
+        event.target.value = "";
+      }
+    },
+    [],
+  );
+
+  // Execute the import with the chosen conflict mode
+  const handleConfirmImport = useCallback(async () => {
+    if (!pendingImportSkills) return;
+
+    setShowSkillImportDialog(false);
+    setIsImportingSkills(true);
+    try {
+      const response = await fetch(`${getApiBase()}/skills/import`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          skills: pendingImportSkills,
+          conflict_mode: importConflictMode,
+        }),
+      });
+
+      const result = await response.json();
+      if (result.success && result.data) {
+        const { imported, skipped, overwritten, errors } = result.data;
+        console.log(
+          `Skills imported: ${imported}, skipped: ${skipped}, overwritten: ${overwritten}`,
+          errors.length > 0 ? `Errors: ${errors.join(", ")}` : "",
+        );
+
+        // Refresh the skill registry so imported skills appear immediately
+        if (imported > 0 || overwritten > 0) {
+          try {
+            const skillsRes = await fetch(`${getApiBase()}/skills`);
+            const skillsData = await skillsRes.json();
+            const allSkills = skillsData.data ?? skillsData ?? [];
+            const nonBuiltin = allSkills.filter((s: { source: string }) => s.source !== "builtin");
+            registerUserSkills(nonBuiltin);
+          } catch {
+            // Skill refresh is non-critical
+          }
+        }
+      } else {
+        console.error("Failed to import skills:", result.error);
+      }
+    } catch (error) {
+      console.error("Failed to import skills:", error);
+    } finally {
+      setIsImportingSkills(false);
+      setPendingImportSkills(null);
+    }
+  }, [pendingImportSkills, importConflictMode]);
+
+  // === Skill Fork ===
+  const _handleForkSkill = useCallback(async (skillId: string, newName?: string) => {
+    try {
+      const response = await fetch(`${getApiBase()}/skills/${skillId}/fork`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ new_name: newName || undefined }),
+      });
+      if (!response.ok) {
+        const err = await response.json();
+        console.error("Fork failed:", err);
+        return;
+      }
+      // Refresh skills after fork
+      const allResponse = await fetch(`${getApiBase()}/skills`);
+      if (allResponse.ok) {
+        const allSkills = await allResponse.json();
+        const nonBuiltin = allSkills.filter((s: { source: string }) => s.source !== "builtin");
+        registerUserSkills(nonBuiltin);
+      }
+    } catch (err) {
+      console.error("Fork error:", err);
+    }
+  }, []);
+
+  // === Skill Approval ===
+  const _handleApproveSkill = useCallback(async (skillId: string, status: string) => {
+    try {
+      const response = await fetch(`${getApiBase()}/skills/${skillId}/approve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status }),
+      });
+      if (!response.ok) {
+        const err = await response.json();
+        console.error("Approval failed:", err);
+        return;
+      }
+      // Refresh skills after approval change
+      const allResponse = await fetch(`${getApiBase()}/skills`);
+      if (allResponse.ok) {
+        const allSkills = await allResponse.json();
+        const nonBuiltin = allSkills.filter((s: { source: string }) => s.source !== "builtin");
+        registerUserSkills(nonBuiltin);
+      }
+    } catch (err) {
+      console.error("Approval error:", err);
+    }
+  }, []);
 
   // Filter workflows
   const filteredWorkflows = savedWorkflows.filter((w) => {
@@ -1055,7 +1545,7 @@ function WorkflowBuilderContent({
       try {
         console.log("[WorkflowBuilder] Running workflow:", workflowId, state.workflow.name);
 
-        const runUrl = `${API_BASE}/unified-workflows/${workflowId}/run`;
+        const runUrl = `${getApiBase()}/unified-workflows/${workflowId}/run`;
         const requestBody = JSON.stringify({
           monitor_index: 0,
           // No timeout_seconds - runs until completion or manual stop
@@ -1129,7 +1619,7 @@ function WorkflowBuilderContent({
   // Handle stop execution
   const handleStop = useCallback(async () => {
     try {
-      const response = await fetch(`${API_BASE}/stop-execution`, {
+      const response = await fetch(`${getApiBase()}/stop-execution`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
       });
@@ -1724,6 +2214,243 @@ function WorkflowBuilderContent({
               <span className="text-sm">Export</span>
             </button>
 
+            <button
+              onClick={handleOpenExportDialog}
+              disabled={isExportingSkills}
+              className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-zinc-700 hover:bg-zinc-600 text-zinc-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              title="Export skills to file"
+              data-ui-id="workflow-builder-export-skills-btn"
+            >
+              {isExportingSkills ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Download className="w-4 h-4" />
+              )}
+              <span className="text-sm">Export Skills</span>
+            </button>
+
+            <button
+              onClick={() => skillFileInputRef.current?.click()}
+              disabled={isImportingSkills}
+              className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-zinc-700 hover:bg-zinc-600 text-zinc-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              title="Import skills from file"
+              data-ui-id="workflow-builder-import-skills-btn"
+            >
+              {isImportingSkills ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Upload className="w-4 h-4" />
+              )}
+              <span className="text-sm">Import Skills</span>
+            </button>
+            <input
+              ref={skillFileInputRef}
+              type="file"
+              accept=".json"
+              className="hidden"
+              onChange={handleImportFileSelected}
+            />
+
+            <button
+              onClick={() => setShowCompositionBuilder(true)}
+              className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-zinc-700 hover:bg-zinc-600 text-zinc-200 transition-colors"
+              title="Create a composition skill from existing skills"
+              data-ui-id="workflow-builder-create-composition-btn"
+            >
+              <Layers className="w-4 h-4" />
+              <span className="text-sm">Create Composition</span>
+            </button>
+
+            {/* Composition Skill Builder Dialog */}
+            {showCompositionBuilder && (
+              <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+                <div className="bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl w-[520px]">
+                  <CompositionSkillBuilder
+                    resolveIcon={resolveSkillIcon}
+                    onSave={async (refs) => {
+                      const name = prompt("Composition skill name:");
+                      if (!name) return;
+                      const slug = name
+                        .toLowerCase()
+                        .replace(/[^a-z0-9]+/g, "-")
+                        .replace(/^-|-$/g, "");
+                      try {
+                        await fetch(`${getApiBase()}/skills`, {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({
+                            id: `user:${slug}`,
+                            name,
+                            slug,
+                            description: `Composition of ${refs.length} skills`,
+                            category: "composition",
+                            tags: ["composition"],
+                            icon: "layers",
+                            color: "blue",
+                            allowed_phases: ["setup", "verification", "completion"],
+                            parameters: [],
+                            template: { kind: "composition", skill_refs: refs },
+                          }),
+                        });
+                        // Refresh skills registry
+                        const skillsRes = await fetch(`${getApiBase()}/skills`);
+                        const skillsData = await skillsRes.json();
+                        const allSkills = skillsData.data ?? skillsData ?? [];
+                        const nonBuiltin = allSkills.filter(
+                          (s: { source: string }) => s.source !== "builtin",
+                        );
+                        registerUserSkills(nonBuiltin);
+                      } catch (error) {
+                        console.error("Failed to create composition skill:", error);
+                      }
+                      setShowCompositionBuilder(false);
+                    }}
+                    onCancel={() => setShowCompositionBuilder(false)}
+                  />
+                </div>
+              </div>
+            )}
+
+            {/* Skill Export Dialog */}
+            {showSkillExportDialog && (
+              <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+                <div className="bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl w-[400px] max-h-[500px] flex flex-col">
+                  <div className="px-4 py-3 border-b border-zinc-700">
+                    <h3 className="text-sm font-medium text-zinc-200">Export Skills</h3>
+                    <p className="text-xs text-zinc-500 mt-0.5">Select skills to export</p>
+                  </div>
+                  <div className="flex-1 overflow-y-auto px-4 py-2 space-y-1">
+                    <label className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-zinc-800 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={selectedSkillIdsForExport.size === availableSkillsForExport.length}
+                        onChange={(e) => {
+                          if (e.target.checked) {
+                            setSelectedSkillIdsForExport(
+                              new Set(availableSkillsForExport.map((s) => s.id)),
+                            );
+                          } else {
+                            setSelectedSkillIdsForExport(new Set());
+                          }
+                        }}
+                        className="rounded border-zinc-600"
+                      />
+                      <span className="text-xs text-zinc-400">Select All</span>
+                    </label>
+                    {availableSkillsForExport.map((skill) => (
+                      <label
+                        key={skill.id}
+                        className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-zinc-800 cursor-pointer"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={selectedSkillIdsForExport.has(skill.id)}
+                          onChange={(e) => {
+                            setSelectedSkillIdsForExport((prev) => {
+                              const next = new Set(prev);
+                              if (e.target.checked) next.add(skill.id);
+                              else next.delete(skill.id);
+                              return next;
+                            });
+                          }}
+                          className="rounded border-zinc-600"
+                        />
+                        <span className="text-sm text-zinc-200">{skill.name}</span>
+                        {skill.source === "community" && (
+                          <span className="px-1.5 py-0.5 text-[10px] rounded-full bg-purple-900/30 text-purple-400">
+                            Community
+                          </span>
+                        )}
+                      </label>
+                    ))}
+                  </div>
+                  <div className="px-4 py-3 border-t border-zinc-700 flex justify-end gap-2">
+                    <button
+                      className="px-3 py-1.5 text-sm text-zinc-400 hover:text-zinc-200 transition-colors rounded"
+                      onClick={() => setShowSkillExportDialog(false)}
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      className="px-3 py-1.5 text-sm bg-blue-600 hover:bg-blue-500 text-white rounded disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                      onClick={handleExportSkills}
+                      disabled={selectedSkillIdsForExport.size === 0}
+                    >
+                      Export {selectedSkillIdsForExport.size} Skill
+                      {selectedSkillIdsForExport.size !== 1 ? "s" : ""}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Skill Import Dialog — conflict mode selection */}
+            {showSkillImportDialog && pendingImportSkills && (
+              <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+                <div className="bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl w-[380px]">
+                  <div className="px-4 py-3 border-b border-zinc-700">
+                    <h3 className="text-sm font-medium text-zinc-200">Import Skills</h3>
+                    <p className="text-xs text-zinc-500 mt-0.5">
+                      {(pendingImportSkills as unknown[]).length} skill
+                      {(pendingImportSkills as unknown[]).length !== 1 ? "s" : ""} found in file
+                    </p>
+                  </div>
+                  <div className="px-4 py-3 space-y-2">
+                    <p className="text-xs text-zinc-400">
+                      When a skill with the same name already exists:
+                    </p>
+                    <label className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-zinc-800 cursor-pointer">
+                      <input
+                        type="radio"
+                        name="conflictMode"
+                        checked={importConflictMode === "skip"}
+                        onChange={() => setImportConflictMode("skip")}
+                        className="text-blue-600"
+                      />
+                      <div>
+                        <span className="text-sm text-zinc-200">Skip</span>
+                        <p className="text-xs text-zinc-500">
+                          Keep the existing skill, ignore the imported one
+                        </p>
+                      </div>
+                    </label>
+                    <label className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-zinc-800 cursor-pointer">
+                      <input
+                        type="radio"
+                        name="conflictMode"
+                        checked={importConflictMode === "overwrite"}
+                        onChange={() => setImportConflictMode("overwrite")}
+                        className="text-blue-600"
+                      />
+                      <div>
+                        <span className="text-sm text-zinc-200">Overwrite</span>
+                        <p className="text-xs text-zinc-500">
+                          Replace existing skills with imported versions
+                        </p>
+                      </div>
+                    </label>
+                  </div>
+                  <div className="px-4 py-3 border-t border-zinc-700 flex justify-end gap-2">
+                    <button
+                      className="px-3 py-1.5 text-sm text-zinc-400 hover:text-zinc-200 transition-colors rounded"
+                      onClick={() => {
+                        setShowSkillImportDialog(false);
+                        setPendingImportSkills(null);
+                      }}
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      className="px-3 py-1.5 text-sm bg-blue-600 hover:bg-blue-500 text-white rounded transition-colors"
+                      onClick={handleConfirmImport}
+                    >
+                      Import
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
             {isExecuting ? (
               <button
                 onClick={handleStop}
@@ -1878,24 +2605,6 @@ function WorkflowBuilderContent({
                 </div>
               </div>
 
-              {/* Add Step Dropdown */}
-              {dropdownOpen && (
-                <div className="fixed inset-0 z-40" onClick={() => setDropdownOpen(false)}>
-                  <div
-                    className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    <AddStepDropdown
-                      filterPhase={dropdownPhase ?? undefined}
-                      onAddStep={handleStepAdded}
-                      isOpen={dropdownOpen}
-                      onClose={() => setDropdownOpen(false)}
-                      onOpenWorkflowPicker={handleOpenWorkflowPicker}
-                    />
-                  </div>
-                </div>
-              )}
-
               {/* Prompt Library Picker */}
               <PromptLibraryPicker
                 isOpen={promptPickerOpen}
@@ -2006,6 +2715,32 @@ function WorkflowBuilderContent({
                 onClose={() => setShowSaveBeforeRunDialog(false)}
                 onConfirm={handleSaveAndRun}
               />
+            </div>
+          )}
+
+          {/* Add Step Dropdown (fixed overlay, renders regardless of empty state) */}
+          {dropdownOpen && (
+            <div className="fixed inset-0 z-40" onClick={() => setDropdownOpen(false)}>
+              <div
+                className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <AddStepDropdown
+                  filterPhase={dropdownPhase ?? undefined}
+                  onAddStep={handleStepAdded}
+                  isOpen={dropdownOpen}
+                  onClose={() => setDropdownOpen(false)}
+                  onSkillUsed={async (skillId) => {
+                    try {
+                      await fetch(`${getApiBase()}/skills/${skillId}/increment-usage`, {
+                        method: "POST",
+                      });
+                    } catch {
+                      // Non-critical, silently ignore
+                    }
+                  }}
+                />
+              </div>
             </div>
           )}
 

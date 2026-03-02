@@ -1,6 +1,6 @@
-// Generator Evaluation shared types
+import { getApiBase } from "@/lib/runner-api";
 
-export const API_BASE = "http://localhost:9876";
+// Generator Evaluation shared types
 
 // ============================================================================
 // Dashboard
@@ -168,7 +168,7 @@ export interface ApiResponse<T = unknown> {
 
 /** Typed fetch helper for generator-eval endpoints */
 export async function fetchApi<T>(path: string, options?: RequestInit): Promise<T> {
-  const resp = await fetch(`${API_BASE}${path}`, {
+  const resp = await fetch(`${getApiBase()}${path}`, {
     headers: { "Content-Type": "application/json" },
     ...options,
   });

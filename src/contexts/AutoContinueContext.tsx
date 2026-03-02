@@ -7,6 +7,7 @@
  */
 
 import { createContext, useContext, useState, useCallback, useEffect, type ReactNode } from "react";
+import { getApiPort } from "@/lib/runner-api";
 
 interface AutoContinueContextValue {
   /** Whether auto-continue on restart is enabled */
@@ -25,8 +26,11 @@ interface AutoContinueProviderProps {
   children: ReactNode;
 }
 
-/** Ports to try for the MCP API server (fallback for zombie connections on Windows) */
-const MCP_API_PORTS = [9876, 9877, 9878];
+/** Build port list: primary port from config + two consecutive fallbacks for zombie connections on Windows */
+function getMcpApiPorts(): number[] {
+  const primary = getApiPort();
+  return [primary, primary + 1, primary + 2];
+}
 
 /** Fetch with timeout */
 async function fetchWithTimeout(
@@ -75,7 +79,7 @@ async function fetchWithFallbackPorts(
   }
 
   // Try all ports
-  for (const port of MCP_API_PORTS) {
+  for (const port of getMcpApiPorts()) {
     try {
       const response = await fetchWithTimeout(
         `http://localhost:${port}${path}`,
@@ -90,7 +94,7 @@ async function fetchWithFallbackPorts(
     }
   }
 
-  throw new Error(`Could not connect to MCP API on any port: ${MCP_API_PORTS.join(", ")}`);
+  throw new Error(`Could not connect to MCP API on any port: ${getMcpApiPorts().join(", ")}`);
 }
 
 /** Maximum number of retry attempts when fetching initial state */

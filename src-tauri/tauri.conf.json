@@ -24,7 +24,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost data: blob:; font-src 'self' data:; connect-src 'self' http://127.0.0.1:9876 http://localhost:9876 ws://127.0.0.1:9876 ws://localhost:9876 https://api.anthropic.com https://github.com https://*.githubusercontent.com ipc: http://ipc.localhost; media-src 'self' asset: http://asset.localhost blob:",
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost data: blob:; font-src 'self' data:; connect-src 'self' http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:* https://api.anthropic.com https://github.com https://*.githubusercontent.com ipc: http://ipc.localhost; media-src 'self' asset: http://asset.localhost blob:",
       "assetProtocol": {
         "enable": true,
         "scope": ["**"]

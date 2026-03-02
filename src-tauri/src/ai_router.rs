@@ -106,7 +106,7 @@ fn default_simple_keywords() -> Vec<String> {
 impl Default for RoutingConfig {
     fn default() -> Self {
         Self {
-            enabled: false, // Disabled by default - opt-in feature
+            enabled: true, // Enabled by default — routes by task complexity
             simple_model: default_simple_model(),
             medium_model: default_medium_model(),
             complex_model: default_complex_model(),

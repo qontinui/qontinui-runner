@@ -3,7 +3,11 @@
 //! This module contains all data structures used by the verification-agentic loop.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
+
+use super::conditional_routing::{evaluate_routing_rules, ResolvedModelConfig, RoutingContext};
+use crate::unified_workflows::ModelOverrideConfig;
 
 /// Result of a single iteration of the verification-agentic loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,8 +128,16 @@ pub struct StageConfig {
     pub provider: Option<String>,
     /// Model override for this stage (None = use workflow default).
     pub model: Option<String>,
+    /// Per-phase model overrides for this stage.
+    pub model_overrides: HashMap<String, ModelOverrideConfig>,
     /// Timeout in seconds for this stage's AI sessions.
     pub timeout_seconds: Option<u64>,
+    /// Whether to pause for human approval after each agentic phase.
+    pub approval_gate: bool,
+    /// Optional condition for conditional stage execution.
+    /// When set, the stage is evaluated against this condition before running.
+    /// If the condition is not met, the stage is skipped.
+    pub condition: Option<crate::unified_workflows::StageCondition>,
 }
 
 /// Configuration for the verification-agentic loop.
@@ -173,6 +185,8 @@ pub struct LoopConfig {
     pub provider_override: Option<String>,
     /// Optional AI model override for this loop (from stage config).
     pub model_override: Option<String>,
+    /// Per-phase model overrides (from stage/workflow config).
+    pub model_overrides: HashMap<String, ModelOverrideConfig>,
     /// Stage index when running as part of a multi-stage workflow (None = single-stage).
     pub stage_index: Option<u32>,
     /// Maximum total AI sessions across all stages (None = unlimited).
@@ -182,6 +196,145 @@ pub struct LoopConfig {
     /// When true, the backend reads `result_data.generated_workflow_id` and spawns
     /// the generated workflow without relying on frontend polling.
     pub auto_run_generated: bool,
+    /// Whether to pause for human approval after each agentic phase.
+    /// When true, the loop controller registers an approval request and waits
+    /// for a human response before continuing to the next verification iteration.
+    pub approval_gate: bool,
+    /// Maximum token budget for iteration context building.
+    /// Context sections are added in priority order until this budget is reached.
+    /// Default: 100_000 (~400K chars). Set lower to reduce prompt size.
+    pub max_context_tokens: usize,
+    /// Whether to include knowledge from similar workflows (cross-workflow learning).
+    /// When true, the first iteration queries the knowledge base for insights
+    /// from other workflows with similar names.
+    pub cross_workflow_learning: bool,
+    /// Per-step verification history tracking pass/fail across iterations.
+    /// Key: step name, Value: vector of pass (true) / fail (false) results per iteration.
+    /// Runtime-only state — not persisted. Populated during loop execution.
+    pub verification_history: HashMap<String, Vec<bool>>,
+    /// Runtime routing context for conditional model routing.
+    /// Updated by the loop controller before each phase invocation.
+    pub routing_context: RoutingContext,
+}
+
+impl LoopConfig {
+    /// Update the routing context with current loop state.
+    pub fn set_routing_context(&mut self, iteration: u32, verification_failures: u32) {
+        self.routing_context = RoutingContext {
+            iteration,
+            verification_failures,
+            stage_index: self.stage_index,
+        };
+    }
+
+    /// Resolve the model for a specific phase, considering routing rules.
+    /// If routing rules exist and the routing context is populated, evaluates rules first.
+    /// Fallback chain: routing rules → phase-specific override → workflow-level model_override → None.
+    /// The sentinel value `"__smart__"` is treated as None (let the router decide).
+    pub fn resolve_model_for_phase(&self, phase: &str) -> Option<String> {
+        // Check if there are routing rules for this phase
+        if let Some(config) = self.model_overrides.get(phase) {
+            if let Some(ref rules) = config.routing_rules {
+                if !rules.is_empty() && self.routing_context.iteration > 0 {
+                    let resolved = evaluate_routing_rules(rules, &self.routing_context, config);
+                    let model = resolved.model.or_else(|| self.model_override.clone());
+                    return match model.as_deref() {
+                        Some("__smart__") => None,
+                        _ => model,
+                    };
+                }
+            }
+        }
+
+        let model = self
+            .model_overrides
+            .get(phase)
+            .and_then(|c| c.model.clone())
+            .or_else(|| self.model_override.clone());
+
+        // "__smart__" sentinel means "let the router decide"
+        match model.as_deref() {
+            Some("__smart__") => None,
+            _ => model,
+        }
+    }
+
+    /// Resolve the provider for a specific phase, considering routing rules.
+    /// If routing rules exist and the routing context is populated, evaluates rules first.
+    /// Fallback chain: routing rules → phase-specific override → workflow-level provider_override → None.
+    pub fn resolve_provider_for_phase(&self, phase: &str) -> Option<String> {
+        // Check if there are routing rules for this phase
+        if let Some(config) = self.model_overrides.get(phase) {
+            if let Some(ref rules) = config.routing_rules {
+                if !rules.is_empty() && self.routing_context.iteration > 0 {
+                    let resolved = evaluate_routing_rules(rules, &self.routing_context, config);
+                    return resolved.provider.or_else(|| self.provider_override.clone());
+                }
+            }
+        }
+
+        self.model_overrides
+            .get(phase)
+            .and_then(|c| c.provider.clone())
+            .or_else(|| self.provider_override.clone())
+    }
+
+    /// Resolve the temperature override for a specific phase.
+    pub fn resolve_temperature_for_phase(&self, phase: &str) -> Option<f32> {
+        self.model_overrides.get(phase).and_then(|c| c.temperature)
+    }
+
+    /// Resolve the max_tokens override for a specific phase.
+    pub fn resolve_max_tokens_for_phase(&self, phase: &str) -> Option<u32> {
+        self.model_overrides.get(phase).and_then(|c| c.max_tokens)
+    }
+
+    /// Resolve the fallback model for a specific phase.
+    pub fn resolve_fallback_model_for_phase(&self, phase: &str) -> Option<String> {
+        self.model_overrides
+            .get(phase)
+            .and_then(|c| c.fallback_model.clone())
+    }
+
+    /// Resolve the fallback provider for a specific phase.
+    pub fn resolve_fallback_provider_for_phase(&self, phase: &str) -> Option<String> {
+        self.model_overrides
+            .get(phase)
+            .and_then(|c| c.fallback_provider.clone())
+    }
+
+    /// Resolve model for a phase with runtime context for conditional routing.
+    ///
+    /// If the phase has routing_rules, evaluates them against the context.
+    /// Otherwise falls back to the static resolve chain.
+    pub fn resolve_model_for_phase_with_context(
+        &self,
+        phase: &str,
+        ctx: &RoutingContext,
+    ) -> ResolvedModelConfig {
+        if let Some(config) = self.model_overrides.get(phase) {
+            if let Some(ref rules) = config.routing_rules {
+                if !rules.is_empty() {
+                    let resolved = evaluate_routing_rules(rules, ctx, config);
+                    // Apply workflow-level fallback for model/provider
+                    return ResolvedModelConfig {
+                        model: resolved.model.or_else(|| self.model_override.clone()),
+                        provider: resolved.provider.or_else(|| self.provider_override.clone()),
+                        temperature: resolved.temperature,
+                        max_tokens: resolved.max_tokens,
+                    };
+                }
+            }
+        }
+
+        // No routing rules — use static resolution
+        ResolvedModelConfig {
+            model: self.resolve_model_for_phase(phase),
+            provider: self.resolve_provider_for_phase(phase),
+            temperature: self.resolve_temperature_for_phase(phase),
+            max_tokens: self.resolve_max_tokens_for_phase(phase),
+        }
+    }
 }
 
 /// Result of the completion sweep phase.
@@ -218,9 +371,16 @@ impl WorkflowPhase {
 #[derive(Debug, Clone)]
 pub enum AgenticOutcome {
     /// AI ran successfully
-    Success { output: String },
+    Success {
+        output: String,
+        parsed: Option<super::agentic_output::AgenticPhaseOutput>,
+    },
     /// AI ran but reported failure
-    Failed { output: String, error: String },
+    Failed {
+        output: String,
+        error: String,
+        parsed: Option<super::agentic_output::AgenticPhaseOutput>,
+    },
     /// AI execution errored out
     Error { error: String },
     /// Skipped (no agentic steps defined)
@@ -234,10 +394,19 @@ impl AgenticOutcome {
 
     pub fn output(&self) -> Option<&str> {
         match self {
-            AgenticOutcome::Success { output } => Some(output),
+            AgenticOutcome::Success { output, .. } => Some(output),
             AgenticOutcome::Failed { output, .. } => Some(output),
             AgenticOutcome::Error { error } => Some(error),
             AgenticOutcome::Skipped => None,
+        }
+    }
+
+    /// Access the parsed structured output, if available.
+    pub fn parsed(&self) -> Option<&super::agentic_output::AgenticPhaseOutput> {
+        match self {
+            AgenticOutcome::Success { parsed, .. } => parsed.as_ref(),
+            AgenticOutcome::Failed { parsed, .. } => parsed.as_ref(),
+            AgenticOutcome::Error { .. } | AgenticOutcome::Skipped => None,
         }
     }
 }

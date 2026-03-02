@@ -13,8 +13,8 @@ import type {
   ScreenshotInfo,
   ScreenshotsResult,
 } from "../../types";
+import { getApiBase } from "@/lib/runner-api";
 
-const API_BASE = "http://localhost:9876";
 const POLL_INTERVAL_MS = 2000;
 
 interface ActionLogResponse {
@@ -60,7 +60,7 @@ export function useGuiAutomationData(): GuiAutomationData {
   // Fetch action log
   const fetchActionLog = useCallback(async () => {
     try {
-      const response = await fetch(`${API_BASE}/action-log/view`);
+      const response = await fetch(`${getApiBase()}/action-log/view`);
       if (response.ok) {
         const data: ActionLogResponse = await response.json();
         setActionLogData(data);
@@ -76,7 +76,7 @@ export function useGuiAutomationData(): GuiAutomationData {
   // Fetch screenshots
   const fetchScreenshots = useCallback(async () => {
     try {
-      const response = await fetch(`${API_BASE}/screenshots/list`);
+      const response = await fetch(`${getApiBase()}/screenshots/list`);
       if (response.ok) {
         const data: ScreenshotsResponse = await response.json();
         if (data.success && data.data) {

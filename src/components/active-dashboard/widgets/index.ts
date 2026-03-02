@@ -101,6 +101,12 @@ export {
   type FlowExecutionData,
 } from "./flow-execution";
 
+// Convergence (standalone widget - not registry-based)
+export { ConvergenceWidget } from "./convergence";
+
+// AI Stream (standalone widget - not registry-based)
+export { AiStreamWidget } from "./ai-stream";
+
 // Shared components
 export {
   StepStatusBadge,

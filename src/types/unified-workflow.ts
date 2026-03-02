@@ -39,6 +39,8 @@ export {
   type WorkflowStage,
   type UnifiedWorkflow,
   type WorkflowExportManifest,
+  type ModelOverrideConfig,
+  type ModelOverrides,
   type WorkflowExport,
   type WorkflowImportResult,
 } from "@qontinui/schemas/unified_workflow";

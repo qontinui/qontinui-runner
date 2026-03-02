@@ -19,12 +19,14 @@
 //! The hardener runs once after the verification/fixer loop, best-effort.
 //! On error it falls back to the original workflow.
 
-use crate::ai_provider::{run_prompt_with_routing, AiResponse};
+use crate::ai_provider::AiResponse;
 use crate::ai_router::TaskContext;
 use crate::doctor::DoctorHandle;
+use crate::skills::SkillRegistry;
 use crate::unified_workflows::UnifiedWorkflow;
 use crate::workflow_generation::generator::extract_json_from_response;
 use crate::workflow_generation::rules;
+use crate::workflow_generation::schema_context::format_skills_for_generator;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -285,6 +287,9 @@ pub fn run_hardener_agent(
     description: &str,
     doctor_handle: Option<&DoctorHandle>,
     conn: Option<&Connection>,
+    model_override: Option<&str>,
+    provider_override: Option<&str>,
+    skill_registry: &SkillRegistry,
 ) -> (UnifiedWorkflow, Option<HardeningSummary>) {
     // Step 0: Apply deterministic fixups before AI hardening
     let mut workflow = fix_sdk_urls(workflow);
@@ -321,9 +326,25 @@ pub fn run_hardener_agent(
         }
     };
 
-    let prompt = build_hardener_prompt(&workflow_json, description, &app_context, conn);
+    let prompt = build_hardener_prompt(
+        &workflow_json,
+        description,
+        &app_context,
+        conn,
+        skill_registry,
+    );
     let task_context = TaskContext::from_prompt(&prompt);
-    let ai_result: AiResponse = run_prompt_with_routing(&prompt, &task_context, doctor_handle);
+    let ai_result: AiResponse = crate::ai_provider::run_prompt_with_model_override(
+        &prompt,
+        &task_context,
+        doctor_handle,
+        model_override,
+        provider_override,
+        None,
+        None,
+        None,
+        None,
+    );
 
     if !ai_result.success {
         warn!(
@@ -590,6 +611,20 @@ pub fn sanitize_commands_in_steps(steps: &mut [Value]) -> usize {
             }
         }
 
+        // Replace bash negation prefix `! command` with explicit exit code handling.
+        // `! grep ...` is bash-specific; the shell router may not detect `!` as bash syntax,
+        // causing it to be routed to cmd.exe where it fails.
+        // Fix: `! grep -qE 'pat' file` → `grep -qE 'pat' file && exit 1 || exit 0`
+        let current_cmd_for_negation = step.get(cmd_key).and_then(|v| v.as_str()).unwrap_or(&cmd);
+        if current_cmd_for_negation.trim().starts_with("! ") {
+            let inner_cmd = current_cmd_for_negation.trim().strip_prefix("! ").unwrap();
+            let fixed = format!("{} && exit 1 || exit 0", inner_cmd);
+            if let Some(obj) = step.as_object_mut() {
+                obj.insert(cmd_key.to_string(), Value::String(fixed));
+                count += 1;
+            }
+        }
+
         // Quote URLs containing & in curl commands — unquoted & is misinterpreted
         // as a shell command separator by bash, e.g.:
         //   curl http://host/api?a=1&b=2 | grep x
@@ -849,6 +884,7 @@ fn build_hardener_prompt(
     description: &str,
     app_context: &AppContext,
     conn: Option<&Connection>,
+    skill_registry: &SkillRegistry,
 ) -> String {
     let mut prompt = format!(
         r#"You are a verification hardener agent for Qontinui Runner.
@@ -1108,7 +1144,17 @@ verify that the tab has spatial visualization content. Add content-specific chec
 8. **Command with check_type fields**: For check conversions, include `mode: "check"`, `check_type`, `command`, and `working_directory` on the `command` step
 9. **Do not convert existing command+check_type steps**: Do NOT convert `command` steps that already have `check_type` set (lint, typecheck, etc.) — they are already deterministic
 10. **SDK verification uses command+curl**: Use `command` steps with `mode: "shell"` and curl piped to grep for SDK-based verification, not `api_request`
-11. **Always set mode on command steps**: Every `command` step must include a `mode` field (`shell`, `check`, `check_group`, or `test`) matching the fields present"#);
+11. **Always set mode on command steps**: Every `command` step must include a `mode` field (`shell`, `check`, `check_group`, or `test`) matching the fields present
+12. **No bash negation prefix**: NEVER use `!` as a command prefix to invert exit codes (e.g., `! grep -qE 'pattern' file`). The `!` operator is bash-specific and may not be detected by the shell router on Windows. Instead, use: `grep -qE 'pattern' file && exit 1 || exit 0`"#);
+    }
+
+    // Include skill catalog context so the hardener can match steps to known skills
+    let skills_section = format_skills_for_generator(skill_registry);
+    if !skills_section.is_empty() {
+        prompt.push_str(&format!(
+            "\n\n{}\nWhen hardening steps, prefer configurations that align with these known skill templates. If a verification step matches a skill's purpose, use the equivalent deterministic configuration from the skill catalog.\n",
+            skills_section
+        ));
     }
 
     prompt.push_str(&format!(
@@ -1312,7 +1358,9 @@ mod tests {
             generated_by_task_run_id: None,
             stages: Vec::new(),
             stop_on_failure: false,
+            approval_gate: false,
             reflection_mode: false,
+            model_overrides: std::collections::HashMap::new(),
             created_at: "2025-01-01T00:00:00Z".to_string(),
             updated_at: "2025-01-01T00:00:00Z".to_string(),
         }
@@ -1596,7 +1644,7 @@ mod tests {
             json!({"id": "s1", "type": "prompt", "content": "Check page"}),
         ]);
         let ctx = AppContext::from_workflow(&workflow, "test");
-        let prompt = build_hardener_prompt("{}", "test", &ctx, None);
+        let prompt = build_hardener_prompt("{}", "test", &ctx, None, &SkillRegistry::new());
         assert!(prompt.contains("Rule 4"));
         assert!(prompt.contains("page navigation"));
     }
@@ -1607,7 +1655,7 @@ mod tests {
             json!({"id": "s1", "type": "command", "command": "curl -s http://localhost:9876/ui-bridge/sdk/ai/search", "mode": "shell"}),
         ]);
         let ctx = AppContext::from_workflow(&workflow, "test");
-        let prompt = build_hardener_prompt("{}", "test", &ctx, None);
+        let prompt = build_hardener_prompt("{}", "test", &ctx, None, &SkillRegistry::new());
         assert!(prompt.contains("ai/search"));
         assert!(prompt.contains("total"));
         assert!(prompt.contains("grep"));
@@ -1651,7 +1699,7 @@ mod tests {
         workflow.agentic_steps =
             vec![json!({"id": "a1", "type": "prompt", "content": "Implement thumbnails"})];
         let ctx = AppContext::from_workflow(&workflow, "test");
-        let prompt = build_hardener_prompt("{}", "test", &ctx, None);
+        let prompt = build_hardener_prompt("{}", "test", &ctx, None, &SkillRegistry::new());
         assert!(prompt.contains("Rule 5"));
         assert!(prompt.contains("agentic step"));
         assert!(prompt.contains("verification coverage"));
@@ -2050,6 +2098,28 @@ mod tests {
         let cmd = "python -c 'import sys; print(sys.argv)' & echo done";
         let result = quote_curl_urls_with_ampersand(cmd);
         assert!(result.is_none(), "Should not modify non-curl commands");
+    }
+
+    #[test]
+    fn test_sanitize_commands_replaces_bash_negation() {
+        let mut steps = vec![json!({
+            "id": "s1", "type": "command", "mode": "shell",
+            "command": "! grep -qE 'RoutingStatusSection|RetryStatusSection' file.tsx",
+            "name": "Old imports removed"
+        })];
+        let count = sanitize_commands_in_steps(&mut steps);
+        assert!(count >= 1, "Should sanitize bash negation prefix");
+        let cmd = steps[0].get("command").unwrap().as_str().unwrap();
+        assert!(
+            cmd.contains("&& exit 1 || exit 0"),
+            "Should convert ! prefix to explicit exit code handling: {}",
+            cmd
+        );
+        assert!(
+            !cmd.starts_with("! "),
+            "Should not start with bash negation: {}",
+            cmd
+        );
     }
 
     #[test]

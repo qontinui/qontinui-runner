@@ -1,7 +1,9 @@
 /**
  * useApiReady Hook
  *
- * Tracks whether the runner's HTTP API server (port 9876) is ready.
+ * Tracks whether the runner's HTTP API server is ready and configures
+ * the centralized API base URL with the actual bound port.
+ *
  * Uses three mechanisms to ensure reliable detection:
  * 1. Tauri event listener for `api-ready` (fastest path on initial startup)
  * 2. IPC re-check after listener setup (closes the race window)
@@ -11,6 +13,20 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { setApiPort } from "@/lib/runner-api";
+
+/** Fetch the actual port from the backend and configure the API base URL. */
+async function syncApiPort(): Promise<void> {
+  try {
+    const port = await invoke<number>("get_api_port");
+    if (port && port > 0) {
+      setApiPort(port);
+      console.log("[API] API port set to", port);
+    }
+  } catch {
+    // Backend not ready yet — will retry
+  }
+}
 
 export function useApiReady(): boolean {
   const [isReady, setIsReady] = useState(false);
@@ -20,12 +36,23 @@ export function useApiReady(): boolean {
 
     let cancelled = false;
 
+    const markReady = () => {
+      if (!cancelled) {
+        syncApiPort().finally(() => {
+          if (!cancelled) setIsReady(true);
+        });
+      }
+    };
+
     // 1. Listen for the api-ready event (fastest path on fresh startup)
     let unlisten: (() => void) | null = null;
 
     listen<number>("api-ready", (event) => {
       if (!cancelled) {
         console.log("[API] API server ready (event, port:", event.payload, ")");
+        if (event.payload && event.payload > 0) {
+          setApiPort(event.payload);
+        }
         setIsReady(true);
       }
     }).then((fn) => {
@@ -38,7 +65,7 @@ export function useApiReady(): boolean {
           .then((ready) => {
             if (ready && !cancelled) {
               console.log("[API] API server already ready (IPC post-listen check)");
-              setIsReady(true);
+              markReady();
             }
           })
           .catch(() => {});
@@ -51,7 +78,7 @@ export function useApiReady(): boolean {
         .then((ready) => {
           if (ready && !cancelled) {
             console.log("[API] API server ready (poll)");
-            setIsReady(true);
+            markReady();
           }
         })
         .catch(() => {});

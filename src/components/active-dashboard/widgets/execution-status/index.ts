@@ -1,8 +1,8 @@
 /**
  * Execution Status Widget
  *
- * Dashboard widget for displaying real-time execution status.
- * Shows status for task routing, retries, memory compression, and lifecycle hooks.
+ * Dashboard widget for displaying workflow health and progress.
+ * Shows session budget, stage progress, iteration trend, current activity, and timing.
  */
 
 export { ExecutionStatusFullWidget } from "./ExecutionStatusFullWidget";

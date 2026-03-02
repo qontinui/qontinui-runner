@@ -8,6 +8,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { Search, X, Check as CheckIcon, Workflow, FolderOpen, Layers } from "lucide-react";
 import type { WorkflowPhase, UnifiedWorkflow } from "../../types/unified-workflow";
+import { getApiBase } from "@/lib/runner-api";
 
 interface WorkflowLibraryPickerProps {
   isOpen: boolean;
@@ -17,8 +18,6 @@ interface WorkflowLibraryPickerProps {
   /** Current workflow ID to exclude from the list (prevent self-reference) */
   excludeWorkflowId?: string;
 }
-
-const API_BASE = "http://localhost:9876";
 
 export function WorkflowLibraryPicker({
   isOpen,
@@ -43,7 +42,7 @@ export function WorkflowLibraryPicker({
     const fetchWorkflows = async () => {
       setIsLoading(true);
       try {
-        const response = await fetch(`${API_BASE}/unified-workflows`, {
+        const response = await fetch(`${getApiBase()}/unified-workflows`, {
           signal: controller.signal,
         });
         const result = await response.json();

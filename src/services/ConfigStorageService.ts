@@ -1,11 +1,11 @@
 /**
  * ConfigStorageService
  *
- * HTTP client for the ConfigStorage API on the runner (port 9876).
+ * HTTP client for the ConfigStorage API on the runner.
  * Provides CRUD operations for stored configurations.
  */
 
-const RUNNER_API_URL = "http://localhost:9876";
+import { getApiBase } from "@/lib/runner-api";
 
 /**
  * Metadata for a stored configuration (without full config data)
@@ -39,7 +39,7 @@ interface ApiResponse<T> {
  * Make an API request to the runner
  */
 async function apiRequest<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
-  const url = `${RUNNER_API_URL}${endpoint}`;
+  const url = `${getApiBase()}${endpoint}`;
   console.log(`[CONFIG_STORAGE] ${options.method || "GET"} ${endpoint}`);
 
   try {

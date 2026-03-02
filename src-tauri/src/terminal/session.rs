@@ -1,0 +1,397 @@
+//! TerminalSession — PTY lifecycle management for a single terminal instance.
+//!
+//! Spawns a shell via `portable-pty`, manages reader/writer threads,
+//! and emits Tauri events for output and exit.
+
+use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+use base64::{engine::general_purpose::STANDARD, Engine};
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use tauri::{AppHandle, Emitter};
+use tracing::{debug, info, warn};
+
+use super::interceptor::OutputInterceptor;
+use super::types::{TerminalExitEvent, TerminalId, TerminalInfo, TerminalOutputEvent};
+
+/// A single PTY-backed terminal session.
+pub struct TerminalSession {
+    /// Unique identifier for this terminal.
+    id: TerminalId,
+    /// Display title.
+    title: String,
+    /// Working directory the shell was started in.
+    working_dir: String,
+    /// Thread-safe writer to PTY stdin.
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    /// Handle to the PTY master (needed for resize).
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    /// Child process PID.
+    child_pid: Option<u32>,
+    /// Current terminal dimensions (atomic for lock-free resize from &self).
+    cols: AtomicU16,
+    rows: AtomicU16,
+    /// Whether the shell process is still alive.
+    is_alive: Arc<AtomicBool>,
+    /// Exit code (set when process exits).
+    exit_code: Arc<Mutex<Option<i32>>>,
+    /// Handle to the reader thread (for join on cleanup).
+    reader_join: Mutex<Option<thread::JoinHandle<()>>>,
+    /// Handle to the waiter thread (for join on cleanup).
+    waiter_join: Mutex<Option<thread::JoinHandle<()>>>,
+    /// Bytes received by the frontend (for flow control).
+    bytes_sent: Arc<std::sync::atomic::AtomicU64>,
+    bytes_acked: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl TerminalSession {
+    /// Spawn a new terminal session with a shell process.
+    pub fn spawn(
+        id: TerminalId,
+        title: String,
+        working_dir: String,
+        cols: u16,
+        rows: u16,
+        app_handle: AppHandle,
+        interceptor: Arc<OutputInterceptor>,
+    ) -> Result<Self, String> {
+        let pty_system = native_pty_system();
+
+        let pair = pty_system
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| format!("Failed to open PTY: {}", e))?;
+
+        // Build shell command
+        let mut cmd = Self::build_shell_command();
+
+        // Set working directory
+        let cwd = if working_dir.is_empty() {
+            dirs::home_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| ".".to_string())
+        } else {
+            working_dir.clone()
+        };
+        cmd.cwd(&cwd);
+
+        // Remove CLAUDECODE env var so Claude CLI works inside the terminal
+        cmd.env_remove("CLAUDECODE");
+
+        // Set TERM for proper color/capability support
+        #[cfg(target_os = "windows")]
+        cmd.env("TERM", "cygwin");
+        #[cfg(not(target_os = "windows"))]
+        cmd.env("TERM", "xterm-256color");
+
+        // Spawn the child process
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|e| format!("Failed to spawn shell: {}", e))?;
+
+        let child_pid = child.process_id();
+        info!(
+            terminal_id = %id,
+            pid = ?child_pid,
+            cwd = %cwd,
+            "Terminal session spawned"
+        );
+
+        // Assign to Windows Job Object for crash safety
+        #[cfg(target_os = "windows")]
+        if let Some(pid) = child_pid {
+            Self::assign_to_job_object(pid);
+        }
+
+        // Get writer and master from the PTY pair
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|e| format!("Failed to take PTY writer: {}", e))?;
+        let writer = Arc::new(Mutex::new(writer));
+
+        let is_alive = Arc::new(AtomicBool::new(true));
+        let exit_code: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
+        let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let bytes_acked = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        // Get a reader from the master PTY
+        let mut reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|e| format!("Failed to clone PTY reader: {}", e))?;
+
+        // Spawn reader thread: reads PTY output → interceptor → Tauri event
+        let reader_id = id.clone();
+        let reader_app = app_handle.clone();
+        let reader_alive = is_alive.clone();
+        let reader_bytes_sent = bytes_sent.clone();
+        let reader_bytes_acked = bytes_acked.clone();
+        let reader_handle = thread::Builder::new()
+            .name(format!("terminal-reader-{}", &id))
+            .spawn(move || {
+                let mut buf = [0u8; 8192];
+                loop {
+                    if !reader_alive.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    // Flow control: pause if frontend is too far behind
+                    let sent = reader_bytes_sent.load(Ordering::Relaxed);
+                    let acked = reader_bytes_acked.load(Ordering::Relaxed);
+                    if sent > acked + 1_048_576 {
+                        // 1MB backpressure threshold
+                        thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+
+                    match reader.read(&mut buf) {
+                        Ok(0) => {
+                            debug!(terminal_id = %reader_id, "PTY reader got EOF");
+                            break;
+                        }
+                        Ok(n) => {
+                            let data = interceptor.process(&reader_id, &buf[..n]);
+                            let encoded = STANDARD.encode(&data);
+                            let event = TerminalOutputEvent {
+                                terminal_id: reader_id.clone(),
+                                data: encoded,
+                            };
+                            if let Err(e) = reader_app.emit("terminal-output", &event) {
+                                warn!(
+                                    terminal_id = %reader_id,
+                                    error = %e,
+                                    "Failed to emit terminal output event"
+                                );
+                            }
+                            reader_bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            // On Windows, the PTY reader returns an error when the child exits
+                            debug!(terminal_id = %reader_id, error = %e, "PTY read error (likely process exit)");
+                            break;
+                        }
+                    }
+                }
+                debug!(terminal_id = %reader_id, "Reader thread exiting");
+            })
+            .map_err(|e| format!("Failed to spawn reader thread: {}", e))?;
+
+        // Spawn waiter thread: detects process exit
+        let waiter_id = id.clone();
+        let waiter_alive = is_alive.clone();
+        let waiter_exit = exit_code.clone();
+        let waiter_app = app_handle;
+        let waiter_handle = thread::Builder::new()
+            .name(format!("terminal-waiter-{}", &id))
+            .spawn(move || {
+                // portable-pty's child is not Send, so we must wait in the thread that has it
+                let mut child = child;
+                let status = child.wait();
+                let code = match status {
+                    Ok(exit) => {
+                        // ExitStatus doesn't expose the code directly on all platforms
+                        // via portable-pty. Use success() check.
+                        if exit.success() {
+                            Some(0)
+                        } else {
+                            // Try to get the exit code; fall back to 1 for non-zero
+                            Some(1)
+                        }
+                    }
+                    Err(e) => {
+                        warn!(terminal_id = %waiter_id, error = %e, "Failed to wait on child process");
+                        None
+                    }
+                };
+
+                waiter_alive.store(false, Ordering::Relaxed);
+                if let Ok(mut ec) = waiter_exit.lock() {
+                    *ec = code;
+                }
+
+                info!(terminal_id = %waiter_id, exit_code = ?code, "Terminal process exited");
+
+                let event = TerminalExitEvent {
+                    terminal_id: waiter_id.clone(),
+                    exit_code: code,
+                };
+                if let Err(e) = waiter_app.emit("terminal-exit", &event) {
+                    warn!(
+                        terminal_id = %waiter_id,
+                        error = %e,
+                        "Failed to emit terminal exit event"
+                    );
+                }
+            })
+            .map_err(|e| format!("Failed to spawn waiter thread: {}", e))?;
+
+        // Store the master for resize operations
+        let master: Box<dyn MasterPty + Send> = pair.master;
+
+        Ok(Self {
+            id,
+            title,
+            working_dir: cwd,
+            writer,
+            master: Arc::new(Mutex::new(master)),
+            child_pid,
+            cols: AtomicU16::new(cols),
+            rows: AtomicU16::new(rows),
+            is_alive,
+            exit_code,
+            reader_join: Mutex::new(Some(reader_handle)),
+            waiter_join: Mutex::new(Some(waiter_handle)),
+            bytes_sent,
+            bytes_acked,
+        })
+    }
+
+    /// Build the platform-appropriate shell command.
+    fn build_shell_command() -> CommandBuilder {
+        #[cfg(target_os = "windows")]
+        {
+            let mut cmd = CommandBuilder::new("powershell.exe");
+            cmd.args(["-NoLogo", "-NoExit"]);
+            cmd
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+            let mut cmd = CommandBuilder::new(&shell);
+            cmd.arg("--login");
+            cmd
+        }
+    }
+
+    /// Assign a process to the Windows Job Object for crash safety.
+    #[cfg(target_os = "windows")]
+    fn assign_to_job_object(pid: u32) {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_ALL_ACCESS};
+
+        unsafe {
+            let handle = OpenProcess(PROCESS_ALL_ACCESS, 0, pid);
+            if !handle.is_null() && !std::ptr::eq(handle, INVALID_HANDLE_VALUE as *mut _) {
+                crate::job_object::assign_process_to_job(handle as _);
+                CloseHandle(handle as _);
+            }
+        }
+    }
+
+    /// Write data (keystrokes) to the PTY stdin.
+    pub fn write(&self, data: &[u8]) -> Result<(), String> {
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|e| format!("Writer lock poisoned: {}", e))?;
+        writer
+            .write_all(data)
+            .map_err(|e| format!("Failed to write to PTY: {}", e))?;
+        writer
+            .flush()
+            .map_err(|e| format!("Failed to flush PTY: {}", e))?;
+        Ok(())
+    }
+
+    /// Resize the PTY dimensions.
+    pub fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+        let master = self
+            .master
+            .lock()
+            .map_err(|e| format!("Master lock poisoned: {}", e))?;
+        master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| format!("Failed to resize PTY: {}", e))?;
+        self.cols.store(cols, Ordering::Relaxed);
+        self.rows.store(rows, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Acknowledge bytes received by the frontend (flow control).
+    pub fn ack(&self, bytes: u64) {
+        self.bytes_acked.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Get terminal info for the frontend.
+    pub fn info(&self) -> TerminalInfo {
+        TerminalInfo {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            pid: self.child_pid,
+            cols: self.cols.load(Ordering::Relaxed),
+            rows: self.rows.load(Ordering::Relaxed),
+            working_dir: self.working_dir.clone(),
+            is_alive: self.is_alive.load(Ordering::Relaxed),
+            exit_code: self.exit_code.lock().ok().and_then(|ec| *ec),
+        }
+    }
+
+    /// Check if the shell process is still alive.
+    pub fn is_alive(&self) -> bool {
+        self.is_alive.load(Ordering::Relaxed)
+    }
+
+    /// Kill the shell process and clean up threads.
+    pub fn close(&self) {
+        info!(terminal_id = %self.id, "Closing terminal session");
+        self.is_alive.store(false, Ordering::Relaxed);
+
+        // Kill the child process via PID if still alive
+        if let Some(pid) = self.child_pid {
+            #[cfg(target_os = "windows")]
+            {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/F", "/T", "/PID", &pid.to_string()])
+                    .output();
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGTERM);
+                }
+            }
+        }
+
+        // Drop the writer to signal EOF
+        if let Ok(mut writer) = self.writer.lock() {
+            // Replace with a dummy writer that does nothing
+            // The actual drop will close the pipe
+            drop(writer.flush());
+        }
+
+        // Join threads (with timeout to avoid hanging)
+        if let Ok(mut handle) = self.reader_join.lock() {
+            if let Some(h) = handle.take() {
+                let _ = h.join();
+            }
+        }
+        if let Ok(mut handle) = self.waiter_join.lock() {
+            if let Some(h) = handle.take() {
+                let _ = h.join();
+            }
+        }
+
+        info!(terminal_id = %self.id, "Terminal session closed");
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        if self.is_alive.load(Ordering::Relaxed) {
+            self.close();
+        }
+    }
+}

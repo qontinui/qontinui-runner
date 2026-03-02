@@ -25,6 +25,7 @@ import type {
   FixType,
   FixEffectiveness,
 } from "../../types/reflection";
+import { getApiBase } from "@/lib/runner-api";
 
 // ============================================================================
 // Constants
@@ -102,7 +103,7 @@ export function ReflectionDashboard() {
 
     async function loadWorkflows() {
       try {
-        const resp = await fetch("http://localhost:9876/task-runs?limit=100", {
+        const resp = await fetch(`${getApiBase()}/task-runs?limit=100`, {
           signal: controller.signal,
         });
         const json = await resp.json();
@@ -135,13 +136,13 @@ export function ReflectionDashboard() {
     try {
       const [reportData, historyData, fixesData] = await Promise.all([
         fetchApi<EffectivenessReport>(
-          `http://localhost:9876/reflection/effectiveness-report?workflow_name=${encodeURIComponent(workflowName)}`,
+          `${getApiBase()}/reflection/effectiveness-report?workflow_name=${encodeURIComponent(workflowName)}`,
         ),
         fetchApi<ReflectionRunSummary[]>(
-          `http://localhost:9876/reflection/history?workflow_name=${encodeURIComponent(workflowName)}`,
+          `${getApiBase()}/reflection/history?workflow_name=${encodeURIComponent(workflowName)}`,
         ),
         fetchApi<ReflectionFix[]>(
-          `http://localhost:9876/reflection-fixes?workflow_name=${encodeURIComponent(workflowName)}`,
+          `${getApiBase()}/reflection-fixes?workflow_name=${encodeURIComponent(workflowName)}`,
         ),
       ]);
       setReport(reportData);

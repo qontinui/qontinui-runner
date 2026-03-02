@@ -6,13 +6,17 @@
  */
 
 import type { ComponentType } from "react";
-import type { CanvasComponentType } from "@qontinui/shared-types";
 import { MarkdownPanel } from "./MarkdownPanel";
 import { TablePanel } from "./TablePanel";
 import { CodeDiffPanel } from "./CodeDiffPanel";
 import { KeyValuePanel } from "./KeyValuePanel";
 import { AlertPanel } from "./AlertPanel";
 import { TerminalPanel } from "./TerminalPanel";
+import { TimelinePanel } from "./TimelinePanel";
+import { FileTreePanel } from "./FileTreePanel";
+import { ProgressChartPanel } from "./ProgressChartPanel";
+import { FindingListPanel } from "./FindingListPanel";
+import { ChecklistPanel } from "./ChecklistPanel";
 
 /**
  * Props that all canvas panel components receive.
@@ -20,6 +24,8 @@ import { TerminalPanel } from "./TerminalPanel";
 export interface CanvasPanelComponentProps {
   data: Record<string, unknown>;
   size?: "compact" | "normal" | "large";
+  panelId?: string;
+  readOnly?: boolean;
 }
 
 /**
@@ -46,8 +52,11 @@ const COMPONENT_MAP: Record<string, ComponentType<CanvasPanelComponentProps>> = 
   KeyValue: KeyValuePanel,
   Alert: AlertPanel,
   Terminal: TerminalPanel,
-  // Deferred: Timeline, FileTree, ProgressChart, FindingList, Checklist
-  // These will render as FallbackPanel (showing JSON) until implemented
+  Timeline: TimelinePanel,
+  FileTree: FileTreePanel,
+  ProgressChart: ProgressChartPanel,
+  FindingList: FindingListPanel,
+  Checklist: ChecklistPanel,
 };
 
 /**

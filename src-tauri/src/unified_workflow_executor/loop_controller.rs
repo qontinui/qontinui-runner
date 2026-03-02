@@ -17,6 +17,7 @@ use tauri::Manager;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::config_storage::ConfigStorage;
+use crate::database::CreateTaskRunEventInput;
 use crate::doctor::DoctorHandle;
 use crate::event_system::EventBroadcaster;
 use crate::orchestrator::integration::StageTransition;
@@ -387,7 +388,10 @@ impl LoopController {
                     max_iterations: config.max_iterations,
                     provider: config.provider_override.clone(),
                     model: config.model_override.clone(),
+                    model_overrides: config.model_overrides.clone(),
                     timeout_seconds: None,
+                    approval_gate: config.approval_gate,
+                    condition: None, // Single-phase normalization has no condition
                 };
                 config.stages = vec![single_stage];
             }
@@ -465,6 +469,8 @@ impl LoopController {
 
         let mut any_stage_passed = false;
         let mut last_loop_result: Option<LoopResult> = None;
+        let mut total_stage_failures: u32 = 0;
+        let mut total_iterations_across_stages: u32 = 0;
 
         for stage_idx in 0..config.stages.len() {
             let stage = &config.stages[stage_idx];
@@ -478,6 +484,29 @@ impl LoopController {
                 continue;
             }
             let stage_num = stage_idx + 1;
+
+            // Evaluate conditional stage execution
+            if let Some(ref condition) = stage.condition {
+                let previous_passed = last_loop_result
+                    .as_ref()
+                    .map(|r| r.verification_passed)
+                    .unwrap_or(true); // No previous stage = treat as passed
+
+                let should_skip = evaluate_stage_condition(
+                    condition,
+                    previous_passed,
+                    total_iterations_across_stages,
+                    total_stage_failures,
+                );
+
+                if should_skip {
+                    info!(
+                        "STAGE-SKIP: stage {}/{} '{}' skipped (condition not met: {:?})",
+                        stage_num, total_stages, stage.name, condition
+                    );
+                    continue;
+                }
+            }
 
             // Check for external stop
             if self.is_task_stopped(&config.execution_id) {
@@ -520,6 +549,7 @@ impl LoopController {
                                 "Max sessions ({}) exhausted after {} sessions (before stage {}/{})",
                                 max, task_run.sessions_count, stage_num, total_stages
                             ),
+                            Some(&config.workflow_id),
                         )
                         .await;
                         return WorkflowResult {
@@ -566,6 +596,20 @@ impl LoopController {
                     0,
                 );
 
+                // Resolve setup phase model override: stage model_overrides → stage model → workflow model
+                let setup_model = stage
+                    .model_overrides
+                    .get("setup")
+                    .and_then(|c| c.model.clone())
+                    .or_else(|| stage.model.clone())
+                    .or_else(|| config.model_override.clone());
+                let setup_provider = stage
+                    .model_overrides
+                    .get("setup")
+                    .and_then(|c| c.provider.clone())
+                    .or_else(|| stage.provider.clone())
+                    .or_else(|| config.provider_override.clone());
+
                 let (setup_ok, setup_results) = self
                     .setup_executor
                     .run_setup(
@@ -578,6 +622,8 @@ impl LoopController {
                         ),
                         logger,
                         Some(stage_idx as u32),
+                        setup_model,
+                        setup_provider,
                     )
                     .await;
 
@@ -623,6 +669,7 @@ impl LoopController {
                         self.mark_task_failed(
                             &config.execution_id,
                             &format!("Stage {} setup failed", stage_num),
+                            Some(&config.workflow_id),
                         )
                         .await;
                         return WorkflowResult {
@@ -746,9 +793,15 @@ impl LoopController {
                     reflection_mode: config.reflection_mode,
                     provider_override: stage.provider.clone(),
                     model_override: stage.model.clone(),
+                    model_overrides: stage.model_overrides.clone(),
                     stage_index: Some(stage_idx as u32),
                     max_sessions: config.max_sessions,
                     auto_run_generated: false,
+                    approval_gate: config.approval_gate,
+                    max_context_tokens: config.max_context_tokens,
+                    cross_workflow_learning: config.cross_workflow_learning,
+                    verification_history: std::collections::HashMap::new(),
+                    routing_context: Default::default(),
                 };
 
                 // Handle agentic-first: run the agentic phase before the verification loop.
@@ -793,13 +846,13 @@ impl LoopController {
 
                     // Log agentic output
                     let output_text = match &outcome {
-                        AgenticOutcome::Success { output } => {
+                        AgenticOutcome::Success { output, .. } => {
                             format!(
                                 "\n=== Agentic Phase (iteration {}) ===\n{}",
                                 agentic_iteration, output
                             )
                         }
-                        AgenticOutcome::Failed { output, error } => {
+                        AgenticOutcome::Failed { output, error, .. } => {
                             warn!(
                                 "Stage {} agentic-first failed: {}, continuing with verification",
                                 stage_num, error
@@ -866,7 +919,7 @@ impl LoopController {
 
                 let loop_result = self
                     .run_verification_agentic_loop(
-                        &stage_loop_config,
+                        &mut stage_loop_config,
                         &stage.verification_steps,
                         has_agentic,
                         &stage.agentic_steps,
@@ -888,12 +941,34 @@ impl LoopController {
                     any_stage_passed = true;
                 }
 
-                // Run per-stage completion steps if verification passed
-                if loop_result.should_run_completion()
+                // Check if completion has critical artifact steps that must always run
+                let has_artifact_save = stage
+                    .completion_automation_steps
+                    .iter()
+                    .any(|s| s.step_type == "save_workflow_artifact");
+                let force_completion =
+                    has_artifact_save && !loop_result.critical_failure && !loop_result.was_stopped;
+
+                // Run per-stage completion steps if verification passed or forced for artifact saves
+                if (loop_result.should_run_completion() || force_completion)
                     && (!stage.completion_automation_steps.is_empty()
                         || !stage.completion_prompt_steps.is_empty())
                 {
                     info!("  Stage {}: Running completion", stage_num);
+                    // Resolve completion phase model override
+                    let comp_model = stage
+                        .model_overrides
+                        .get("completion")
+                        .and_then(|c| c.model.clone())
+                        .or_else(|| stage.model.clone())
+                        .or_else(|| config.model_override.clone());
+                    let comp_provider = stage
+                        .model_overrides
+                        .get("completion")
+                        .and_then(|c| c.provider.clone())
+                        .or_else(|| stage.provider.clone())
+                        .or_else(|| config.provider_override.clone());
+
                     let (_, completion_results) = self
                         .completion_executor
                         .run_completion(
@@ -907,6 +982,8 @@ impl LoopController {
                             loop_result.iterations_run,
                             logger,
                             Some(stage_idx as u32),
+                            comp_model,
+                            comp_provider,
                         )
                         .await;
                     all_step_results.extend(completion_results);
@@ -931,6 +1008,7 @@ impl LoopController {
                             "Stage {} verification failed after {} iterations",
                             stage_num, loop_result.iterations_run
                         ),
+                        Some(&config.workflow_id),
                     )
                     .await;
                     return WorkflowResult {
@@ -940,6 +1018,12 @@ impl LoopController {
                         duration_ms: start.elapsed().as_millis() as u64,
                         loop_result: Some(loop_result),
                     };
+                }
+
+                // Update tracking counters for conditional stage evaluation
+                total_iterations_across_stages += loop_result.iterations_run;
+                if !loop_result.verification_passed {
+                    total_stage_failures += 1;
                 }
 
                 last_loop_result = Some(loop_result);
@@ -1013,12 +1097,22 @@ impl LoopController {
                     .await;
             }
 
-            // Fire-and-forget summary generation
+            // Fire-and-forget summary generation with per-phase model override
             let db = self.checkpoint_db.clone();
             let exec_id = config.execution_id.clone();
             let doctor_handle = self.doctor_handle.clone();
+            let summary_model = config.resolve_model_for_phase("summary");
+            let summary_provider = config.resolve_provider_for_phase("summary");
             tokio::spawn(async move {
-                match generate_task_summary_async(db, exec_id.clone(), doctor_handle).await {
+                match generate_task_summary_async(
+                    db,
+                    exec_id.clone(),
+                    doctor_handle,
+                    summary_model,
+                    summary_provider,
+                )
+                .await
+                {
                     Ok(_) => info!("Generated summary for completed task {}", exec_id),
                     Err(e) => warn!("Failed to generate summary for task {}: {}", exec_id, e),
                 }
@@ -1035,15 +1129,29 @@ impl LoopController {
                     None,
                 ),
             );
-            self.mark_task_failed(&config.execution_id, "No stages passed verification")
-                .await;
+            self.mark_task_failed(
+                &config.execution_id,
+                "No stages passed verification",
+                Some(&config.workflow_id),
+            )
+            .await;
 
-            // Fire-and-forget summary generation for failed task
+            // Fire-and-forget summary generation for failed task with per-phase model override
             let db = self.checkpoint_db.clone();
             let exec_id = config.execution_id.clone();
             let doctor_handle = self.doctor_handle.clone();
+            let summary_model = config.resolve_model_for_phase("summary");
+            let summary_provider = config.resolve_provider_for_phase("summary");
             tokio::spawn(async move {
-                match generate_task_summary_async(db, exec_id.clone(), doctor_handle).await {
+                match generate_task_summary_async(
+                    db,
+                    exec_id.clone(),
+                    doctor_handle,
+                    summary_model,
+                    summary_provider,
+                )
+                .await
+                {
                     Ok(_) => info!("Generated summary for failed task {}", exec_id),
                     Err(e) => warn!(
                         "Failed to generate summary for failed task {}: {}",
@@ -1191,6 +1299,17 @@ impl LoopController {
             });
         }
 
+        // Aggregate phase token usage totals for the task run
+        if let Err(e) = self
+            .checkpoint_db
+            .update_task_run_token_totals(&config.execution_id)
+        {
+            warn!(
+                "Failed to aggregate token totals for {}: {}",
+                config.execution_id, e
+            );
+        }
+
         WorkflowResult {
             success: overall_passed,
             verification_passed: overall_passed,
@@ -1216,7 +1335,7 @@ impl LoopController {
     )]
     async fn run_verification_agentic_loop(
         &self,
-        config: &LoopConfig,
+        config: &mut LoopConfig,
         verification_steps: &[ExecutionStepConfig],
         has_agentic_steps: bool,
         agentic_steps: &[ExecutionStepConfig],
@@ -1230,6 +1349,15 @@ impl LoopController {
         // Start from the configured starting_iteration (for resume) or 0 (for fresh start)
         let mut iteration = config.starting_iteration;
 
+        // Convergence tracking state: previous failed step names and stall detection
+        let mut prev_failed_step_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut stall_counter: u32 = 0;
+        let mut prev_failed_count: u32 = 0;
+
+        // Track cumulative verification failures for conditional routing context
+        let mut verification_failures: u32 = 0;
+
         // Dynamic verification steps accumulated from agentic phase outputs.
         // These are merged with the static verification steps for subsequent iterations.
         let mut dynamic_steps: Vec<ExecutionStepConfig> = initial_dynamic_steps;
@@ -1242,6 +1370,9 @@ impl LoopController {
 
         loop {
             iteration += 1;
+
+            // Update routing context for conditional model routing
+            config.set_routing_context(iteration, verification_failures);
 
             info!(
                 "--- LOOP ITERATION {} of {} ---{}",
@@ -1360,8 +1491,7 @@ impl LoopController {
             );
 
             // Build effective verification steps: static steps + any dynamically injected steps
-            let effective_verification_steps: Vec<ExecutionStepConfig> = if dynamic_steps.is_empty()
-            {
+            let all_verification_steps: Vec<ExecutionStepConfig> = if dynamic_steps.is_empty() {
                 verification_steps.to_vec()
             } else {
                 let mut combined = verification_steps.to_vec();
@@ -1375,7 +1505,52 @@ impl LoopController {
                 combined
             };
 
-            let (verification_result, step_results) = self
+            // Improvement C: Intelligent test selection — skip consistently passing steps
+            let mut skipped_consistent_pass: Vec<String> = Vec::new();
+            let effective_verification_steps: Vec<ExecutionStepConfig> = if iteration > 3 {
+                let mut filtered = Vec::new();
+                for step in &all_verification_steps {
+                    let step_name = step.name.as_deref().unwrap_or(&step.step_type);
+                    let history = config.verification_history.get(step_name);
+                    let should_skip = if let Some(results) = history {
+                        // Skip if last 3 consecutive iterations all passed
+                        let len = results.len();
+                        len >= 3 && results[len - 1] && results[len - 2] && results[len - 3]
+                    } else {
+                        false
+                    };
+
+                    if should_skip {
+                        let consecutive_passes = history
+                            .unwrap()
+                            .iter()
+                            .rev()
+                            .take_while(|&&passed| passed)
+                            .count();
+                        info!(
+                            "VERIFICATION-SKIP: step '{}' skipped (passed {} consecutive times)",
+                            step_name, consecutive_passes
+                        );
+                        skipped_consistent_pass.push(step_name.to_string());
+                    } else {
+                        filtered.push(step.clone());
+                    }
+                }
+                filtered
+            } else {
+                all_verification_steps.clone()
+            };
+
+            if !skipped_consistent_pass.is_empty() {
+                info!(
+                    "VERIFICATION-SELECTION: Running {}/{} steps ({} skipped - consistently passing)",
+                    effective_verification_steps.len(),
+                    all_verification_steps.len(),
+                    skipped_consistent_pass.len()
+                );
+            }
+
+            let (mut verification_result, step_results) = self
                 .verification_executor
                 .run_verification(
                     &effective_verification_steps,
@@ -1386,6 +1561,52 @@ impl LoopController {
                     config.stage_index,
                 )
                 .await;
+
+            // Update skipped_steps count to include consistently-passing skips
+            verification_result.skipped_steps += skipped_consistent_pass.len();
+
+            // Update verification history with this iteration's results
+            for step_result in &verification_result.step_results {
+                let entry = config
+                    .verification_history
+                    .entry(step_result.step_name.clone())
+                    .or_default();
+                entry.push(step_result.success);
+            }
+            // Record skipped-as-passed entries too (they're still passing)
+            for name in &skipped_consistent_pass {
+                let entry = config.verification_history.entry(name.clone()).or_default();
+                entry.push(true);
+            }
+
+            // Improvement D: Flaky test detection
+            // Check for alternating pass/fail patterns in the last 4 iterations
+            let flaky_steps: Vec<String> = config
+                .verification_history
+                .iter()
+                .filter_map(|(name, results)| {
+                    if results.len() >= 4 {
+                        let tail = &results[results.len() - 4..];
+                        // Count alternations (pass->fail or fail->pass)
+                        let alternations = tail
+                            .windows(2)
+                            .filter(|w| w[0] != w[1])
+                            .count();
+                        // 3 alternations in 4 entries = perfect flip-flop (e.g., T,F,T,F)
+                        if alternations >= 3 {
+                            warn!(
+                                "VERIFICATION-FLAKY: step '{}' detected as flaky ({} alternations in last {} runs)",
+                                name, alternations, tail.len()
+                            );
+                            Some(name.clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+                .collect();
 
             // Add step results to overall results
             all_step_results.extend(step_results);
@@ -1460,6 +1681,65 @@ impl LoopController {
                     verification_result.all_passed,
                 ),
             );
+
+            // Emit convergence metrics for the frontend dashboard
+            {
+                let failed_count = verification_result.failed_steps as u32;
+                let passed_count = verification_result.passed_steps as u32;
+                let skipped_count = verification_result.skipped_steps as u32;
+
+                // Compute current failed step names
+                let current_failed_names: std::collections::HashSet<String> = verification_result
+                    .step_results
+                    .iter()
+                    .filter(|sr| !sr.success)
+                    .map(|sr| sr.step_name.clone())
+                    .collect();
+
+                // Calculate new vs repeated failures
+                let new_failures = current_failed_names
+                    .difference(&prev_failed_step_names)
+                    .count() as u32;
+                let repeated_failures = current_failed_names
+                    .intersection(&prev_failed_step_names)
+                    .count() as u32;
+
+                // Stall detection: failed count has not decreased in 3+ consecutive iterations
+                if iteration > 1 {
+                    if failed_count >= prev_failed_count {
+                        stall_counter += 1;
+                    } else {
+                        stall_counter = 0;
+                    }
+                }
+                let is_stalled = stall_counter >= 3;
+
+                let broadcaster = EventBroadcaster::new(self.app_handle.clone());
+                broadcaster.iteration_metrics(
+                    &config.execution_id,
+                    iteration,
+                    failed_count,
+                    passed_count,
+                    skipped_count,
+                    new_failures,
+                    repeated_failures,
+                    is_stalled,
+                );
+
+                info!(
+                    "CONVERGENCE: iteration={}, failed={}, passed={}, new={}, repeated={}, stalled={}",
+                    iteration, failed_count, passed_count, new_failures, repeated_failures, is_stalled
+                );
+
+                // Update tracking state for next iteration
+                prev_failed_step_names = current_failed_names;
+                prev_failed_count = failed_count;
+
+                // Increment cumulative verification failures for routing context
+                if !verification_result.all_passed {
+                    verification_failures += 1;
+                }
+            }
 
             // Check verification outcome
             if verification_result.all_passed {
@@ -1562,6 +1842,56 @@ impl LoopController {
             );
 
             let failure_context = verification_result.build_failure_context();
+
+            // Enhance failure context with flaky test annotations
+            let failure_context = if !flaky_steps.is_empty() {
+                let mut enhanced = failure_context;
+                // Add flaky annotation for each flaky step that failed
+                for step_result in &verification_result.step_results {
+                    if !step_result.success && flaky_steps.contains(&step_result.step_name) {
+                        enhanced = enhanced.replace(
+                            &format!("#### {}", step_result.step_name),
+                            &format!("#### [flaky] {}", step_result.step_name),
+                        );
+                    }
+                }
+                // Add a note about flaky tests at the end
+                let flaky_failed: Vec<&String> = flaky_steps
+                    .iter()
+                    .filter(|name| {
+                        verification_result
+                            .step_results
+                            .iter()
+                            .any(|sr| &sr.step_name == *name && !sr.success)
+                    })
+                    .collect();
+                if !flaky_failed.is_empty() {
+                    enhanced.push_str("\n### Flaky Test Notice\n\n");
+                    enhanced.push_str(
+                        "Note: The following steps appear flaky (alternating pass/fail). Their failures may be intermittent rather than a code issue:\n",
+                    );
+                    for name in &flaky_failed {
+                        enhanced.push_str(&format!("- {}\n", name));
+                    }
+                    enhanced.push('\n');
+                }
+                enhanced
+            } else {
+                failure_context
+            };
+
+            // Add skip summary to failure context
+            let failure_context = if !skipped_consistent_pass.is_empty() {
+                format!(
+                    "{}\n_Ran {}/{} steps ({} skipped - consistently passing)_\n",
+                    failure_context,
+                    effective_verification_steps.len(),
+                    all_verification_steps.len(),
+                    skipped_consistent_pass.len()
+                )
+            } else {
+                failure_context
+            };
 
             // Record verification feedback as knowledge for cross-iteration context
             {
@@ -1794,9 +2124,9 @@ impl LoopController {
             };
             iteration_results.push(iter_result);
 
-            // Log agentic outcome for debugging
+            // Log agentic outcome for debugging (including parsed confidence)
             info!(
-                "AGENTIC-OUTCOME: iteration={}, outcome={}",
+                "AGENTIC-OUTCOME: iteration={}, outcome={}, confidence={}",
                 iteration,
                 match &agentic_outcome {
                     AgenticOutcome::Success { .. } => "Success",
@@ -1806,38 +2136,97 @@ impl LoopController {
                         "Error"
                     }
                     AgenticOutcome::Skipped => "Skipped",
-                }
+                },
+                agentic_outcome
+                    .parsed()
+                    .and_then(|p| p.confidence)
+                    .map(|c| format!("{:.0}%", c * 100.0))
+                    .unwrap_or_else(|| "N/A".to_string()),
             );
 
-            // Check if the AI signaled unfixable errors
-            // This allows the AI to gracefully exit the loop when it determines
-            // that the errors cannot be fixed (e.g., infrastructure issues,
-            // missing dependencies, external service problems).
-            if let Some(output) = agentic_outcome.output() {
-                if output.contains("[UNFIXABLE_ERRORS]") || output.contains("[UNFIXABLE_ERROR]") {
-                    warn!(
-                        "AI signaled unfixable errors on iteration {} - exiting loop gracefully",
-                        iteration
+            // Log and store findings from the parsed output, if any
+            if let Some(parsed) = agentic_outcome.parsed() {
+                if !parsed.findings.is_empty() {
+                    info!(
+                        "AGENTIC-FINDINGS: iteration={}, count={}, titles=[{}]",
+                        iteration,
+                        parsed.findings.len(),
+                        parsed
+                            .findings
+                            .iter()
+                            .map(|f| format!("{}({})", f.title, f.severity))
+                            .collect::<Vec<_>>()
+                            .join(", "),
                     );
 
-                    // Log the unfixable signal to the task output
-                    let _ = self.checkpoint_db.append_task_output_ex(
-                        &config.execution_id,
-                        "\n=== AI SIGNALED UNFIXABLE ERRORS ===\nThe AI has determined that some errors cannot be fixed automatically. Proceeding to completion phase.\n",
-                        false,
-                        false,
-                    );
-
-                    return LoopResult {
-                        iterations_run: iteration,
-                        verification_passed: false,
-                        max_iterations_reached: false,
-                        critical_failure: false,
-                        was_stopped: false,
-                        unfixable_errors: true,
-                        iteration_results,
+                    // Store findings as a task_run_event for later retrieval
+                    let findings_data = serde_json::json!({
+                        "phase": "agentic",
+                        "iteration": iteration,
+                        "findings": parsed.findings,
+                    });
+                    let findings_event = CreateTaskRunEventInput {
+                        task_run_id: config.execution_id.clone(),
+                        event_type: "agentic_findings".to_string(),
+                        event_subtype: None,
+                        message: format!(
+                            "Agentic phase reported {} finding(s) on iteration {}",
+                            parsed.findings.len(),
+                            iteration,
+                        ),
+                        data: Some(serde_json::to_string(&findings_data).unwrap_or_default()),
+                        workflow_name: None,
+                        state_name: None,
+                        action_id: None,
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        duration_ms: None,
                     };
+                    if let Err(e) = self.checkpoint_db.create_task_run_event(&findings_event) {
+                        warn!("Failed to store agentic findings event: {}", e);
+                    }
                 }
+            }
+
+            // Check if the AI signaled unfixable errors.
+            // Prefer the structured `parsed` output, fall back to raw marker check.
+            let is_unfixable = if let Some(parsed) = agentic_outcome.parsed() {
+                parsed.unfixable
+            } else if let Some(output) = agentic_outcome.output() {
+                output.contains("[UNFIXABLE_ERRORS]") || output.contains("[UNFIXABLE_ERROR]")
+            } else {
+                false
+            };
+            if is_unfixable {
+                let reason = agentic_outcome
+                    .parsed()
+                    .and_then(|p| p.unfixable_reason.as_deref())
+                    .unwrap_or("(no reason provided)");
+                warn!(
+                    "AI signaled unfixable errors on iteration {} - exiting loop gracefully. Reason: {}",
+                    iteration, reason
+                );
+
+                // Log the unfixable signal to the task output
+                let unfixable_msg = format!(
+                    "\n=== AI SIGNALED UNFIXABLE ERRORS ===\nThe AI has determined that some errors cannot be fixed automatically.\nReason: {}\nProceeding to completion phase.\n",
+                    reason
+                );
+                let _ = self.checkpoint_db.append_task_output_ex(
+                    &config.execution_id,
+                    &unfixable_msg,
+                    false,
+                    false,
+                );
+
+                return LoopResult {
+                    iterations_run: iteration,
+                    verification_passed: false,
+                    max_iterations_reached: false,
+                    critical_failure: false,
+                    was_stopped: false,
+                    unfixable_errors: true,
+                    iteration_results,
+                };
             }
 
             // Check if the task was stopped during the agentic phase
@@ -1852,6 +2241,245 @@ impl LoopController {
                     unfixable_errors: false,
                     iteration_results,
                 };
+            }
+
+            // -----------------------------------------------------------------
+            // APPROVAL GATE (optional human-in-the-loop pause)
+            // -----------------------------------------------------------------
+            // If the workflow has approval_gate enabled, or if the AI output
+            // contains the [APPROVAL_GATE] marker, pause for human review.
+            let needs_approval = config.approval_gate
+                || agentic_outcome
+                    .output()
+                    .map(|o| o.contains("[APPROVAL_GATE]"))
+                    .unwrap_or(false);
+
+            if needs_approval && agentic_outcome.is_success() {
+                info!(
+                    "Approval gate triggered on iteration {} - pausing for human review",
+                    iteration
+                );
+
+                // Collect context for the reviewer
+                let diff_stat_for_approval = match crate::process_helpers::tokio_no_window("git")
+                    .args(["diff", "--stat"])
+                    .output()
+                    .await
+                {
+                    Ok(o) if o.status.success() => {
+                        let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                        if s.is_empty() {
+                            None
+                        } else {
+                            Some(s)
+                        }
+                    }
+                    _ => None,
+                };
+
+                let diff_for_approval = match crate::process_helpers::tokio_no_window("git")
+                    .args(["diff"])
+                    .output()
+                    .await
+                {
+                    Ok(o) if o.status.success() => {
+                        let raw = String::from_utf8_lossy(&o.stdout).to_string();
+                        if raw.is_empty() {
+                            None
+                        } else if raw.len() > 8000 {
+                            Some(format!(
+                                "{}...\n[truncated, {} more chars]",
+                                &raw[..8000],
+                                raw.len() - 8000
+                            ))
+                        } else {
+                            Some(raw)
+                        }
+                    }
+                    _ => None,
+                };
+
+                // Build the approval request
+                let approval_id = format!("approval-{}-iter-{}", config.execution_id, iteration);
+                let summary = agentic_outcome
+                    .parsed()
+                    .map(|p| p.summary.clone())
+                    .unwrap_or_else(|| {
+                        format!("Agentic phase completed (iteration {})", iteration)
+                    });
+                let files_modified = agentic_outcome
+                    .parsed()
+                    .map(|p| {
+                        p.files_modified
+                            .iter()
+                            .map(|f| f.path.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+
+                let context = super::approval::ApprovalContext {
+                    summary: summary.clone(),
+                    files_modified: files_modified.clone(),
+                    git_diff_stat: diff_stat_for_approval.clone(),
+                    git_diff: diff_for_approval.clone(),
+                };
+
+                let request = super::approval::ApprovalRequest {
+                    id: approval_id.clone(),
+                    execution_id: config.execution_id.clone(),
+                    iteration,
+                    prompt: format!(
+                        "The AI has completed iteration {}. Review the changes and approve to continue.",
+                        iteration
+                    ),
+                    context: context.clone(),
+                    options: vec![
+                        "Approve".to_string(),
+                        "Reject".to_string(),
+                        "Abort Workflow".to_string(),
+                    ],
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                };
+
+                // Record to database for audit trail
+                let context_json =
+                    serde_json::to_string(&context).unwrap_or_else(|_| "{}".to_string());
+                let _ = self.checkpoint_db.insert_approval_gate(
+                    &approval_id,
+                    &config.execution_id,
+                    iteration,
+                    &request.prompt,
+                    &context_json,
+                );
+
+                // Persist workflow state: ApprovalPending
+                self.persist_workflow_state(
+                    &config.execution_id,
+                    &UnifiedWorkflowState::approval_pending(
+                        iteration,
+                        config.stage_index,
+                        approval_id.clone(),
+                        request.prompt.clone(),
+                    ),
+                );
+
+                // Register with the in-memory approval registry
+                let registry = super::approval::get_approval_registry();
+                let receiver = registry.register(request).await;
+
+                // Emit event to notify the frontend
+                let broadcaster = EventBroadcaster::new(self.app_handle.clone());
+                broadcaster.approval_required(
+                    &config.execution_id,
+                    &approval_id,
+                    iteration,
+                    &format!("Review changes from iteration {}", iteration),
+                );
+
+                // Log the pause
+                let _ = self.checkpoint_db.append_task_output_ex(
+                    &config.execution_id,
+                    &format!(
+                        "\n=== APPROVAL GATE (Iteration {}) ===\nWaiting for human review...\n",
+                        iteration
+                    ),
+                    false,
+                    false,
+                );
+
+                // Wait for the human response (or stop signal)
+                let approval_response = tokio::select! {
+                    resp = receiver => {
+                        match resp {
+                            Ok(r) => r,
+                            Err(_) => {
+                                warn!("Approval receiver dropped - treating as abort");
+                                super::approval::ApprovalResponse {
+                                    approved: false,
+                                    action: "abort".to_string(),
+                                    comment: Some("Approval channel closed unexpectedly".to_string()),
+                                }
+                            }
+                        }
+                    }
+                    _ = async {
+                        // Poll for stop signal while waiting for approval
+                        loop {
+                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                            if self.is_task_stopped(&config.execution_id) {
+                                return;
+                            }
+                        }
+                    } => {
+                        // Task was stopped while waiting for approval
+                        warn!("Task stopped while waiting for approval - aborting");
+                        // Cancel the pending approval
+                        registry.cancel_all_for_execution(&config.execution_id).await;
+                        super::approval::ApprovalResponse {
+                            approved: false,
+                            action: "abort".to_string(),
+                            comment: Some("Task was stopped".to_string()),
+                        }
+                    }
+                };
+
+                // Record the response to the database
+                let _ = self.checkpoint_db.resolve_approval_gate(
+                    &approval_id,
+                    &approval_response.action,
+                    approval_response.comment.as_deref(),
+                );
+
+                // Emit resolved event
+                broadcaster.approval_resolved(
+                    &config.execution_id,
+                    &approval_id,
+                    approval_response.approved,
+                    &approval_response.action,
+                );
+
+                // Log the decision
+                let _ = self.checkpoint_db.append_task_output_ex(
+                    &config.execution_id,
+                    &format!(
+                        "Approval decision: {} (comment: {})\n",
+                        approval_response.action,
+                        approval_response.comment.as_deref().unwrap_or("none")
+                    ),
+                    false,
+                    false,
+                );
+
+                // Handle the response
+                if approval_response.action == "abort" {
+                    warn!(
+                        "Workflow aborted via approval gate on iteration {}",
+                        iteration
+                    );
+                    return LoopResult {
+                        iterations_run: iteration,
+                        verification_passed: false,
+                        max_iterations_reached: false,
+                        critical_failure: false,
+                        was_stopped: true,
+                        unfixable_errors: false,
+                        iteration_results,
+                    };
+                }
+                if !approval_response.approved {
+                    info!(
+                        "Changes rejected on iteration {} - AI will retry",
+                        iteration
+                    );
+                    // Continue to verification, which will likely fail,
+                    // prompting the AI to try a different approach
+                }
+
+                // Restore workflow state to agentic_complete so normal flow continues
+                self.persist_workflow_state(
+                    &config.execution_id,
+                    &UnifiedWorkflowState::agentic_complete(iteration),
+                );
             }
 
             // Capture git diff after agentic phase for cross-iteration context.
@@ -1957,10 +2585,16 @@ impl LoopController {
                     Ok(())
                 });
             }
+
+            // Check workflow chain triggers
+            if let Some(wf_id) = workflow_id {
+                self.check_chain_triggers(execution_id, wf_id, "completed")
+                    .await;
+            }
         }
     }
 
-    async fn mark_task_failed(&self, execution_id: &str, reason: &str) {
+    async fn mark_task_failed(&self, execution_id: &str, reason: &str, workflow_id: Option<&str>) {
         if let Err(e) = self.checkpoint_db.fail_task_run(execution_id, reason) {
             error!("Failed to mark task {} as failed: {}", execution_id, e);
         } else {
@@ -1984,6 +2618,30 @@ impl LoopController {
                         warn!("Failed to sync task failure to backend: {}", e);
                     }
                 }
+            });
+
+            // Check workflow chain triggers
+            if let Some(wf_id) = workflow_id {
+                self.check_chain_triggers(execution_id, wf_id, "failed")
+                    .await;
+            }
+        }
+    }
+
+    /// Fire-and-forget: check if any workflow chain triggers match this completion.
+    async fn check_chain_triggers(&self, execution_id: &str, workflow_id: &str, status: &str) {
+        let service = crate::trigger_system::get_trigger_service().await;
+        if let Some(service) = service {
+            let tx = service.event_sender();
+            let db = self.checkpoint_db.clone();
+            let wf_id = workflow_id.to_string();
+            let exec_id = execution_id.to_string();
+            let status = status.to_string();
+            tokio::spawn(async move {
+                crate::trigger_system::watchers::workflow_chain::check_workflow_chains(
+                    &db, &tx, &wf_id, &exec_id, &status, None,
+                )
+                .await;
             });
         }
     }
@@ -2281,7 +2939,7 @@ impl LoopController {
 
             // Append sweep output to task output_log
             let output_text = match &outcome {
-                AgenticOutcome::Success { output } => {
+                AgenticOutcome::Success { output, .. } => {
                     format!(
                         "\n\n=== Completion Sweep (Iteration {}/{}) ===\n\n{}",
                         iteration + 1,
@@ -2289,7 +2947,7 @@ impl LoopController {
                         output
                     )
                 }
-                AgenticOutcome::Failed { output, error } => {
+                AgenticOutcome::Failed { output, error, .. } => {
                     warn!("SWEEP: Iteration {} failed: {}", iteration + 1, error);
                     format!(
                         "\n\n=== Completion Sweep (Iteration {}/{}, FAILED: {}) ===\n\n{}",
@@ -2433,6 +3091,60 @@ impl WorkflowResult {
 }
 
 /// Configuration for workflow resume on startup.
+/// Evaluate whether a stage should be skipped based on its condition.
+///
+/// Returns `true` if the stage should be **skipped** (condition not met).
+/// All condition fields combine with AND semantics: if any condition
+/// is not satisfied, the stage is skipped.
+///
+/// # Arguments
+/// - `condition` - The stage condition to evaluate
+/// - `previous_passed` - Whether the previous stage's verification passed
+/// - `total_iterations` - Total iterations across all completed stages so far
+/// - `total_failures` - Number of stages that failed verification so far
+fn evaluate_stage_condition(
+    condition: &crate::unified_workflows::StageCondition,
+    previous_passed: bool,
+    total_iterations: u32,
+    total_failures: u32,
+) -> bool {
+    // Check if_previous condition
+    if let Some(ref if_prev) = condition.if_previous {
+        match if_prev.as_str() {
+            "passed" => {
+                if !previous_passed {
+                    return true; // skip: previous did not pass
+                }
+            }
+            "failed" => {
+                if previous_passed {
+                    return true; // skip: previous did not fail
+                }
+            }
+            "any" => {} // always run
+            other => {
+                warn!("Unknown if_previous value '{}', treating as 'any'", other);
+            }
+        }
+    }
+
+    // Check min_iteration condition
+    if let Some(min_iter) = condition.min_iteration {
+        if total_iterations < min_iter {
+            return true; // skip: not enough iterations yet
+        }
+    }
+
+    // Check min_failures condition
+    if let Some(min_fail) = condition.min_failures {
+        if total_failures < min_fail {
+            return true; // skip: not enough failures yet
+        }
+    }
+
+    false // all conditions met, do NOT skip
+}
+
 pub struct ResumeConfig {
     /// Whether to attempt resume of interrupted workflows (default: true)
     pub resume_enabled: bool,
@@ -2615,9 +3327,15 @@ pub async fn resume_interrupted_workflows(
                                 reflection_mode: workflow.reflection_mode,
                                 provider_override: None,
                                 model_override: None,
+                                model_overrides: workflow.model_overrides.clone(),
                                 stage_index: None,
                                 max_sessions: Some(workflow.max_iterations),
                                 auto_run_generated: false,
+                                approval_gate: workflow.approval_gate,
+                                max_context_tokens: 100_000,
+                                cross_workflow_learning: true,
+                                verification_history: std::collections::HashMap::new(),
+                                routing_context: Default::default(),
                             };
 
                             controller
@@ -2750,9 +3468,15 @@ pub async fn resume_interrupted_workflows(
                                 reflection_mode: workflow.reflection_mode,
                                 provider_override: None,
                                 model_override: None,
+                                model_overrides: workflow.model_overrides.clone(),
                                 stage_index: None,
                                 max_sessions: Some(workflow.max_iterations),
                                 auto_run_generated: false,
+                                approval_gate: workflow.approval_gate,
+                                max_context_tokens: 100_000,
+                                cross_workflow_learning: true,
+                                verification_history: std::collections::HashMap::new(),
+                                routing_context: Default::default(),
                             };
 
                             controller

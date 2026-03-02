@@ -46,12 +46,19 @@ export interface HealthCheckConfig {
   consecutive_failures: number;
 }
 
+export interface ScheduleConfig {
+  type: "schedule";
+  cron_expression: string;
+  timezone: string;
+}
+
 export type TriggerConfig =
   | WebhookConfig
   | FileWatchConfig
   | WorkflowChainConfig
   | GitEventConfig
-  | HealthCheckConfig;
+  | HealthCheckConfig
+  | ScheduleConfig;
 
 // ============================================================================
 // Trigger Definition
@@ -74,6 +81,8 @@ export interface WorkflowTrigger {
   debounce_ms: number;
   cooldown_seconds: number;
   max_concurrent: number;
+  retry_count: number;
+  retry_delay_seconds: number;
   enabled: boolean;
   last_triggered_at?: string;
   last_execution_id?: string;
@@ -111,6 +120,8 @@ export interface CreateTriggerRequest {
   debounce_ms?: number;
   cooldown_seconds?: number;
   max_concurrent?: number;
+  retry_count?: number;
+  retry_delay_seconds?: number;
 }
 
 export interface UpdateTriggerRequest {
@@ -123,6 +134,8 @@ export interface UpdateTriggerRequest {
   debounce_ms?: number;
   cooldown_seconds?: number;
   max_concurrent?: number;
+  retry_count?: number;
+  retry_delay_seconds?: number;
 }
 
 export interface TriggerSystemStatus {
@@ -131,6 +144,7 @@ export interface TriggerSystemStatus {
   enabled_triggers: number;
   active_watchers: number;
   active_executions: number;
+  dropped_events: number;
 }
 
 // ============================================================================
@@ -149,6 +163,8 @@ export function getTriggerTypeLabel(type: string): string {
       return "Git Event";
     case "health_check":
       return "Health Check";
+    case "schedule":
+      return "Schedule";
     default:
       return type;
   }
@@ -163,6 +179,8 @@ export function getActionColor(action: string): string {
     case "throttled":
       return "text-orange-400";
     case "condition_failed":
+    case "chain_depth_exceeded":
+    case "disabled":
       return "text-gray-400";
     case "error":
       return "text-red-400";

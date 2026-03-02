@@ -17,6 +17,7 @@ import { BottomBar } from "./BottomBar";
 import { ActiveRunsBar } from "./ActiveRunsBar";
 import { ShortcutsModal } from "./ShortcutsModal";
 import { CompletionSummary } from "./CompletionSummary";
+import { ApprovalDialog } from "./ApprovalDialog";
 import { registerAllWidgets } from "./widgets";
 import { useFlowExecutionData } from "./widgets/flow-execution";
 import { windowManager } from "../../managers";
@@ -24,6 +25,7 @@ import type { ActivityType } from "../../types/dashboard/activity-types";
 import type { DashboardStatus } from "../../hooks/dashboard/useDashboardState";
 import type { StepStats } from "./widgets/shared/types";
 import type { CommandResponse } from "../../types/displayProfile";
+import { getApiBase } from "@/lib/runner-api";
 
 // Register widgets at module load time (before any component renders)
 // This ensures widgets are available when hooks run
@@ -219,7 +221,7 @@ export function DashboardPage({
     if (taskId) {
       try {
         console.log(`[DASHBOARD] Stopping unified workflow: ${taskId}`);
-        const response = await fetch(`http://localhost:9876/task-runs/${taskId}/stop`, {
+        const response = await fetch(`${getApiBase()}/task-runs/${taskId}/stop`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
         });
@@ -450,6 +452,11 @@ export function DashboardPage({
 
           {/* Shortcuts Modal */}
           <ShortcutsModal isOpen={showShortcuts} onClose={() => setShowShortcuts(false)} />
+
+          {/* Approval Dialog Overlay - shown when workflow is paused for human review */}
+          {state.taskInfo?.taskId && (
+            <ApprovalDialog taskRunId={state.taskInfo.taskId} onResolved={() => refresh()} />
+          )}
 
           {/* Completion Summary Overlay */}
           <CompletionSummary

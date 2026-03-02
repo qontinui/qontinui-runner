@@ -31,6 +31,7 @@ export { NewRunDialog } from "./NewRunDialog";
 // Overlays
 export { ShortcutsModal } from "./ShortcutsModal";
 export { CompletionSummary } from "./CompletionSummary";
+export { ApprovalDialog } from "./ApprovalDialog";
 
 // Legacy components (may be deprecated in future)
 export { LiveExecutionView } from "./LiveExecutionView";
