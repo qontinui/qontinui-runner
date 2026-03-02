@@ -1034,13 +1034,17 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 }
             });
 
-            // Start scheduler service in background
-            info!("Starting scheduler service");
-            tauri::async_runtime::spawn(async move {
-                // Wait briefly for MCP API server to bind
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                scheduler_service::start_scheduler_service().await;
-            });
+            // Start scheduler service in background (skip for secondary instances to avoid duplicate executions)
+            if std::env::var("QONTINUI_INSTANCE_NAME").is_ok() {
+                info!("Secondary instance — skipping scheduler service");
+            } else {
+                info!("Starting scheduler service");
+                tauri::async_runtime::spawn(async move {
+                    // Wait briefly for MCP API server to bind
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    scheduler_service::start_scheduler_service().await;
+                });
+            }
 
             // Start error monitor service in background
             info!("Starting error monitor service");
@@ -1089,8 +1093,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // Auto-start processes
-                manager.start_auto_processes().await;
+                // Auto-start processes (skip for secondary instances to avoid port conflicts)
+                let is_secondary = std::env::var("QONTINUI_INSTANCE_NAME").is_ok();
+                if is_secondary {
+                    info!("Secondary instance — skipping managed process auto-start");
+                } else {
+                    manager.start_auto_processes().await;
+                }
 
                 // Store the manager
                 let mut manager_lock = app_state_for_pcm.process_capture_manager.lock().await;
