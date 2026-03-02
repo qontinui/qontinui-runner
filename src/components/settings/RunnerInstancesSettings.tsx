@@ -9,6 +9,7 @@ import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Monitor, Plus, Trash2, Play, Square } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
+import { getApiPort } from "@/lib/runner-api";
 import type { LogFunction } from "./types";
 
 interface InstanceStatus {
@@ -17,6 +18,7 @@ interface InstanceStatus {
   port: number;
   running: boolean;
   pid: number | null;
+  api_ready: boolean;
 }
 
 interface RunnerInstancesSettingsProps {
@@ -51,10 +53,11 @@ export function RunnerInstancesSettings({ onLog }: RunnerInstancesSettingsProps)
     return () => clearInterval(interval);
   }, [loadInstances]);
 
-  // Auto-suggest next available port
+  // Auto-suggest next available port (skip primary runner port and all instance ports)
   useEffect(() => {
-    if (showAddForm && instances.length > 0) {
+    if (showAddForm) {
       const usedPorts = new Set(instances.map((i) => i.port));
+      usedPorts.add(getApiPort());
       let nextPort = 9877;
       while (usedPorts.has(nextPort)) nextPort++;
       setNewPort(nextPort);
@@ -66,6 +69,20 @@ export function RunnerInstancesSettings({ onLog }: RunnerInstancesSettingsProps)
       onLog("warning", "Instance name is required");
       return;
     }
+
+    // Check for port conflict with primary runner
+    if (newPort === getApiPort()) {
+      onLog("warning", "Port conflicts with the primary runner");
+      return;
+    }
+
+    // Check for port conflict with existing instances
+    const conflicting = instances.find((i) => i.port === newPort);
+    if (conflicting) {
+      onLog("warning", `Port already used by instance '${conflicting.name}'`);
+      return;
+    }
+
     try {
       const id = `instance-${Date.now()}`;
       await invoke("save_runner_instance", { id, name: newName.trim(), port: newPort });
@@ -142,9 +159,19 @@ export function RunnerInstancesSettings({ onLog }: RunnerInstancesSettingsProps)
             {/* Status indicator */}
             <div
               className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${
-                instance.running ? "bg-green-500" : "bg-gray-500"
+                instance.running && instance.api_ready
+                  ? "bg-green-500"
+                  : instance.running
+                    ? "bg-yellow-500"
+                    : "bg-gray-500"
               }`}
-              title={instance.running ? `Running (PID: ${instance.pid})` : "Stopped"}
+              title={
+                instance.running && instance.api_ready
+                  ? `Ready (PID: ${instance.pid})`
+                  : instance.running
+                    ? `Starting... (PID: ${instance.pid})`
+                    : "Stopped"
+              }
             />
 
             {/* Info */}

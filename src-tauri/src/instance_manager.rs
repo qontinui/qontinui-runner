@@ -19,6 +19,7 @@ pub struct InstanceStatus {
     pub port: u16,
     pub running: bool,
     pub pid: Option<u32>,
+    pub api_ready: bool,
 }
 
 /// Handle for a spawned runner instance.
@@ -150,12 +151,20 @@ impl InstanceManager {
             (false, None)
         };
 
+        // Probe the instance's HTTP API to check if it's actually ready
+        let api_ready = if running {
+            probe_instance_api(config.port).await
+        } else {
+            false
+        };
+
         InstanceStatus {
             id: config.id.clone(),
             name: config.name.clone(),
             port: config.port,
             running,
             pid,
+            api_ready,
         }
     }
 
@@ -176,4 +185,20 @@ fn is_process_alive(child: &mut std::process::Child) -> bool {
         Ok(None) => true,     // Still running
         Err(_) => false,      // Error checking — assume dead
     }
+}
+
+/// Probe an instance's HTTP API to check if it's ready to accept requests.
+/// Returns true if the `/status` endpoint responds within 1 second.
+async fn probe_instance_api(port: u16) -> bool {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(1))
+        .build();
+
+    let client = match client {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    let url = format!("http://localhost:{}/status", port);
+    client.get(&url).send().await.is_ok()
 }

@@ -1482,16 +1482,8 @@ function AppContent() {
       }
 
       case "terminal":
-        return (
-          <div className="h-full overflow-hidden">
-            <TerminalPage
-              onNavigateToWorkflow={(workflowId) => {
-                setEditWorkflowId(workflowId);
-                setActiveTab("unified-workflow-builder");
-              }}
-            />
-          </div>
-        );
+        // Rendered always-mounted outside the switch (see below)
+        return null;
 
       case "help":
         return <HelpTab />;
@@ -1528,7 +1520,18 @@ function AppContent() {
           />
 
           {/* Content Area */}
-          <main className="flex-1 overflow-hidden">{renderTabContent()}</main>
+          <main className="flex-1 overflow-hidden relative">
+            {renderTabContent()}
+            {/* Terminal is always-mounted to preserve PTY sessions and scrollback across tab switches */}
+            <div className={`absolute inset-0 ${activeTab === "terminal" ? "" : "hidden"}`}>
+              <TerminalPage
+                onNavigateToWorkflow={(workflowId) => {
+                  setEditWorkflowId(workflowId);
+                  setActiveTab("unified-workflow-builder");
+                }}
+              />
+            </div>
+          </main>
         </div>
 
         {/* Action Detail Modal */}
