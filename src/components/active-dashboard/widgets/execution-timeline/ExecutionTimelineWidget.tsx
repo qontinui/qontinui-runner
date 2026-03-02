@@ -7,7 +7,7 @@
  * Provides a high-level overview of workflow execution progress.
  */
 
-import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { useState, useRef, useCallback, useMemo } from "react";
 import {
   Terminal,
   CheckCircle,
@@ -445,12 +445,6 @@ function IterationSection({
   expandedStepId: string | null;
   onStepToggle: (stepId: string) => void;
 }) {
-  const [expanded, setExpanded] = useState(defaultExpanded);
-
-  // Sync local state when parent changes defaultExpanded
-  useEffect(() => {
-    setExpanded(defaultExpanded);
-  }, [defaultExpanded]);
   const colors = getAccentColors(phaseColor as Parameters<typeof getAccentColors>[0]);
   const successColors = getStatusColors("success");
   const errorColors = getStatusColors("error");
@@ -463,14 +457,12 @@ function IterationSection({
       {/* Iteration header */}
       <button
         onClick={() => {
-          const newExpanded = !expanded;
-          setExpanded(newExpanded);
           if (onIterationToggle && iterationKey) {
-            onIterationToggle(iterationKey, newExpanded);
+            onIterationToggle(iterationKey, !defaultExpanded);
           }
         }}
-        aria-expanded={expanded}
-        aria-label={`Iteration ${iterationGroup.iteration} section, ${expanded ? "collapse" : "expand"}`}
+        aria-expanded={defaultExpanded}
+        aria-label={`Iteration ${iterationGroup.iteration} section, ${defaultExpanded ? "collapse" : "expand"}`}
         className={cn(
           "w-full flex items-center gap-2 px-3 py-1.5 transition-colors",
           "hover:bg-muted/20",
@@ -478,7 +470,7 @@ function IterationSection({
         )}
       >
         {/* Expand/collapse icon */}
-        {expanded ? (
+        {defaultExpanded ? (
           <ChevronDown className="h-3 w-3 text-muted-foreground" />
         ) : (
           <ChevronRight className="h-3 w-3 text-muted-foreground" />
@@ -520,7 +512,7 @@ function IterationSection({
       </button>
 
       {/* Steps list */}
-      {expanded && (
+      {defaultExpanded && (
         <div className="bg-muted/5">
           {iterationGroup.steps.map((step) => (
             <StepRow
@@ -770,69 +762,59 @@ export function ExecutionTimelineWidget({
     setExpandedStepId((prev) => (prev === stepId ? null : stepId));
   }, []);
 
-  // Track which iterations are expanded
-  // By default, only the current/latest iteration in each phase is expanded
-  const [expandedIterations, setExpandedIterations] = useState<Set<string>>(new Set());
+  // User-explicit iteration expand/collapse overrides (key -> expanded boolean)
+  const [userIterationToggles, setUserIterationToggles] = useState<Map<string, boolean>>(new Map());
 
   // Track the previous iteration counts to detect new iterations
   const prevIterationCounts = useRef<Map<string, number>>(new Map());
 
-  // Derive a stable key from phaseGroups to avoid re-running every render
-  const phaseGroupsKey = phaseGroups
-    .map((g) => `${g.stageIndex}:${g.phase}:${g.iterationGroups.length}`)
-    .join(",");
+  // Compute expanded iterations during render by merging auto-defaults with user overrides.
+  // Auto-default: expand the latest iteration in each phase.
+  // When a new iteration appears, user overrides for that phase are ignored so the latest expands.
+  const expandedIterations = useMemo(() => {
+    const result = new Set<string>();
 
-  // Update expanded iterations when new iterations are detected
-  useEffect(() => {
-    setExpandedIterations((prevExpanded) => {
-      const newExpandedSet = new Set<string>();
+    for (const group of phaseGroups) {
+      if (!group.hasIterations || group.iterationGroups.length === 0) continue;
 
-      for (const group of phaseGroups) {
-        if (!group.hasIterations || group.iterationGroups.length === 0) continue;
+      const groupId = `${group.stageIndex}:${group.phase}`;
+      const prevCount = prevIterationCounts.current.get(groupId) ?? 0;
+      const currentCount = group.iterationGroups.length;
+      const maxIteration = Math.max(...group.iterationGroups.map((g) => g.iteration));
+      const isNewIteration = currentCount > prevCount;
 
-        const groupId = `${group.stageIndex}:${group.phase}`;
-        const prevCount = prevIterationCounts.current.get(groupId) ?? 0;
-        const currentCount = group.iterationGroups.length;
-        const maxIteration = Math.max(...group.iterationGroups.map((g) => g.iteration));
+      prevIterationCounts.current.set(groupId, currentCount);
 
-        // If new iteration started, only expand the latest one
-        if (currentCount > prevCount) {
-          // Collapse all previous iterations, expand only the latest
-          const latestKey = `${groupId}-${maxIteration}`;
-          newExpandedSet.add(latestKey);
-        } else {
-          // Preserve existing expanded state for this phase
-          for (const iterGroup of group.iterationGroups) {
-            const key = `${groupId}-${iterGroup.iteration}`;
-            if (prevExpanded.has(key)) {
-              newExpandedSet.add(key);
+      if (isNewIteration) {
+        // New iteration detected: expand only the latest, ignore user overrides for this phase
+        result.add(`${groupId}-${maxIteration}`);
+      } else {
+        // Apply user overrides; default to expanding the latest if no overrides exist
+        let hasUserOverride = false;
+        for (const iterGroup of group.iterationGroups) {
+          const key = `${groupId}-${iterGroup.iteration}`;
+          const userToggle = userIterationToggles.get(key);
+          if (userToggle !== undefined) {
+            hasUserOverride = true;
+            if (userToggle) {
+              result.add(key);
             }
           }
-          // If nothing was expanded, expand the latest
-          const phaseHasExpanded = group.iterationGroups.some((g) =>
-            newExpandedSet.has(`${groupId}-${g.iteration}`),
-          );
-          if (!phaseHasExpanded) {
-            newExpandedSet.add(`${groupId}-${maxIteration}`);
-          }
         }
-
-        prevIterationCounts.current.set(groupId, currentCount);
+        // If user hasn't toggled anything for this phase, expand the latest
+        if (!hasUserOverride) {
+          result.add(`${groupId}-${maxIteration}`);
+        }
       }
+    }
 
-      return newExpandedSet;
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phaseGroupsKey]);
+    return result;
+  }, [phaseGroups, userIterationToggles]);
 
   const handleIterationToggle = useCallback((key: string, expanded: boolean) => {
-    setExpandedIterations((prev) => {
-      const next = new Set(prev);
-      if (expanded) {
-        next.add(key);
-      } else {
-        next.delete(key);
-      }
+    setUserIterationToggles((prev) => {
+      const next = new Map(prev);
+      next.set(key, expanded);
       return next;
     });
   }, []);

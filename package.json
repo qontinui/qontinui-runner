@@ -88,7 +88,7 @@
     "lucide-react": "^0.562.0",
     "postcss": "^8.5",
     "prism-react-renderer": "^2.4.1",
-    "qontinui-navigation": "file:../qontinui-navigation",
+    "qontinui-navigation": "github:qontinui/qontinui-navigation",
     "qrcode.react": "^4.2.0",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",

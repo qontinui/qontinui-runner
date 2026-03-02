@@ -8,7 +8,7 @@
 
 import { useState, useCallback, useRef } from "react";
 import { Upload, FileJson, AlertCircle, Check } from "lucide-react";
-import type { SpecConfig } from "./types";
+import type { SpecConfig, LegacyTestGeneratorOutput } from "./types";
 import { validateSpecConfig, migrateFromTestGeneratorOutput } from "./types";
 
 interface SpecFileLoaderProps {
@@ -55,8 +55,7 @@ export function SpecFileLoader({ onLoad, currentFile }: SpecFileLoaderProps) {
             return;
           }
 
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const specConfig = migrateFromTestGeneratorOutput(parsed as any);
+          const specConfig = migrateFromTestGeneratorOutput(parsed as LegacyTestGeneratorOutput);
           setMigratedFromLegacy(true);
           setError(null);
           onLoad(specConfig);

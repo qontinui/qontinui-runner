@@ -44,11 +44,13 @@ export function TerminalPage({ onNavigateToWorkflow }: TerminalPageProps) {
   }
 
   // Auto-create first terminal on mount
+  const didInit = useRef(false);
   useEffect(() => {
-    if (tabs.length === 0) {
+    if (!didInit.current && tabs.length === 0) {
+      didInit.current = true;
       createTerminal();
     }
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [createTerminal, tabs.length]);
 
   const handleExit = useCallback(
     (terminalId: string, exitCode: number | null) => {
