@@ -154,14 +154,22 @@ pub async fn generate_workflow_standalone(
         });
     }
 
-    // Build generation request
-    let request = crate::workflow_generation::GenerateWorkflowRequest {
-        description,
-        inline_context: Some(format!(
+    // Enrich context with existing specs for spec-aware generation
+    let existing_specs = crate::commands::ai_chat::fetch_existing_specs().await;
+    let enriched_context = if existing_specs != "No existing specs found" {
+        crate::commands::ai_chat::build_spec_aware_context(&inline_context, &existing_specs)
+    } else {
+        format!(
             "The following is a Claude Code conversation transcript or selected text. \
              Use this context to generate an appropriate workflow:\n\n{}",
             inline_context
-        )),
+        )
+    };
+
+    // Build generation request
+    let request = crate::workflow_generation::GenerateWorkflowRequest {
+        description,
+        inline_context: Some(enriched_context),
         category: None,
         tags: None,
         max_iterations: None,

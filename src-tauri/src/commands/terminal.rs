@@ -102,6 +102,41 @@ pub fn terminal_list(
     })
 }
 
+/// Get the scrollback buffer for a terminal session (used for reconnection).
+///
+/// Returns the buffered PTY output so a reconnecting frontend can replay it,
+/// along with byte offset metadata. Also resets flow control so the reconnecting
+/// frontend doesn't immediately hit backpressure.
+#[tauri::command]
+pub fn terminal_get_buffer(
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+    terminal_id: String,
+) -> Result<CommandResponse, String> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    let session = terminal_manager
+        .get(&terminal_id)
+        .ok_or_else(|| format!("Terminal not found: {}", terminal_id))?;
+
+    let (data, start_offset) = session.get_scrollback_buffer();
+    let total_bytes_produced = session.info().total_bytes_produced;
+
+    // Reset flow control so the reconnecting frontend starts fresh
+    session.reset_flow_control();
+
+    let encoded = STANDARD.encode(&data);
+
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::json!({
+            "data": encoded,
+            "start_offset": start_offset,
+            "total_bytes_produced": total_bytes_produced,
+        })),
+    })
+}
+
 /// Acknowledge bytes received by the frontend (flow control).
 #[tauri::command]
 pub fn terminal_ack(

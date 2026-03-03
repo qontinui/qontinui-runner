@@ -933,6 +933,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal::terminal_close,
             commands::terminal::terminal_list,
             commands::terminal::terminal_ack,
+            commands::terminal::terminal_get_buffer,
             // Runner instance management commands (dev feature)
             commands::instances::get_runner_instances,
             commands::instances::save_runner_instance,
@@ -944,6 +945,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::transcript::transcript_read_session,
             commands::transcript::transcript_get_latest,
             commands::transcript::generate_workflow_standalone,
+            // Terminal session analysis commands
+            commands::terminal_analysis::analyze_session_summary,
+            commands::terminal_analysis::analyze_architecture,
+            commands::terminal_analysis::analyze_change_impact,
+            commands::terminal_analysis::analyze_plan_progress,
+            commands::terminal_analysis::analyze_cross_tab,
+            commands::terminal_analysis::get_latest_plan_content,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");

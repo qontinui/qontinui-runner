@@ -81,6 +81,7 @@ class RunnerWebSocketClient:
         project_id: str,
         runner_version: str = "0.1.0",
         runner_name: str | None = None,
+        runner_port: int | None = None,
         auto_reconnect: bool = True,
         heartbeat_interval: int = 30,
         max_reconnect_attempts: int = 5,
@@ -97,6 +98,7 @@ class RunnerWebSocketClient:
             project_id: Project UUID
             runner_version: Version of qontinui-runner
             runner_name: Custom user-defined name for this runner
+            runner_port: HTTP API port this runner is listening on
             auto_reconnect: Enable automatic reconnection on disconnect
             heartbeat_interval: Seconds between heartbeat messages
             max_reconnect_attempts: Maximum reconnection attempts
@@ -114,6 +116,7 @@ class RunnerWebSocketClient:
         self.project_id = project_id
         self.runner_version = runner_version
         self.runner_name = runner_name
+        self.runner_port = runner_port
         self.auto_reconnect = auto_reconnect
         self.heartbeat_interval = heartbeat_interval
         self.max_reconnect_attempts = max_reconnect_attempts
@@ -438,15 +441,18 @@ class RunnerWebSocketClient:
             True if info sent successfully, False otherwise
         """
         # Message format must match WSMessage schema: {type, data}
+        data: dict[str, Any] = {
+            "runner_name": self.runner_name,
+            "runner_version": self.runner_version,
+            "runner_os": self.runner_os,
+            "runner_hostname": self.runner_hostname,
+            "timestamp": self._get_timestamp(),
+        }
+        if self.runner_port is not None:
+            data["runner_port"] = self.runner_port
         message = {
             "type": "runner_info",
-            "data": {
-                "runner_name": self.runner_name,
-                "runner_version": self.runner_version,
-                "runner_os": self.runner_os,
-                "runner_hostname": self.runner_hostname,
-                "timestamp": self._get_timestamp(),
-            },
+            "data": data,
         }
 
         logger.info(f"Sending runner info: name={self.runner_name}")

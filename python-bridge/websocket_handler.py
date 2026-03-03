@@ -111,6 +111,7 @@ class WebSocketHandler:
         token: str,
         project_id: str | None = None,
         runner_name: str | None = None,
+        runner_port: int | None = None,
     ) -> bool:
         """
         Configure WebSocket connection settings.
@@ -121,13 +122,14 @@ class WebSocketHandler:
             token: JWT authentication token
             project_id: Optional project ID
             runner_name: Optional custom name for this runner
+            runner_port: Optional HTTP API port this runner listens on
 
         Returns:
             True if configuration successful, False otherwise
         """
         self.emit_log(
             "info",
-            f"[WS_HANDLER] configure called: enabled={enabled}, url={api_url}, project_id={project_id}, runner_name={runner_name}",
+            f"[WS_HANDLER] configure called: enabled={enabled}, url={api_url}, project_id={project_id}, runner_name={runner_name}, runner_port={runner_port}",
         )
         self.emit_log("info", f"[WS_HANDLER] WEBSOCKET_AVAILABLE={WEBSOCKET_AVAILABLE}")
 
@@ -146,6 +148,7 @@ class WebSocketHandler:
                 token=token,
                 project_id=str(project_id) if project_id else None,
                 runner_name=runner_name,
+                runner_port=int(runner_port) if runner_port is not None else None,
                 auto_reconnect=True,
                 heartbeat_interval=30,
                 max_reconnect_attempts=5,
@@ -311,6 +314,7 @@ class WebSocketHandler:
                 project_id=self.ws_config.project_id,  # type: ignore[arg-type]
                 runner_version=self.ws_config.runner_version,
                 runner_name=self.ws_config.runner_name,
+                runner_port=self.ws_config.runner_port,
                 auto_reconnect=self.ws_config.auto_reconnect,
                 heartbeat_interval=self.ws_config.heartbeat_interval,
                 max_reconnect_attempts=self.ws_config.max_reconnect_attempts,

@@ -37,7 +37,11 @@ import {
   Activity,
   ScanSearch,
   HeartPulse,
+  MoreHorizontal,
+  ExternalLink,
+  PanelLeft,
 } from "lucide-react";
+import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import type {
   WorkflowPhase,
   UnifiedStep,
@@ -88,17 +92,16 @@ import { WorkflowLibraryPicker } from "./WorkflowLibraryPicker";
 import { AiGenerateWorkflowModal } from "./AiGenerateWorkflowModal";
 import { AiGeneratePanel } from "./AiGeneratePanel";
 import { StageSelector } from "./StageSelector";
-import { GenerateFromStatesModal } from "./GenerateFromStatesModal";
-import { AddStateStepsModal } from "./AddStateStepsModal";
 import { PromptTemplateEditor } from "./PromptTemplateEditor";
 import { ContextManagement } from "./ContextManagement";
 import { PageTutorialMenu } from "../tutorial";
 import { getAccentColors } from "@/design-system";
 import { BatchDeleteDialog, ConfirmDialog } from "../ui";
-import { BuilderToolbar, toolbarActions } from "../ui/BuilderToolbar";
 import { registerUserSkills } from "@qontinui/workflow-utils";
-import { CompositionSkillBuilder } from "@qontinui/workflow-ui/components";
 import { getApiBase } from "@/lib/runner-api";
+import { CompositionBuilderDialog } from "./CompositionBuilderDialog";
+import { SkillExportDialog } from "./SkillExportDialog";
+import { SkillImportDialog } from "./SkillImportDialog";
 
 // Minimal icon resolver for composition builder (maps icon IDs to lucide components)
 const SKILL_ICON_MAP: Record<string, React.ComponentType<{ className?: string }>> = {
@@ -1094,11 +1097,26 @@ function WorkflowBuilderContent({
   // AI generate workflow modal state
   const [aiGenerateModalOpen, setAiGenerateModalOpen] = useState(false);
 
-  // Generate from states modal state
-  const [generateFromStatesModalOpen, setGenerateFromStatesModalOpen] = useState(false);
-
-  // Add state steps modal state
-  const [addStateStepsModalOpen, setAddStateStepsModalOpen] = useState(false);
+  // Library panel visibility (persisted to localStorage, default hidden)
+  const [showLibrary, setShowLibrary] = useState(() => {
+    try {
+      const stored = localStorage.getItem("qontinui-workflow-library-visible");
+      return stored === "true";
+    } catch {
+      return false;
+    }
+  });
+  const toggleLibrary = useCallback(() => {
+    setShowLibrary((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem("qontinui-workflow-library-visible", String(next));
+      } catch {
+        // ignore
+      }
+      return next;
+    });
+  }, []);
 
   // Ref for focusing the name input when creating new workflow
   const nameInputRef = useRef<HTMLInputElement | null>(null);
@@ -1122,6 +1140,7 @@ function WorkflowBuilderContent({
   const [isExportingSkills, setIsExportingSkills] = useState(false);
   const [isImportingSkills, setIsImportingSkills] = useState(false);
   const skillFileInputRef = useRef<HTMLInputElement>(null);
+  const workflowFileInputRef = useRef<HTMLInputElement>(null);
   const [showSkillImportDialog, setShowSkillImportDialog] = useState(false);
   const [pendingImportSkills, setPendingImportSkills] = useState<unknown[] | null>(null);
   const [importConflictMode, setImportConflictMode] = useState<"skip" | "overwrite">("skip");
@@ -1134,15 +1153,9 @@ function WorkflowBuilderContent({
   );
   const [showCompositionBuilder, setShowCompositionBuilder] = useState(false);
 
-  // Handle creating a new workflow with visual feedback
+  // Handle creating a new workflow — resets to empty state which shows the AI generation panel
   const handleNewWorkflow = useCallback(() => {
     resetToNew();
-    setShowSettings(true);
-    // Focus the name input after state updates
-    setTimeout(() => {
-      nameInputRef.current?.focus();
-      nameInputRef.current?.select();
-    }, 50);
   }, [resetToNew]);
 
   const accentColors = getAccentColors("green");
@@ -1998,170 +2011,255 @@ function WorkflowBuilderContent({
   return (
     <div className="h-full flex">
       {/* Left Panel - Workflow List */}
-      <div className="w-80 border-r border-border flex flex-col bg-card">
-        {/* Header */}
-        <div className="p-4 border-b border-border">
-          {/* Title row */}
-          <div className="flex items-center justify-between mb-2">
-            <h2
-              className="text-lg font-semibold flex items-center gap-2"
-              data-ui-id="workflow-builder-title"
-            >
-              <Sparkles className="w-5 h-5" style={{ color: accentColors.bgSolid }} />
-              Workflows
-            </h2>
-            <PageTutorialMenu page="unified-workflow-builder" variant="compact" />
-          </div>
-
-          {/* Action buttons row */}
-          <BuilderToolbar
-            className="mb-3"
-            actions={[
-              toolbarActions.ai(() => setAiGenerateModalOpen(true)),
-              toolbarActions.stateMachine(() => setGenerateFromStatesModalOpen(true)),
-              toolbarActions.addFromState(() => setAddStateStepsModalOpen(true)),
-              toolbarActions.new(handleNewWorkflow, "New"),
-              toolbarActions.import(handleImportWorkflow, ".json", workflowsLoading),
-              toolbarActions.editInWeb("/build/workflows"),
-              toolbarActions.delete(
-                () => setIsWorkflowSelectionMode(!isWorkflowSelectionMode),
-                isWorkflowSelectionMode,
-              ),
-            ]}
-          />
-
-          {/* Import error message */}
-          {workflowImportError && (
-            <div className="mx-4 mb-2 p-2 bg-red-500/10 border border-red-500/30 rounded-md text-red-400 text-xs flex items-center justify-between">
-              <span>{workflowImportError}</span>
-              <button
-                onClick={() => setWorkflowImportError(null)}
-                className="p-0.5 hover:bg-red-500/20 rounded"
+      {showLibrary && (
+        <div className="w-80 border-r border-border flex flex-col bg-card">
+          {/* Header */}
+          <div className="p-4 border-b border-border">
+            {/* Title row with dropdown and actions */}
+            <div className="flex items-center justify-between mb-3">
+              <h2
+                className="text-lg font-semibold flex items-center gap-2"
+                data-ui-id="workflow-builder-title"
               >
-                <span className="text-red-400">×</span>
-              </button>
-            </div>
-          )}
-
-          {/* Search */}
-          <div className="relative">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-            <input
-              type="text"
-              placeholder="Search workflows..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full pl-9 pr-3 py-2 bg-muted border border-border rounded-lg text-sm focus:outline-none focus:border-border"
-              data-ui-id="workflow-builder-search-input"
-            />
-          </div>
-        </div>
-
-        {/* Selection Mode Header */}
-        {isWorkflowSelectionMode && (
-          <div className="flex items-center justify-between px-4 py-2 bg-red-500/10 border-b border-red-500/30">
-            <span className="text-sm text-red-400">{selectedWorkflowIds.size} selected</span>
-            <div className="flex items-center gap-2">
-              {selectedWorkflowIds.size > 0 && (
+                <Sparkles className="w-5 h-5" style={{ color: accentColors.bgSolid }} />
+                Workflows
+              </h2>
+              <div className="flex items-center gap-1">
+                {/* Add/Import dropdown */}
+                <DropdownMenu.Root>
+                  <DropdownMenu.Trigger asChild>
+                    <button
+                      className="flex items-center justify-center w-7 h-7 rounded-md hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
+                      title="Add or import workflow"
+                      data-ui-id="workflow-builder-add-menu-btn"
+                    >
+                      <Plus className="w-4 h-4" />
+                    </button>
+                  </DropdownMenu.Trigger>
+                  <DropdownMenu.Portal>
+                    <DropdownMenu.Content
+                      className="min-w-[180px] bg-card/95 backdrop-blur rounded-lg shadow-xl p-1 animate-slideDown z-50"
+                      sideOffset={5}
+                      align="end"
+                    >
+                      <DropdownMenu.Item
+                        className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors"
+                        data-ui-id="workflow-builder-new-workflow-item"
+                        onSelect={handleNewWorkflow}
+                      >
+                        <Plus className="w-3.5 h-3.5 text-muted-foreground" />
+                        <span className="flex-1">New Workflow</span>
+                      </DropdownMenu.Item>
+                      <DropdownMenu.Item
+                        className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors disabled:opacity-50"
+                        data-ui-id="workflow-builder-import-workflow-item"
+                        disabled={workflowsLoading}
+                        onSelect={() => workflowFileInputRef.current?.click()}
+                      >
+                        <Upload className="w-3.5 h-3.5 text-muted-foreground" />
+                        <span className="flex-1">Import from File</span>
+                      </DropdownMenu.Item>
+                      <DropdownMenu.Separator className="h-px bg-border/50 my-1" />
+                      <DropdownMenu.Item
+                        className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors"
+                        asChild
+                      >
+                        <a
+                          href="http://localhost:3001/build/workflows"
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="flex items-center gap-2 px-3 py-2 text-xs rounded-md no-underline text-inherit hover:bg-muted/50 transition-colors"
+                        >
+                          <ExternalLink className="w-3.5 h-3.5 text-indigo-400" />
+                          <span className="flex-1">Open in Web</span>
+                        </a>
+                      </DropdownMenu.Item>
+                    </DropdownMenu.Content>
+                  </DropdownMenu.Portal>
+                </DropdownMenu.Root>
+                <input
+                  ref={workflowFileInputRef}
+                  type="file"
+                  accept=".json"
+                  className="hidden"
+                  onChange={handleImportWorkflow}
+                />
+                {/* Batch delete toggle */}
                 <button
-                  onClick={() => setShowBatchDeleteDialog(true)}
-                  className="flex items-center gap-1 px-3 py-1 text-sm font-medium bg-red-600 hover:bg-red-500 text-white rounded-md transition-colors"
+                  onClick={() => setIsWorkflowSelectionMode(!isWorkflowSelectionMode)}
+                  className={`flex items-center justify-center w-7 h-7 rounded-md transition-colors ${
+                    isWorkflowSelectionMode
+                      ? "bg-red-500/20 text-red-400"
+                      : "text-muted-foreground hover:text-red-400 hover:bg-muted"
+                  }`}
+                  title={
+                    isWorkflowSelectionMode ? "Cancel selection" : "Select workflows to delete"
+                  }
                 >
                   <Trash2 className="w-3.5 h-3.5" />
-                  Delete
                 </button>
-              )}
-              <button
-                onClick={exitWorkflowSelectionMode}
-                className="px-3 py-1 text-sm text-muted-foreground hover:text-foreground transition-colors"
-              >
-                Cancel
-              </button>
+                <PageTutorialMenu page="unified-workflow-builder" variant="compact" />
+              </div>
+            </div>
+
+            {/* Import error message */}
+            {workflowImportError && (
+              <div className="mx-4 mb-2 p-2 bg-red-500/10 border border-red-500/30 rounded-md text-red-400 text-xs flex items-center justify-between">
+                <span>{workflowImportError}</span>
+                <button
+                  onClick={() => setWorkflowImportError(null)}
+                  className="p-0.5 hover:bg-red-500/20 rounded"
+                >
+                  <span className="text-red-400">×</span>
+                </button>
+              </div>
+            )}
+
+            {/* Search */}
+            <div className="relative">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+              <input
+                type="text"
+                placeholder="Search workflows..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="w-full pl-9 pr-3 py-2 bg-muted border border-border rounded-lg text-sm focus:outline-none focus:border-border"
+                data-ui-id="workflow-builder-search-input"
+              />
             </div>
           </div>
-        )}
 
-        {/* Workflow List */}
-        <div className="flex-1 overflow-y-auto p-2">
-          {workflowsLoading ? (
-            <div className="flex items-center justify-center py-8">
-              <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
-            </div>
-          ) : filteredWorkflows.length === 0 ? (
-            <div className="text-center py-8 text-muted-foreground">
-              <Sparkles className="w-8 h-8 mx-auto mb-2 opacity-50" />
-              <p className="text-sm">No workflows found</p>
-            </div>
-          ) : (
-            <div className="space-y-1">
-              {filteredWorkflows.map((workflow) => (
+          {/* Selection Mode Header */}
+          {isWorkflowSelectionMode && (
+            <div className="flex items-center justify-between px-4 py-2 bg-red-500/10 border-b border-red-500/30">
+              <span className="text-sm text-red-400">{selectedWorkflowIds.size} selected</span>
+              <div className="flex items-center gap-2">
+                {selectedWorkflowIds.size > 0 && (
+                  <button
+                    onClick={() => setShowBatchDeleteDialog(true)}
+                    className="flex items-center gap-1 px-3 py-1 text-sm font-medium bg-red-600 hover:bg-red-500 text-white rounded-md transition-colors"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    Delete
+                  </button>
+                )}
                 <button
-                  key={workflow.id}
-                  aria-label={`${isWorkflowSelectionMode ? "Select" : "Open"} workflow: ${workflow.name}`}
-                  data-ui-id={`workflow-builder-list-item-${workflow.id}`}
-                  onClick={() => {
-                    if (isWorkflowSelectionMode) {
-                      toggleWorkflowSelection(workflow.id);
-                    } else {
-                      selectWorkflow(workflow);
-                    }
-                  }}
-                  className={`w-full text-left p-3 rounded-lg transition-colors flex items-start gap-3 ${
-                    isWorkflowSelectionMode && selectedWorkflowIds.has(workflow.id)
-                      ? "bg-red-500/20 border border-red-500/50"
-                      : state.workflow.id === workflow.id
-                        ? "bg-muted/80"
-                        : "hover:bg-muted"
-                  } ${isWorkflowSelectionMode ? "border" : ""} ${
-                    isWorkflowSelectionMode && !selectedWorkflowIds.has(workflow.id)
-                      ? "border-transparent"
-                      : ""
-                  }`}
+                  onClick={exitWorkflowSelectionMode}
+                  className="px-3 py-1 text-sm text-muted-foreground hover:text-foreground transition-colors"
                 >
-                  {/* Checkbox in selection mode */}
-                  {isWorkflowSelectionMode && (
-                    <div
-                      className={`flex-shrink-0 w-5 h-5 mt-0.5 rounded border-2 flex items-center justify-center transition-colors ${
-                        selectedWorkflowIds.has(workflow.id)
-                          ? "bg-red-500 border-red-500"
-                          : "border-muted-foreground"
-                      }`}
-                    >
-                      {selectedWorkflowIds.has(workflow.id) && (
-                        <Check className="w-3 h-3 text-white" />
-                      )}
-                    </div>
-                  )}
-                  <div className="flex-1 min-w-0">
-                    <div className="font-medium text-sm truncate">{workflow.name}</div>
-                    {workflow.description && (
-                      <div className="text-xs text-muted-foreground truncate mt-0.5">
-                        {workflow.description}
-                      </div>
-                    )}
-                    <div className="flex items-center gap-2 mt-1.5">
-                      <span className="text-xs text-muted-foreground">
-                        {getStepCount(workflow)} steps
-                      </span>
-                      {workflow.category && (
-                        <span className="text-xs px-1.5 py-0.5 rounded bg-muted text-muted-foreground">
-                          {workflow.category}
-                        </span>
-                      )}
-                    </div>
-                  </div>
+                  Cancel
                 </button>
-              ))}
+              </div>
             </div>
           )}
+
+          {/* Workflow List */}
+          <div className="flex-1 overflow-y-auto p-2">
+            {workflowsLoading ? (
+              <div className="flex items-center justify-center py-8">
+                <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+              </div>
+            ) : filteredWorkflows.length === 0 ? (
+              <div className="text-center py-8 text-muted-foreground">
+                <Sparkles className="w-8 h-8 mx-auto mb-2 opacity-50" />
+                <p className="text-sm">No workflows found</p>
+              </div>
+            ) : (
+              <div className="space-y-1">
+                {filteredWorkflows.map((workflow) => (
+                  <button
+                    key={workflow.id}
+                    aria-label={`${isWorkflowSelectionMode ? "Select" : "Open"} workflow: ${workflow.name}`}
+                    data-ui-id={`workflow-builder-list-item-${workflow.id}`}
+                    onClick={() => {
+                      if (isWorkflowSelectionMode) {
+                        toggleWorkflowSelection(workflow.id);
+                      } else {
+                        selectWorkflow(workflow);
+                      }
+                    }}
+                    className={`w-full text-left p-3 rounded-lg transition-colors flex items-start gap-3 ${
+                      isWorkflowSelectionMode && selectedWorkflowIds.has(workflow.id)
+                        ? "bg-red-500/20 border border-red-500/50"
+                        : state.workflow.id === workflow.id
+                          ? "bg-muted/80"
+                          : "hover:bg-muted"
+                    } ${isWorkflowSelectionMode ? "border" : ""} ${
+                      isWorkflowSelectionMode && !selectedWorkflowIds.has(workflow.id)
+                        ? "border-transparent"
+                        : ""
+                    }`}
+                  >
+                    {/* Checkbox in selection mode */}
+                    {isWorkflowSelectionMode && (
+                      <div
+                        className={`flex-shrink-0 w-5 h-5 mt-0.5 rounded border-2 flex items-center justify-center transition-colors ${
+                          selectedWorkflowIds.has(workflow.id)
+                            ? "bg-red-500 border-red-500"
+                            : "border-muted-foreground"
+                        }`}
+                      >
+                        {selectedWorkflowIds.has(workflow.id) && (
+                          <Check className="w-3 h-3 text-white" />
+                        )}
+                      </div>
+                    )}
+                    <div className="flex-1 min-w-0">
+                      <div className="font-medium text-sm truncate">{workflow.name}</div>
+                      {workflow.description && (
+                        <div className="text-xs text-muted-foreground truncate mt-0.5">
+                          {workflow.description}
+                        </div>
+                      )}
+                      <div className="flex items-center gap-2 mt-1.5">
+                        <span className="text-xs text-muted-foreground">
+                          {getStepCount(workflow)} steps
+                        </span>
+                        {workflow.category && (
+                          <span className="text-xs px-1.5 py-0.5 rounded bg-muted text-muted-foreground">
+                            {workflow.category}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
-      </div>
+      )}
 
       {/* Right Panel - Editor */}
       <div className="flex-1 flex flex-col bg-zinc-900">
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-zinc-700">
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-3">
+            <button
+              data-ui-id="workflow-builder-library-toggle-btn"
+              onClick={toggleLibrary}
+              className={`p-1.5 rounded-md transition-colors ${
+                showLibrary
+                  ? "bg-zinc-700 text-zinc-200"
+                  : "text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800"
+              }`}
+              title={showLibrary ? "Hide workflow library" : "Show workflow library"}
+            >
+              <PanelLeft className="w-4 h-4" />
+            </button>
+            <button
+              data-tutorial-id="workflow-settings"
+              data-ui-id="workflow-builder-settings-btn"
+              onClick={() => setShowSettings(!showSettings)}
+              className={`p-1.5 rounded-md transition-colors ${
+                showSettings
+                  ? "bg-zinc-700 text-zinc-200"
+                  : "text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800"
+              }`}
+              title="Settings"
+            >
+              <Settings className="w-4 h-4" />
+            </button>
             <h1 className="text-lg font-semibold text-zinc-100">
               {state.workflow.name || "New Workflow"}
               {hasUnsavedChanges && <span className="text-zinc-500 ml-2">*</span>}
@@ -2169,20 +2267,6 @@ function WorkflowBuilderContent({
           </div>
 
           <div className="flex items-center gap-2">
-            <button
-              data-tutorial-id="workflow-settings"
-              data-ui-id="workflow-builder-settings-btn"
-              onClick={() => setShowSettings(!showSettings)}
-              className={`
-                flex items-center gap-2 px-3 py-1.5 rounded-md transition-colors
-                ${showSettings ? "bg-zinc-700 text-zinc-200" : "text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800"}
-              `}
-              title="Settings"
-            >
-              <Settings className="w-4 h-4" />
-              <span className="text-sm">Settings</span>
-            </button>
-
             <button
               data-tutorial-id="save-workflow-button"
               data-ui-id="workflow-builder-save-btn"
@@ -2199,50 +2283,63 @@ function WorkflowBuilderContent({
               <span className="text-sm">{state.isSaving ? "Saving..." : "Save"}</span>
             </button>
 
-            <button
-              onClick={handleExportWorkflow}
-              disabled={!state.workflow.id || isExportingWorkflow}
-              className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-zinc-700 hover:bg-zinc-600 text-zinc-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              title="Export workflow to file"
-              data-ui-id="workflow-builder-export-btn"
-            >
-              {isExportingWorkflow ? (
-                <Loader2 className="w-4 h-4 animate-spin" />
-              ) : (
-                <Download className="w-4 h-4" />
-              )}
-              <span className="text-sm">Export</span>
-            </button>
-
-            <button
-              onClick={handleOpenExportDialog}
-              disabled={isExportingSkills}
-              className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-zinc-700 hover:bg-zinc-600 text-zinc-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              title="Export skills to file"
-              data-ui-id="workflow-builder-export-skills-btn"
-            >
-              {isExportingSkills ? (
-                <Loader2 className="w-4 h-4 animate-spin" />
-              ) : (
-                <Download className="w-4 h-4" />
-              )}
-              <span className="text-sm">Export Skills</span>
-            </button>
-
-            <button
-              onClick={() => skillFileInputRef.current?.click()}
-              disabled={isImportingSkills}
-              className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-zinc-700 hover:bg-zinc-600 text-zinc-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              title="Import skills from file"
-              data-ui-id="workflow-builder-import-skills-btn"
-            >
-              {isImportingSkills ? (
-                <Loader2 className="w-4 h-4 animate-spin" />
-              ) : (
-                <Upload className="w-4 h-4" />
-              )}
-              <span className="text-sm">Import Skills</span>
-            </button>
+            {/* Overflow menu for less-frequent actions */}
+            <DropdownMenu.Root>
+              <DropdownMenu.Trigger asChild>
+                <button
+                  className="flex items-center justify-center p-1.5 rounded-md text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 transition-colors"
+                  title="More actions"
+                  data-ui-id="workflow-builder-more-menu-btn"
+                >
+                  <MoreHorizontal className="w-4 h-4" />
+                </button>
+              </DropdownMenu.Trigger>
+              <DropdownMenu.Portal>
+                <DropdownMenu.Content
+                  className="min-w-[200px] bg-card/95 backdrop-blur rounded-lg shadow-xl p-1 animate-slideDown z-50"
+                  sideOffset={5}
+                  align="end"
+                >
+                  <DropdownMenu.Item
+                    className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors disabled:opacity-50"
+                    data-ui-id="workflow-builder-export-btn"
+                    disabled={!state.workflow.id || isExportingWorkflow}
+                    onSelect={handleExportWorkflow}
+                  >
+                    <Download className="w-3.5 h-3.5 text-muted-foreground" />
+                    <span className="flex-1">Export Workflow</span>
+                  </DropdownMenu.Item>
+                  <DropdownMenu.Separator className="h-px bg-border/50 my-1" />
+                  <DropdownMenu.Item
+                    className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors disabled:opacity-50"
+                    data-ui-id="workflow-builder-export-skills-btn"
+                    disabled={isExportingSkills}
+                    onSelect={handleOpenExportDialog}
+                  >
+                    <Download className="w-3.5 h-3.5 text-muted-foreground" />
+                    <span className="flex-1">Export Skills</span>
+                  </DropdownMenu.Item>
+                  <DropdownMenu.Item
+                    className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors disabled:opacity-50"
+                    data-ui-id="workflow-builder-import-skills-btn"
+                    disabled={isImportingSkills}
+                    onSelect={() => skillFileInputRef.current?.click()}
+                  >
+                    <Upload className="w-3.5 h-3.5 text-muted-foreground" />
+                    <span className="flex-1">Import Skills</span>
+                  </DropdownMenu.Item>
+                  <DropdownMenu.Separator className="h-px bg-border/50 my-1" />
+                  <DropdownMenu.Item
+                    className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors"
+                    data-ui-id="workflow-builder-create-composition-btn"
+                    onSelect={() => setShowCompositionBuilder(true)}
+                  >
+                    <Layers className="w-3.5 h-3.5 text-muted-foreground" />
+                    <span className="flex-1">Create Composition</span>
+                  </DropdownMenu.Item>
+                </DropdownMenu.Content>
+              </DropdownMenu.Portal>
+            </DropdownMenu.Root>
             <input
               ref={skillFileInputRef}
               type="file"
@@ -2250,206 +2347,6 @@ function WorkflowBuilderContent({
               className="hidden"
               onChange={handleImportFileSelected}
             />
-
-            <button
-              onClick={() => setShowCompositionBuilder(true)}
-              className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-zinc-700 hover:bg-zinc-600 text-zinc-200 transition-colors"
-              title="Create a composition skill from existing skills"
-              data-ui-id="workflow-builder-create-composition-btn"
-            >
-              <Layers className="w-4 h-4" />
-              <span className="text-sm">Create Composition</span>
-            </button>
-
-            {/* Composition Skill Builder Dialog */}
-            {showCompositionBuilder && (
-              <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-                <div className="bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl w-[520px]">
-                  <CompositionSkillBuilder
-                    resolveIcon={resolveSkillIcon}
-                    onSave={async (refs) => {
-                      const name = prompt("Composition skill name:");
-                      if (!name) return;
-                      const slug = name
-                        .toLowerCase()
-                        .replace(/[^a-z0-9]+/g, "-")
-                        .replace(/^-|-$/g, "");
-                      try {
-                        await fetch(`${getApiBase()}/skills`, {
-                          method: "POST",
-                          headers: { "Content-Type": "application/json" },
-                          body: JSON.stringify({
-                            id: `user:${slug}`,
-                            name,
-                            slug,
-                            description: `Composition of ${refs.length} skills`,
-                            category: "composition",
-                            tags: ["composition"],
-                            icon: "layers",
-                            color: "blue",
-                            allowed_phases: ["setup", "verification", "completion"],
-                            parameters: [],
-                            template: { kind: "composition", skill_refs: refs },
-                          }),
-                        });
-                        // Refresh skills registry
-                        const skillsRes = await fetch(`${getApiBase()}/skills`);
-                        const skillsData = await skillsRes.json();
-                        const allSkills = skillsData.data ?? skillsData ?? [];
-                        const nonBuiltin = allSkills.filter(
-                          (s: { source: string }) => s.source !== "builtin",
-                        );
-                        registerUserSkills(nonBuiltin);
-                      } catch (error) {
-                        console.error("Failed to create composition skill:", error);
-                      }
-                      setShowCompositionBuilder(false);
-                    }}
-                    onCancel={() => setShowCompositionBuilder(false)}
-                  />
-                </div>
-              </div>
-            )}
-
-            {/* Skill Export Dialog */}
-            {showSkillExportDialog && (
-              <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-                <div className="bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl w-[400px] max-h-[500px] flex flex-col">
-                  <div className="px-4 py-3 border-b border-zinc-700">
-                    <h3 className="text-sm font-medium text-zinc-200">Export Skills</h3>
-                    <p className="text-xs text-zinc-500 mt-0.5">Select skills to export</p>
-                  </div>
-                  <div className="flex-1 overflow-y-auto px-4 py-2 space-y-1">
-                    <label className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-zinc-800 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={selectedSkillIdsForExport.size === availableSkillsForExport.length}
-                        onChange={(e) => {
-                          if (e.target.checked) {
-                            setSelectedSkillIdsForExport(
-                              new Set(availableSkillsForExport.map((s) => s.id)),
-                            );
-                          } else {
-                            setSelectedSkillIdsForExport(new Set());
-                          }
-                        }}
-                        className="rounded border-zinc-600"
-                      />
-                      <span className="text-xs text-zinc-400">Select All</span>
-                    </label>
-                    {availableSkillsForExport.map((skill) => (
-                      <label
-                        key={skill.id}
-                        className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-zinc-800 cursor-pointer"
-                      >
-                        <input
-                          type="checkbox"
-                          checked={selectedSkillIdsForExport.has(skill.id)}
-                          onChange={(e) => {
-                            setSelectedSkillIdsForExport((prev) => {
-                              const next = new Set(prev);
-                              if (e.target.checked) next.add(skill.id);
-                              else next.delete(skill.id);
-                              return next;
-                            });
-                          }}
-                          className="rounded border-zinc-600"
-                        />
-                        <span className="text-sm text-zinc-200">{skill.name}</span>
-                        {skill.source === "community" && (
-                          <span className="px-1.5 py-0.5 text-[10px] rounded-full bg-purple-900/30 text-purple-400">
-                            Community
-                          </span>
-                        )}
-                      </label>
-                    ))}
-                  </div>
-                  <div className="px-4 py-3 border-t border-zinc-700 flex justify-end gap-2">
-                    <button
-                      className="px-3 py-1.5 text-sm text-zinc-400 hover:text-zinc-200 transition-colors rounded"
-                      onClick={() => setShowSkillExportDialog(false)}
-                    >
-                      Cancel
-                    </button>
-                    <button
-                      className="px-3 py-1.5 text-sm bg-blue-600 hover:bg-blue-500 text-white rounded disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                      onClick={handleExportSkills}
-                      disabled={selectedSkillIdsForExport.size === 0}
-                    >
-                      Export {selectedSkillIdsForExport.size} Skill
-                      {selectedSkillIdsForExport.size !== 1 ? "s" : ""}
-                    </button>
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* Skill Import Dialog — conflict mode selection */}
-            {showSkillImportDialog && pendingImportSkills && (
-              <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-                <div className="bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl w-[380px]">
-                  <div className="px-4 py-3 border-b border-zinc-700">
-                    <h3 className="text-sm font-medium text-zinc-200">Import Skills</h3>
-                    <p className="text-xs text-zinc-500 mt-0.5">
-                      {(pendingImportSkills as unknown[]).length} skill
-                      {(pendingImportSkills as unknown[]).length !== 1 ? "s" : ""} found in file
-                    </p>
-                  </div>
-                  <div className="px-4 py-3 space-y-2">
-                    <p className="text-xs text-zinc-400">
-                      When a skill with the same name already exists:
-                    </p>
-                    <label className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-zinc-800 cursor-pointer">
-                      <input
-                        type="radio"
-                        name="conflictMode"
-                        checked={importConflictMode === "skip"}
-                        onChange={() => setImportConflictMode("skip")}
-                        className="text-blue-600"
-                      />
-                      <div>
-                        <span className="text-sm text-zinc-200">Skip</span>
-                        <p className="text-xs text-zinc-500">
-                          Keep the existing skill, ignore the imported one
-                        </p>
-                      </div>
-                    </label>
-                    <label className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-zinc-800 cursor-pointer">
-                      <input
-                        type="radio"
-                        name="conflictMode"
-                        checked={importConflictMode === "overwrite"}
-                        onChange={() => setImportConflictMode("overwrite")}
-                        className="text-blue-600"
-                      />
-                      <div>
-                        <span className="text-sm text-zinc-200">Overwrite</span>
-                        <p className="text-xs text-zinc-500">
-                          Replace existing skills with imported versions
-                        </p>
-                      </div>
-                    </label>
-                  </div>
-                  <div className="px-4 py-3 border-t border-zinc-700 flex justify-end gap-2">
-                    <button
-                      className="px-3 py-1.5 text-sm text-zinc-400 hover:text-zinc-200 transition-colors rounded"
-                      onClick={() => {
-                        setShowSkillImportDialog(false);
-                        setPendingImportSkills(null);
-                      }}
-                    >
-                      Cancel
-                    </button>
-                    <button
-                      className="px-3 py-1.5 text-sm bg-blue-600 hover:bg-blue-500 text-white rounded transition-colors"
-                      onClick={handleConfirmImport}
-                    >
-                      Import
-                    </button>
-                  </div>
-                </div>
-              </div>
-            )}
 
             {isExecuting ? (
               <button
@@ -2475,6 +2372,40 @@ function WorkflowBuilderContent({
             )}
           </div>
         </div>
+
+        {/* Dialogs (rendered outside header flow) */}
+        <CompositionBuilderDialog
+          isOpen={showCompositionBuilder}
+          onClose={() => setShowCompositionBuilder(false)}
+          resolveIcon={resolveSkillIcon}
+        />
+        <SkillExportDialog
+          isOpen={showSkillExportDialog}
+          onClose={() => setShowSkillExportDialog(false)}
+          availableSkills={availableSkillsForExport}
+          selectedIds={selectedSkillIdsForExport}
+          onToggleId={(id) => {
+            setSelectedSkillIdsForExport((prev) => {
+              const next = new Set(prev);
+              if (next.has(id)) next.delete(id);
+              else next.add(id);
+              return next;
+            });
+          }}
+          onSelectAll={(ids) => setSelectedSkillIdsForExport(ids)}
+          onExport={handleExportSkills}
+        />
+        <SkillImportDialog
+          isOpen={showSkillImportDialog && !!pendingImportSkills}
+          onClose={() => {
+            setShowSkillImportDialog(false);
+            setPendingImportSkills(null);
+          }}
+          skillCount={pendingImportSkills ? (pendingImportSkills as unknown[]).length : 0}
+          conflictMode={importConflictMode}
+          onSetConflictMode={setImportConflictMode}
+          onConfirm={handleConfirmImport}
+        />
 
         {/* Status display */}
         {isExecuting && (
@@ -2669,28 +2600,6 @@ function WorkflowBuilderContent({
                 onWorkflowGenerated={handleAiWorkflowGenerated}
               />
 
-              {/* Generate from State Machine Modal */}
-              <GenerateFromStatesModal
-                isOpen={generateFromStatesModalOpen}
-                onClose={() => setGenerateFromStatesModalOpen(false)}
-                onWorkflowGenerated={handleAiWorkflowGenerated}
-              />
-
-              {/* Add Steps from State Modal */}
-              <AddStateStepsModal
-                isOpen={addStateStepsModalOpen}
-                onClose={() => setAddStateStepsModalOpen(false)}
-                addStep={addStep}
-                onStepsAdded={(result) => {
-                  console.log(
-                    "[WorkflowBuilder] Added steps from state:",
-                    result.verificationSteps.length,
-                    "verification,",
-                    result.agenticStep ? "1 agentic" : "0 agentic",
-                  );
-                }}
-              />
-
               {/* Batch Delete Workflows Dialog */}
               <BatchDeleteDialog
                 open={showBatchDeleteDialog}
@@ -2820,7 +2729,7 @@ export function WorkflowBuilderTab({
 }: WorkflowBuilderTabProps) {
   return (
     <div data-tutorial-id="workflow-builder-nav" className="h-full">
-      <WorkflowBuilderProvider>
+      <WorkflowBuilderProvider startEmpty={!editWorkflowId}>
         <WorkflowBuilderInner
           editWorkflowId={editWorkflowId}
           onOpenLibrary={onOpenLibrary}

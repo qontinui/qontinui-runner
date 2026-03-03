@@ -1108,7 +1108,7 @@ pub async fn resume_chat_sessions(
 ///
 /// Tries both the cached external app specs and the runner's own specs.
 /// Returns a JSON string of whatever specs are available, or an empty message.
-async fn fetch_existing_specs() -> String {
+pub(crate) async fn fetch_existing_specs() -> String {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
@@ -1166,7 +1166,7 @@ async fn fetch_existing_specs() -> String {
 /// Combines the plan text with spec generation instructions and any
 /// existing specs so the AI can create/update page specs alongside
 /// the workflow.
-fn build_spec_aware_context(plan_text: &str, existing_specs: &str) -> String {
+pub(crate) fn build_spec_aware_context(plan_text: &str, existing_specs: &str) -> String {
     format!(
         r#"The following AI plan message describes what should be built. Generate a workflow
 that implements this plan, including creating or updating semantic page specs.

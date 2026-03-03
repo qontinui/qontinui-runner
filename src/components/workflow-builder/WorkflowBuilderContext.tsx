@@ -202,14 +202,24 @@ function workflowBuilderReducer(
   action: WorkflowBuilderAction,
 ): WorkflowBuilderState {
   switch (action.type) {
-    case "SET_WORKFLOW":
+    case "SET_WORKFLOW": {
+      const wf = action.payload;
+      const si = wf.stages && wf.stages.length > 0 ? 0 : null;
+      const phaseHasSteps = (phase: WorkflowPhase) => getPhaseSteps(wf, si, phase).length > 0;
       return {
         ...state,
-        workflow: action.payload,
-        originalWorkflow: action.payload,
+        workflow: wf,
+        originalWorkflow: wf,
         selectedStepId: null,
-        currentStageIndex: action.payload.stages && action.payload.stages.length > 0 ? 0 : null,
+        currentStageIndex: si,
+        expandedPhases: {
+          setup: phaseHasSteps("setup"),
+          verification: phaseHasSteps("verification"),
+          agentic: phaseHasSteps("agentic"),
+          completion: phaseHasSteps("completion"),
+        },
       };
+    }
 
     case "UPDATE_WORKFLOW":
       return {
@@ -374,6 +384,12 @@ function workflowBuilderReducer(
         originalWorkflow: null,
         selectedStepId: null,
         error: null,
+        expandedPhases: {
+          setup: false,
+          verification: false,
+          agentic: false,
+          completion: false,
+        },
       };
     }
 
@@ -600,6 +616,8 @@ const WorkflowBuilderContext = createContext<WorkflowBuilderContextValue | null>
 interface WorkflowBuilderProviderProps {
   children: React.ReactNode;
   initialWorkflow?: UnifiedWorkflow;
+  /** When true, skip restoring draft from localStorage and start with an empty workflow */
+  startEmpty?: boolean;
 }
 
 // Helper to load workflow from localStorage
@@ -661,11 +679,15 @@ function saveOriginalToStorage(workflow: UnifiedWorkflow | null): void {
  * Inner provider that manages the runner-specific state.
  * Wrapped by SharedBuilderProvider and WorkflowDataProvider.
  */
-function RunnerWorkflowBuilderInner({ children, initialWorkflow }: WorkflowBuilderProviderProps) {
-  // Try to load from localStorage if no initial workflow provided
-  const storedWorkflow = !initialWorkflow ? loadFromStorage() : null;
+function RunnerWorkflowBuilderInner({
+  children,
+  initialWorkflow,
+  startEmpty,
+}: WorkflowBuilderProviderProps) {
+  // Try to load from localStorage if no initial workflow provided (and not starting empty)
+  const storedWorkflow = !initialWorkflow && !startEmpty ? loadFromStorage() : null;
   // Also load the original workflow to preserve update vs create state
-  const storedOriginalWorkflow = !initialWorkflow ? loadOriginalFromStorage() : null;
+  const storedOriginalWorkflow = !initialWorkflow && !startEmpty ? loadOriginalFromStorage() : null;
 
   const emptyWorkflow: UnifiedWorkflow = {
     ...createDefaultWorkflow(),
@@ -683,12 +705,17 @@ function RunnerWorkflowBuilderInner({ children, initialWorkflow }: WorkflowBuild
       const wf = initialWorkflow ?? storedWorkflow ?? emptyWorkflow;
       return wf.stages && wf.stages.length > 0 ? 0 : null;
     })(),
-    expandedPhases: {
-      setup: true,
-      verification: true,
-      agentic: true,
-      completion: true,
-    },
+    expandedPhases: (() => {
+      const wf = initialWorkflow ?? storedWorkflow ?? emptyWorkflow;
+      const si = wf.stages && wf.stages.length > 0 ? 0 : null;
+      const hasSteps = (phase: WorkflowPhase) => getPhaseSteps(wf, si, phase).length > 0;
+      return {
+        setup: hasSteps("setup"),
+        verification: hasSteps("verification"),
+        agentic: hasSteps("agentic"),
+        completion: hasSteps("completion"),
+      };
+    })(),
     showSaveDialog: false,
     showAddDropdown: false,
     addDropdownPhase: null,
@@ -1055,11 +1082,12 @@ function RunnerWorkflowBuilderInner({ children, initialWorkflow }: WorkflowBuild
 export function WorkflowBuilderProvider({
   children,
   initialWorkflow,
+  startEmpty,
 }: WorkflowBuilderProviderProps) {
   return (
     <WorkflowDataProvider adapter={runnerDataAdapter}>
       <SharedBuilderProvider initialWorkflow={initialWorkflow}>
-        <RunnerWorkflowBuilderInner initialWorkflow={initialWorkflow}>
+        <RunnerWorkflowBuilderInner initialWorkflow={initialWorkflow} startEmpty={startEmpty}>
           {children}
         </RunnerWorkflowBuilderInner>
       </SharedBuilderProvider>

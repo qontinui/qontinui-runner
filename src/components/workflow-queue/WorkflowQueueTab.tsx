@@ -7,7 +7,7 @@
  */
 
 import { useState, useEffect, useCallback } from "react";
-import { Play, RefreshCw, Trash2, Loader2, Settings2 } from "lucide-react";
+import { Play, RefreshCw, Trash2, Loader2, Settings2, ChevronRight } from "lucide-react";
 import { WorkflowLibraryPanel } from "./WorkflowLibraryPanel";
 import { WorkflowQueuePanel } from "./WorkflowQueuePanel";
 import type { WorkflowWithStats, QueuedWorkflow, WorkflowStats } from "./types";
@@ -17,6 +17,7 @@ import { getApiBase } from "@/lib/runner-api";
 
 const STORAGE_KEY = "qontinui-workflow-queue";
 const OPTIONS_STORAGE_KEY = "qontinui-workflow-queue-options";
+const LIBRARY_OPEN_KEY = "qontinui-workflow-queue-library-open";
 
 type LogLevel = "info" | "warning" | "error" | "debug" | "success";
 
@@ -52,6 +53,24 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
     }
   });
   const [showOptions, setShowOptions] = useState(false);
+
+  // Library panel visibility — persisted to localStorage
+  const [isLibraryOpen, setIsLibraryOpen] = useState<boolean>(() => {
+    try {
+      const stored = localStorage.getItem(LIBRARY_OPEN_KEY);
+      return stored !== null ? JSON.parse(stored) : true;
+    } catch {
+      return true;
+    }
+  });
+
+  const toggleLibrary = useCallback(() => {
+    setIsLibraryOpen((prev) => {
+      const next = !prev;
+      localStorage.setItem(LIBRARY_OPEN_KEY, JSON.stringify(next));
+      return next;
+    });
+  }, []);
 
   // Execution state
   const [isExecuting, setIsExecuting] = useState(false);
@@ -236,18 +255,39 @@ export function WorkflowQueueTab({ onNavigateToActive, onLog }: WorkflowQueueTab
 
       {/* Main content - two panels */}
       <div className="flex-1 flex overflow-hidden">
-        {/* Left: Library */}
-        <WorkflowLibraryPanel
-          workflows={filteredWorkflows}
-          loading={loading}
-          search={search}
-          onSearchChange={setSearch}
-          category={category}
-          onCategoryChange={setCategory}
-          categories={categories}
-          onAddToQueue={addToQueue}
-          queuedIds={queuedIds}
-        />
+        {/* Left: Library (collapsible) */}
+        {isLibraryOpen ? (
+          <div className="flex-shrink-0 flex" style={{ width: 280 }}>
+            <WorkflowLibraryPanel
+              workflows={filteredWorkflows}
+              loading={loading}
+              search={search}
+              onSearchChange={setSearch}
+              category={category}
+              onCategoryChange={setCategory}
+              categories={categories}
+              onAddToQueue={addToQueue}
+              queuedIds={queuedIds}
+              onCollapse={toggleLibrary}
+            />
+          </div>
+        ) : (
+          /* Collapsed library strip */
+          <button
+            onClick={toggleLibrary}
+            className="flex-shrink-0 flex flex-col items-center justify-center gap-2 w-8 border-r border-white/10
+                       text-muted-foreground hover:text-foreground hover:bg-white/5 transition-colors"
+            title="Expand workflow library"
+          >
+            <ChevronRight className="w-4 h-4" />
+            <span
+              className="text-xs font-medium"
+              style={{ writingMode: "vertical-rl", transform: "rotate(180deg)" }}
+            >
+              Library
+            </span>
+          </button>
+        )}
 
         {/* Right: Queue */}
         <WorkflowQueuePanel items={queue} onRemove={removeFromQueue} onReorder={reorderQueue} />

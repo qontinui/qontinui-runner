@@ -11,13 +11,27 @@ import "@xterm/xterm/css/xterm.css";
 export interface TerminalInstanceHandle {
   getSelection: () => string;
   hasSelection: () => boolean;
+  writeToTerminal: (text: string) => void;
+  /** Read up to `maxLines` lines from the terminal scrollback buffer. */
+  getScrollback: (maxLines?: number) => string;
 }
 
 interface TerminalInstanceProps {
   terminalId: string;
   visible: boolean;
+  /** True when this instance is reconnecting to an existing Rust PTY session. */
+  isReconnecting?: boolean;
+  /** Called after scrollback buffer has been replayed and live events are flowing. */
+  onReconnected?: () => void;
   onExit?: (exitCode: number | null) => void;
   onSelectionChange?: (hasSelection: boolean) => void;
+  onFirstInput?: (input: string) => void;
+}
+
+interface ScrollbackBufferResponse {
+  data: string; // base64
+  start_offset: number;
+  total_bytes_produced: number;
 }
 
 interface TerminalOutputEvent {
@@ -44,7 +58,10 @@ function uint8ToBase64(bytes: Uint8Array): string {
 const encoder = new TextEncoder();
 
 export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInstanceProps>(
-  function TerminalInstanceInner({ terminalId, visible, onExit, onSelectionChange }, ref) {
+  function TerminalInstanceInner(
+    { terminalId, visible, isReconnecting, onReconnected, onExit, onSelectionChange, onFirstInput },
+    ref,
+  ) {
     const containerRef = useRef<HTMLDivElement>(null);
     const termRef = useRef<Terminal | null>(null);
     const fitAddonRef = useRef<FitAddon | null>(null);
@@ -55,11 +72,41 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
     onExitRef.current = onExit;
     const onSelectionChangeRef = useRef(onSelectionChange);
     onSelectionChangeRef.current = onSelectionChange;
+    const onFirstInputRef = useRef(onFirstInput);
+    onFirstInputRef.current = onFirstInput;
+    const onReconnectedRef = useRef(onReconnected);
+    onReconnectedRef.current = onReconnected;
+    const firstInputReportedRef = useRef(false);
+    const inputAccumulatorRef = useRef("");
+    // Gate for reconnection: queues live events until scrollback is replayed
+    const reconnectGateRef = useRef<{
+      open: boolean;
+      queue: Uint8Array[];
+    } | null>(isReconnecting ? { open: false, queue: [] } : null);
 
-    // Expose selection API to parent components
+    // Expose selection, write, and scrollback API to parent components
     useImperativeHandle(ref, () => ({
       getSelection: () => termRef.current?.getSelection() ?? "",
       hasSelection: () => termRef.current?.hasSelection() ?? false,
+      writeToTerminal: (text: string) => {
+        const bytes = encoder.encode(text);
+        invoke("terminal_write", { terminalId, data: uint8ToBase64(bytes) }).catch(() => {});
+      },
+      getScrollback: (maxLines = 500) => {
+        const term = termRef.current;
+        if (!term) return "";
+        const buffer = term.buffer.active;
+        const totalLines = buffer.length;
+        const startLine = Math.max(0, totalLines - maxLines);
+        const lines: string[] = [];
+        for (let i = startLine; i < totalLines; i++) {
+          const line = buffer.getLine(i);
+          if (line) {
+            lines.push(line.translateToString(true));
+          }
+        }
+        return lines.join("\n");
+      },
     }));
 
     // Debounced fit — coalesce rapid resize events
@@ -139,9 +186,24 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         viewport.classList.add("scrollbar-dark");
       }
 
-      // Try WebGL renderer, fall back to Canvas, then DOM
+      // Try WebGL renderer, fall back to Canvas, then DOM.
+      // Also handle WebGL context loss (GPU crash) by falling back at runtime.
       try {
-        term.loadAddon(new WebglAddon());
+        const webgl = new WebglAddon();
+        webgl.onContextLoss(() => {
+          console.warn(`[Terminal ${terminalId}] WebGL context lost, falling back to Canvas`);
+          try {
+            webgl.dispose();
+          } catch {
+            // ignore dispose errors
+          }
+          try {
+            term.loadAddon(new CanvasAddon());
+          } catch {
+            // Fall through to DOM renderer
+          }
+        });
+        term.loadAddon(webgl);
       } catch {
         try {
           term.loadAddon(new CanvasAddon());
@@ -158,8 +220,26 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         onSelectionChangeRef.current?.(term.hasSelection());
       });
 
-      // Forward user input to PTY
+      // Forward user input to PTY + track first input line for auto-naming
       const inputDisposable = term.onData((data) => {
+        // Track first input line for auto-naming
+        if (!firstInputReportedRef.current) {
+          for (const ch of data) {
+            if (ch === "\r" || ch === "\n") {
+              const line = inputAccumulatorRef.current.trim();
+              if (line.length > 0) {
+                firstInputReportedRef.current = true;
+                onFirstInputRef.current?.(line);
+              }
+              inputAccumulatorRef.current = "";
+              break;
+            } else if (ch.charCodeAt(0) >= 32) {
+              // Only accumulate printable characters
+              inputAccumulatorRef.current += ch;
+            }
+          }
+        }
+
         const bytes = encoder.encode(data);
         invoke("terminal_write", {
           terminalId,
@@ -179,7 +259,8 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         }).catch(() => {});
       });
 
-      // Listen for PTY output
+      // Listen for PTY output — gate during reconnection
+      const gate = reconnectGateRef.current;
       let outputUnsub: UnlistenFn | null = null;
       listen<TerminalOutputEvent>("terminal-output", (event) => {
         if (event.payload.terminal_id !== terminalId) return;
@@ -188,11 +269,66 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         for (let i = 0; i < raw.length; i++) {
           bytes[i] = raw.charCodeAt(i);
         }
-        term.write(bytes);
+
+        // If we're reconnecting and the gate is still closed, queue the event
+        if (gate && !gate.open) {
+          gate.queue.push(bytes);
+          return;
+        }
+
+        try {
+          term.write(bytes);
+        } catch (e) {
+          console.error(`[Terminal ${terminalId}] term.write error:`, e);
+        }
         bytesReceivedRef.current += bytes.length;
       }).then((fn) => {
         outputUnsub = fn;
       });
+
+      // If reconnecting: fetch scrollback buffer, write it, then open the gate
+      if (gate) {
+        (async () => {
+          try {
+            const result = await invoke<{
+              success: boolean;
+              data: ScrollbackBufferResponse | null;
+            }>("terminal_get_buffer", { terminalId });
+            if (result.success && result.data) {
+              const bufData = result.data as unknown as ScrollbackBufferResponse;
+              const raw = atob(bufData.data);
+              const bytes = new Uint8Array(raw.length);
+              for (let i = 0; i < raw.length; i++) {
+                bytes[i] = raw.charCodeAt(i);
+              }
+              if (bytes.length > 0) {
+                try {
+                  term.write(bytes);
+                } catch (e) {
+                  console.error(`[Terminal ${terminalId}] scrollback write error:`, e);
+                }
+                bytesReceivedRef.current += bytes.length;
+              }
+            }
+          } catch (err) {
+            console.warn(`[Terminal ${terminalId}] Failed to fetch scrollback:`, err);
+          }
+
+          // Open the gate and flush queued live events
+          gate.open = true;
+          for (const queued of gate.queue) {
+            try {
+              term.write(queued);
+            } catch (e) {
+              console.error(`[Terminal ${terminalId}] queued write error:`, e);
+            }
+            bytesReceivedRef.current += queued.length;
+          }
+          gate.queue.length = 0;
+
+          onReconnectedRef.current?.();
+        })();
+      }
 
       // Listen for process exit
       let exitUnsub: UnlistenFn | null = null;

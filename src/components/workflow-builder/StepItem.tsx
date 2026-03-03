@@ -88,7 +88,7 @@ export function StepItem({
   onToggleSelect,
 }: StepItemProps) {
   const moveButtons = (
-    <div className="flex flex-col gap-0.5 shrink-0">
+    <div className="flex flex-col gap-0.5 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity">
       <button
         onClick={(e) => {
           e.stopPropagation();

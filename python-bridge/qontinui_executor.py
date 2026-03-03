@@ -1436,17 +1436,18 @@ class QontinuiExecutor:
             token = params.get("jwt_token", "")
             project_id = params.get("project_id")
             runner_name = params.get("runner_name")
+            runner_port = params.get("runner_port")
             print(
-                f"[info    ] WS_DEBUG: enabled={enabled}, api_url={api_url}, project_id={project_id}, runner_name={runner_name}, token_len={len(token) if token else 0}",
+                f"[info    ] WS_DEBUG: enabled={enabled}, api_url={api_url}, project_id={project_id}, runner_name={runner_name}, runner_port={runner_port}, token_len={len(token) if token else 0}",
                 file=sys.stderr,
                 flush=True,
             )
             self.event_manager.emit_log(
                 "info",
-                f"[WS_CONFIGURE] enabled={enabled}, api_url={api_url}, project_id={project_id}, runner_name={runner_name}, token_len={len(token) if token else 0}",
+                f"[WS_CONFIGURE] enabled={enabled}, api_url={api_url}, project_id={project_id}, runner_name={runner_name}, runner_port={runner_port}, token_len={len(token) if token else 0}",
             )
             success = self.websocket_handler.configure(
-                enabled, api_url, token, project_id, runner_name
+                enabled, api_url, token, project_id, runner_name, runner_port
             )
             print(
                 f"[info    ] WS_DEBUG: configure result: success={success}",

@@ -102,17 +102,27 @@ export function AuthProvider({ children }: AuthProviderProps) {
       console.log(
         `[AUTH] refreshAuth() #${callNum} - refresh_token succeeded, checking auth status...`,
       );
-      await checkAuthStatus();
+      // Wrap the status check in its own try/catch — if refresh succeeded but the
+      // status check fails (e.g., transient 5xx), keep the existing auth state
+      // rather than propagating the failure as unauthenticated.
+      try {
+        await checkAuthStatus();
+      } catch (statusErr) {
+        console.warn(
+          `[AUTH] refreshAuth() #${callNum} - status check failed after successful refresh, keeping existing auth state:`,
+          statusErr,
+        );
+      }
       console.log(`[AUTH] refreshAuth() #${callNum} - completed successfully`);
     } catch (err) {
-      console.error(`[AUTH] refreshAuth() #${callNum} - Failed to refresh token:`, err);
+      console.warn(`[AUTH] refreshAuth() #${callNum} - Token refresh failed:`, err);
+      // Don't immediately log the user out. The current access token may still be
+      // valid — a refresh failure alone (e.g., transient network issue, backend
+      // momentarily unavailable) should not destroy the user's session and cause
+      // the entire app tree (including terminal sessions) to unmount.
+      // The next refresh cycle will try again. If the token truly expired,
+      // subsequent API calls will return 401 and the user can re-authenticate.
       setError(err as string);
-      // If refresh fails, user needs to log in again
-      setAuthStatus({
-        authenticated: false,
-        user: null,
-        device_info: null,
-      });
     }
   }, [checkAuthStatus]);
 

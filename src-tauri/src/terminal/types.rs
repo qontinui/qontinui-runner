@@ -16,6 +16,10 @@ pub struct TerminalInfo {
     pub working_dir: String,
     pub is_alive: bool,
     pub exit_code: Option<i32>,
+    /// Unix timestamp in milliseconds when the session was created.
+    pub created_at: u64,
+    /// Monotonic counter of all bytes ever produced by the PTY.
+    pub total_bytes_produced: u64,
 }
 
 /// Event payload emitted when a terminal produces output.

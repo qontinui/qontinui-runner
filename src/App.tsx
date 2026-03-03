@@ -1525,10 +1525,8 @@ function AppContent() {
             {/* Terminal is always-mounted to preserve PTY sessions and scrollback across tab switches */}
             <div className={`absolute inset-0 ${activeTab === "terminal" ? "" : "hidden"}`}>
               <TerminalPage
-                onNavigateToWorkflow={(workflowId) => {
-                  setEditWorkflowId(workflowId);
-                  setActiveTab("unified-workflow-builder");
-                }}
+                onNavigateToBuilder={() => setActiveTab("unified-workflow-builder")}
+                onNavigateToActive={() => setActiveTab("active")}
               />
             </div>
           </main>

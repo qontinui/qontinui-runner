@@ -94,6 +94,7 @@ pub mod step_outputs; // Step output collection for test builder
 pub mod storage;
 pub mod task_sync; // renamed from ai_task_reporting
 pub mod terminal;
+pub mod terminal_analysis; // Terminal session analysis (session summary, architecture, change impact, etc.)
 pub mod test_orchestrator; // AI-driven multi-step API test orchestration
 pub mod testing;
 pub mod tiered_info;

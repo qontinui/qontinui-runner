@@ -32,6 +32,18 @@ class WebSocketConfig:
     # Runner info
     runner_version: str = "0.1.0"
     runner_name: str | None = None  # Custom user-defined runner name
+    runner_port: int | None = None  # HTTP API port this runner listens on
+
+    @staticmethod
+    def _parse_int_env(name: str, default: int | None = None) -> int | None:
+        """Parse an integer environment variable, returning default on missing or invalid values."""
+        raw = os.getenv(name)
+        if not raw:
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            return default
 
     @classmethod
     def from_env(cls) -> "WebSocketConfig":
@@ -63,6 +75,7 @@ class WebSocketConfig:
             max_reconnect_attempts=int(os.getenv("QONTINUI_WS_MAX_RECONNECT", "5")),
             runner_version=os.getenv("QONTINUI_RUNNER_VERSION", "0.1.0"),
             runner_name=os.getenv("QONTINUI_RUNNER_NAME"),
+            runner_port=cls._parse_int_env("QONTINUI_PORT"),
         )
 
     @classmethod
@@ -88,6 +101,7 @@ class WebSocketConfig:
             max_reconnect_attempts=data.get("max_reconnect_attempts", 5),
             runner_version=data.get("runner_version", "0.1.0"),
             runner_name=data.get("runner_name"),
+            runner_port=data.get("runner_port"),
         )
 
     def validate(self) -> tuple[bool, str | None]:

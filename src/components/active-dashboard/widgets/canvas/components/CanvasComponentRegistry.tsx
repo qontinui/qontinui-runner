@@ -17,6 +17,7 @@ import { FileTreePanel } from "./FileTreePanel";
 import { ProgressChartPanel } from "./ProgressChartPanel";
 import { FindingListPanel } from "./FindingListPanel";
 import { ChecklistPanel } from "./ChecklistPanel";
+import { ArchitectureGraphPanel } from "./ArchitectureGraphPanel";
 
 /**
  * Props that all canvas panel components receive.
@@ -57,6 +58,7 @@ const COMPONENT_MAP: Record<string, ComponentType<CanvasPanelComponentProps>> = 
   ProgressChart: ProgressChartPanel,
   FindingList: FindingListPanel,
   Checklist: ChecklistPanel,
+  ArchitectureGraph: ArchitectureGraphPanel,
 };
 
 /**

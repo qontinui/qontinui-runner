@@ -17,7 +17,12 @@ import type { CanvasWidgetProps, CanvasPanel } from "./types";
 /**
  * Full Canvas widget component.
  */
-export function CanvasWidget({ isSummary, data, className }: CanvasWidgetProps) {
+export function CanvasWidget({
+  isSummary,
+  hideHeader,
+  data,
+  className,
+}: CanvasWidgetProps & { hideHeader?: boolean }) {
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
   const [maximizedPanelId, setMaximizedPanelId] = useState<string | null>(null);
   const [typeFilter, setTypeFilter] = useState<Set<string>>(new Set());
@@ -130,30 +135,32 @@ export function CanvasWidget({ isSummary, data, className }: CanvasWidgetProps) 
   return (
     <div className={cn("flex flex-col h-full overflow-hidden", className)}>
       {/* Header */}
-      <div className="flex items-center justify-between border-b border-border px-4 py-2 bg-muted/10 flex-shrink-0">
-        <div className="flex items-center gap-3">
-          <LayoutDashboard className="h-4 w-4 text-rose-500" />
-          <h3 className="text-sm font-semibold text-foreground">Canvas</h3>
-          <span className="text-xs text-muted-foreground">Agent-rendered panels</span>
+      {!hideHeader && (
+        <div className="flex items-center justify-between border-b border-border px-4 py-2 bg-muted/10 flex-shrink-0">
+          <div className="flex items-center gap-3">
+            <LayoutDashboard className="h-4 w-4 text-rose-500" />
+            <h3 className="text-sm font-semibold text-foreground">Canvas</h3>
+            <span className="text-xs text-muted-foreground">Agent-rendered panels</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={handleExpandAll}
+              className="px-2 py-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+            >
+              Expand
+            </button>
+            <button
+              onClick={handleCollapseAll}
+              className="px-2 py-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+            >
+              Collapse
+            </button>
+            <Badge variant="muted" className="text-xs">
+              {data.panelCount}
+            </Badge>
+          </div>
         </div>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={handleExpandAll}
-            className="px-2 py-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
-          >
-            Expand
-          </button>
-          <button
-            onClick={handleCollapseAll}
-            className="px-2 py-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
-          >
-            Collapse
-          </button>
-          <Badge variant="muted" className="text-xs">
-            {data.panelCount}
-          </Badge>
-        </div>
-      </div>
+      )}
 
       {/* Type filter chips */}
       {availableTypes.length >= 2 && (

@@ -3,10 +3,12 @@
 //! Spawns a shell via `portable-pty`, manages reader/writer threads,
 //! and emits Tauri events for output and exit.
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
@@ -15,6 +17,9 @@ use tracing::{debug, info, warn};
 
 use super::interceptor::OutputInterceptor;
 use super::types::{TerminalExitEvent, TerminalId, TerminalInfo, TerminalOutputEvent};
+
+/// Maximum scrollback buffer capacity (1 MB).
+const SCROLLBACK_CAPACITY: usize = 1_048_576;
 
 /// A single PTY-backed terminal session.
 pub struct TerminalSession {
@@ -42,8 +47,14 @@ pub struct TerminalSession {
     /// Handle to the waiter thread (for join on cleanup).
     waiter_join: Mutex<Option<thread::JoinHandle<()>>>,
     /// Bytes received by the frontend (for flow control).
-    bytes_sent: Arc<std::sync::atomic::AtomicU64>,
-    bytes_acked: Arc<std::sync::atomic::AtomicU64>,
+    bytes_sent: Arc<AtomicU64>,
+    bytes_acked: Arc<AtomicU64>,
+    /// Ring buffer of recent raw PTY output for reconnection.
+    scrollback_buffer: Arc<Mutex<VecDeque<u8>>>,
+    /// Monotonic counter of all bytes ever produced by the PTY.
+    total_bytes_produced: Arc<AtomicU64>,
+    /// Unix timestamp in milliseconds when the session was created.
+    created_at: u64,
 }
 
 impl TerminalSession {
@@ -84,10 +95,10 @@ impl TerminalSession {
         // Remove CLAUDECODE env var so Claude CLI works inside the terminal
         cmd.env_remove("CLAUDECODE");
 
-        // Set TERM for proper color/capability support
-        #[cfg(target_os = "windows")]
-        cmd.env("TERM", "cygwin");
-        #[cfg(not(target_os = "windows"))]
+        // Set TERM for proper color/capability support.
+        // xterm.js is a full xterm-compatible terminal, so use xterm-256color on all
+        // platforms. The previous "cygwin" setting on Windows caused issues with tools
+        // like Claude Code that check TERM for capability detection.
         cmd.env("TERM", "xterm-256color");
 
         // Spawn the child process
@@ -119,8 +130,14 @@ impl TerminalSession {
 
         let is_alive = Arc::new(AtomicBool::new(true));
         let exit_code: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
-        let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let bytes_acked = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let bytes_sent = Arc::new(AtomicU64::new(0));
+        let bytes_acked = Arc::new(AtomicU64::new(0));
+        let scrollback_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(SCROLLBACK_CAPACITY)));
+        let total_bytes_produced = Arc::new(AtomicU64::new(0));
+        let created_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
 
         // Get a reader from the master PTY
         let mut reader = pair
@@ -128,12 +145,14 @@ impl TerminalSession {
             .try_clone_reader()
             .map_err(|e| format!("Failed to clone PTY reader: {}", e))?;
 
-        // Spawn reader thread: reads PTY output → interceptor → Tauri event
+        // Spawn reader thread: reads PTY output → interceptor → scrollback + Tauri event
         let reader_id = id.clone();
         let reader_app = app_handle.clone();
         let reader_alive = is_alive.clone();
         let reader_bytes_sent = bytes_sent.clone();
         let reader_bytes_acked = bytes_acked.clone();
+        let reader_scrollback = scrollback_buffer.clone();
+        let reader_total_bytes = total_bytes_produced.clone();
         let reader_handle = thread::Builder::new()
             .name(format!("terminal-reader-{}", &id))
             .spawn(move || {
@@ -159,6 +178,18 @@ impl TerminalSession {
                         }
                         Ok(n) => {
                             let data = interceptor.process(&reader_id, &buf[..n]);
+
+                            // Tee processed output into scrollback ring buffer
+                            if let Ok(mut sb) = reader_scrollback.lock() {
+                                for &byte in &data {
+                                    if sb.len() >= SCROLLBACK_CAPACITY {
+                                        sb.pop_front();
+                                    }
+                                    sb.push_back(byte);
+                                }
+                            }
+                            reader_total_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+
                             let encoded = STANDARD.encode(&data);
                             let event = TerminalOutputEvent {
                                 terminal_id: reader_id.clone(),
@@ -251,6 +282,9 @@ impl TerminalSession {
             waiter_join: Mutex::new(Some(waiter_handle)),
             bytes_sent,
             bytes_acked,
+            scrollback_buffer,
+            total_bytes_produced,
+            created_at,
         })
     }
 
@@ -336,7 +370,27 @@ impl TerminalSession {
             working_dir: self.working_dir.clone(),
             is_alive: self.is_alive.load(Ordering::Relaxed),
             exit_code: self.exit_code.lock().ok().and_then(|ec| *ec),
+            created_at: self.created_at,
+            total_bytes_produced: self.total_bytes_produced.load(Ordering::Relaxed),
         }
+    }
+
+    /// Get the scrollback buffer contents and the byte offset where the data starts.
+    /// Returns `(data, start_offset)` where `start_offset = total_bytes_produced - data.len()`.
+    pub fn get_scrollback_buffer(&self) -> (Vec<u8>, u64) {
+        let total = self.total_bytes_produced.load(Ordering::Relaxed);
+        let data = match self.scrollback_buffer.lock() {
+            Ok(sb) => sb.iter().copied().collect::<Vec<u8>>(),
+            Err(_) => Vec::new(),
+        };
+        let start_offset = total.saturating_sub(data.len() as u64);
+        (data, start_offset)
+    }
+
+    /// Reset flow control counters so a reconnecting frontend doesn't hit backpressure.
+    pub fn reset_flow_control(&self) {
+        let sent = self.bytes_sent.load(Ordering::Relaxed);
+        self.bytes_acked.store(sent, Ordering::Relaxed);
     }
 
     /// Check if the shell process is still alive.

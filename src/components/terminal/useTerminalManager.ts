@@ -7,6 +7,10 @@ export interface TerminalTab {
   pid: number | null;
   isAlive: boolean;
   exitCode: number | null;
+  workingDir?: string;
+  createdAt?: number;
+  /** True while the frontend is replaying the scrollback buffer from Rust. */
+  isReconnecting?: boolean;
 }
 
 interface TerminalInfo {
@@ -18,6 +22,8 @@ interface TerminalInfo {
   working_dir: string;
   is_alive: boolean;
   exit_code: number | null;
+  created_at: number;
+  total_bytes_produced: number;
 }
 
 interface CommandResponse {
@@ -30,6 +36,56 @@ export function useTerminalManager() {
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const nextTitleNum = useRef(1);
+  const [initialized, setInitialized] = useState(false);
+
+  /**
+   * Reconnect to existing Rust PTY sessions that survived a React remount.
+   * Returns true if sessions were found and restored.
+   */
+  const reconnectToExistingSessions = useCallback(async (): Promise<boolean> => {
+    try {
+      const result = await invoke<CommandResponse>("terminal_list");
+      if (!result.success || !result.data) return false;
+
+      const terminals = (result.data as { terminals: TerminalInfo[] }).terminals;
+      if (!terminals || terminals.length === 0) return false;
+
+      console.log(`[TerminalManager] Reconnecting to ${terminals.length} existing PTY session(s)`);
+
+      // Rebuild tabs from Rust session data (already sorted by created_at)
+      const reconnectedTabs: TerminalTab[] = terminals.map((info) => ({
+        id: info.id,
+        title: info.title,
+        pid: info.pid ?? null,
+        isAlive: info.is_alive,
+        exitCode: info.exit_code ?? null,
+        workingDir: info.working_dir || undefined,
+        createdAt: info.created_at,
+        isReconnecting: true,
+      }));
+
+      // Update nextTitleNum to avoid collisions
+      for (const tab of reconnectedTabs) {
+        const match = tab.title.match(/^Terminal (\d+)$/);
+        if (match) {
+          nextTitleNum.current = Math.max(nextTitleNum.current, parseInt(match[1], 10) + 1);
+        }
+      }
+
+      setTabs(reconnectedTabs);
+      // Select the last tab (most recently created)
+      setActiveId(reconnectedTabs[reconnectedTabs.length - 1].id);
+      return true;
+    } catch (err) {
+      console.error("[TerminalManager] Failed to reconnect:", err);
+      return false;
+    }
+  }, []);
+
+  /** Mark a tab as having completed reconnection (buffer replayed). */
+  const markReconnected = useCallback((id: string) => {
+    setTabs((prev) => prev.map((t) => (t.id === id ? { ...t, isReconnecting: false } : t)));
+  }, []);
 
   const createTerminal = useCallback(async (title?: string): Promise<string | null> => {
     try {
@@ -47,6 +103,8 @@ export function useTerminalManager() {
         pid: info.pid ?? null,
         isAlive: info.is_alive,
         exitCode: info.exit_code ?? null,
+        workingDir: info.working_dir || undefined,
+        createdAt: info.created_at,
       };
 
       setTabs((prev) => [...prev, tab]);
@@ -91,9 +149,13 @@ export function useTerminalManager() {
     tabs,
     activeId,
     setActiveId,
+    initialized,
+    setInitialized,
     createTerminal,
     closeTerminal,
     renameTab,
     updateTab,
+    reconnectToExistingSessions,
+    markReconnected,
   };
 }

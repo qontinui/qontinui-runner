@@ -57,6 +57,8 @@ pub fn configure_websocket(
         config.enabled, config.url, config.runner_name
     );
 
+    let runner_port = state.api_port.load(std::sync::atomic::Ordering::Relaxed);
+
     with_default_bridge(&state, |bridge| {
         bridge
             .configure_websocket(
@@ -65,6 +67,7 @@ pub fn configure_websocket(
                 config.token.clone(),
                 config.project_id.clone(),
                 config.runner_name.clone(),
+                Some(runner_port),
             )
             .map_err(|e| {
                 error!("Failed to configure WebSocket: {}", e);

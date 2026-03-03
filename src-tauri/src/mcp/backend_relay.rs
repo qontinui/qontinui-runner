@@ -145,6 +145,32 @@ async fn relay_loop(
                 let (write, read) = ws_stream.split();
                 let write = Arc::new(Mutex::new(write));
 
+                // Send runner_info immediately so the backend knows our API port
+                {
+                    let port = api_state
+                        .app_state
+                        .api_port
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let instance_name = std::env::var("QONTINUI_INSTANCE_NAME").ok();
+                    let runner_info = serde_json::json!({
+                        "type": "runner_info",
+                        "data": {
+                            "runner_name": instance_name.unwrap_or_else(|| "Desktop Runner".to_string()),
+                            "runner_port": port,
+                            "runner_hostname": hostname::get().ok().map(|h| h.to_string_lossy().to_string()),
+                            "runner_os": std::env::consts::OS,
+                            "runner_version": env!("CARGO_PKG_VERSION"),
+                        }
+                    });
+                    let info_text = serde_json::to_string(&runner_info).unwrap_or_default();
+                    let mut w = write.lock().await;
+                    if let Err(e) = w.send(Message::Text(info_text)).await {
+                        warn!("Failed to send runner_info to backend relay: {}", e);
+                    } else {
+                        info!("Sent runner_info to backend relay (port={})", port);
+                    }
+                }
+
                 // Run inbound and outbound handlers concurrently
                 let write_clone = write.clone();
                 let write_ping = write.clone();

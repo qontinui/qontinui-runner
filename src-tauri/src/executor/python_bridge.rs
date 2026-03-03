@@ -490,6 +490,7 @@ impl PythonBridge {
         token: String,
         project_id: Option<String>,
         runner_name: Option<String>,
+        runner_port: Option<u16>,
     ) -> Result<(), String> {
         // Configure WebSocket
         self.send_command(
@@ -500,6 +501,7 @@ impl PythonBridge {
                 "jwt_token": token,
                 "project_id": project_id,
                 "runner_name": runner_name,
+                "runner_port": runner_port,
             })),
         )?;
 

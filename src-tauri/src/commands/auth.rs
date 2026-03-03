@@ -414,14 +414,25 @@ pub async fn check_auth_status() -> Result<AuthStatus, String> {
         })?;
 
     if !response.status().is_success() {
-        warn!("Token validation failed: {}", response.status());
-        // Clear invalid tokens
-        let _ = auth_manager.clear_tokens();
-        return Ok(AuthStatus {
-            authenticated: false,
-            user: None,
-            device_id: None,
-        });
+        let status = response.status();
+        warn!("Token validation failed: {}", status);
+
+        // Only clear tokens on definitive auth failures (401/403).
+        // For transient errors (5xx, timeouts, etc.), return Err so the
+        // frontend catch block fires without changing auth state.
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            let _ = auth_manager.clear_tokens();
+            return Ok(AuthStatus {
+                authenticated: false,
+                user: None,
+                device_id: None,
+            });
+        } else {
+            return Err(format!(
+                "Auth status check failed with transient error: {}",
+                status
+            ));
+        }
     }
 
     let user_info: ApiUserInfo = response.json().await.map_err(|e| {
@@ -683,8 +694,12 @@ pub async fn refresh_token() -> Result<(), String> {
             status, error_text
         );
 
-        // Clear tokens if refresh failed (likely expired)
-        let _ = auth_manager.clear_tokens();
+        // Only clear tokens on definitive auth failures (401/403 = token truly invalid).
+        // For transient errors (5xx, network issues), keep the tokens so the next
+        // refresh cycle can retry without forcing a full re-login.
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            let _ = auth_manager.clear_tokens();
+        }
 
         return Err(format!("Token refresh failed: {}", error_text));
     }

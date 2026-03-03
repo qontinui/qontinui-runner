@@ -18,7 +18,9 @@ pub struct TranscriptSession {
     pub project_path: String,
     pub config_dir: String,
     pub message_count: usize,
-    pub last_modified: String, // ISO 8601
+    pub last_modified: String,                 // ISO 8601
+    pub first_message_preview: Option<String>, // first ~80 chars of first user message
+    pub has_plans: bool,                       // true if any message has planContent
 }
 
 /// A single parsed message from a Claude Code transcript.
@@ -144,10 +146,15 @@ pub fn list_sessions(
                     })
                     .unwrap_or_default();
 
-                // Count lines as approximate message count (cheap)
-                let line_count = fs::read_to_string(&path)
-                    .map(|content| content.lines().count())
-                    .unwrap_or(0);
+                // Read file content for line count, preview, and plan detection
+                let content = fs::read_to_string(&path).unwrap_or_default();
+                let line_count = content.lines().count();
+
+                // Substring check for plans (cheap — no JSON parse needed)
+                let has_plans = content.contains("\"planContent\"");
+
+                // Extract first user message preview (scan first ~20 lines)
+                let first_message_preview = extract_first_user_preview(&content);
 
                 sessions.push(TranscriptSession {
                     session_id,
@@ -155,6 +162,8 @@ pub fn list_sessions(
                     config_dir: config_dir.to_string_lossy().to_string(),
                     message_count: line_count,
                     last_modified,
+                    first_message_preview,
+                    has_plans,
                 });
             }
         }
@@ -393,9 +402,10 @@ pub fn get_latest_session_id(config_dir: &Path, project_path: &str) -> Option<Tr
                         })
                         .unwrap_or_default();
 
-                    let line_count = fs::read_to_string(&session_file)
-                        .map(|c| c.lines().count())
-                        .unwrap_or(0);
+                    let content = fs::read_to_string(&session_file).unwrap_or_default();
+                    let line_count = content.lines().count();
+                    let has_plans = content.contains("\"planContent\"");
+                    let first_message_preview = extract_first_user_preview(&content);
 
                     return Some(TranscriptSession {
                         session_id: session_id.to_string(),
@@ -403,6 +413,8 @@ pub fn get_latest_session_id(config_dir: &Path, project_path: &str) -> Option<Tr
                         config_dir: config_dir.to_string_lossy().to_string(),
                         message_count: line_count,
                         last_modified,
+                        first_message_preview,
+                        has_plans,
                     });
                 }
             }
@@ -414,6 +426,62 @@ pub fn get_latest_session_id(config_dir: &Path, project_path: &str) -> Option<Tr
         Ok(sessions) if !sessions.is_empty() => Some(sessions[0].clone()),
         _ => None,
     }
+}
+
+/// Extract a preview from the first user message in a JSONL transcript.
+///
+/// Scans the first 20 lines for a `"type":"user"` record and extracts
+/// the first ~80 characters of the user's text content.
+fn extract_first_user_preview(content: &str) -> Option<String> {
+    for line in content.lines().take(20) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Quick check before parsing JSON
+        if !line.contains("\"type\":\"user\"") && !line.contains("\"type\": \"user\"") {
+            continue;
+        }
+        if let Ok(record) = serde_json::from_str::<serde_json::Value>(line) {
+            if record.get("type").and_then(|t| t.as_str()) == Some("user") {
+                // Extract text from message.content
+                if let Some(content_val) = record.get("message").and_then(|m| m.get("content")) {
+                    let text = if let Some(s) = content_val.as_str() {
+                        s.to_string()
+                    } else if let Some(arr) = content_val.as_array() {
+                        arr.iter()
+                            .filter_map(|block| {
+                                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                    block.get("text").and_then(|t| t.as_str()).map(String::from)
+                                } else {
+                                    None
+                                }
+                            })
+                            .next()
+                            .unwrap_or_default()
+                    } else {
+                        continue;
+                    };
+
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        let preview = if trimmed.len() > 80 {
+                            // Find a valid char boundary at or before byte 80
+                            let mut end = 80;
+                            while end > 0 && !trimmed.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            format!("{}...", &trimmed[..end])
+                        } else {
+                            trimmed.to_string()
+                        };
+                        return Some(preview);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -531,6 +599,30 @@ mod tests {
         assert!(text.contains("Build a calculator"));
         assert!(text.contains("## Assistant"));
         assert!(text.contains("I'll create a calculator app."));
+    }
+
+    #[test]
+    fn test_extract_first_user_preview() {
+        let content = r#"{"type":"system","uuid":"s1","timestamp":"2025-01-01T00:00:00Z"}
+{"type":"user","uuid":"u1","timestamp":"2025-01-01T00:00:01Z","message":{"role":"user","content":"Fix the login bug so that users can authenticate properly"}}
+{"type":"assistant","uuid":"a1","timestamp":"2025-01-01T00:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"I'll fix it."}]}}"#;
+        let preview = extract_first_user_preview(content);
+        assert_eq!(
+            preview,
+            Some("Fix the login bug so that users can authenticate properly".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_first_user_preview_truncates() {
+        let long_msg = "a".repeat(120);
+        let content = format!(
+            r#"{{"type":"user","uuid":"u1","timestamp":"2025-01-01T00:00:00Z","message":{{"role":"user","content":"{}"}}}}"#,
+            long_msg
+        );
+        let preview = extract_first_user_preview(&content).unwrap();
+        assert!(preview.len() <= 84); // 80 chars + "..."
+        assert!(preview.ends_with("..."));
     }
 
     #[test]

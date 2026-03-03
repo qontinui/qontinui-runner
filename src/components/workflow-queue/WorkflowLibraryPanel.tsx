@@ -5,7 +5,7 @@
  * Includes search, category filtering, and add-to-queue functionality.
  */
 
-import { Search, Loader2, Inbox } from "lucide-react";
+import { Search, Loader2, Inbox, ChevronLeft } from "lucide-react";
 import type { WorkflowWithStats } from "./types";
 import { WorkflowLibraryCard } from "./WorkflowLibraryCard";
 
@@ -19,6 +19,7 @@ interface WorkflowLibraryPanelProps {
   categories: string[];
   onAddToQueue: (workflow: WorkflowWithStats) => void;
   queuedIds: Set<string>;
+  onCollapse: () => void;
 }
 
 export function WorkflowLibraryPanel({
@@ -31,12 +32,22 @@ export function WorkflowLibraryPanel({
   categories,
   onAddToQueue,
   queuedIds,
+  onCollapse,
 }: WorkflowLibraryPanelProps) {
   return (
-    <div className="w-1/2 border-r border-white/10 flex flex-col">
+    <div className="w-full border-r border-white/10 flex flex-col">
       {/* Header */}
-      <div className="px-4 py-3 border-b border-white/10">
-        <h2 className="text-h3 text-foreground mb-3">Workflow Library</h2>
+      <div className="px-3 py-3 border-b border-white/10">
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-h3 text-foreground">Workflow Library</h2>
+          <button
+            onClick={onCollapse}
+            className="p-1 rounded-md text-muted-foreground hover:text-foreground hover:bg-white/5 transition-colors"
+            title="Collapse library"
+          >
+            <ChevronLeft className="w-4 h-4" />
+          </button>
+        </div>
 
         {/* Search */}
         <div className="relative mb-3">
