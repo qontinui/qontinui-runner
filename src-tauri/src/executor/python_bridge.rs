@@ -111,7 +111,7 @@ impl PythonBridge {
     ///
     /// This is an async function that must be called from an async context.
     /// For synchronous contexts, use the bridge manager which handles the async call.
-    #[instrument(name = "python.startup", skip(self))]
+    #[instrument(name = "qontinui.python.startup", skip(self))]
     pub async fn start(&mut self) -> Result<(), String> {
         // Check if process is already running
         if self.process.is_some() {
@@ -604,7 +604,7 @@ impl PythonBridge {
     /// The command response result or an error if timeout or send fails
     #[allow(clippy::async_yields_async)]
     #[instrument(
-        name = "python.command",
+        name = "qontinui.python.command",
         skip(self, params, timeout_duration),
         fields(command = %command, timeout_ms = timeout_duration.as_millis() as u64)
     )]

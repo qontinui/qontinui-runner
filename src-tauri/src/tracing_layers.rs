@@ -57,26 +57,15 @@ pub struct SpanLayerConfig {
 
 impl Default for SpanLayerConfig {
     fn default() -> Self {
+        use crate::semantic_conventions::spans;
+
+        let names: Vec<String> = spans::SUMMARY_SPANS.iter().map(|s| s.to_string()).collect();
+
         Self {
             dev_logs_dir: crate::paths::get_dev_logs_dir(),
             enable_jsonl: true,
             enable_sqlite: true,
-            summary_span_names: vec![
-                // Critical path spans
-                "workflow.execute".to_string(),
-                "workflow.phase.setup".to_string(),
-                "workflow.phase.verification".to_string(),
-                "workflow.phase.agentic".to_string(),
-                "workflow.phase.completion".to_string(),
-                "workflow.loop_iteration".to_string(),
-                // Hot path spans
-                "ai.session".to_string(),
-                "verification.phase".to_string(),
-                "agentic.phase".to_string(),
-                // Diagnostic spans
-                "python.startup".to_string(),
-                "python.command".to_string(),
-            ],
+            summary_span_names: names,
         }
     }
 }
@@ -371,7 +360,7 @@ impl SqliteSpanLayer {
         }
     }
 
-    /// Check if a span name should be persisted
+    /// Check if a span name should be persisted.
     fn should_persist(&self, name: &str) -> bool {
         self.config.summary_span_names.iter().any(|n| n == name)
     }
@@ -716,9 +705,9 @@ mod tests {
         let config = SpanLayerConfig::default();
         assert!(config
             .summary_span_names
-            .contains(&"workflow.execute".to_string()));
+            .contains(&"qontinui.workflow".to_string()));
         assert!(config
             .summary_span_names
-            .contains(&"ai.session".to_string()));
+            .contains(&"qontinui.ai.session".to_string()));
     }
 }

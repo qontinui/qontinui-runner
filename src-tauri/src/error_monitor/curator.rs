@@ -839,6 +839,7 @@ mod tests {
             finding_id: None,
             resolved_by_task_run_id: None,
             resolution_notes: None,
+            trace_id: None,
             acknowledged_at: None,
             resolved_at: None,
         }

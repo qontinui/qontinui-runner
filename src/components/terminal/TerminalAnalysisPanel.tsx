@@ -18,7 +18,8 @@ export type AnalysisType =
   | "architecture"
   | "change-impact"
   | "progress"
-  | "cross-tab";
+  | "cross-tab"
+  | "page-architecture";
 
 const ANALYSIS_LABELS: Record<AnalysisType, string> = {
   "session-summary": "Session Summary",
@@ -26,6 +27,7 @@ const ANALYSIS_LABELS: Record<AnalysisType, string> = {
   "change-impact": "Change Impact",
   progress: "Plan Progress",
   "cross-tab": "All Sessions",
+  "page-architecture": "Page Map",
 };
 
 const ANALYSIS_ICONS: Record<AnalysisType, string> = {
@@ -34,6 +36,7 @@ const ANALYSIS_ICONS: Record<AnalysisType, string> = {
   "change-impact": "🔍",
   progress: "📊",
   "cross-tab": "🗂",
+  "page-architecture": "🗺",
 };
 
 interface TerminalAnalysisPanelProps {

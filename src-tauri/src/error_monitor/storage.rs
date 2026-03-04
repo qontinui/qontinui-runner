@@ -349,10 +349,10 @@ impl ErrorEventStorage {
                     message, stack_trace, context_lines, raw_entry,
                     file_path, line_number, column_number, function_name,
                     signature_hash, occurrence_count, first_seen_at, last_seen_at,
-                    status
+                    status, trace_id
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, datetime('now'), ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                    ?13, ?14, ?15, ?16, ?17, 1, datetime('now'), datetime('now'), 'new'
+                    ?13, ?14, ?15, ?16, ?17, 1, datetime('now'), datetime('now'), 'new', ?18
                 )
                 "#,
                 params![
@@ -376,6 +376,7 @@ impl ErrorEventStorage {
                         .as_ref()
                         .and_then(|l| l.function_name.as_ref()),
                     signature_hash,
+                    event.trace_id,
                 ],
             )
             .map_err(|e| format!("Failed to insert error event: {}", e))?;
@@ -394,7 +395,7 @@ impl ErrorEventStorage {
                    e.file_path, e.line_number, e.column_number, e.function_name,
                    e.signature_hash, e.occurrence_count, e.first_seen_at, e.last_seen_at,
                    e.status, e.finding_id, e.resolved_by_task_run_id, e.resolution_notes,
-                   e.acknowledged_at, e.resolved_at, tr.workflow_name
+                   e.acknowledged_at, e.resolved_at, tr.workflow_name, e.trace_id
             FROM error_events e
             LEFT JOIN task_runs tr ON e.task_run_id = tr.id
             WHERE e.id = ?1
@@ -416,7 +417,7 @@ impl ErrorEventStorage {
                    e.file_path, e.line_number, e.column_number, e.function_name,
                    e.signature_hash, e.occurrence_count, e.first_seen_at, e.last_seen_at,
                    e.status, e.finding_id, e.resolved_by_task_run_id, e.resolution_notes,
-                   e.acknowledged_at, e.resolved_at, tr.workflow_name
+                   e.acknowledged_at, e.resolved_at, tr.workflow_name, e.trace_id
             FROM error_events e
             LEFT JOIN task_runs tr ON e.task_run_id = tr.id
             WHERE 1=1
@@ -802,7 +803,7 @@ impl ErrorEventStorage {
                        e.file_path, e.line_number, e.column_number, e.function_name,
                        e.signature_hash, e.occurrence_count, e.first_seen_at, e.last_seen_at,
                        e.status, e.finding_id, e.resolved_by_task_run_id, e.resolution_notes,
-                       e.acknowledged_at, e.resolved_at, tr.workflow_name
+                       e.acknowledged_at, e.resolved_at, tr.workflow_name, e.trace_id
                 FROM error_events e
                 LEFT JOIN task_runs tr ON e.task_run_id = tr.id
                 JOIN error_events_fts fts ON e.id = fts.rowid
@@ -868,6 +869,7 @@ impl ErrorEventStorage {
             finding_id: row.get(23)?,
             resolved_by_task_run_id: row.get(24)?,
             resolution_notes: row.get(25)?,
+            trace_id: row.get(29)?,
             acknowledged_at: row.get(26)?,
             resolved_at: row.get(27)?,
         })

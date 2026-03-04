@@ -7,7 +7,7 @@
 
 import { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from "react";
 import type { TaskActivityInfo } from "../types/dashboard/widget-registry";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 const POLL_INTERVAL_MS = 2000;
 
@@ -190,7 +190,7 @@ export function ActiveRunsProvider({ children }: ActiveRunsProviderProps) {
   const refresh = useCallback(async () => {
     try {
       // Fetch running tasks
-      const tasksResponse = await fetch(`${getApiBase()}/task-runs/running`);
+      const tasksResponse = await tracedFetch(`${getApiBase()}/task-runs/running`);
       let tasks: RunningTaskData[] = [];
       if (tasksResponse.ok) {
         tasks = await tasksResponse.json();
@@ -199,7 +199,7 @@ export function ActiveRunsProvider({ children }: ActiveRunsProviderProps) {
       // Fetch bridges info
       let bridges: BridgeData[] = [];
       try {
-        const bridgesResponse = await fetch(`${getApiBase()}/bridges`);
+        const bridgesResponse = await tracedFetch(`${getApiBase()}/bridges`);
         if (bridgesResponse.ok) {
           const bridgesData = await bridgesResponse.json();
           if (bridgesData.success && Array.isArray(bridgesData.data)) {
@@ -233,7 +233,7 @@ export function ActiveRunsProvider({ children }: ActiveRunsProviderProps) {
       // Fetch GUI lock info
       let guiLockHolder: string | null = null;
       try {
-        const lockResponse = await fetch(`${getApiBase()}/gui-lock`);
+        const lockResponse = await tracedFetch(`${getApiBase()}/gui-lock`);
         if (lockResponse.ok) {
           const lockData = await lockResponse.json();
           if (lockData.success && lockData.data?.holder_id) {

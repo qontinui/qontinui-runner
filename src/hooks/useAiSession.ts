@@ -1,15 +1,14 @@
 /**
- * useChatSession Hook
+ * useAiSession Hook
  *
- * Manages a standalone chat session in the runner via Tauri IPC.
- * Analogous to the web frontend's useChatWebSocket, but using
- * Tauri commands + events instead of WebSocket relay.
+ * Manages a standalone AI session in the runner via Tauri IPC.
+ * Used by ProcessManager's "Fix with AI" feature and similar AI interactions.
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { ChatMessage, ChatSessionState } from "@qontinui/shared-types";
+import type { AiMessage, AiSessionState } from "@qontinui/shared-types";
 import { parseOutputLog } from "@qontinui/workflow-utils";
 
 /** Payload from the "ai-output" Tauri event. */
@@ -33,19 +32,19 @@ interface CommandResponse {
   data?: Record<string, unknown>;
 }
 
-const STORAGE_KEY = "qontinui-chat-active-session";
+const STORAGE_KEY = "qontinui-ai-active-session";
 
-export function useChatSession() {
+export function useAiSession() {
   const [taskRunId, setTaskRunId] = useState<string | null>(null);
-  const [sessionState, setSessionState] = useState<ChatSessionState>("disconnected");
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [sessionState, setSessionState] = useState<AiSessionState>("disconnected");
+  const [messages, setMessages] = useState<AiMessage[]>([]);
   const [streamingContent, setStreamingContent] = useState("");
   const [isGeneratingWorkflow, setIsGeneratingWorkflow] = useState(false);
   const [toolActivity, setToolActivity] = useState<string | null>(null);
 
   const streamingBufferRef = useRef("");
   const taskRunIdRef = useRef<string | null>(null);
-  const sessionStateRef = useRef<ChatSessionState>("disconnected");
+  const sessionStateRef = useRef<AiSessionState>("disconnected");
   const restoredRef = useRef(false);
   const restorePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -74,10 +73,10 @@ export function useChatSession() {
         if (state && state !== "not_found" && state !== "closed") {
           // Session is alive in SessionManager — restore normally
           setTaskRunId(savedId);
-          setSessionState(state as ChatSessionState);
+          setSessionState(state as AiSessionState);
 
           // Load message history from DB
-          invoke<CommandResponse>("get_chat_output", { taskRunId: savedId })
+          invoke<CommandResponse>("get_ai_output", { taskRunId: savedId })
             .then((outputResponse) => {
               if (outputResponse.success && outputResponse.data?.output_log) {
                 const parsed = parseOutputLog(outputResponse.data.output_log as string);
@@ -90,7 +89,7 @@ export function useChatSession() {
 
         // Session not in SessionManager — check if DB has a running chat session
         // (it may be in the process of being resumed after a runner restart)
-        invoke<CommandResponse>("get_chat_output", { taskRunId: savedId })
+        invoke<CommandResponse>("get_ai_output", { taskRunId: savedId })
           .then((outputResponse) => {
             if (
               !outputResponse.success ||
@@ -125,7 +124,7 @@ export function useChatSession() {
                     // Session has been resumed by the backend
                     clearInterval(pollInterval);
                     restorePollRef.current = null;
-                    setSessionState(pollState as ChatSessionState);
+                    setSessionState(pollState as AiSessionState);
                   } else if (pollCount >= maxPolls) {
                     // Timeout — session wasn't resumed, clean up
                     clearInterval(pollInterval);
@@ -243,7 +242,7 @@ export function useChatSession() {
         setToolActivity(null);
       }
 
-      setSessionState(state as ChatSessionState);
+      setSessionState(state as AiSessionState);
     }).then((fn) => {
       if (cancelled) {
         fn();
@@ -283,7 +282,7 @@ export function useChatSession() {
       });
       const state = stateResponse.data?.state as string | undefined;
       if (state && state !== "not_found" && state !== "closed") {
-        setSessionState(state as ChatSessionState);
+        setSessionState(state as AiSessionState);
       } else {
         // No live process — show as stopped/historical
         setSessionState("closed");
@@ -294,7 +293,7 @@ export function useChatSession() {
 
     // Load messages from DB
     try {
-      const outputResponse = await invoke<CommandResponse>("get_chat_output", {
+      const outputResponse = await invoke<CommandResponse>("get_ai_output", {
         taskRunId: newTaskRunId,
       });
       if (outputResponse.success && outputResponse.data?.output_log) {
@@ -302,14 +301,14 @@ export function useChatSession() {
         setMessages(parsed);
       }
     } catch (e) {
-      console.error("[useChatSession] Failed to load session messages:", e);
+      console.error("[useAiSession] Failed to load session messages:", e);
     }
   }, []);
 
   const createSession = useCallback(async (taskName?: string) => {
     try {
-      const response = await invoke<CommandResponse>("create_chat_session", {
-        taskName: taskName || "New Chat",
+      const response = await invoke<CommandResponse>("create_ai_session", {
+        taskName: taskName || "New Session",
       });
 
       if (response.success && response.data) {
@@ -328,7 +327,7 @@ export function useChatSession() {
       }
       return null;
     } catch (e) {
-      console.error("[useChatSession] Failed to create session:", e);
+      console.error("[useAiSession] Failed to create session:", e);
       return null;
     }
   }, []);
@@ -354,10 +353,10 @@ export function useChatSession() {
         });
 
         if (response.data?.state) {
-          setSessionState(response.data.state as ChatSessionState);
+          setSessionState(response.data.state as AiSessionState);
         }
       } catch (e) {
-        console.error("[useChatSession] Failed to send message:", e);
+        console.error("[useAiSession] Failed to send message:", e);
       }
     },
     [taskRunId],
@@ -368,18 +367,18 @@ export function useChatSession() {
     try {
       await invoke<CommandResponse>("interrupt_ai_session", { taskRunId });
     } catch (e) {
-      console.error("[useChatSession] Failed to interrupt:", e);
+      console.error("[useAiSession] Failed to interrupt:", e);
     }
   }, [taskRunId]);
 
   const close = useCallback(async () => {
     if (!taskRunId) return;
     try {
-      await invoke<CommandResponse>("close_chat_session", { taskRunId });
+      await invoke<CommandResponse>("close_ai_session", { taskRunId });
       setSessionState("closed");
       localStorage.removeItem(STORAGE_KEY);
     } catch (e) {
-      console.error("[useChatSession] Failed to close:", e);
+      console.error("[useAiSession] Failed to close:", e);
     }
   }, [taskRunId]);
 
@@ -387,12 +386,12 @@ export function useChatSession() {
     async (name: string) => {
       if (!taskRunId) return;
       try {
-        await invoke<CommandResponse>("rename_chat_session", {
+        await invoke<CommandResponse>("rename_ai_session", {
           taskRunId,
           name,
         });
       } catch (e) {
-        console.error("[useChatSession] Failed to rename:", e);
+        console.error("[useAiSession] Failed to rename:", e);
       }
     },
     [taskRunId],
@@ -401,7 +400,7 @@ export function useChatSession() {
   const getOutput = useCallback(async () => {
     if (!taskRunId) return;
     try {
-      const response = await invoke<CommandResponse>("get_chat_output", {
+      const response = await invoke<CommandResponse>("get_ai_output", {
         taskRunId,
       });
       if (response.success && response.data?.output_log) {
@@ -409,7 +408,7 @@ export function useChatSession() {
         setMessages(parsed);
       }
     } catch (e) {
-      console.error("[useChatSession] Failed to get output:", e);
+      console.error("[useAiSession] Failed to get output:", e);
     }
   }, [taskRunId]);
 
@@ -418,9 +417,9 @@ export function useChatSession() {
       if (!taskRunId) return null;
       setIsGeneratingWorkflow(true);
       try {
-        const response = await invoke<CommandResponse>("generate_workflow_from_chat", {
+        const response = await invoke<CommandResponse>("generate_workflow_from_session", {
           taskRunId,
-          description: "Generate workflow from chat conversation",
+          description: "Generate workflow from session conversation",
           includeUiBridge: includeUIBridge,
           sourceContent: sourceContent ?? null,
         });
@@ -430,7 +429,7 @@ export function useChatSession() {
         }
         return null;
       } catch (e) {
-        console.error("[useChatSession] Failed to generate workflow:", e);
+        console.error("[useAiSession] Failed to generate workflow:", e);
         setIsGeneratingWorkflow(false);
         return null;
       }

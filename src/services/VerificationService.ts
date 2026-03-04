@@ -13,7 +13,7 @@ import type {
   VerificationFailedMarker,
   RunnerRestartMarker,
 } from "../types/verification";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 // Re-export types for convenience
 export type {
@@ -272,7 +272,7 @@ class VerificationService {
     this.emit({ type: "restart_requested" });
 
     try {
-      const response = await fetch(`${getApiBase()}/restart-runner`, {
+      const response = await tracedFetch(`${getApiBase()}/restart-runner`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

@@ -1,17 +1,17 @@
 import { useEffect, useCallback, useRef, useState, createRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { TerminalInstance, type TerminalInstanceHandle } from "./TerminalInstance";
+import { TerminalInstance, type TerminalInstanceHandle, type ShellIntegrationEvent } from "./TerminalInstance";
 import { TerminalTabBar } from "./TerminalTabBar";
 import { TerminalActionBar } from "./TerminalActionBar";
 import { TerminalNotification } from "./TerminalNotification";
 import { TranscriptSessionSidebar } from "./TranscriptSessionSidebar";
 import { TranscriptContentPanel } from "./TranscriptContentPanel";
-import { useTranscriptSessions, type TranscriptMessage } from "./useTranscriptSessions";
+import { useTranscriptSessions, type TranscriptMessage, type TranscriptSession } from "./useTranscriptSessions";
 import { TerminalAnalysisPanel, type AnalysisType } from "./TerminalAnalysisPanel";
 import { useTerminalManager } from "./useTerminalManager";
 import { WorkflowPreviewPanel } from "@qontinui/workflow-ui";
 import type { UnifiedWorkflow, CanvasPanel } from "@qontinui/shared-types";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 interface CommandResponse {
   success: boolean;
@@ -44,6 +44,12 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
     reconnectToExistingSessions,
     markReconnected,
   } = useTerminalManager();
+
+  // Shell integration: structured command history per tab
+  const [commandHistories, setCommandHistories] = useState<
+    Record<string, { command: string; exitCode: number; timestamp: number }[]>
+  >({});
+  const pendingCommandRef = useRef<Record<string, string>>({});
 
   // Diagnostic: detect unexpected unmount/remount cycles that destroy terminal state
   const mountCountRef = useRef(0);
@@ -179,6 +185,72 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
     [updateTab],
   );
 
+  const handleShellIntegration = useCallback(
+    (tabId: string, event: ShellIntegrationEvent) => {
+      // If this tab has a pending resume command, fire it on the first prompt
+      if (event.type === "prompt_start") {
+        const pending = pendingResumeRef.current;
+        if (pending && pending.tabId === tabId) {
+          pendingResumeRef.current = null;
+          // Small defer so the prompt finishes rendering before we write
+          setTimeout(() => {
+            const ref = terminalRefs.current.get(tabId);
+            ref?.current?.writeToTerminal(`claude --resume ${pending.sessionId}\r`);
+          }, 50);
+        }
+      }
+      if (event.type === "cwd") {
+        updateTab(tabId, { workingDir: event.path });
+      } else if (event.type === "command_line") {
+        pendingCommandRef.current[tabId] = event.command;
+      } else if (event.type === "command_done") {
+        const cmd = pendingCommandRef.current[tabId];
+        if (cmd) {
+          delete pendingCommandRef.current[tabId];
+          setCommandHistories((prev) => ({
+            ...prev,
+            [tabId]: [
+              ...(prev[tabId] ?? []).slice(-99),
+              { command: cmd, exitCode: event.exitCode, timestamp: Date.now() },
+            ],
+          }));
+        }
+      }
+    },
+    [updateTab],
+  );
+
+  // ── Resume Claude Code session in terminal ─────────────────────────────────
+
+  // Tracks the tab ID and session ID awaiting the first shell prompt to send the command.
+  const pendingResumeRef = useRef<{ tabId: string; sessionId: string } | null>(null);
+
+  const handleResumeSession = useCallback(
+    async (session: TranscriptSession) => {
+      // Derive a short label from the session ID for the tab title
+      const tabTitle = `claude ${session.session_id.slice(0, 8)}`;
+      const tabId = await createTerminal(tabTitle, session.project_path);
+      if (!tabId) return;
+
+      // Close the transcript panel so the terminal is visible
+      setRightPanelMode(null);
+      setSelectedTranscriptSessionId(null);
+
+      // Queue the resume command — it will be sent once the shell emits its first prompt
+      pendingResumeRef.current = { tabId, sessionId: session.session_id };
+
+      // Fallback: send after 1.5 s regardless (in case shell integration isn't active)
+      setTimeout(() => {
+        const pending = pendingResumeRef.current;
+        if (!pending || pending.tabId !== tabId) return;
+        pendingResumeRef.current = null;
+        const ref = terminalRefs.current.get(tabId);
+        ref?.current?.writeToTerminal(`claude --resume ${pending.sessionId}\r`);
+      }, 1500);
+    },
+    [createTerminal],
+  );
+
   // ── Session selection ──────────────────────────────────────────────────────
 
   const handleSelectTranscriptSession = useCallback(
@@ -238,6 +310,31 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
     }
   }, []);
 
+  // ── Generate from latest session ──────────────────────────────────────────
+
+  const handleGenerateFromLatestSession = useCallback(async () => {
+    try {
+      const result = await invoke<CommandResponse>("transcript_get_latest", {});
+      if (result.success && result.data) {
+        const session = result.data as { session_id: string };
+        // Open sidebar so the user can see the session list
+        setShowSidebar(true);
+        // Load and display the session's messages
+        await handleSelectTranscriptSession(session.session_id);
+      } else {
+        setNotification({
+          message: "No Claude Code sessions found",
+          type: "error",
+        });
+      }
+    } catch (err) {
+      setNotification({
+        message: `Failed to detect session: ${err instanceof Error ? err.message : err}`,
+        type: "error",
+      });
+    }
+  }, [handleSelectTranscriptSession]);
+
   // ── Generation entry points ────────────────────────────────────────────────
 
   const handleGenerateFromTranscript = useCallback(
@@ -247,12 +344,63 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
     [runGeneration],
   );
 
+  const handleGenerateAndRunFromTranscript = useCallback(
+    async (description: string, inlineContext: string) => {
+      lastGenerationParamsRef.current = { description, inlineContext };
+      setIsGenerating(true);
+      setRightPanelMode("workflow");
+      setGeneratedWorkflow(null);
+      setWorkflowError(undefined);
+
+      try {
+        const result = await invoke<CommandResponse>("generate_workflow_standalone", {
+          description,
+          inlineContext,
+        });
+
+        if (result.success && result.data) {
+          const data = result.data as GenerateWorkflowResponse;
+          if (data.workflow) {
+            // Auto-execute immediately — skip the preview panel
+            await tracedFetch(`${getApiBase()}/unified-workflows/execute-inline`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(data.workflow),
+            });
+            setRightPanelMode(null);
+            setNotification({
+              message: `Running: "${data.workflow.name}"`,
+              type: "success",
+            });
+            onNavigateToActive?.();
+          } else {
+            const errMsg = data.error || "Generation returned no workflow";
+            setGeneratedWorkflow(null);
+            setWorkflowError(errMsg);
+            setNotification({ message: errMsg, type: "error" });
+          }
+        } else {
+          const errMsg = result.message || "Workflow generation failed";
+          setWorkflowError(errMsg);
+          setNotification({ message: errMsg, type: "error" });
+        }
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : "Failed to generate workflow";
+        setWorkflowError(errMsg);
+        setNotification({ message: errMsg, type: "error" });
+      } finally {
+        setIsGenerating(false);
+      }
+    },
+    [onNavigateToActive],
+  );
+
   // ── Workflow preview panel handlers ────────────────────────────────────────
 
   const handleExecute = useCallback(async () => {
     if (!generatedWorkflow) return;
     try {
-      await fetch(`${getApiBase()}/unified-workflows/execute-inline`, {
+      await tracedFetch(`${getApiBase()}/unified-workflows/execute-inline`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(generatedWorkflow),
@@ -267,7 +415,7 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
   const handleSaveWorkflow = useCallback(async () => {
     if (!generatedWorkflow) return;
     try {
-      await fetch(`${getApiBase()}/unified-workflows`, {
+      await tracedFetch(`${getApiBase()}/unified-workflows`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(generatedWorkflow),
@@ -281,7 +429,7 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
   const handleEditInBuilder = useCallback(() => {
     if (!generatedWorkflow) return;
     try {
-      localStorage.setItem("qontinui-chat-generated-workflow", JSON.stringify(generatedWorkflow));
+      localStorage.setItem("qontinui-generated-workflow", JSON.stringify(generatedWorkflow));
     } catch {
       // ignore storage errors
     }
@@ -320,7 +468,14 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
       // Collect the right input per analysis type
       let input = "";
       if (type === "session-summary") {
-        input = activeId ? getScrollback(activeId, 500) : "";
+        // Prefer structured command history over raw ANSI-polluted scrollback
+        const history = commandHistories[activeId ?? ""] ?? [];
+        input =
+          history.length > 0
+            ? history.map((e) => `$ ${e.command}  [exit ${e.exitCode}]`).join("\n")
+            : activeId
+              ? getScrollback(activeId, 500)
+              : "";
       } else if (type === "architecture") {
         // Prefer: plan content → terminal selection → scrollback
         if (latestPlanContent.trim().length > 0) {
@@ -348,12 +503,18 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
       } else if (type === "cross-tab") {
         const parts: string[] = [];
         for (const tab of tabs) {
-          const content = getScrollback(tab.id, 200);
+          const history = commandHistories[tab.id] ?? [];
+          const content =
+            history.length > 0
+              ? history.map((e) => `$ ${e.command}  [exit ${e.exitCode}]`).join("\n")
+              : getScrollback(tab.id, 200);
           if (content.trim().length > 0) {
             parts.push(`--- Tab: ${tab.title} ---\n${content}`);
           }
         }
         input = parts.join("\n\n");
+      } else if (type === "page-architecture") {
+        input = "";
       }
 
       const commandMap: Record<AnalysisType, string> = {
@@ -362,10 +523,12 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
         "change-impact": "analyze_change_impact",
         progress: "analyze_plan_progress",
         "cross-tab": "analyze_cross_tab",
+        "page-architecture": "analyze_page_architecture",
       };
 
       try {
-        const result = await invoke<CommandResponse>(commandMap[type], { input });
+        const args = type === "page-architecture" ? {} : { input };
+        const result = await invoke<CommandResponse>(commandMap[type], args);
 
         if (result.success && result.data) {
           const data = result.data as { panels?: CanvasPanel[] };
@@ -379,7 +542,7 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
         setIsAnalyzing(false);
       }
     },
-    [activeId, tabs, getScrollback, getActiveSelection, latestPlanContent],
+    [activeId, tabs, getScrollback, getActiveSelection, latestPlanContent, commandHistories],
   );
 
   // ── Auto-naming from first input ──────────────────────────────────────────
@@ -445,6 +608,7 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
         isGenerating={isGenerating}
         isAnalyzing={isAnalyzing}
         onAnalyze={handleAnalyze}
+        onGenerateFromSession={handleGenerateFromLatestSession}
         planFileName={planFileName}
         isPlanLoading={isPlanLoading}
         onRefreshPlan={loadPlanContent}
@@ -465,6 +629,7 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
             selectedSessionId={selectedTranscriptSessionId}
             onSelectSession={handleSelectTranscriptSession}
             onRefresh={refreshSessions}
+            onResume={handleResumeSession}
           />
         )}
 
@@ -480,6 +645,7 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
               onReconnected={() => markReconnected(tab.id)}
               onExit={(code) => handleExit(tab.id, code)}
               onFirstInput={(input) => handleFirstInput(tab.id, input)}
+              onShellIntegration={(event) => handleShellIntegration(tab.id, event)}
             />
           ))}
           {tabs.length === 0 && (
@@ -499,9 +665,12 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
         {rightPanelMode === "transcript" && selectedTranscriptSessionId && (
           <TranscriptContentPanel
             sessionId={selectedTranscriptSessionId}
+            session={sessions.find((s) => s.session_id === selectedTranscriptSessionId) ?? null}
             messages={transcriptMessages}
             loading={loadingMessages}
             onGenerate={handleGenerateFromTranscript}
+            onGenerateAndRun={handleGenerateAndRunFromTranscript}
+            onResume={handleResumeSession}
             onClose={() => {
               setRightPanelMode(null);
               setSelectedTranscriptSessionId(null);

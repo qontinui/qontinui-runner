@@ -16,6 +16,14 @@ export interface TerminalInstanceHandle {
   getScrollback: (maxLines?: number) => string;
 }
 
+export type ShellIntegrationEvent =
+  | { type: "prompt_start" }
+  | { type: "command_ready" }
+  | { type: "command_execute" }
+  | { type: "command_done"; exitCode: number }
+  | { type: "command_line"; command: string }
+  | { type: "cwd"; path: string };
+
 interface TerminalInstanceProps {
   terminalId: string;
   visible: boolean;
@@ -26,6 +34,8 @@ interface TerminalInstanceProps {
   onExit?: (exitCode: number | null) => void;
   onSelectionChange?: (hasSelection: boolean) => void;
   onFirstInput?: (input: string) => void;
+  /** Called when the shell emits an OSC 633 shell integration event. */
+  onShellIntegration?: (event: ShellIntegrationEvent) => void;
 }
 
 interface ScrollbackBufferResponse {
@@ -59,7 +69,16 @@ const encoder = new TextEncoder();
 
 export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInstanceProps>(
   function TerminalInstanceInner(
-    { terminalId, visible, isReconnecting, onReconnected, onExit, onSelectionChange, onFirstInput },
+    {
+      terminalId,
+      visible,
+      isReconnecting,
+      onReconnected,
+      onExit,
+      onSelectionChange,
+      onFirstInput,
+      onShellIntegration,
+    },
     ref,
   ) {
     const containerRef = useRef<HTMLDivElement>(null);
@@ -76,6 +95,8 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
     onFirstInputRef.current = onFirstInput;
     const onReconnectedRef = useRef(onReconnected);
     onReconnectedRef.current = onReconnected;
+    const onShellIntegrationRef = useRef(onShellIntegration);
+    onShellIntegrationRef.current = onShellIntegration;
     const firstInputReportedRef = useRef(false);
     const inputAccumulatorRef = useRef("");
     // Gate for reconnection: queues live events until scrollback is replayed
@@ -220,6 +241,21 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         onSelectionChangeRef.current?.(term.hasSelection());
       });
 
+      // Handle Ctrl+V paste — Tauri's webview doesn't fire the browser paste
+      // event that xterm.js relies on, so we intercept the key and read the
+      // clipboard manually.
+      term.attachCustomKeyEventHandler((event) => {
+        if (event.type === "keydown" && event.key === "v" && (event.ctrlKey || event.metaKey) && !event.shiftKey) {
+          navigator.clipboard.readText().then((text) => {
+            if (text) {
+              term.paste(text);
+            }
+          }).catch(() => {});
+          return false; // prevent xterm default handling
+        }
+        return true;
+      });
+
       // Forward user input to PTY + track first input line for auto-naming
       const inputDisposable = term.onData((data) => {
         // Track first input line for auto-naming
@@ -359,6 +395,25 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         }
       }, 250);
 
+      // OSC 633 shell integration handler
+      const oscDisposable = term.parser.registerOscHandler(633, (data) => {
+        const cb = onShellIntegrationRef.current;
+        if (!cb) return false;
+        if (data === "A") cb({ type: "prompt_start" });
+        else if (data === "B") cb({ type: "command_ready" });
+        else if (data === "C") cb({ type: "command_execute" });
+        else if (data.startsWith("D")) {
+          const code = parseInt(data.slice(2), 10);
+          cb({ type: "command_done", exitCode: isNaN(code) ? 0 : code });
+        } else if (data.startsWith("E;")) {
+          cb({ type: "command_line", command: data.slice(2).replace(/\\x3b/g, ";") });
+        } else if (data.startsWith("P;Cwd=")) {
+          cb({ type: "cwd", path: data.slice(6) });
+        }
+        // Return false: don't consume — let xterm render normally (sequences are invisible)
+        return false;
+      });
+
       // Cleanup
       return () => {
         clearInterval(ackTimer);
@@ -367,6 +422,7 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         selectionDisposable.dispose();
         inputDisposable.dispose();
         binaryDisposable.dispose();
+        oscDisposable.dispose();
         outputUnsub?.();
         exitUnsub?.();
         term.dispose();

@@ -50,10 +50,20 @@ export function useTerminalManager() {
       const terminals = (result.data as { terminals: TerminalInfo[] }).terminals;
       if (!terminals || terminals.length === 0) return false;
 
-      console.log(`[TerminalManager] Reconnecting to ${terminals.length} existing PTY session(s)`);
+      // Only reconnect to alive sessions; silently close dead ones
+      const dead = terminals.filter((t) => !t.is_alive);
+      const alive = terminals.filter((t) => t.is_alive);
+
+      for (const t of dead) {
+        invoke("terminal_close", { terminalId: t.id }).catch(() => {});
+      }
+
+      if (alive.length === 0) return false;
+
+      console.log(`[TerminalManager] Reconnecting to ${alive.length} existing PTY session(s)`);
 
       // Rebuild tabs from Rust session data (already sorted by created_at)
-      const reconnectedTabs: TerminalTab[] = terminals.map((info) => ({
+      const reconnectedTabs: TerminalTab[] = alive.map((info) => ({
         id: info.id,
         title: info.title,
         pid: info.pid ?? null,
@@ -87,34 +97,38 @@ export function useTerminalManager() {
     setTabs((prev) => prev.map((t) => (t.id === id ? { ...t, isReconnecting: false } : t)));
   }, []);
 
-  const createTerminal = useCallback(async (title?: string): Promise<string | null> => {
-    try {
-      const displayTitle = title ?? `Terminal ${nextTitleNum.current++}`;
-      const result = await invoke<CommandResponse>("terminal_create", {
-        title: displayTitle,
-      });
+  const createTerminal = useCallback(
+    async (title?: string, workingDir?: string): Promise<string | null> => {
+      try {
+        const displayTitle = title ?? `Terminal ${nextTitleNum.current++}`;
+        const result = await invoke<CommandResponse>("terminal_create", {
+          title: displayTitle,
+          workingDir: workingDir ?? null,
+        });
 
-      if (!result.success || !result.data) return null;
+        if (!result.success || !result.data) return null;
 
-      const info = result.data as unknown as TerminalInfo;
-      const tab: TerminalTab = {
-        id: info.id,
-        title: info.title,
-        pid: info.pid ?? null,
-        isAlive: info.is_alive,
-        exitCode: info.exit_code ?? null,
-        workingDir: info.working_dir || undefined,
-        createdAt: info.created_at,
-      };
+        const info = result.data as unknown as TerminalInfo;
+        const tab: TerminalTab = {
+          id: info.id,
+          title: info.title,
+          pid: info.pid ?? null,
+          isAlive: info.is_alive,
+          exitCode: info.exit_code ?? null,
+          workingDir: info.working_dir || undefined,
+          createdAt: info.created_at,
+        };
 
-      setTabs((prev) => [...prev, tab]);
-      setActiveId(info.id);
-      return info.id;
-    } catch (err) {
-      console.error("Failed to create terminal:", err);
-      return null;
-    }
-  }, []);
+        setTabs((prev) => [...prev, tab]);
+        setActiveId(info.id);
+        return info.id;
+      } catch (err) {
+        console.error("Failed to create terminal:", err);
+        return null;
+      }
+    },
+    [],
+  );
 
   const closeTerminal = useCallback(async (id: string) => {
     try {
@@ -139,7 +153,7 @@ export function useTerminalManager() {
   }, []);
 
   const updateTab = useCallback(
-    (id: string, updates: Partial<Pick<TerminalTab, "isAlive" | "exitCode">>) => {
+    (id: string, updates: Partial<Pick<TerminalTab, "isAlive" | "exitCode" | "workingDir">>) => {
       setTabs((prev) => prev.map((t) => (t.id === id ? { ...t, ...updates } : t)));
     },
     [],

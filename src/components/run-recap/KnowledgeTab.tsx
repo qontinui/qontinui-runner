@@ -31,7 +31,7 @@ import {
   RotateCcw,
 } from "lucide-react";
 import type { Finding, FindingSeverity } from "@/types/findings";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 interface KnowledgeTabProps {
   taskRunId: string;
@@ -195,7 +195,7 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
       if (!taskRunId) return;
 
       try {
-        const response = await fetch(`${getApiBase()}/task-runs/${taskRunId}/reflection-fixes`, {
+        const response = await tracedFetch(`${getApiBase()}/task-runs/${taskRunId}/reflection-fixes`, {
           signal: controller.signal,
         });
         if (response.ok) {
@@ -226,7 +226,7 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
   const triggerReflection = async () => {
     setTriggeringReflection(true);
     try {
-      const response = await fetch(`${getApiBase()}/reflection/trigger/${taskRunId}`, {
+      const response = await tracedFetch(`${getApiBase()}/reflection/trigger/${taskRunId}`, {
         method: "POST",
       });
       if (response.ok) {

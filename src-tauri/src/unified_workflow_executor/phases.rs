@@ -1356,7 +1356,7 @@ impl SetupExecutor {
     ///
     /// Step checkpointing is integrated for resume capability.
     #[instrument(
-        name = "workflow.phase.setup",
+        name = "qontinui.workflow.phase.setup",
         skip(self, automation_steps, prompt_steps, logger),
         fields(
             execution_id = %execution_id,
@@ -1910,7 +1910,7 @@ impl VerificationExecutor {
     /// - Each step is checkpointed before (running) and after (success/failed) execution
     /// - On resume, completed steps can be skipped based on checkpoint data
     #[instrument(
-        name = "workflow.phase.verification",
+        name = "qontinui.workflow.phase.verification",
         skip(self, steps, logger),
         fields(
             execution_id = %execution_id,
@@ -2193,7 +2193,7 @@ impl AgenticExecutor {
     /// Progress markers from previous sessions are included in the context
     /// to help the AI understand where to resume long operations.
     #[instrument(
-        name = "workflow.phase.agentic",
+        name = "qontinui.workflow.phase.agentic",
         skip(self, config, failure_context, agentic_steps, logger),
         fields(
             execution_id = %config.execution_id,
@@ -3002,7 +3002,7 @@ impl CompletionExecutor {
     ///
     /// Step checkpointing is integrated for resume capability.
     #[instrument(
-        name = "workflow.phase.completion",
+        name = "qontinui.workflow.phase.completion",
         skip(self, automation_steps, prompt_steps, logger),
         fields(
             execution_id = %execution_id,

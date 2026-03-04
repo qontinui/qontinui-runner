@@ -224,4 +224,8 @@ export const defaultDetectors: Record<ActivityType, (info: TaskActivityInfo) => 
     // Show canvas widget when agent has created canvas panels
     return info.activities.includes("canvas");
   },
+  trace_viewer: (info) => {
+    // Show trace viewer when there's an active task with spans
+    return info.taskId !== null || info.activities.includes("trace_viewer");
+  },
 };

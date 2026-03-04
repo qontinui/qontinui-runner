@@ -7,7 +7,7 @@
  */
 
 import { useState, useEffect, useCallback } from "react";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 interface ApiResponse<T> {
   success: boolean;
@@ -44,7 +44,7 @@ async function apiRequest<T>(method: string, endpoint: string, body?: unknown): 
     options.body = JSON.stringify(body);
   }
 
-  const response = await fetch(`${getApiBase()}${endpoint}`, options);
+  const response = await tracedFetch(`${getApiBase()}${endpoint}`, options);
   const result: ApiResponse<T> = await response.json();
 
   if (!result.success) {

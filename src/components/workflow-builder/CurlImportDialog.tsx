@@ -8,7 +8,7 @@ import { useState } from "react";
 import { Upload, X, Loader2, AlertCircle, Check } from "lucide-react";
 import type { WorkflowPhase, HttpMethod } from "../../types";
 import { getAccentColors, getStatusColors } from "@/design-system";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 // Parsed cURL response from the backend
 interface ParsedCurl {
@@ -57,7 +57,7 @@ export function CurlImportDialog({ isOpen, onClose, onImport, phase }: CurlImpor
     setParsedResult(null);
 
     try {
-      const response = await fetch(`${getApiBase()}/api-request/import-curl`, {
+      const response = await tracedFetch(`${getApiBase()}/api-request/import-curl`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ curl_command: curlCommand }),

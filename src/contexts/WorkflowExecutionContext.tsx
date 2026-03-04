@@ -44,7 +44,7 @@ import {
   type ExecutorEventPayload,
 } from "../hooks/useUnifiedEvents";
 import { useActiveRunsOptional } from "./ActiveRunsContext";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 // =============================================================================
 // API Constants
@@ -752,10 +752,10 @@ export function WorkflowExecutionProvider({ children }: WorkflowExecutionProvide
     try {
       // Fetch full state and workflow state in parallel
       const [fullStateResponse, workflowStateResponse] = await Promise.all([
-        fetch(`${getApiBase()}/task-runs/${taskId}/full-state`, {
+        tracedFetch(`${getApiBase()}/task-runs/${taskId}/full-state`, {
           signal: controller.signal,
         }),
-        fetch(`${getApiBase()}/task-runs/${taskId}/workflow-state`, {
+        tracedFetch(`${getApiBase()}/task-runs/${taskId}/workflow-state`, {
           signal: controller.signal,
         }).catch(() => null), // workflow-state is supplementary; don't fail if unavailable
       ]);

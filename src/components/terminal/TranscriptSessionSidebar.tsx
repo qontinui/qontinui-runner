@@ -1,4 +1,4 @@
-import { RefreshCw } from "lucide-react";
+import { RefreshCw, TerminalSquare } from "lucide-react";
 import type { TranscriptSession } from "./useTranscriptSessions";
 
 interface TranscriptSessionSidebarProps {
@@ -7,6 +7,7 @@ interface TranscriptSessionSidebarProps {
   selectedSessionId: string | null;
   onSelectSession: (sessionId: string) => void;
   onRefresh: () => void;
+  onResume: (session: TranscriptSession) => void;
 }
 
 function formatDate(iso: string): string {
@@ -30,6 +31,7 @@ export function TranscriptSessionSidebar({
   selectedSessionId,
   onSelectSession,
   onRefresh,
+  onResume,
 }: TranscriptSessionSidebarProps) {
   return (
     <div className="w-[280px] h-full flex flex-col border-r border-[#2a2d3d] bg-[#13141f] shrink-0">
@@ -59,11 +61,11 @@ export function TranscriptSessionSidebar({
           sessions.map((session) => {
             const isActive = session.session_id === selectedSessionId;
             return (
-              <button
+              <div
                 key={session.session_id}
-                onClick={() => onSelectSession(session.session_id)}
+                data-ui-bridge-id={`session-${session.session_id}`}
                 className={`
-                  w-full text-left px-3 py-2 border-l-2 transition-colors
+                  group relative border-l-2 transition-colors
                   ${
                     isActive
                       ? "border-l-[#7aa2f7] bg-[#7aa2f7]/5"
@@ -71,28 +73,45 @@ export function TranscriptSessionSidebar({
                   }
                 `}
               >
-                <div className="flex items-center gap-1.5 mb-0.5">
-                  {session.has_plans && (
-                    <span
-                      className="w-1.5 h-1.5 rounded-full bg-[#e0af68] shrink-0"
-                      title="Contains plan content"
-                    />
+                <button
+                  onClick={() => onSelectSession(session.session_id)}
+                  className="w-full text-left px-3 py-2 pr-8"
+                >
+                  <div className="flex items-center gap-1.5 mb-0.5">
+                    {session.has_plans && (
+                      <span
+                        className="w-1.5 h-1.5 rounded-full bg-[#e0af68] shrink-0"
+                        title="Contains plan content"
+                      />
+                    )}
+                    <span className="text-xs text-[#a9b1d6] truncate font-mono">
+                      {session.session_id.slice(0, 12)}...
+                    </span>
+                  </div>
+                  {session.first_message_preview && (
+                    <p className="text-[11px] text-[#565f89] truncate mb-0.5">
+                      &ldquo;{session.first_message_preview}&rdquo;
+                    </p>
                   )}
-                  <span className="text-xs text-[#a9b1d6] truncate font-mono">
-                    {session.session_id.slice(0, 12)}...
-                  </span>
-                </div>
-                {session.first_message_preview && (
-                  <p className="text-[11px] text-[#565f89] truncate mb-0.5">
-                    &ldquo;{session.first_message_preview}&rdquo;
-                  </p>
-                )}
-                <div className="flex items-center gap-1 text-[10px] text-[#414868]">
-                  <span>{formatDate(session.last_modified)}</span>
-                  <span>&middot;</span>
-                  <span>{session.message_count} records</span>
-                </div>
-              </button>
+                  <div className="flex items-center gap-1 text-[10px] text-[#414868]">
+                    <span>{formatDate(session.last_modified)}</span>
+                    <span>&middot;</span>
+                    <span>{session.message_count} records</span>
+                  </div>
+                </button>
+
+                {/* Quick-resume button — visible on hover */}
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onResume(session);
+                  }}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 p-1 rounded opacity-0 group-hover:opacity-100 text-[#565f89] hover:text-[#9ece6a] hover:bg-[#9ece6a]/10 transition-all"
+                  title={`Resume: claude --resume ${session.session_id}`}
+                >
+                  <TerminalSquare className="w-3.5 h-3.5" />
+                </button>
+              </div>
             );
           })
         )}

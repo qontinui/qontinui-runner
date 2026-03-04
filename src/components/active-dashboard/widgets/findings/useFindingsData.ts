@@ -9,7 +9,7 @@ import { useState, useEffect, useCallback, useMemo } from "react";
 import type { Finding, FindingsData, FindingSeverity, FindingStatus } from "./types";
 import { getSeverityColors, getStatusColors } from "@/design-system";
 import { useCurrentTaskRunId } from "@/contexts";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 /** Polling interval for findings data (5 seconds - less frequent than other widgets) */
 const POLL_INTERVAL_MS = 5000;
@@ -134,7 +134,7 @@ export function useFindingsData(): FindingsData {
         ? `${getApiBase()}/findings/summary?task_run_id=${encodeURIComponent(currentTaskRunId)}`
         : `${getApiBase()}/findings/summary`;
 
-      const response = await fetch(url);
+      const response = await tracedFetch(url);
       if (!response.ok) {
         // API not available or error - return empty data
         setFindings([]);

@@ -20,7 +20,7 @@ import {
   AutomationToolkitSidebar,
 } from "./gui-automation";
 import type { SavedMacro } from "../types";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 type LogLevel = "info" | "warning" | "error" | "debug" | "success";
 
@@ -41,7 +41,7 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
   const fetchMacros = useCallback(async () => {
     setMacrosLoading(true);
     try {
-      const macrosRes = await fetch(`${getApiBase()}/macros`).catch(() => ({ ok: false }));
+      const macrosRes = await tracedFetch(`${getApiBase()}/macros`).catch(() => ({ ok: false }));
       const macrosData = macrosRes.ok ? await (macrosRes as Response).json() : { success: false };
 
       // Sort by modified_at descending (most recent first)
@@ -67,7 +67,7 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
   const runMacro = async (macro: SavedMacro) => {
     setRunningMacroId(macro.id);
     try {
-      const response = await fetch(`${getApiBase()}/macros/${macro.id}/run`, {
+      const response = await tracedFetch(`${getApiBase()}/macros/${macro.id}/run`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({}),

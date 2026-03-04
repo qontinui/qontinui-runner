@@ -65,6 +65,7 @@ pub mod testing;
 pub mod triggers;
 pub mod types;
 pub mod ui_bridge;
+pub mod ui_bridge_integration;
 pub mod unified_workflows;
 pub mod verification_tests;
 pub mod web_backend_workflows;

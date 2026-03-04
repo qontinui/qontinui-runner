@@ -26,7 +26,7 @@ import {
   generateFingerprints,
   extractFingerprintHashes,
 } from "../lib/ui-bridge/fingerprintGenerator";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 // =============================================================================
 // Types
@@ -263,7 +263,7 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
       setError(null);
 
       try {
-        const resp = await fetch(`${getApiBase()}/ui-bridge/sdk/connect`, {
+        const resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/connect`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -314,7 +314,7 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
 
   const disconnect = useCallback(async (url?: string) => {
     try {
-      await fetch(`${getApiBase()}/ui-bridge/sdk/disconnect`, {
+      await tracedFetch(`${getApiBase()}/ui-bridge/sdk/disconnect`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url: url ?? null }),
@@ -351,7 +351,7 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
 
     // Check if other connections remain and sync state
     try {
-      const statusResp = await fetch(`${getApiBase()}/ui-bridge/sdk/status`);
+      const statusResp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/status`);
       const statusJson = await statusResp.json();
       if (statusJson.success && statusJson.data) {
         const data = statusJson.data;
@@ -378,7 +378,7 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
 
   const switchConnection = useCallback(async (url: string): Promise<boolean> => {
     try {
-      const resp = await fetch(`${getApiBase()}/ui-bridge/sdk/switch`, {
+      const resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/switch`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url }),
@@ -423,7 +423,7 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
   const fetchElements = useCallback(async () => {
     setIsLoadingElements(true);
     try {
-      const resp = await fetch(`${getApiBase()}/ui-bridge/sdk/elements`);
+      const resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/elements`);
       const json = await resp.json();
 
       if (json.success === false) {
@@ -505,7 +505,7 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
       const targetFingerprint = elements.find((e) => e.id === elementId)?.fingerprint?.hash || null;
 
       try {
-        const resp = await fetch(
+        const resp = await tracedFetch(
           `${getApiBase()}/ui-bridge/sdk/element/${encodeURIComponent(elementId)}/action`,
           {
             method: "POST",
@@ -659,7 +659,7 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
             break;
         }
 
-        const resp = await fetch(url, {
+        const resp = await tracedFetch(url, {
           method,
           headers: method === "POST" ? { "Content-Type": "application/json" } : undefined,
           body: body ? JSON.stringify(body) : undefined,
@@ -723,7 +723,7 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
 
   const refreshSnapshot = useCallback(async () => {
     try {
-      const resp = await fetch(`${getApiBase()}/ui-bridge/sdk/snapshot`);
+      const resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/snapshot`);
       const json = await resp.json();
       if (json.success !== false) {
         setSnapshot(json.data || json);
@@ -739,7 +739,7 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
 
   const refreshComponents = useCallback(async () => {
     try {
-      const resp = await fetch(`${getApiBase()}/ui-bridge/sdk/components`);
+      const resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/components`);
       const json = await resp.json();
       if (json.success !== false) {
         setComponents(json.data?.components || json.components || json.data || []);
@@ -755,7 +755,7 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
 
   const aiSearch = useCallback(async (query: string): Promise<unknown> => {
     try {
-      const resp = await fetch(`${getApiBase()}/ui-bridge/sdk/ai/search`, {
+      const resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/ai/search`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query }),
@@ -768,7 +768,7 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
 
   const aiExecute = useCallback(async (instruction: string): Promise<unknown> => {
     try {
-      const resp = await fetch(`${getApiBase()}/ui-bridge/sdk/ai/execute`, {
+      const resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/ai/execute`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ instruction }),
@@ -793,7 +793,7 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
       const queryString = params.toString();
       const url = `${getApiBase()}/ui-bridge/sdk/screenshot${queryString ? `?${queryString}` : ""}`;
 
-      const resp = await fetch(url);
+      const resp = await tracedFetch(url);
       const json = await resp.json();
 
       if (json.success && json.data) {
@@ -824,7 +824,7 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
 
   const highlightElement = useCallback(async (elementId: string) => {
     try {
-      await fetch(
+      await tracedFetch(
         `${getApiBase()}/ui-bridge/sdk/debug/highlight/${encodeURIComponent(elementId)}`,
         {
           method: "POST",
@@ -1103,7 +1103,7 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
       // from the fetch response directly. Let's create a helper.
       const fetchLatestElements = async (): Promise<ExternalElement[]> => {
         try {
-          const resp = await fetch(`${getApiBase()}/ui-bridge/sdk/elements`);
+          const resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/elements`);
           const json = await resp.json();
 
           if (json.success === false) return [];
@@ -1151,7 +1151,7 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
         const beforeCaptureId = session?.lastCaptureId || null;
 
         try {
-          await fetch(
+          await tracedFetch(
             `${getApiBase()}/ui-bridge/sdk/element/${encodeURIComponent(elementId)}/action`,
             {
               method: "POST",
@@ -1394,7 +1394,7 @@ export function useSdkUIBridge(): UseSdkUIBridgeReturn {
 
     const interval = setInterval(async () => {
       try {
-        const resp = await fetch(`${getApiBase()}/ui-bridge/sdk/check-health`);
+        const resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/check-health`);
         const json = await resp.json();
 
         if (!json.success || !json.data) return;

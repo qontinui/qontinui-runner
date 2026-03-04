@@ -52,6 +52,7 @@ mod mcp;
 mod mcp_api;
 mod mcp_client;
 mod mcp_embedded;
+mod middleware;
 mod orchestrator;
 mod paths;
 mod playwright;
@@ -68,6 +69,7 @@ mod saved_api_requests;
 mod scheduler;
 mod scheduler_service;
 mod secure_storage;
+mod semantic_conventions;
 mod settings;
 mod skills;
 mod state_explorer;
@@ -317,20 +319,20 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .manage(shared_app_state)
         .manage(rag_state)
         .manage(instance_manager) // For multi-instance management (dev feature)
-        .manage(session_manager) // For interactive AI chat commands
+        .manage(session_manager) // For interactive AI session commands
         .manage(terminal_manager) // For embedded PTY terminal sessions
         .manage(checkpoint_db.clone()) // For error_monitor commands that need direct db access
         .invoke_handler(tauri::generate_handler![
-            // Interactive AI chat commands (send messages, interrupt, query state)
-            commands::ai_chat::list_chat_sessions,
-            commands::ai_chat::send_user_message,
-            commands::ai_chat::interrupt_ai_session,
-            commands::ai_chat::get_ai_session_state,
-            commands::ai_chat::create_chat_session,
-            commands::ai_chat::close_chat_session,
-            commands::ai_chat::rename_chat_session,
-            commands::ai_chat::get_chat_output,
-            commands::ai_chat::generate_workflow_from_chat,
+            // Interactive AI session commands (send messages, interrupt, query state)
+            commands::ai_session::list_ai_sessions,
+            commands::ai_session::send_user_message,
+            commands::ai_session::interrupt_ai_session,
+            commands::ai_session::get_ai_session_state,
+            commands::ai_session::create_ai_session,
+            commands::ai_session::close_ai_session,
+            commands::ai_session::rename_ai_session,
+            commands::ai_session::get_ai_output,
+            commands::ai_session::generate_workflow_from_session,
             // Authentication commands
             commands::auth::login,
             commands::auth::logout,
@@ -355,6 +357,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::config::get_include_summary_step_by_default,
             commands::config::save_include_summary_step_by_default,
             commands::config::get_workspace_paths,
+            commands::config::get_claude_config_dirs,
+            commands::config::save_claude_config_dirs,
             // Dataset commands
             commands::dataset::scan_local_images,
             commands::dataset::package_dataset,
@@ -858,6 +862,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::setup_wizard::save_log_sources_from_setup,
             commands::setup_wizard::save_ai_provider_from_setup,
             commands::setup_wizard::suggest_process_configs_for_setup,
+            commands::setup_wizard::discover_claude_config_dirs,
             // Test Orchestrator commands (AI-driven multi-step API test creation)
             commands::test_orchestrator::plan_test_orchestration,
             commands::test_orchestrator::execute_test_orchestration,
@@ -951,6 +956,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal_analysis::analyze_change_impact,
             commands::terminal_analysis::analyze_plan_progress,
             commands::terminal_analysis::analyze_cross_tab,
+            commands::terminal_analysis::analyze_page_architecture,
             commands::terminal_analysis::get_latest_plan_content,
         ])
         .setup(|app| {

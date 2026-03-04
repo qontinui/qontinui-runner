@@ -1,4 +1,4 @@
-import { PanelLeft, FileText, RefreshCw } from "lucide-react";
+import { PanelLeft, FileText, RefreshCw, Wand2 } from "lucide-react";
 import type { AnalysisType } from "./TerminalAnalysisPanel";
 
 interface TerminalActionBarProps {
@@ -7,6 +7,7 @@ interface TerminalActionBarProps {
   isGenerating: boolean;
   isAnalyzing: boolean;
   onAnalyze: (type: AnalysisType) => void;
+  onGenerateFromSession: () => void;
   /** Filename of the loaded plan, or null if none detected. */
   planFileName: string | null;
   /** True while the plan is being loaded from disk. */
@@ -29,6 +30,11 @@ const ANALYSIS_BUTTONS: { type: AnalysisType; label: string; title: string }[] =
   },
   { type: "progress", label: "Plan Progress", title: "Assess progress against current plan" },
   { type: "cross-tab", label: "All Sessions", title: "Summarize all open terminal sessions" },
+  {
+    type: "page-architecture",
+    label: "Page Map",
+    title: "Architecture diagram of Terminal page components",
+  },
 ];
 
 export function TerminalActionBar({
@@ -37,6 +43,7 @@ export function TerminalActionBar({
   isGenerating,
   isAnalyzing,
   onAnalyze,
+  onGenerateFromSession,
   planFileName,
   isPlanLoading,
   onRefreshPlan,
@@ -61,6 +68,22 @@ export function TerminalActionBar({
         >
           {showSidebar ? <PanelLeft className="w-3 h-3" /> : <FileText className="w-3 h-3" />}
           {showSidebar ? "Hide Sessions" : "Browse Sessions"}
+        </button>
+
+        <div className="w-px h-4 bg-[#2a2d3d]" />
+
+        <button
+          onClick={onGenerateFromSession}
+          disabled={busy}
+          title="Generate workflow from latest Claude Code session"
+          data-ui-id="terminal-action-bar-generate-workflow-btn"
+          className={`
+            flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-medium transition-colors
+            ${busy ? "text-[#414868] cursor-not-allowed" : "text-[#bb9af7] hover:bg-[#bb9af7]/10 hover:text-[#c8abff]"}
+          `}
+        >
+          <Wand2 className="w-3 h-3" />
+          Generate Workflow
         </button>
 
         {isGenerating && (

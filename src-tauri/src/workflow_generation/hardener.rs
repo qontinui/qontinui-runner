@@ -133,6 +133,14 @@ impl AppContext {
             .chain(workflow.verification_steps.iter())
             .chain(workflow.agentic_steps.iter())
             .chain(workflow.completion_steps.iter())
+            .chain(workflow.stages.iter().flat_map(|stage| {
+                stage
+                    .setup_steps
+                    .iter()
+                    .chain(stage.verification_steps.iter())
+                    .chain(stage.agentic_steps.iter())
+                    .chain(stage.completion_steps.iter())
+            }))
             .collect();
 
         for step in &all_steps {
@@ -230,6 +238,37 @@ pub fn should_harden_verification(workflow: &UnifiedWorkflow) -> bool {
         return true;
     }
 
+    // Check stage verification steps for hardenable candidates
+    let has_hardenable_stage_steps = workflow.stages.iter().any(|stage| {
+        stage.verification_steps.iter().any(|step| {
+            let step_type = step.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let mode = step.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+
+            match step_type {
+                "prompt" => true,
+                "command" if mode == "test" || step.get("test_type").is_some() => {
+                    if !has_sdk_connect {
+                        return false;
+                    }
+                    let test_type = step.get("test_type").and_then(|v| v.as_str()).unwrap_or("");
+                    test_type == "playwright" || is_ui_verification_test(step)
+                }
+                "command" if mode == "shell" && has_sdk_connect => {
+                    let cmd = step.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                    if !cmd.contains("ui-bridge/sdk") {
+                        return false;
+                    }
+                    !cmd.contains("grep") && !cmd.contains("jq")
+                }
+                _ => false,
+            }
+        })
+    });
+
+    if has_hardenable_stage_steps {
+        return true;
+    }
+
     // Check for agentic-verification coverage gaps:
     // If there are more agentic steps than deterministic verification steps,
     // there's likely a gap where some agentic work has no verification coverage
@@ -246,6 +285,24 @@ pub fn should_harden_verification(workflow: &UnifiedWorkflow) -> bool {
         // Heuristic: each agentic step should have at least one dedicated check
         if workflow.agentic_steps.len() > deterministic_verification_count {
             return true;
+        }
+    }
+
+    // Check for agentic-verification coverage gaps within stages
+    for stage in &workflow.stages {
+        if !stage.agentic_steps.is_empty() {
+            let deterministic_count = stage
+                .verification_steps
+                .iter()
+                .filter(|s| {
+                    let t = s.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    t != "prompt"
+                })
+                .count();
+
+            if stage.agentic_steps.len() > deterministic_count {
+                return true;
+            }
         }
     }
 
@@ -282,6 +339,7 @@ fn is_ui_verification_test(step: &Value) -> bool {
 /// tests with SDK checks when the SDK is available, and upgrades weak assertions.
 ///
 /// Non-fatal: returns the original workflow on any error.
+/// Returns `(workflow, summary, hardener_prompt)`.
 pub fn run_hardener_agent(
     workflow: &UnifiedWorkflow,
     description: &str,
@@ -290,7 +348,8 @@ pub fn run_hardener_agent(
     model_override: Option<&str>,
     provider_override: Option<&str>,
     skill_registry: &SkillRegistry,
-) -> (UnifiedWorkflow, Option<HardeningSummary>) {
+    insights_section: Option<&str>,
+) -> (UnifiedWorkflow, Option<HardeningSummary>, Option<String>) {
     // Step 0: Apply deterministic fixups before AI hardening
     let mut workflow = fix_sdk_urls(workflow);
 
@@ -299,6 +358,12 @@ pub fn run_hardener_agent(
     sanitize_total += sanitize_commands_in_steps(&mut workflow.setup_steps);
     sanitize_total += sanitize_commands_in_steps(&mut workflow.verification_steps);
     sanitize_total += sanitize_commands_in_steps(&mut workflow.completion_steps);
+    // Sanitize stage steps
+    for stage in workflow.stages.iter_mut() {
+        sanitize_total += sanitize_commands_in_steps(&mut stage.setup_steps);
+        sanitize_total += sanitize_commands_in_steps(&mut stage.verification_steps);
+        sanitize_total += sanitize_commands_in_steps(&mut stage.completion_steps);
+    }
     if sanitize_total > 0 {
         info!(
             "Command sanitizer: fixed {} steps with Python escaping issues",
@@ -308,7 +373,7 @@ pub fn run_hardener_agent(
 
     if !should_harden_verification(&workflow) {
         debug!("No hardenable verification steps found, skipping");
-        return (workflow, None);
+        return (workflow, None, None);
     }
 
     let candidate_count = count_candidates(&workflow);
@@ -322,7 +387,7 @@ pub fn run_hardener_agent(
         Ok(j) => j,
         Err(e) => {
             warn!("Failed to serialize workflow for hardening: {}", e);
-            return (workflow, None);
+            return (workflow, None, None);
         }
     };
 
@@ -332,6 +397,7 @@ pub fn run_hardener_agent(
         &app_context,
         conn,
         skill_registry,
+        insights_section,
     );
     let task_context = TaskContext::from_prompt(&prompt);
     let ai_result: AiResponse = crate::ai_provider::run_prompt_with_model_override(
@@ -351,7 +417,7 @@ pub fn run_hardener_agent(
             "Hardener agent failed: {}",
             ai_result.error.as_deref().unwrap_or("unknown")
         );
-        return (workflow, None);
+        return (workflow, None, Some(prompt));
     }
 
     // Parse the response
@@ -360,21 +426,26 @@ pub fn run_hardener_agent(
         Ok(w) => w,
         Err(e) => {
             warn!("Hardener produced invalid JSON: {}", e);
-            return (workflow, None);
+            return (workflow, None, Some(prompt));
         }
     };
 
     // Safety checks
     if let Some(error) = validate_hardened_output(&workflow, &hardened) {
         warn!("Hardener safety check failed: {}", error);
-        return (workflow, None);
+        return (workflow, None, Some(prompt));
     }
 
     // Post-hardener sanitize: the AI may re-introduce jq commands or other
     // platform-incompatible patterns in its output. Re-apply sanitization.
-    let post_sanitize = sanitize_commands_in_steps(&mut hardened.setup_steps)
+    let mut post_sanitize = sanitize_commands_in_steps(&mut hardened.setup_steps)
         + sanitize_commands_in_steps(&mut hardened.verification_steps)
         + sanitize_commands_in_steps(&mut hardened.completion_steps);
+    for stage in hardened.stages.iter_mut() {
+        post_sanitize += sanitize_commands_in_steps(&mut stage.setup_steps);
+        post_sanitize += sanitize_commands_in_steps(&mut stage.verification_steps);
+        post_sanitize += sanitize_commands_in_steps(&mut stage.completion_steps);
+    }
     if post_sanitize > 0 {
         info!(
             "Post-hardener sanitize: fixed {} steps with jq/escaping issues in AI output",
@@ -394,7 +465,7 @@ pub fn run_hardener_agent(
         summary.converted_count, summary.kept_as_prompt_count
     );
 
-    (hardened, Some(summary))
+    (hardened, Some(summary), Some(prompt))
 }
 
 /// Deterministic fixup: replace `/ui-bridge/control/` with `/ui-bridge/sdk/` in command steps
@@ -474,8 +545,18 @@ fn fix_sdk_urls(workflow: &UnifiedWorkflow) -> UnifiedWorkflow {
     fixup_count += fix_steps(&mut fixed.verification_steps);
     fixup_count += fix_steps(&mut fixed.completion_steps);
 
+    // Fix SDK URLs in stage steps
+    for stage in fixed.stages.iter_mut() {
+        fixup_count += fix_steps(&mut stage.setup_steps);
+        fixup_count += fix_steps(&mut stage.verification_steps);
+        fixup_count += fix_steps(&mut stage.completion_steps);
+    }
+
     // Add retry parameters to SDK verification steps after navigation
-    let retry_count = inject_retries_after_navigation(&mut fixed.verification_steps);
+    let mut retry_count = inject_retries_after_navigation(&mut fixed.verification_steps);
+    for stage in fixed.stages.iter_mut() {
+        retry_count += inject_retries_after_navigation(&mut stage.verification_steps);
+    }
     if retry_count > 0 {
         info!(
             "SDK URL fixup: added retries to {} verification steps after navigation",
@@ -853,26 +934,35 @@ fn count_candidates(workflow: &UnifiedWorkflow) -> usize {
         json.contains("ui-bridge/sdk/connect")
     };
 
-    workflow
+    let is_candidate = |step: &&Value| -> bool {
+        let t = step.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let mode = step.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+        match t {
+            "prompt" => true,
+            "command" if (mode == "test" || step.get("test_type").is_some()) && has_sdk => {
+                let tt = step.get("test_type").and_then(|v| v.as_str()).unwrap_or("");
+                tt == "playwright" || is_ui_verification_test(step)
+            }
+            "command" if mode == "shell" && has_sdk => {
+                let cmd = step.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                cmd.contains("ui-bridge/sdk") && !cmd.contains("grep") && !cmd.contains("jq")
+            }
+            _ => false,
+        }
+    };
+
+    let top_level = workflow
         .verification_steps
         .iter()
-        .filter(|step| {
-            let t = step.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            let mode = step.get("mode").and_then(|v| v.as_str()).unwrap_or("");
-            match t {
-                "prompt" => true,
-                "command" if (mode == "test" || step.get("test_type").is_some()) && has_sdk => {
-                    let tt = step.get("test_type").and_then(|v| v.as_str()).unwrap_or("");
-                    tt == "playwright" || is_ui_verification_test(step)
-                }
-                "command" if mode == "shell" && has_sdk => {
-                    let cmd = step.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                    cmd.contains("ui-bridge/sdk") && !cmd.contains("grep") && !cmd.contains("jq")
-                }
-                _ => false,
-            }
-        })
-        .count()
+        .filter(is_candidate)
+        .count();
+    let stage_level: usize = workflow
+        .stages
+        .iter()
+        .map(|stage| stage.verification_steps.iter().filter(is_candidate).count())
+        .sum();
+
+    top_level + stage_level
 }
 
 // ============================================================================
@@ -885,6 +975,7 @@ fn build_hardener_prompt(
     app_context: &AppContext,
     conn: Option<&Connection>,
     skill_registry: &SkillRegistry,
+    insights_section: Option<&str>,
 ) -> String {
     let mut prompt = format!(
         r#"You are a verification hardener agent for Qontinui Runner.
@@ -1136,16 +1227,17 @@ verify that the tab has spatial visualization content. Add content-specific chec
 
 1. **Only modify verification_steps**: Do NOT change setup_steps, agentic_steps, or completion_steps
 2. **Preserve step IDs**: Every step must keep its original `id` field (unless splitting a step, in which case keep the original ID on one and generate new UUIDs for additions)
-3. **Preserve step order**: Steps must remain in the same relative position
-4. **Adding steps is allowed**: If a Playwright test step checks multiple things, you MAY replace it with multiple `command` or `ui_bridge` steps. You MAY also add NEW verification steps to cover uncovered agentic goals. Keep original `id`s on existing steps and generate new UUIDs for additions.
-5. **Keep subjective prompts**: If a prompt step is genuinely subjective (e.g., "Is the UX intuitive?"), keep it as `prompt`
-6. **Complete required fields**: Every converted step must have all required fields for its new type
-7. **Only 3 step types**: All steps must use `command`, `ui_bridge`, or `prompt`. Do NOT output `api_request`, `check`, `test`, `gate`, or `spec` types.
-8. **Command with check_type fields**: For check conversions, include `mode: "check"`, `check_type`, `command`, and `working_directory` on the `command` step
-9. **Do not convert existing command+check_type steps**: Do NOT convert `command` steps that already have `check_type` set (lint, typecheck, etc.) — they are already deterministic
-10. **SDK verification uses command+curl**: Use `command` steps with `mode: "shell"` and curl piped to grep for SDK-based verification, not `api_request`
-11. **Always set mode on command steps**: Every `command` step must include a `mode` field (`shell`, `check`, `check_group`, or `test`) matching the fields present
-12. **No bash negation prefix**: NEVER use `!` as a command prefix to invert exit codes (e.g., `! grep -qE 'pattern' file`). The `!` operator is bash-specific and may not be detected by the shell router on Windows. Instead, use: `grep -qE 'pattern' file && exit 1 || exit 0`"#);
+3. **Preserve criterion_id**: If a verification step has a `criterion_id` field, keep it on the converted step (or on the primary replacement step if splitting). Do NOT modify, replace, or remove `criterion_id` values — they link verification steps to acceptance criteria.
+4. **Preserve step order**: Steps must remain in the same relative position
+5. **Adding steps is allowed**: If a Playwright test step checks multiple things, you MAY replace it with multiple `command` or `ui_bridge` steps. You MAY also add NEW verification steps to cover uncovered agentic goals. Keep original `id`s on existing steps and generate new UUIDs for additions.
+6. **Keep subjective prompts**: If a prompt step is genuinely subjective (e.g., "Is the UX intuitive?"), keep it as `prompt`
+7. **Complete required fields**: Every converted step must have all required fields for its new type
+8. **Only 3 step types**: All steps must use `command`, `ui_bridge`, or `prompt`. Do NOT output `api_request`, `check`, `test`, `gate`, or `spec` types.
+9. **Command with check_type fields**: For check conversions, include `mode: "check"`, `check_type`, `command`, and `working_directory` on the `command` step
+10. **Do not convert existing command+check_type steps**: Do NOT convert `command` steps that already have `check_type` set (lint, typecheck, etc.) — they are already deterministic
+11. **SDK verification uses command+curl**: Use `command` steps with `mode: "shell"` and curl piped to grep for SDK-based verification, not `api_request`
+12. **Always set mode on command steps**: Every `command` step must include a `mode` field (`shell`, `check`, `check_group`, or `test`) matching the fields present
+13. **No bash negation prefix**: NEVER use `!` as a command prefix to invert exit codes (e.g., `! grep -qE 'pattern' file`). The `!` operator is bash-specific and may not be detected by the shell router on Windows. Instead, use: `grep -qE 'pattern' file && exit 1 || exit 0`"#);
     }
 
     // Include skill catalog context so the hardener can match steps to known skills
@@ -1155,6 +1247,13 @@ verify that the tab has spatial visualization content. Add content-specific chec
             "\n\n{}\nWhen hardening steps, prefer configurations that align with these known skill templates. If a verification step matches a skill's purpose, use the equivalent deterministic configuration from the skill catalog.\n",
             skills_section
         ));
+    }
+
+    if let Some(insights) = insights_section {
+        if !insights.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(insights);
+        }
     }
 
     prompt.push_str(&format!(
@@ -1224,6 +1323,64 @@ fn validate_hardened_output(
         return Some("completion_steps were modified".to_string());
     }
 
+    // Validate stage count is preserved
+    if original.stages.len() != hardened.stages.len() {
+        return Some(format!(
+            "Stage count changed: {} -> {}",
+            original.stages.len(),
+            hardened.stages.len()
+        ));
+    }
+
+    // Validate per-stage invariants
+    for (idx, (orig_stage, hard_stage)) in original
+        .stages
+        .iter()
+        .zip(hardened.stages.iter())
+        .enumerate()
+    {
+        // Stage verification step count may increase but not decrease
+        if hard_stage.verification_steps.len() < orig_stage.verification_steps.len() {
+            return Some(format!(
+                "stages[{}] verification step count decreased: {} -> {}",
+                idx,
+                orig_stage.verification_steps.len(),
+                hard_stage.verification_steps.len()
+            ));
+        }
+
+        // All original stage verification step IDs must be present
+        for orig_step in &orig_stage.verification_steps {
+            let orig_id = orig_step.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            if orig_id.is_empty() {
+                continue;
+            }
+            let found = hard_stage.verification_steps.iter().any(|h| {
+                h.get("id")
+                    .and_then(|v| v.as_str())
+                    .map(|id| id == orig_id)
+                    .unwrap_or(false)
+            });
+            if !found {
+                return Some(format!(
+                    "stages[{}]: original step ID '{}' is missing from hardened output",
+                    idx, orig_id
+                ));
+            }
+        }
+
+        // Non-verification phases within stages must be unchanged
+        if orig_stage.setup_steps != hard_stage.setup_steps {
+            return Some(format!("stages[{}].setup_steps were modified", idx));
+        }
+        if orig_stage.agentic_steps != hard_stage.agentic_steps {
+            return Some(format!("stages[{}].agentic_steps were modified", idx));
+        }
+        if orig_stage.completion_steps != hard_stage.completion_steps {
+            return Some(format!("stages[{}].completion_steps were modified", idx));
+        }
+    }
+
     None
 }
 
@@ -1237,9 +1394,16 @@ fn build_summary(original: &UnifiedWorkflow, hardened: &UnifiedWorkflow) -> Hard
     let mut kept_as_prompt_count = 0;
 
     // Build a map of original step IDs to their types/modes/names for comparison
+    // Include both top-level and stage verification steps
     let orig_map: std::collections::HashMap<&str, (&str, &str, &str)> = original
         .verification_steps
         .iter()
+        .chain(
+            original
+                .stages
+                .iter()
+                .flat_map(|s| s.verification_steps.iter()),
+        )
         .filter_map(|s| {
             let id = s.get("id").and_then(|v| v.as_str())?;
             let t = s.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
@@ -1249,8 +1413,20 @@ fn build_summary(original: &UnifiedWorkflow, hardened: &UnifiedWorkflow) -> Hard
         })
         .collect();
 
-    // Check each hardened step against the original
-    for hard_step in &hardened.verification_steps {
+    // Check each hardened verification step against the original
+    // Include both top-level and stage verification steps
+    let all_hardened_verification: Vec<&Value> = hardened
+        .verification_steps
+        .iter()
+        .chain(
+            hardened
+                .stages
+                .iter()
+                .flat_map(|s| s.verification_steps.iter()),
+        )
+        .collect();
+
+    for hard_step in &all_hardened_verification {
         let hard_id = hard_step.get("id").and_then(|v| v.as_str()).unwrap_or("");
         let hard_type = hard_step
             .get("type")
@@ -1644,7 +1820,7 @@ mod tests {
             json!({"id": "s1", "type": "prompt", "content": "Check page"}),
         ]);
         let ctx = AppContext::from_workflow(&workflow, "test");
-        let prompt = build_hardener_prompt("{}", "test", &ctx, None, &SkillRegistry::new());
+        let prompt = build_hardener_prompt("{}", "test", &ctx, None, &SkillRegistry::new(), None);
         assert!(prompt.contains("Rule 4"));
         assert!(prompt.contains("page navigation"));
     }
@@ -1655,7 +1831,7 @@ mod tests {
             json!({"id": "s1", "type": "command", "command": "curl -s http://localhost:9876/ui-bridge/sdk/ai/search", "mode": "shell"}),
         ]);
         let ctx = AppContext::from_workflow(&workflow, "test");
-        let prompt = build_hardener_prompt("{}", "test", &ctx, None, &SkillRegistry::new());
+        let prompt = build_hardener_prompt("{}", "test", &ctx, None, &SkillRegistry::new(), None);
         assert!(prompt.contains("ai/search"));
         assert!(prompt.contains("total"));
         assert!(prompt.contains("grep"));
@@ -1699,7 +1875,7 @@ mod tests {
         workflow.agentic_steps =
             vec![json!({"id": "a1", "type": "prompt", "content": "Implement thumbnails"})];
         let ctx = AppContext::from_workflow(&workflow, "test");
-        let prompt = build_hardener_prompt("{}", "test", &ctx, None, &SkillRegistry::new());
+        let prompt = build_hardener_prompt("{}", "test", &ctx, None, &SkillRegistry::new(), None);
         assert!(prompt.contains("Rule 5"));
         assert!(prompt.contains("agentic step"));
         assert!(prompt.contains("verification coverage"));

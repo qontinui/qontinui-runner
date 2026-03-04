@@ -130,17 +130,17 @@ export function AiProviderStep({ onComplete, onBack }: AiProviderStepProps) {
         </button>
         <div className="flex gap-2">
           <button className="btn-secondary" onClick={handleSkip} data-ui-id="setup-wizard-skip-ai">
-            Skip for now
+            Skip
           </button>
           {selectedProvider && (
             <button
               className="btn-primary flex items-center gap-2"
               onClick={handleSave}
               disabled={saving}
-              data-ui-id="setup-wizard-finish"
+              data-ui-id="setup-wizard-next-ai"
             >
               {saving && <Loader2 className="w-4 h-4 animate-spin" />}
-              Finish Setup
+              Next
             </button>
           )}
         </div>

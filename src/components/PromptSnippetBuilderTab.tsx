@@ -25,7 +25,7 @@ import type { PromptSnippet } from "../types";
 import { getAccentColors } from "@/design-system";
 import { BuilderToolbar, toolbarActions } from "./ui/BuilderToolbar";
 import { BatchDeleteDialog } from "./ui/BatchDeleteDialog";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 interface PromptSnippetBuilderTabProps {
   onLog?: (level: string, message: string) => void;
@@ -84,7 +84,7 @@ export function PromptSnippetBuilderTab({
     setIsDeleting(true);
     try {
       for (const id of selectedIds) {
-        await fetch(`${getApiBase()}/prompt-snippets/${id}`, { method: "DELETE" });
+        await tracedFetch(`${getApiBase()}/prompt-snippets/${id}`, { method: "DELETE" });
       }
       exitSelectionMode();
       setShowBatchDeleteDialog(false);
@@ -107,7 +107,7 @@ export function PromptSnippetBuilderTab({
   const fetchPromptSnippets = useCallback(async () => {
     try {
       setLoading(true);
-      const response = await fetch(`${getApiBase()}/prompt-snippets`);
+      const response = await tracedFetch(`${getApiBase()}/prompt-snippets`);
       if (response.ok) {
         const result = await response.json();
         if (result.success && result.data) {
@@ -183,14 +183,14 @@ export function PromptSnippetBuilderTab({
       let response;
       if (selectedSnippet) {
         // Update existing
-        response = await fetch(`${getApiBase()}/prompt-snippets/${selectedSnippet.id}`, {
+        response = await tracedFetch(`${getApiBase()}/prompt-snippets/${selectedSnippet.id}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
         });
       } else {
         // Create new
-        response = await fetch(`${getApiBase()}/prompt-snippets`, {
+        response = await tracedFetch(`${getApiBase()}/prompt-snippets`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
@@ -224,7 +224,7 @@ export function PromptSnippetBuilderTab({
     if (!confirm(`Delete prompt snippet "${selectedSnippet.name}"?`)) return;
 
     try {
-      const response = await fetch(`${getApiBase()}/prompt-snippets/${selectedSnippet.id}`, {
+      const response = await tracedFetch(`${getApiBase()}/prompt-snippets/${selectedSnippet.id}`, {
         method: "DELETE",
       });
 
@@ -254,7 +254,7 @@ export function PromptSnippetBuilderTab({
         tags: selectedSnippet.tags,
       };
 
-      const response = await fetch(`${getApiBase()}/prompt-snippets`, {
+      const response = await tracedFetch(`${getApiBase()}/prompt-snippets`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),

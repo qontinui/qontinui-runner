@@ -555,6 +555,9 @@ impl ShellCommandHandler {
             cmd.current_dir(&resolved);
         }
 
+        // Inject trace ID for cross-process correlation
+        cmd.env("QONTINUI_TRACE_ID", uuid::Uuid::new_v4().to_string());
+
         // Capture stdout and stderr
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());

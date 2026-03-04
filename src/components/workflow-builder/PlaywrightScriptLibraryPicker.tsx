@@ -17,7 +17,7 @@ import {
   FolderOpen,
 } from "lucide-react";
 import type { WorkflowPhase } from "../../types/unified-workflow";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 // PlaywrightScript type from script storage
 interface PlaywrightScript {
@@ -65,7 +65,7 @@ export function PlaywrightScriptLibraryPicker({
     const fetchScripts = async () => {
       setIsLoading(true);
       try {
-        const response = await fetch(`${getApiBase()}/playwright/tests`, {
+        const response = await tracedFetch(`${getApiBase()}/playwright/tests`, {
           signal: controller.signal,
         });
         if (response.ok) {

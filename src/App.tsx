@@ -34,6 +34,7 @@ import {
   BarChart3,
   Database,
   TestTube,
+  Activity,
 } from "lucide-react";
 
 // Contexts
@@ -139,7 +140,6 @@ import { ActiveDashboardPage } from "./components/active-dashboard";
 import { HistoryTab } from "./components/HistoryTab";
 import { ExecuteTab } from "./components/ExecuteTab";
 import { WorkflowQueueTab } from "./components/workflow-queue";
-import { ChatPage } from "./components/chat";
 // Monitor/Observe components
 import { ExecutionReport } from "./components/findings";
 import { StateExplorerTab } from "./components/state-explorer";
@@ -148,6 +148,7 @@ import { StatisticsTab } from "./components/statistics";
 // Run-specific components
 import { RunSelectionProvider } from "./contexts/RunSelectionContext";
 import { RunPageLayout } from "./components/run-dashboard/RunPageLayout";
+import { TraceViewerPage } from "./components/run-dashboard/TraceViewerPage";
 import { RunActionsTab } from "./components/run-logs/RunActionsTab";
 import { RunImageRecognitionTab } from "./components/run-logs/RunImageRecognitionTab";
 import { AiDataViewerTab } from "./components/run-logs/AiDataViewerTab";
@@ -162,12 +163,13 @@ import { ErrorMonitorTab } from "./components/error-monitor";
 import { ProcessManagerTab } from "./components/process-manager";
 import { ReflectionDashboard } from "./components/reflection-dashboard/ReflectionDashboard";
 import { GeneratorEvalPage } from "./pages/GeneratorEvalPage";
+import { UIBridgeIntegrationPage } from "./pages/ui-bridge-integration/UIBridgeIntegrationPage";
 import { TerminalPage } from "./components/terminal";
 
 // Development tools
 import { PerformanceOverlay } from "./components/dev";
 
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 // Styles
 import "./index.css";
@@ -178,7 +180,6 @@ type LogSubTab = "general" | "image" | "actions";
 type MainTabId =
   | "gui-automation"
   | "workflow-queue"
-  | "run-plan"
   | "active"
   | "runs"
   | "history"
@@ -196,6 +197,7 @@ type MainTabId =
   | "run-ai-output"
   | "run-statistics"
   | "run-ai-data"
+  | "run-traces"
   // Legacy tab IDs for migration
   | "ai"
   | "logs"
@@ -220,6 +222,7 @@ type MainTabId =
   | "config-log-sources"
   | "config-findings"
   | "config-hooks"
+  | "config-ui-bridge"
   | "triggers"
   | "tasks"
   | "settings"
@@ -245,7 +248,6 @@ type MainTabId =
 const VALID_TAB_IDS: MainTabId[] = [
   "gui-automation",
   "workflow-queue",
-  "run-plan",
   "active",
   "runs",
   "history",
@@ -263,6 +265,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "run-ai-output",
   "run-statistics",
   "run-ai-data",
+  "run-traces",
   // Legacy (for migration)
   "ai",
   "logs",
@@ -287,6 +290,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "config-log-sources",
   "config-findings",
   "config-hooks",
+  "config-ui-bridge",
   "triggers",
   "tasks",
   "settings",
@@ -336,6 +340,7 @@ function migrateTabId(stored: string | null): MainTabId {
     "live-page-generator": "unified-workflow-builder", // Spec discovery now in AI Generate panel
     "spec-discovery": "unified-workflow-builder", // Spec discovery now in AI Generate panel
     "page-sweep": "unified-workflow-builder", // Page Sweep removed, multi-page now in SpecSourceSection
+    "run-plan": "terminal", // Chat page removed, workflow generation now in Terminal
     // Old observe tab migrations to new structure
     logs: "run-recap",
     "run-dashboard": "run-recap", // Dashboard merged into Summary (formerly Recap)
@@ -528,7 +533,7 @@ function AppContent() {
     };
   }, []);
 
-  // Listen for zombie task cleanup events from the backend
+  // Listen for stale task detection events from the backend
   useEffect(() => {
     let unlisten: (() => void) | null = null;
 
@@ -537,12 +542,12 @@ function AppContent() {
         task_run_id: string;
         task_name: string;
         message: string;
-      }>("zombie-task-cleaned", (event) => {
+      }>("stale-task-detected", (event) => {
         const { task_name, message } = event.payload;
-        console.log("[APP] Zombie task cleaned:", event.payload);
-        setZombieTaskMessage(`${task_name}: ${message}`);
-        // Auto-dismiss after 8 seconds
-        setTimeout(() => setZombieTaskMessage(null), 8000);
+        console.log("[APP] Stale task detected:", event.payload);
+        setStaleTaskMessage(`${task_name}: ${message}`);
+        // Auto-dismiss after 10 seconds
+        setTimeout(() => setStaleTaskMessage(null), 10000);
       });
     };
 
@@ -578,8 +583,8 @@ function AppContent() {
   const [isRunningLastWorkflow, setIsRunningLastWorkflow] = useState(false);
   const [runLastWorkflowError, setRunLastWorkflowError] = useState<string | null>(null);
 
-  // State for zombie task cleanup toast
-  const [zombieTaskMessage, setZombieTaskMessage] = useState<string | null>(null);
+  // State for stale task detection toast
+  const [staleTaskMessage, setStaleTaskMessage] = useState<string | null>(null);
 
   // The last workflow can be re-run if we have a workflow_name
   const lastRunWorkflowId = lastRun?.workflow_name ?? null;
@@ -592,7 +597,7 @@ function AppContent() {
 
     try {
       // Search for the unified workflow by name in the database
-      const searchResponse = await fetch(
+      const searchResponse = await tracedFetch(
         `${getApiBase()}/unified-workflows/search?q=${encodeURIComponent(lastRun.workflow_name)}`,
       );
 
@@ -609,7 +614,7 @@ function AppContent() {
 
       if (workflow?.id) {
         // Found in DB — run via the /run endpoint
-        fetch(`${getApiBase()}/unified-workflows/${workflow.id}/run`, {
+        tracedFetch(`${getApiBase()}/unified-workflows/${workflow.id}/run`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({}),
@@ -628,7 +633,7 @@ function AppContent() {
         // If not in the React ref, try fetching from the backend's last-inline store
         if (!inlinePayload || inlinePayload.name !== rawName) {
           try {
-            const inlineResponse = await fetch(`${getApiBase()}/unified-workflows/last-inline`);
+            const inlineResponse = await tracedFetch(`${getApiBase()}/unified-workflows/last-inline`);
             if (inlineResponse.ok) {
               const inlineResult = await inlineResponse.json();
               if (inlineResult.data?.name === rawName) {
@@ -642,7 +647,7 @@ function AppContent() {
 
         if (inlinePayload && inlinePayload.name === rawName) {
           // Re-execute the inline workflow
-          fetch(`${getApiBase()}/unified-workflows/execute-inline`, {
+          tracedFetch(`${getApiBase()}/unified-workflows/execute-inline`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(inlinePayload),
@@ -930,14 +935,6 @@ function AppContent() {
           <WorkflowQueueTab onNavigateToActive={() => setActiveTab("active")} onLog={addLog} />
         );
 
-      case "run-plan":
-        return (
-          <ChatPage
-            onNavigateToBuilder={() => setActiveTab("unified-workflow-builder")}
-            onNavigateToActive={() => setActiveTab("active")}
-          />
-        );
-
       case "active":
         return (
           <ActiveDashboardPage
@@ -1177,6 +1174,21 @@ function AppContent() {
           </RunSelectionProvider>
         );
 
+      case "run-traces":
+        return (
+          <RunSelectionProvider>
+            <RunPageLayout
+              title="Traces"
+              icon={Activity}
+              onNavigateToActive={() => setActiveTab("active")}
+            >
+              <div className="h-full overflow-hidden">
+                <TraceViewerPage />
+              </div>
+            </RunPageLayout>
+          </RunSelectionProvider>
+        );
+
       // ========== LEGACY TABS (for backward compatibility) ==========
       case "ai":
         return (
@@ -1401,6 +1413,13 @@ function AppContent() {
           </div>
         );
 
+      case "config-ui-bridge":
+        return (
+          <div className="h-full overflow-hidden">
+            <UIBridgeIntegrationPage />
+          </div>
+        );
+
       case "capture":
         return (
           <div className="h-full overflow-y-auto">
@@ -1582,18 +1601,18 @@ function AppContent() {
           </div>
         )}
 
-        {/* Zombie task cleanup toast */}
-        {zombieTaskMessage && (
+        {/* Stale task detection toast */}
+        {staleTaskMessage && (
           <div className="fixed bottom-4 right-4 p-4 rounded-lg shadow-lg border max-w-md z-toast bg-card border-yellow-500/50">
             <div className="flex items-start gap-3">
               <div className="flex-1 min-w-0">
                 <h4 className="font-medium text-sm text-yellow-600 dark:text-yellow-400">
-                  Task Stopped Automatically
+                  Possibly Stale Task
                 </h4>
-                <p className="text-sm text-muted-foreground mt-1">{zombieTaskMessage}</p>
+                <p className="text-sm text-muted-foreground mt-1">{staleTaskMessage}</p>
               </div>
               <button
-                onClick={() => setZombieTaskMessage(null)}
+                onClick={() => setStaleTaskMessage(null)}
                 className="text-muted-foreground hover:text-foreground flex-shrink-0"
               >
                 &times;

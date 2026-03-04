@@ -13,7 +13,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::claude_protocol::codec::decode_message;
 use crate::claude_protocol::types::OutgoingControlResponse;
-use crate::commands::ai_chat::emit_session_state;
+use crate::commands::ai_session::emit_session_state;
 use crate::findings::{FindingParser, ParsedFinding};
 use crate::mcp::shared::{emit_ai_output, AiSessionContext};
 use crate::workflow_state::{ParsedProgress, ProgressParser};

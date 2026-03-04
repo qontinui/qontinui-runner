@@ -35,7 +35,8 @@ export type ActivityType =
   | "mcp_call"
   | "execution_timeline"
   | "flow_execution"
-  | "canvas";
+  | "canvas"
+  | "trace_viewer";
 
 /**
  * Status of an individual activity.
@@ -205,6 +206,12 @@ export const ACTIVITY_DISPLAY_CONFIG: Record<ActivityType, ActivityDisplayConfig
     accentColor: "rose",
     detailRoute: "/canvas",
   },
+  trace_viewer: {
+    displayName: "Trace Viewer",
+    icon: "Activity",
+    accentColor: "sky",
+    detailRoute: "/runs/traces",
+  },
 };
 
 /**
@@ -225,6 +232,7 @@ export const ACTIVITY_PRIORITIES: Record<ActivityType, number> = {
   findings: 30,
   execution_status: 35,
   canvas: 3,
+  trace_viewer: 40,
 };
 
 /**

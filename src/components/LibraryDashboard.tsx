@@ -26,7 +26,7 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { isDevelopmentMode } from "qontinui-navigation";
 import { getAccentColors } from "@/design-system";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 // Item types that can appear in the dashboard
 type ItemType =
@@ -179,14 +179,14 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
         macrosRes,
         checksRes,
       ] = await Promise.allSettled([
-        fetch(`${getApiBase()}/prompts`),
-        fetch(`${getApiBase()}/prompt-snippets`),
-        fetch(`${getApiBase()}/contexts`),
-        fetch(`${getApiBase()}/saved-verifications`),
-        fetch(`${getApiBase()}/saved-api-requests`),
-        fetch(`${getApiBase()}/playwright-scripts`),
-        fetch(`${getApiBase()}/unified-workflows`),
-        fetch(`${getApiBase()}/macros`),
+        tracedFetch(`${getApiBase()}/prompts`),
+        tracedFetch(`${getApiBase()}/prompt-snippets`),
+        tracedFetch(`${getApiBase()}/contexts`),
+        tracedFetch(`${getApiBase()}/saved-verifications`),
+        tracedFetch(`${getApiBase()}/saved-api-requests`),
+        tracedFetch(`${getApiBase()}/playwright-scripts`),
+        tracedFetch(`${getApiBase()}/unified-workflows`),
+        tracedFetch(`${getApiBase()}/macros`),
         invoke<{ success: boolean; data?: ApiResponseItem[] }>("list_checks", {
           enabledOnly: false,
         }),

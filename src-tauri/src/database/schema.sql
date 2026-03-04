@@ -1,5 +1,5 @@
 -- SQLite Schema for qontinui-runner
--- Version: 84
+-- Version: 87
 --
 -- This schema provides persistent storage for task runs, settings,
 -- prompts, and scheduler state.
@@ -1827,6 +1827,9 @@ CREATE TABLE IF NOT EXISTS error_events (
     -- Embedding vector for hybrid RAG search (384-dim MiniLM as f32 BLOB)
     message_embedding BLOB,  -- Embedding of the error message
 
+    -- Cross-service trace correlation
+    trace_id TEXT,
+
     -- Status timestamps
     acknowledged_at TEXT,
     resolved_at TEXT
@@ -1841,6 +1844,7 @@ CREATE INDEX IF NOT EXISTS idx_error_events_severity ON error_events(severity);
 CREATE INDEX IF NOT EXISTS idx_error_events_captured ON error_events(captured_at DESC);
 CREATE INDEX IF NOT EXISTS idx_error_events_last_seen ON error_events(last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS idx_error_events_source_name ON error_events(log_source_name);
+CREATE INDEX IF NOT EXISTS idx_error_events_trace_id ON error_events(trace_id);
 
 -- Full-text search for error messages and stack traces
 CREATE VIRTUAL TABLE IF NOT EXISTS error_events_fts USING fts5(
@@ -2169,6 +2173,7 @@ CREATE TABLE IF NOT EXISTS reflection_fixes (
     FOREIGN KEY (source_task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
     FOREIGN KEY (reflection_task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
     FOREIGN KEY (source_finding_id) REFERENCES task_run_findings(id) ON DELETE SET NULL,
+    source_agent TEXT,                        -- Which generation agent caused this (specification, builder, verification, hardener)
     FOREIGN KEY (source_knowledge_id) REFERENCES task_knowledge(id) ON DELETE SET NULL
 );
 
@@ -2178,6 +2183,7 @@ CREATE INDEX IF NOT EXISTS idx_reflection_fixes_content_hash ON reflection_fixes
 CREATE INDEX IF NOT EXISTS idx_reflection_fixes_status ON reflection_fixes(status);
 CREATE INDEX IF NOT EXISTS idx_reflection_fixes_effectiveness ON reflection_fixes(effectiveness);
 CREATE INDEX IF NOT EXISTS idx_reflection_fixes_applied_at ON reflection_fixes(applied_at);
+CREATE INDEX IF NOT EXISTS idx_reflection_fixes_source_agent ON reflection_fixes(source_agent);
 
 -- =============================================================================
 -- Generation Rules (Version 60)
@@ -2195,8 +2201,11 @@ CREATE TABLE IF NOT EXISTS generation_rules (
     content TEXT NOT NULL,        -- Full markdown rule text
     condition TEXT,               -- NULL = always, 'has_sdk_connect', 'targets_web_app'
     status TEXT NOT NULL DEFAULT 'active',  -- 'active', 'disabled', 'superseded'
-    provenance TEXT NOT NULL DEFAULT 'seed', -- 'seed' (original hardcoded), 'reflection' (created by reflection auto-apply)
+    provenance TEXT NOT NULL DEFAULT 'seed', -- 'seed' (original hardcoded), 'reflection' (created by reflection auto-apply), 'auto_insight' (from prompt analysis)
     source_fix_id TEXT,           -- FK to reflection_fixes.id if provenance = 'reflection'
+    confidence REAL DEFAULT 1.0,          -- Confidence score for auto-generated rules
+    auto_generated_at TEXT,               -- When auto-generated (NULL for manual/seed rules)
+    evidence_count INTEGER DEFAULT 0,     -- How many examples support this rule
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY (source_fix_id) REFERENCES reflection_fixes(id) ON DELETE SET NULL
@@ -2295,6 +2304,16 @@ CREATE TABLE IF NOT EXISTS generation_pipeline_artifacts (
     hardened_json TEXT,
     final_json TEXT,
     validation_errors TEXT,
+
+    -- Specification
+    specification_duration_ms INTEGER,
+    specification_criteria TEXT,
+
+    -- Prompt capture (for training data / analysis)
+    specification_prompt TEXT,
+    builder_prompt TEXT,
+    verification_prompts TEXT,
+    hardener_prompt TEXT,
 
     -- Outcome
     success INTEGER NOT NULL DEFAULT 1,
@@ -2459,4 +2478,24 @@ CREATE INDEX IF NOT EXISTS idx_user_skills_category ON user_skills(category);
 CREATE INDEX IF NOT EXISTS idx_user_skills_updated_at ON user_skills(updated_at);
 CREATE INDEX IF NOT EXISTS idx_user_skills_source ON user_skills(source);
 
-INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (84, datetime('now'));
+-- UI Bridge integration tracking (projects with runtime injection or source integration)
+CREATE TABLE IF NOT EXISTS ui_bridge_integrations (
+    id TEXT PRIMARY KEY,
+    project_path TEXT NOT NULL,
+    label TEXT,
+    framework TEXT,
+    integration_type TEXT NOT NULL,  -- 'runtime' | 'source' | 'both'
+    sdk_version TEXT,
+    status TEXT NOT NULL DEFAULT 'active',  -- 'active' | 'disconnected' | 'outdated'
+    proxy_port INTEGER,
+    target_url TEXT,
+    last_health_check INTEGER,
+    element_count INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ui_bridge_integrations_status ON ui_bridge_integrations(status);
+CREATE INDEX IF NOT EXISTS idx_ui_bridge_integrations_type ON ui_bridge_integrations(integration_type);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (87, datetime('now'));

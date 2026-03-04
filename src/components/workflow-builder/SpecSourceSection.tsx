@@ -24,7 +24,7 @@ import { buildSpecPrompt, type DiscoveredSpec, type SpecGroup } from "@/lib/spec
 import { parseDiscoveredSpecs, unwrapSpecResponse } from "@/lib/ui-bridge/spec-parser";
 import { getAllSpecs } from "@/lib/spec-registry";
 import { listen } from "@tauri-apps/api/event";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 // =============================================================================
 // Types
@@ -135,7 +135,7 @@ export function SpecSourceSection({ onSpecsChanged }: SpecSourceSectionProps) {
 
     (async () => {
       try {
-        const resp = await fetch(`${getApiBase()}/ui-bridge/sdk/status`, {
+        const resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/status`, {
           signal: controller.signal,
         });
         const json = await resp.json();
@@ -191,7 +191,7 @@ export function SpecSourceSection({ onSpecsChanged }: SpecSourceSectionProps) {
 
       // Merge cached specs from the runner database
       try {
-        const resp = await fetch(`${getApiBase()}/ui-bridge/sdk/cached-specs`);
+        const resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/cached-specs`);
         const json = await resp.json();
         if (json.success && Array.isArray(json.data)) {
           for (const cached of json.data) {
@@ -283,7 +283,7 @@ export function SpecSourceSection({ onSpecsChanged }: SpecSourceSectionProps) {
       async () => {
         // Refresh cached specs from runner
         try {
-          const resp = await fetch(`${getApiBase()}/ui-bridge/sdk/cached-specs`);
+          const resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/cached-specs`);
           const json = await resp.json();
           if (json.success && Array.isArray(json.data)) {
             setDiscoveredSpecs((prev) => {
@@ -359,7 +359,7 @@ export function SpecSourceSection({ onSpecsChanged }: SpecSourceSectionProps) {
     setIsConnecting(true);
     setConnectionError(null);
     try {
-      const resp = await fetch(`${getApiBase()}/ui-bridge/sdk/connect`, {
+      const resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/connect`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url: url.trim() }),
@@ -382,7 +382,7 @@ export function SpecSourceSection({ onSpecsChanged }: SpecSourceSectionProps) {
   // Disconnect from SDK app
   const handleDisconnect = useCallback(async () => {
     try {
-      await fetch(`${getApiBase()}/ui-bridge/sdk/disconnect`, {
+      await tracedFetch(`${getApiBase()}/ui-bridge/sdk/disconnect`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({}),
@@ -399,7 +399,7 @@ export function SpecSourceSection({ onSpecsChanged }: SpecSourceSectionProps) {
     if (!isConnected) return;
     setIsDiscovering(true);
     try {
-      const resp = await fetch(`${getApiBase()}/ui-bridge/sdk/discover`, {
+      const resp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/discover`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "getSpecs" }),
@@ -427,7 +427,7 @@ export function SpecSourceSection({ onSpecsChanged }: SpecSourceSectionProps) {
     setCrawlProgress("Discovering links...");
     try {
       // Step 1: Discover navigable links from the current page
-      const linkResp = await fetch(`${getApiBase()}/ui-bridge/sdk/discover`, {
+      const linkResp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/discover`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ interactive_only: false }),
@@ -466,7 +466,7 @@ export function SpecSourceSection({ onSpecsChanged }: SpecSourceSectionProps) {
 
         try {
           // Navigate to page
-          await fetch(`${getApiBase()}/ui-bridge/sdk/navigate`, {
+          await tracedFetch(`${getApiBase()}/ui-bridge/sdk/navigate`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ url }),
@@ -476,7 +476,7 @@ export function SpecSourceSection({ onSpecsChanged }: SpecSourceSectionProps) {
           await new Promise((resolve) => setTimeout(resolve, 2500));
 
           // Discover specs on this page
-          const specResp = await fetch(`${getApiBase()}/ui-bridge/sdk/discover`, {
+          const specResp = await tracedFetch(`${getApiBase()}/ui-bridge/sdk/discover`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ action: "getSpecs" }),

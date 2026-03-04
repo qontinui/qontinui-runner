@@ -6,7 +6,7 @@
  */
 
 import { useState, useEffect, useCallback } from "react";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 const POLL_INTERVAL_MS = 2000;
 
@@ -58,7 +58,7 @@ export function useGuiLock(enabled = true): UseGuiLockResult {
    */
   const refresh = useCallback(async () => {
     try {
-      const response = await fetch(`${getApiBase()}/gui-lock`);
+      const response = await tracedFetch(`${getApiBase()}/gui-lock`);
 
       if (!response.ok) {
         // API may return error if bridge manager not initialized

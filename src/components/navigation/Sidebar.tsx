@@ -86,6 +86,7 @@ import {
   Server,
   Workflow,
   Cpu,
+  Plug,
 } from "lucide-react";
 
 // Import shared navigation structure and state management
@@ -144,6 +145,7 @@ const ICON_MAP: Record<IconName, LucideIcon> = {
   ShieldCheck,
   FolderOpen,
   Tag,
+  Plug,
   Calendar,
   User,
   HardDrive,

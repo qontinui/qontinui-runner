@@ -5,7 +5,7 @@
  * Provides CRUD operations for stored configurations.
  */
 
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 /**
  * Metadata for a stored configuration (without full config data)
@@ -43,7 +43,7 @@ async function apiRequest<T>(endpoint: string, options: RequestInit = {}): Promi
   console.log(`[CONFIG_STORAGE] ${options.method || "GET"} ${endpoint}`);
 
   try {
-    const response = await fetch(url, {
+    const response = await tracedFetch(url, {
       ...options,
       headers: {
         "Content-Type": "application/json",

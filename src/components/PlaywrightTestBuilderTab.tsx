@@ -34,7 +34,7 @@ import { PromptSnippetSelector, usePromptSnippetMention } from "./PromptSnippetS
 import { executeAiTask } from "../hooks";
 import { getAccentColors, getStatusColors } from "@/design-system";
 import { BuilderToolbar, toolbarActions } from "./ui/BuilderToolbar";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 type LogLevel = "info" | "warning" | "error" | "debug" | "success";
 
@@ -395,7 +395,7 @@ export function PlaywrightTestBuilderTab({
     const controller = new AbortController();
     const timeoutId = setTimeout(async () => {
       try {
-        await fetch(`${getApiBase()}/playwright/tests/${editingScript.id}`, {
+        await tracedFetch(`${getApiBase()}/playwright/tests/${editingScript.id}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ description: formDescription }),
@@ -426,7 +426,7 @@ export function PlaywrightTestBuilderTab({
     let cancelled = false;
     const timeoutId = setTimeout(async () => {
       try {
-        const response = await fetch(`${getApiBase()}/playwright/tests/${editingScript.id}`, {
+        const response = await tracedFetch(`${getApiBase()}/playwright/tests/${editingScript.id}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ name: formName }),
@@ -434,7 +434,7 @@ export function PlaywrightTestBuilderTab({
         });
         if (response.ok && !cancelled) {
           // Reload scripts to update the list display
-          const scriptsResponse = await fetch(`${getApiBase()}/playwright/tests`, {
+          const scriptsResponse = await tracedFetch(`${getApiBase()}/playwright/tests`, {
             signal: controller.signal,
           });
           const result = await scriptsResponse.json();
@@ -466,7 +466,7 @@ export function PlaywrightTestBuilderTab({
     const controller = new AbortController();
     const timeoutId = setTimeout(async () => {
       try {
-        await fetch(`${getApiBase()}/playwright/tests/${editingScript.id}`, {
+        await tracedFetch(`${getApiBase()}/playwright/tests/${editingScript.id}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ ai_instructions: formAiInstructions || null }),
@@ -514,7 +514,7 @@ export function PlaywrightTestBuilderTab({
 
     const loadScriptForEditing = async () => {
       try {
-        const response = await fetch(`${getApiBase()}/playwright/tests/${editScriptId}`, {
+        const response = await tracedFetch(`${getApiBase()}/playwright/tests/${editScriptId}`, {
           signal: controller.signal,
         });
         const result = await response.json();
@@ -585,7 +585,7 @@ export function PlaywrightTestBuilderTab({
   const loadScripts = useCallback(async () => {
     setLoading(true);
     try {
-      const response = await fetch(`${getApiBase()}/playwright/tests`);
+      const response = await tracedFetch(`${getApiBase()}/playwright/tests`);
       const result = await response.json();
       if (result.success) {
         setScripts(result.data || []);
@@ -623,7 +623,7 @@ export function PlaywrightTestBuilderTab({
     setIsBatchDeleting(true);
     try {
       for (const id of selectedIds) {
-        await fetch(`${getApiBase()}/playwright/tests/${id}`, { method: "DELETE" });
+        await tracedFetch(`${getApiBase()}/playwright/tests/${id}`, { method: "DELETE" });
       }
       exitSelectionMode();
       setShowBatchDeleteDialog(false);
@@ -643,7 +643,7 @@ export function PlaywrightTestBuilderTab({
 
   const loadCategories = async () => {
     try {
-      const response = await fetch(`${getApiBase()}/playwright/tests/categories`);
+      const response = await tracedFetch(`${getApiBase()}/playwright/tests/categories`);
       const result = await response.json();
       if (result.success) {
         setCategories(result.data || []);
@@ -684,7 +684,7 @@ export function PlaywrightTestBuilderTab({
     const scriptContent = options?.generatedContent || formScriptContent;
 
     try {
-      const response = await fetch(`${getApiBase()}/playwright/tests`, {
+      const response = await tracedFetch(`${getApiBase()}/playwright/tests`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -830,7 +830,7 @@ test('${formName || "test"}', async ({ page }) => {
   const _deleteScript = async (id: string) => {
     if (!confirm("Are you sure you want to delete this script?")) return;
     try {
-      const response = await fetch(`${getApiBase()}/playwright/tests/${id}`, {
+      const response = await tracedFetch(`${getApiBase()}/playwright/tests/${id}`, {
         method: "DELETE",
       });
       const result = await response.json();
@@ -847,7 +847,7 @@ test('${formName || "test"}', async ({ page }) => {
 
   const _duplicateScript = async (id: string) => {
     try {
-      const response = await fetch(`${getApiBase()}/playwright/tests/${id}/duplicate`, {
+      const response = await tracedFetch(`${getApiBase()}/playwright/tests/${id}/duplicate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({}),
@@ -870,7 +870,7 @@ test('${formName || "test"}', async ({ page }) => {
     setExecutionResult(null);
 
     try {
-      const response = await fetch(`${getApiBase()}/playwright/tests/${id}/run`, {
+      const response = await tracedFetch(`${getApiBase()}/playwright/tests/${id}/run`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -908,7 +908,7 @@ test('${formName || "test"}', async ({ page }) => {
       if (!file) return;
       const text = await file.text();
       try {
-        const response = await fetch(`${getApiBase()}/playwright/tests/import`, {
+        const response = await tracedFetch(`${getApiBase()}/playwright/tests/import`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ scripts_json: text }),
@@ -930,7 +930,7 @@ test('${formName || "test"}', async ({ page }) => {
 
   const exportScripts = async () => {
     try {
-      const response = await fetch(`${getApiBase()}/playwright/tests/export`);
+      const response = await tracedFetch(`${getApiBase()}/playwright/tests/export`);
       const result = await response.json();
       if (result.success) {
         const blob = new Blob([result.data], { type: "application/json" });
@@ -1425,7 +1425,7 @@ OR
     // This ensures the backend has the latest code (especially important after copying a script)
     try {
       log("Saving current script state...");
-      const preSaveResponse = await fetch(`${getApiBase()}/playwright/tests/${scriptId}`, {
+      const preSaveResponse = await tracedFetch(`${getApiBase()}/playwright/tests/${scriptId}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1462,7 +1462,7 @@ OR
 
         // Run the test
         setExecutionState("running");
-        const runResponse = await fetch(`${getApiBase()}/playwright/tests/${scriptId}/run`, {
+        const runResponse = await tracedFetch(`${getApiBase()}/playwright/tests/${scriptId}/run`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({}),
@@ -1751,7 +1751,7 @@ import { test, expect } from '@playwright/test';
         log("Saving updated script...");
 
         // Save the updated script
-        const saveResponse = await fetch(`${getApiBase()}/playwright/tests/${scriptId}`, {
+        const saveResponse = await tracedFetch(`${getApiBase()}/playwright/tests/${scriptId}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -1802,7 +1802,7 @@ import { test, expect } from '@playwright/test';
 
     // Stop the AI analysis if it's running
     try {
-      await fetch(`${getApiBase()}/stop-ai-analysis`, {
+      await tracedFetch(`${getApiBase()}/stop-ai-analysis`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
       });
@@ -1827,7 +1827,7 @@ import { test, expect } from '@playwright/test';
 
     // First save the current form state
     try {
-      const saveResponse = await fetch(`${getApiBase()}/playwright/tests/${id}`, {
+      const saveResponse = await tracedFetch(`${getApiBase()}/playwright/tests/${id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1935,7 +1935,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
     // Auto-save the updated description if editing
     if (editingScript) {
       try {
-        await fetch(`${getApiBase()}/playwright/tests/${editingScript.id}`, {
+        await tracedFetch(`${getApiBase()}/playwright/tests/${editingScript.id}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ description: descriptionPreview }),
@@ -2659,7 +2659,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                               }
                               try {
                                 onLog("info", "Closing Chrome and relaunching with debug port...");
-                                const response = await fetch(
+                                const response = await tracedFetch(
                                   `${getApiBase()}/launch-debug-chrome`,
                                   {
                                     method: "POST",

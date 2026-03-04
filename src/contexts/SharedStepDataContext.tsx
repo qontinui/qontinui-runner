@@ -26,7 +26,7 @@ import {
   calculateStepStats,
   detectStartTime,
 } from "@/components/active-dashboard/widgets/shared/utils";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 // =============================================================================
 // Constants
@@ -72,7 +72,7 @@ export function SharedStepDataProvider({ children }: SharedStepDataProviderProps
   // Fetch all steps via batch endpoint (single round-trip for steps + metadata)
   const fetchSteps = useCallback(async () => {
     try {
-      const response = await fetch(`${getApiBase()}/current-execution/batch`);
+      const response = await tracedFetch(`${getApiBase()}/current-execution/batch`);
       if (!response.ok) {
         if (mountedRef.current) {
           setError(`HTTP ${response.status}`);

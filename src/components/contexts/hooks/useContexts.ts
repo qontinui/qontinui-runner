@@ -17,7 +17,7 @@ import type {
   UpdateContextRequest,
   WebSyncStatus,
 } from "../../../types/context";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 interface CommandResponse {
   success: boolean;
@@ -128,7 +128,7 @@ export function useContexts(autoRefresh = false, refreshInterval = 30000): UseCo
         options.body = JSON.stringify(body);
       }
 
-      const response = await fetch(`${getApiBase()}${endpoint}`, options);
+      const response = await tracedFetch(`${getApiBase()}${endpoint}`, options);
       const result: ApiResponse<T> = await response.json();
 
       if (!result.success) {

@@ -139,6 +139,83 @@ pub fn validate_workflow(workflow: &UnifiedWorkflow) -> Vec<ValidationError> {
         .collect();
     validate_step_references(&all_steps, &mut errors);
 
+    // Validate stages (multi-stage workflows)
+    for (stage_idx, stage) in workflow.stages.iter().enumerate() {
+        let stage_prefix = format!("stages[{}]", stage_idx);
+
+        // Validate step IDs and phases
+        validate_steps(
+            &stage.setup_steps,
+            &format!("{}.setup", stage_prefix),
+            &mut errors,
+        );
+        validate_steps(
+            &stage.verification_steps,
+            &format!("{}.verification", stage_prefix),
+            &mut errors,
+        );
+        validate_steps(
+            &stage.agentic_steps,
+            &format!("{}.agentic", stage_prefix),
+            &mut errors,
+        );
+        validate_steps(
+            &stage.completion_steps,
+            &format!("{}.completion", stage_prefix),
+            &mut errors,
+        );
+
+        // Validate phase constraints
+        validate_phase_constraints(&stage.setup_steps, "setup", &mut errors);
+        validate_phase_constraints(&stage.verification_steps, "verification", &mut errors);
+        validate_phase_constraints(&stage.agentic_steps, "agentic", &mut errors);
+        validate_phase_constraints(&stage.completion_steps, "completion", &mut errors);
+
+        // Validate command fields
+        validate_command_step_fields(
+            &stage.setup_steps,
+            &format!("{}.setup", stage_prefix),
+            &mut errors,
+        );
+        validate_command_step_fields(
+            &stage.verification_steps,
+            &format!("{}.verification", stage_prefix),
+            &mut errors,
+        );
+        validate_command_step_fields(
+            &stage.completion_steps,
+            &format!("{}.completion", stage_prefix),
+            &mut errors,
+        );
+
+        // Validate ui_bridge fields
+        validate_ui_bridge_step_fields(
+            &stage.setup_steps,
+            &format!("{}.setup", stage_prefix),
+            &mut errors,
+        );
+        validate_ui_bridge_step_fields(
+            &stage.verification_steps,
+            &format!("{}.verification", stage_prefix),
+            &mut errors,
+        );
+        validate_ui_bridge_step_fields(
+            &stage.completion_steps,
+            &format!("{}.completion", stage_prefix),
+            &mut errors,
+        );
+
+        // Validate references within this stage
+        let stage_all_steps: Vec<&Value> = stage
+            .setup_steps
+            .iter()
+            .chain(stage.verification_steps.iter())
+            .chain(stage.agentic_steps.iter())
+            .chain(stage.completion_steps.iter())
+            .collect();
+        validate_step_references(&stage_all_steps, &mut errors);
+    }
+
     // Validate timestamps
     if chrono::DateTime::parse_from_rfc3339(&workflow.created_at).is_err() {
         errors.push(ValidationError {
@@ -777,6 +854,112 @@ pub fn fix_workflow(workflow: &mut UnifiedWorkflow) {
         }
     }
 
+    // Fix stages (multi-stage workflows)
+    for stage in workflow.stages.iter_mut() {
+        let stage_steps: Vec<&mut Vec<Value>> = vec![
+            &mut stage.setup_steps,
+            &mut stage.verification_steps,
+            &mut stage.agentic_steps,
+            &mut stage.completion_steps,
+        ];
+
+        // Pass 1: Build ID map for this stage
+        let mut stage_id_map = std::collections::HashMap::new();
+        for steps in stage_steps.iter() {
+            for step in steps.iter() {
+                if let Value::Object(map) = step {
+                    if let Some(old_id) = map.get("id").and_then(|v| v.as_str()) {
+                        let needs_new = Uuid::parse_str(old_id)
+                            .map(|u| u.get_version_num() != 4)
+                            .unwrap_or(true);
+                        if needs_new {
+                            stage_id_map.insert(old_id.to_string(), Uuid::new_v4().to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pass 2: Apply fixes (needs re-borrow)
+        let stage_steps_mut: Vec<(&mut Vec<Value>, &str)> = vec![
+            (&mut stage.setup_steps, "setup"),
+            (&mut stage.verification_steps, "verification"),
+            (&mut stage.agentic_steps, "agentic"),
+            (&mut stage.completion_steps, "completion"),
+        ];
+        for (steps, phase) in stage_steps_mut {
+            let allowed_types = allowed_types_for_phase(phase);
+            let default_type = if phase == "agentic" {
+                "prompt"
+            } else {
+                "command"
+            };
+            for step in steps.iter_mut() {
+                if let Value::Object(map) = step {
+                    // Replace ID if in mapping
+                    if let Some(old_id) = map.get("id").and_then(|v| v.as_str()).map(String::from) {
+                        if let Some(new_id) = stage_id_map.get(&old_id) {
+                            map.insert("id".to_string(), Value::String(new_id.clone()));
+                        }
+                    } else {
+                        map.insert("id".to_string(), Value::String(Uuid::new_v4().to_string()));
+                    }
+
+                    // Fix phase mismatch
+                    if map.get("phase").and_then(|v| v.as_str()) != Some(phase) {
+                        map.insert("phase".to_string(), Value::String(phase.to_string()));
+                    }
+
+                    // Fix invalid step types
+                    if let Some(step_type) =
+                        map.get("type").and_then(|v| v.as_str()).map(String::from)
+                    {
+                        if !allowed_types.contains(&step_type.as_str()) {
+                            tracing::info!(
+                                "Fixing invalid step type '{}' -> '{}' in stage {} phase",
+                                step_type,
+                                default_type,
+                                phase
+                            );
+                            map.insert("type".to_string(), Value::String(default_type.to_string()));
+                        }
+                    }
+
+                    // Infer and set mode on command steps that are missing it
+                    let is_command = map.get("type").and_then(|v| v.as_str()) == Some("command");
+                    if is_command && !map.contains_key("mode") {
+                        let inferred_mode = if map.contains_key("check_group_id") {
+                            "check_group"
+                        } else if map.contains_key("check_type") {
+                            "check"
+                        } else if map.contains_key("test_type") || map.contains_key("test_id") {
+                            "test"
+                        } else {
+                            "shell"
+                        };
+                        tracing::info!(
+                            "Inferring mode '{}' for command step in stage {} phase",
+                            inferred_mode,
+                            phase
+                        );
+                        map.insert("mode".to_string(), Value::String(inferred_mode.to_string()));
+                    }
+
+                    // Update depends_on references
+                    if let Some(Value::Array(deps)) = map.get_mut("depends_on") {
+                        for dep in deps.iter_mut() {
+                            if let Some(old_dep) = dep.as_str().map(String::from) {
+                                if let Some(new_dep) = stage_id_map.get(&old_dep) {
+                                    *dep = Value::String(new_dep.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // For check-group workflows, strip setup and completion steps.
     // The AI builder often adds unnecessary setup/completion steps despite generation rules.
     // This deterministic fix ensures check-group workflows are clean.
@@ -798,6 +981,98 @@ pub fn fix_workflow(workflow: &mut UnifiedWorkflow) {
             workflow.completion_steps.clear();
         }
     }
+}
+
+/// Validate that acceptance criteria are covered by verification steps.
+///
+/// Checks:
+/// - Each automatable criterion has a matching verification step (by `criterion_id`)
+/// - No verification step has an orphan `criterion_id` that doesn't match any criterion
+///
+/// Critical criteria missing coverage produce errors; important/optional produce warnings.
+pub fn validate_criteria_coverage(
+    workflow: &UnifiedWorkflow,
+    criteria: &super::specification::AcceptanceCriteria,
+) -> Vec<ValidationError> {
+    use super::specification::{CriterionPriority, VerificationMethod};
+
+    let mut errors = Vec::new();
+
+    // Collect all criterion_ids from verification steps (top-level + stages)
+    let mut found_criterion_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
+    let all_verification_steps: Vec<&Value> = workflow
+        .verification_steps
+        .iter()
+        .chain(
+            workflow
+                .stages
+                .iter()
+                .flat_map(|s| s.verification_steps.iter()),
+        )
+        .collect();
+
+    for step in &all_verification_steps {
+        if let Some(cid) = step.get("criterion_id").and_then(|v| v.as_str()) {
+            found_criterion_ids.insert(cid.to_string());
+        }
+    }
+
+    // Check each automatable criterion has a matching verification step
+    let automatable: Vec<&super::specification::AcceptanceCriterion> = criteria
+        .criteria
+        .iter()
+        .filter(|c| c.method != VerificationMethod::Manual)
+        .collect();
+
+    for criterion in &automatable {
+        if !found_criterion_ids.contains(&criterion.id) {
+            let (kind, severity_label) = match criterion.priority {
+                CriterionPriority::Critical => {
+                    (ValidationErrorKind::MissingRequiredField, "CRITICAL")
+                }
+                CriterionPriority::Important => (ValidationErrorKind::Structural, "important"),
+                CriterionPriority::Optional => (ValidationErrorKind::Structural, "optional"),
+            };
+            errors.push(ValidationError {
+                kind,
+                field: format!("criterion_id:{}", criterion.id),
+                message: format!(
+                    "{} acceptance criterion '{}' ({}) has no matching verification step with criterion_id=\"{}\"",
+                    severity_label, criterion.description, criterion.category, criterion.id
+                ),
+                step_name: None,
+            });
+        }
+    }
+
+    // Check for orphan criterion_ids on verification steps
+    let valid_ids: std::collections::HashSet<&str> =
+        criteria.criteria.iter().map(|c| c.id.as_str()).collect();
+
+    for step in &all_verification_steps {
+        if let Some(cid) = step.get("criterion_id").and_then(|v| v.as_str()) {
+            if !valid_ids.contains(cid) {
+                let step_name = step
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                errors.push(ValidationError {
+                    kind: ValidationErrorKind::InvalidReference,
+                    field: "criterion_id".to_string(),
+                    message: format!(
+                        "Verification step '{}' has criterion_id=\"{}\" which doesn't match any acceptance criterion",
+                        step_name, cid
+                    ),
+                    step_name: Some(step_name),
+                });
+            }
+        }
+    }
+
+    errors
 }
 
 #[cfg(test)]

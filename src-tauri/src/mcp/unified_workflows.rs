@@ -869,6 +869,7 @@ pub async fn generate_unified_workflow_handler(
                     verification_iterations: vec![],
                     hardening_summary: None,
                     discovery_calls: vec![],
+                    acceptance_criteria: None,
                 }
             }
         }

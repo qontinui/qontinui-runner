@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 interface PhaseUsage {
   phase: string;
@@ -28,7 +28,7 @@ export function UsageSection({ taskRunId }: { taskRunId: string }) {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    fetch(`${getApiBase()}/task-runs/${taskRunId}/usage`)
+    tracedFetch(`${getApiBase()}/task-runs/${taskRunId}/usage`)
       .then((res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return res.json();

@@ -2711,7 +2711,7 @@ function ExecutionSpansSection() {
 
     (async () => {
       try {
-        const res = await fetch(
+        const res = await tracedFetch(
           `${getApiBase()}/execution-spans?execution_id=${encodeURIComponent(selectedRunId)}&limit=200`,
           { signal: controller.signal },
         );
@@ -2724,7 +2724,7 @@ function ExecutionSpansSection() {
         // If no run-specific spans, fetch recent spans from all executions
         if (runSpans.length === 0) {
           try {
-            const allRes = await fetch(`${getApiBase()}/execution-spans?limit=50`, {
+            const allRes = await tracedFetch(`${getApiBase()}/execution-spans?limit=50`, {
               signal: controller.signal,
             });
             const allData = await allRes.json();
@@ -2984,7 +2984,7 @@ import {
   useCaptureFeedback,
 } from "../../hooks/useMobileData";
 import type { MobileState as _MobileState, MobileLog as _MobileLog } from "../../types/mobile";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 // Mobile State Section - displays device/app state captures
 function MobileStateSection() {

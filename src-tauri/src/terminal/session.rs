@@ -18,6 +18,19 @@ use tracing::{debug, info, warn};
 use super::interceptor::OutputInterceptor;
 use super::types::{TerminalExitEvent, TerminalId, TerminalInfo, TerminalOutputEvent};
 
+/// Shell integration scripts embedded at compile time.
+#[cfg(target_os = "windows")]
+const PS1_INTEGRATION: &str = include_str!("../../resources/shell-integration.ps1");
+#[cfg(not(target_os = "windows"))]
+const BASH_INTEGRATION: &str = include_str!("../../resources/shell-integration.bash");
+
+/// Write a shell integration script to a temp file, returning the path on success.
+fn write_integration_script(content: &str, name: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::temp_dir().join(name);
+    std::fs::write(&path, content).ok()?;
+    Some(path)
+}
+
 /// Maximum scrollback buffer capacity (1 MB).
 const SCROLLBACK_CAPACITY: usize = 1_048_576;
 
@@ -288,19 +301,39 @@ impl TerminalSession {
         })
     }
 
-    /// Build the platform-appropriate shell command.
+    /// Build the platform-appropriate shell command, injecting shell integration if possible.
     fn build_shell_command() -> CommandBuilder {
         #[cfg(target_os = "windows")]
         {
             let mut cmd = CommandBuilder::new("powershell.exe");
-            cmd.args(["-NoLogo", "-NoExit"]);
+            // Try to write and source the integration script. Fall back to plain -NoExit on failure.
+            if let Some(script_path) =
+                write_integration_script(PS1_INTEGRATION, "qontinui-shell-integration.ps1")
+            {
+                // -Command mode: dot-source the script then keep shell alive.
+                // The script itself sources $PROFILE and sets up OSC 633 hooks.
+                let source_cmd = format!(". '{}'", script_path.display());
+                cmd.args(["-NoLogo", "-NoExit", "-Command", source_cmd.as_str()]);
+            } else {
+                cmd.args(["-NoLogo", "-NoExit"]);
+            }
             cmd
         }
         #[cfg(not(target_os = "windows"))]
         {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
             let mut cmd = CommandBuilder::new(&shell);
-            cmd.arg("--login");
+            // Use --rcfile to source our integration script (which re-sources ~/.bashrc internally).
+            // Fall back to --login if the script can't be written.
+            if let Some(script_path) =
+                write_integration_script(BASH_INTEGRATION, "qontinui-shell-integration.bash")
+            {
+                let rcfile = script_path.to_string_lossy().into_owned();
+                cmd.arg("--rcfile");
+                cmd.arg(rcfile.as_str());
+            } else {
+                cmd.arg("--login");
+            }
             cmd
         }
     }

@@ -1,4 +1,4 @@
-//! Periodic background detection and cleanup of zombie task runs.
+//! Periodic background detection of potentially stale task runs.
 //!
 //! Task runs can get stuck as "running" in the database when:
 //! - The runner crashes and task status never gets updated
@@ -6,10 +6,12 @@
 //! - The startup resume mechanism fails silently
 //!
 //! This module runs a periodic sweep that detects orphaned tasks (tasks marked
-//! as running in the DB but with no active Claude CLI process) and cleans them up
-//! after a grace period.
+//! as running in the DB but with no active Claude CLI process) and notifies
+//! the user after a grace period. It does NOT automatically stop tasks, since
+//! false positives (e.g., inline sessions without SessionManager registration)
+//! would destroy legitimate in-progress work.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,7 +24,6 @@ use tracing::{info, warn};
 use crate::claude_session::manager::SessionManager;
 use crate::database::CheckpointDb;
 use crate::doctor::strategies::is_process_alive;
-use crate::event_system::EventBroadcaster;
 
 /// How often to run the sweep.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
@@ -30,12 +31,12 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// Delay before the first sweep, allowing startup resume to complete.
 const STARTUP_GRACE: Duration = Duration::from_secs(45);
 
-/// How long a task must be orphaned before it gets cleaned up.
+/// How long a task must be orphaned before we notify the user.
 const ORPHAN_GRACE: Duration = Duration::from_secs(90);
 
-/// Payload emitted to the frontend when a zombie task is cleaned up.
+/// Payload emitted to the frontend when a potentially stale task is detected.
 #[derive(Debug, Clone, Serialize)]
-struct ZombieTaskCleanedPayload {
+struct StaleTaskDetectedPayload {
     task_run_id: String,
     task_name: String,
     message: String,
@@ -43,16 +44,20 @@ struct ZombieTaskCleanedPayload {
 
 /// Tracks when each task was first observed as orphaned.
 ///
-/// A task must remain orphaned for `ORPHAN_GRACE` before cleanup,
+/// A task must remain orphaned for `ORPHAN_GRACE` before notification,
 /// preventing false positives during brief session transitions.
 struct OrphanTracker {
     first_seen: HashMap<String, Instant>,
+    /// Tasks we've already notified about — avoids spamming the same toast every sweep.
+    /// Cleared when a task regains a live session or leaves the running set.
+    notified: HashSet<String>,
 }
 
 impl OrphanTracker {
     fn new() -> Self {
         Self {
             first_seen: HashMap::new(),
+            notified: HashSet::new(),
         }
     }
 
@@ -67,15 +72,27 @@ impl OrphanTracker {
     /// Clear tracking for a task (it has a live session again).
     fn clear(&mut self, task_id: &str) {
         self.first_seen.remove(task_id);
+        self.notified.remove(task_id);
+    }
+
+    /// Check whether we've already notified for this task.
+    fn was_notified(&self, task_id: &str) -> bool {
+        self.notified.contains(task_id)
+    }
+
+    /// Mark a task as notified.
+    fn mark_notified(&mut self, task_id: &str) {
+        self.notified.insert(task_id.to_string());
     }
 
     /// Remove entries for tasks no longer in the running set.
     fn retain_known(&mut self, running_ids: &[String]) {
         self.first_seen.retain(|id, _| running_ids.contains(id));
+        self.notified.retain(|id| running_ids.contains(id));
     }
 }
 
-/// Run a single sweep cycle: detect and clean up zombie task runs.
+/// Run a single sweep cycle: detect potentially stale task runs and notify.
 async fn sweep_once(
     db: &Arc<CheckpointDb>,
     session_manager: &Arc<SessionManager>,
@@ -93,16 +110,19 @@ async fn sweep_once(
                     tasks.push((run.id, run.task_name));
                 }
             }
-            Err(e) => warn!("Zombie sweep: failed to query running task runs: {}", e),
+            Err(e) => warn!("Stale task sweep: failed to query running task runs: {}", e),
         }
 
-        match db_clone.get_running_chat_sessions() {
-            Ok(chats) => {
-                for chat in chats {
-                    tasks.push((chat.id, chat.task_name));
+        match db_clone.get_running_ai_sessions() {
+            Ok(sessions) => {
+                for session in sessions {
+                    tasks.push((session.id, session.task_name));
                 }
             }
-            Err(e) => warn!("Zombie sweep: failed to query running chat sessions: {}", e),
+            Err(e) => warn!(
+                "Stale task sweep: failed to query running AI sessions: {}",
+                e
+            ),
         }
 
         tasks
@@ -112,10 +132,11 @@ async fn sweep_once(
 
     if running_tasks.is_empty() {
         orphan_tracker.first_seen.clear();
+        orphan_tracker.notified.clear();
         return;
     }
 
-    // 2. Get all sessions from the SessionManager
+    // 2. Get all sessions from the SessionManager (includes both interactive and inline PIDs)
     let sessions = session_manager.list_all_with_state();
     let session_map: HashMap<String, (crate::claude_session::state::SessionState, u32)> = sessions
         .into_iter()
@@ -123,7 +144,6 @@ async fn sweep_once(
         .collect();
 
     // 3. Check each running task
-    let mut cleaned_ids = Vec::new();
     let running_ids: Vec<String> = running_tasks.iter().map(|(id, _)| id.clone()).collect();
 
     for (task_id, task_name) in &running_tasks {
@@ -137,59 +157,29 @@ async fn sweep_once(
             continue;
         }
 
-        // No live session — track as orphaned
+        // No live session — track as potentially stale
         let orphan_duration = orphan_tracker.observe(task_id);
 
-        if orphan_duration >= ORPHAN_GRACE {
-            // Orphaned long enough — clean it up
+        if orphan_duration >= ORPHAN_GRACE && !orphan_tracker.was_notified(task_id) {
+            // Orphaned long enough and not yet notified — warn the user
             warn!(
-                "Zombie sweep: cleaning up orphaned task '{}' (id={}, orphaned for {:.0}s)",
+                "Stale task sweep: task '{}' (id={}) has had no active session for {:.0}s — notifying user",
                 task_name,
                 task_id,
                 orphan_duration.as_secs_f64()
             );
 
-            // Mark as stopped in DB
-            let db_for_stop = db.clone();
-            let stop_id = task_id.clone();
-            let stop_result =
-                tokio::task::spawn_blocking(move || db_for_stop.stop_task_run(&stop_id)).await;
-
-            match stop_result {
-                Ok(Ok(())) => {
-                    info!("Zombie sweep: task {} marked as stopped", task_id);
-                }
-                Ok(Err(e)) => {
-                    warn!("Zombie sweep: failed to stop task {}: {}", task_id, e);
-                    continue;
-                }
-                Err(e) => {
-                    warn!(
-                        "Zombie sweep: spawn_blocking failed for task {}: {}",
-                        task_id, e
-                    );
-                    continue;
-                }
-            }
-
-            // Remove stale session entry if present
-            session_manager.remove(task_id);
-
-            // Notify frontend via EventBroadcaster (updates task list polling)
-            let broadcaster = EventBroadcaster::new(app_handle.clone());
-            broadcaster.task_run_update(task_id, "stopped", None, None);
-
-            // Emit dedicated event for toast notification
-            let payload = ZombieTaskCleanedPayload {
+            // Emit notification event for toast (advisory only — does NOT stop the task)
+            let payload = StaleTaskDetectedPayload {
                 task_run_id: task_id.clone(),
                 task_name: task_name.clone(),
-                message: "No active session found — task was stopped automatically".to_string(),
+                message: "No active session detected — this task may be stale. You can stop it manually if needed.".to_string(),
             };
-            if let Err(e) = app_handle.emit("zombie-task-cleaned", &payload) {
-                warn!("Zombie sweep: failed to emit event: {}", e);
+            if let Err(e) = app_handle.emit("stale-task-detected", &payload) {
+                warn!("Stale task sweep: failed to emit event: {}", e);
             }
 
-            cleaned_ids.push(task_id.clone());
+            orphan_tracker.mark_notified(task_id);
         }
     }
 
@@ -197,15 +187,10 @@ async fn sweep_once(
     session_manager.cleanup_closed();
 
     // 5. Prune orphan tracker for tasks no longer running
-    // (also removes entries we just cleaned up, since they're now 'stopped')
-    let still_running: Vec<String> = running_ids
-        .into_iter()
-        .filter(|id| !cleaned_ids.contains(id))
-        .collect();
-    orphan_tracker.retain_known(&still_running);
+    orphan_tracker.retain_known(&running_ids);
 }
 
-/// Start the zombie sweep background task.
+/// Start the stale task sweep background task.
 ///
 /// Waits for `STARTUP_GRACE` before the first sweep, then runs
 /// `sweep_once()` every `SWEEP_INTERVAL`.
@@ -220,7 +205,7 @@ pub fn start_zombie_sweep(
         // Wait for startup resume to complete
         tokio::time::sleep(STARTUP_GRACE).await;
         info!(
-            "Zombie sweep: started (interval={}s, orphan_grace={}s)",
+            "Stale task sweep: started (interval={}s, orphan_grace={}s)",
             SWEEP_INTERVAL.as_secs(),
             ORPHAN_GRACE.as_secs()
         );

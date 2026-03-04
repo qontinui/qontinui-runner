@@ -1,4 +1,4 @@
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 // Generator Evaluation shared types
 
@@ -168,7 +168,7 @@ export interface ApiResponse<T = unknown> {
 
 /** Typed fetch helper for generator-eval endpoints */
 export async function fetchApi<T>(path: string, options?: RequestInit): Promise<T> {
-  const resp = await fetch(`${getApiBase()}${path}`, {
+  const resp = await tracedFetch(`${getApiBase()}${path}`, {
     headers: { "Content-Type": "application/json" },
     ...options,
   });

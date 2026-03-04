@@ -51,6 +51,10 @@ pub struct ReflectionFix {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evaluated_at: Option<String>,
     pub created_at: String,
+    /// Which generation agent's output likely caused this issue
+    /// (e.g. "specification", "builder", "verification", "hardener")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_agent: Option<String>,
 }
 
 /// Types of fixes that a reflection workflow can apply.
@@ -192,6 +196,9 @@ pub struct CreateReflectionFixInput {
     pub new_value: Option<String>,
     #[serde(default = "default_confidence")]
     pub confidence: String,
+    /// Which generation agent's output likely caused this issue
+    #[serde(default)]
+    pub source_agent: Option<String>,
 }
 
 fn default_confidence() -> String {

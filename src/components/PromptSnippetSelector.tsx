@@ -10,7 +10,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Puzzle, Search, ChevronDown, X } from "lucide-react";
 import type { PromptSnippet } from "../types";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 interface PromptSnippetSelectorProps {
   onSelect: (content: string) => void;
@@ -64,8 +64,8 @@ export function PromptSnippetSelector({
     setLoading(true);
     try {
       const [snippetsRes, categoriesRes] = await Promise.all([
-        fetch(`${getApiBase()}/prompt-snippets`),
-        fetch(`${getApiBase()}/prompt-snippets/categories`),
+        tracedFetch(`${getApiBase()}/prompt-snippets`),
+        tracedFetch(`${getApiBase()}/prompt-snippets/categories`),
       ]);
 
       if (snippetsRes.ok) {

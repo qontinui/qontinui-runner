@@ -25,6 +25,7 @@ import {
   ListOrdered,
   LayoutDashboard,
   Clock,
+  Scan,
 } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { Badge } from "../ui";
@@ -70,6 +71,7 @@ const activityIcons: Record<ActivityType, React.ComponentType<{ className?: stri
   execution_timeline: ListOrdered,
   flow_execution: GitBranch,
   canvas: LayoutDashboard,
+  trace_viewer: Scan,
 };
 
 /**

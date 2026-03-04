@@ -27,3 +27,5 @@ export function getApiBase(): string {
 export function getWsBase(): string {
   return _wsBase;
 }
+
+export { tracedFetch } from "./traced-fetch";

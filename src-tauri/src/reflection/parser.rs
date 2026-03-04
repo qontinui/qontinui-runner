@@ -28,14 +28,17 @@ pub struct ParsedReflectionFix {
     pub old_value: Option<String>,
     pub new_value: Option<String>,
     pub source_finding_id: Option<String>,
+    /// Which generation agent's output likely caused this issue
+    pub source_agent: Option<String>,
 }
 
 static REFLECTION_FIX_START: OnceLock<Regex> = OnceLock::new();
 static REFLECTION_FIX_END: OnceLock<Regex> = OnceLock::new();
 
 fn get_start_pattern() -> &'static Regex {
-    REFLECTION_FIX_START
-        .get_or_init(|| Regex::new(r"(?i)\[REFLECTION_FIX:([a-z_]+):([a-z]+)\]").unwrap())
+    REFLECTION_FIX_START.get_or_init(|| {
+        Regex::new(r"(?i)\[REFLECTION_FIX:([a-z_]+):([a-z]+)(?::([a-z_]+))?\]").unwrap()
+    })
 }
 
 fn get_end_pattern() -> &'static Regex {
@@ -65,6 +68,18 @@ fn normalize_confidence(s: &str) -> String {
     }
 }
 
+/// Normalize agent name to canonical form.
+fn normalize_agent(s: &str) -> Option<String> {
+    match s.to_lowercase().as_str() {
+        "specification" | "spec" => Some("specification".to_string()),
+        "builder" | "build" => Some("builder".to_string()),
+        "verification" | "verifier" | "verify" => Some("verification".to_string()),
+        "fixer" | "fix" => Some("fixer".to_string()),
+        "hardener" | "harden" => Some("hardener".to_string()),
+        _ => Some(s.to_lowercase()),
+    }
+}
+
 /// State machine for parsing multi-line reflection fix blocks.
 #[derive(Debug, Default)]
 pub struct ReflectionFixParser {
@@ -72,6 +87,7 @@ pub struct ReflectionFixParser {
     current_content: String,
     current_fix_type: String,
     current_confidence: String,
+    current_agent: Option<String>,
 }
 
 impl ReflectionFixParser {
@@ -90,8 +106,9 @@ impl ReflectionFixParser {
                 let content = std::mem::take(&mut self.current_content);
                 let fix_type = std::mem::take(&mut self.current_fix_type);
                 let confidence = std::mem::take(&mut self.current_confidence);
+                let agent = self.current_agent.take();
                 self.in_block = false;
-                return Some(parse_content(&content, &fix_type, &confidence));
+                return Some(parse_content(&content, &fix_type, &confidence, agent));
             } else {
                 self.current_content.push_str(line);
                 self.current_content.push('\n');
@@ -105,9 +122,11 @@ impl ReflectionFixParser {
                 .map(|m| m.as_str())
                 .unwrap_or("context_addition");
             let confidence_raw = caps.get(2).map(|m| m.as_str()).unwrap_or("medium");
+            let agent_raw = caps.get(3).map(|m| m.as_str());
 
             self.current_fix_type = normalize_fix_type(fix_type_raw);
             self.current_confidence = normalize_confidence(confidence_raw);
+            self.current_agent = agent_raw.and_then(normalize_agent);
             self.in_block = true;
             self.current_content.clear();
 
@@ -119,8 +138,9 @@ impl ReflectionFixParser {
                 let content = rest.replace("[/REFLECTION_FIX]", "").trim().to_string();
                 let fix_type = std::mem::take(&mut self.current_fix_type);
                 let confidence = std::mem::take(&mut self.current_confidence);
+                let agent = self.current_agent.take();
                 self.in_block = false;
-                return Some(parse_content(&content, &fix_type, &confidence));
+                return Some(parse_content(&content, &fix_type, &confidence, agent));
             }
 
             if marker_end < line.len() {
@@ -137,16 +157,23 @@ impl ReflectionFixParser {
         self.current_content.clear();
         self.current_fix_type.clear();
         self.current_confidence.clear();
+        self.current_agent = None;
     }
 }
 
 /// Parse the content between start and end markers into structured data.
-fn parse_content(content: &str, fix_type: &str, confidence: &str) -> ParsedReflectionFix {
+fn parse_content(
+    content: &str,
+    fix_type: &str,
+    confidence: &str,
+    marker_agent: Option<String>,
+) -> ParsedReflectionFix {
     let mut description = String::new();
     let mut file_changed = None;
     let mut old_value = None;
     let mut new_value = None;
     let mut source_finding_id = None;
+    let mut content_agent = None;
 
     let mut current_field: Option<&str> = None;
     let mut current_value = String::new();
@@ -161,6 +188,7 @@ fn parse_content(content: &str, fix_type: &str, confidence: &str) -> ParsedRefle
                 &mut old_value,
                 &mut new_value,
                 &mut source_finding_id,
+                &mut content_agent,
                 current_field,
                 &current_value,
             );
@@ -173,6 +201,7 @@ fn parse_content(content: &str, fix_type: &str, confidence: &str) -> ParsedRefle
                 &mut old_value,
                 &mut new_value,
                 &mut source_finding_id,
+                &mut content_agent,
                 current_field,
                 &current_value,
             );
@@ -185,6 +214,7 @@ fn parse_content(content: &str, fix_type: &str, confidence: &str) -> ParsedRefle
                 &mut old_value,
                 &mut new_value,
                 &mut source_finding_id,
+                &mut content_agent,
                 current_field,
                 &current_value,
             );
@@ -197,6 +227,7 @@ fn parse_content(content: &str, fix_type: &str, confidence: &str) -> ParsedRefle
                 &mut old_value,
                 &mut new_value,
                 &mut source_finding_id,
+                &mut content_agent,
                 current_field,
                 &current_value,
             );
@@ -209,10 +240,24 @@ fn parse_content(content: &str, fix_type: &str, confidence: &str) -> ParsedRefle
                 &mut old_value,
                 &mut new_value,
                 &mut source_finding_id,
+                &mut content_agent,
                 current_field,
                 &current_value,
             );
             current_field = Some("finding");
+            current_value = rest.trim().to_string();
+        } else if let Some(rest) = trimmed.strip_prefix("Agent:") {
+            save_field(
+                &mut description,
+                &mut file_changed,
+                &mut old_value,
+                &mut new_value,
+                &mut source_finding_id,
+                &mut content_agent,
+                current_field,
+                &current_value,
+            );
+            current_field = Some("agent");
             current_value = rest.trim().to_string();
         } else if current_field.is_some() && !trimmed.is_empty() {
             if !current_value.is_empty() {
@@ -229,6 +274,7 @@ fn parse_content(content: &str, fix_type: &str, confidence: &str) -> ParsedRefle
         &mut old_value,
         &mut new_value,
         &mut source_finding_id,
+        &mut content_agent,
         current_field,
         &current_value,
     );
@@ -238,6 +284,9 @@ fn parse_content(content: &str, fix_type: &str, confidence: &str) -> ParsedRefle
         description = content.trim().to_string();
     }
 
+    // Agent from marker takes priority, then from content field
+    let source_agent = marker_agent.or(content_agent);
+
     ParsedReflectionFix {
         fix_type: fix_type.to_string(),
         confidence: confidence.to_string(),
@@ -246,6 +295,7 @@ fn parse_content(content: &str, fix_type: &str, confidence: &str) -> ParsedRefle
         old_value,
         new_value,
         source_finding_id,
+        source_agent,
     }
 }
 
@@ -255,6 +305,7 @@ fn save_field(
     old_value: &mut Option<String>,
     new_value: &mut Option<String>,
     source_finding_id: &mut Option<String>,
+    source_agent: &mut Option<String>,
     field: Option<&str>,
     value: &str,
 ) {
@@ -267,6 +318,7 @@ fn save_field(
         Some("old") => *old_value = Some(value.to_string()),
         Some("new") => *new_value = Some(value.to_string()),
         Some("finding") => *source_finding_id = Some(value.to_string()),
+        Some("agent") => *source_agent = normalize_agent(value),
         _ => {}
     }
 }

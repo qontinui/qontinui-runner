@@ -31,7 +31,7 @@ import type {
   ProcessSessionOutputLine,
 } from "../types/aiData";
 import type { TaskRunMcpCallsDbResult } from "../types/mcp-config";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 /**
  * Service for accessing AI data viewer data via Tauri commands.
@@ -68,7 +68,7 @@ export const aiDataService = {
     additionalSessions: number,
   ): Promise<AiDataResponse<TaskRun>> {
     try {
-      const response = await fetch(`${getApiBase()}/task-runs/${taskId}/resume`, {
+      const response = await tracedFetch(`${getApiBase()}/task-runs/${taskId}/resume`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ additional_sessions: additionalSessions }),
@@ -102,7 +102,7 @@ export const aiDataService = {
     error?: string;
   }> {
     try {
-      const response = await fetch(`${getApiBase()}/task-runs/${taskId}/generate-summary`, {
+      const response = await tracedFetch(`${getApiBase()}/task-runs/${taskId}/generate-summary`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",

@@ -15,7 +15,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { windowManager } from "../managers";
 import { Workflow } from "./useConfiguration";
 import type { CommandResponse } from "../types/displayProfile";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 interface UseExecutionControlOptions {
   onLog?: (level: "info" | "warning" | "error" | "debug" | "success", message: string) => void;
@@ -148,7 +148,7 @@ export function useExecutionControl(
         console.log("[EXECUTION_CONTROL] Executing via unified /execute-steps:", step);
         setExecutionActive(true);
 
-        const response = await fetch(`${getApiBase()}/execute-steps`, {
+        const response = await tracedFetch(`${getApiBase()}/execute-steps`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({

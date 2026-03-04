@@ -23,7 +23,7 @@ import { ProcessOutputViewer } from "./ProcessOutputViewer";
 import { ProcessConfigEditor } from "./ProcessConfigEditor";
 import { ScanProjectsModal } from "./ScanProjectsModal";
 import { AiFixPanel } from "./AiFixPanel";
-import { useChatSession } from "../../hooks/useChatSession";
+import { useAiSession } from "../../hooks/useAiSession";
 
 interface ProcessStatus {
   id: string;
@@ -88,7 +88,7 @@ export function ProcessManagerTab() {
     interrupt: aiInterrupt,
     close: aiClose,
     resetSession: aiResetSession,
-  } = useChatSession();
+  } = useAiSession();
 
   // Load processes
   const loadProcesses = useCallback(async () => {

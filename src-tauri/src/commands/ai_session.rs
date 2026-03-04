@@ -1,7 +1,7 @@
-//! Tauri commands for interactive AI chat sessions.
+//! Tauri commands for interactive AI sessions.
 //!
 //! These commands allow the frontend to send messages to active Claude CLI sessions,
-//! interrupt processing, query session state, and manage standalone chat sessions.
+//! interrupt processing, query session state, and manage standalone AI sessions.
 
 use std::sync::Arc;
 
@@ -44,17 +44,17 @@ pub fn emit_session_state(
     }
 }
 
-/// List recent chat sessions for the sidebar.
+/// List recent AI sessions for the sidebar.
 ///
-/// Returns lightweight summaries of all chat sessions (running, stopped, failed),
+/// Returns lightweight summaries of all AI sessions (running, stopped, failed),
 /// enriched with `is_live` indicating whether a live CLI process exists.
 #[tauri::command]
-pub async fn list_chat_sessions(
+pub async fn list_ai_sessions(
     app_state: tauri::State<'_, Arc<AppState>>,
     session_manager: tauri::State<'_, Arc<SessionManager>>,
 ) -> Result<CommandResponse, String> {
     let db = app_state.checkpoint_db.clone();
-    let result = tokio::task::spawn_blocking(move || db.get_chat_sessions(50)).await;
+    let result = tokio::task::spawn_blocking(move || db.get_ai_sessions(50)).await;
 
     match result {
         Ok(Ok(sessions)) => {
@@ -83,7 +83,7 @@ pub async fn list_chat_sessions(
         }
         Ok(Err(e)) => Ok(CommandResponse {
             success: false,
-            message: Some(format!("Failed to list chat sessions: {}", e)),
+            message: Some(format!("Failed to list AI sessions: {}", e)),
             data: None,
         }),
         Err(e) => Ok(CommandResponse {
@@ -278,12 +278,12 @@ pub async fn get_ai_session_state(
     }
 }
 
-/// Create a standalone chat session.
+/// Create a standalone AI session.
 ///
 /// Creates a task run record in the database, spawns a Claude CLI session
 /// in the background, and returns the task_run_id immediately.
 #[tauri::command]
-pub async fn create_chat_session(
+pub async fn create_ai_session(
     app_handle: tauri::AppHandle,
     session_manager: tauri::State<'_, Arc<SessionManager>>,
     app_state: tauri::State<'_, Arc<AppState>>,
@@ -293,7 +293,7 @@ pub async fn create_chat_session(
     let name = task_name.unwrap_or_else(|| "New Chat".to_string());
 
     info!(
-        "create_chat_session: task_run_id={}, name={}",
+        "create_ai_session: task_run_id={}, name={}",
         task_run_id, name
     );
 
@@ -304,7 +304,7 @@ pub async fn create_chat_session(
     let create_result = tokio::task::spawn_blocking(move || {
         db.create_task_run(
             &CreateTaskRunInput::new(id_clone, name_clone)
-                .with_prompt("Chat session")
+                .with_prompt("AI session")
                 .with_workflow_type("chat"),
         )
     })
@@ -346,7 +346,7 @@ pub async fn create_chat_session(
                 let session = Arc::new(session);
 
                 if let Err(e) = sm.register(&trid, session.clone()) {
-                    warn!("Failed to register chat session: {}", e);
+                    warn!("Failed to register AI session: {}", e);
                     return;
                 }
 
@@ -355,10 +355,10 @@ pub async fn create_chat_session(
                 // a context switch note via send_user_message's first-interaction logic.
                 emit_session_state(&handle, &trid, &trid, session.state());
 
-                info!("Chat session ready: task_run_id={}", trid);
+                info!("AI session ready: task_run_id={}", trid);
             }
             Err(e) => {
-                warn!("Failed to spawn chat session: {}", e);
+                warn!("Failed to spawn AI session: {}", e);
             }
         }
     });
@@ -366,7 +366,7 @@ pub async fn create_chat_session(
     // 3. Return immediately with task_run_id
     Ok(CommandResponse {
         success: true,
-        message: Some("Chat session creating".to_string()),
+        message: Some("AI session creating".to_string()),
         data: Some(serde_json::json!({
             "task_run_id": task_run_id,
             "state": "initializing",
@@ -374,17 +374,17 @@ pub async fn create_chat_session(
     })
 }
 
-/// Close a chat session.
+/// Close an AI session.
 ///
 /// Gracefully closes the Claude CLI session and updates the task run status.
 #[tauri::command]
-pub async fn close_chat_session(
+pub async fn close_ai_session(
     app_handle: tauri::AppHandle,
     session_manager: tauri::State<'_, Arc<SessionManager>>,
     app_state: tauri::State<'_, Arc<AppState>>,
     task_run_id: String,
 ) -> Result<CommandResponse, String> {
-    info!("close_chat_session: task_run_id={}", task_run_id);
+    info!("close_ai_session: task_run_id={}", task_run_id);
 
     // Remove and close the session
     if let Some(session) = session_manager.remove(&task_run_id) {
@@ -407,24 +407,24 @@ pub async fn close_chat_session(
 
     Ok(CommandResponse {
         success: true,
-        message: Some("Chat session closed".to_string()),
+        message: Some("AI session closed".to_string()),
         data: Some(serde_json::json!({
             "state": "closed",
         })),
     })
 }
 
-/// Rename a chat session.
+/// Rename an AI session.
 ///
 /// Updates the task_name for the task run in the database.
 #[tauri::command]
-pub async fn rename_chat_session(
+pub async fn rename_ai_session(
     app_state: tauri::State<'_, Arc<AppState>>,
     task_run_id: String,
     name: String,
 ) -> Result<CommandResponse, String> {
     info!(
-        "rename_chat_session: task_run_id={}, name={}",
+        "rename_ai_session: task_run_id={}, name={}",
         task_run_id, name
     );
 
@@ -451,13 +451,13 @@ pub async fn rename_chat_session(
     }
 }
 
-/// Get the output log for a chat session.
+/// Get the output log for an AI session.
 ///
 /// Returns the full conversation output. Combines the persisted DB output_log
 /// with any in-memory accumulated output from the live session that hasn't
 /// been persisted yet (e.g., the current or most recent AI response).
 #[tauri::command]
-pub async fn get_chat_output(
+pub async fn get_ai_output(
     app_state: tauri::State<'_, Arc<AppState>>,
     session_manager: tauri::State<'_, Arc<SessionManager>>,
     task_run_id: String,
@@ -541,7 +541,7 @@ pub async fn get_chat_output(
     })
 }
 
-/// Generate a workflow from a chat conversation.
+/// Generate a workflow from an AI session conversation.
 ///
 /// Reads the conversation output log and uses the workflow generator
 /// to create a UnifiedWorkflow from the conversation context.
@@ -549,7 +549,7 @@ pub async fn get_chat_output(
 /// of the full conversation, and enriches the context with spec generation
 /// instructions and existing page specs.
 #[tauri::command]
-pub async fn generate_workflow_from_chat(
+pub async fn generate_workflow_from_session(
     app_handle: tauri::AppHandle,
     app_state: tauri::State<'_, Arc<AppState>>,
     session_manager: tauri::State<'_, Arc<SessionManager>>,
@@ -559,7 +559,7 @@ pub async fn generate_workflow_from_chat(
     source_content: Option<String>,
 ) -> Result<CommandResponse, String> {
     info!(
-        "generate_workflow_from_chat: task_run_id={}, has_source_content={}",
+        "generate_workflow_from_session: task_run_id={}, has_source_content={}",
         task_run_id,
         source_content.is_some()
     );
@@ -631,9 +631,10 @@ pub async fn generate_workflow_from_chat(
         include_design_guidance: None,
         auto_run: None,
         model_overrides: None,
+        generate_specification: Some(true),
     };
 
-    // Emit a UI-only note that generation is starting (not sent to AI session —
+    // Emit a UI-only note that generation is starting (not sent to AI session --
     // the AI would respond prematurely while generation is still running).
     {
         let start_note = "Generating workflow from conversation...";
@@ -678,7 +679,7 @@ pub async fn generate_workflow_from_chat(
         match gen_result {
             Ok(response) => response,
             Err(e) => {
-                warn!("DB access failed for chat workflow generation: {}", e);
+                warn!("DB access failed for session workflow generation: {}", e);
                 crate::workflow_generation::GenerateWorkflowResponse {
                     workflow: None,
                     validation_errors: vec![],
@@ -688,6 +689,7 @@ pub async fn generate_workflow_from_chat(
                     verification_iterations: vec![],
                     hardening_summary: None,
                     discovery_calls: vec![],
+                    acceptance_criteria: None,
                 }
             }
         }
@@ -696,7 +698,7 @@ pub async fn generate_workflow_from_chat(
 
     match gen_result {
         Ok(response) => {
-            // Save workflow to database and store reference in chat task run
+            // Save workflow to database and store reference in AI session task run
             if response.success {
                 if let Some(ref workflow) = response.workflow {
                     // Persist to workflow library so it appears in the UI
@@ -763,7 +765,7 @@ pub async fn generate_workflow_from_chat(
                         }
                     }
 
-                    // Store generated_workflow_id in the chat task run's result_data
+                    // Store generated_workflow_id in the AI session task run's result_data
                     {
                         let wf_id = &workflow.id;
                         let wf_name = &workflow.name;
@@ -780,7 +782,7 @@ pub async fn generate_workflow_from_chat(
                         .await
                         .unwrap_or_else(|e| Err(e.to_string()))
                         {
-                            warn!("Failed to update chat task run result_data: {}", e);
+                            warn!("Failed to update AI session task run result_data: {}", e);
                         }
                     }
                 }
@@ -908,7 +910,7 @@ pub async fn generate_workflow_from_chat(
     }
 }
 
-/// Resume interrupted chat sessions on startup.
+/// Resume interrupted AI sessions on startup.
 ///
 /// Queries for task runs with status='running' and workflow_type='chat',
 /// parses their conversation history from the output_log, spawns new
@@ -916,49 +918,49 @@ pub async fn generate_workflow_from_chat(
 /// the SessionManager.
 ///
 /// Returns the number of sessions successfully resumed.
-pub async fn resume_chat_sessions(
+pub async fn resume_ai_sessions(
     db: Arc<CheckpointDb>,
     session_manager: Arc<SessionManager>,
     app_handle: tauri::AppHandle,
 ) -> u32 {
-    // Query running chat sessions
+    // Query running AI sessions
     let db_for_query = db.clone();
-    let chat_sessions =
-        match tokio::task::spawn_blocking(move || db_for_query.get_running_chat_sessions()).await {
+    let ai_sessions =
+        match tokio::task::spawn_blocking(move || db_for_query.get_running_ai_sessions()).await {
             Ok(Ok(sessions)) => sessions,
             Ok(Err(e)) => {
-                warn!("Failed to query running chat sessions: {}", e);
+                warn!("Failed to query running AI sessions: {}", e);
                 return 0;
             }
             Err(e) => {
-                warn!("Task panicked querying chat sessions: {}", e);
+                warn!("Task panicked querying AI sessions: {}", e);
                 return 0;
             }
         };
 
-    if chat_sessions.is_empty() {
+    if ai_sessions.is_empty() {
         return 0;
     }
 
     info!(
-        "Found {} interrupted chat session(s) to resume",
-        chat_sessions.len()
+        "Found {} interrupted AI session(s) to resume",
+        ai_sessions.len()
     );
 
     let mut resumed_count = 0u32;
 
-    for task_run in chat_sessions {
+    for task_run in ai_sessions {
         let task_run_id = task_run.id.clone();
         let task_name = task_run.task_name.clone();
 
-        // Skip stale sessions older than 24 hours — mark as stopped
+        // Skip stale sessions older than 24 hours -- mark as stopped
         if let Ok(ts) =
             chrono::NaiveDateTime::parse_from_str(&task_run.updated_at, "%Y-%m-%d %H:%M:%S")
         {
             let age = chrono::Utc::now().naive_utc() - ts;
             if age > chrono::Duration::hours(24) {
                 info!(
-                    "Chat session {} is stale ({} hours old), marking as stopped",
+                    "AI session {} is stale ({} hours old), marking as stopped",
                     task_run_id,
                     age.num_hours()
                 );
@@ -983,7 +985,7 @@ pub async fn resume_chat_sessions(
             Ok(Ok(Some(log))) => log,
             _ => {
                 info!(
-                    "No output_log for chat session {}, marking as stopped",
+                    "No output_log for AI session {}, marking as stopped",
                     task_run_id
                 );
                 let db_for_stop = db.clone();
@@ -1000,7 +1002,7 @@ pub async fn resume_chat_sessions(
         let turns = parse_conversation(&output_log);
         if turns.is_empty() {
             info!(
-                "Empty conversation for chat session {}, marking as stopped",
+                "Empty conversation for AI session {}, marking as stopped",
                 task_run_id
             );
             let db_for_stop = db.clone();
@@ -1053,7 +1055,7 @@ pub async fn resume_chat_sessions(
                         let session = Arc::new(session);
                         if let Err(e) = session_manager.register(&task_run_id, session.clone()) {
                             warn!(
-                                "Failed to register resumed chat session {}: {}",
+                                "Failed to register resumed AI session {}: {}",
                                 task_run_id, e
                             );
                             let _ = session.close();
@@ -1068,12 +1070,12 @@ pub async fn resume_chat_sessions(
                             SessionState::Processing,
                         );
 
-                        info!("Resumed chat session: {} (\"{}\")", task_run_id, task_name);
+                        info!("Resumed AI session: {} (\"{}\")", task_run_id, task_name);
                         resumed_count += 1;
                     }
                     Err(e) => {
                         error!(
-                            "Failed to send replay prompt for chat session {}: {}",
+                            "Failed to send replay prompt for AI session {}: {}",
                             task_run_id, e
                         );
                         let _ = session.close();

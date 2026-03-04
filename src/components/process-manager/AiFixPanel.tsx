@@ -3,12 +3,12 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { X, Send, Square } from "lucide-react";
 import { cn } from "../../lib/utils";
-import type { ChatMessage, ChatSessionState } from "@qontinui/shared-types";
+import type { AiMessage, AiSessionState } from "@qontinui/shared-types";
 
 interface AiFixPanelProps {
-  messages: ChatMessage[];
+  messages: AiMessage[];
   streamingContent: string;
-  sessionState: ChatSessionState;
+  sessionState: AiSessionState;
   processName: string;
   onSendFollowUp: (message: string) => void;
   onInterrupt: () => void;
@@ -183,7 +183,7 @@ export function AiFixPanel({
   );
 }
 
-function StatusBadge({ state }: { state: ChatSessionState }) {
+function StatusBadge({ state }: { state: AiSessionState }) {
   const config: Record<string, { label: string; color: string }> = {
     disconnected: { label: "disconnected", color: "text-zinc-500" },
     initializing: { label: "starting...", color: "text-amber-400" },

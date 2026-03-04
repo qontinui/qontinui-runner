@@ -47,7 +47,7 @@ import {
   GENERATION_TEMPLATES,
   type WorkflowGenerationTemplate,
 } from "@/lib/workflow-generation-templates";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 // Icon lookup map for template icons
 const TEMPLATE_ICONS: Record<string, LucideIcon> = {
@@ -117,7 +117,7 @@ export interface AiGeneratePanelProps {
 
 async function autoSaveGenerationPrompt(promptText: string): Promise<void> {
   try {
-    const resp = await fetch(`${getApiBase()}/prompts`);
+    const resp = await tracedFetch(`${getApiBase()}/prompts`);
     const json = await resp.json();
     const existing: SavedPrompt[] = json.data ?? [];
     const trimmed = promptText.trim();
@@ -128,7 +128,7 @@ async function autoSaveGenerationPrompt(promptText: string): Promise<void> {
 
     const name = trimmed.length > 60 ? trimmed.substring(0, 57) + "..." : trimmed;
 
-    await fetch(`${getApiBase()}/prompts`, {
+    await tracedFetch(`${getApiBase()}/prompts`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -243,7 +243,7 @@ export function AiGeneratePanel({
 
     (async () => {
       try {
-        const resp = await fetch(`${getApiBase()}/prompts`, { signal: controller.signal });
+        const resp = await tracedFetch(`${getApiBase()}/prompts`, { signal: controller.signal });
         const json = await resp.json();
         if (!cancelled) setSavedPrompts(json.data ?? []);
       } catch {
@@ -252,7 +252,7 @@ export function AiGeneratePanel({
     })();
     (async () => {
       try {
-        const resp = await fetch(`${getApiBase()}/contexts`, { signal: controller.signal });
+        const resp = await tracedFetch(`${getApiBase()}/contexts`, { signal: controller.signal });
         const json = await resp.json();
         if (!cancelled) setSavedContexts(json.data ?? []);
       } catch {
@@ -274,7 +274,7 @@ export function AiGeneratePanel({
 
     (async () => {
       try {
-        const resp = await fetch(`${getApiBase()}/settings/ai`, { signal: controller.signal });
+        const resp = await tracedFetch(`${getApiBase()}/settings/ai`, { signal: controller.signal });
         const json = await resp.json();
         if (!cancelled) setAiSettings(json.data ?? null);
       } catch {
@@ -335,7 +335,7 @@ export function AiGeneratePanel({
     setIsSavingTemplate(true);
     try {
       const name = trimmed.length > 60 ? trimmed.substring(0, 57) + "..." : trimmed;
-      await fetch(`${getApiBase()}/prompts`, {
+      await tracedFetch(`${getApiBase()}/prompts`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -347,7 +347,7 @@ export function AiGeneratePanel({
         }),
       });
       // Refresh prompts
-      const resp = await fetch(`${getApiBase()}/prompts`);
+      const resp = await tracedFetch(`${getApiBase()}/prompts`);
       const json = await resp.json();
       setSavedPrompts(json.data ?? []);
     } catch {
@@ -360,7 +360,7 @@ export function AiGeneratePanel({
   const handleDeleteSavedTemplate = useCallback(async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
     try {
-      await fetch(`${getApiBase()}/prompts/${id}`, { method: "DELETE" });
+      await tracedFetch(`${getApiBase()}/prompts/${id}`, { method: "DELETE" });
       setSavedPrompts((prev) => prev.filter((p) => p.id !== id));
     } catch {
       // Failed to delete
@@ -372,7 +372,7 @@ export function AiGeneratePanel({
     setIsImportingFile(true);
     setImportFeedback(null);
     try {
-      const importResp = await fetch(`${getApiBase()}/contexts/user/from-file`, {
+      const importResp = await tracedFetch(`${getApiBase()}/contexts/user/from-file`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ file_path: filePath.trim() }),
@@ -384,7 +384,7 @@ export function AiGeneratePanel({
       setFilePath("");
       setImportFeedback({ type: "success", message: "Context imported successfully" });
       // Refresh contexts
-      const resp = await fetch(`${getApiBase()}/contexts`);
+      const resp = await tracedFetch(`${getApiBase()}/contexts`);
       const json = await resp.json();
       setSavedContexts(json.data ?? []);
       // Auto-dismiss success after 3s
@@ -509,7 +509,7 @@ export function AiGeneratePanel({
 
   /** Fire a single generate-async request and return the task_run_id. */
   const fireGenerateRequest = async (request: Record<string, unknown>): Promise<string> => {
-    const resp = await fetch(`${getApiBase()}/unified-workflows/generate-async`, {
+    const resp = await tracedFetch(`${getApiBase()}/unified-workflows/generate-async`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(request),

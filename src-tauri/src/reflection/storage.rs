@@ -29,6 +29,7 @@ fn row_to_fix(row: &rusqlite::Row) -> rusqlite::Result<ReflectionFix> {
         applied_at: row.get("applied_at")?,
         evaluated_at: row.get("evaluated_at")?,
         created_at: row.get("created_at")?,
+        source_agent: row.get("source_agent").unwrap_or(None),
     })
 }
 
@@ -38,7 +39,7 @@ const SELECT_ALL_COLUMNS: &str = r#"
     fix_type, fix_description, file_changed,
     old_value, new_value, confidence, content_hash,
     status, effectiveness, effectiveness_evidence,
-    applied_at, evaluated_at, created_at
+    applied_at, evaluated_at, created_at, source_agent
 "#;
 
 /// Normalize text for semantic deduplication.
@@ -133,8 +134,8 @@ pub fn insert_fix(
             source_finding_id, source_knowledge_id,
             fix_type, fix_description, file_changed,
             old_value, new_value, confidence, content_hash,
-            status, applied_at, created_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'applied', ?13, ?13)
+            status, applied_at, created_at, source_agent
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'applied', ?13, ?13, ?14)
         "#,
         params![
             id,
@@ -150,6 +151,7 @@ pub fn insert_fix(
             input.confidence,
             content_hash,
             now,
+            input.source_agent,
         ],
     )
     .map_err(|e| format!("Failed to insert reflection fix: {}", e))?;
@@ -485,6 +487,7 @@ mod tests {
                 applied_at TEXT NOT NULL,
                 evaluated_at TEXT,
                 created_at TEXT NOT NULL,
+                source_agent TEXT,
                 FOREIGN KEY (source_task_run_id) REFERENCES task_runs(id),
                 FOREIGN KEY (reflection_task_run_id) REFERENCES task_runs(id)
             );
@@ -519,6 +522,7 @@ mod tests {
             old_value: None,
             new_value: Some("New docs content".to_string()),
             confidence: "high".to_string(),
+            source_agent: None,
         };
 
         let fix = insert_fix(&conn, &input).unwrap();
@@ -558,6 +562,7 @@ mod tests {
                 old_value: None,
                 new_value: None,
                 confidence: "medium".to_string(),
+                source_agent: None,
             };
             insert_fix(&conn, &input).unwrap();
         }
@@ -590,6 +595,7 @@ mod tests {
             old_value: Some("5000".to_string()),
             new_value: Some("15000".to_string()),
             confidence: "high".to_string(),
+            source_agent: None,
         };
 
         let fix = insert_fix(&conn, &input).unwrap();
@@ -635,6 +641,7 @@ mod tests {
             old_value: None,
             new_value: Some("New API docs".to_string()),
             confidence: "high".to_string(),
+            source_agent: None,
         };
 
         let fix1 = insert_fix(&conn, &input).unwrap();
@@ -652,6 +659,7 @@ mod tests {
             old_value: None,
             new_value: Some("New API docs".to_string()),
             confidence: "high".to_string(),
+            source_agent: None,
         };
 
         let fix2 = insert_fix(&conn, &input2).unwrap();
@@ -688,6 +696,7 @@ mod tests {
             old_value: None,
             new_value: None,
             confidence: "high".to_string(),
+            source_agent: None,
         };
 
         let input2 = CreateReflectionFixInput {
@@ -701,6 +710,7 @@ mod tests {
             old_value: None,
             new_value: None,
             confidence: "high".to_string(),
+            source_agent: None,
         };
 
         let fix1 = insert_fix(&conn, &input1).unwrap();

@@ -10,7 +10,7 @@ import { useState, useCallback } from "react";
 import { CheckSquare, Square } from "lucide-react";
 import { cn } from "../../../../../lib/utils";
 import type { CanvasPanelComponentProps } from "./CanvasComponentRegistry";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 interface ChecklistItem {
   id: string;
@@ -53,7 +53,7 @@ export function ChecklistPanel({ data, size, panelId, readOnly }: CanvasPanelCom
 
       // Persist to backend
       try {
-        await fetch(`${getApiBase()}/canvas/panels/${panelId}`, {
+        await tracedFetch(`${getApiBase()}/canvas/panels/${panelId}`, {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ data: { items: updatedItems } }),

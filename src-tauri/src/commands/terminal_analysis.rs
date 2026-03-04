@@ -408,6 +408,95 @@ fn collect_plan_files(dir: &PathBuf, candidates: &mut Vec<(SystemTime, PathBuf)>
     }
 }
 
+// ============================================================================
+// Command 6: Page Architecture (static — no AI)
+// ============================================================================
+
+/// Return a hardcoded architecture diagram of the Terminal page's component hierarchy.
+///
+/// No input required, no AI call — returns static ArchitectureGraph + KeyValue panels.
+#[tauri::command]
+pub async fn analyze_page_architecture() -> Result<CommandResponse, String> {
+    info!("analyze_page_architecture: returning static page map");
+
+    let panels = serde_json::json!({
+        "panels": [
+            {
+                "panel_id": "page-arch-graph",
+                "title": "Terminal Page — Component Architecture",
+                "component": "ArchitectureGraph",
+                "data": {
+                    "nodes": [
+                        { "id": "terminal-page",    "label": "TerminalPage",              "layer": "frontend", "changed": true,  "description": "Orchestrator — three-panel layout with tabs, sidebar, and right panel" },
+                        { "id": "tab-bar",           "label": "TerminalTabBar",            "layer": "frontend", "changed": false, "description": "Tab management — create, close, rename, and switch terminal tabs" },
+                        { "id": "action-bar",        "label": "TerminalActionBar",         "layer": "frontend", "changed": true,  "description": "Sidebar toggle, plan indicator, and analysis action buttons" },
+                        { "id": "notification",      "label": "TerminalNotification",      "layer": "frontend", "changed": false, "description": "Auto-dismiss notification bar for success/error messages" },
+                        { "id": "terminal-inst",     "label": "TerminalInstance",          "layer": "frontend", "changed": false, "description": "xterm.js terminal emulator (one per tab)" },
+                        { "id": "session-sidebar",   "label": "TranscriptSessionSidebar",  "layer": "frontend", "changed": true,  "description": "Left panel — Claude Code session list with plan dot indicators" },
+                        { "id": "content-panel",     "label": "TranscriptContentPanel",    "layer": "frontend", "changed": true,  "description": "Right panel — message viewer with workflow generation" },
+                        { "id": "analysis-panel",    "label": "TerminalAnalysisPanel",     "layer": "frontend", "changed": true,  "description": "Right panel — canvas-based analysis output renderer" },
+                        { "id": "workflow-preview",  "label": "WorkflowPreviewPanel",      "layer": "frontend", "changed": false, "description": "Right panel — generated workflow Execute/Edit/Save actions" },
+                        { "id": "use-terminal-mgr",  "label": "useTerminalManager",        "layer": "shared",   "changed": false, "description": "Tab state management hook (create, close, rename, reconnect)" },
+                        { "id": "use-transcript",    "label": "useTranscriptSessions",     "layer": "shared",   "changed": true,  "description": "Session list + message loading hook" },
+                        { "id": "transcript-rs",     "label": "transcript commands",       "layer": "runner",   "changed": true,  "description": "Rust: list_sessions, read_session, generate_workflow" },
+                        { "id": "analysis-rs",       "label": "analysis commands",         "layer": "runner",   "changed": true,  "description": "Rust: 5 AI analysis types + page-architecture (static)" },
+                        { "id": "ai-provider",       "label": "AI Provider",               "layer": "backend",  "changed": false, "description": "LLM prompt/response backend for analysis commands" }
+                    ],
+                    "edges": [
+                        { "source": "terminal-page",   "target": "tab-bar",          "label": "renders",   "type": "dependency" },
+                        { "source": "terminal-page",   "target": "action-bar",       "label": "renders",   "type": "dependency" },
+                        { "source": "terminal-page",   "target": "notification",     "label": "renders",   "type": "dependency" },
+                        { "source": "terminal-page",   "target": "terminal-inst",    "label": "renders",   "type": "dependency" },
+                        { "source": "terminal-page",   "target": "session-sidebar",  "label": "renders",   "type": "dependency" },
+                        { "source": "terminal-page",   "target": "content-panel",    "label": "renders",   "type": "dependency" },
+                        { "source": "terminal-page",   "target": "analysis-panel",   "label": "renders",   "type": "dependency" },
+                        { "source": "terminal-page",   "target": "workflow-preview", "label": "renders",   "type": "dependency" },
+                        { "source": "terminal-page",   "target": "use-terminal-mgr", "label": "uses",     "type": "dependency" },
+                        { "source": "terminal-page",   "target": "use-transcript",   "label": "uses",     "type": "dependency" },
+                        { "source": "content-panel",   "target": "transcript-rs",    "label": "invoke",   "type": "api" },
+                        { "source": "use-transcript",  "target": "transcript-rs",    "label": "invoke",   "type": "api" },
+                        { "source": "analysis-panel",  "target": "analysis-rs",      "label": "invoke",   "type": "api" },
+                        { "source": "analysis-rs",     "target": "ai-provider",      "label": "LLM call", "type": "api" }
+                    ]
+                }
+            },
+            {
+                "panel_id": "page-arch-legend",
+                "title": "Component Responsibilities",
+                "component": "KeyValue",
+                "data": {
+                    "entries": [
+                        { "key": "TerminalPage",              "value": "Top-level orchestrator — manages three-panel layout, analysis dispatch, and workflow generation" },
+                        { "key": "TerminalTabBar",            "value": "Tab strip with create/close/rename — keyboard shortcuts Ctrl+Shift+T/W and Ctrl+Tab" },
+                        { "key": "TerminalActionBar",         "value": "Two-row bar: session browser toggle + plan indicator (row 1), analysis buttons (row 2)" },
+                        { "key": "TerminalNotification",      "value": "Auto-dismiss success/error banner below the action bar" },
+                        { "key": "TerminalInstance",          "value": "xterm.js terminal — one per tab, provides getScrollback() and getSelection() for analysis" },
+                        { "key": "TranscriptSessionSidebar",  "value": "Left panel — lists Claude Code sessions from SQLite, shows plan-dot status per session" },
+                        { "key": "TranscriptContentPanel",    "value": "Right panel — displays messages from a selected session, offers 'Generate Workflow' action" },
+                        { "key": "TerminalAnalysisPanel",     "value": "Right panel — renders CanvasWidget panels (graphs, tables, checklists) from analysis commands" },
+                        { "key": "WorkflowPreviewPanel",      "value": "Right panel — shows generated workflow with Execute, Edit in Builder, and Save actions" },
+                        { "key": "useTerminalManager",        "value": "Hook: tab CRUD, PTY session reconnection, and state persistence" },
+                        { "key": "useTranscriptSessions",     "value": "Hook: loads session list and individual session messages via Tauri IPC" },
+                        { "key": "transcript commands (Rust)", "value": "list_sessions, read_session, get_latest, generate_workflow_standalone" },
+                        { "key": "analysis commands (Rust)",   "value": "session_summary, architecture, change_impact, plan_progress, cross_tab, page_architecture" },
+                        { "key": "AI Provider",               "value": "Configurable LLM backend — used by 5 analysis commands (page_architecture is static)" }
+                    ]
+                }
+            }
+        ]
+    });
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Page architecture diagram generated".to_string()),
+        data: Some(panels),
+    })
+}
+
+// ============================================================================
+// Plan content loader
+// ============================================================================
+
 /// Find and return the content of the most recently modified plan file.
 ///
 /// Search order:

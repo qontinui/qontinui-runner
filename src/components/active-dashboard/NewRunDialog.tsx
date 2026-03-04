@@ -11,7 +11,7 @@ import { X, Monitor, Cloud, AlertTriangle, Loader2 } from "lucide-react";
 import { Button } from "../ui";
 import { getAccentColors } from "@/design-system";
 import { useActiveRuns } from "../../contexts/ActiveRunsContext";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 type RunMode = "gui" | "headless";
 
@@ -83,7 +83,7 @@ export function NewRunDialog({ open, onClose, onSuccess }: NewRunDialogProps) {
         force_gui_lock: selectedMode === "gui" && forceGuiLock,
       };
 
-      const response = await fetch(`${getApiBase()}/bridges`, {
+      const response = await tracedFetch(`${getApiBase()}/bridges`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",

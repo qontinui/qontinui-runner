@@ -10,6 +10,10 @@ use super::state::SessionState;
 /// Manages active Claude CLI sessions, keyed by task_run_id.
 pub struct SessionManager {
     sessions: Mutex<HashMap<String, Arc<ClaudeSession>>>,
+    /// PIDs for inline (non-interactive) Claude sessions, keyed by task_run_id.
+    /// These sessions don't have a full ClaudeSession object but still need to be
+    /// visible to the stale task sweep so it can check process liveness.
+    inline_pids: Mutex<HashMap<String, u32>>,
     /// Pending context to prepend to the next user message for a given task_run_id.
     /// Used for system notes that should be delivered with the next user message
     /// rather than sent as standalone messages (which would trigger unwanted response turns).
@@ -20,6 +24,7 @@ impl SessionManager {
     pub fn new() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            inline_pids: Mutex::new(HashMap::new()),
             pending_context: Mutex::new(HashMap::new()),
         }
     }
@@ -76,10 +81,33 @@ impl SessionManager {
         self.get(task_run_id).map(|s| s.state())
     }
 
+    /// Register an inline (non-interactive) session's PID for stale task sweep visibility.
+    /// Unlike `register`, this doesn't require a full ClaudeSession — just the PID.
+    pub fn register_inline_pid(&self, task_run_id: &str, pid: u32) {
+        if let Ok(mut guard) = self.inline_pids.lock() {
+            guard.insert(task_run_id.to_string(), pid);
+            info!(
+                "SessionManager: registered inline PID {} for {}",
+                pid, task_run_id
+            );
+        }
+    }
+
+    /// Remove an inline session's PID (called when the inline session completes).
+    pub fn remove_inline_pid(&self, task_run_id: &str) {
+        if let Ok(mut guard) = self.inline_pids.lock() {
+            if guard.remove(task_run_id).is_some() {
+                info!("SessionManager: removed inline PID for {}", task_run_id);
+            }
+        }
+    }
+
     /// List all sessions with their task_run_id, current state, and PID.
-    /// Used by the zombie sweep to check session liveness.
+    /// Includes both interactive sessions and inline PID registrations.
+    /// Used by the stale task sweep to check session liveness.
     pub fn list_all_with_state(&self) -> Vec<(String, SessionState, u32)> {
-        self.sessions
+        let mut results: Vec<(String, SessionState, u32)> = self
+            .sessions
             .lock()
             .map(|guard| {
                 guard
@@ -87,7 +115,19 @@ impl SessionManager {
                     .map(|(k, s)| (k.clone(), s.state(), s.pid()))
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+
+        // Include inline PIDs with a synthetic Processing state
+        if let Ok(guard) = self.inline_pids.lock() {
+            for (id, pid) in guard.iter() {
+                // Only add if not already covered by an interactive session
+                if !results.iter().any(|(k, _, _)| k == id) {
+                    results.push((id.clone(), SessionState::Processing, *pid));
+                }
+            }
+        }
+
+        results
     }
 
     /// List all active session task_run_ids.
@@ -158,17 +198,27 @@ impl SessionManager {
     pub fn close_all_sessions(&self) {
         if let Ok(mut guard) = self.sessions.lock() {
             let count = guard.len();
-            if count == 0 {
-                return;
+            if count > 0 {
+                info!("SessionManager: closing all {} active sessions", count);
+                for (task_run_id, session) in guard.drain() {
+                    info!(
+                        "SessionManager: closing session for {} (state: {})",
+                        task_run_id,
+                        session.state()
+                    );
+                    let _ = session.close();
+                }
             }
-            info!("SessionManager: closing all {} active sessions", count);
-            for (task_run_id, session) in guard.drain() {
+        }
+        // Also clear inline PID registrations
+        if let Ok(mut guard) = self.inline_pids.lock() {
+            let count = guard.len();
+            if count > 0 {
                 info!(
-                    "SessionManager: closing session for {} (state: {})",
-                    task_run_id,
-                    session.state()
+                    "SessionManager: clearing {} inline PID registrations",
+                    count
                 );
-                let _ = session.close();
+                guard.clear();
             }
         }
     }

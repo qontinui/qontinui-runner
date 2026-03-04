@@ -65,6 +65,13 @@ import { FlowExecutionWidget, FlowExecutionSummary, useFlowExecutionData } from 
 // Import Canvas widget
 import { CanvasWidget, CanvasSummary, useCanvasData } from "./canvas";
 
+// Import Trace Viewer widget
+import {
+  TraceViewerDashboardWidget,
+  TraceViewerDashboardSummary,
+  useTraceViewerWidgetData,
+} from "./trace-viewer";
+
 /**
  * Register all dashboard widgets.
  * Call this once at app initialization.
@@ -269,6 +276,20 @@ export function registerAllWidgets(): void {
     detectActivity: defaultDetectors.canvas,
     defaultPriority: 3,
     detailRoute: "/canvas",
+  });
+
+  // Trace Viewer - Jaeger-inspired waterfall execution trace viewer
+  widgetRegistry.register({
+    id: "trace_viewer",
+    displayName: "Trace Viewer",
+    icon: "Activity",
+    accentColor: "sky",
+    FullComponent: TraceViewerDashboardWidget,
+    SummaryComponent: TraceViewerDashboardSummary,
+    useData: useTraceViewerWidgetData,
+    detectActivity: defaultDetectors.trace_viewer,
+    defaultPriority: 40,
+    detailRoute: "/runs/traces",
   });
 
   // Mark registry as initialized

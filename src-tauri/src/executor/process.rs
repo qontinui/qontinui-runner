@@ -120,6 +120,12 @@ impl ProcessManager {
         // Set environment variable as backup
         cmd.env("QONTINUI_DISABLE_CONSOLE_LOGGING", "1");
 
+        // Inject trace context for cross-service correlation
+        {
+            let trace_id = uuid::Uuid::new_v4().to_string();
+            cmd.env("QONTINUI_TRACE_ID", &trace_id);
+        }
+
         // Set the model cache directory for lazy loading
         if let Ok(app_data_dir) = self.app_handle.path().app_data_dir() {
             let models_dir = app_data_dir.join("models");
@@ -162,6 +168,12 @@ impl ProcessManager {
 
         // Set environment variable as backup
         cmd.env("QONTINUI_DISABLE_CONSOLE_LOGGING", "1");
+
+        // Inject trace context for cross-service correlation
+        {
+            let trace_id = uuid::Uuid::new_v4().to_string();
+            cmd.env("QONTINUI_TRACE_ID", &trace_id);
+        }
 
         // Set the model cache directory for lazy loading
         if let Ok(app_data_dir) = self.app_handle.path().app_data_dir() {

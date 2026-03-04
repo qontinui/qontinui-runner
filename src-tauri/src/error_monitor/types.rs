@@ -337,6 +337,8 @@ pub struct ErrorEvent {
     pub raw_entry: String,
     /// Timestamp from the log entry
     pub log_timestamp: Option<String>,
+    /// Trace ID for cross-service correlation
+    pub trace_id: Option<String>,
 }
 
 impl ErrorEvent {
@@ -410,6 +412,8 @@ pub struct StoredErrorEvent {
     pub resolved_by_task_run_id: Option<String>,
     /// Resolution notes
     pub resolution_notes: Option<String>,
+    /// Trace ID for cross-service correlation
+    pub trace_id: Option<String>,
     /// When acknowledged
     pub acknowledged_at: Option<String>,
     /// When resolved
@@ -507,6 +511,7 @@ mod tests {
             context_lines: None,
             raw_entry: "error log line".to_string(),
             log_timestamp: None,
+            trace_id: None,
         };
 
         let hash1 = event.compute_signature_hash();

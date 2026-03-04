@@ -250,6 +250,9 @@ fn spawn_and_wait_with_doctor(
     // The runner legitimately needs to spawn Claude CLI as a subprocess, not as a nested session.
     cmd.env_remove("CLAUDECODE");
 
+    // Inject trace ID for cross-process correlation
+    cmd.env("QONTINUI_TRACE_ID", uuid::Uuid::new_v4().to_string());
+
     match doctor_handle {
         Some(handle) => {
             // Must pipe stdout/stderr so wait_with_output() can capture them.

@@ -9,7 +9,7 @@ import { useState, useEffect, useMemo } from "react";
 import { MessageSquare, Search, X, Loader2, Check } from "lucide-react";
 import type { SavedPrompt, WorkflowPhase } from "../../types";
 import { getAccentColors } from "@/design-system";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 interface PromptLibraryPickerProps {
   /** Whether the picker is open */
@@ -44,7 +44,7 @@ export function PromptLibraryPicker({
     const fetchPrompts = async () => {
       setIsLoading(true);
       try {
-        const response = await fetch(`${getApiBase()}/prompts`, { signal: controller.signal });
+        const response = await tracedFetch(`${getApiBase()}/prompts`, { signal: controller.signal });
         const data = await response.json();
         if (!cancelled && data.success && data.data) {
           setSavedPrompts(data.data);

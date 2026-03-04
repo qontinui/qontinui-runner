@@ -31,6 +31,7 @@ pub struct ReflectionDeps {
     pub config_storage: Arc<tokio::sync::Mutex<ConfigStorage>>,
     pub app_handle: tauri::AppHandle,
     pub pid_tracker: Arc<std::sync::Mutex<Vec<u32>>>,
+    pub session_manager: Option<Arc<crate::claude_session::SessionManager>>,
 }
 
 /// Check whether a reflection run should be launched for the given task run.
@@ -349,10 +350,11 @@ pub fn launch_reflection(
     let completion_automation_steps = completion_steps;
 
     // Build LoopController with full deps
-    // Note: We intentionally do NOT pass session_manager here.
-    // Reflection workflows use inline mode (one-shot), not interactive sessions,
-    // because the Claude CLI interactive session fails during initialization
-    // when spawned programmatically from a background task.
+    // Note: We do NOT use interactive sessions here (reflection workflows use
+    // inline one-shot mode because the Claude CLI interactive session fails
+    // during initialization when spawned from a background task).
+    // However, we DO pass the session_manager for inline PID registration,
+    // which gives the stale task sweep visibility into running inline processes.
     let reflection_fix_ctx = crate::mcp::shared::ReflectionFixContext {
         source_task_run_id: source_task_run_id.clone(),
         reflection_task_run_id: reflection_id.clone(),
@@ -365,6 +367,11 @@ pub fn launch_reflection(
         deps.pid_tracker.clone(),
     )
     .with_reflection_fix_ctx(reflection_fix_ctx);
+
+    // Pass session_manager for inline PID tracking (not interactive sessions)
+    if let Some(sm) = deps.session_manager {
+        controller = controller.with_session_manager(sm);
+    }
 
     info!(
         "Spawning reflection workflow '{}' (id: {}) with {} setup steps",

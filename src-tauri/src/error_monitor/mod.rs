@@ -56,6 +56,7 @@
 pub mod commands;
 pub mod curator;
 pub mod parsers;
+pub mod pipeline;
 pub mod service;
 pub mod storage;
 pub mod types;

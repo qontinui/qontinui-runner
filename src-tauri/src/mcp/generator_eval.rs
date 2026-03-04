@@ -796,4 +796,86 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/generator-eval/examples/{workflow_id}",
             put(update_example_status_handler),
         )
+        // Training Data Export
+        .route("/generator-eval/training-data", get(training_data_handler))
+        // Prompt Analysis Insights
+        .route("/generator-eval/insights", get(prompt_insights_handler))
+}
+
+// ============================================================================
+// Training Data Export
+// ============================================================================
+
+#[derive(Deserialize)]
+struct TrainingDataQuery {
+    agent: String,
+    #[serde(default = "default_min_score")]
+    min_score: f64,
+    #[serde(default = "default_training_limit")]
+    limit: u32,
+}
+
+fn default_min_score() -> f64 {
+    0.0
+}
+fn default_training_limit() -> u32 {
+    1000
+}
+
+async fn training_data_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(params): Query<TrainingDataQuery>,
+) -> Result<
+    Json<ApiResponse<Vec<crate::workflow_generation::training_data::TrainingExample>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    let db = state.app_state.checkpoint_db.clone();
+    let agent = params.agent;
+    let min_score = params.min_score;
+    let limit = params.limit;
+
+    let examples = tokio::task::spawn_blocking(move || {
+        let conn = db.get_conn_string()?;
+        crate::workflow_generation::training_data::export_training_data(
+            &conn, &agent, min_score, limit,
+        )
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(e.to_string())),
+        )
+    })?
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+
+    Ok(Json(ApiResponse::success(examples)))
+}
+
+// ============================================================================
+// Prompt Analysis Insights
+// ============================================================================
+
+async fn prompt_insights_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<
+    Json<ApiResponse<Vec<crate::workflow_generation::prompt_analysis::PromptInsight>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    let db = state.app_state.checkpoint_db.clone();
+
+    let insights = tokio::task::spawn_blocking(move || {
+        let conn = db.get_conn_string()?;
+        crate::workflow_generation::prompt_analysis::analyze_all(&conn)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(e.to_string())),
+        )
+    })?
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+
+    Ok(Json(ApiResponse::success(insights)))
 }

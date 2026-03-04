@@ -25,7 +25,7 @@ import type {
   FixType,
   FixEffectiveness,
 } from "../../types/reflection";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 // ============================================================================
 // Constants
@@ -62,7 +62,7 @@ interface ApiResponse<T> {
 
 async function fetchApi<T>(url: string): Promise<T | null> {
   try {
-    const response = await fetch(url);
+    const response = await tracedFetch(url);
     if (!response.ok) return null;
     const json: ApiResponse<T> = await response.json();
     return json.success ? (json.data ?? null) : null;
@@ -103,7 +103,7 @@ export function ReflectionDashboard() {
 
     async function loadWorkflows() {
       try {
-        const resp = await fetch(`${getApiBase()}/task-runs?limit=100`, {
+        const resp = await tracedFetch(`${getApiBase()}/task-runs?limit=100`, {
           signal: controller.signal,
         });
         const json = await resp.json();

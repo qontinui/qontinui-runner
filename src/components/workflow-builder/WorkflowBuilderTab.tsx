@@ -98,7 +98,7 @@ import { PageTutorialMenu } from "../tutorial";
 import { getAccentColors } from "@/design-system";
 import { BatchDeleteDialog, ConfirmDialog } from "../ui";
 import { registerUserSkills } from "@qontinui/workflow-utils";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { CompositionBuilderDialog } from "./CompositionBuilderDialog";
 import { SkillExportDialog } from "./SkillExportDialog";
 import { SkillImportDialog } from "./SkillImportDialog";
@@ -1164,7 +1164,7 @@ function WorkflowBuilderContent({
   const fetchWorkflows = useCallback(async () => {
     setWorkflowsLoading(true);
     try {
-      const response = await fetch(`${getApiBase()}/unified-workflows`);
+      const response = await tracedFetch(`${getApiBase()}/unified-workflows`);
       const result = await response.json();
       if (result.success && result.data) {
         setSavedWorkflows(result.data);
@@ -1217,7 +1217,7 @@ function WorkflowBuilderContent({
     setIsDeletingWorkflows(true);
     try {
       const deletePromises = Array.from(selectedWorkflowIds).map((id) =>
-        fetch(`${getApiBase()}/unified-workflows/${id}`, { method: "DELETE" }),
+        tracedFetch(`${getApiBase()}/unified-workflows/${id}`, { method: "DELETE" }),
       );
       await Promise.all(deletePromises);
 
@@ -1256,7 +1256,7 @@ function WorkflowBuilderContent({
 
     setIsExportingWorkflow(true);
     try {
-      const response = await fetch(`${getApiBase()}/unified-workflows/${state.workflow.id}/export`);
+      const response = await tracedFetch(`${getApiBase()}/unified-workflows/${state.workflow.id}/export`);
       const data = await response.json();
       if (data.success && data.data) {
         const exportData = data.data as WorkflowExport;
@@ -1305,7 +1305,7 @@ function WorkflowBuilderContent({
         }
 
         // Call the import API
-        const response = await fetch(`${getApiBase()}/unified-workflows/import`, {
+        const response = await tracedFetch(`${getApiBase()}/unified-workflows/import`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -1338,7 +1338,7 @@ function WorkflowBuilderContent({
   // Open the export dialog with a list of available skills
   const handleOpenExportDialog = useCallback(async () => {
     try {
-      const res = await fetch(`${getApiBase()}/skills`);
+      const res = await tracedFetch(`${getApiBase()}/skills`);
       const data = await res.json();
       const allSkills = data.data ?? data ?? [];
       const nonBuiltin = allSkills
@@ -1366,7 +1366,7 @@ function WorkflowBuilderContent({
     setShowSkillExportDialog(false);
     try {
       const skillIds = Array.from(selectedSkillIdsForExport);
-      const response = await fetch(`${getApiBase()}/skills/export`, {
+      const response = await tracedFetch(`${getApiBase()}/skills/export`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ skill_ids: skillIds }),
@@ -1427,7 +1427,7 @@ function WorkflowBuilderContent({
     setShowSkillImportDialog(false);
     setIsImportingSkills(true);
     try {
-      const response = await fetch(`${getApiBase()}/skills/import`, {
+      const response = await tracedFetch(`${getApiBase()}/skills/import`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1447,7 +1447,7 @@ function WorkflowBuilderContent({
         // Refresh the skill registry so imported skills appear immediately
         if (imported > 0 || overwritten > 0) {
           try {
-            const skillsRes = await fetch(`${getApiBase()}/skills`);
+            const skillsRes = await tracedFetch(`${getApiBase()}/skills`);
             const skillsData = await skillsRes.json();
             const allSkills = skillsData.data ?? skillsData ?? [];
             const nonBuiltin = allSkills.filter((s: { source: string }) => s.source !== "builtin");
@@ -1470,7 +1470,7 @@ function WorkflowBuilderContent({
   // === Skill Fork ===
   const _handleForkSkill = useCallback(async (skillId: string, newName?: string) => {
     try {
-      const response = await fetch(`${getApiBase()}/skills/${skillId}/fork`, {
+      const response = await tracedFetch(`${getApiBase()}/skills/${skillId}/fork`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ new_name: newName || undefined }),
@@ -1481,7 +1481,7 @@ function WorkflowBuilderContent({
         return;
       }
       // Refresh skills after fork
-      const allResponse = await fetch(`${getApiBase()}/skills`);
+      const allResponse = await tracedFetch(`${getApiBase()}/skills`);
       if (allResponse.ok) {
         const allSkills = await allResponse.json();
         const nonBuiltin = allSkills.filter((s: { source: string }) => s.source !== "builtin");
@@ -1495,7 +1495,7 @@ function WorkflowBuilderContent({
   // === Skill Approval ===
   const _handleApproveSkill = useCallback(async (skillId: string, status: string) => {
     try {
-      const response = await fetch(`${getApiBase()}/skills/${skillId}/approve`, {
+      const response = await tracedFetch(`${getApiBase()}/skills/${skillId}/approve`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ status }),
@@ -1506,7 +1506,7 @@ function WorkflowBuilderContent({
         return;
       }
       // Refresh skills after approval change
-      const allResponse = await fetch(`${getApiBase()}/skills`);
+      const allResponse = await tracedFetch(`${getApiBase()}/skills`);
       if (allResponse.ok) {
         const allSkills = await allResponse.json();
         const nonBuiltin = allSkills.filter((s: { source: string }) => s.source !== "builtin");
@@ -1564,7 +1564,7 @@ function WorkflowBuilderContent({
           // No timeout_seconds - runs until completion or manual stop
         });
 
-        fetch(runUrl, {
+        tracedFetch(runUrl, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: requestBody,
@@ -1632,7 +1632,7 @@ function WorkflowBuilderContent({
   // Handle stop execution
   const handleStop = useCallback(async () => {
     try {
-      const response = await fetch(`${getApiBase()}/stop-execution`, {
+      const response = await tracedFetch(`${getApiBase()}/stop-execution`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
       });
@@ -2641,7 +2641,7 @@ function WorkflowBuilderContent({
                   onClose={() => setDropdownOpen(false)}
                   onSkillUsed={async (skillId) => {
                     try {
-                      await fetch(`${getApiBase()}/skills/${skillId}/increment-usage`, {
+                      await tracedFetch(`${getApiBase()}/skills/${skillId}/increment-usage`, {
                         method: "POST",
                       });
                     } catch {

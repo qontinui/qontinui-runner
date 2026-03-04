@@ -22,7 +22,7 @@ import {
   type OrchestratorStateChangePayload,
 } from "../useWebSocketEvents";
 import { useWorkflowExecutionOptional } from "../../contexts/WorkflowExecutionContext";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 // Polling is now fallback only - real-time events provide instant updates
 const POLL_INTERVAL_MS = 5000;
@@ -137,7 +137,7 @@ export function useOrchestratorState(
     }
 
     try {
-      const response = await fetch(`${getApiBase()}/task-runs/${taskId}/orchestrator-state`);
+      const response = await tracedFetch(`${getApiBase()}/task-runs/${taskId}/orchestrator-state`);
       if (!response.ok) {
         throw new Error(`Failed to fetch orchestrator state: ${response.statusText}`);
       }

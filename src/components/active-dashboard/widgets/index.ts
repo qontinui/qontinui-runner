@@ -101,6 +101,17 @@ export {
   type FlowExecutionData,
 } from "./flow-execution";
 
+// Trace Viewer
+export {
+  TraceViewerWidget,
+  TraceViewerSummary,
+  TraceViewerDashboardWidget,
+  TraceViewerDashboardSummary,
+  useTraceViewerData,
+  useTraceViewerWidgetData,
+  type TraceViewerWidgetData,
+} from "./trace-viewer";
+
 // Convergence (standalone widget - not registry-based)
 export { ConvergenceWidget } from "./convergence";
 

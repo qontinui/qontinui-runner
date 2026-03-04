@@ -18,7 +18,7 @@ import { getAccentColors } from "@/design-system";
 import { groupEntriesIntoLoops /* type AiLoop */ } from "../types/aiLoop";
 import { useAiTaskPolling } from "../hooks";
 import { AiMessageDisplay, groupEntriesBySource } from "./shared";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 export interface AiOutputLine {
   id: string;
@@ -259,7 +259,7 @@ export function AiOutputTab({
   // Stop the current AI analysis
   const handleStopAi = useCallback(async () => {
     try {
-      const response = await fetch(`${getApiBase()}/stop-ai-analysis`, {
+      const response = await tracedFetch(`${getApiBase()}/stop-ai-analysis`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
       });
@@ -287,7 +287,7 @@ export function AiOutputTab({
       // This is the authoritative source - if no tasks are running, AI is not working
       let hasRunningTasks = false;
       try {
-        const response = await fetch(`${getApiBase()}/task-runs/running`);
+        const response = await tracedFetch(`${getApiBase()}/task-runs/running`);
         if (response.ok) {
           const tasks = await response.json();
           hasRunningTasks = Array.isArray(tasks) && tasks.length > 0;

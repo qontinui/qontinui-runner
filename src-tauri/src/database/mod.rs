@@ -138,9 +138,9 @@ pub struct CachedAppSpec {
     pub page_url: Option<String>,
 }
 
-/// Lightweight summary of a chat session for sidebar listing.
+/// Lightweight summary of an AI session for sidebar listing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatSessionSummary {
+pub struct AiSessionSummary {
     pub id: String,
     pub task_name: String,
     pub status: String,
@@ -5828,6 +5828,98 @@ impl CheckpointDb {
             info!("Successfully migrated to version 85 (phase token usage tracking)");
         }
 
+        // Version 86: Add trace_id to error_events for cross-service trace correlation
+        if current_version < 86 {
+            info!("Migrating to version 86 (cross-service trace propagation)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE error_events ADD COLUMN trace_id TEXT;
+                CREATE INDEX IF NOT EXISTS idx_error_events_trace_id ON error_events(trace_id);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (86, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 86: {}", e))?;
+
+            info!("Successfully migrated to version 86 (cross-service trace propagation)");
+        }
+
+        // Version 87: Add UI Bridge integrations tracking table
+        if current_version < 87 {
+            info!("Migrating to version 87 (UI Bridge integrations tracking)...");
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS ui_bridge_integrations (
+                    id TEXT PRIMARY KEY,
+                    project_path TEXT NOT NULL,
+                    label TEXT,
+                    framework TEXT,
+                    integration_type TEXT NOT NULL,
+                    sdk_version TEXT,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    proxy_port INTEGER,
+                    target_url TEXT,
+                    last_health_check INTEGER,
+                    element_count INTEGER,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_ui_bridge_integrations_status ON ui_bridge_integrations(status);
+                CREATE INDEX IF NOT EXISTS idx_ui_bridge_integrations_type ON ui_bridge_integrations(integration_type);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (87, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 87: {}", e))?;
+
+            info!("Successfully migrated to version 87 (UI Bridge integrations tracking)");
+        }
+
+        if current_version < 88 {
+            info!(
+                "Migrating to version 88 (specification + prompt columns on pipeline_artifacts)..."
+            );
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE generation_pipeline_artifacts ADD COLUMN specification_duration_ms INTEGER;
+                ALTER TABLE generation_pipeline_artifacts ADD COLUMN specification_criteria TEXT;
+                ALTER TABLE generation_pipeline_artifacts ADD COLUMN specification_prompt TEXT;
+                ALTER TABLE generation_pipeline_artifacts ADD COLUMN builder_prompt TEXT;
+                ALTER TABLE generation_pipeline_artifacts ADD COLUMN verification_prompts TEXT;
+                ALTER TABLE generation_pipeline_artifacts ADD COLUMN hardener_prompt TEXT;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (88, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 88: {}", e))?;
+
+            info!("Successfully migrated to version 88 (specification + prompt columns on pipeline_artifacts)");
+        }
+
+        if current_version < 89 {
+            info!("Migrating to version 89 (source_agent on reflection_fixes, auto-rule fields on generation_rules)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE reflection_fixes ADD COLUMN source_agent TEXT;
+                CREATE INDEX IF NOT EXISTS idx_reflection_fixes_source_agent ON reflection_fixes(source_agent);
+
+                ALTER TABLE generation_rules ADD COLUMN confidence REAL DEFAULT 1.0;
+                ALTER TABLE generation_rules ADD COLUMN auto_generated_at TEXT;
+                ALTER TABLE generation_rules ADD COLUMN evidence_count INTEGER DEFAULT 0;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (89, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 89: {}", e))?;
+
+            info!("Successfully migrated to version 89 (source_agent + auto-rule fields)");
+        }
+
         Ok(())
     }
 
@@ -7372,9 +7464,9 @@ impl CheckpointDb {
         Ok(task_runs)
     }
 
-    /// Get all running chat session task runs for resume on startup.
+    /// Get all running AI session task runs for resume on startup.
     /// Returns task runs where status = 'running' AND workflow_type = 'chat'.
-    pub fn get_running_chat_sessions(&self) -> Result<Vec<TaskRun>, String> {
+    pub fn get_running_ai_sessions(&self) -> Result<Vec<TaskRun>, String> {
         let conn = self.get_conn()?;
 
         let mut stmt = conn
@@ -7441,9 +7533,9 @@ impl CheckpointDb {
         Ok(task_runs)
     }
 
-    /// Get recent chat sessions (all statuses) for sidebar listing.
+    /// Get recent AI sessions (all statuses) for sidebar listing.
     /// Returns lightweight summaries ordered by most recently updated.
-    pub fn get_chat_sessions(&self, limit: u32) -> Result<Vec<ChatSessionSummary>, String> {
+    pub fn get_ai_sessions(&self, limit: u32) -> Result<Vec<AiSessionSummary>, String> {
         let conn = self.get_conn()?;
 
         let mut stmt = conn
@@ -7460,7 +7552,7 @@ impl CheckpointDb {
 
         let sessions = stmt
             .query_map(params![limit], |row| {
-                Ok(ChatSessionSummary {
+                Ok(AiSessionSummary {
                     id: row.get(0)?,
                     task_name: row.get(1)?,
                     status: row.get(2)?,
@@ -18190,6 +18282,8 @@ impl CheckpointDb {
             r#"INSERT INTO generation_pipeline_artifacts
                 (id, workflow_id, task_run_id, description, category, created_at,
                  investigation_duration_ms, investigation_enriched_description,
+                 specification_duration_ms, specification_criteria,
+                 specification_prompt, builder_prompt, verification_prompts, hardener_prompt,
                  discovery_duration_ms, builder_duration_ms, autofix_duration_ms,
                  verification_duration_ms, hardener_duration_ms, total_duration_ms,
                  discovery_calls, builder_raw_output, builder_parsed_json, autofix_diff,
@@ -18197,7 +18291,8 @@ impl CheckpointDb {
                  hardened_json, final_json, validation_errors,
                  success, error_message, model_used)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                    ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)"#,
+                    ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27,
+                    ?28, ?29, ?30, ?31, ?32, ?33)"#,
             params![
                 artifact.id,
                 artifact.workflow_id,
@@ -18207,6 +18302,18 @@ impl CheckpointDb {
                 artifact.created_at,
                 artifact.investigation_duration_ms.map(|v| v as i64),
                 artifact.investigation_enriched_description,
+                artifact.specification_duration_ms.map(|v| v as i64),
+                artifact
+                    .specification_criteria
+                    .as_ref()
+                    .map(|v| v.to_string()),
+                artifact.specification_prompt,
+                artifact.builder_prompt,
+                artifact
+                    .verification_prompts
+                    .as_ref()
+                    .map(|v| v.to_string()),
+                artifact.hardener_prompt,
                 artifact.discovery_duration_ms.map(|v| v as i64),
                 artifact.builder_duration_ms.map(|v| v as i64),
                 artifact.autofix_duration_ms.map(|v| v as i64),
@@ -18248,6 +18355,8 @@ impl CheckpointDb {
         let result = conn.query_row(
             r#"SELECT id, workflow_id, task_run_id, description, category, created_at,
                       investigation_duration_ms, investigation_enriched_description,
+                      specification_duration_ms, specification_criteria,
+                      specification_prompt, builder_prompt, verification_prompts, hardener_prompt,
                       discovery_duration_ms, builder_duration_ms, autofix_duration_ms,
                       verification_duration_ms, hardener_duration_ms, total_duration_ms,
                       discovery_calls, builder_raw_output, builder_parsed_json, autofix_diff,
@@ -18333,6 +18442,8 @@ impl CheckpointDb {
         let result = conn.query_row(
             r#"SELECT id, workflow_id, task_run_id, description, category, created_at,
                       investigation_duration_ms, investigation_enriched_description,
+                      specification_duration_ms, specification_criteria,
+                      specification_prompt, builder_prompt, verification_prompts, hardener_prompt,
                       discovery_duration_ms, builder_duration_ms, autofix_duration_ms,
                       verification_duration_ms, hardener_duration_ms, total_duration_ms,
                       discovery_calls, builder_raw_output, builder_parsed_json, autofix_diff,
@@ -18386,43 +18497,52 @@ impl CheckpointDb {
                 .unwrap_or(None)
                 .map(|v| v as u64),
             investigation_enriched_description: row.get(7).unwrap_or(None),
-            discovery_duration_ms: row
+            specification_duration_ms: row
                 .get::<_, Option<i64>>(8)
                 .unwrap_or(None)
                 .map(|v| v as u64),
+            specification_criteria: parse_json(row.get(9).unwrap_or(None)),
+            specification_prompt: row.get(10).unwrap_or(None),
+            builder_prompt: row.get(11).unwrap_or(None),
+            verification_prompts: parse_json(row.get(12).unwrap_or(None)),
+            hardener_prompt: row.get(13).unwrap_or(None),
+            discovery_duration_ms: row
+                .get::<_, Option<i64>>(14)
+                .unwrap_or(None)
+                .map(|v| v as u64),
             builder_duration_ms: row
-                .get::<_, Option<i64>>(9)
+                .get::<_, Option<i64>>(15)
                 .unwrap_or(None)
                 .map(|v| v as u64),
             autofix_duration_ms: row
-                .get::<_, Option<i64>>(10)
+                .get::<_, Option<i64>>(16)
                 .unwrap_or(None)
                 .map(|v| v as u64),
             verification_duration_ms: row
-                .get::<_, Option<i64>>(11)
+                .get::<_, Option<i64>>(17)
                 .unwrap_or(None)
                 .map(|v| v as u64),
             hardener_duration_ms: row
-                .get::<_, Option<i64>>(12)
+                .get::<_, Option<i64>>(18)
                 .unwrap_or(None)
                 .map(|v| v as u64),
             total_duration_ms: row
-                .get::<_, Option<i64>>(13)
+                .get::<_, Option<i64>>(19)
                 .unwrap_or(None)
                 .map(|v| v as u64),
-            discovery_calls: parse_json(row.get(14).unwrap_or(None)),
-            builder_raw_output: row.get(15).unwrap_or(None),
-            builder_parsed_json: parse_json(row.get(16).unwrap_or(None)),
-            autofix_diff: parse_json(row.get(17).unwrap_or(None)),
-            verification_iterations: parse_json(row.get(18).unwrap_or(None)),
-            fixer_snapshots: parse_json_vec(row.get(19).unwrap_or(None)),
-            hardening_summary: parse_json(row.get(20).unwrap_or(None)),
-            hardened_json: parse_json(row.get(21).unwrap_or(None)),
-            final_json: parse_json(row.get(22).unwrap_or(None)),
-            validation_errors: parse_json(row.get(23).unwrap_or(None)),
-            success: row.get(24).unwrap_or(true),
-            error_message: row.get(25).unwrap_or(None),
-            model_used: row.get(26).unwrap_or(None),
+            discovery_calls: parse_json(row.get(20).unwrap_or(None)),
+            builder_raw_output: row.get(21).unwrap_or(None),
+            builder_parsed_json: parse_json(row.get(22).unwrap_or(None)),
+            autofix_diff: parse_json(row.get(23).unwrap_or(None)),
+            verification_iterations: parse_json(row.get(24).unwrap_or(None)),
+            fixer_snapshots: parse_json_vec(row.get(25).unwrap_or(None)),
+            hardening_summary: parse_json(row.get(26).unwrap_or(None)),
+            hardened_json: parse_json(row.get(27).unwrap_or(None)),
+            final_json: parse_json(row.get(28).unwrap_or(None)),
+            validation_errors: parse_json(row.get(29).unwrap_or(None)),
+            success: row.get(30).unwrap_or(true),
+            error_message: row.get(31).unwrap_or(None),
+            model_used: row.get(32).unwrap_or(None),
         }
     }
 

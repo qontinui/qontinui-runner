@@ -786,6 +786,10 @@ pub struct Settings {
     /// Configured runner instances for multi-instance dev workflows
     #[serde(default)]
     pub runner_instances: Vec<RunnerInstanceConfig>,
+    /// Directories containing Claude Code configs (each should have a `projects/` subdirectory).
+    /// Used by Terminal > Browse Sessions to find transcript files.
+    #[serde(default)]
+    pub claude_config_dirs: Vec<String>,
 }
 
 // ============================================================================
@@ -982,6 +986,21 @@ pub fn save_auto_load_last_config(enabled: bool) -> Result<(), String> {
     info!("Saving auto-load last config setting: {}", enabled);
     let mut settings = load_settings();
     settings.auto_load_last_config = enabled;
+    save_settings(&settings)?;
+    Ok(())
+}
+
+/// Get the configured Claude Code config directories
+pub fn get_claude_config_dirs() -> Vec<String> {
+    let settings = load_settings();
+    settings.claude_config_dirs
+}
+
+/// Save the configured Claude Code config directories
+pub fn save_claude_config_dirs(dirs: Vec<String>) -> Result<(), String> {
+    info!("Saving {} Claude config dirs", dirs.len());
+    let mut settings = load_settings();
+    settings.claude_config_dirs = dirs;
     save_settings(&settings)?;
     Ok(())
 }

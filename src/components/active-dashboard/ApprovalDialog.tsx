@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { Loader2, History, ChevronDown, ChevronUp } from "lucide-react";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 interface ApprovalRequest {
   id: string;
@@ -58,7 +58,7 @@ export function ApprovalDialog({ taskRunId, onResolved }: ApprovalDialogProps) {
 
     const poll = async () => {
       try {
-        const resp = await fetch(`${getApiBase()}/task-runs/${taskRunId}/approvals`);
+        const resp = await tracedFetch(`${getApiBase()}/task-runs/${taskRunId}/approvals`);
         if (resp.ok && !cancelled) {
           const data = await resp.json();
           setApprovals(data);
@@ -111,7 +111,7 @@ export function ApprovalDialog({ taskRunId, onResolved }: ApprovalDialogProps) {
     async (approvalId: string, action: string) => {
       setResponding(true);
       try {
-        const resp = await fetch(
+        const resp = await tracedFetch(
           `${getApiBase()}/task-runs/${taskRunId}/approvals/${approvalId}/respond`,
           {
             method: "POST",
@@ -178,7 +178,7 @@ export function ApprovalDialog({ taskRunId, onResolved }: ApprovalDialogProps) {
   const fetchHistory = useCallback(async () => {
     setHistoryLoading(true);
     try {
-      const resp = await fetch(`${getApiBase()}/task-runs/${taskRunId}/approval-gates`);
+      const resp = await tracedFetch(`${getApiBase()}/task-runs/${taskRunId}/approval-gates`);
       if (resp.ok) {
         const data = await resp.json();
         // Filter to only resolved gates (not the currently pending one)

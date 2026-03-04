@@ -46,9 +46,9 @@ use tokio::sync::Mutex as TokioMutex;
 
 // Command modules organized by domain
 pub mod accessibility;
-pub mod ai_chat; // Interactive AI chat session commands (send message, interrupt, get state)
 pub mod ai_data;
 pub mod ai_generation; // AI generation for builder tabs (context, api request, task, exploration)
+pub mod ai_session; // Interactive AI session commands (send message, interrupt, get state)
 pub mod ai_settings;
 pub mod auth;
 pub mod backup; // Comprehensive backup and restore

@@ -39,6 +39,7 @@ pub struct FollowUpDeps {
     pub config_storage: Arc<tokio::sync::Mutex<ConfigStorage>>,
     pub app_handle: tauri::AppHandle,
     pub pid_tracker: Arc<std::sync::Mutex<Vec<u32>>>,
+    pub session_manager: Option<Arc<crate::claude_session::SessionManager>>,
 }
 
 /// Check whether a follow-up run should be launched for the given task run.
@@ -285,6 +286,11 @@ pub fn launch_follow_up(deps: FollowUpDeps, source_task_run_id: String) -> Resul
         deps.pid_tracker.clone(),
     )
     .with_step_injection_ctx(step_injection_ctx);
+
+    // Pass session_manager for inline PID tracking (not interactive sessions)
+    if let Some(sm) = deps.session_manager {
+        controller = controller.with_session_manager(sm);
+    }
 
     info!(
         "Spawning follow-up workflow '{}' (id: {}) with {} setup steps",

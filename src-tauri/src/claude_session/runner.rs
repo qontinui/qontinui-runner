@@ -154,6 +154,8 @@ fn run_claude_session_inline(
     reflection_fix_ctx: Option<ReflectionFixContext>,
     step_injection_ctx: Option<StepInjectionContext>,
     model_override: Option<&str>,
+    session_manager: Option<&Arc<crate::claude_session::SessionManager>>,
+    task_run_id: Option<&str>,
 ) -> Result<(bool, String, Vec<ExecutionStepConfig>), String> {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -212,6 +214,7 @@ fn run_claude_session_inline(
         // Remove CLAUDECODE env var to prevent "nested session" detection.
         // The runner spawns Claude CLI as an automation tool, not as a nested session.
         .env_remove("CLAUDECODE")
+        .env("QONTINUI_TRACE_ID", uuid::Uuid::new_v4().to_string())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -236,6 +239,11 @@ fn run_claude_session_inline(
                 child_pid, session_id
             );
         }
+    }
+
+    // Register inline PID with SessionManager for stale task sweep visibility
+    if let (Some(sm), Some(trid)) = (session_manager, task_run_id) {
+        sm.register_inline_pid(trid, child_pid);
     }
 
     // Track activity for timeout (created early so Doctor registration can use it)
@@ -270,6 +278,10 @@ fn run_claude_session_inline(
         // Also unregister from Doctor
         if let Some(handle) = doctor_handle {
             let _ = handle.unregister_blocking(child_pid);
+        }
+        // Remove inline PID from SessionManager
+        if let (Some(sm), Some(trid)) = (session_manager, task_run_id) {
+            sm.remove_inline_pid(trid);
         }
     };
 
@@ -888,6 +900,7 @@ fn run_claude_session_inline(
                         old_value: parsed_fix.old_value,
                         new_value: parsed_fix.new_value,
                         confidence: parsed_fix.confidence.clone(),
+                        source_agent: parsed_fix.source_agent,
                     };
 
                     match reflection_storage::insert_fix(&conn, &input) {
@@ -1267,6 +1280,8 @@ pub fn run_claude_session_with_retry(
     reflection_fix_ctx: Option<ReflectionFixContext>,
     step_injection_ctx: Option<StepInjectionContext>,
     model_override: Option<&str>,
+    session_manager: Option<&Arc<crate::claude_session::SessionManager>>,
+    task_run_id: Option<&str>,
 ) -> Result<(bool, String, Option<RetryState>, Vec<ExecutionStepConfig>), String> {
     use std::thread;
     use std::time::Duration;
@@ -1288,6 +1303,8 @@ pub fn run_claude_session_with_retry(
                 reflection_fix_ctx,
                 step_injection_ctx,
                 model_override,
+                session_manager,
+                task_run_id,
             )?;
             return Ok((result.0, result.1, None, result.2));
         }
@@ -1330,6 +1347,8 @@ pub fn run_claude_session_with_retry(
             reflection_fix_ctx_clone,
             step_injection_ctx_clone,
             model_override,
+            session_manager,
+            task_run_id,
         );
 
         match result {
@@ -1426,7 +1445,7 @@ pub fn run_claude_session_with_retry(
 /// Unlike `run_claude_session_inline` which sends a single prompt and waits for completion,
 /// this function spawns a `ClaudeSession` that supports multiple turns, user message queuing,
 /// and interrupt. The session is registered with the `SessionManager` so the frontend can
-/// interact with it via the `ai_chat` Tauri commands.
+/// interact with it via the `ai_session` Tauri commands.
 ///
 /// Returns `(success, output)` after the session completes.
 #[allow(clippy::too_many_arguments)]
@@ -1446,7 +1465,7 @@ pub fn run_claude_session_interactive(
     _step_injection_ctx: Option<StepInjectionContext>,
 ) -> Result<(bool, String, Vec<ExecutionStepConfig>), String> {
     use crate::claude_session::ClaudeSession;
-    use crate::commands::ai_chat::emit_session_state;
+    use crate::commands::ai_session::emit_session_state;
     use std::sync::Arc;
 
     info!(

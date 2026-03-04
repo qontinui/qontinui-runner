@@ -16,7 +16,7 @@ import {
 import { SectionHeader } from "./SectionHeader";
 import { getAccentColors } from "@/design-system";
 import type { AgenticSettings as AgenticSettingsType, LogFunction } from "./types";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 interface TauriResult<T> {
   success: boolean;
@@ -183,7 +183,7 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
 
   const loadReflectionSettings = async () => {
     try {
-      const response = await fetch(`${getApiBase()}/reflection/settings`);
+      const response = await tracedFetch(`${getApiBase()}/reflection/settings`);
       if (response.ok) {
         const result = await response.json();
         if (result.success && result.data) {
@@ -199,7 +199,7 @@ export function AgenticSettings({ onLog }: AgenticSettingsProps) {
   const toggleReflection = async (enabled: boolean) => {
     setReflectionEnabled(enabled);
     try {
-      const response = await fetch(`${getApiBase()}/reflection/settings`, {
+      const response = await tracedFetch(`${getApiBase()}/reflection/settings`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ reflection_enabled: enabled }),

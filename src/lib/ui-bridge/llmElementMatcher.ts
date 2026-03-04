@@ -6,7 +6,7 @@
  */
 
 import type { ExternalElement } from "../../types/ui-bridge-types";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 // =============================================================================
 // Types
@@ -256,7 +256,7 @@ async function callLLM(prompt: string, timeoutMs: number): Promise<string | null
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
-    const response = await fetch(`${getApiBase()}/ai/simple-query`, {
+    const response = await tracedFetch(`${getApiBase()}/ai/simple-query`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -518,7 +518,7 @@ export async function isLLMAvailable(): Promise<boolean> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 5000);
 
-    const response = await fetch(`${getApiBase()}/health`, {
+    const response = await tracedFetch(`${getApiBase()}/health`, {
       method: "GET",
       signal: controller.signal,
     });

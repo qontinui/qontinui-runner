@@ -186,6 +186,78 @@ pub async fn suggest_workspace_sources_for_setup(workspace_path: String) -> Resu
 }
 
 // ============================================================================
+// Claude Config Directory Discovery (pure Rust, no Python CLI)
+// ============================================================================
+
+/// Auto-discover Claude Code config directories on this machine.
+///
+/// Scans common locations for directories containing a `projects/` subfolder:
+/// - `CLAUDE_CONFIG_DIR` env var
+/// - `C:\claude\.claude-*\` (multi-account setups)
+/// - `%USERPROFILE%\.claude` (standard location)
+/// - `%LOCALAPPDATA%\claude` (alternate install)
+#[tauri::command]
+pub fn discover_claude_config_dirs() -> Result<Vec<Value>, String> {
+    info!("Setup wizard: discovering Claude Code config directories");
+    let mut results: Vec<Value> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    let mut add = |path: std::path::PathBuf, label: &str, source: &str| {
+        let path_str = path.to_string_lossy().to_string();
+        if path.join("projects").exists() && seen.insert(path_str.clone()) {
+            results.push(serde_json::json!({
+                "path": path_str,
+                "label": label,
+                "source": source,
+            }));
+        }
+    };
+
+    // 1. CLAUDE_CONFIG_DIR env var
+    if let Ok(env_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+        let p = std::path::PathBuf::from(&env_dir);
+        let label = p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| env_dir.clone());
+        add(p, &label, "CLAUDE_CONFIG_DIR env var");
+    }
+
+    // 2. Scan C:\claude\.claude-*\ (multi-account setups on Windows)
+    let claude_root = std::path::Path::new("C:\\claude");
+    if claude_root.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(claude_root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        if name.starts_with(".claude-") {
+                            let label = name.to_string();
+                            add(path, &label, "auto-detected");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. %USERPROFILE%\.claude (standard location)
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        let home_claude = std::path::PathBuf::from(&home).join(".claude");
+        add(home_claude, ".claude", "home directory");
+    }
+
+    // 4. %LOCALAPPDATA%\claude (alternate install location)
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        let local_claude = std::path::PathBuf::from(&local_app_data).join("claude");
+        add(local_claude, "claude (LocalAppData)", "auto-detected");
+    }
+
+    info!("Discovered {} Claude config directories", results.len());
+    Ok(results)
+}
+
+// ============================================================================
 // Save Commands
 // ============================================================================
 

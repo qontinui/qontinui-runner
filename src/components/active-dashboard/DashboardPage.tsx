@@ -25,7 +25,7 @@ import type { ActivityType } from "../../types/dashboard/activity-types";
 import type { DashboardStatus } from "../../hooks/dashboard/useDashboardState";
 import type { StepStats } from "./widgets/shared/types";
 import type { CommandResponse } from "../../types/displayProfile";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 // Register widgets at module load time (before any component renders)
 // This ensures widgets are available when hooks run
@@ -221,7 +221,7 @@ export function DashboardPage({
     if (taskId) {
       try {
         console.log(`[DASHBOARD] Stopping unified workflow: ${taskId}`);
-        const response = await fetch(`${getApiBase()}/task-runs/${taskId}/stop`, {
+        const response = await tracedFetch(`${getApiBase()}/task-runs/${taskId}/stop`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
         });

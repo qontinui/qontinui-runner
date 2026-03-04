@@ -1,20 +1,26 @@
 import { useState, useCallback } from "react";
-import { X, Check, Wand2, User, Bot } from "lucide-react";
-import type { TranscriptMessage } from "./useTranscriptSessions";
+import { X, Check, Wand2, Play, User, Bot, TerminalSquare } from "lucide-react";
+import type { TranscriptMessage, TranscriptSession } from "./useTranscriptSessions";
 
 interface TranscriptContentPanelProps {
   sessionId: string;
+  session: TranscriptSession | null;
   messages: TranscriptMessage[];
   loading: boolean;
   onGenerate: (description: string, inlineContext: string) => void;
+  onGenerateAndRun?: (description: string, inlineContext: string) => void;
+  onResume: (session: TranscriptSession) => void;
   onClose: () => void;
 }
 
 export function TranscriptContentPanel({
   sessionId,
+  session,
   messages,
   loading,
   onGenerate,
+  onGenerateAndRun,
+  onResume,
   onClose,
 }: TranscriptContentPanelProps) {
   const [selectedMessageIds, setSelectedMessageIds] = useState<Set<string>>(
@@ -54,9 +60,9 @@ export function TranscriptContentPanel({
     setSelectedMessageIds(new Set(messages.filter((m) => m.plan_content).map((m) => m.uuid)));
   }, [messages]);
 
-  const handleGenerate = useCallback(() => {
+  const buildContext = useCallback(() => {
     const selected = messages.filter((m) => selectedMessageIds.has(m.uuid));
-    if (selected.length === 0) return;
+    if (selected.length === 0) return null;
 
     const parts = selected.map((msg) => {
       const role = msg.msg_type === "user" ? "User" : "Assistant";
@@ -65,13 +71,25 @@ export function TranscriptContentPanel({
       return `${planPart}${textPart}`.trim();
     });
 
-    const inlineContext = parts.filter(Boolean).join("\n\n---\n\n");
-    const desc =
-      description.trim() ||
-      `Generate workflow from Claude Code transcript (${selected.length} messages)`;
+    return {
+      inlineContext: parts.filter(Boolean).join("\n\n---\n\n"),
+      desc:
+        description.trim() ||
+        `Generate workflow from Claude Code transcript (${selected.length} messages)`,
+    };
+  }, [messages, selectedMessageIds, description]);
 
-    onGenerate(desc, inlineContext);
-  }, [messages, selectedMessageIds, description, onGenerate]);
+  const handleGenerate = useCallback(() => {
+    const ctx = buildContext();
+    if (!ctx) return;
+    onGenerate(ctx.desc, ctx.inlineContext);
+  }, [buildContext, onGenerate]);
+
+  const handleGenerateAndRun = useCallback(() => {
+    const ctx = buildContext();
+    if (!ctx || !onGenerateAndRun) return;
+    onGenerateAndRun(ctx.desc, ctx.inlineContext);
+  }, [buildContext, onGenerateAndRun]);
 
   const planCount = messages.filter((m) => m.plan_content).length;
 
@@ -85,12 +103,24 @@ export function TranscriptContentPanel({
           </span>
           <span className="text-[10px] text-[#565f89] shrink-0">{messages.length} messages</span>
         </div>
-        <button
-          onClick={onClose}
-          className="p-1 rounded hover:bg-[#2a2d3d] text-[#565f89] hover:text-[#c0caf5] transition-colors shrink-0"
-        >
-          <X className="w-3.5 h-3.5" />
-        </button>
+        <div className="flex items-center gap-1 shrink-0">
+          {session && (
+            <button
+              onClick={() => onResume(session)}
+              className="flex items-center gap-1 px-2 py-1 rounded text-[10px] font-medium bg-[#9ece6a]/10 text-[#9ece6a] hover:bg-[#9ece6a]/20 transition-colors"
+              title={`Resume in terminal: claude --resume ${session.session_id}`}
+            >
+              <TerminalSquare className="w-3 h-3" />
+              Resume
+            </button>
+          )}
+          <button
+            onClick={onClose}
+            className="p-1 rounded hover:bg-[#2a2d3d] text-[#565f89] hover:text-[#c0caf5] transition-colors"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
       </div>
 
       {/* Selection controls */}
@@ -228,21 +258,41 @@ export function TranscriptContentPanel({
           />
         </div>
 
-        <button
-          onClick={handleGenerate}
-          disabled={selectedMessageIds.size === 0}
-          className={`
-            w-full flex items-center justify-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium transition-colors
-            ${
-              selectedMessageIds.size > 0
-                ? "bg-[#7aa2f7] text-white hover:bg-[#89b4fa]"
-                : "bg-[#2a2d3d] text-[#414868] cursor-not-allowed"
-            }
-          `}
-        >
-          <Wand2 className="w-3 h-3" />
-          Generate Workflow ({selectedMessageIds.size} messages)
-        </button>
+        <div className="flex gap-1.5">
+          <button
+            onClick={handleGenerate}
+            disabled={selectedMessageIds.size === 0}
+            className={`
+              flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium transition-colors
+              ${
+                selectedMessageIds.size > 0
+                  ? "bg-[#7aa2f7] text-white hover:bg-[#89b4fa]"
+                  : "bg-[#2a2d3d] text-[#414868] cursor-not-allowed"
+              }
+            `}
+          >
+            <Wand2 className="w-3 h-3" />
+            Generate ({selectedMessageIds.size})
+          </button>
+          {onGenerateAndRun && (
+            <button
+              onClick={handleGenerateAndRun}
+              disabled={selectedMessageIds.size === 0}
+              className={`
+                flex items-center justify-center gap-1 px-2.5 py-1.5 rounded text-xs font-medium transition-colors
+                ${
+                  selectedMessageIds.size > 0
+                    ? "bg-[#9ece6a] text-[#1a1b26] hover:bg-[#b0d97a]"
+                    : "bg-[#2a2d3d] text-[#414868] cursor-not-allowed"
+                }
+              `}
+              title="Generate workflow and immediately run it"
+            >
+              <Play className="w-3 h-3" />
+              Run
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );

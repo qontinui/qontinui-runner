@@ -8,13 +8,13 @@
 import type { WorkflowDataAdapter } from "@qontinui/workflow-ui";
 import type { UnifiedWorkflow, SkillDefinition } from "@qontinui/shared-types/workflow";
 import type { LibraryItem } from "@qontinui/shared-types/library";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 export function createRunnerDataAdapter(): WorkflowDataAdapter {
   return {
     async fetchPrompts(): Promise<LibraryItem[]> {
       try {
-        const res = await fetch(`${getApiBase()}/prompts`);
+        const res = await tracedFetch(`${getApiBase()}/prompts`);
         if (!res.ok) return [];
         const data = await res.json();
         const prompts = data.prompts ?? data ?? [];
@@ -30,7 +30,7 @@ export function createRunnerDataAdapter(): WorkflowDataAdapter {
 
     async fetchChecks(): Promise<LibraryItem[]> {
       try {
-        const res = await fetch(`${getApiBase()}/checks`);
+        const res = await tracedFetch(`${getApiBase()}/checks`);
         if (!res.ok) return [];
         const data = await res.json();
         const checks = data.checks ?? data ?? [];
@@ -46,7 +46,7 @@ export function createRunnerDataAdapter(): WorkflowDataAdapter {
 
     async fetchCheckGroups(): Promise<LibraryItem[]> {
       try {
-        const res = await fetch(`${getApiBase()}/check-groups`);
+        const res = await tracedFetch(`${getApiBase()}/check-groups`);
         if (!res.ok) return [];
         const data = await res.json();
         const groups = data.check_groups ?? data ?? [];
@@ -62,7 +62,7 @@ export function createRunnerDataAdapter(): WorkflowDataAdapter {
 
     async fetchShellCommands(): Promise<LibraryItem[]> {
       try {
-        const res = await fetch(`${getApiBase()}/shell-commands`);
+        const res = await tracedFetch(`${getApiBase()}/shell-commands`);
         if (!res.ok) return [];
         const data = await res.json();
         const commands = data.shell_commands ?? data ?? [];
@@ -78,7 +78,7 @@ export function createRunnerDataAdapter(): WorkflowDataAdapter {
 
     async fetchWorkflows(): Promise<UnifiedWorkflow[]> {
       try {
-        const res = await fetch(`${getApiBase()}/unified-workflows`);
+        const res = await tracedFetch(`${getApiBase()}/unified-workflows`);
         if (!res.ok) return [];
         const data = await res.json();
         if (data.success && data.data) {
@@ -92,7 +92,7 @@ export function createRunnerDataAdapter(): WorkflowDataAdapter {
 
     async fetchPlaywrightScripts(): Promise<LibraryItem[]> {
       try {
-        const res = await fetch(`${getApiBase()}/playwright-scripts`);
+        const res = await tracedFetch(`${getApiBase()}/playwright-scripts`);
         if (!res.ok) return [];
         const data = await res.json();
         const scripts = data.scripts ?? data ?? [];
@@ -108,7 +108,7 @@ export function createRunnerDataAdapter(): WorkflowDataAdapter {
 
     async fetchSkills(): Promise<SkillDefinition[]> {
       try {
-        const res = await fetch(`${getApiBase()}/skills`);
+        const res = await tracedFetch(`${getApiBase()}/skills`);
         if (!res.ok) return [];
         const data = await res.json();
         // Runner API wraps in { success: true, data: [...] }
@@ -121,7 +121,7 @@ export function createRunnerDataAdapter(): WorkflowDataAdapter {
 
     async fetchContexts(): Promise<LibraryItem[]> {
       try {
-        const res = await fetch(`${getApiBase()}/contexts`);
+        const res = await tracedFetch(`${getApiBase()}/contexts`);
         if (!res.ok) return [];
         const data = await res.json();
         const contexts = data.contexts ?? data ?? [];
@@ -136,7 +136,7 @@ export function createRunnerDataAdapter(): WorkflowDataAdapter {
     },
 
     async saveWorkflow(workflow: UnifiedWorkflow): Promise<UnifiedWorkflow> {
-      const res = await fetch(`${getApiBase()}/unified-workflows`, {
+      const res = await tracedFetch(`${getApiBase()}/unified-workflows`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(workflow),
@@ -148,7 +148,7 @@ export function createRunnerDataAdapter(): WorkflowDataAdapter {
     },
 
     async loadWorkflow(id: string): Promise<UnifiedWorkflow> {
-      const res = await fetch(`${getApiBase()}/unified-workflows/${id}`);
+      const res = await tracedFetch(`${getApiBase()}/unified-workflows/${id}`);
       if (!res.ok) throw new Error("Failed to load workflow");
       const data = await res.json();
       if (data.success && data.data) return data.data as UnifiedWorkflow;
@@ -156,7 +156,7 @@ export function createRunnerDataAdapter(): WorkflowDataAdapter {
     },
 
     async deleteWorkflow(id: string): Promise<void> {
-      const res = await fetch(`${getApiBase()}/unified-workflows/${id}`, {
+      const res = await tracedFetch(`${getApiBase()}/unified-workflows/${id}`, {
         method: "DELETE",
       });
       if (!res.ok) throw new Error("Failed to delete workflow");
@@ -164,7 +164,7 @@ export function createRunnerDataAdapter(): WorkflowDataAdapter {
 
     async listWorkflows(): Promise<UnifiedWorkflow[]> {
       try {
-        const res = await fetch(`${getApiBase()}/unified-workflows`);
+        const res = await tracedFetch(`${getApiBase()}/unified-workflows`);
         if (!res.ok) return [];
         const data = await res.json();
         if (data.success && data.data) {

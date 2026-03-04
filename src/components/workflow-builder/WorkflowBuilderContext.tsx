@@ -51,7 +51,7 @@ import {
   isWorkflowEmpty,
 } from "../../types";
 import { registerUserSkills } from "@qontinui/workflow-utils";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 // Re-export shared types for consumers that may need them
 export type { SharedBuilderState, SharedBuilderAction, SharedBuilderContextValue };
@@ -918,7 +918,7 @@ function RunnerWorkflowBuilderInner({
         : `${getApiBase()}/unified-workflows/${workflow.id}`;
       const method = isNew ? "POST" : "PUT";
 
-      const response = await fetch(url, {
+      const response = await tracedFetch(url, {
         method,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
@@ -949,7 +949,7 @@ function RunnerWorkflowBuilderInner({
     dispatch({ type: "SET_ERROR", payload: null });
 
     try {
-      const response = await fetch(`${getApiBase()}/unified-workflows/${id}`);
+      const response = await tracedFetch(`${getApiBase()}/unified-workflows/${id}`);
       const data = await response.json();
 
       if (data.success && data.data) {
@@ -975,7 +975,7 @@ function RunnerWorkflowBuilderInner({
     dispatch({ type: "SET_ERROR", payload: null });
 
     try {
-      const response = await fetch(`${getApiBase()}/unified-workflows/${id}/export`);
+      const response = await tracedFetch(`${getApiBase()}/unified-workflows/${id}/export`);
       const data = await response.json();
 
       if (data.success && data.data) {
@@ -1004,7 +1004,7 @@ function RunnerWorkflowBuilderInner({
       dispatch({ type: "SET_ERROR", payload: null });
 
       try {
-        const response = await fetch(`${getApiBase()}/unified-workflows/import`, {
+        const response = await tracedFetch(`${getApiBase()}/unified-workflows/import`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({

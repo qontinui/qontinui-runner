@@ -10,7 +10,7 @@ import { LucideIcon, Activity, ExternalLink, RotateCw } from "lucide-react";
 import { RunSelector } from "../run-selection/RunSelector";
 import { useRunSelectionOptional } from "../../contexts/RunSelectionContext";
 import { getStatusColors } from "@/design-system";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 /** Maps runner page titles to web run-detail tab names */
 const TAB_MAPPING: Record<string, string> = {
@@ -57,7 +57,7 @@ export function RunPageLayout({
     setIsRerunning(true);
     try {
       // Look up the workflow by name
-      const searchRes = await fetch(
+      const searchRes = await tracedFetch(
         `${getApiBase()}/unified-workflows/search?q=${encodeURIComponent(selectedRun.workflow_name)}`,
       );
       const searchData = await searchRes.json();
@@ -73,7 +73,7 @@ export function RunPageLayout({
             w.name.toLowerCase() === selectedRun.workflow_name!.toLowerCase(),
         ) || workflows[0];
       // Run the workflow
-      await fetch(`${getApiBase()}/unified-workflows/${workflow.id}/run`, {
+      await tracedFetch(`${getApiBase()}/unified-workflows/${workflow.id}/run`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ monitor_index: 0 }),

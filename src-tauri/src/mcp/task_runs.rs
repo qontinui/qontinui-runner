@@ -2471,7 +2471,7 @@ pub async fn send_message_to_session(
             let new_state = session.state();
 
             // Emit session state change event
-            crate::commands::ai_chat::emit_session_state(
+            crate::commands::ai_session::emit_session_state(
                 &state.app_handle,
                 &id,
                 session.session_id(),
@@ -2983,26 +2983,26 @@ pub async fn sse_ai_output_for_task_run(
     Sse::new(combined).keep_alive(KeepAlive::default())
 }
 
-/// Request body for creating an ad-hoc chat session.
+/// Request body for creating an ad-hoc AI session.
 #[derive(Debug, Deserialize)]
-pub struct CreateChatRequest {
-    /// Name for the chat session
-    #[serde(default = "default_chat_name")]
+pub struct CreateSessionRequest {
+    /// Name for the AI session
+    #[serde(default = "default_session_name")]
     task_name: String,
 }
 
-fn default_chat_name() -> String {
+fn default_session_name() -> String {
     "Ad-hoc Chat".to_string()
 }
 
-/// Create an ad-hoc chat session not tied to a workflow.
+/// Create an ad-hoc AI session not tied to a workflow.
 ///
 /// Creates a task_run record and spawns a new AI session.
-pub async fn create_chat_session(
+pub async fn create_ai_session(
     State(state): State<Arc<ApiState>>,
-    Json(req): Json<CreateChatRequest>,
+    Json(req): Json<CreateSessionRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    info!("Creating ad-hoc chat session: {}", req.task_name);
+    info!("Creating ad-hoc AI session: {}", req.task_name);
 
     let task_run_id = uuid::Uuid::new_v4().to_string();
 
@@ -3012,7 +3012,7 @@ pub async fn create_chat_session(
     let name_clone = req.task_name.clone();
     tokio::task::spawn_blocking(move || {
         let input = CreateTaskRunInput::new(id_clone, name_clone)
-            .with_prompt("Ad-hoc chat session")
+            .with_prompt("Ad-hoc AI session")
             .with_workflow_type("chat");
         db.create_task_run(&input)
     })
@@ -3032,7 +3032,7 @@ pub async fn create_chat_session(
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| ".".to_string());
 
-    let system_prompt = "You are an AI assistant in a chat session initiated from the qontinui \
+    let system_prompt = "You are an AI assistant in a session initiated from the qontinui \
         mobile app. Respond helpfully and conversationally. The user may ask about anything — \
         workflows, automation, code questions, or general topics."
         .to_string();
@@ -3052,7 +3052,7 @@ pub async fn create_chat_session(
 
             // Register with session manager
             if let Err(e) = session_manager.register(&task_run_id, session.clone()) {
-                warn!("Failed to register chat session: {}", e);
+                warn!("Failed to register AI session: {}", e);
                 return Ok(Json(serde_json::json!({
                     "id": task_run_id,
                     "task_name": req.task_name,
@@ -3062,7 +3062,7 @@ pub async fn create_chat_session(
             }
 
             // Emit initial ready state
-            crate::commands::ai_chat::emit_session_state(
+            crate::commands::ai_session::emit_session_state(
                 &state.app_handle,
                 &task_run_id,
                 &task_run_id,
@@ -3071,7 +3071,7 @@ pub async fn create_chat_session(
 
             // Send the system prompt as initial prompt
             if let Err(e) = session.send_initial_prompt(&system_prompt) {
-                warn!("Failed to send initial prompt for chat session: {}", e);
+                warn!("Failed to send initial prompt for AI session: {}", e);
                 return Ok(Json(serde_json::json!({
                     "id": task_run_id,
                     "task_name": req.task_name,
@@ -3081,14 +3081,14 @@ pub async fn create_chat_session(
             }
 
             // Emit processing state
-            crate::commands::ai_chat::emit_session_state(
+            crate::commands::ai_session::emit_session_state(
                 &state.app_handle,
                 &task_run_id,
                 &task_run_id,
                 session.state(),
             );
 
-            info!("Chat session created: task_run_id={}", task_run_id);
+            info!("AI session created: task_run_id={}", task_run_id);
             Ok(Json(serde_json::json!({
                 "id": task_run_id,
                 "task_name": req.task_name,
@@ -3096,7 +3096,7 @@ pub async fn create_chat_session(
             })))
         }
         Err(e) => {
-            warn!("Failed to create chat session: {}", e);
+            warn!("Failed to create AI session: {}", e);
             Ok(Json(serde_json::json!({
                 "id": task_run_id,
                 "task_name": req.task_name,
@@ -3107,8 +3107,8 @@ pub async fn create_chat_session(
     }
 }
 
-/// Generate a workflow from a chat session's conversation context
-pub async fn generate_workflow_from_chat(
+/// Generate a workflow from an AI session's conversation context
+pub async fn generate_workflow_from_session(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(req): Json<serde_json::Value>,
@@ -3173,6 +3173,7 @@ pub async fn generate_workflow_from_chat(
         include_design_guidance: None,
         auto_run: None,
         model_overrides: None,
+        generate_specification: Some(true),
     };
 
     let doctor_handle = state.doctor_handle.clone();
@@ -3204,6 +3205,7 @@ pub async fn generate_workflow_from_chat(
                 verification_iterations: vec![],
                 hardening_summary: None,
                 discovery_calls: vec![],
+                acceptance_criteria: None,
             },
         }
     })
@@ -3387,7 +3389,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     axum::Router::new()
         .route("/task-runs", get(list_task_runs).post(create_task_run))
         .route("/task-runs/running", get(list_running_task_runs))
-        .route("/task-runs/chat", post(create_chat_session))
+        .route("/task-runs/session", post(create_ai_session))
         .route("/task-runs/:id", get(get_task_run).delete(delete_task_run))
         .route("/task-runs/:id/output", get(get_task_output))
         .route("/task-runs/:id/workflow-state", get(get_workflow_state))
@@ -3436,7 +3438,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/task-runs/:id/session-state", get(get_session_state))
         .route(
             "/task-runs/:id/generate-workflow",
-            post(generate_workflow_from_chat),
+            post(generate_workflow_from_session),
         )
         .route("/task-runs/:id/rename", post(rename_task_run))
         .route(
@@ -3453,6 +3455,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/current-execution/steps", get(get_current_execution_steps))
         .route("/current-execution/batch", get(get_current_execution_batch))
         .route("/task-runs/:id/usage", get(get_task_run_usage))
+        .route("/traces/:trace_id", get(get_trace_correlation))
 }
 
 /// Get per-phase token usage breakdown for a task run.
@@ -3487,6 +3490,105 @@ async fn get_task_run_usage(
             "cost_cents": total_cost,
         }
     })))
+}
+
+/// Get cross-service trace correlation data for a given trace ID.
+///
+/// Queries both execution_spans and error_events tables to return
+/// all data associated with a trace, enabling cross-service debugging.
+async fn get_trace_correlation(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(trace_id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let db = state.app_state.checkpoint_db.clone();
+    let tid = trace_id.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = db.get_conn_string()?;
+
+        // Query execution spans for this trace
+        let mut span_stmt = conn
+            .prepare(
+                r#"
+                SELECT id, execution_id, trace_id, span_id, parent_span_id, name,
+                       start_ts, end_ts, duration_ms, attributes, success, error, created_at
+                FROM execution_spans
+                WHERE trace_id = ?1
+                ORDER BY start_ts ASC
+                "#,
+            )
+            .map_err(|e| format!("Failed to prepare spans query: {}", e))?;
+
+        let spans: Vec<serde_json::Value> = span_stmt
+            .query_map(rusqlite::params![&tid], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, i64>(0)?,
+                    "execution_id": row.get::<_, Option<String>>(1)?,
+                    "trace_id": row.get::<_, String>(2)?,
+                    "span_id": row.get::<_, String>(3)?,
+                    "parent_span_id": row.get::<_, Option<String>>(4)?,
+                    "name": row.get::<_, String>(5)?,
+                    "start_ts": row.get::<_, String>(6)?,
+                    "end_ts": row.get::<_, Option<String>>(7)?,
+                    "duration_ms": row.get::<_, Option<i64>>(8)?,
+                    "attributes": row.get::<_, Option<String>>(9)?,
+                    "success": row.get::<_, Option<i32>>(10)?,
+                    "error": row.get::<_, Option<String>>(11)?,
+                    "created_at": row.get::<_, String>(12)?,
+                }))
+            })
+            .map_err(|e| format!("Failed to query spans: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Query error events for this trace
+        let mut error_stmt = conn
+            .prepare(
+                r#"
+                SELECT id, log_source_name, task_run_id, severity, error_type,
+                       message, stack_trace, captured_at, status, trace_id
+                FROM error_events
+                WHERE trace_id = ?1
+                ORDER BY captured_at ASC
+                "#,
+            )
+            .map_err(|e| format!("Failed to prepare errors query: {}", e))?;
+
+        let errors: Vec<serde_json::Value> = error_stmt
+            .query_map(rusqlite::params![&tid], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, i64>(0)?,
+                    "log_source_name": row.get::<_, String>(1)?,
+                    "task_run_id": row.get::<_, Option<String>>(2)?,
+                    "severity": row.get::<_, String>(3)?,
+                    "error_type": row.get::<_, Option<String>>(4)?,
+                    "message": row.get::<_, String>(5)?,
+                    "stack_trace": row.get::<_, Option<String>>(6)?,
+                    "captured_at": row.get::<_, String>(7)?,
+                    "status": row.get::<_, String>(8)?,
+                    "trace_id": row.get::<_, Option<String>>(9)?,
+                }))
+            })
+            .map_err(|e| format!("Failed to query errors: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok::<_, String>(serde_json::json!({
+            "trace_id": tid,
+            "execution_spans": spans,
+            "error_events": errors,
+            "span_count": spans.len(),
+            "error_count": errors.len(),
+        }))
+    })
+    .await
+    .map_err(|e| {
+        error!("spawn_blocking error in get_trace_correlation: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(result))
 }
 
 #[cfg(test)]

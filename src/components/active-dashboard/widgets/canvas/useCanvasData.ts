@@ -9,7 +9,7 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { listen } from "@tauri-apps/api/event";
 import type { CanvasData, CanvasPanel, CanvasUpdateEvent } from "./types";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 const POLL_INTERVAL_MS = 5000;
 
@@ -24,7 +24,7 @@ export function useCanvasData(): CanvasData {
   // Fetch all panels from API (for reconnection/initial load)
   const fetchPanels = useCallback(async () => {
     try {
-      const response = await fetch(`${getApiBase()}/canvas/panels`);
+      const response = await tracedFetch(`${getApiBase()}/canvas/panels`);
       if (response.ok) {
         const result = await response.json();
         if (result.success && result.data) {

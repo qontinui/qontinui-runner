@@ -236,10 +236,11 @@ pub fn create_router(
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
             let count =
-                crate::commands::ai_chat::resume_chat_sessions(chat_db, chat_sm, chat_handle).await;
+                crate::commands::ai_session::resume_ai_sessions(chat_db, chat_sm, chat_handle)
+                    .await;
 
             if count > 0 {
-                info!("Resumed {} chat session(s) on startup", count);
+                info!("Resumed {} AI session(s) on startup", count);
             }
         });
     }
@@ -371,11 +372,15 @@ pub fn create_router(
         .merge(crate::mcp::testing::routes())
         .merge(crate::mcp::triggers::routes())
         .merge(crate::mcp::ui_bridge::routes())
+        .merge(crate::mcp::ui_bridge_integration::routes())
         .merge(crate::mcp::unified_workflows::routes())
         .merge(crate::mcp::verification_tests::routes())
         .merge(crate::mcp::websocket::routes())
         .route("/cloud-relay/start", post(cloud_relay_start))
         .route("/cloud-relay/status", get(cloud_relay_status))
+        .layer(axum::middleware::from_fn(
+            crate::middleware::trace_propagation_middleware,
+        ))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .layer(RequestBodyLimitLayer::new(100 * 1024 * 1024))

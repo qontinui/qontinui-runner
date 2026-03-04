@@ -8,7 +8,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { Search, X, Check as CheckIcon, Workflow, FolderOpen, Layers } from "lucide-react";
 import type { WorkflowPhase, UnifiedWorkflow } from "../../types/unified-workflow";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 interface WorkflowLibraryPickerProps {
   isOpen: boolean;
@@ -42,7 +42,7 @@ export function WorkflowLibraryPicker({
     const fetchWorkflows = async () => {
       setIsLoading(true);
       try {
-        const response = await fetch(`${getApiBase()}/unified-workflows`, {
+        const response = await tracedFetch(`${getApiBase()}/unified-workflows`, {
           signal: controller.signal,
         });
         const result = await response.json();

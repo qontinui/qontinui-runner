@@ -30,6 +30,16 @@ pub struct PipelineArtifact {
     // Investigation
     pub investigation_enriched_description: Option<String>,
 
+    // Specification
+    pub specification_duration_ms: Option<u64>,
+    pub specification_criteria: Option<serde_json::Value>,
+
+    // Prompt capture (for training data / analysis)
+    pub specification_prompt: Option<String>,
+    pub builder_prompt: Option<String>,
+    pub verification_prompts: Option<serde_json::Value>,
+    pub hardener_prompt: Option<String>,
+
     // Intermediate snapshots
     pub discovery_calls: Option<serde_json::Value>,
     pub builder_raw_output: Option<String>,
@@ -74,6 +84,12 @@ pub struct PipelineArtifactBuilder {
 
     pub investigation_duration_ms: Option<u64>,
     pub investigation_enriched_description: Option<String>,
+    pub specification_duration_ms: Option<u64>,
+    pub specification_criteria: Option<serde_json::Value>,
+    pub specification_prompt: Option<String>,
+    pub builder_prompt: Option<String>,
+    pub verification_prompts: Vec<String>,
+    pub hardener_prompt: Option<String>,
     pub discovery_duration_ms: Option<u64>,
     pub builder_duration_ms: Option<u64>,
     pub autofix_duration_ms: Option<u64>,
@@ -118,6 +134,16 @@ impl PipelineArtifactBuilder {
 
             investigation_duration_ms: self.investigation_duration_ms,
             investigation_enriched_description: self.investigation_enriched_description,
+            specification_duration_ms: self.specification_duration_ms,
+            specification_criteria: self.specification_criteria,
+            specification_prompt: self.specification_prompt,
+            builder_prompt: self.builder_prompt,
+            verification_prompts: if self.verification_prompts.is_empty() {
+                None
+            } else {
+                serde_json::to_value(&self.verification_prompts).ok()
+            },
+            hardener_prompt: self.hardener_prompt,
             discovery_duration_ms: self.discovery_duration_ms,
             builder_duration_ms: self.builder_duration_ms,
             autofix_duration_ms: self.autofix_duration_ms,

@@ -8,7 +8,7 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import type { PlaywrightTestData } from "./types";
 import type { ScriptExecution, StepStats } from "../shared/types";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 const POLL_INTERVAL_MS = 2000;
 
@@ -52,7 +52,7 @@ export function usePlaywrightTestData(): PlaywrightTestData {
   // Fetch script executions
   const fetchScripts = useCallback(async () => {
     try {
-      const response = await fetch(`${getApiBase()}/step-executions?type=script`);
+      const response = await tracedFetch(`${getApiBase()}/step-executions?type=script`);
       if (response.ok) {
         const data: StepExecutionResponse = await response.json();
         if (data.success && data.data?.executions) {

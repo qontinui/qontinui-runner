@@ -6,7 +6,9 @@
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, warn};
+
+use super::prompt_analysis;
 
 /// Aggregated self-improvement context for prompt injection.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -23,6 +25,12 @@ pub struct SelfImprovementContext {
     pub delete_rate: (i64, i64),
     /// Average rating if available.
     pub avg_rating: Option<f64>,
+    /// Specification agent insights from prompt analysis.
+    pub specification_insights: Vec<String>,
+    /// Verification blind spots from prompt analysis.
+    pub verification_blind_spots: Vec<String>,
+    /// Hardener conversion patterns from prompt analysis.
+    pub hardener_patterns: Vec<String>,
 }
 
 /// Analyze historical generation patterns from the database.
@@ -30,6 +38,10 @@ pub struct SelfImprovementContext {
 /// Queries across `task_run_findings`, `learning_outcomes`, `learning_patterns`,
 /// and `workflow_generation_feedback` to build a comprehensive improvement context.
 pub fn analyze_generation_patterns(conn: &Connection) -> Result<SelfImprovementContext, String> {
+    // Load per-agent insights from prompt analysis
+    let (specification_insights, verification_blind_spots, hardener_patterns) =
+        load_agent_insights(conn);
+
     let ctx = SelfImprovementContext {
         common_verifier_issues: query_common_verifier_issues(conn)?,
         fixer_failures: query_fixer_failures(conn)?,
@@ -37,6 +49,9 @@ pub fn analyze_generation_patterns(conn: &Connection) -> Result<SelfImprovementC
         commonly_edited_fields: query_commonly_edited_fields(conn)?,
         delete_rate: query_delete_rate(conn)?,
         avg_rating: query_avg_rating(conn)?,
+        specification_insights,
+        verification_blind_spots,
+        hardener_patterns,
     };
 
     debug!(
@@ -120,6 +135,9 @@ impl SelfImprovementContext {
             && self.commonly_edited_fields.is_empty()
             && self.delete_rate == (0, 0)
             && self.avg_rating.is_none()
+            && self.specification_insights.is_empty()
+            && self.verification_blind_spots.is_empty()
+            && self.hardener_patterns.is_empty()
     }
 }
 
@@ -267,4 +285,88 @@ fn query_avg_rating(conn: &Connection) -> Result<Option<f64>, String> {
         .flatten();
 
     Ok(avg)
+}
+
+// ============================================================================
+// Per-Agent Insight Loading
+// ============================================================================
+
+/// Load per-agent insights from prompt analysis, returning (spec, verification, hardener).
+fn load_agent_insights(conn: &Connection) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let all_insights = match prompt_analysis::analyze_all(conn) {
+        Ok(insights) => insights,
+        Err(e) => {
+            warn!("Failed to load prompt analysis insights: {}", e);
+            return (vec![], vec![], vec![]);
+        }
+    };
+
+    let mut spec = Vec::new();
+    let mut verification = Vec::new();
+    let mut hardener = Vec::new();
+
+    for insight in all_insights {
+        let desc = insight.description.clone();
+        match insight.agent.as_str() {
+            "specification" => spec.push(desc),
+            "verification" => verification.push(desc),
+            "hardener" => hardener.push(desc),
+            // Builder insights go into the general improvement context
+            _ => {}
+        }
+    }
+
+    (spec, verification, hardener)
+}
+
+// ============================================================================
+// Per-Agent Formatting Functions
+// ============================================================================
+
+/// Format specification insights as markdown for the specification prompt.
+pub fn format_specification_insights(context: &SelfImprovementContext) -> String {
+    if context.specification_insights.is_empty() {
+        return String::new();
+    }
+
+    let mut output = String::from("## Lessons from Past Generations\n\n");
+    output.push_str(
+        "Based on analysis of previous workflow generations, pay attention to these patterns:\n\n",
+    );
+    for insight in &context.specification_insights {
+        output.push_str(&format!("- {}\n", insight));
+    }
+    output.push('\n');
+    output
+}
+
+/// Format verification blind spots as markdown for the verification prompt.
+pub fn format_verification_insights(context: &SelfImprovementContext) -> String {
+    if context.verification_blind_spots.is_empty() {
+        return String::new();
+    }
+
+    let mut output = String::from("## Known Blind Spots\n\n");
+    output.push_str("Previous analysis found that the verification agent tends to miss these issue types. Check for them explicitly:\n\n");
+    for blind_spot in &context.verification_blind_spots {
+        output.push_str(&format!("- {}\n", blind_spot));
+    }
+    output.push('\n');
+    output
+}
+
+/// Format hardener patterns as markdown for the hardener prompt.
+pub fn format_hardener_insights(context: &SelfImprovementContext) -> String {
+    if context.hardener_patterns.is_empty() {
+        return String::new();
+    }
+
+    let mut output = String::from("## Patterns from Past Conversions\n\n");
+    output
+        .push_str("Based on analysis of previous hardener runs, watch out for these patterns:\n\n");
+    for pattern in &context.hardener_patterns {
+        output.push_str(&format!("- {}\n", pattern));
+    }
+    output.push('\n');
+    output
 }

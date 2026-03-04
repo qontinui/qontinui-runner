@@ -10,7 +10,7 @@ import { LayoutDashboard, Loader2 } from "lucide-react";
 import { Badge } from "../ui";
 import { PanelCard } from "../active-dashboard/widgets/canvas/components/PanelCard";
 import type { CanvasPanel } from "@qontinui/shared-types";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 interface CanvasRecapTabProps {
   taskRunId: string;
@@ -28,7 +28,7 @@ export function CanvasRecapTab({ taskRunId }: CanvasRecapTabProps) {
     async function fetchPanels() {
       try {
         setIsLoading(true);
-        const response = await fetch(`${getApiBase()}/canvas/panels/history/${taskRunId}`);
+        const response = await tracedFetch(`${getApiBase()}/canvas/panels/history/${taskRunId}`);
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}`);
         }

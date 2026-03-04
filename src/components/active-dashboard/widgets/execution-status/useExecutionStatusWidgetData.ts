@@ -16,7 +16,7 @@ import type {
   IterationTrend,
   WorkflowTiming,
 } from "./types";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 const POLL_INTERVAL_MS = 3000;
 
@@ -94,7 +94,7 @@ export function useExecutionStatusWidgetData(): ExecutionStatusWidgetData {
   const fetchSessionBudget = useCallback(async () => {
     if (!taskRunId) return;
     try {
-      const res = await fetch(`${getApiBase()}/task-runs/${taskRunId}`);
+      const res = await tracedFetch(`${getApiBase()}/task-runs/${taskRunId}`);
       if (res.ok) {
         const data = await res.json();
         setSessionBudget({

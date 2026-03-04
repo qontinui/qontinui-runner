@@ -8,7 +8,7 @@
 import { useState, useEffect, useCallback } from "react";
 import type { PlaywrightData, TestSpec, TestStatus } from "./types";
 import { DEFAULT_PLAYWRIGHT_DATA } from "./types";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 /**
  * Response shape from the playwright log API.
@@ -133,7 +133,7 @@ export function usePlaywrightData(): PlaywrightData {
 
   const fetchData = useCallback(async () => {
     try {
-      const response = await fetch(`${getApiBase()}/logs/playwright`);
+      const response = await tracedFetch(`${getApiBase()}/logs/playwright`);
 
       if (!response.ok) {
         // If endpoint doesn't exist yet, return defaults
@@ -177,7 +177,7 @@ export function usePlaywrightDataWithStatus(): {
 
   const fetchData = useCallback(async () => {
     try {
-      const response = await fetch(`${getApiBase()}/logs/playwright`);
+      const response = await tracedFetch(`${getApiBase()}/logs/playwright`);
 
       if (!response.ok) {
         if (response.status === 404) {

@@ -522,7 +522,7 @@ async fn handle_relay_command(
             let create_result = tokio::task::spawn_blocking(move || {
                 db.create_task_run(
                     &crate::database::CreateTaskRunInput::new(id_clone, name_clone)
-                        .with_prompt("Remote chat session")
+                        .with_prompt("Remote AI session")
                         .with_workflow_type("chat"),
                 )
             })
@@ -556,7 +556,7 @@ async fn handle_relay_command(
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|_| ".".to_string());
 
-                let system_prompt = "You are an AI assistant in a chat session initiated from the \
+                let system_prompt = "You are an AI assistant in a session initiated from the \
                     qontinui mobile app. Respond helpfully and conversationally. The user may ask \
                     about anything — workflows, automation, code questions, or general topics."
                     .to_string();
@@ -574,12 +574,12 @@ async fn handle_relay_command(
                         let session = Arc::new(session);
 
                         if let Err(e) = session_manager.register(&bg_task_run_id, session.clone()) {
-                            warn!("Failed to register relay chat session: {}", e);
+                            warn!("Failed to register relay AI session: {}", e);
                             return;
                         }
 
                         // Emit ready state
-                        crate::commands::ai_chat::emit_session_state(
+                        crate::commands::ai_session::emit_session_state(
                             &bg_state.app_handle,
                             &bg_task_run_id,
                             &bg_task_run_id,
@@ -594,7 +594,7 @@ async fn handle_relay_command(
                         }
 
                         // Emit processing state
-                        crate::commands::ai_chat::emit_session_state(
+                        crate::commands::ai_session::emit_session_state(
                             &bg_state.app_handle,
                             &bg_task_run_id,
                             &bg_task_run_id,
@@ -602,21 +602,18 @@ async fn handle_relay_command(
                         );
 
                         info!(
-                            "Relay chat session ready: task_run_id={}, task_name={}",
+                            "Relay AI session ready: task_run_id={}, task_name={}",
                             bg_task_run_id, bg_task_name
                         );
                     }
                     Err(e) => {
-                        warn!("Failed to spawn relay chat session: {}", e);
+                        warn!("Failed to spawn relay AI session: {}", e);
                     }
                 }
             });
 
             // Return immediately so handle_inbound stays responsive to pings
-            info!(
-                "Relay chat session initializing: task_run_id={}",
-                task_run_id
-            );
+            info!("Relay AI session initializing: task_run_id={}", task_run_id);
             Some(serde_json::json!({
                 "type": "chat_created",
                 "id": task_run_id,
@@ -646,7 +643,7 @@ async fn handle_relay_command(
                 if let Some(session) = sm.get(task_run_id) {
                     match session.interrupt() {
                         Ok(()) => {
-                            crate::commands::ai_chat::emit_session_state(
+                            crate::commands::ai_session::emit_session_state(
                                 &api_state.app_handle,
                                 task_run_id,
                                 session.session_id(),
@@ -791,6 +788,7 @@ async fn handle_relay_command(
                 include_design_guidance: None,
                 auto_run: None,
                 model_overrides: None,
+                generate_specification: Some(true),
             };
 
             let doctor_handle = api_state.doctor_handle.clone();
@@ -825,6 +823,7 @@ async fn handle_relay_command(
                             verification_iterations: vec![],
                             hardening_summary: None,
                             discovery_calls: vec![],
+                            acceptance_criteria: None,
                         }
                     }
                 }

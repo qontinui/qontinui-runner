@@ -17,7 +17,7 @@ import { cn } from "../../../../lib/utils";
 import { ProgressBar, InlineProgressBar, type ProgressType } from "../../../ui/ProgressBar";
 import { ProgressErrorBoundary } from "../../../ui/ProgressErrorBoundary";
 import { Loader2 } from "lucide-react";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 /**
  * Progress marker data from the API.
@@ -108,7 +108,7 @@ export function useStepProgressMarkers(
     }
 
     try {
-      const response = await fetch(
+      const response = await tracedFetch(
         `${getApiBase()}/task-runs/${taskRunId}/steps/${checkpointId}/progress`,
       );
       if (!response.ok) {

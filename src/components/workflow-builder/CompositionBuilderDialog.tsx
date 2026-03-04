@@ -7,7 +7,7 @@
 import React from "react";
 import { CompositionSkillBuilder } from "@qontinui/workflow-ui/components";
 import { registerUserSkills } from "@qontinui/workflow-utils";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 interface CompositionBuilderDialogProps {
   isOpen: boolean;
@@ -35,7 +35,7 @@ export function CompositionBuilderDialog({
               .replace(/[^a-z0-9]+/g, "-")
               .replace(/^-|-$/g, "");
             try {
-              await fetch(`${getApiBase()}/skills`, {
+              await tracedFetch(`${getApiBase()}/skills`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -52,7 +52,7 @@ export function CompositionBuilderDialog({
                   template: { kind: "composition", skill_refs: refs },
                 }),
               });
-              const skillsRes = await fetch(`${getApiBase()}/skills`);
+              const skillsRes = await tracedFetch(`${getApiBase()}/skills`);
               const skillsData = await skillsRes.json();
               const allSkills = skillsData.data ?? skillsData ?? [];
               const nonBuiltin = allSkills.filter(

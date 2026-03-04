@@ -29,7 +29,7 @@ import { findingsTracker, getVisibleCategories, getCategoryById } from "../../se
 import { CategorySection } from "./CategorySection";
 import { useAiTaskPolling } from "../../hooks";
 import { useRunSelectionOptional } from "../../contexts/RunSelectionContext";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 /** Auto-fixable category IDs */
 const AUTO_FIXABLE_CATEGORIES = ["code_bug", "security", "test_issue", "documentation"];
@@ -115,7 +115,7 @@ export function ExecutionReport({
 
     const loadAutoFixSetting = async () => {
       try {
-        const response = await fetch(`${getApiBase()}/session/auto-fix`, {
+        const response = await tracedFetch(`${getApiBase()}/session/auto-fix`, {
           signal: controller.signal,
         });
         const result = await response.json();
@@ -141,7 +141,7 @@ export function ExecutionReport({
 
     setAutoFixLoading(true);
     try {
-      const response = await fetch(`${getApiBase()}/session/auto-fix`, {
+      const response = await tracedFetch(`${getApiBase()}/session/auto-fix`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ enabled: !autoFixEnabled }),

@@ -440,3 +440,48 @@ pub fn get_workspace_paths() -> Result<CommandResponse, String> {
         })),
     })
 }
+
+/// Get the configured Claude Code config directories.
+///
+/// # Returns
+/// * `Ok(CommandResponse)` - Success with dirs array
+#[tauri::command]
+pub fn get_claude_config_dirs() -> Result<CommandResponse, String> {
+    let dirs = settings::get_claude_config_dirs();
+
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::json!({ "dirs": dirs })),
+    })
+}
+
+/// Save the configured Claude Code config directories.
+///
+/// Validates that each path has a `projects/` subdirectory before saving.
+///
+/// # Arguments
+/// * `dirs` - List of directory paths to save
+///
+/// # Returns
+/// * `Ok(CommandResponse)` - Success message
+/// * `Err(String)` - Error if settings cannot be saved
+#[tauri::command]
+pub fn save_claude_config_dirs(dirs: Vec<String>) -> Result<CommandResponse, String> {
+    info!("Saving {} Claude config dirs", dirs.len());
+
+    // Validate each path has a projects/ subdirectory
+    let valid_dirs: Vec<String> = dirs
+        .into_iter()
+        .filter(|d| std::path::Path::new(d).join("projects").exists())
+        .collect();
+
+    settings::save_claude_config_dirs(valid_dirs.clone())
+        .map_err(|e| format!("Failed to save Claude config dirs: {}", e))?;
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some(format!("Saved {} Claude config dirs", valid_dirs.len())),
+        data: Some(serde_json::json!({ "dirs": valid_dirs })),
+    })
+}

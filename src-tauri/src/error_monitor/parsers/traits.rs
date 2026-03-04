@@ -123,6 +123,7 @@ impl ErrorEventBuilder {
             context_lines: self.context_lines,
             raw_entry: self.raw_entry,
             log_timestamp: self.log_timestamp,
+            trace_id: None,
         }
     }
 }

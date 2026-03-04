@@ -6,7 +6,7 @@ import type {
   CreateTriggerRequest,
   UpdateTriggerRequest,
 } from "../../types/triggers";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 interface WorkflowOption {
   id: string;
@@ -100,7 +100,7 @@ export function TriggerEditor({ trigger, onSave, onCancel }: TriggerEditorProps)
   useEffect(() => {
     (async () => {
       try {
-        const res = await fetch(`${getApiBase()}/unified-workflows`, {
+        const res = await tracedFetch(`${getApiBase()}/unified-workflows`, {
           headers: { "Content-Type": "application/json" },
         });
         const json = await res.json();

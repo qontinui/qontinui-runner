@@ -7,7 +7,7 @@ import type {
   CreateTriggerRequest,
   UpdateTriggerRequest,
 } from "../types/triggers";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 interface ApiResponse<T> {
   success: boolean;
@@ -27,7 +27,7 @@ async function apiRequest<T>(
   options?: RequestInit,
 ): Promise<{ data: T | null; error: string | null }> {
   try {
-    const response = await fetch(`${getApiBase()}${path}`, {
+    const response = await tracedFetch(`${getApiBase()}${path}`, {
       headers: { "Content-Type": "application/json" },
       ...options,
     });

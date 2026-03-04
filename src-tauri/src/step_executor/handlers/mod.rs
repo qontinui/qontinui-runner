@@ -530,6 +530,8 @@ impl PromptStepHandler {
                 None, // reflection_fix_ctx
                 None, // step_injection_ctx
                 None, // model_override
+                None, // session_manager — no inline PID tracking for step executor
+                None, // task_run_id
             )
         })
         .await;

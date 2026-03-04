@@ -439,7 +439,7 @@ impl UnifiedAiSessionExecutor {
     /// 5. Logs events via StepEventLogger
     /// 6. Returns AiSessionResult
     #[instrument(
-        name = "ai.session",
+        name = "qontinui.ai.session",
         skip(self, prompt, logger),
         fields(
             execution_id = %config.task_run_id,
@@ -548,11 +548,13 @@ impl UnifiedAiSessionExecutor {
         // Run Claude session (interactive if session manager is available AND setting enabled, otherwise inline)
         let workspace_for_claude = workspace_root;
         let sid_for_claude = session_id.clone();
-        let session_manager = if use_interactive {
+        let interactive_session_manager = if use_interactive {
             self.session_manager.clone()
         } else {
             None
         };
+        // Always pass session_manager for inline PID registration (stale task sweep visibility)
+        let inline_session_manager = self.session_manager.clone();
         let task_run_id_for_claude = config.task_run_id.clone();
         let reflection_fix_ctx = config.reflection_fix_ctx.clone();
         let step_injection_ctx = config.step_injection_ctx.clone();
@@ -560,7 +562,7 @@ impl UnifiedAiSessionExecutor {
 
         let result = tokio::task::spawn_blocking(move || {
             let doctor_ref = doctor_handle.as_ref();
-            if let Some(ref sm) = session_manager {
+            if let Some(ref sm) = interactive_session_manager {
                 // Interactive mode: bidirectional stream-json session
                 crate::claude_session::runner::run_claude_session_interactive_with_retry(
                     &workspace_for_claude,
@@ -599,6 +601,8 @@ impl UnifiedAiSessionExecutor {
                     reflection_fix_ctx,
                     step_injection_ctx,
                     model_override.as_deref(),
+                    inline_session_manager.as_ref(),
+                    Some(&task_run_id_for_claude),
                 )
             }
         })

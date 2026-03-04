@@ -437,10 +437,10 @@ fn build_builder_prompt(
 - No circular dependencies exist in `depends_on` chains
 - Step names are descriptive (not "Step 1", "Test", etc.)
 - `working_directory` paths are real absolute or project-relative paths (no placeholders)
-- Only use these 4 step types: `command`, `test`, `ui_bridge`, `prompt`
+- Only 3 step types exist: `command`, `ui_bridge`, and `prompt`. Do NOT use `test`, `shell_command`, `api_request`, `check`, `gate`, or `spec`. Tests are run via `command` with `test_type` set. Checks are run via `command` with `check_type` set.
 
 ### CRITICAL — Verification must be automated, not just AI judgment:
-- verification_steps MUST include at least one automated step (`command`, `test`, or `ui_bridge` with assert action). NEVER create a workflow where ALL verification steps are `prompt` type — this is the #1 most common generation mistake.
+- verification_steps MUST include at least one automated step (`command` or `ui_bridge` with assert action). NEVER create a workflow where ALL verification steps are `prompt` type — this is the #1 most common generation mistake.
 - If the workflow creates/modifies TypeScript files, ALWAYS include: `{{"type": "command", "check_type": "typecheck", "command": "npx tsc --noEmit", "working_directory": "<project_dir>"}}`
 - If the workflow creates/modifies Python files, ALWAYS include: `{{"type": "command", "check_type": "typecheck", "command": "mypy .", "working_directory": "<project_dir>"}}`
 - If the workflow targets a web app (localhost:3001 or localhost:1420), ALWAYS include a `ui_bridge` step in verification to verify UI state. Add SDK connect in setup first.
@@ -488,6 +488,9 @@ Every agentic step MUST have at least one corresponding verification step that w
 - Agentic step "implement drag-and-drop" with only a visual review → add a Playwright interaction test
 
 If an agentic step has multiple distinct goals (e.g., "edge labels, initial state badge, and keyboard shortcuts"), each goal needs its own verification step or a combined test that checks all of them.
+
+- When the task involves **removing** a page, route, component, or feature from a web app, verification MUST include a **runtime check** confirming the removal (e.g., UI Bridge navigate to the removed URL and assert 404/redirect, or use sdk/ai/search to verify removed nav elements are absent). Static file-existence checks (`test ! -f`) alone are NOT sufficient — build caches and routing config may still serve removed content.
+- In multi-stage workflows, EACH stage that modifies UI behavior (adds, removes, or changes visible pages/components) MUST have its own UI Bridge verification steps. Do not rely on UI Bridge checks in other stages to cover this stage's UI changes.
 
 ### Out-of-Scope Enforcement
 
@@ -538,6 +541,8 @@ Check for these issues:
 15. **Web app SDK verification**: If the workflow targets a web app (localhost:3001, localhost:1420), there SHOULD be a `ui_bridge` step in verification to verify UI state programmatically. Flag as a warning if missing.
 16. **Agentic-verification coverage**: Every agentic step MUST have at least one verification step that would FAIL if that agentic step's work was NOT done. A tab-existence check does NOT count as coverage for an agentic step that adds content within that tab. Flag as a failure if any agentic step has no corresponding verification.
 17. **Out-of-scope enforcement**: If the task description contains "out of scope", "do not change", "do not modify", or similar boundary constraints, there SHOULD be at least one verification step that checks those boundaries were respected. Flag as a warning if missing.
+18. **Removal runtime verification**: If any stage removes a page/route/component from a web app, does it include a runtime verification (UI Bridge or curl) that the removed entity is no longer accessible? File-existence checks (test ! -f) alone are insufficient for web apps. Flag as a failure if missing.
+19. **Per-stage UI coverage**: In multi-stage workflows, does each stage that modifies UI have its own UI Bridge verification? A UI Bridge check in one stage does NOT cover changes in another stage. Flag as a warning if missing.
 "#
     .to_string();
 
@@ -667,6 +672,7 @@ Analyze the user's intent in context of the project structure (from discovery co
 4. **Flag potential issues** — dead code paths, missing implementations, broken data flows
 5. **Specify concrete targets** — replace vague references with specific file paths and component names
 6. **Mention verification approaches** — suggest what should be checked to verify the work
+7. **Runtime verification for removals** — for tasks that involve removing pages/routes/components, note that the running application must be checked (not just source files) since build caches, SSR, and routing configurations may still serve removed content
 
 CRITICAL: Do NOT run shell commands, make HTTP requests, use APIs, or interact with any system.
 Do NOT ask questions or request permission. You are a text-in, text-out analyst.

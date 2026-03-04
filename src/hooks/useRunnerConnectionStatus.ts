@@ -6,7 +6,7 @@
  */
 
 import { useState, useEffect, useCallback } from "react";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 export interface ConnectionStatus {
   isConnected: boolean;
@@ -30,7 +30,7 @@ export function useRunnerConnectionStatus(): ConnectionStatus {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), HEALTH_TIMEOUT);
 
-      const response = await fetch(`${getApiBase()}/health`, {
+      const response = await tracedFetch(`${getApiBase()}/health`, {
         signal: controller.signal,
       });
       clearTimeout(timeout);

@@ -22,7 +22,7 @@ import {
   type OrchestratorAgent,
   detectCurrentOrchestratorAgent,
 } from "../../components/shared/AiMessageDisplay";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 // Polling is now fallback only - real-time events provide instant updates
 const ACTIVITY_POLL_INTERVAL_MS = 5000;
@@ -163,7 +163,7 @@ export function useDashboardState(): UseDashboardStateResult {
     const pollActivityStatus = async () => {
       try {
         // Check for running GUI actions
-        const actionResponse = await fetch(`${getApiBase()}/action-log/view`);
+        const actionResponse = await tracedFetch(`${getApiBase()}/action-log/view`);
         let guiRunning = false;
         if (actionResponse.ok) {
           const actionData = await actionResponse.json();

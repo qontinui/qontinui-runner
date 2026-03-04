@@ -84,7 +84,7 @@ Before the demo:
 ## Section 4: Generate a Workflow from Natural Language (3-4 minutes)
 
 ### Step 4a: Open the generator
-**Navigate to:** Chat page (run-plan) or Workflow Builder → AI Generate panel
+**Navigate to:** Terminal page → Generate Workflow button, or Workflow Builder → AI Generate panel
 
 ### Step 4b: Type a description
 **Type something like:**

@@ -8,7 +8,7 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import type { ShellCommandData } from "./types";
 import type { ShellCommandExecution, StepStats } from "../shared/types";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 const POLL_INTERVAL_MS = 2000;
 
@@ -56,7 +56,7 @@ export function useShellCommandData(): ShellCommandData {
   const fetchCommands = useCallback(async () => {
     try {
       // Fetch from current-execution/steps with shell_command filter
-      const response = await fetch(`${getApiBase()}/current-execution/steps?step_type=shell`);
+      const response = await tracedFetch(`${getApiBase()}/current-execution/steps?step_type=shell`);
       if (response.ok) {
         const data: CurrentExecutionStepsResponse = await response.json();
         if (data.success && data.executions) {

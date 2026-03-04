@@ -455,6 +455,108 @@ pub fn truncate_to_title(description: &str) -> String {
     }
 }
 
+// ============================================================================
+// Auto-Rule Generation from Insights
+// ============================================================================
+
+/// Promote high-confidence prompt insights into auto-generated rules.
+///
+/// An insight is promoted when:
+/// - `confidence > 0.8`
+/// - `evidence_count >= 5`
+/// - No existing rule with similar content (content-hash dedup)
+///
+/// Returns the number of newly created rules.
+pub fn promote_insights_to_rules(
+    conn: &Connection,
+    insights: &[super::prompt_analysis::PromptInsight],
+) -> Result<u32, String> {
+    let mut created = 0u32;
+
+    for insight in insights {
+        // Only promote high-confidence insights with sufficient evidence
+        if insight.confidence <= 0.8 || insight.evidence_count < 5 {
+            continue;
+        }
+
+        let rule_content = match &insight.suggested_rule {
+            Some(content) => content.clone(),
+            None => continue, // No suggested rule text → skip
+        };
+
+        // Dedup: check if a similar auto-generated rule already exists
+        let content_hash = simple_content_hash(&rule_content);
+        let existing_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM generation_rules WHERE provenance = 'auto_insight' AND content LIKE ?1",
+                rusqlite::params![format!("%{}%", &content_hash)],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        if existing_count > 0 {
+            continue;
+        }
+
+        // Map insight agent to rule agent + section
+        let (rule_agent, rule_section) =
+            map_insight_to_rule_location(&insight.agent, &insight.insight_type);
+
+        let rule_number = next_rule_number(conn, &rule_agent, &rule_section);
+        let title = truncate_to_title(&insight.description);
+
+        // Tag the content with the hash for future dedup
+        let tagged_content = format!("{}\n<!-- hash:{} -->", rule_content, content_hash);
+
+        let input = InsertRuleInput {
+            agent: rule_agent,
+            section: rule_section,
+            rule_number,
+            title,
+            content: tagged_content,
+            condition: None,
+            provenance: "auto_insight".to_string(),
+            source_fix_id: None,
+        };
+
+        match insert_rule(conn, &input) {
+            Ok(_) => created += 1,
+            Err(e) => warn!("Failed to auto-create rule from insight: {}", e),
+        }
+    }
+
+    if created > 0 {
+        tracing::info!("Auto-generated {} rules from prompt insights", created);
+    }
+
+    Ok(created)
+}
+
+/// Simple content hash for dedup (first 16 chars of content, normalized).
+fn simple_content_hash(content: &str) -> String {
+    let normalized: String = content
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .take(32)
+        .collect();
+    normalized[..normalized.len().min(16)].to_string()
+}
+
+/// Map an insight's agent + type to the appropriate rule agent + section.
+fn map_insight_to_rule_location(agent: &str, insight_type: &str) -> (String, String) {
+    match (agent, insight_type) {
+        ("specification", _) => ("specification".to_string(), "criteria_rules".to_string()),
+        ("verification", "verification_blind_spot") => {
+            ("verification".to_string(), "check_rules".to_string())
+        }
+        ("verification", _) => ("verification".to_string(), "check_rules".to_string()),
+        ("hardener", _) => ("hardener".to_string(), "conversion_rules".to_string()),
+        ("builder", _) => ("schema_context".to_string(), "important_rules".to_string()),
+        _ => ("schema_context".to_string(), "important_rules".to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

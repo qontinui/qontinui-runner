@@ -39,12 +39,14 @@ pub struct TranscriptMessage {
 
 /// Find Claude Code config directories on this machine.
 ///
-/// Checks `CLAUDE_CONFIG_DIR` env var first, then scans common locations
-/// like `C:/claude/.claude-*/` for directories containing a `projects/` subfolder.
+/// Checks (in order):
+/// 1. `CLAUDE_CONFIG_DIR` env var
+/// 2. User-configured dirs from settings (validated for `projects/` subfolder)
+/// 3. `~/.claude` fallback (standard location)
 pub fn find_claude_config_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
 
-    // Check CLAUDE_CONFIG_DIR env var first
+    // 1. Check CLAUDE_CONFIG_DIR env var first
     if let Ok(env_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
         let p = PathBuf::from(&env_dir);
         if p.join("projects").exists() {
@@ -52,24 +54,16 @@ pub fn find_claude_config_dirs() -> Vec<PathBuf> {
         }
     }
 
-    // Scan C:/claude/.claude-*/ directories (Windows-specific paths)
-    if let Ok(entries) = fs::read_dir("C:\\claude") {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.starts_with(".claude-") && path.join("projects").exists() {
-                        // Don't add duplicates
-                        if !dirs.iter().any(|d| d == &path) {
-                            dirs.push(path);
-                        }
-                    }
-                }
-            }
+    // 2. User-configured dirs from settings
+    let configured = crate::settings::get_claude_config_dirs();
+    for dir_str in configured {
+        let p = PathBuf::from(&dir_str);
+        if p.join("projects").exists() && !dirs.iter().any(|d| d == &p) {
+            dirs.push(p);
         }
     }
 
-    // Also check user home directory for standard .claude location
+    // 3. Fallback: user home directory for standard .claude location
     if let Ok(home) = std::env::var("USERPROFILE") {
         let home_claude = PathBuf::from(&home).join(".claude");
         if home_claude.join("projects").exists() && !dirs.iter().any(|d| d == &home_claude) {
@@ -93,13 +87,11 @@ fn encode_project_path(project_path: &str) -> String {
         .trim_end_matches('/')
         .to_string();
 
-    // Claude Code uses: replace / with -, remove :
-    // C:/Users/jspin/Documents/qontinui_parent → C--Users-jspin-Documents-qontinui_parent
-    // Actually looking at the real dir name: C--Users-jspin-Documents-qontinui-parent
-    // The encoding replaces : with nothing, / with -, and _ with -
+    // Claude Code encoding: :/ → --, then all :, /, \, _ → -
+    // C:/Users/jspin/Documents/qontinui_parent → C--Users-jspin-Documents-qontinui-parent
     normalized
         .replace(":/", "--")
-        .replace([':', '/', '\\'], "-")
+        .replace([':', '/', '\\', '_'], "-")
 }
 
 // ── Session Listing ──────────────────────────────────────────────────────────

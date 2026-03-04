@@ -6,7 +6,7 @@
  */
 
 import { useState, useCallback, useRef } from "react";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 // ============================================================================
 // Types
@@ -91,7 +91,7 @@ export function useAppDiscovery(): UseAppDiscoveryReturn {
   const scanningWebRef = useRef(false);
 
   const fetchJson = useCallback(async <T>(url: string, signal?: AbortSignal): Promise<T> => {
-    const response = await fetch(url, {
+    const response = await tracedFetch(url, {
       method: url.includes("/scan") && !url.includes("/scan/") ? "POST" : "GET",
       headers: { "Content-Type": "application/json" },
       signal,
@@ -184,7 +184,7 @@ export function useAppDiscovery(): UseAppDiscoveryReturn {
   const forwardDevice = useCallback(
     async (deviceId: string, remotePort: number = 9876): Promise<ForwardDeviceResult | null> => {
       try {
-        const response = await fetch(`${getApiBase()}/ui-bridge/apps/forward-device`, {
+        const response = await tracedFetch(`${getApiBase()}/ui-bridge/apps/forward-device`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ deviceId, remotePort }),

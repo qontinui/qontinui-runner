@@ -5,8 +5,9 @@ import { WelcomeStep } from "./WelcomeStep";
 import { ProjectStep } from "./ProjectStep";
 import { ProcessStep } from "./ProcessStep";
 import { AiProviderStep } from "./AiProviderStep";
+import { ClaudeConfigStep } from "./ClaudeConfigStep";
 
-const STEPS = ["Welcome", "Projects", "Processes", "AI Provider"];
+const STEPS = ["Welcome", "Projects", "Processes", "AI Provider", "Claude Sessions"];
 
 interface Project {
   path: string;
@@ -48,30 +49,35 @@ export function SetupWizard({ onComplete }: SetupWizardProps) {
     setCurrentStep((s) => Math.max(s - 1, 0));
   }, []);
 
-  const finishSetup = useCallback(
-    async (_aiConfig: { provider: string } | null) => {
-      try {
-        // Save process configs
-        for (const config of selectedProcessConfigs) {
-          await invoke("save_process_config", { config });
-        }
-
-        // Mark setup as completed
-        await invoke("complete_setup");
-        onComplete();
-      } catch (err) {
-        console.error("Failed to complete setup:", err);
-        // Still complete even if save fails - user can configure later
-        try {
-          await invoke("complete_setup");
-        } catch {
-          // Ignore
-        }
-        onComplete();
-      }
+  const handleAiProviderComplete = useCallback(
+    (_aiConfig: { provider: string } | null) => {
+      // AiProviderStep saves the provider internally; just advance
+      goNext();
     },
-    [selectedProcessConfigs, onComplete],
+    [goNext],
   );
+
+  const finishSetup = useCallback(async () => {
+    try {
+      // Save process configs
+      for (const config of selectedProcessConfigs) {
+        await invoke("save_process_config", { config });
+      }
+
+      // Mark setup as completed
+      await invoke("complete_setup");
+      onComplete();
+    } catch (err) {
+      console.error("Failed to complete setup:", err);
+      // Still complete even if save fails - user can configure later
+      try {
+        await invoke("complete_setup");
+      } catch {
+        // Ignore
+      }
+      onComplete();
+    }
+  }, [selectedProcessConfigs, onComplete]);
 
   return (
     <div className="min-h-screen bg-background grid-dots flex flex-col items-center justify-center p-4">
@@ -100,7 +106,13 @@ export function SetupWizard({ onComplete }: SetupWizardProps) {
           />
         )}
 
-        {currentStep === 3 && <AiProviderStep onComplete={finishSetup} onBack={goBack} />}
+        {currentStep === 3 && (
+          <AiProviderStep onComplete={handleAiProviderComplete} onBack={goBack} />
+        )}
+
+        {currentStep === 4 && (
+          <ClaudeConfigStep onComplete={finishSetup} onBack={goBack} />
+        )}
       </div>
     </div>
   );

@@ -1,6 +1,7 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Settings as SettingsIcon, FileText } from "lucide-react";
+import { open } from "@tauri-apps/plugin-dialog";
+import { Settings as SettingsIcon, FileText, FolderSearch, Plus, X, RefreshCw } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import type { AppSettings, LogFunction } from "./types";
 
@@ -18,6 +19,16 @@ interface IncludeSummaryStepData {
   enabled: boolean;
 }
 
+interface ClaudeConfigDirsData {
+  dirs: string[];
+}
+
+interface DiscoveredDir {
+  path: string;
+  label: string;
+  source: string;
+}
+
 interface GeneralSettingsProps {
   onLog: LogFunction;
 }
@@ -27,10 +38,13 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
     auto_load_last_config: false,
   });
   const [includeSummaryStep, setIncludeSummaryStep] = useState<boolean>(true);
+  const [claudeConfigDirs, setClaudeConfigDirs] = useState<string[]>([]);
+  const [detectingDirs, setDetectingDirs] = useState(false);
 
   useEffect(() => {
     loadAppSettings();
     loadIncludeSummaryStep();
+    loadClaudeConfigDirs();
   }, []);
 
   const loadAppSettings = async () => {
@@ -109,6 +123,72 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
       setIncludeSummaryStep(!newValue);
     }
   };
+
+  const loadClaudeConfigDirs = async () => {
+    try {
+      const result = await invoke<TauriResult<ClaudeConfigDirsData>>("get_claude_config_dirs");
+      if (result?.success && result.data) {
+        setClaudeConfigDirs(result.data.dirs);
+      }
+    } catch (err) {
+      console.error("Failed to load Claude config dirs:", err);
+    }
+  };
+
+  const saveClaudeConfigDirs = useCallback(
+    async (dirs: string[]) => {
+      try {
+        const result = await invoke<TauriResult<ClaudeConfigDirsData>>(
+          "save_claude_config_dirs",
+          { dirs },
+        );
+        if (result?.success && result.data) {
+          setClaudeConfigDirs(result.data.dirs);
+          onLog("success", `Saved ${result.data.dirs.length} Claude config directories`);
+        } else {
+          onLog("error", "Failed to save Claude config dirs");
+        }
+      } catch (err) {
+        console.error("Failed to save Claude config dirs:", err);
+        onLog("error", `Failed to save Claude config dirs: ${err}`);
+      }
+    },
+    [onLog],
+  );
+
+  const handleRemoveClaudeDir = useCallback(
+    (path: string) => {
+      const updated = claudeConfigDirs.filter((d) => d !== path);
+      saveClaudeConfigDirs(updated);
+    },
+    [claudeConfigDirs, saveClaudeConfigDirs],
+  );
+
+  const handleAddClaudeDir = useCallback(async () => {
+    const selected = await open({ directory: true, multiple: false });
+    if (selected) {
+      const path = selected as string;
+      if (!claudeConfigDirs.includes(path)) {
+        saveClaudeConfigDirs([...claudeConfigDirs, path]);
+      }
+    }
+  }, [claudeConfigDirs, saveClaudeConfigDirs]);
+
+  const handleAutoDetectClaudeDirs = useCallback(async () => {
+    setDetectingDirs(true);
+    try {
+      const found = await invoke<DiscoveredDir[]>("discover_claude_config_dirs");
+      const newPaths = found.map((d) => d.path);
+      // Merge with existing, dedup
+      const merged = [...new Set([...claudeConfigDirs, ...newPaths])];
+      await saveClaudeConfigDirs(merged);
+    } catch (err) {
+      console.error("Failed to auto-detect Claude config dirs:", err);
+      onLog("error", `Auto-detect failed: ${err}`);
+    } finally {
+      setDetectingDirs(false);
+    }
+  }, [claudeConfigDirs, saveClaudeConfigDirs, onLog]);
 
   return (
     <div className="space-y-6">
@@ -198,6 +278,65 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
             comprehensive summary of your workflow execution, including what was accomplished and
             any issues encountered. It runs at the end of the completion phase.
           </div>
+        </div>
+      </div>
+
+      {/* Claude Code Sessions */}
+      <div
+        className="space-y-4 rounded-lg bg-card/50 p-4"
+        data-ui-id="settings-general-claude-sessions-section"
+      >
+        <h4 className="font-medium text-sm flex items-center gap-2">
+          <FolderSearch className="w-4 h-4" />
+          Claude Code Sessions
+        </h4>
+
+        <div className="text-xs text-muted-foreground mb-2">
+          Directories containing Claude Code configs used by Terminal &gt; Browse Sessions to find
+          transcript files. Each directory must have a <code>projects/</code> subdirectory.
+        </div>
+
+        <div className="space-y-2">
+          {claudeConfigDirs.length === 0 ? (
+            <div className="text-sm text-muted-foreground text-center py-3">
+              No directories configured. The default <code>~/.claude</code> location is used as
+              fallback.
+            </div>
+          ) : (
+            claudeConfigDirs.map((dir) => (
+              <div
+                key={dir}
+                className="flex items-center gap-2 p-2 rounded-lg bg-muted/30 group"
+              >
+                <span className="text-sm truncate flex-1">{dir}</span>
+                <button
+                  onClick={() => handleRemoveClaudeDir(dir)}
+                  className="text-zinc-500 hover:text-red-400 transition-colors opacity-0 group-hover:opacity-100"
+                  title="Remove"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            ))
+          )}
+        </div>
+
+        <div className="flex gap-2">
+          <button
+            className="btn-secondary text-xs flex items-center gap-1.5"
+            onClick={handleAddClaudeDir}
+          >
+            <Plus className="w-3.5 h-3.5" />
+            Add Directory
+          </button>
+          <button
+            className="btn-secondary text-xs flex items-center gap-1.5"
+            onClick={handleAutoDetectClaudeDirs}
+            disabled={detectingDirs}
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${detectingDirs ? "animate-spin" : ""}`} />
+            Auto-Detect
+          </button>
         </div>
       </div>
     </div>

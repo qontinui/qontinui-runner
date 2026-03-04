@@ -145,7 +145,7 @@ impl LoopController {
     /// 3. COMPLETION (only if verification passed)
     /// 4. Return final result
     #[instrument(
-        name = "workflow.execute",
+        name = "qontinui.workflow",
         skip(self, setup_automation_steps, setup_prompt_steps, verification_steps, agentic_steps, completion_automation_steps, completion_prompt_steps),
         fields(
             execution_id = %config.execution_id,
@@ -1202,11 +1202,16 @@ impl LoopController {
 
         // Trigger reflection workflow (dev mode only, non-reflection runs only)
         if config.is_dev_mode {
+            let session_manager: Option<Arc<crate::claude_session::SessionManager>> = self
+                .app_handle
+                .try_state::<Arc<crate::claude_session::SessionManager>>()
+                .map(|s| s.inner().clone());
             let deps = crate::reflection::trigger::ReflectionDeps {
                 app_state: self.app_state.clone(),
                 config_storage: self.config_storage.clone(),
                 app_handle: self.app_handle.clone(),
                 pid_tracker: self.pid_tracker.clone(),
+                session_manager: session_manager.clone(),
             };
             let source_task_run_id = config.execution_id.clone();
             tokio::spawn(async move {
@@ -1240,6 +1245,7 @@ impl LoopController {
                 config_storage: self.config_storage.clone(),
                 app_handle: self.app_handle.clone(),
                 pid_tracker: self.pid_tracker.clone(),
+                session_manager,
             };
             let follow_up_source_id = config.execution_id.clone();
             tokio::spawn(async move {
@@ -1324,7 +1330,7 @@ impl LoopController {
     /// CRITICAL: This loop is the ONLY authority on whether verification passes.
     /// The AI cannot bypass this by outputting [TASK_COMPLETE] or similar.
     #[instrument(
-        name = "workflow.verification_agentic_loop",
+        name = "qontinui.workflow.verification_loop",
         skip(self, verification_steps, agentic_steps, all_step_results, transitions, current_stage, logger),
         fields(
             execution_id = %config.execution_id,

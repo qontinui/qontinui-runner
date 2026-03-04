@@ -15,7 +15,7 @@ pub async fn transcript_list_sessions(
 ) -> Result<CommandResponse, String> {
     let project = project_path.unwrap_or_else(|| {
         crate::mcp::shared::get_workspace_paths_internal()
-            .map(|(root, _, _)| root.parent().unwrap_or(&root).to_string_lossy().to_string())
+            .map(|(root, _, _)| root.to_string_lossy().to_string())
             .unwrap_or_default()
     });
 
@@ -28,6 +28,10 @@ pub async fn transcript_list_sessions(
     }
 
     let config_dirs = transcript::find_claude_config_dirs();
+    info!(
+        "transcript_list_sessions: project='{}', config_dirs={:?}",
+        project, config_dirs
+    );
     if config_dirs.is_empty() {
         return Ok(CommandResponse {
             success: true,
@@ -39,7 +43,14 @@ pub async fn transcript_list_sessions(
     let mut all_sessions = Vec::new();
     for dir in &config_dirs {
         match transcript::list_sessions(dir, &project) {
-            Ok(sessions) => all_sessions.extend(sessions),
+            Ok(sessions) => {
+                info!(
+                    "transcript_list_sessions: found {} sessions in {:?}",
+                    sessions.len(),
+                    dir
+                );
+                all_sessions.extend(sessions);
+            }
             Err(e) => warn!("Failed to list sessions in {:?}: {}", dir, e),
         }
     }
@@ -63,7 +74,7 @@ pub async fn transcript_read_session(
 ) -> Result<CommandResponse, String> {
     let project = project_path.unwrap_or_else(|| {
         crate::mcp::shared::get_workspace_paths_internal()
-            .map(|(root, _, _)| root.parent().unwrap_or(&root).to_string_lossy().to_string())
+            .map(|(root, _, _)| root.to_string_lossy().to_string())
             .unwrap_or_default()
     });
 
@@ -104,7 +115,7 @@ pub async fn transcript_get_latest(
 ) -> Result<CommandResponse, String> {
     let project = project_path.unwrap_or_else(|| {
         crate::mcp::shared::get_workspace_paths_internal()
-            .map(|(root, _, _)| root.parent().unwrap_or(&root).to_string_lossy().to_string())
+            .map(|(root, _, _)| root.to_string_lossy().to_string())
             .unwrap_or_default()
     });
 
@@ -131,8 +142,8 @@ pub async fn transcript_get_latest(
 /// Generate a workflow from arbitrary text context (no task_run_id required).
 ///
 /// This is the standalone generation entrypoint for terminal text selections
-/// and transcript imports. Calls the same pipeline as `generate_workflow_from_chat`
-/// but doesn't need an existing chat session.
+/// and transcript imports. Calls the same pipeline as `generate_workflow_from_session`
+/// but doesn't need an existing AI session.
 #[tauri::command]
 pub async fn generate_workflow_standalone(
     app_state: tauri::State<'_, Arc<AppState>>,
@@ -155,9 +166,9 @@ pub async fn generate_workflow_standalone(
     }
 
     // Enrich context with existing specs for spec-aware generation
-    let existing_specs = crate::commands::ai_chat::fetch_existing_specs().await;
+    let existing_specs = crate::commands::ai_session::fetch_existing_specs().await;
     let enriched_context = if existing_specs != "No existing specs found" {
-        crate::commands::ai_chat::build_spec_aware_context(&inline_context, &existing_specs)
+        crate::commands::ai_session::build_spec_aware_context(&inline_context, &existing_specs)
     } else {
         format!(
             "The following is a Claude Code conversation transcript or selected text. \
@@ -188,6 +199,7 @@ pub async fn generate_workflow_standalone(
         include_design_guidance: None,
         auto_run: None,
         model_overrides: None,
+        generate_specification: Some(true),
     };
 
     // Get doctor handle for health monitoring
@@ -222,6 +234,7 @@ pub async fn generate_workflow_standalone(
                     verification_iterations: vec![],
                     hardening_summary: None,
                     discovery_calls: vec![],
+                    acceptance_criteria: None,
                 }
             }
         }

@@ -18,8 +18,14 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::RwLock;
 
 use crate::database::CheckpointDb;
-use crate::error_monitor::parsers::{create_parser, LogParser};
-use crate::error_monitor::storage::{ErrorEventStorage, LogSourceStorage};
+use crate::error_monitor::pipeline::exporters::event_bus::EventBusExporter;
+use crate::error_monitor::pipeline::exporters::sqlite::SqliteExporter;
+use crate::error_monitor::pipeline::processors::dedup::DedupProcessor;
+use crate::error_monitor::pipeline::processors::jsonl_preprocess::JsonlPreprocessor;
+use crate::error_monitor::pipeline::processors::parser::ParserProcessor;
+use crate::error_monitor::pipeline::traits::{Exporter, Processor};
+use crate::error_monitor::pipeline::types::{LogRecord, SourceMeta};
+use crate::error_monitor::storage::LogSourceStorage;
 use crate::error_monitor::types::{
     ErrorEvent, LogFormat, LogSourceConfig, ParserType, PathType, StoredErrorEvent,
 };
@@ -198,13 +204,18 @@ pub struct ErrorMonitorService {
     config: ErrorMonitorConfig,
     /// Currently monitored files with their state
     file_states: HashMap<String, FileState>,
-    /// Current workflow context
-    current_task_run_id: Option<String>,
-    current_workflow_name: Option<String>,
-    /// Event sender
+    /// Current workflow context (shared with SqliteExporter)
+    current_task_run_id: Arc<RwLock<Option<String>>>,
+    current_workflow_name: Arc<RwLock<Option<String>>>,
+    /// Event sender (kept for non-pipeline events like SourceAdded)
     event_tx: Sender<ErrorMonitorEvent>,
-    /// Cached parsers
-    parsers: HashMap<ParserType, Box<dyn LogParser>>,
+    /// Pipeline processors
+    jsonl_preprocessor: JsonlPreprocessor,
+    parser_processor: ParserProcessor,
+    dedup_processor: DedupProcessor,
+    /// Pipeline exporters
+    sqlite_exporter: SqliteExporter,
+    event_bus_exporter: EventBusExporter,
 }
 
 impl ErrorMonitorService {
@@ -216,14 +227,33 @@ impl ErrorMonitorService {
         let (command_tx, command_rx) = mpsc::channel(100);
         let (event_tx, event_rx) = mpsc::channel(config.max_queue_size);
 
+        // Shared workflow context for SqliteExporter
+        let current_task_run_id = Arc::new(RwLock::new(None));
+        let current_workflow_name = Arc::new(RwLock::new(None));
+
+        // Pipeline components
+        let jsonl_preprocessor = JsonlPreprocessor;
+        let parser_processor = ParserProcessor::new();
+        let dedup_processor = DedupProcessor::new(10_000);
+        let sqlite_exporter = SqliteExporter::new(
+            db.clone(),
+            current_task_run_id.clone(),
+            current_workflow_name.clone(),
+        );
+        let event_bus_exporter = EventBusExporter::new(event_tx.clone());
+
         let service = Self {
             db,
             config,
             file_states: HashMap::new(),
-            current_task_run_id: None,
-            current_workflow_name: None,
+            current_task_run_id,
+            current_workflow_name,
             event_tx,
-            parsers: HashMap::new(),
+            jsonl_preprocessor,
+            parser_processor,
+            dedup_processor,
+            sqlite_exporter,
+            event_bus_exporter,
         };
 
         let handle = ErrorMonitorHandle {
@@ -306,45 +336,20 @@ impl ErrorMonitorService {
                             self.remove_source(&name).await;
                         }
                         ServiceCommand::SetWorkflowContext { task_run_id, workflow_name } => {
-                            self.current_task_run_id = task_run_id;
-                            self.current_workflow_name = workflow_name;
+                            *self.current_task_run_id.write().await = task_run_id;
+                            *self.current_workflow_name.write().await = workflow_name;
                         }
                         ServiceCommand::ClearWorkflowContext => {
-                            self.current_task_run_id = None;
-                            self.current_workflow_name = None;
+                            *self.current_task_run_id.write().await = None;
+                            *self.current_workflow_name.write().await = None;
                         }
                         ServiceCommand::ScanAll => {
                             self.scan_all_sources().await;
                         }
-                        ServiceCommand::IngestStreamErrors { source_name, errors } => {
+                        ServiceCommand::IngestStreamErrors { source_name: _, errors } => {
                             if !errors.is_empty() {
-                                tracing::debug!(
-                                    "Ingesting {} stream error(s) from '{}'",
-                                    errors.len(),
-                                    source_name
-                                );
-                                match self.store_errors(errors).await {
-                                    Ok(stored) => {
-                                        if stored.len() == 1 {
-                                            let _ = self.event_tx.send(
-                                                ErrorMonitorEvent::NewError(Box::new(
-                                                    stored.into_iter().next().unwrap(),
-                                                ))
-                                            ).await;
-                                        } else if !stored.is_empty() {
-                                            let _ = self.event_tx.send(
-                                                ErrorMonitorEvent::NewErrors(stored)
-                                            ).await;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "Failed to store stream errors from '{}': {}",
-                                            source_name,
-                                            e
-                                        );
-                                    }
-                                }
+                                let records: Vec<LogRecord> = errors.into_iter().map(LogRecord::from).collect();
+                                self.process_records(records).await;
                             }
                         }
                     }
@@ -493,12 +498,6 @@ impl ErrorMonitorService {
             // Use path as key for file state
             self.file_states
                 .insert(path.to_string_lossy().to_string(), state);
-        }
-
-        // Ensure parser is cached
-        if !self.parsers.contains_key(&parser_type) {
-            self.parsers
-                .insert(parser_type.clone(), create_parser(&parser_type));
         }
     }
 
@@ -692,6 +691,30 @@ impl ErrorMonitorService {
         self.poll_all_sources().await;
     }
 
+    /// Process log records through the pipeline (preprocessor → parser → dedup → exporters).
+    async fn process_records(&self, records: Vec<LogRecord>) {
+        if records.is_empty() {
+            return;
+        }
+
+        // Run through processor chain
+        let records = self.jsonl_preprocessor.process(records).await;
+        let records = self.parser_processor.process(records).await;
+        let records = self.dedup_processor.process(records).await;
+
+        if records.is_empty() {
+            return;
+        }
+
+        // Fan out to exporters
+        if let Err(e) = self.sqlite_exporter.export(&records).await {
+            tracing::warn!("SQLite export failed: {}", e);
+        }
+        if let Err(e) = self.event_bus_exporter.export(&records).await {
+            tracing::warn!("Event bus export failed: {}", e);
+        }
+    }
+
     /// Process changes in a file (inner implementation to avoid borrow issues).
     async fn process_file_changes_inner(
         &self,
@@ -720,327 +743,28 @@ impl ErrorMonitorService {
             return Ok(current_size);
         }
 
-        // For JSONL format, preprocess to filter out success events and extract errors
-        let content_to_parse = match format {
-            LogFormat::Jsonl => self.preprocess_jsonl_content(&content),
-            _ => content,
+        // Convert raw lines to LogRecords
+        let source_meta = SourceMeta {
+            parser_type: parser_type.clone(),
+            format: format.clone(),
+            path: Some(path.to_string_lossy().to_string()),
         };
 
-        if content_to_parse.is_empty() {
-            return Ok(current_size);
-        }
+        let records: Vec<LogRecord> = content
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                LogRecord::new(
+                    line.to_string(),
+                    source_name.to_string(),
+                    source_meta.clone(),
+                )
+            })
+            .collect();
 
-        // Parse content
-        let parser = self
-            .parsers
-            .get(parser_type)
-            .ok_or_else(|| format!("No parser for type {:?}", parser_type))?;
-
-        let errors = parser.parse_content(&content_to_parse, source_name);
-
-        if errors.is_empty() {
-            return Ok(current_size);
-        }
-
-        // Store errors and emit events
-        let stored_errors = self.store_errors(errors).await?;
-
-        if stored_errors.len() == 1 {
-            let _ = self
-                .event_tx
-                .send(ErrorMonitorEvent::NewError(Box::new(
-                    stored_errors.into_iter().next().unwrap(),
-                )))
-                .await;
-        } else if !stored_errors.is_empty() {
-            let _ = self
-                .event_tx
-                .send(ErrorMonitorEvent::NewErrors(stored_errors))
-                .await;
-        }
+        self.process_records(records).await;
 
         Ok(current_size)
-    }
-
-    /// Preprocess JSONL content to filter out success events and extract meaningful errors.
-    ///
-    /// For JSONL files, we parse each line as JSON and:
-    /// 1. Skip events where status indicates success (at any nesting level)
-    /// 2. Only keep events that indicate actual errors
-    /// 3. Extract meaningful error messages from JSON structure
-    fn preprocess_jsonl_content(&self, content: &str) -> String {
-        let mut error_lines = Vec::new();
-
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-
-            // Try to parse as JSON
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
-                // Check if this event indicates an error
-                if let Some(error_message) = self.extract_jsonl_error(&json) {
-                    // Return a formatted error line that the generic parser can handle
-                    error_lines.push(format!("ERROR: {}", error_message));
-                }
-                // If no error found, skip this line (don't pass success events to parser)
-            } else {
-                // If JSON parsing fails, pass the line through as-is (might be malformed)
-                error_lines.push(line.to_string());
-            }
-        }
-
-        error_lines.join("\n")
-    }
-
-    /// Extract error message from a JSONL event if it indicates an error.
-    /// Returns None for success events, Some(message) for error events.
-    fn extract_jsonl_error(&self, json: &serde_json::Value) -> Option<String> {
-        // Skip spec verification step failures — these are expected during
-        // verification loops and are not application errors. The spec system
-        // runs assertions against UI elements; failures mean "not yet fixed",
-        // not "application crashed".
-        if self.is_spec_verification_event(json) {
-            return None;
-        }
-
-        // Check for status fields that indicate success - skip these
-        let success_statuses = [
-            "success",
-            "completed",
-            "pending",
-            "running",
-            "started",
-            "ok",
-        ];
-
-        // Check status at various common nesting levels
-        let status = self.find_status_field(json);
-
-        if let Some(status) = status {
-            let status_lower = status.to_lowercase();
-            if success_statuses.iter().any(|s| status_lower == *s) {
-                return None; // This is a success event, skip it
-            }
-            // Check for error statuses
-            if status_lower == "failed" || status_lower == "error" || status_lower == "failure" {
-                // This is an error event - extract the message
-                return Some(self.build_jsonl_error_message(json, &status));
-            }
-        }
-
-        // Check for explicit error fields
-        if let Some(error) = json.get("error") {
-            if let Some(msg) = error.as_str() {
-                return Some(msg.to_string());
-            }
-            if let Some(msg) = error.get("message").and_then(|v| v.as_str()) {
-                return Some(msg.to_string());
-            }
-        }
-
-        // Check for exception fields
-        if let Some(exception) = json.get("exception").and_then(|v| v.as_str()) {
-            return Some(exception.to_string());
-        }
-
-        // Check for error_type or error_message fields
-        if let Some(error_msg) = json.get("error_message").and_then(|v| v.as_str()) {
-            return Some(error_msg.to_string());
-        }
-
-        // No error indicators found
-        None
-    }
-
-    /// Check if a JSONL event is a spec verification event.
-    /// Spec events have action names starting with "SPEC: " and are generated
-    /// by the UI Bridge spec handler during verification loops. These are
-    /// expected failures (assertions not yet met) rather than application errors.
-    fn is_spec_verification_event(&self, json: &serde_json::Value) -> bool {
-        // Check event_type
-        let event_type = json
-            .get("event_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if event_type != "action_failed" {
-            return false;
-        }
-
-        // Check if the action name starts with "SPEC: "
-        if let Some(node) = json.get("node") {
-            if let Some(name) = node.get("name").and_then(|v| v.as_str()) {
-                if name.starts_with("SPEC: ") {
-                    return true;
-                }
-            }
-        }
-
-        // Also check top-level name field
-        if let Some(name) = json.get("name").and_then(|v| v.as_str()) {
-            if name.starts_with("SPEC: ") {
-                return true;
-            }
-        }
-
-        // Check nested data field — events with event_subtype="complete" may nest
-        // the action_failed info inside a stringified "data" JSON field
-        if let Some(data_str) = json.get("data").and_then(|v| v.as_str()) {
-            if let Ok(data) = serde_json::from_str::<serde_json::Value>(data_str) {
-                if let Some(name) = data.get("step_name").and_then(|v| v.as_str()) {
-                    if name.starts_with("SPEC: ") {
-                        return true;
-                    }
-                }
-                // Also check nested node.name in data
-                if let Some(node) = data.get("node") {
-                    if let Some(name) = node.get("name").and_then(|v| v.as_str()) {
-                        if name.starts_with("SPEC: ") {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Check data as object (not stringified)
-        if let Some(data) = json.get("data").and_then(|v| v.as_object()) {
-            if let Some(name) = data.get("step_name").and_then(|v| v.as_str()) {
-                if name.starts_with("SPEC: ") {
-                    return true;
-                }
-            }
-        }
-
-        false
-    }
-
-    /// Find the status field in a JSON object, checking common nesting patterns.
-    fn find_status_field(&self, json: &serde_json::Value) -> Option<String> {
-        // Check direct status field
-        if let Some(status) = json.get("status").and_then(|v| v.as_str()) {
-            return Some(status.to_string());
-        }
-        // Check nested under "node"
-        if let Some(node) = json.get("node") {
-            if let Some(status) = node.get("status").and_then(|v| v.as_str()) {
-                return Some(status.to_string());
-            }
-        }
-        // Check nested under "result"
-        if let Some(result) = json.get("result") {
-            if let Some(status) = result.get("status").and_then(|v| v.as_str()) {
-                return Some(status.to_string());
-            }
-        }
-        // Check nested under "data"
-        if let Some(data) = json.get("data") {
-            if let Some(status) = data.get("status").and_then(|v| v.as_str()) {
-                return Some(status.to_string());
-            }
-        }
-        None
-    }
-
-    /// Build a meaningful error message from a JSONL error event.
-    fn build_jsonl_error_message(&self, json: &serde_json::Value, status: &str) -> String {
-        let mut parts = Vec::new();
-
-        // Add event type if available
-        if let Some(event_type) = json.get("event_type").and_then(|v| v.as_str()) {
-            parts.push(event_type.to_string());
-        }
-
-        // Add name if available (check various locations)
-        let name = json
-            .get("name")
-            .and_then(|v| v.as_str())
-            .or_else(|| {
-                json.get("node")
-                    .and_then(|n| n.get("name"))
-                    .and_then(|v| v.as_str())
-            })
-            .or_else(|| {
-                json.get("action")
-                    .and_then(|a| a.get("name"))
-                    .and_then(|v| v.as_str())
-            });
-        if let Some(name) = name {
-            parts.push(name.to_string());
-        }
-
-        // Add status
-        parts.push(format!("status={}", status));
-
-        // Add error message if available (check various locations)
-        let error_msg = json
-            .get("error")
-            .and_then(|v| v.as_str())
-            .or_else(|| json.get("message").and_then(|v| v.as_str()))
-            .or_else(|| json.get("error_message").and_then(|v| v.as_str()))
-            .or_else(|| {
-                json.get("node")
-                    .and_then(|n| n.get("error"))
-                    .and_then(|v| v.as_str())
-            })
-            .or_else(|| {
-                json.get("node")
-                    .and_then(|n| n.get("metadata"))
-                    .and_then(|m| m.get("error"))
-                    .and_then(|v| v.as_str())
-            })
-            .or_else(|| {
-                json.get("result")
-                    .and_then(|r| r.get("error"))
-                    .and_then(|v| v.as_str())
-            });
-        if let Some(err) = error_msg {
-            parts.push(err.to_string());
-        }
-
-        // Extract node.metadata for richer error context (assertion details,
-        // stderr output, command info, etc.). Serialize as compact JSON and
-        // append to the message so the error monitor stores actionable details.
-        if let Some(metadata) = json
-            .get("node")
-            .and_then(|n| n.get("metadata"))
-            .and_then(|m| m.as_object())
-        {
-            // Extract key metadata fields that provide actionable context
-            let mut context_parts = Vec::new();
-            for key in &[
-                "passed_count",
-                "failed_count",
-                "assertions_detail",
-                "stderr",
-                "exit_code",
-                "spec_group_name",
-            ] {
-                if let Some(val) = metadata.get(*key) {
-                    let val_str = if val.is_string() {
-                        val.as_str().unwrap_or("").to_string()
-                    } else {
-                        val.to_string()
-                    };
-                    // Truncate very large values to keep message manageable
-                    if val_str.len() > 500 {
-                        context_parts.push(format!("{}={:.500}...", key, val_str));
-                    } else {
-                        context_parts.push(format!("{}={}", key, val_str));
-                    }
-                }
-            }
-            if !context_parts.is_empty() {
-                parts.push(format!("[{}]", context_parts.join(", ")));
-            }
-        }
-
-        if parts.is_empty() {
-            status.to_string()
-        } else {
-            parts.join(" - ")
-        }
     }
 
     /// Read file content from a specific position.
@@ -1058,34 +782,6 @@ impl ErrorMonitorService {
             .map_err(|e| format!("Failed to read file: {}", e))?;
 
         Ok(content)
-    }
-
-    /// Store errors in the database.
-    async fn store_errors(&self, errors: Vec<ErrorEvent>) -> Result<Vec<StoredErrorEvent>, String> {
-        let db = self.db.clone();
-        let task_run_id = self.current_task_run_id.clone();
-        let workflow_name = self.current_workflow_name.clone();
-
-        tokio::task::spawn_blocking(move || {
-            let conn = db.connection()?;
-            let mut stored = Vec::new();
-
-            for error in errors {
-                match ErrorEventStorage::insert(
-                    &conn,
-                    &error,
-                    task_run_id.as_deref(),
-                    workflow_name.as_deref(),
-                ) {
-                    Ok(stored_error) => stored.push(stored_error),
-                    Err(e) => tracing::warn!("Failed to store error: {}", e),
-                }
-            }
-
-            Ok(stored)
-        })
-        .await
-        .map_err(|e| format!("Task join error: {}", e))?
     }
 }
 
@@ -1113,14 +809,21 @@ mod tests {
     use std::io::Write;
     use tempfile::tempdir;
 
+    /// Helper to create a test service via the public constructor.
+    fn create_test_service(
+        db: Arc<CheckpointDb>,
+    ) -> (
+        ErrorMonitorService,
+        ErrorMonitorHandle,
+        Receiver<ServiceCommand>,
+    ) {
+        ErrorMonitorService::new(db, ErrorMonitorConfig::default())
+    }
+
     #[tokio::test]
     async fn test_service_creation() {
-        let dir = tempdir().unwrap();
-        let _db_path = dir.path().join("test.db");
         let db = Arc::new(CheckpointDb::new_in_memory().unwrap());
-
-        let config = ErrorMonitorConfig::default();
-        let (_service, handle, _command_rx) = ErrorMonitorService::new(db, config);
+        let (_service, handle, _command_rx) = create_test_service(db);
 
         // Verify handle can receive events
         let _event_rx = handle.take_event_receiver().await;
@@ -1129,22 +832,8 @@ mod tests {
 
     #[test]
     fn test_resolve_paths_file() {
-        let dir = tempdir().unwrap();
-        let _db_path = dir.path().join("test.db");
         let db = Arc::new(CheckpointDb::new_in_memory().unwrap());
-
-        let config = ErrorMonitorConfig::default();
-        let (event_tx, _) = mpsc::channel(100);
-
-        let service = ErrorMonitorService {
-            db,
-            config,
-            file_states: HashMap::new(),
-            current_task_run_id: None,
-            current_workflow_name: None,
-            event_tx,
-            parsers: HashMap::new(),
-        };
+        let (service, _handle, _command_rx) = create_test_service(db);
 
         let source = LogSourceConfig {
             id: None,
@@ -1174,7 +863,6 @@ mod tests {
     async fn test_read_new_content() {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("test.log");
-        let _db_path = dir.path().join("test.db");
 
         // Create initial log file
         let mut file = std::fs::File::create(&log_path).unwrap();
@@ -1188,18 +876,7 @@ mod tests {
         file.flush().unwrap();
 
         let db = Arc::new(CheckpointDb::new_in_memory().unwrap());
-        let config = ErrorMonitorConfig::default();
-        let (event_tx, _) = mpsc::channel(100);
-
-        let service = ErrorMonitorService {
-            db,
-            config,
-            file_states: HashMap::new(),
-            current_task_run_id: None,
-            current_workflow_name: None,
-            event_tx,
-            parsers: HashMap::new(),
-        };
+        let (service, _handle, _command_rx) = create_test_service(db);
 
         // Read only new content
         let content = service
@@ -1207,119 +884,5 @@ mod tests {
             .unwrap();
         assert!(content.contains("ERROR: Something went wrong"));
         assert!(!content.contains("Initial content"));
-    }
-
-    #[test]
-    fn test_preprocess_jsonl_filters_success_events() {
-        let db = Arc::new(CheckpointDb::new_in_memory().unwrap());
-        let config = ErrorMonitorConfig::default();
-        let (event_tx, _) = mpsc::channel(100);
-
-        let service = ErrorMonitorService {
-            db,
-            config,
-            file_states: HashMap::new(),
-            current_task_run_id: None,
-            current_workflow_name: None,
-            event_tx,
-            parsers: HashMap::new(),
-        };
-
-        // JSONL with success events - should be filtered out
-        let jsonl_content = r#"{"id":"act-1","node":{"status":"success","name":"Test Action"},"event_type":"action_completed"}
-{"id":"act-2","node":{"status":"pending","name":"Pending Action"},"event_type":"action_started"}
-{"id":"act-3","node":{"status":"running","name":"Running Action"},"event_type":"action_progress"}"#;
-
-        let result = service.preprocess_jsonl_content(jsonl_content);
-        assert!(
-            result.is_empty(),
-            "Success events should be filtered out: '{}'",
-            result
-        );
-    }
-
-    #[test]
-    fn test_preprocess_jsonl_keeps_error_events() {
-        let db = Arc::new(CheckpointDb::new_in_memory().unwrap());
-        let config = ErrorMonitorConfig::default();
-        let (event_tx, _) = mpsc::channel(100);
-
-        let service = ErrorMonitorService {
-            db,
-            config,
-            file_states: HashMap::new(),
-            current_task_run_id: None,
-            current_workflow_name: None,
-            event_tx,
-            parsers: HashMap::new(),
-        };
-
-        // JSONL with failed event - should be kept
-        let jsonl_content = r#"{"id":"act-1","node":{"status":"failed","name":"Failed Action"},"event_type":"action_completed"}"#;
-
-        let result = service.preprocess_jsonl_content(jsonl_content);
-        assert!(!result.is_empty(), "Failed events should be kept");
-        assert!(result.contains("ERROR:"), "Should format as ERROR: message");
-    }
-
-    #[test]
-    fn test_preprocess_jsonl_extracts_error_field() {
-        let db = Arc::new(CheckpointDb::new_in_memory().unwrap());
-        let config = ErrorMonitorConfig::default();
-        let (event_tx, _) = mpsc::channel(100);
-
-        let service = ErrorMonitorService {
-            db,
-            config,
-            file_states: HashMap::new(),
-            current_task_run_id: None,
-            current_workflow_name: None,
-            event_tx,
-            parsers: HashMap::new(),
-        };
-
-        // JSONL with explicit error field
-        let jsonl_content = r#"{"error":"Connection timeout occurred"}"#;
-
-        let result = service.preprocess_jsonl_content(jsonl_content);
-        assert!(!result.is_empty(), "Error events should be kept");
-        assert!(
-            result.contains("Connection timeout"),
-            "Should extract error message"
-        );
-    }
-
-    #[test]
-    fn test_preprocess_jsonl_mixed_content() {
-        let db = Arc::new(CheckpointDb::new_in_memory().unwrap());
-        let config = ErrorMonitorConfig::default();
-        let (event_tx, _) = mpsc::channel(100);
-
-        let service = ErrorMonitorService {
-            db,
-            config,
-            file_states: HashMap::new(),
-            current_task_run_id: None,
-            current_workflow_name: None,
-            event_tx,
-            parsers: HashMap::new(),
-        };
-
-        // Mix of success and error events
-        let jsonl_content = r#"{"id":"1","node":{"status":"success","name":"Good"}}
-{"id":"2","node":{"status":"failed","name":"Bad"},"error":"Something broke"}
-{"id":"3","node":{"status":"completed","name":"Done"}}"#;
-
-        let result = service.preprocess_jsonl_content(jsonl_content);
-
-        // Should only contain the failed event
-        let lines: Vec<&str> = result.lines().collect();
-        assert_eq!(
-            lines.len(),
-            1,
-            "Should only have 1 error line, got: {:?}",
-            lines
-        );
-        assert!(lines[0].contains("ERROR:"), "Should be formatted as ERROR");
     }
 }

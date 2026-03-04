@@ -8,7 +8,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { Search, X, Check as CheckIcon, Play, FolderOpen, Tag } from "lucide-react";
 import type { WorkflowPhase } from "../../types/unified-workflow";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 // Macro type from Macro Manager
 interface Macro {
@@ -53,7 +53,7 @@ export function MacroLibraryPicker({ isOpen, onClose, onSelect, phase }: MacroLi
     const fetchMacros = async () => {
       setIsLoading(true);
       try {
-        const response = await fetch(`${getApiBase()}/macros`, { signal: controller.signal });
+        const response = await tracedFetch(`${getApiBase()}/macros`, { signal: controller.signal });
         if (response.ok) {
           const data = await response.json();
           if (!cancelled) {

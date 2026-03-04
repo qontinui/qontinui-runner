@@ -18,7 +18,7 @@ import {
 } from "lucide-react";
 import type { UnifiedWorkflow } from "../../types";
 import { getAccentColors } from "@/design-system";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 const AI_PROVIDERS = [
   { value: "", label: "Default (from settings)" },
@@ -48,6 +48,21 @@ interface ValidationError {
   step_name?: string;
 }
 
+interface AcceptanceCriterion {
+  id: string;
+  description: string;
+  method: "command" | "ui_bridge" | "test" | "manual";
+  priority: "critical" | "important" | "optional";
+  verification_hint: string;
+  category: string;
+}
+
+interface AcceptanceCriteria {
+  goal_summary: string;
+  criteria: AcceptanceCriterion[];
+  assumptions: string[];
+}
+
 interface GenerateWorkflowResponse {
   workflow: UnifiedWorkflow | null;
   validation_errors: ValidationError[];
@@ -55,6 +70,7 @@ interface GenerateWorkflowResponse {
   error: string | null;
   model_used: string | null;
   discovery_calls?: DiscoveryCall[];
+  acceptance_criteria?: AcceptanceCriteria;
 }
 
 interface AiGenerateWorkflowModalProps {
@@ -89,6 +105,7 @@ export function AiGenerateWorkflowModal({
   const [logSourceSelection, setLogSourceSelection] = useState("");
   const [autoIncludeContexts, setAutoIncludeContexts] = useState(true);
   const [discoveryMode, setDiscoveryMode] = useState<"auto" | "enabled" | "disabled">("auto");
+  const [generateSpecification, setGenerateSpecification] = useState(true);
 
   // Discovery results
   const [discoveryCalls, setDiscoveryCalls] = useState<DiscoveryCall[]>([]);
@@ -138,8 +155,11 @@ export function AiGenerateWorkflowModal({
       if (discoveryMode !== "auto") {
         requestBody.discovery_mode = discoveryMode;
       }
+      if (!generateSpecification) {
+        requestBody.generate_specification = false;
+      }
 
-      const response = await fetch(`${getApiBase()}/unified-workflows/generate`, {
+      const response = await tracedFetch(`${getApiBase()}/unified-workflows/generate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(requestBody),
@@ -180,6 +200,7 @@ export function AiGenerateWorkflowModal({
     logSourceSelection,
     autoIncludeContexts,
     discoveryMode,
+    generateSpecification,
   ]);
 
   const handleClose = useCallback(() => {
@@ -438,6 +459,16 @@ export function AiGenerateWorkflowModal({
                       disabled={isGenerating}
                     />
                     <span className="text-muted-foreground">Auto-include Contexts</span>
+                  </label>
+                  <label className="flex items-center gap-2 text-sm cursor-pointer" title="Run a specification agent before generating. Defines acceptance criteria that guide verification step generation.">
+                    <input
+                      type="checkbox"
+                      checked={generateSpecification}
+                      onChange={(e) => setGenerateSpecification(e.target.checked)}
+                      className="w-4 h-4 rounded border-border"
+                      disabled={isGenerating}
+                    />
+                    <span className="text-muted-foreground">Generate Specification</span>
                   </label>
                 </div>
               </div>

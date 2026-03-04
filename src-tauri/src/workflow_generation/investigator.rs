@@ -159,6 +159,7 @@ Analyze the user's intent in context of the project structure and produce an **e
 4. **Flag potential issues** — if you notice dead code paths, missing implementations, broken data flows, or gaps that the workflow should address, mention them
 5. **Specify concrete targets** — replace vague references ("the widget", "the API") with specific file paths and component names where possible
 6. **Mention verification approaches** — suggest what should be checked to verify the work is done correctly (e.g., specific test commands, URLs to check, files that should change)
+7. **Runtime verification for removals** — for tasks that involve removing pages/routes/components, explicitly note that the running application must be checked (not just source files) since build caches, SSR, and routing configurations may still serve removed content
 
 ## Output Format
 

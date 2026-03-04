@@ -10,6 +10,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tauri::Manager;
 use tracing::info;
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
@@ -321,11 +322,16 @@ pub async fn trigger_reflection_handler(
         ));
     }
 
+    let session_manager: Option<Arc<crate::claude_session::SessionManager>> = state
+        .app_handle
+        .try_state::<Arc<crate::claude_session::SessionManager>>()
+        .map(|s| s.inner().clone());
     let deps = crate::reflection::trigger::ReflectionDeps {
         app_state: state.app_state.clone(),
         config_storage: state.config_storage.clone(),
         app_handle: state.app_handle.clone(),
         pid_tracker: state.current_ai_pids.clone(),
+        session_manager,
     };
 
     let result = crate::reflection::trigger::launch_reflection(deps, task_run_id);

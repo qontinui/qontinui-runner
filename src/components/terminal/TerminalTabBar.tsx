@@ -89,23 +89,30 @@ export function TerminalTabBar({
             `}
           >
             <Terminal className="w-3 h-3 shrink-0" />
-            {isEditing ? (
-              <input
-                autoFocus
-                value={editValue}
-                onChange={(e) => setEditValue(e.target.value)}
-                onBlur={commitEdit}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") commitEdit();
-                  if (e.key === "Escape") setEditingId(null);
-                  e.stopPropagation();
-                }}
-                onClick={(e) => e.stopPropagation()}
-                className="bg-transparent border-b border-[#565f89] text-[#c0caf5] text-xs w-20 outline-none"
-              />
-            ) : (
-              <span className="truncate">{tab.title}</span>
-            )}
+            <span className="flex flex-col items-start min-w-0">
+              {isEditing ? (
+                <input
+                  autoFocus
+                  value={editValue}
+                  onChange={(e) => setEditValue(e.target.value)}
+                  onBlur={commitEdit}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") commitEdit();
+                    if (e.key === "Escape") setEditingId(null);
+                    e.stopPropagation();
+                  }}
+                  onClick={(e) => e.stopPropagation()}
+                  className="bg-transparent border-b border-[#565f89] text-[#c0caf5] text-xs w-20 outline-none"
+                />
+              ) : (
+                <span className="truncate">{tab.title}</span>
+              )}
+              {isActive && tab.workingDir && (
+                <span className="text-[9px] text-[#565f89] truncate max-w-[140px]">
+                  {tab.workingDir.split(/[/\\]/).slice(-2).join("/")}
+                </span>
+              )}
+            </span>
             {isDead && tab.exitCode !== null && (
               <span
                 className={`text-[10px] px-1 rounded ${

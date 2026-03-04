@@ -14,7 +14,7 @@ import type {
   CreateScheduledTaskRequest,
   UpdateScheduledTaskRequest,
 } from "../types/scheduler";
-import { getApiBase } from "@/lib/runner-api";
+import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 interface ApiResponse<T> {
   success: boolean;
@@ -80,7 +80,7 @@ export function useScheduler(autoRefresh = true, refreshInterval = 30000): UseSc
         options.body = JSON.stringify(body);
       }
 
-      const response = await fetch(`${getApiBase()}${endpoint}`, options);
+      const response = await tracedFetch(`${getApiBase()}${endpoint}`, options);
       const result: ApiResponse<T> = await response.json();
 
       if (!result.success) {
