@@ -17,7 +17,13 @@ export const TraceViewerDashboardWidget: React.FC<TraceViewerDashboardWidgetProp
 }) => {
   return (
     <div className="h-full overflow-hidden">
-      <TraceViewerWidget executionId={data.executionId} height={400} />
+      <TraceViewerWidget
+        executionId={data.executionId}
+        spans={data.spans}
+        isLoading={data.isLoading}
+        error={data.error}
+        height={400}
+      />
     </div>
   );
 };

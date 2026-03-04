@@ -135,7 +135,10 @@ export function computeInsights(spans: TraceSpan[]): TraceInsights {
     .map((s) => new Date(s.end_ts!).getTime());
 
   const totalDurationMs =
-    ends.length > 0 ? Math.max(...ends) - Math.min(...starts) : 0;
+    ends.length > 0
+      ? ends.reduce((a, b) => Math.max(a, b), -Infinity) -
+        starts.reduce((a, b) => Math.min(a, b), Infinity)
+      : 0;
 
   return {
     totalDurationMs,

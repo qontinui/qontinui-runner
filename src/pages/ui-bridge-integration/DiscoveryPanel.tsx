@@ -1,8 +1,7 @@
 import { RefreshCw, Wifi, WifiOff, Zap, Search } from "lucide-react";
 import { useState, useCallback } from "react";
 import type { DiscoveredApp, ApiResponse } from "./types";
-
-const API_BASE = "http://localhost:9876";
+import { getApiBase } from "@/lib/runner-api";
 
 interface DiscoveryPanelProps {
   onInject?: (url: string) => void;
@@ -16,7 +15,7 @@ export function DiscoveryPanel({ onInject }: DiscoveryPanelProps) {
   const scan = useCallback(async () => {
     setScanning(true);
     try {
-      const resp = await fetch(`${API_BASE}/ui-bridge/apps/scan`, {
+      const resp = await fetch(`${getApiBase()}/ui-bridge/apps/scan`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({}),

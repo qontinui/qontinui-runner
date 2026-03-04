@@ -1,5 +1,4 @@
 import {
-  Activity,
   RefreshCw,
   Trash2,
   CheckCircle2,
@@ -8,8 +7,7 @@ import {
 } from "lucide-react";
 import { useState, useEffect, useCallback } from "react";
 import type { TrackedIntegration, ApiResponse } from "./types";
-
-const API_BASE = "http://localhost:9876";
+import { getApiBase } from "@/lib/runner-api";
 
 export function HealthMonitorPanel() {
   const [integrations, setIntegrations] = useState<TrackedIntegration[]>([]);
@@ -17,7 +15,7 @@ export function HealthMonitorPanel() {
 
   const fetchStatus = useCallback(async () => {
     try {
-      const resp = await fetch(`${API_BASE}/ui-bridge/integration/status`);
+      const resp = await fetch(`${getApiBase()}/ui-bridge/integration/status`);
       const data: ApiResponse<TrackedIntegration[]> = await resp.json();
       if (data.success && data.data) {
         setIntegrations(data.data);
@@ -31,7 +29,7 @@ export function HealthMonitorPanel() {
 
   const runHealthCheck = useCallback(async () => {
     try {
-      const resp = await fetch(`${API_BASE}/ui-bridge/integration/health-check`, {
+      const resp = await fetch(`${getApiBase()}/ui-bridge/integration/health-check`, {
         method: "POST",
       });
       const data: ApiResponse<TrackedIntegration[]> = await resp.json();
@@ -55,7 +53,7 @@ export function HealthMonitorPanel() {
   const deleteIntegration = useCallback(
     async (id: string) => {
       try {
-        await fetch(`${API_BASE}/ui-bridge/integration/${encodeURIComponent(id)}`, {
+        await fetch(`${getApiBase()}/ui-bridge/integration/${encodeURIComponent(id)}`, {
           method: "DELETE",
         });
         fetchStatus();

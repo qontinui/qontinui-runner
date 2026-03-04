@@ -16,8 +16,7 @@ import type {
   FileModification,
   ApiResponse,
 } from "./types";
-
-const API_BASE = "http://localhost:9876";
+import { getApiBase } from "@/lib/runner-api";
 
 export function SourceIntegrationPanel() {
   const [projectPath, setProjectPath] = useState("");
@@ -37,7 +36,7 @@ export function SourceIntegrationPanel() {
     setResult(null);
     setPreview(null);
     try {
-      const resp = await fetch(`${API_BASE}/ui-bridge/integration/analyze`, {
+      const resp = await fetch(`${getApiBase()}/ui-bridge/integration/analyze`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ project_path: projectPath.trim() }),
@@ -58,7 +57,7 @@ export function SourceIntegrationPanel() {
   const previewChanges = useCallback(async () => {
     if (!projectPath.trim()) return;
     try {
-      const resp = await fetch(`${API_BASE}/ui-bridge/integration/preview`, {
+      const resp = await fetch(`${getApiBase()}/ui-bridge/integration/preview`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -80,7 +79,7 @@ export function SourceIntegrationPanel() {
     setIntegrating(true);
     setError(null);
     try {
-      const resp = await fetch(`${API_BASE}/ui-bridge/integration/integrate`, {
+      const resp = await fetch(`${getApiBase()}/ui-bridge/integration/integrate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -108,7 +107,7 @@ export function SourceIntegrationPanel() {
     setUpdating(true);
     setError(null);
     try {
-      const resp = await fetch(`${API_BASE}/ui-bridge/integration/update`, {
+      const resp = await fetch(`${getApiBase()}/ui-bridge/integration/update`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

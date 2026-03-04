@@ -1,12 +1,13 @@
 import React, { useMemo, useCallback } from "react";
 import { FixedSizeList as List } from "react-window";
-import type { TraceTreeNode, SpanFilter, TraceSpan } from "./types";
-import { buildTraceTree, flattenTree, filterSpans, formatDuration } from "./trace-utils";
+import type { TraceSpan, TraceTreeNode } from "./types";
+import { formatDuration } from "./trace-utils";
 import { SpanRow } from "./SpanRow";
 
 interface TraceWaterfallProps {
   spans: TraceSpan[];
-  filter: SpanFilter;
+  /** Pre-filtered flat nodes from the parent widget. */
+  filteredNodes: TraceTreeNode[];
   selectedSpanId: string | null;
   onSelectSpan: (span: TraceSpan) => void;
   height: number;
@@ -14,19 +15,12 @@ interface TraceWaterfallProps {
 
 export const TraceWaterfall: React.FC<TraceWaterfallProps> = ({
   spans,
-  filter,
+  filteredNodes,
   selectedSpanId,
   onSelectSpan,
   height,
 }) => {
-  // Build tree and flatten for rendering
-  const flatNodes = useMemo(() => {
-    const tree = buildTraceTree(spans);
-    const flat = flattenTree(tree);
-    return filterSpans(flat, filter);
-  }, [spans, filter]);
-
-  // Compute trace time bounds
+  // Compute trace time bounds (uses all spans for the full timeline, not just filtered)
   const { traceStartMs, traceDurationMs } = useMemo(() => {
     if (spans.length === 0) return { traceStartMs: 0, traceDurationMs: 0 };
 
@@ -35,8 +29,8 @@ export const TraceWaterfall: React.FC<TraceWaterfallProps> = ({
       .filter((s) => s.end_ts)
       .map((s) => new Date(s.end_ts!).getTime());
 
-    const start = Math.min(...starts);
-    const end = ends.length > 0 ? Math.max(...ends) : start + 1000;
+    const start = starts.reduce((a, b) => Math.min(a, b), Infinity);
+    const end = ends.length > 0 ? ends.reduce((a, b) => Math.max(a, b), -Infinity) : start + 1000;
 
     return { traceStartMs: start, traceDurationMs: end - start };
   }, [spans]);
@@ -45,7 +39,7 @@ export const TraceWaterfall: React.FC<TraceWaterfallProps> = ({
 
   const Row = useCallback(
     ({ index, style }: { index: number; style: React.CSSProperties }) => {
-      const node = flatNodes[index];
+      const node = filteredNodes[index];
       return (
         <div style={style}>
           <SpanRow
@@ -58,10 +52,10 @@ export const TraceWaterfall: React.FC<TraceWaterfallProps> = ({
         </div>
       );
     },
-    [flatNodes, traceStartMs, traceDurationMs, selectedSpanId, onSelectSpan]
+    [filteredNodes, traceStartMs, traceDurationMs, selectedSpanId, onSelectSpan]
   );
 
-  if (flatNodes.length === 0) {
+  if (filteredNodes.length === 0) {
     return (
       <div className="flex-1 flex items-center justify-center text-zinc-500 text-sm">
         No spans to display
@@ -95,7 +89,7 @@ export const TraceWaterfall: React.FC<TraceWaterfallProps> = ({
       {/* Virtualized span list */}
       <List
         height={Math.max(height - 24, 100)}
-        itemCount={flatNodes.length}
+        itemCount={filteredNodes.length}
         itemSize={ROW_HEIGHT}
         width="100%"
       >

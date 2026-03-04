@@ -1,7 +1,7 @@
 import React, { useState, useMemo, useCallback } from "react";
 import type { TraceSpan, SpanFilter } from "./types";
 import { useTraceViewerData } from "./useTraceViewerData";
-import { computeInsights } from "./trace-utils";
+import { buildTraceTree, flattenTree, filterSpans, computeInsights } from "./trace-utils";
 import { TraceToolbar } from "./TraceToolbar";
 import { TraceWaterfall } from "./TraceWaterfall";
 import { SpanDetailPanel } from "./SpanDetailPanel";
@@ -9,6 +9,10 @@ import { PerformanceInsights } from "./PerformanceInsights";
 
 interface TraceViewerWidgetProps {
   executionId: string | null;
+  /** Pre-fetched spans — when provided, skips internal data fetching. */
+  spans?: TraceSpan[];
+  isLoading?: boolean;
+  error?: string | null;
   height?: number;
 }
 
@@ -21,13 +25,31 @@ const DEFAULT_FILTER: SpanFilter = {
 
 export const TraceViewerWidget: React.FC<TraceViewerWidgetProps> = ({
   executionId,
+  spans: externalSpans,
+  isLoading: externalIsLoading,
+  error: externalError,
   height = 400,
 }) => {
-  const { data: spans = [], isLoading, error } = useTraceViewerData(executionId);
+  // Only fetch internally when no external spans are provided
+  const internalQuery = useTraceViewerData(
+    externalSpans !== undefined ? null : executionId
+  );
+
+  const spans = externalSpans ?? internalQuery.data ?? [];
+  const isLoading = externalIsLoading ?? internalQuery.isLoading;
+  const error = externalError ?? (internalQuery.error ? String(internalQuery.error) : null);
+
   const [filter, setFilter] = useState<SpanFilter>(DEFAULT_FILTER);
   const [selectedSpan, setSelectedSpan] = useState<TraceSpan | null>(null);
 
   const insights = useMemo(() => computeInsights(spans), [spans]);
+
+  // Build tree, flatten, and filter — shared between toolbar count and waterfall
+  const filteredNodes = useMemo(() => {
+    const tree = buildTraceTree(spans);
+    const flat = flattenTree(tree);
+    return filterSpans(flat, filter);
+  }, [spans, filter]);
 
   const handleSelectSpan = useCallback((span: TraceSpan) => {
     setSelectedSpan((prev) => (prev?.span_id === span.span_id ? null : span));
@@ -52,7 +74,7 @@ export const TraceViewerWidget: React.FC<TraceViewerWidgetProps> = ({
   if (error) {
     return (
       <div className="flex items-center justify-center h-40 text-red-400 text-sm">
-        Failed to load traces: {String(error)}
+        Failed to load traces: {error}
       </div>
     );
   }
@@ -63,13 +85,13 @@ export const TraceViewerWidget: React.FC<TraceViewerWidgetProps> = ({
         filter={filter}
         onFilterChange={setFilter}
         spanCount={spans.length}
-        filteredCount={spans.length}
+        filteredCount={filteredNodes.length}
       />
 
       <div className="flex flex-1 min-h-0">
         <TraceWaterfall
           spans={spans}
-          filter={filter}
+          filteredNodes={filteredNodes}
           selectedSpanId={selectedSpan?.span_id ?? null}
           onSelectSpan={handleSelectSpan}
           height={height - 64}

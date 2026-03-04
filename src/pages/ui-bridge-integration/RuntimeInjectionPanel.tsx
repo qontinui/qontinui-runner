@@ -3,12 +3,10 @@ import {
   Square,
   ExternalLink,
   RefreshCw,
-  Trash2,
 } from "lucide-react";
 import { useState, useEffect, useCallback } from "react";
 import type { ProxyInstance, InjectResponse, ApiResponse } from "./types";
-
-const API_BASE = "http://localhost:9876";
+import { getApiBase } from "@/lib/runner-api";
 
 // Reuse the ProxyInfo shape from the API (ProxyInstance minus shutdown_tx)
 type ProxyInfo = Omit<ProxyInstance, "shutdown_tx">;
@@ -35,7 +33,7 @@ export function RuntimeInjectionPanel({ prefillUrl, onPrefillConsumed }: Runtime
 
   const fetchProxies = useCallback(async () => {
     try {
-      const resp = await fetch(`${API_BASE}/ui-bridge/integration/proxies`);
+      const resp = await fetch(`${getApiBase()}/ui-bridge/integration/proxies`);
       const data: ApiResponse<ProxyInfo[]> = await resp.json();
       if (data.success && data.data) {
         setProxies(data.data);
@@ -56,7 +54,7 @@ export function RuntimeInjectionPanel({ prefillUrl, onPrefillConsumed }: Runtime
     setInjecting(true);
     setError(null);
     try {
-      const resp = await fetch(`${API_BASE}/ui-bridge/integration/inject`, {
+      const resp = await fetch(`${getApiBase()}/ui-bridge/integration/inject`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -82,7 +80,7 @@ export function RuntimeInjectionPanel({ prefillUrl, onPrefillConsumed }: Runtime
   const stopProxy = useCallback(
     async (port: number) => {
       try {
-        await fetch(`${API_BASE}/ui-bridge/integration/inject/${port}`, {
+        await fetch(`${getApiBase()}/ui-bridge/integration/inject/${port}`, {
           method: "DELETE",
         });
         fetchProxies();
