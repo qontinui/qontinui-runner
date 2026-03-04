@@ -28,7 +28,7 @@ pub async fn trace_propagation_middleware(request: Request<Body>, next: Next) ->
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()[..8].to_string());
 
     // Record on current span
-    tracing::Span::current().record("trace_id", &trace_id.as_str());
+    tracing::Span::current().record("trace_id", trace_id.as_str());
 
     // Process the request
     let mut response = next.run(request).await;

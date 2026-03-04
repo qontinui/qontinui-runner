@@ -129,10 +129,8 @@ impl Receiver for FileWatchReceiver {
                                     })
                                     .collect();
 
-                                if !records.is_empty() {
-                                    if tx.send(records).await.is_err() {
-                                        return; // Channel closed
-                                    }
+                                if !records.is_empty() && tx.send(records).await.is_err() {
+                                    return; // Channel closed
                                 }
                             }
                             Err(e) => {

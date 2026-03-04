@@ -253,7 +253,7 @@ You do NOT implement anything. You only define what "done" looks like.
 
     if let Some(insights) = insights_section {
         if !insights.is_empty() {
-            prompt.push_str("\n");
+            prompt.push('\n');
             prompt.push_str(insights);
         }
     }

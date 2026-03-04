@@ -35,10 +35,8 @@ impl Receiver for StreamReceiver {
                 _ = cancel.cancelled() => break,
                 Some(errors) = self.rx.recv() => {
                     let records: Vec<LogRecord> = errors.into_iter().map(LogRecord::from).collect();
-                    if !records.is_empty() {
-                        if tx.send(records).await.is_err() {
-                            return; // Channel closed
-                        }
+                    if !records.is_empty() && tx.send(records).await.is_err() {
+                        return; // Channel closed
                     }
                 }
                 else => break, // Sender dropped

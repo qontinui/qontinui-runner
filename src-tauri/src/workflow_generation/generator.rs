@@ -408,7 +408,7 @@ pub fn generate_workflow(
         info!("Running specification agent...");
         let spec_insights = self_improve_ctx
             .as_ref()
-            .map(|ctx| self_improve::format_specification_insights(ctx));
+            .map(self_improve::format_specification_insights);
         let spec_result = specification::run_specification_agent(
             &effective_request.description,
             &discovery_context,
@@ -539,7 +539,7 @@ pub fn generate_workflow(
             // Run verification agent
             let verification_blind_spots = self_improve_ctx
                 .as_ref()
-                .map(|ctx| self_improve::format_verification_insights(ctx));
+                .map(self_improve::format_verification_insights);
             let (issues, verification_prompt) = run_verification_agent(
                 &workflow,
                 &request.description,
@@ -637,7 +637,7 @@ pub fn generate_workflow(
     let hardener_start = Instant::now();
     let hardener_insights = self_improve_ctx
         .as_ref()
-        .map(|ctx| self_improve::format_hardener_insights(ctx));
+        .map(self_improve::format_hardener_insights);
     let (mut workflow, hardening_summary, hardener_prompt) = hardener::run_hardener_agent(
         &workflow,
         &request.description,

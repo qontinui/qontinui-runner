@@ -52,9 +52,9 @@ pub enum PackageManager {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum IntegrationStatus {
-    NotIntegrated,
-    PartiallyIntegrated,
-    FullyIntegrated,
+    None,
+    Partial,
+    Full,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -244,7 +244,7 @@ async fn analyze_project(path: &str) -> Result<ProjectAnalysis, String> {
     let mut framework = Framework::Unknown;
     let mut package_manager = PackageManager::Unknown;
     let mut entry_points = Vec::new();
-    let mut ui_bridge_status = IntegrationStatus::NotIntegrated;
+    let mut ui_bridge_status = IntegrationStatus::None;
     let mut existing_sdk_version = None;
     let mut has_babel_plugin = false;
     let mut has_swc_plugin = false;
@@ -293,7 +293,7 @@ async fn analyze_project(path: &str) -> Result<ProjectAnalysis, String> {
                         .or_else(|| dev_deps.get("@qontinui/ui-bridge"))
                     {
                         existing_sdk_version = version.as_str().map(|s| s.to_string());
-                        ui_bridge_status = IntegrationStatus::PartiallyIntegrated;
+                        ui_bridge_status = IntegrationStatus::Partial;
                     }
 
                     // Check for babel/swc plugins
@@ -432,7 +432,7 @@ async fn analyze_project(path: &str) -> Result<ProjectAnalysis, String> {
         )
         .await;
         if has_provider {
-            ui_bridge_status = IntegrationStatus::FullyIntegrated;
+            ui_bridge_status = IntegrationStatus::Full;
         } else {
             issues.push("SDK installed but UIBridgeProvider not found in source".to_string());
         }
@@ -672,12 +672,12 @@ async fn proxy_websocket(target_base: String, req: axum::http::Request<Body>) ->
                 msg = upstream_read.next() => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
-                            if client_ws.send(axum::extract::ws::Message::Text(text.into())).await.is_err() {
+                            if client_ws.send(axum::extract::ws::Message::Text(text)).await.is_err() {
                                 break;
                             }
                         }
                         Some(Ok(Message::Binary(data))) => {
-                            if client_ws.send(axum::extract::ws::Message::Binary(data.into())).await.is_err() {
+                            if client_ws.send(axum::extract::ws::Message::Binary(data)).await.is_err() {
                                 break;
                             }
                         }
@@ -771,8 +771,8 @@ async fn proxy_request(
             .split(';')
             .find_map(|part| {
                 let part = part.trim();
-                if part.starts_with("charset=") {
-                    Some(part["charset=".len()..].trim().to_lowercase())
+                if let Some(charset) = part.strip_prefix("charset=") {
+                    Some(charset.trim().to_lowercase())
                 } else {
                     None
                 }
@@ -1758,7 +1758,7 @@ async fn handle_update(
     };
 
     // Only update projects that already have the SDK
-    if analysis.ui_bridge_status == IntegrationStatus::NotIntegrated {
+    if analysis.ui_bridge_status == IntegrationStatus::None {
         return Json(ApiResponse::error(
             "Project does not have UI Bridge SDK installed. Use 'integrate' instead.".to_string(),
         ));

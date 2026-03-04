@@ -121,16 +121,17 @@ fn extract_error_message(json: &serde_json::Value) -> Option<String> {
 }
 
 fn find_status(json: &serde_json::Value) -> Option<String> {
-    for container in &[
+    for obj in [
         Some(json),
         json.get("node"),
         json.get("result"),
         json.get("data"),
-    ] {
-        if let Some(obj) = container {
-            if let Some(status) = obj.get("status").and_then(|v| v.as_str()) {
-                return Some(status.to_string());
-            }
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(status) = obj.get("status").and_then(|v| v.as_str()) {
+            return Some(status.to_string());
         }
     }
     None
