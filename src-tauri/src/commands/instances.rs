@@ -25,6 +25,12 @@ pub async fn save_runner_instance(
     name: String,
     port: u16,
 ) -> Result<CommandResponse, String> {
+    if port < 1024 {
+        return Err(format!(
+            "Port {} is in the privileged range (0-1023). Use a port >= 1024.",
+            port
+        ));
+    }
     let config = RunnerInstanceConfig {
         id,
         name: name.clone(),

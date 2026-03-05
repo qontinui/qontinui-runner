@@ -1007,7 +1007,7 @@ pub async fn get_instances(
         .ok();
 
     for config in &configs {
-        if config.port == self_port {
+        if config.port == self_port || config.port < 1024 {
             continue;
         }
         let reachable = if let Some(ref client) = client {
