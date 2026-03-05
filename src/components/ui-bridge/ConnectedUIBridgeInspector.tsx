@@ -14,6 +14,8 @@ import {
   type UIBridgeEvent,
   type UIBridgeSnapshot,
 } from "./UIBridgeInspectorPanel";
+import { ElementOverlay } from "./ElementOverlay";
+import { ElementPicker } from "./ElementPicker";
 
 /**
  * Convert a RegisteredElement from ui-bridge to our UIBridgeElement format
@@ -157,18 +159,25 @@ export function ConnectedUIBridgeInspector() {
     [bridge, addEvent],
   );
 
-  // Handle picker toggle (would need custom implementation)
+  // Handle picker toggle
   const handleTogglePicker = useCallback((enabled: boolean) => {
     setPickerActive(enabled);
-    // In a full implementation, this would trigger element picker mode
-    // via the extension or DOM event listeners
   }, []);
 
-  // Handle overlays toggle (would need custom implementation)
+  // Handle overlays toggle
   const handleToggleOverlays = useCallback((enabled: boolean) => {
     setOverlaysEnabled(enabled);
-    // In a full implementation, this would show/hide element highlight overlays
   }, []);
+
+  // Handle element pick from picker mode
+  const handlePickElement = useCallback(
+    (elementId: string) => {
+      setPickerActive(false);
+      setSelectedElementId(elementId);
+      addEvent("element_picked", { elementId });
+    },
+    [addEvent],
+  );
 
   // Track previous availability to only log once per connection
   const prevAvailable = useRef(bridge.available);
@@ -184,22 +193,38 @@ export function ConnectedUIBridgeInspector() {
   }, [bridge.available, bridge.elements.length, addEvent]);
 
   return (
-    <UIBridgeInspectorPanel
-      targetUrl={window.location.href}
-      connected={bridge.available}
-      onRefresh={handleRefresh}
-      snapshot={snapshot}
-      events={events}
-      loading={loading}
-      error={error}
-      selectedElementId={selectedElementId}
-      onSelectElement={handleSelectElement}
-      onExecuteAction={handleExecuteAction}
-      onTogglePicker={handleTogglePicker}
-      pickerActive={pickerActive}
-      onToggleOverlays={handleToggleOverlays}
-      overlaysEnabled={overlaysEnabled}
-    />
+    <>
+      <UIBridgeInspectorPanel
+        targetUrl={window.location.href}
+        connected={bridge.available}
+        onRefresh={handleRefresh}
+        snapshot={snapshot}
+        events={events}
+        loading={loading}
+        error={error}
+        selectedElementId={selectedElementId}
+        onSelectElement={handleSelectElement}
+        onExecuteAction={handleExecuteAction}
+        onTogglePicker={handleTogglePicker}
+        pickerActive={pickerActive}
+        onToggleOverlays={handleToggleOverlays}
+        overlaysEnabled={overlaysEnabled}
+      />
+      {overlaysEnabled && snapshot && (
+        <ElementOverlay
+          elements={snapshot.elements}
+          selectedElementId={selectedElementId}
+          onSelectElement={(id) => setSelectedElementId(id)}
+        />
+      )}
+      {pickerActive && snapshot && (
+        <ElementPicker
+          elements={snapshot.elements}
+          onPick={handlePickElement}
+          onCancel={() => setPickerActive(false)}
+        />
+      )}
+    </>
   );
 }
 

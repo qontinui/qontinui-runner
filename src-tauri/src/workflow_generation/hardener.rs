@@ -474,7 +474,7 @@ pub fn run_hardener_agent(
 ///
 /// This catches a common AI generation mistake where the builder agent uses the runner's
 /// own control endpoint instead of the SDK proxy endpoint.
-fn fix_sdk_urls(workflow: &UnifiedWorkflow) -> UnifiedWorkflow {
+pub fn fix_sdk_urls(workflow: &UnifiedWorkflow) -> UnifiedWorkflow {
     let workflow_json = serde_json::to_string(workflow).unwrap_or_default();
     let has_sdk_connect = workflow_json.contains("ui-bridge/sdk/connect");
     let targets_web =
@@ -640,6 +640,7 @@ fn inject_retries_after_navigation(steps: &mut [Value]) -> usize {
 /// 1. Replaces `jq` commands with Python equivalents (jq unavailable on Windows)
 /// 2. Fixes Python f-string escaping issues
 /// 3. Normalizes nested `retry` objects to flat `retry_count`/`retry_delay_ms` fields
+/// 4. Removes `curl -f` flag in piped commands (suppresses output on HTTP errors)
 pub fn sanitize_commands_in_steps(steps: &mut [Value]) -> usize {
     let mut count = 0;
 
@@ -703,6 +704,20 @@ pub fn sanitize_commands_in_steps(steps: &mut [Value]) -> usize {
             if let Some(obj) = step.as_object_mut() {
                 obj.insert(cmd_key.to_string(), Value::String(fixed));
                 count += 1;
+            }
+        }
+
+        // Fix `curl -sf` (or `-sف`) in piped commands: the -f flag suppresses ALL output
+        // on HTTP errors, so the downstream command (python, grep) receives empty stdin
+        // and fails with a confusing error. Replace with `curl -s` when output is piped.
+        let current_cmd_for_curl = step.get(cmd_key).and_then(|v| v.as_str()).unwrap_or(&cmd);
+        if current_cmd_for_curl.contains("| ") {
+            let fixed_curl = fix_curl_sf_in_piped_commands(current_cmd_for_curl);
+            if fixed_curl != current_cmd_for_curl {
+                if let Some(obj) = step.as_object_mut() {
+                    obj.insert(cmd_key.to_string(), Value::String(fixed_curl));
+                    count += 1;
+                }
             }
         }
 
@@ -837,6 +852,64 @@ fn replace_python_fstring_with_clean(cmd: &str) -> Option<String> {
     }
 
     None
+}
+
+/// Fix `curl -sf` in piped commands by removing the `-f` flag.
+///
+/// The `-f` (fail) flag makes curl suppress ALL output on HTTP error status codes (4xx/5xx).
+/// When the output is piped to another command (e.g., `python -c`, `grep`), the downstream
+/// command receives empty stdin and fails with a confusing error like `JSONDecodeError`.
+///
+/// This function removes `-f` from curl flags when the command pipes to another program.
+fn fix_curl_sf_in_piped_commands(cmd: &str) -> String {
+    if !cmd.contains("curl ") || !cmd.contains("| ") {
+        return cmd.to_string();
+    }
+
+    // Match patterns: "curl -sf", "curl -fs", "curl -sfL", "curl -fsL", etc.
+    // We need to remove just the 'f' from the flags group.
+    let mut result = cmd.to_string();
+    let mut changed = false;
+
+    // Find curl invocations and their flag groups
+    for (i, _) in cmd.match_indices("curl ") {
+        let after_curl = &cmd[i + 5..];
+        // Look for a flags group starting with -
+        if let Some(flags_start) = after_curl.find('-') {
+            let flags_abs = i + 5 + flags_start;
+            // Extract the flag group (everything until next space)
+            let flags_end = after_curl[flags_start..]
+                .find(' ')
+                .map(|p| flags_abs + p)
+                .unwrap_or(cmd.len());
+            let flags = &cmd[flags_abs..flags_end];
+
+            // Only process single-letter flag groups (like -sf, -sfL, -fsL)
+            // Skip long flags like --fail
+            if flags.starts_with('-') && !flags.starts_with("--") && flags.contains('f') {
+                let new_flags: String = flags.chars().filter(|c| *c != 'f').collect();
+                if new_flags == "-" {
+                    // Only had -f, replace with -s if not already present
+                    result = format!("{}-s{}", &result[..flags_abs], &result[flags_end..]);
+                } else {
+                    result = format!(
+                        "{}{}{}",
+                        &result[..flags_abs],
+                        new_flags,
+                        &result[flags_end..]
+                    );
+                }
+                changed = true;
+                break; // Only fix the first curl invocation
+            }
+        }
+    }
+
+    if changed {
+        result
+    } else {
+        cmd.to_string()
+    }
 }
 
 /// Quote URLs containing `&` in curl commands so bash doesn't interpret `&` as a
@@ -1536,6 +1609,7 @@ mod tests {
             stop_on_failure: false,
             approval_gate: false,
             reflection_mode: false,
+            completion_prompts_first: false,
             model_overrides: std::collections::HashMap::new(),
             created_at: "2025-01-01T00:00:00Z".to_string(),
             updated_at: "2025-01-01T00:00:00Z".to_string(),
@@ -2209,7 +2283,7 @@ mod tests {
     fn test_sanitize_commands_leaves_non_jq_alone() {
         let mut steps = vec![json!({
             "id": "s1", "type": "command", "mode": "shell",
-            "command": "curl -sf http://localhost:9876/ui-bridge/sdk/snapshot | grep 'elements'",
+            "command": "curl -s http://localhost:9876/ui-bridge/sdk/snapshot | grep 'elements'",
             "name": "Simple grep"
         })];
         let count = sanitize_commands_in_steps(&mut steps);
@@ -2313,5 +2387,62 @@ mod tests {
             "URL should be quoted: {}",
             cmd
         );
+    }
+
+    // === fix_curl_sf_in_piped_commands tests ===
+
+    #[test]
+    fn test_curl_sf_removed_in_piped_command() {
+        let cmd = r#"curl -sf http://localhost:9876/ui-bridge/sdk/snapshot | python -c "import sys,json; d=json.load(sys.stdin)""#;
+        let fixed = fix_curl_sf_in_piped_commands(cmd);
+        assert!(
+            !fixed.contains("-sf"),
+            "Should remove -f from -sf: {}",
+            fixed
+        );
+        assert!(fixed.contains("-s "), "Should keep -s: {}", fixed);
+    }
+
+    #[test]
+    fn test_curl_fs_removed_in_piped_command() {
+        let cmd = "curl -fs http://example.com/api | grep ok";
+        let fixed = fix_curl_sf_in_piped_commands(cmd);
+        assert!(!fixed.contains('f'), "Should remove f from -fs: {}", fixed);
+        assert!(fixed.contains("-s"), "Should keep -s: {}", fixed);
+    }
+
+    #[test]
+    fn test_curl_sfL_becomes_sL() {
+        let cmd = "curl -sfL http://example.com | python -c 'print(1)'";
+        let fixed = fix_curl_sf_in_piped_commands(cmd);
+        assert_eq!(fixed.contains("-sL"), true, "Should become -sL: {}", fixed);
+        assert!(!fixed.contains('f'), "Should not contain f: {}", fixed);
+    }
+
+    #[test]
+    fn test_curl_s_not_changed_when_no_pipe() {
+        let cmd = "curl -sf http://example.com";
+        let fixed = fix_curl_sf_in_piped_commands(cmd);
+        assert_eq!(fixed, cmd, "Should not change command without pipe");
+    }
+
+    #[test]
+    fn test_curl_s_not_changed_when_already_correct() {
+        let cmd = "curl -s http://example.com | grep ok";
+        let fixed = fix_curl_sf_in_piped_commands(cmd);
+        assert_eq!(fixed, cmd, "Should not change command without -f");
+    }
+
+    #[test]
+    fn test_sanitize_fixes_curl_sf_in_piped_steps() {
+        let mut steps = vec![json!({
+            "command": r#"curl -sf http://localhost:9876/ui-bridge/sdk/snapshot | python -c "import sys,json; d=json.load(sys.stdin)""#,
+            "name": "Check snapshot"
+        })];
+        let count = sanitize_commands_in_steps(&mut steps);
+        assert!(count >= 1, "Should sanitize curl -sf in piped command");
+        let cmd = steps[0].get("command").unwrap().as_str().unwrap();
+        assert!(!cmd.contains("-sf"), "Should not contain -sf: {}", cmd);
+        assert!(cmd.contains("-s "), "Should contain -s: {}", cmd);
     }
 }

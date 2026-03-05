@@ -47,7 +47,9 @@ export function useApiRequestData(): ApiRequestData {
   // Fetch API request executions from /current-execution/steps
   const fetchRequests = useCallback(async () => {
     try {
-      const response = await tracedFetch(`${getApiBase()}/current-execution/steps?step_type=api_request`);
+      const response = await tracedFetch(
+        `${getApiBase()}/current-execution/steps?step_type=api_request`,
+      );
       if (response.ok) {
         const data: CurrentExecutionStepsResponse = await response.json();
         if (data.success && data.executions) {

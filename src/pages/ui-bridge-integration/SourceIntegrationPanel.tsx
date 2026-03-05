@@ -10,12 +10,7 @@ import {
   ArrowUpCircle,
 } from "lucide-react";
 import { useState, useCallback } from "react";
-import type {
-  ProjectAnalysis,
-  IntegrationResult,
-  FileModification,
-  ApiResponse,
-} from "./types";
+import type { ProjectAnalysis, IntegrationResult, FileModification, ApiResponse } from "./types";
 import { getApiBase } from "@/lib/runner-api";
 
 export function SourceIntegrationPanel() {
@@ -135,8 +130,8 @@ export function SourceIntegrationPanel() {
       <div className="p-4 rounded-lg border border-border bg-card/50">
         <h3 className="text-sm font-medium mb-1">Project Directory</h3>
         <p className="text-xs text-muted-foreground mb-3">
-          Enter the path to a web application project to analyze and
-          automatically integrate the UI Bridge SDK.
+          Enter the path to a web application project to analyze and automatically integrate the UI
+          Bridge SDK.
         </p>
         <div className="flex gap-2">
           <div className="flex-1 relative">
@@ -179,34 +174,20 @@ export function SourceIntegrationPanel() {
           <div className="grid grid-cols-2 gap-3 text-xs">
             <InfoRow label="Framework" value={formatFramework(analysis.framework)} />
             <InfoRow label="Package Manager" value={analysis.package_manager} />
-            <InfoRow
-              label="SDK Version"
-              value={analysis.existing_sdk_version || "Not installed"}
-            />
-            <InfoRow
-              label="Server Adapter"
-              value={analysis.server_adapter || "None"}
-            />
+            <InfoRow label="SDK Version" value={analysis.existing_sdk_version || "Not installed"} />
+            <InfoRow label="Server Adapter" value={analysis.server_adapter || "None"} />
             <InfoRow
               label="Dev Server Port"
               value={analysis.dev_server_port?.toString() || "Unknown"}
             />
-            <InfoRow
-              label="Entry Points"
-              value={analysis.entry_points.length.toString()}
-            />
+            <InfoRow label="Entry Points" value={analysis.entry_points.length.toString()} />
           </div>
 
           {analysis.entry_points.length > 0 && (
             <div className="mt-3">
-              <p className="text-[10px] text-muted-foreground font-medium mb-1">
-                Entry Points:
-              </p>
+              <p className="text-[10px] text-muted-foreground font-medium mb-1">Entry Points:</p>
               {analysis.entry_points.map((ep, i) => (
-                <div
-                  key={i}
-                  className="flex items-center gap-2 text-xs text-muted-foreground"
-                >
+                <div key={i} className="flex items-center gap-2 text-xs text-muted-foreground">
                   <FileCode className="w-3 h-3 shrink-0" />
                   <span className="truncate">{ep.path}</span>
                   <span className="text-[10px] px-1 py-0.5 rounded bg-white/5">
@@ -219,14 +200,9 @@ export function SourceIntegrationPanel() {
 
           {analysis.issues.length > 0 && (
             <div className="mt-3">
-              <p className="text-[10px] text-yellow-400 font-medium mb-1">
-                Issues:
-              </p>
+              <p className="text-[10px] text-yellow-400 font-medium mb-1">Issues:</p>
               {analysis.issues.map((issue, i) => (
-                <div
-                  key={i}
-                  className="flex items-center gap-1.5 text-xs text-yellow-400/80"
-                >
+                <div key={i} className="flex items-center gap-1.5 text-xs text-yellow-400/80">
                   <AlertTriangle className="w-3 h-3 shrink-0" />
                   {issue}
                 </div>
@@ -236,7 +212,7 @@ export function SourceIntegrationPanel() {
 
           {/* Actions */}
           <div className="flex items-center gap-2 mt-4 pt-3 border-t border-border">
-            {analysis.ui_bridge_status !== "fully_integrated" && (
+            {analysis.ui_bridge_status !== "full" && (
               <>
                 <button
                   onClick={previewChanges}
@@ -263,8 +239,7 @@ export function SourceIntegrationPanel() {
                 </button>
               </>
             )}
-            {(analysis.ui_bridge_status === "partially_integrated" ||
-              analysis.ui_bridge_status === "fully_integrated") && (
+            {(analysis.ui_bridge_status === "partial" || analysis.ui_bridge_status === "full") && (
               <button
                 onClick={updateSdk}
                 disabled={updating}
@@ -290,10 +265,7 @@ export function SourceIntegrationPanel() {
           <h3 className="text-sm font-medium mb-3">Planned Modifications</h3>
           <div className="flex flex-col gap-2">
             {preview.map((mod, i) => (
-              <div
-                key={i}
-                className="flex items-start gap-2 p-2 rounded bg-white/5 text-xs"
-              >
+              <div key={i} className="flex items-start gap-2 p-2 rounded bg-white/5 text-xs">
                 <FileCode className="w-3.5 h-3.5 text-cyan-400 shrink-0 mt-0.5" />
                 <div>
                   <p className="font-medium text-foreground">{mod.file_path}</p>
@@ -312,9 +284,7 @@ export function SourceIntegrationPanel() {
       {result && (
         <div
           className={`p-4 rounded-lg border ${
-            result.success
-              ? "border-green-500/30 bg-green-500/5"
-              : "border-red-500/30 bg-red-500/5"
+            result.success ? "border-green-500/30 bg-green-500/5" : "border-red-500/30 bg-red-500/5"
           }`}
         >
           <div className="flex items-center gap-2 mb-2">
@@ -324,21 +294,16 @@ export function SourceIntegrationPanel() {
               <AlertTriangle className="w-4 h-4 text-red-400" />
             )}
             <h3 className="text-sm font-medium">
-              {result.success
-                ? "Integration Successful"
-                : "Integration Failed"}
+              {result.success ? "Integration Successful" : "Integration Failed"}
             </h3>
           </div>
 
           {result.modifications.length > 0 && (
             <div className="mb-2">
-              <p className="text-[10px] text-muted-foreground font-medium mb-1">
-                Modified files:
-              </p>
+              <p className="text-[10px] text-muted-foreground font-medium mb-1">Modified files:</p>
               {result.modifications.map((mod, i) => (
                 <p key={i} className="text-xs text-muted-foreground">
-                  {mod.modification_type === "create_new" ? "+" : "~"}{" "}
-                  {mod.file_path}
+                  {mod.modification_type === "create_new" ? "+" : "~"} {mod.file_path}
                 </p>
               ))}
             </div>
@@ -346,9 +311,7 @@ export function SourceIntegrationPanel() {
 
           {result.next_steps.length > 0 && (
             <div>
-              <p className="text-[10px] text-muted-foreground font-medium mb-1">
-                Next steps:
-              </p>
+              <p className="text-[10px] text-muted-foreground font-medium mb-1">Next steps:</p>
               {result.next_steps.map((step, i) => (
                 <p key={i} className="text-xs text-muted-foreground">
                   {i + 1}. {step}
@@ -383,27 +346,25 @@ function InfoRow({ label, value }: { label: string; value: string }) {
 
 function StatusBadge({ status }: { status: string }) {
   const config: Record<string, { bg: string; text: string; label: string }> = {
-    not_integrated: {
+    none: {
       bg: "bg-yellow-500/10",
       text: "text-yellow-400",
       label: "Not Integrated",
     },
-    partially_integrated: {
+    partial: {
       bg: "bg-orange-500/10",
       text: "text-orange-400",
       label: "Partially Integrated",
     },
-    fully_integrated: {
+    full: {
       bg: "bg-green-500/10",
       text: "text-green-400",
       label: "Fully Integrated",
     },
   };
-  const c = config[status] || config.not_integrated;
+  const c = config[status] || config.none;
   return (
-    <span
-      className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${c.bg} ${c.text}`}
-    >
+    <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${c.bg} ${c.text}`}>
       {c.label}
     </span>
   );

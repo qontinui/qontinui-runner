@@ -392,11 +392,14 @@ export function AiTab({
 
     setRunAutoContinueLoading(true);
     try {
-      const response = await tracedFetch(`${getApiBase()}/task-runs/${selectedSessionId}/auto-continue`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ auto_continue: !runAutoContinue }),
-      });
+      const response = await tracedFetch(
+        `${getApiBase()}/task-runs/${selectedSessionId}/auto-continue`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ auto_continue: !runAutoContinue }),
+        },
+      );
       const result = await response.json();
       if (result.success) {
         setRunAutoContinue(result.auto_continue);

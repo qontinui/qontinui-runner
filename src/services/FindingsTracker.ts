@@ -485,6 +485,22 @@ export class FindingsTracker {
   }
 
   /**
+   * Auto-resolve a needs_input finding that matches a newly-detected resolved finding.
+   * Matches on categoryId and the first 30 chars of the title (case-insensitive).
+   */
+  resolveMatchingFinding(categoryId: string, title: string): Finding | null {
+    const needsInput = this.getFindingsNeedingInput();
+    const normalizedTitle = title.toLowerCase().slice(0, 30);
+    const match = needsInput.find(
+      (f) => f.categoryId === categoryId && f.title.toLowerCase().slice(0, 30) === normalizedTitle,
+    );
+    if (match) {
+      return this.resolveFinding(match.id, "Auto-resolved: matching resolution detected");
+    }
+    return null;
+  }
+
+  /**
    * Provide user response for a finding
    */
   provideUserResponse(findingId: string, response: string): Finding | null {

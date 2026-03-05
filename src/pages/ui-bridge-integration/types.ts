@@ -11,10 +11,7 @@ export type Framework =
 
 export type PackageManager = "npm" | "yarn" | "pnpm" | "bun" | "unknown";
 
-export type IntegrationStatus =
-  | "not_integrated"
-  | "partially_integrated"
-  | "fully_integrated";
+export type IntegrationStatus = "none" | "partial" | "full";
 
 export type IntegrationType = "runtime" | "source" | "both";
 

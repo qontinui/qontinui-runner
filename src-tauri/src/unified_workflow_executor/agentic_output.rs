@@ -92,7 +92,7 @@ pub struct AgenticPhaseOutput {
     #[serde(default)]
     pub findings: Vec<FindingOutput>,
     /// The raw AI output text (always preserved for debugging)
-    #[serde(skip_serializing)]
+    #[serde(skip_serializing, default)]
     pub raw_output: String,
 }
 

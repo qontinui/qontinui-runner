@@ -20,10 +20,7 @@ export const SpanDetailPanel: React.FC<SpanDetailPanelProps> = ({ span, onClose 
         <h3 className="text-sm font-medium text-zinc-200 truncate">
           {span.name.replace(/^qontinui\./, "")}
         </h3>
-        <button
-          onClick={onClose}
-          className="text-zinc-500 hover:text-zinc-300 text-xs"
-        >
+        <button onClick={onClose} className="text-zinc-500 hover:text-zinc-300 text-xs">
           ✕
         </button>
       </div>
@@ -57,9 +54,7 @@ export const SpanDetailPanel: React.FC<SpanDetailPanelProps> = ({ span, onClose 
         {span.end_ts && (
           <div>
             <span className="text-zinc-500">End:</span>
-            <span className="text-zinc-400 ml-1">
-              {new Date(span.end_ts).toLocaleTimeString()}
-            </span>
+            <span className="text-zinc-400 ml-1">{new Date(span.end_ts).toLocaleTimeString()}</span>
           </div>
         )}
 

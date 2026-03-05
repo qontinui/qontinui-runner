@@ -16,16 +16,10 @@ export const TraceViewerSummary: React.FC<TraceViewerSummaryProps> = ({ executio
 
   return (
     <div className="flex items-center gap-3 text-xs">
-      <span className="text-zinc-400">
-        {insights.spanCount} spans
-      </span>
-      <span className="text-zinc-400">
-        {formatDuration(insights.totalDurationMs)}
-      </span>
+      <span className="text-zinc-400">{insights.spanCount} spans</span>
+      <span className="text-zinc-400">{formatDuration(insights.totalDurationMs)}</span>
       {insights.errorCount > 0 && (
-        <span className="text-red-400">
-          {insights.errorCount} errors
-        </span>
+        <span className="text-red-400">{insights.errorCount} errors</span>
       )}
     </div>
   );

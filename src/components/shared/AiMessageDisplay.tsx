@@ -563,7 +563,13 @@ function detectStatusType(text: string): StatusType {
   }
 
   // Check for running indicators
-  if (text.includes("🚀") || lowerText.includes("running") || lowerText.includes("starting")) {
+  if (
+    text.includes("🚀") ||
+    text.includes("⏳") ||
+    lowerText.includes("running") ||
+    lowerText.includes("starting") ||
+    lowerText.includes("working")
+  ) {
     return "running";
   }
 
@@ -622,7 +628,7 @@ function StatusBanner({ group }: { group: MessageGroup }) {
 
   // Remove emoji from the beginning of the text for cleaner display
   // Using Unicode property escapes to properly match emoji sequences
-  const cleanText = group.combinedText.replace(/^(?:🚀|✅|❌|📋|⚠️|ℹ️)\s*/gmu, "").trim();
+  const cleanText = group.combinedText.replace(/^(?:🚀|✅|❌|📋|⚠️|ℹ️|⏳)\s*/gmu, "").trim();
 
   return (
     <div

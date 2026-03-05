@@ -12,9 +12,7 @@ interface TraceViewerDashboardWidgetProps extends BaseWidgetProps {
   data: TraceViewerWidgetData;
 }
 
-export const TraceViewerDashboardWidget: React.FC<TraceViewerDashboardWidgetProps> = ({
-  data,
-}) => {
+export const TraceViewerDashboardWidget: React.FC<TraceViewerDashboardWidgetProps> = ({ data }) => {
   return (
     <div className="h-full overflow-hidden">
       <TraceViewerWidget

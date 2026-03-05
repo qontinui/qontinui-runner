@@ -110,9 +110,7 @@ export function SetupWizard({ onComplete }: SetupWizardProps) {
           <AiProviderStep onComplete={handleAiProviderComplete} onBack={goBack} />
         )}
 
-        {currentStep === 4 && (
-          <ClaudeConfigStep onComplete={finishSetup} onBack={goBack} />
-        )}
+        {currentStep === 4 && <ClaudeConfigStep onComplete={finishSetup} onBack={goBack} />}
       </div>
     </div>
   );

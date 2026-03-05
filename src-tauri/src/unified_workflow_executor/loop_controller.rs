@@ -28,6 +28,7 @@ use crate::summary_generator::generate_task_summary_async;
 use crate::workflow_state::{StateMachine, WorkflowState};
 use crate::AppState;
 
+use super::canvas_panels::CanvasPanelManager;
 use super::phases::{AgenticExecutor, CompletionExecutor, SetupExecutor, VerificationExecutor};
 use super::resume::{ResumeManager, ResumePoint};
 use super::states::UnifiedWorkflowState;
@@ -56,6 +57,7 @@ pub struct LoopController {
     doctor_handle: Option<DoctorHandle>,
     reflection_fix_ctx: Option<crate::mcp::shared::ReflectionFixContext>,
     step_injection_ctx: Option<crate::step_injection::types::StepInjectionContext>,
+    canvas_manager: tokio::sync::Mutex<CanvasPanelManager>,
 }
 
 impl LoopController {
@@ -95,6 +97,11 @@ impl LoopController {
             ),
             checkpoint_db: app_state.checkpoint_db.clone(),
             knowledge_base: KnowledgeBase::new(app_state.checkpoint_db.clone()),
+            canvas_manager: tokio::sync::Mutex::new(CanvasPanelManager::new(
+                app_state.canvas_state.clone(),
+                app_state.checkpoint_db.clone(),
+                app_handle.clone(),
+            )),
             app_state,
             config_storage,
             app_handle,
@@ -300,6 +307,13 @@ impl LoopController {
                 + completion_prompt_steps.len()
         );
 
+        // Emit canvas panels for workflow start
+        self.canvas_manager
+            .lock()
+            .await
+            .on_workflow_start(&config)
+            .await;
+
         // Create centralized step event logger for this execution
         // This ensures consistent event format and prevents duplicate logging
         let logger = StepEventLogger::new(
@@ -392,6 +406,7 @@ impl LoopController {
                     timeout_seconds: None,
                     approval_gate: config.approval_gate,
                     condition: None, // Single-phase normalization has no condition
+                    completion_prompts_first: false,
                 };
                 config.stages = vec![single_stage];
             }
@@ -508,6 +523,13 @@ impl LoopController {
                 }
             }
 
+            // Notify canvas of stage start
+            self.canvas_manager
+                .lock()
+                .await
+                .on_stage_start(stage_idx as u32, &stage.name, total_stages)
+                .await;
+
             // Check for external stop
             if self.is_task_stopped(&config.execution_id) {
                 warn!("Task stopped before stage {}/{}", stage_num, total_stages);
@@ -515,6 +537,14 @@ impl LoopController {
                     &config.execution_id,
                     &UnifiedWorkflowState::stopped_in_phase("stage", Some(stage_idx as u32)),
                 );
+                self.canvas_manager
+                    .lock()
+                    .await
+                    .on_workflow_failed(&format!(
+                        "Stopped before stage {}/{}",
+                        stage_num, total_stages
+                    ))
+                    .await;
                 return WorkflowResult {
                     success: false,
                     verification_passed: false,
@@ -552,6 +582,14 @@ impl LoopController {
                             Some(&config.workflow_id),
                         )
                         .await;
+                        self.canvas_manager
+                            .lock()
+                            .await
+                            .on_workflow_failed(&format!(
+                                "Max sessions ({}) exhausted before stage {}/{}",
+                                max, stage_num, total_stages
+                            ))
+                            .await;
                         return WorkflowResult {
                             success: false,
                             verification_passed: false,
@@ -627,6 +665,13 @@ impl LoopController {
                     )
                     .await;
 
+                // Emit canvas panel for setup completion
+                self.canvas_manager
+                    .lock()
+                    .await
+                    .on_setup_complete(setup_ok, &setup_results)
+                    .await;
+
                 // Log setup output
                 {
                     let mut output = format!(
@@ -672,6 +717,11 @@ impl LoopController {
                             Some(&config.workflow_id),
                         )
                         .await;
+                        self.canvas_manager
+                            .lock()
+                            .await
+                            .on_workflow_failed(&format!("Stage {} setup failed", stage_num))
+                            .await;
                         return WorkflowResult {
                             success: false,
                             verification_passed: false,
@@ -888,6 +938,19 @@ impl LoopController {
                         &UnifiedWorkflowState::agentic_complete(agentic_iteration),
                     );
 
+                    // Notify canvas of agentic-first completion
+                    self.canvas_manager
+                        .lock()
+                        .await
+                        .on_agentic_complete(
+                            agentic_iteration,
+                            &outcome,
+                            &[],
+                            injected_steps.len(),
+                            0,
+                        )
+                        .await;
+
                     // Adjust starting_iteration so the loop continues after this agentic phase,
                     // and reduce max_iterations by 1 to account for the session already consumed.
                     // Without this, the total sessions = 1 (agentic-first) + max_iterations - 1
@@ -984,6 +1047,7 @@ impl LoopController {
                             Some(stage_idx as u32),
                             comp_model,
                             comp_provider,
+                            stage.completion_prompts_first,
                         )
                         .await;
                     all_step_results.extend(completion_results);
@@ -1011,6 +1075,14 @@ impl LoopController {
                         Some(&config.workflow_id),
                     )
                     .await;
+                    {
+                        let sessions = self.canvas_manager.lock().await.get_sessions_count().await;
+                        self.canvas_manager
+                            .lock()
+                            .await
+                            .on_workflow_complete(&loop_result, start.elapsed(), sessions)
+                            .await;
+                    }
                     return WorkflowResult {
                         success: false,
                         verification_passed: false,
@@ -1085,6 +1157,22 @@ impl LoopController {
             self.mark_task_completed(&config.execution_id, Some(&config.workflow_id))
                 .await;
 
+            // Emit canvas outcome panel for successful completion
+            if let Some(ref lr) = last_loop_result {
+                let cm = &self.canvas_manager;
+                let sessions = cm.lock().await.get_sessions_count().await;
+                cm.lock()
+                    .await
+                    .on_workflow_complete(lr, start.elapsed(), sessions)
+                    .await;
+            } else {
+                self.canvas_manager
+                    .lock()
+                    .await
+                    .on_workflow_failed("Workflow completed (no verification loop)")
+                    .await;
+            }
+
             // Resolve targeted errors on successful completion
             if any_stage_passed && !config.targeted_error_ids.is_empty() {
                 self.resolve_targeted_errors(&config.execution_id, &config.targeted_error_ids)
@@ -1135,6 +1223,22 @@ impl LoopController {
                 Some(&config.workflow_id),
             )
             .await;
+
+            // Emit canvas outcome panel for failed completion
+            if let Some(ref lr) = last_loop_result {
+                let cm = &self.canvas_manager;
+                let sessions = cm.lock().await.get_sessions_count().await;
+                cm.lock()
+                    .await
+                    .on_workflow_complete(lr, start.elapsed(), sessions)
+                    .await;
+            } else {
+                self.canvas_manager
+                    .lock()
+                    .await
+                    .on_workflow_failed("No stages passed verification")
+                    .await;
+            }
 
             // Fire-and-forget summary generation for failed task with per-phase model override
             let db = self.checkpoint_db.clone();
@@ -1679,6 +1783,17 @@ impl LoopController {
                 });
             }
 
+            // Emit canvas panel for verification completion
+            self.canvas_manager
+                .lock()
+                .await
+                .on_verification_complete(
+                    iteration,
+                    &verification_result,
+                    &config.verification_history,
+                )
+                .await;
+
             // Persist workflow state: VerificationComplete
             self.persist_workflow_state(
                 &config.execution_id,
@@ -2015,6 +2130,7 @@ impl LoopController {
                 iteration,
             );
 
+            let agentic_phase_start = std::time::Instant::now();
             let (agentic_outcome, new_injected_steps) = self
                 .agentic_executor
                 .run_agentic(
@@ -2026,13 +2142,14 @@ impl LoopController {
                     logger,
                 )
                 .await;
+            let agentic_duration_ms = agentic_phase_start.elapsed().as_millis() as u64;
 
             // Accumulate any newly injected steps for future verification iterations
+            let new_injected_count = new_injected_steps.len();
             if !new_injected_steps.is_empty() {
                 info!(
                     "Injected {} dynamic verification step(s) from agentic phase (iteration {})",
-                    new_injected_steps.len(),
-                    iteration
+                    new_injected_count, iteration
                 );
                 dynamic_steps.extend(new_injected_steps);
             }
@@ -2068,7 +2185,7 @@ impl LoopController {
             }
 
             // Record findings from AI output as knowledge entries
-            if let Some(output) = agentic_outcome.output() {
+            let parsed_findings = if let Some(output) = agentic_outcome.output() {
                 let findings = parse_findings_from_output(output);
                 if !findings.is_empty() {
                     let parent_id = get_parent_task_id(&config.execution_id);
@@ -2116,7 +2233,24 @@ impl LoopController {
                         warn!("Failed to record agentic observation: {}", e);
                     }
                 }
-            }
+
+                findings
+            } else {
+                Vec::new()
+            };
+
+            // Emit canvas panel for agentic phase completion
+            self.canvas_manager
+                .lock()
+                .await
+                .on_agentic_complete(
+                    iteration,
+                    &agentic_outcome,
+                    &parsed_findings,
+                    new_injected_count,
+                    agentic_duration_ms,
+                )
+                .await;
 
             let iter_result = IterationResult {
                 iteration,
@@ -3618,6 +3752,8 @@ fn substitute_step_vars(step: &mut ExecutionStepConfig, artifact_dir: &str, exec
     sub(&mut step.check_command);
     sub(&mut step.check_working_directory);
     sub(&mut step.artifact_input_path);
+    sub(&mut step.fixup_input_path);
+    sub(&mut step.fixup_criteria_path);
 
     // Also substitute in prompt content (may reference artifact paths)
     if let Some(ref mut content) = step.prompt_content {

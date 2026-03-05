@@ -374,6 +374,7 @@ pub async fn get_unified_workflow(
                 stop_on_failure: Some(workflow.stop_on_failure),
                 approval_gate: Some(workflow.approval_gate),
                 reflection_mode: Some(workflow.reflection_mode),
+                completion_prompts_first: Some(workflow.completion_prompts_first),
                 model_overrides: Some(workflow.model_overrides.clone()),
             };
             if let Err(e) = state
@@ -779,6 +780,7 @@ pub async fn import_unified_workflow(
         stop_on_failure: Some(workflow.stop_on_failure),
         approval_gate: Some(workflow.approval_gate),
         reflection_mode: Some(workflow.reflection_mode),
+        completion_prompts_first: Some(workflow.completion_prompts_first),
         model_overrides: Some(workflow.model_overrides.clone()),
     };
 
@@ -998,6 +1000,7 @@ pub async fn generate_unified_workflow_async_handler(
         stop_on_failure: Some(meta_workflow.stop_on_failure),
         approval_gate: Some(meta_workflow.approval_gate),
         reflection_mode: Some(meta_workflow.reflection_mode),
+        completion_prompts_first: Some(meta_workflow.completion_prompts_first),
         model_overrides: Some(meta_workflow.model_overrides.clone()),
     };
 
@@ -1779,6 +1782,7 @@ pub async fn execute_inline_workflow(
         stop_on_failure: false,
         approval_gate: false,
         reflection_mode: false,
+        completion_prompts_first: false,
         model_overrides: std::collections::HashMap::new(),
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),

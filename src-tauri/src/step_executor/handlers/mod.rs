@@ -14,7 +14,7 @@
 //!             └── handler.execute(step, context)
 //! ```
 //!
-//! ## Available Handlers (6 active)
+//! ## Available Handlers (8 active)
 //!
 //! | Category | Handlers |
 //! |----------|----------|
@@ -22,8 +22,9 @@
 //! | **UI Bridge** | ui_bridge |
 //! | **AI** | prompt |
 //! | **Artifact** | save_workflow_artifact |
+//! | **Fixup** | workflow_fixup (deterministic autofix, harden, validate_criteria) |
 //! | **Process** | restart_process |
-//! | **Composition** | workflow (runs a saved workflow inline) |
+//! | **Composition** | workflow (runs a saved workflow inline), workflow_ref |
 //!
 //! ## Adding a New Step Type
 //!
@@ -81,6 +82,7 @@ pub mod restart_process;
 mod save_workflow_artifact;
 pub(crate) mod ui_bridge;
 mod workflow;
+mod workflow_fixup;
 mod workflow_ref;
 
 // Re-export handlers for registration
@@ -89,6 +91,7 @@ use restart_process::RestartProcessHandler;
 use save_workflow_artifact::SaveWorkflowArtifactHandler;
 use ui_bridge::UiBridgeHandler;
 use workflow::WorkflowStepHandler;
+use workflow_fixup::WorkflowFixupHandler;
 use workflow_ref::WorkflowRefHandler;
 
 /// Result of executing a step handler.
@@ -374,7 +377,7 @@ impl HandlerRegistry {
     /// Create a registry pre-populated with all standard handlers.
     ///
     /// This is the recommended way to create a registry for production use.
-    /// 7 active handlers: command (incl. test dispatch), ui_bridge, prompt, restart_process, save_workflow_artifact, workflow, workflow_ref
+    /// 8 active handlers: command (incl. test dispatch), ui_bridge, prompt, restart_process, save_workflow_artifact, workflow_fixup, workflow, workflow_ref
     pub fn with_standard_handlers() -> Self {
         let mut registry = Self::new();
 
@@ -382,6 +385,7 @@ impl HandlerRegistry {
         registry.register(PromptStepHandler);
         registry.register(RestartProcessHandler);
         registry.register(SaveWorkflowArtifactHandler);
+        registry.register(WorkflowFixupHandler);
         registry.register(UiBridgeHandler);
         registry.register(WorkflowStepHandler);
         registry.register(WorkflowRefHandler);

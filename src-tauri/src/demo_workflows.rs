@@ -200,6 +200,7 @@ fn build_calculator_workflow(
         stop_on_failure: Some(false),
         approval_gate: Some(false),
         reflection_mode: Some(false),
+        completion_prompts_first: None,
         model_overrides: None,
     }
 }
@@ -279,6 +280,7 @@ fn build_tdd_workflow(
         stop_on_failure: Some(false),
         approval_gate: Some(false),
         reflection_mode: Some(false),
+        completion_prompts_first: None,
         model_overrides: None,
     }
 }
@@ -359,6 +361,7 @@ fn build_pipeline_workflow(
         stop_on_failure: Some(false),
         approval_gate: Some(false),
         reflection_mode: Some(false),
+        completion_prompts_first: None,
         model_overrides: None,
     }
 }

@@ -814,15 +814,48 @@ impl CheckHandler {
             }
         }
 
+        // Load acceptance criteria for cross-validation if provided
+        let criteria_section = if let Some(criteria_path) = &step.ai_review_criteria_path {
+            match std::fs::read_to_string(criteria_path) {
+                Ok(criteria_json) => {
+                    match serde_json::from_str::<
+                        crate::workflow_generation::specification::AcceptanceCriteria,
+                    >(&criteria_json)
+                    {
+                        Ok(criteria) => Some(
+                            crate::workflow_generation::specification::format_criteria_for_verifier(
+                                &criteria,
+                            ),
+                        ),
+                        Err(e) => {
+                            tracing::warn!("Failed to parse criteria JSON from '{}': {} — skipping cross-validation", criteria_path, e);
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to read criteria file '{}': {} — skipping cross-validation",
+                        criteria_path,
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Build the AI review prompt
         let review_prompt = step
             .ai_review_prompt
             .as_deref()
             .unwrap_or("Review the following content for correctness, completeness, and quality.");
 
+        let criteria_text = criteria_section.as_deref().unwrap_or("");
         let full_prompt = format!(
-            "{}\n\n## Input to Review\n\n{}\n\n## Output Format\nReturn ONLY a JSON object (no markdown fencing): {{\"passed\": bool, \"issues\": [\"issue description\", ...]}}",
-            review_prompt, input_content
+            "{}{}\n\n## Input to Review\n\n{}\n\n## Output Format\nReturn ONLY a JSON object (no markdown fencing): {{\"passed\": bool, \"issues\": [\"issue description\", ...]}}",
+            review_prompt, criteria_text, input_content
         );
 
         let metadata = json!({

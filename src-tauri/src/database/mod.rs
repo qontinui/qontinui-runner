@@ -5920,6 +5920,22 @@ impl CheckpointDb {
             info!("Successfully migrated to version 89 (source_agent + auto-rule fields)");
         }
 
+        // Version 90: Add completion_prompts_first to unified_workflows
+        if current_version < 90 {
+            info!("Migrating to version 90 (add completion_prompts_first to unified_workflows)...");
+
+            conn.execute_batch(
+                r#"
+                ALTER TABLE unified_workflows ADD COLUMN completion_prompts_first INTEGER NOT NULL DEFAULT 0;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (90, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 90: {}", e))?;
+
+            info!("Successfully migrated to version 90 (completion_prompts_first)");
+        }
+
         Ok(())
     }
 
@@ -12149,7 +12165,8 @@ impl CheckpointDb {
                        context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                        log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
                        preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
-                       stages, stop_on_failure, reflection_mode, model_overrides, approval_gate
+                       stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
+                       completion_prompts_first
                 FROM unified_workflows
                 ORDER BY updated_at DESC
                 "#,
@@ -12229,6 +12246,7 @@ impl CheckpointDb {
                         serde_json::from_str(&json_str).unwrap_or_default()
                     },
                     approval_gate: row.get::<_, Option<i32>>(32)?.unwrap_or(0) != 0,
+                    completion_prompts_first: row.get::<_, Option<i32>>(33)?.unwrap_or(0) != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -12255,7 +12273,8 @@ impl CheckpointDb {
                    context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                    log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
                    preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
-                   stages, stop_on_failure, reflection_mode, model_overrides, approval_gate
+                   stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
+                   completion_prompts_first
             FROM unified_workflows
             WHERE id = ?1
             "#,
@@ -12330,6 +12349,7 @@ impl CheckpointDb {
                         serde_json::from_str(&json_str).unwrap_or_default()
                     },
                     approval_gate: row.get::<_, Option<i32>>(32)?.unwrap_or(0) != 0,
+                    completion_prompts_first: row.get::<_, Option<i32>>(33)?.unwrap_or(0) != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -12358,7 +12378,8 @@ impl CheckpointDb {
                    context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                    log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
                    preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
-                   stages, stop_on_failure, reflection_mode, model_overrides, approval_gate
+                   stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
+                   completion_prompts_first
             FROM unified_workflows
             WHERE name = ?1
             ORDER BY updated_at DESC
@@ -12435,6 +12456,7 @@ impl CheckpointDb {
                         serde_json::from_str(&json_str).unwrap_or_default()
                     },
                     approval_gate: row.get::<_, Option<i32>>(32)?.unwrap_or(0) != 0,
+                    completion_prompts_first: row.get::<_, Option<i32>>(33)?.unwrap_or(0) != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -12500,8 +12522,9 @@ impl CheckpointDb {
                 context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                 log_watch_enabled, health_check_enabled, health_check_urls, preflight_check_enabled,
                 generated_by_task_run_id, enable_sweep, max_sweep_iterations,
-                stages, stop_on_failure, reflection_mode, model_overrides, approval_gate
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
+                stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
+                completion_prompts_first
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34)
             "#,
             params![
                 id,
@@ -12537,6 +12560,7 @@ impl CheckpointDb {
                 request.reflection_mode.unwrap_or(true),
                 serde_json::to_string(&request.model_overrides.clone().unwrap_or_default()).unwrap_or_else(|_| "{}".to_string()),
                 request.approval_gate.unwrap_or(false),
+                request.completion_prompts_first.unwrap_or(false),
             ],
         )
         .map_err(|e| format!("Failed to create unified workflow: {}", e))?;
@@ -12597,8 +12621,9 @@ impl CheckpointDb {
                 context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                 log_watch_enabled, health_check_enabled, health_check_urls, preflight_check_enabled,
                 generated_by_task_run_id, enable_sweep, max_sweep_iterations,
-                stages, stop_on_failure, reflection_mode, model_overrides, approval_gate
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
+                stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
+                completion_prompts_first
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34)
             "#,
             params![
                 id,
@@ -12634,6 +12659,7 @@ impl CheckpointDb {
                 request.reflection_mode.unwrap_or(true),
                 serde_json::to_string(&request.model_overrides.clone().unwrap_or_default()).unwrap_or_else(|_| "{}".to_string()),
                 request.approval_gate.unwrap_or(false),
+                request.completion_prompts_first.unwrap_or(false),
             ],
         )
         .map_err(|e| format!("Failed to create unified workflow: {}", e))?;
@@ -12735,6 +12761,9 @@ impl CheckpointDb {
         let stop_on_failure = request.stop_on_failure.unwrap_or(existing.stop_on_failure);
         let approval_gate = request.approval_gate.unwrap_or(existing.approval_gate);
         let reflection_mode = request.reflection_mode.unwrap_or(existing.reflection_mode);
+        let completion_prompts_first = request
+            .completion_prompts_first
+            .unwrap_or(existing.completion_prompts_first);
         let model_overrides = request
             .model_overrides
             .as_ref()
@@ -12793,8 +12822,9 @@ impl CheckpointDb {
                 stop_on_failure = ?27,
                 approval_gate = ?28,
                 reflection_mode = ?29,
-                model_overrides = ?30
-            WHERE id = ?31
+                model_overrides = ?30,
+                completion_prompts_first = ?31
+            WHERE id = ?32
             "#,
             params![
                 name,
@@ -12827,6 +12857,7 @@ impl CheckpointDb {
                 approval_gate,
                 reflection_mode,
                 model_overrides_json,
+                completion_prompts_first,
                 id,
             ],
         )
@@ -12862,7 +12893,8 @@ impl CheckpointDb {
                    context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                    log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
                    preflight_check_enabled, generated_by_task_run_id, enable_sweep, max_sweep_iterations,
-                   stages, stop_on_failure, reflection_mode, model_overrides, approval_gate
+                   stages, stop_on_failure, reflection_mode, model_overrides, approval_gate,
+                   completion_prompts_first
             FROM unified_workflows
             WHERE 1=1
             "#,
@@ -12971,6 +13003,7 @@ impl CheckpointDb {
                         serde_json::from_str(&json_str).unwrap_or_default()
                     },
                     approval_gate: row.get::<_, Option<i32>>(32)?.unwrap_or(0) != 0,
+                    completion_prompts_first: row.get::<_, Option<i32>>(33)?.unwrap_or(0) != 0,
                     // targeted_error_ids is a runtime field, not stored in DB
                     targeted_error_ids: vec![],
                 })
@@ -13022,6 +13055,7 @@ impl CheckpointDb {
             stop_on_failure: Some(original.stop_on_failure),
             approval_gate: Some(original.approval_gate),
             reflection_mode: Some(original.reflection_mode),
+            completion_prompts_first: Some(original.completion_prompts_first),
             model_overrides: Some(original.model_overrides),
         };
 
@@ -13047,7 +13081,8 @@ impl CheckpointDb {
                        context_ids, disabled_context_ids, auto_include_contexts, prompt_template,
                        log_watch_enabled, health_check_enabled, health_check_urls, timeout_seconds,
                        preflight_check_enabled, generated_by_task_run_id, enable_sweep,
-                       max_sweep_iterations, stages, stop_on_failure, reflection_mode, model_overrides, approval_gate
+                       max_sweep_iterations, stages, stop_on_failure, reflection_mode, model_overrides,
+                       approval_gate, completion_prompts_first
                 FROM unified_workflows
                 WHERE sync_pending = 1
                 "#,
@@ -13127,6 +13162,7 @@ impl CheckpointDb {
                         serde_json::from_str(&json_str).unwrap_or_default()
                     },
                     approval_gate: row.get::<_, Option<i32>>(32)?.unwrap_or(0) != 0,
+                    completion_prompts_first: row.get::<_, Option<i32>>(33)?.unwrap_or(0) != 0,
                     targeted_error_ids: vec![],
                 })
             })
@@ -15733,7 +15769,7 @@ impl CheckpointDb {
                        disabled_context_ids, auto_include_contexts, prompt_template,
                        generated_by_task_run_id, enable_sweep, max_sweep_iterations,
                        stages, stop_on_failure, reflection_mode, sync_pending, example_status,
-                       model_overrides, approval_gate
+                       model_overrides, approval_gate, completion_prompts_first
                 FROM unified_workflows
                 ORDER BY updated_at DESC
                 "#,
@@ -15822,6 +15858,7 @@ impl CheckpointDb {
                     "example_status": row.get::<_, Option<String>>(32)?,
                     "model_overrides": model_overrides,
                     "approval_gate": row.get::<_, Option<i64>>(34)?,
+                    "completion_prompts_first": row.get::<_, Option<i64>>(35)?,
                 }))
             })
             .map_err(|e| format!("Failed to export unified workflows: {}", e))?
@@ -16323,6 +16360,8 @@ impl CheckpointDb {
             let stop_on_failure = workflow["stop_on_failure"].as_i64().unwrap_or(0);
             let approval_gate = workflow["approval_gate"].as_i64().unwrap_or(0);
             let reflection_mode = workflow["reflection_mode"].as_i64().unwrap_or(1);
+            let completion_prompts_first =
+                workflow["completion_prompts_first"].as_i64().unwrap_or(0);
             let sync_pending = workflow["sync_pending"].as_i64().unwrap_or(0);
             let example_status = workflow["example_status"].as_str().unwrap_or("pending");
 
@@ -16336,12 +16375,13 @@ impl CheckpointDb {
                     preflight_check_enabled, log_source_selection, context_ids,
                     disabled_context_ids, auto_include_contexts, prompt_template,
                     generated_by_task_run_id, enable_sweep, max_sweep_iterations,
-                    stages, stop_on_failure, approval_gate, reflection_mode, sync_pending, example_status
+                    stages, stop_on_failure, approval_gate, reflection_mode, completion_prompts_first,
+                    sync_pending, example_status
                 )
                 VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
-                    ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34
+                    ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35
                 )
                 "#,
                 params![
@@ -16377,6 +16417,7 @@ impl CheckpointDb {
                     stop_on_failure,
                     approval_gate,
                     reflection_mode,
+                    completion_prompts_first,
                     sync_pending,
                     example_status
                 ],

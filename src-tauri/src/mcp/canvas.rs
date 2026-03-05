@@ -59,6 +59,21 @@ impl CanvasState {
         self.panels.clear();
         self.task_run_id = None;
     }
+
+    /// Insert or update a panel in the canvas state.
+    pub fn insert_panel(&mut self, panel: StoredPanel) {
+        self.panels.insert(panel.panel_id.clone(), panel);
+    }
+
+    /// Set the task run ID for the current canvas state.
+    pub fn set_task_run_id(&mut self, id: Option<String>) {
+        self.task_run_id = id;
+    }
+
+    /// Get the number of panels in the canvas state.
+    pub fn panel_count(&self) -> usize {
+        self.panels.len()
+    }
 }
 
 /// A stored canvas panel.

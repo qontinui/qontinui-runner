@@ -63,7 +63,27 @@ pub fn find_claude_config_dirs() -> Vec<PathBuf> {
         }
     }
 
-    // 3. Fallback: user home directory for standard .claude location
+    // 3. Scan C:\claude\.claude-*\ (multi-account setups on Windows)
+    let claude_root = std::path::Path::new("C:\\claude");
+    if claude_root.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(claude_root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        if name.starts_with(".claude-")
+                            && path.join("projects").exists()
+                            && !dirs.iter().any(|d| d == &path)
+                        {
+                            dirs.push(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Fallback: user home directory for standard .claude location
     if let Ok(home) = std::env::var("USERPROFILE") {
         let home_claude = PathBuf::from(&home).join(".claude");
         if home_claude.join("projects").exists() && !dirs.iter().any(|d| d == &home_claude) {
@@ -140,6 +160,12 @@ pub fn list_sessions(
 
                 // Read file content for line count, preview, and plan detection
                 let content = fs::read_to_string(&path).unwrap_or_default();
+
+                // Skip workflow-spawned sessions (they use bypassPermissions)
+                if is_workflow_session(&content) {
+                    continue;
+                }
+
                 let line_count = content.lines().count();
 
                 // Substring check for plans (cheap — no JSON parse needed)
@@ -420,6 +446,29 @@ pub fn get_latest_session_id(config_dir: &Path, project_path: &str) -> Option<Tr
     }
 }
 
+/// Check if a JSONL transcript belongs to a workflow-spawned session.
+///
+/// Runner-spawned sessions (workflow generation, summarization, auto-debug) are
+/// identified by two markers:
+/// 1. A `queue-operation` record in the first line (all runner one-shot sessions)
+/// 2. `permissionMode: "bypassPermissions"` in the first user message (supervisor sessions)
+///
+/// Interactive sessions never have either marker.
+fn is_workflow_session(content: &str) -> bool {
+    for line in content.lines().take(5) {
+        // queue-operation is the strongest signal — runner-spawned one-shot sessions
+        // always start with this record; interactive sessions never have it.
+        if line.contains("\"queue-operation\"") {
+            return true;
+        }
+        // bypassPermissions catches supervisor auto-debug sessions
+        if line.contains("\"bypassPermissions\"") {
+            return true;
+        }
+    }
+    false
+}
+
 /// Extract a preview from the first user message in a JSONL transcript.
 ///
 /// Scans the first 20 lines for a `"type":"user"` record and extracts
@@ -484,11 +533,11 @@ mod tests {
     fn test_encode_project_path() {
         assert_eq!(
             encode_project_path("C:/Users/jspin/Documents/qontinui_parent"),
-            "C--Users-jspin-Documents-qontinui_parent"
+            "C--Users-jspin-Documents-qontinui-parent"
         );
         assert_eq!(
             encode_project_path("C:\\Users\\jspin\\Documents\\qontinui_parent"),
-            "C--Users-jspin-Documents-qontinui_parent"
+            "C--Users-jspin-Documents-qontinui-parent"
         );
     }
 

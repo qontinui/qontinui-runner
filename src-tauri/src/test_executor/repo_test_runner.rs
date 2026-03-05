@@ -56,13 +56,10 @@ pub fn execute_repo_test(test_def: &TestDefinition) -> TestExecutionResult {
 
     // Execute the test command
     let output = if cfg!(target_os = "windows") {
-        // cmd.exe doesn't understand single quotes — strip them.
-        let cmd_command = command.replace('\'', "");
-
         // Extract Unix-style env var prefixes (KEY=VALUE) from the command.
         // cmd.exe doesn't support "KEY=VALUE command" syntax, so we parse out
         // env vars and pass them via Command::env() instead.
-        let (extra_envs, actual_command) = extract_env_prefix(&cmd_command);
+        let (extra_envs, actual_command) = extract_env_prefix(&command);
 
         let mut cmd = crate::process_helpers::cmd_no_window();
         cmd.args(["/c", &actual_command]);

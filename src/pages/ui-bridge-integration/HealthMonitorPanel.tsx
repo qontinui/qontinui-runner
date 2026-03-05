@@ -1,10 +1,4 @@
-import {
-  RefreshCw,
-  Trash2,
-  CheckCircle2,
-  AlertTriangle,
-  XCircle,
-} from "lucide-react";
+import { RefreshCw, Trash2, CheckCircle2, AlertTriangle, XCircle } from "lucide-react";
 import { useState, useEffect, useCallback } from "react";
 import type { TrackedIntegration, ApiResponse } from "./types";
 import { getApiBase } from "@/lib/runner-api";
@@ -61,7 +55,7 @@ export function HealthMonitorPanel() {
         console.error("Failed to delete:", err);
       }
     },
-    [fetchStatus]
+    [fetchStatus],
   );
 
   if (loading) {
@@ -102,9 +96,7 @@ export function HealthMonitorPanel() {
           />
           <SummaryCard
             label="Disconnected"
-            count={
-              integrations.filter((i) => i.status === "disconnected").length
-            }
+            count={integrations.filter((i) => i.status === "disconnected").length}
             color="red"
           />
           <SummaryCard
@@ -118,8 +110,8 @@ export function HealthMonitorPanel() {
       {/* Table */}
       {integrations.length === 0 ? (
         <div className="text-center py-12 text-muted-foreground text-sm">
-          No integrations tracked yet. Use Discovery, Runtime Injection, or
-          Source Integration to add one.
+          No integrations tracked yet. Use Discovery, Runtime Injection, or Source Integration to
+          add one.
         </div>
       ) : (
         <div className="border border-border rounded-lg overflow-hidden">
@@ -154,10 +146,7 @@ export function HealthMonitorPanel() {
             </thead>
             <tbody>
               {integrations.map((integration) => (
-                <tr
-                  key={integration.id}
-                  className="border-b border-border/50 last:border-0"
-                >
+                <tr key={integration.id} className="border-b border-border/50 last:border-0">
                   <td className="px-3 py-2">
                     <div className="max-w-[200px] truncate text-foreground">
                       {integration.label ||
@@ -222,9 +211,7 @@ function SummaryCard({
     yellow: "text-yellow-400 bg-yellow-500/5 border-yellow-500/20",
   };
   return (
-    <div
-      className={`px-3 py-2 rounded-lg border text-center ${colorClasses[color]}`}
-    >
+    <div className={`px-3 py-2 rounded-lg border text-center ${colorClasses[color]}`}>
       <div className="text-lg font-bold">{count}</div>
       <div className="text-[10px] font-medium opacity-80">{label}</div>
     </div>
@@ -232,10 +219,7 @@ function SummaryCard({
 }
 
 function HealthBadge({ status }: { status: string }) {
-  const config: Record<
-    string,
-    { icon: typeof CheckCircle2; bg: string; text: string }
-  > = {
+  const config: Record<string, { icon: typeof CheckCircle2; bg: string; text: string }> = {
     active: {
       icon: CheckCircle2,
       bg: "bg-green-500/10",
@@ -272,9 +256,7 @@ function TypeBadge({ type }: { type: string }) {
   };
   const c = config[type] || config.runtime;
   return (
-    <span
-      className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${c.bg} ${c.text}`}
-    >
+    <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${c.bg} ${c.text}`}>
       {type}
     </span>
   );

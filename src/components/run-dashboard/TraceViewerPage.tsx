@@ -8,10 +8,7 @@ export const TraceViewerPage: React.FC = () => {
   return (
     <div className="flex flex-col h-full p-4 gap-4">
       <div className="flex-1 min-h-0">
-        <TraceViewerWidget
-          executionId={selectedRunId}
-          height={window.innerHeight - 140}
-        />
+        <TraceViewerWidget executionId={selectedRunId} height={window.innerHeight - 140} />
       </div>
     </div>
   );

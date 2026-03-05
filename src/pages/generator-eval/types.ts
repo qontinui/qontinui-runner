@@ -157,6 +157,33 @@ export interface ExampleWorkflow {
 }
 
 // ============================================================================
+// Insights
+// ============================================================================
+
+export interface PromptInsight {
+  agent: string;
+  insight_type: string;
+  description: string;
+  evidence_count: number;
+  confidence: number;
+  suggested_rule: string | null;
+}
+
+// ============================================================================
+// Training Data
+// ============================================================================
+
+export interface TrainingExample {
+  agent: string;
+  prompt: string;
+  completion: string;
+  score: number;
+  artifact_id: string;
+  workflow_id: string | null;
+  created_at: string;
+}
+
+// ============================================================================
 // API Response
 // ============================================================================
 

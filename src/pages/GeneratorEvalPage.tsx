@@ -1,11 +1,21 @@
 import * as Tabs from "@radix-ui/react-tabs";
-import { BarChart3, Microscope, PenLine, FlaskConical, BookOpen } from "lucide-react";
+import {
+  BarChart3,
+  Microscope,
+  PenLine,
+  FlaskConical,
+  BookOpen,
+  Lightbulb,
+  GraduationCap,
+} from "lucide-react";
 import { useState } from "react";
 import { DashboardTab } from "./generator-eval/DashboardTab";
 import { PipelineInspectorTab } from "./generator-eval/PipelineInspectorTab";
 import { EditAnalysisTab } from "./generator-eval/EditAnalysisTab";
 import { BenchmarksTab } from "./generator-eval/BenchmarksTab";
 import { ExampleLibraryTab } from "./generator-eval/ExampleLibraryTab";
+import { InsightsTab } from "./generator-eval/InsightsTab";
+import { TrainingDataTab } from "./generator-eval/TrainingDataTab";
 
 const TABS = [
   { id: "dashboard", label: "Dashboard", icon: BarChart3 },
@@ -13,6 +23,8 @@ const TABS = [
   { id: "edits", label: "Edit Analysis", icon: PenLine },
   { id: "benchmarks", label: "Benchmarks", icon: FlaskConical },
   { id: "examples", label: "Example Library", icon: BookOpen },
+  { id: "insights", label: "Insights", icon: Lightbulb },
+  { id: "training", label: "Training Data", icon: GraduationCap },
 ] as const;
 
 export function GeneratorEvalPage() {
@@ -66,6 +78,12 @@ export function GeneratorEvalPage() {
         </Tabs.Content>
         <Tabs.Content value="examples" className="flex-1 min-h-0 pt-4 overflow-auto">
           <ExampleLibraryTab />
+        </Tabs.Content>
+        <Tabs.Content value="insights" className="flex-1 min-h-0 pt-4 overflow-auto">
+          <InsightsTab />
+        </Tabs.Content>
+        <Tabs.Content value="training" className="flex-1 min-h-0 pt-4 overflow-auto">
+          <TrainingDataTab />
         </Tabs.Content>
       </Tabs.Root>
     </div>

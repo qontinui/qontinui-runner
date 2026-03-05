@@ -39,10 +39,7 @@ export function generateTraceId(): string {
  * If a response includes `X-Trace-Id` and we don't have one set,
  * we capture it for subsequent requests.
  */
-export async function tracedFetch(
-  url: string,
-  init?: RequestInit
-): Promise<Response> {
+export async function tracedFetch(url: string, init?: RequestInit): Promise<Response> {
   const headers = new Headers(init?.headers);
 
   if (currentTraceId && !headers.has(TRACE_ID_HEADER)) {

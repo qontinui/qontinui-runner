@@ -1,4 +1,4 @@
-import { PanelLeft, FileText, RefreshCw, Wand2 } from "lucide-react";
+import { PanelLeft, FileText, RefreshCw, Wand2, MessageSquare } from "lucide-react";
 import type { AnalysisType } from "./TerminalAnalysisPanel";
 
 interface TerminalActionBarProps {
@@ -14,6 +14,12 @@ interface TerminalActionBarProps {
   isPlanLoading: boolean;
   /** Reload the plan file from disk. */
   onRefreshPlan: () => void;
+  /** Toggle the findings decision panel. */
+  onToggleFindings: () => void;
+  /** Whether the findings panel is currently open. */
+  findingsActive: boolean;
+  /** Number of findings needing user input. */
+  findingsCount: number;
 }
 
 const ANALYSIS_BUTTONS: { type: AnalysisType; label: string; title: string }[] = [
@@ -47,6 +53,9 @@ export function TerminalActionBar({
   planFileName,
   isPlanLoading,
   onRefreshPlan,
+  onToggleFindings,
+  findingsActive,
+  findingsCount,
 }: TerminalActionBarProps) {
   const busy = isAnalyzing || isGenerating;
 
@@ -95,6 +104,32 @@ export function TerminalActionBar({
             </div>
           </>
         )}
+
+        <div className="w-px h-4 bg-[#2a2d3d]" />
+
+        <button
+          onClick={onToggleFindings}
+          title="Toggle findings decisions panel"
+          data-ui-id="terminal-action-bar-decisions-btn"
+          className={`
+            flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-medium transition-colors relative
+            ${
+              findingsActive
+                ? "text-[#bb9af7] bg-[#bb9af7]/10"
+                : findingsCount > 0
+                  ? "text-[#bb9af7] hover:bg-[#bb9af7]/10 hover:text-[#c8abff]"
+                  : "text-[#565f89] hover:bg-[#2a2d3d] hover:text-[#a9b1d6]"
+            }
+          `}
+        >
+          <MessageSquare className="w-3 h-3" />
+          Decisions
+          {findingsCount > 0 && (
+            <span className="ml-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-bold leading-none bg-[#bb9af7]/20 text-[#bb9af7]">
+              {findingsCount}
+            </span>
+          )}
+        </button>
 
         {/* Plan file indicator (right-aligned) */}
         <div className="ml-auto flex items-center gap-1.5">

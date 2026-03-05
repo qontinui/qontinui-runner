@@ -641,4 +641,174 @@ mod tests {
         assert!(md.contains("1. **Rule One**: Do this thing"));
         assert!(md.contains("2. **Rule Two**: Do that thing"));
     }
+
+    // ========================================================================
+    // Database-backed tests for promote_insights_to_rules and helpers
+    // ========================================================================
+
+    use crate::workflow_generation::prompt_analysis::PromptInsight;
+
+    /// Create an in-memory SQLite database with the generation_rules table.
+    fn setup_rules_db() -> Connection {
+        let conn = Connection::open_in_memory().expect("Failed to create in-memory DB");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE generation_rules (
+                id TEXT PRIMARY KEY,
+                agent TEXT NOT NULL,
+                section TEXT NOT NULL,
+                rule_number INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                condition TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                provenance TEXT NOT NULL DEFAULT 'seed',
+                source_fix_id TEXT,
+                confidence REAL DEFAULT 1.0,
+                auto_generated_at TEXT,
+                evidence_count INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            "#,
+        )
+        .expect("Failed to create generation_rules table");
+        conn
+    }
+
+    #[test]
+    fn test_promote_high_confidence_insight() {
+        let conn = setup_rules_db();
+        let insights = vec![PromptInsight {
+            agent: "builder".to_string(),
+            insight_type: "recurring_failure".to_string(),
+            description: "Builder produces missing error handling".to_string(),
+            evidence_count: 6,
+            confidence: 0.9,
+            suggested_rule: Some("test rule".to_string()),
+        }];
+
+        let created = promote_insights_to_rules(&conn, &insights).expect("promote failed");
+        assert_eq!(
+            created, 1,
+            "Expected 1 rule created for high-confidence insight"
+        );
+
+        // Verify the rule exists in the database
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM generation_rules WHERE provenance = 'auto_insight'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_promote_low_confidence_skipped() {
+        let conn = setup_rules_db();
+        let insights = vec![PromptInsight {
+            agent: "builder".to_string(),
+            insight_type: "recurring_failure".to_string(),
+            description: "Low confidence insight".to_string(),
+            evidence_count: 6,
+            confidence: 0.5,
+            suggested_rule: Some("test rule".to_string()),
+        }];
+
+        let created = promote_insights_to_rules(&conn, &insights).expect("promote failed");
+        assert_eq!(created, 0, "Expected 0 rules for low-confidence insight");
+    }
+
+    #[test]
+    fn test_promote_low_evidence_skipped() {
+        let conn = setup_rules_db();
+        let insights = vec![PromptInsight {
+            agent: "builder".to_string(),
+            insight_type: "recurring_failure".to_string(),
+            description: "Low evidence insight".to_string(),
+            evidence_count: 3,
+            confidence: 0.9,
+            suggested_rule: Some("test rule".to_string()),
+        }];
+
+        let created = promote_insights_to_rules(&conn, &insights).expect("promote failed");
+        assert_eq!(created, 0, "Expected 0 rules for low-evidence insight");
+    }
+
+    #[test]
+    fn test_promote_no_suggested_rule_skipped() {
+        let conn = setup_rules_db();
+        let insights = vec![PromptInsight {
+            agent: "builder".to_string(),
+            insight_type: "recurring_failure".to_string(),
+            description: "No suggested rule".to_string(),
+            evidence_count: 6,
+            confidence: 0.9,
+            suggested_rule: None,
+        }];
+
+        let created = promote_insights_to_rules(&conn, &insights).expect("promote failed");
+        assert_eq!(created, 0, "Expected 0 rules when suggested_rule is None");
+    }
+
+    #[test]
+    fn test_promote_dedup() {
+        let conn = setup_rules_db();
+        let insights = vec![PromptInsight {
+            agent: "builder".to_string(),
+            insight_type: "recurring_failure".to_string(),
+            description: "Dedup test insight".to_string(),
+            evidence_count: 6,
+            confidence: 0.9,
+            suggested_rule: Some("test rule for dedup".to_string()),
+        }];
+
+        let first = promote_insights_to_rules(&conn, &insights).expect("first promote failed");
+        assert_eq!(first, 1, "First promotion should create 1 rule");
+
+        let second = promote_insights_to_rules(&conn, &insights).expect("second promote failed");
+        assert_eq!(second, 0, "Second promotion should create 0 rules (dedup)");
+
+        // Verify only 1 rule total in the database
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM generation_rules WHERE provenance = 'auto_insight'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "Only 1 rule should exist after double promote");
+    }
+
+    #[test]
+    fn test_simple_content_hash_empty() {
+        let result = simple_content_hash("");
+        assert_eq!(result, "", "Hash of empty string should be empty");
+    }
+
+    #[test]
+    fn test_map_insight_to_rule_location() {
+        assert_eq!(
+            map_insight_to_rule_location("specification", "any"),
+            ("specification".to_string(), "criteria_rules".to_string()),
+        );
+        assert_eq!(
+            map_insight_to_rule_location("verification", "verification_blind_spot"),
+            ("verification".to_string(), "check_rules".to_string()),
+        );
+        assert_eq!(
+            map_insight_to_rule_location("hardener", "any"),
+            ("hardener".to_string(), "conversion_rules".to_string()),
+        );
+        assert_eq!(
+            map_insight_to_rule_location("builder", "any"),
+            ("schema_context".to_string(), "important_rules".to_string()),
+        );
+        assert_eq!(
+            map_insight_to_rule_location("unknown", "any"),
+            ("schema_context".to_string(), "important_rules".to_string()),
+        );
+    }
 }

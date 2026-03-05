@@ -370,6 +370,8 @@ impl ShellCommandHandler {
             || trimmed.contains("<<'EOF'")  // heredoc
             || trimmed.contains("python -c")  // Python one-liners need bash for proper quoting
             || trimmed.contains("python3 -c")  // Python3 one-liners need bash for proper quoting
+            || trimmed.contains("node -e")  // Node.js eval needs bash for proper quoting
+            || trimmed.contains("node --eval")  // Node.js eval (long form)
             || (trimmed.starts_with("if ") && trimmed.contains("; then"))  // bash if
             || (trimmed.starts_with("for ") && trimmed.contains("; do")) // bash for
     }

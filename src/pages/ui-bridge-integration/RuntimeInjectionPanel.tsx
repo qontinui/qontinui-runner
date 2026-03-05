@@ -1,9 +1,4 @@
-import {
-  Play,
-  Square,
-  ExternalLink,
-  RefreshCw,
-} from "lucide-react";
+import { Play, Square, ExternalLink, RefreshCw, Plug } from "lucide-react";
 import { useState, useEffect, useCallback } from "react";
 import type { ProxyInstance, InjectResponse, ApiResponse } from "./types";
 import { getApiBase } from "@/lib/runner-api";
@@ -16,7 +11,10 @@ interface RuntimeInjectionPanelProps {
   onPrefillConsumed?: () => void;
 }
 
-export function RuntimeInjectionPanel({ prefillUrl, onPrefillConsumed }: RuntimeInjectionPanelProps) {
+export function RuntimeInjectionPanel({
+  prefillUrl,
+  onPrefillConsumed,
+}: RuntimeInjectionPanelProps) {
   const [targetUrl, setTargetUrl] = useState("");
   const [label, setLabel] = useState("");
 
@@ -88,19 +86,17 @@ export function RuntimeInjectionPanel({ prefillUrl, onPrefillConsumed }: Runtime
         console.error("Failed to stop proxy:", err);
       }
     },
-    [fetchProxies]
+    [fetchProxies],
   );
 
   return (
     <div className="flex flex-col gap-4">
       {/* Inject form */}
       <div className="p-4 rounded-lg border border-border bg-card/50">
-        <h3 className="text-sm font-medium mb-3">
-          Start Runtime Injection
-        </h3>
+        <h3 className="text-sm font-medium mb-3">Start Runtime Injection</h3>
         <p className="text-xs text-muted-foreground mb-3">
-          Create a reverse proxy that injects the UI Bridge SDK into any running
-          web app — no code changes required.
+          Create a reverse proxy that injects the UI Bridge SDK into any running web app — no code
+          changes required.
         </p>
         <div className="flex gap-2">
           <input
@@ -134,9 +130,7 @@ export function RuntimeInjectionPanel({ prefillUrl, onPrefillConsumed }: Runtime
             Inject
           </button>
         </div>
-        {error && (
-          <p className="text-xs text-red-400 mt-2">{error}</p>
-        )}
+        {error && <p className="text-xs text-red-400 mt-2">{error}</p>}
       </div>
 
       {/* Active proxies */}
@@ -179,20 +173,13 @@ export function RuntimeInjectionPanel({ prefillUrl, onPrefillConsumed }: Runtime
               </thead>
               <tbody>
                 {proxies.map((proxy) => (
-                  <tr
-                    key={proxy.proxy_port}
-                    className="border-b border-border/50 last:border-0"
-                  >
-                    <td className="px-3 py-2 text-foreground">
-                      {proxy.label}
-                    </td>
+                  <tr key={proxy.proxy_port} className="border-b border-border/50 last:border-0">
+                    <td className="px-3 py-2 text-foreground">{proxy.label}</td>
                     <td className="px-3 py-2 text-muted-foreground truncate max-w-[200px]">
                       {proxy.target_url}
                     </td>
                     <td className="px-3 py-2">
-                      <code className="text-xs text-cyan-400">
-                        {proxy.proxy_url}
-                      </code>
+                      <code className="text-xs text-cyan-400">{proxy.proxy_url}</code>
                     </td>
                     <td className="px-3 py-2">
                       <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full bg-green-500/10 text-green-400 font-medium">
@@ -203,13 +190,28 @@ export function RuntimeInjectionPanel({ prefillUrl, onPrefillConsumed }: Runtime
                     <td className="px-3 py-2">
                       <div className="flex items-center justify-end gap-1">
                         <button
-                          onClick={() =>
-                            window.open(proxy.proxy_url, "_blank")
-                          }
+                          onClick={() => window.open(proxy.proxy_url, "_blank")}
                           className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-white/5 transition-colors"
                           title="Open proxy URL"
                         >
                           <ExternalLink className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          onClick={async () => {
+                            try {
+                              await fetch(`${getApiBase()}/ui-bridge/sdk/connect`, {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({ url: proxy.proxy_url }),
+                              });
+                            } catch {
+                              /* ignore connection errors */
+                            }
+                          }}
+                          className="p-1 rounded text-muted-foreground hover:text-cyan-400 hover:bg-cyan-500/10 transition-colors"
+                          title="Connect SDK client to this proxy"
+                        >
+                          <Plug className="w-3.5 h-3.5" />
                         </button>
                         <button
                           onClick={() => stopProxy(proxy.proxy_port)}

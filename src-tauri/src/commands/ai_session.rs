@@ -741,6 +741,7 @@ pub async fn generate_workflow_from_session(
                         stop_on_failure: Some(workflow.stop_on_failure),
                         approval_gate: Some(workflow.approval_gate),
                         reflection_mode: Some(workflow.reflection_mode),
+                        completion_prompts_first: Some(workflow.completion_prompts_first),
                         model_overrides: Some(workflow.model_overrides.clone()),
                     };
 

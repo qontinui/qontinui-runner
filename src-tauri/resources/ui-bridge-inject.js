@@ -446,6 +446,136 @@
       window.history.forward();
       return { success: true };
     },
+
+    /** Get computed CSS styles for an element */
+    getComputedStyles(id, properties) {
+      const entry = registry.get(id);
+      if (!entry || !document.contains(entry.element)) {
+        registry.delete(id);
+        return { success: false, error: "Element not found: " + id };
+      }
+      const computed = getComputedStyle(entry.element);
+      const defaultProps = [
+        "color", "backgroundColor", "fontSize", "fontWeight", "fontFamily",
+        "borderColor", "borderWidth", "borderRadius", "padding", "margin",
+        "display", "position", "opacity", "cursor", "textAlign",
+        "lineHeight", "zIndex", "width", "height", "overflow",
+      ];
+      const props = Array.isArray(properties) ? properties : defaultProps;
+      const styles = {};
+      for (const prop of props) {
+        styles[prop] = computed[prop] || null;
+      }
+      return { success: true, id, styles };
+    },
+
+    /** Get ARIA accessibility info for an element */
+    getAccessibilityInfo(id) {
+      const entry = registry.get(id);
+      if (!entry || !document.contains(entry.element)) {
+        registry.delete(id);
+        return { success: false, error: "Element not found: " + id };
+      }
+      const el = entry.element;
+      return {
+        success: true,
+        id,
+        role: el.getAttribute("role") || el.tagName.toLowerCase(),
+        ariaLabel: el.getAttribute("aria-label"),
+        ariaDescribedBy: el.getAttribute("aria-describedby"),
+        ariaLabelledBy: el.getAttribute("aria-labelledby"),
+        ariaExpanded: el.getAttribute("aria-expanded"),
+        ariaHidden: el.getAttribute("aria-hidden"),
+        ariaDisabled: el.getAttribute("aria-disabled"),
+        ariaChecked: el.getAttribute("aria-checked"),
+        ariaSelected: el.getAttribute("aria-selected"),
+        ariaRequired: el.getAttribute("aria-required"),
+        ariaValueNow: el.getAttribute("aria-valuenow"),
+        ariaValueMin: el.getAttribute("aria-valuemin"),
+        ariaValueMax: el.getAttribute("aria-valuemax"),
+        tabIndex: el.tabIndex,
+      };
+    },
+
+    /** Wait for an element matching a CSS selector to appear */
+    waitForElement(selector, timeoutMs) {
+      const timeout = typeof timeoutMs === "number" ? timeoutMs : 5000;
+      return new Promise((resolve) => {
+        const existing = document.querySelector(selector);
+        if (existing) {
+          resolve({ success: true, found: true, selector });
+          return;
+        }
+        const deadline = Date.now() + timeout;
+        const obs = new MutationObserver(() => {
+          if (document.querySelector(selector)) {
+            obs.disconnect();
+            resolve({ success: true, found: true, selector });
+          } else if (Date.now() > deadline) {
+            obs.disconnect();
+            resolve({ success: false, found: false, selector, timedOut: true });
+          }
+        });
+        obs.observe(document.documentElement, { childList: true, subtree: true });
+        setTimeout(() => {
+          obs.disconnect();
+          resolve({ success: false, found: false, selector, timedOut: true });
+        }, timeout);
+      });
+    },
+
+    /** Find elements by CSS selector (not just interactive ones) */
+    querySelectorAll(selector) {
+      try {
+        const elements = document.querySelectorAll(selector);
+        const results = Array.from(elements).map((el) => {
+          const rect = el.getBoundingClientRect();
+          return {
+            tagName: el.tagName.toLowerCase(),
+            id: el.id || null,
+            className: el.className?.toString()?.substring(0, 100) || null,
+            text: el.textContent?.trim()?.substring(0, 100) || null,
+            rect: {
+              x: Math.round(rect.x), y: Math.round(rect.y),
+              width: Math.round(rect.width), height: Math.round(rect.height),
+            },
+            visible: rect.width > 0 && rect.height > 0,
+          };
+        });
+        return { success: true, selector, count: results.length, elements: results };
+      } catch (err) {
+        return { success: false, error: err.message };
+      }
+    },
+
+    /** Get all elements with their computed styles (design snapshot) */
+    getDesignSnapshot() {
+      discoverElements();
+      const elems = [];
+      const defaultStyleProps = [
+        "color", "backgroundColor", "fontSize", "fontWeight",
+        "borderRadius", "padding", "display", "opacity",
+      ];
+      for (const [id, entry] of registry) {
+        if (!document.contains(entry.element)) { registry.delete(id); continue; }
+        const computed = getComputedStyle(entry.element);
+        const styles = {};
+        for (const prop of defaultStyleProps) styles[prop] = computed[prop] || null;
+        elems.push({
+          id,
+          ...entry.meta,
+          state: getElementState(entry.element),
+          styles,
+        });
+      }
+      return {
+        url: window.location.href,
+        title: document.title,
+        timestamp: Date.now(),
+        elementCount: elems.length,
+        elements: elems,
+      };
+    },
   };
 
   // =========================================================================
@@ -525,6 +655,52 @@
   } else {
     discoverElements();
   }
+
+  // =========================================================================
+  // Proxy Control Polling — fetches pending commands from the proxy and
+  // executes them against the local API, then POSTs results back.
+  // =========================================================================
+
+  setInterval(async () => {
+    try {
+      const resp = await fetch("/__ui-bridge/control/pending");
+      if (!resp.ok) return;
+      const commands = await resp.json();
+      if (!commands || !commands.length) return;
+
+      const results = [];
+      for (const cmd of commands) {
+        let result;
+        try {
+          if (typeof api[cmd.method] === "function") {
+            const maybePromise = api[cmd.method](...(cmd.args || []));
+            const data =
+              maybePromise instanceof Promise
+                ? await maybePromise
+                : maybePromise;
+            result = { id: cmd.id, success: true, data };
+          } else {
+            result = {
+              id: cmd.id,
+              success: false,
+              error: "Unknown method: " + cmd.method,
+            };
+          }
+        } catch (err) {
+          result = { id: cmd.id, success: false, error: err.message };
+        }
+        results.push(result);
+      }
+
+      await fetch("/__ui-bridge/control/results", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(results),
+      });
+    } catch (_) {
+      /* ignore polling errors — proxy may not be running */
+    }
+  }, 150);
 
   console.log(
     `[UI Bridge] Injected. Discovered ${registry.size} interactive elements.`

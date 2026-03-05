@@ -520,6 +520,7 @@ mod tests {
             applied_at: "2025-01-01T01:00:00Z".to_string(),
             evaluated_at: None,
             created_at: "2025-01-01T01:00:00Z".to_string(),
+            source_agent: None,
         };
 
         let result = evaluate_fix(&conn, &fix).unwrap();
@@ -567,6 +568,7 @@ mod tests {
             applied_at: "2025-01-01T01:00:00Z".to_string(),
             evaluated_at: None,
             created_at: "2025-01-01T01:00:00Z".to_string(),
+            source_agent: None,
         };
 
         let result = evaluate_fix(&conn, &fix).unwrap();
@@ -617,6 +619,7 @@ mod tests {
             applied_at: "2025-01-01T01:00:00Z".to_string(),
             evaluated_at: None,
             created_at: "2025-01-01T01:00:00Z".to_string(),
+            source_agent: None,
         };
 
         let result = evaluate_fix(&conn, &fix).unwrap();
@@ -669,6 +672,7 @@ mod tests {
             applied_at: "2025-01-01T01:00:00Z".to_string(),
             evaluated_at: None,
             created_at: "2025-01-01T01:00:00Z".to_string(),
+            source_agent: None,
         };
 
         let result = evaluate_fix(&conn, &fix).unwrap();
@@ -711,6 +715,7 @@ mod tests {
             applied_at: "2025-01-01T01:00:00Z".to_string(),
             evaluated_at: None,
             created_at: "2025-01-01T01:00:00Z".to_string(),
+            source_agent: None,
         };
 
         let result = evaluate_fix(&conn, &fix).unwrap();
@@ -753,6 +758,7 @@ mod tests {
             applied_at: "2025-01-01T01:00:00Z".to_string(),
             evaluated_at: None,
             created_at: "2025-01-01T01:00:00Z".to_string(),
+            source_agent: None,
         };
 
         // Now marks effective since both source and subsequent have zero findings
@@ -808,6 +814,7 @@ mod tests {
             applied_at: "2025-01-01T01:00:00Z".to_string(),
             evaluated_at: None,
             created_at: "2025-01-01T01:00:00Z".to_string(),
+            source_agent: None,
         };
 
         let result = evaluate_fix(&conn, &fix).unwrap();

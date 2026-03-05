@@ -267,3 +267,213 @@ pub fn analyze_all(conn: &Connection) -> Result<Vec<PromptInsight>, String> {
 
     Ok(all_insights)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn setup_test_db() -> Connection {
+        let conn = Connection::open_in_memory().expect("Failed to create in-memory DB");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE reflection_fixes (
+                id TEXT PRIMARY KEY,
+                source_task_run_id TEXT NOT NULL,
+                reflection_task_run_id TEXT NOT NULL,
+                fix_type TEXT NOT NULL,
+                fix_description TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'applied',
+                effectiveness TEXT,
+                source_agent TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE generation_pipeline_artifacts (
+                id TEXT PRIMARY KEY,
+                workflow_id TEXT,
+                description TEXT NOT NULL,
+                specification_criteria TEXT,
+                success INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE unified_workflows (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL
+            );
+
+            CREATE TABLE task_runs (
+                id TEXT PRIMARY KEY,
+                workflow_name TEXT
+            );
+            "#,
+        )
+        .expect("Failed to create test schema");
+        conn
+    }
+
+    #[test]
+    fn test_analyze_reflection_fixes_above_threshold() {
+        let conn = setup_test_db();
+
+        for i in 0..4 {
+            conn.execute(
+                "INSERT INTO reflection_fixes (id, source_task_run_id, reflection_task_run_id, fix_type, fix_description, status, effectiveness, source_agent, created_at)
+                 VALUES (?1, 'tr1', 'rtr1', 'missing_error_handling', 'Add error handling', 'applied', 'effective', 'builder', '2026-01-01T00:00:00Z')",
+                params![format!("fix_{}", i)],
+            ).expect("Failed to insert reflection fix");
+        }
+
+        let insights = analyze_reflection_fixes(&conn, "builder", 3).expect("Analysis failed");
+        assert_eq!(insights.len(), 1);
+        assert_eq!(insights[0].agent, "builder");
+        assert_eq!(insights[0].evidence_count, 4);
+    }
+
+    #[test]
+    fn test_analyze_reflection_fixes_below_threshold() {
+        let conn = setup_test_db();
+
+        for i in 0..2 {
+            conn.execute(
+                "INSERT INTO reflection_fixes (id, source_task_run_id, reflection_task_run_id, fix_type, fix_description, status, effectiveness, source_agent, created_at)
+                 VALUES (?1, 'tr1', 'rtr1', 'missing_error_handling', 'Add error handling', 'applied', 'effective', 'builder', '2026-01-01T00:00:00Z')",
+                params![format!("fix_{}", i)],
+            ).expect("Failed to insert reflection fix");
+        }
+
+        let insights = analyze_reflection_fixes(&conn, "builder", 3).expect("Analysis failed");
+        assert!(insights.is_empty());
+    }
+
+    #[test]
+    fn test_analyze_specification_gaps() {
+        let conn = setup_test_db();
+
+        conn.execute(
+            "INSERT INTO unified_workflows (id, name) VALUES ('wf1', 'Test Workflow')",
+            [],
+        )
+        .expect("Failed to insert workflow");
+
+        conn.execute(
+            "INSERT INTO task_runs (id, workflow_name) VALUES ('tr1', 'Test Workflow')",
+            [],
+        )
+        .expect("Failed to insert task run");
+
+        // Insert 3 artifacts so gap_count >= 3 threshold is met
+        for i in 0..3 {
+            conn.execute(
+                &format!(
+                    "INSERT INTO generation_pipeline_artifacts (id, workflow_id, description, specification_criteria, success, created_at)
+                     VALUES ('gpa{}', 'wf1', 'test {}', '[\"some criteria\"]', 1, '2026-01-01T00:00:00Z')",
+                    i, i
+                ),
+                [],
+            )
+            .expect("Failed to insert artifact");
+        }
+
+        for i in 0..3 {
+            conn.execute(
+                "INSERT INTO reflection_fixes (id, source_task_run_id, reflection_task_run_id, fix_type, fix_description, status, effectiveness, source_agent, created_at)
+                 VALUES (?1, 'tr1', 'rtr1', 'missed_check', 'Verification missed this', 'applied', 'effective', 'verification', '2026-01-01T00:00:00Z')",
+                params![format!("fix_{}", i)],
+            ).expect("Failed to insert reflection fix");
+        }
+
+        let insights = analyze_specification_gaps(&conn).expect("Analysis failed");
+        assert!(
+            insights.len() >= 1,
+            "Expected at least 1 specification_gap insight, got {}",
+            insights.len()
+        );
+        assert_eq!(insights[0].insight_type, "specification_gap");
+    }
+
+    #[test]
+    fn test_analyze_verification_blind_spots() {
+        let conn = setup_test_db();
+
+        for i in 0..3 {
+            conn.execute(
+                "INSERT INTO reflection_fixes (id, source_task_run_id, reflection_task_run_id, fix_type, fix_description, status, effectiveness, source_agent, created_at)
+                 VALUES (?1, 'tr1', 'rtr1', 'wrong_selector', 'Used incorrect CSS selector', 'applied', 'effective', 'builder', '2026-01-01T00:00:00Z')",
+                params![format!("fix_{}", i)],
+            ).expect("Failed to insert reflection fix");
+        }
+
+        let insights = analyze_verification_blind_spots(&conn).expect("Analysis failed");
+        assert_eq!(insights.len(), 1);
+        assert_eq!(insights[0].insight_type, "verification_blind_spot");
+    }
+
+    #[test]
+    fn test_analyze_all_combines_insights() {
+        let conn = setup_test_db();
+
+        // Insert data for analyze_reflection_fixes (builder agent, 4 fixes of same type)
+        for i in 0..4 {
+            conn.execute(
+                "INSERT INTO reflection_fixes (id, source_task_run_id, reflection_task_run_id, fix_type, fix_description, status, effectiveness, source_agent, created_at)
+                 VALUES (?1, 'tr1', 'rtr1', 'missing_error_handling', 'Add error handling', 'applied', 'effective', 'builder', '2026-01-01T00:00:00Z')",
+                params![format!("builder_fix_{}", i)],
+            ).expect("Failed to insert builder fix");
+        }
+
+        // Insert data for analyze_verification_blind_spots (3 fixes from builder with effectiveness)
+        // The builder fixes above also satisfy blind spot analysis since they are builder+effective+applied
+        // with count >= 3. So we already have data for that.
+
+        // Insert data for analyze_specification_gaps
+        conn.execute(
+            "INSERT INTO unified_workflows (id, name) VALUES ('wf1', 'Test Workflow')",
+            [],
+        )
+        .expect("Failed to insert workflow");
+
+        conn.execute(
+            "INSERT INTO task_runs (id, workflow_name) VALUES ('tr1', 'Test Workflow')",
+            [],
+        )
+        .expect("Failed to insert task run");
+
+        conn.execute(
+            "INSERT INTO generation_pipeline_artifacts (id, workflow_id, description, specification_criteria, success, created_at)
+             VALUES ('gpa1', 'wf1', 'test', '[\"some criteria\"]', 1, '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("Failed to insert artifact");
+
+        for i in 0..3 {
+            conn.execute(
+                "INSERT INTO reflection_fixes (id, source_task_run_id, reflection_task_run_id, fix_type, fix_description, status, effectiveness, source_agent, created_at)
+                 VALUES (?1, 'tr1', 'rtr1', 'missed_check', 'Verification missed this', 'applied', 'effective', 'verification', '2026-01-01T00:00:00Z')",
+                params![format!("spec_fix_{}", i)],
+            ).expect("Failed to insert verification fix");
+        }
+
+        let insights = analyze_all(&conn).expect("Analysis failed");
+
+        // Should have insights from multiple sources:
+        // - analyze_reflection_fixes for builder (4 fixes of same type >= threshold 3)
+        // - analyze_verification_blind_spots (4 builder fixes with effectiveness >= 3)
+        // - analyze_specification_gaps (artifact + verification fixes >= 3)
+        assert!(
+            insights.len() >= 2,
+            "Expected at least 2 combined insights, got {}",
+            insights.len()
+        );
+
+        let insight_types: Vec<&str> = insights.iter().map(|i| i.insight_type.as_str()).collect();
+        assert!(
+            insight_types.contains(&"recurring_failure")
+                || insight_types.contains(&"verification_blind_spot")
+                || insight_types.contains(&"specification_gap"),
+            "Expected insights from multiple analysis functions, got types: {:?}",
+            insight_types
+        );
+    }
+}

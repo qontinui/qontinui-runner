@@ -452,27 +452,87 @@ impl TerminalSession {
             }
         }
 
-        // Drop the writer to signal EOF
+        // Drop the writer to signal EOF on stdin
         if let Ok(mut writer) = self.writer.lock() {
-            // Replace with a dummy writer that does nothing
-            // The actual drop will close the pipe
             drop(writer.flush());
         }
 
-        // Join threads (with timeout to avoid hanging)
+        // Drop the master PTY handle — this closes the OS pipe and unblocks the
+        // reader thread which may be stuck in a blocking read() call.
+        if let Ok(mut master) = self.master.lock() {
+            // Replace with a placeholder so the Drop actually runs now.
+            // MasterPty is trait-object-boxed, so we swap it out.
+            let _dropped = std::mem::replace(&mut *master, create_noop_master());
+        }
+
+        // Join threads with a timeout so we never hang the UI
         if let Ok(mut handle) = self.reader_join.lock() {
             if let Some(h) = handle.take() {
-                let _ = h.join();
+                join_with_timeout(h, "reader", &self.id);
             }
         }
         if let Ok(mut handle) = self.waiter_join.lock() {
             if let Some(h) = handle.take() {
-                let _ = h.join();
+                join_with_timeout(h, "waiter", &self.id);
             }
         }
 
         info!(terminal_id = %self.id, "Terminal session closed");
     }
+}
+
+/// Join a thread with a timeout, logging a warning if it doesn't finish in time.
+fn join_with_timeout(handle: thread::JoinHandle<()>, name: &str, terminal_id: &str) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let thread_name = name.to_string();
+    let tid = terminal_id.to_string();
+
+    // Spawn a helper thread that joins and signals completion
+    let _ = thread::Builder::new()
+        .name(format!("join-{}-{}", thread_name, tid))
+        .spawn(move || {
+            let _ = handle.join();
+            let _ = tx.send(());
+        });
+
+    // Wait up to 2 seconds
+    if rx.recv_timeout(std::time::Duration::from_secs(2)).is_err() {
+        warn!(
+            terminal_id = %terminal_id,
+            thread = %name,
+            "Thread did not finish within 2s timeout — detaching"
+        );
+    }
+}
+
+/// Create a no-op MasterPty placeholder used when dropping the real master during close.
+fn create_noop_master() -> Box<dyn MasterPty + Send> {
+    Box::new(NoopMaster)
+}
+
+/// Minimal MasterPty that does nothing — used as a swap target during close().
+struct NoopMaster;
+
+impl MasterPty for NoopMaster {
+    fn resize(&self, _size: PtySize) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+    fn get_size(&self) -> Result<PtySize, anyhow::Error> {
+        Ok(PtySize {
+            rows: 0,
+            cols: 0,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+    }
+    fn try_clone_reader(&self) -> Result<Box<dyn Read + Send>, anyhow::Error> {
+        Ok(Box::new(std::io::empty()))
+    }
+    fn take_writer(&self) -> Result<Box<dyn Write + Send>, anyhow::Error> {
+        Ok(Box::new(std::io::sink()))
+    }
+    #[cfg(unix)]
+    fn process_group_leader(&self) {}
 }
 
 impl Drop for TerminalSession {

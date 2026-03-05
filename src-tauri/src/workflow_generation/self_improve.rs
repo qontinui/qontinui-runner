@@ -31,6 +31,8 @@ pub struct SelfImprovementContext {
     pub verification_blind_spots: Vec<String>,
     /// Hardener conversion patterns from prompt analysis.
     pub hardener_patterns: Vec<String>,
+    /// Builder construction patterns from prompt analysis.
+    pub builder_insights: Vec<String>,
 }
 
 /// Analyze historical generation patterns from the database.
@@ -39,7 +41,7 @@ pub struct SelfImprovementContext {
 /// and `workflow_generation_feedback` to build a comprehensive improvement context.
 pub fn analyze_generation_patterns(conn: &Connection) -> Result<SelfImprovementContext, String> {
     // Load per-agent insights from prompt analysis
-    let (specification_insights, verification_blind_spots, hardener_patterns) =
+    let (specification_insights, verification_blind_spots, hardener_patterns, builder_insights) =
         load_agent_insights(conn);
 
     let ctx = SelfImprovementContext {
@@ -52,6 +54,7 @@ pub fn analyze_generation_patterns(conn: &Connection) -> Result<SelfImprovementC
         specification_insights,
         verification_blind_spots,
         hardener_patterns,
+        builder_insights,
     };
 
     debug!(
@@ -138,6 +141,7 @@ impl SelfImprovementContext {
             && self.specification_insights.is_empty()
             && self.verification_blind_spots.is_empty()
             && self.hardener_patterns.is_empty()
+            && self.builder_insights.is_empty()
     }
 }
 
@@ -291,19 +295,20 @@ fn query_avg_rating(conn: &Connection) -> Result<Option<f64>, String> {
 // Per-Agent Insight Loading
 // ============================================================================
 
-/// Load per-agent insights from prompt analysis, returning (spec, verification, hardener).
-fn load_agent_insights(conn: &Connection) -> (Vec<String>, Vec<String>, Vec<String>) {
+/// Load per-agent insights from prompt analysis, returning (spec, verification, hardener, builder).
+fn load_agent_insights(conn: &Connection) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
     let all_insights = match prompt_analysis::analyze_all(conn) {
         Ok(insights) => insights,
         Err(e) => {
             warn!("Failed to load prompt analysis insights: {}", e);
-            return (vec![], vec![], vec![]);
+            return (vec![], vec![], vec![], vec![]);
         }
     };
 
     let mut spec = Vec::new();
     let mut verification = Vec::new();
     let mut hardener = Vec::new();
+    let mut builder = Vec::new();
 
     for insight in all_insights {
         let desc = insight.description.clone();
@@ -311,12 +316,12 @@ fn load_agent_insights(conn: &Connection) -> (Vec<String>, Vec<String>, Vec<Stri
             "specification" => spec.push(desc),
             "verification" => verification.push(desc),
             "hardener" => hardener.push(desc),
-            // Builder insights go into the general improvement context
+            "builder" => builder.push(desc),
             _ => {}
         }
     }
 
-    (spec, verification, hardener)
+    (spec, verification, hardener, builder)
 }
 
 // ============================================================================
@@ -369,4 +374,133 @@ pub fn format_hardener_insights(context: &SelfImprovementContext) -> String {
     }
     output.push('\n');
     output
+}
+
+/// Format builder insights as markdown for the builder prompt.
+pub fn format_builder_insights(context: &SelfImprovementContext) -> String {
+    if context.builder_insights.is_empty() {
+        return String::new();
+    }
+
+    let mut output = String::from("## Lessons for Workflow Construction\n\n");
+    output.push_str(
+        "Based on analysis of previous builder runs, pay attention to these patterns:\n\n",
+    );
+    for insight in &context.builder_insights {
+        output.push_str(&format!("- {}\n", insight));
+    }
+    output.push('\n');
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_specification_insights_empty() {
+        let ctx = SelfImprovementContext::default();
+        let result = format_specification_insights(&ctx);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_format_specification_insights_with_data() {
+        let ctx = SelfImprovementContext {
+            specification_insights: vec!["insight 1".into(), "insight 2".into()],
+            ..Default::default()
+        };
+        let result = format_specification_insights(&ctx);
+        assert!(result.contains("Lessons from Past Generations"));
+        assert!(result.contains("insight 1"));
+        assert!(result.contains("insight 2"));
+    }
+
+    #[test]
+    fn test_format_verification_insights_empty() {
+        let ctx = SelfImprovementContext::default();
+        let result = format_verification_insights(&ctx);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_format_verification_insights_with_data() {
+        let ctx = SelfImprovementContext {
+            verification_blind_spots: vec!["blind spot 1".into()],
+            ..Default::default()
+        };
+        let result = format_verification_insights(&ctx);
+        assert!(result.contains("Known Blind Spots"));
+        assert!(result.contains("blind spot 1"));
+    }
+
+    #[test]
+    fn test_format_hardener_insights_empty() {
+        let ctx = SelfImprovementContext::default();
+        let result = format_hardener_insights(&ctx);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_format_hardener_insights_with_data() {
+        let ctx = SelfImprovementContext {
+            hardener_patterns: vec!["pattern 1".into()],
+            ..Default::default()
+        };
+        let result = format_hardener_insights(&ctx);
+        assert!(result.contains("Patterns from Past Conversions"));
+        assert!(result.contains("pattern 1"));
+    }
+
+    #[test]
+    fn test_format_builder_insights_empty() {
+        let ctx = SelfImprovementContext::default();
+        let result = format_builder_insights(&ctx);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_format_builder_insights_with_data() {
+        let ctx = SelfImprovementContext {
+            builder_insights: vec!["lesson 1".into(), "lesson 2".into()],
+            ..Default::default()
+        };
+        let result = format_builder_insights(&ctx);
+        assert!(result.contains("Lessons for Workflow Construction"));
+        assert!(result.contains("lesson 1"));
+        assert!(result.contains("lesson 2"));
+    }
+
+    #[test]
+    fn test_is_empty_default() {
+        let ctx = SelfImprovementContext::default();
+        assert!(ctx.is_empty());
+    }
+
+    #[test]
+    fn test_is_empty_with_builder_insights() {
+        let ctx = SelfImprovementContext {
+            builder_insights: vec!["x".to_string()],
+            ..Default::default()
+        };
+        assert!(!ctx.is_empty());
+    }
+
+    #[test]
+    fn test_format_improvement_context_empty() {
+        let ctx = SelfImprovementContext::default();
+        let result = format_improvement_context(&ctx);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_format_improvement_context_with_data() {
+        let ctx = SelfImprovementContext {
+            common_verifier_issues: vec![("issue".into(), 5)],
+            ..Default::default()
+        };
+        let result = format_improvement_context(&ctx);
+        assert!(result.contains("Historical Generation Patterns"));
+        assert!(result.contains("issue"));
+    }
 }

@@ -1,14 +1,26 @@
 import { useEffect, useCallback, useRef, useState, createRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { TerminalInstance, type TerminalInstanceHandle, type ShellIntegrationEvent } from "./TerminalInstance";
+import {
+  TerminalInstance,
+  type TerminalInstanceHandle,
+  type ShellIntegrationEvent,
+} from "./TerminalInstance";
 import { TerminalTabBar } from "./TerminalTabBar";
 import { TerminalActionBar } from "./TerminalActionBar";
 import { TerminalNotification } from "./TerminalNotification";
 import { TranscriptSessionSidebar } from "./TranscriptSessionSidebar";
 import { TranscriptContentPanel } from "./TranscriptContentPanel";
-import { useTranscriptSessions, type TranscriptMessage, type TranscriptSession } from "./useTranscriptSessions";
+import {
+  useTranscriptSessions,
+  type TranscriptMessage,
+  type TranscriptSession,
+} from "./useTranscriptSessions";
 import { TerminalAnalysisPanel, type AnalysisType } from "./TerminalAnalysisPanel";
+import { TerminalFindingsPanel } from "./TerminalFindingsPanel";
 import { useTerminalManager } from "./useTerminalManager";
+import { useTerminalFindings } from "./useTerminalFindings";
+import { findingsTracker } from "@/services/FindingsTracker";
+import type { Finding } from "@/types/findings";
 import { WorkflowPreviewPanel } from "@qontinui/workflow-ui";
 import type { UnifiedWorkflow, CanvasPanel } from "@qontinui/shared-types";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
@@ -101,8 +113,11 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
   const [transcriptMessages, setTranscriptMessages] = useState<TranscriptMessage[]>([]);
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [rightPanelMode, setRightPanelMode] = useState<
-    "transcript" | "workflow" | "analysis" | null
+    "transcript" | "workflow" | "analysis" | "findings" | null
   >(null);
+
+  // Session-scoped findings from terminal output
+  const { processOutput, activeFindings, allFindings } = useTerminalFindings(activeId ?? null);
 
   // Analysis state
   const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -195,7 +210,7 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
           // Small defer so the prompt finishes rendering before we write
           setTimeout(() => {
             const ref = terminalRefs.current.get(tabId);
-            ref?.current?.writeToTerminal(`claude --resume ${pending.sessionId}\r`);
+            ref?.current?.writeToTerminal(`${pending.resumeCmd}\r`);
           }, 50);
         }
       }
@@ -223,7 +238,7 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
   // ── Resume Claude Code session in terminal ─────────────────────────────────
 
   // Tracks the tab ID and session ID awaiting the first shell prompt to send the command.
-  const pendingResumeRef = useRef<{ tabId: string; sessionId: string } | null>(null);
+  const pendingResumeRef = useRef<{ tabId: string; resumeCmd: string } | null>(null);
 
   const handleResumeSession = useCallback(
     async (session: TranscriptSession) => {
@@ -236,8 +251,20 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
       setRightPanelMode(null);
       setSelectedTranscriptSessionId(null);
 
-      // Queue the resume command — it will be sent once the shell emits its first prompt
-      pendingResumeRef.current = { tabId, sessionId: session.session_id };
+      // Queue the resume command — it will be sent once the shell emits its first prompt.
+      // Include the config_dir so Claude CLI searches the right directory.
+      // Windows terminals use PowerShell ($env:VAR), others use bash (VAR=val cmd).
+      const configDir = session.config_dir;
+      const isWindows = navigator.platform.startsWith("Win");
+      let resumeCmd: string;
+      if (configDir) {
+        resumeCmd = isWindows
+          ? `$env:CLAUDE_CONFIG_DIR="${configDir}"; claude --resume ${session.session_id}`
+          : `CLAUDE_CONFIG_DIR="${configDir}" claude --resume ${session.session_id}`;
+      } else {
+        resumeCmd = `claude --resume ${session.session_id}`;
+      }
+      pendingResumeRef.current = { tabId, resumeCmd };
 
       // Fallback: send after 1.5 s regardless (in case shell integration isn't active)
       setTimeout(() => {
@@ -245,7 +272,7 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
         if (!pending || pending.tabId !== tabId) return;
         pendingResumeRef.current = null;
         const ref = terminalRefs.current.get(tabId);
-        ref?.current?.writeToTerminal(`claude --resume ${pending.sessionId}\r`);
+        ref?.current?.writeToTerminal(`${pending.resumeCmd}\r`);
       }, 1500);
     },
     [createTerminal],
@@ -545,6 +572,71 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
     [activeId, tabs, getScrollback, getActiveSelection, latestPlanContent, commandHistories],
   );
 
+  // ── Findings handlers ────────────────────────────────────────────────────
+
+  const handleFindingRespond = useCallback(
+    (findingId: string, text: string) => {
+      findingsTracker.provideUserResponse(findingId, text);
+      if (activeId) {
+        terminalRefs.current.get(activeId)?.current?.writeToTerminal(text + "\r");
+      }
+    },
+    [activeId],
+  );
+
+  const handleFixFinding = useCallback(
+    async (finding: Finding) => {
+      const activeTab = tabs.find((t) => t.id === activeId);
+      const workingDir = activeTab?.workingDir;
+      const tabTitle = `fix: ${finding.title.slice(0, 20)}`;
+      const tabId = await createTerminal(tabTitle, workingDir);
+      if (!tabId) return;
+
+      setRightPanelMode(null); // close findings panel to show terminal
+
+      const title = finding.title.replace(/"/g, '\\"');
+      const desc = finding.description.replace(/"/g, '\\"').slice(0, 500);
+      const filePart = finding.codeContext?.file
+        ? ` File: ${finding.codeContext.file}${finding.codeContext.line ? ":" + finding.codeContext.line : ""}.`
+        : "";
+      const resumeCmd = `claude "Fix this issue: ${title}.${filePart} Details: ${desc}"`;
+
+      pendingResumeRef.current = { tabId, resumeCmd };
+      setTimeout(() => {
+        const pending = pendingResumeRef.current;
+        if (!pending || pending.tabId !== tabId) return;
+        pendingResumeRef.current = null;
+        terminalRefs.current.get(tabId)?.current?.writeToTerminal(`${pending.resumeCmd}\r`);
+      }, 1500);
+    },
+    [activeId, tabs, createTerminal],
+  );
+
+  const handleGenerateFromFindings = useCallback(
+    async (findings: Finding[]) => {
+      const description =
+        "Fix the following unresolved findings from the current development session";
+      const inlineContext = findings
+        .map((f) => {
+          let entry = `- [${f.categoryId}:${f.severity}] ${f.title}`;
+          if (f.description) entry += `\n  ${f.description}`;
+          if (f.codeContext?.file) {
+            entry += `\n  File: ${f.codeContext.file}`;
+            if (f.codeContext.line) entry += `:${f.codeContext.line}`;
+          }
+          if (f.pendingQuestion) entry += `\n  Question: ${f.pendingQuestion.question}`;
+          return entry;
+        })
+        .join("\n\n");
+      await runGeneration(description, inlineContext);
+    },
+    [runGeneration],
+  );
+
+  const handleToggleFindings = useCallback(() => {
+    setRightPanelMode((prev) => (prev === "findings" ? null : "findings"));
+  }, []);
+
   // ── Auto-naming from first input ──────────────────────────────────────────
 
   const handleFirstInput = useCallback(
@@ -612,6 +704,9 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
         planFileName={planFileName}
         isPlanLoading={isPlanLoading}
         onRefreshPlan={loadPlanContent}
+        onToggleFindings={handleToggleFindings}
+        findingsActive={rightPanelMode === "findings"}
+        findingsCount={activeFindings.length}
       />
       <TerminalNotification
         message={notification?.message ?? null}
@@ -646,6 +741,7 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
               onExit={(code) => handleExit(tab.id, code)}
               onFirstInput={(input) => handleFirstInput(tab.id, input)}
               onShellIntegration={(event) => handleShellIntegration(tab.id, event)}
+              onOutput={(text) => processOutput(tab.id, text)}
             />
           ))}
           {tabs.length === 0 && (
@@ -698,6 +794,16 @@ export function TerminalPage({ onNavigateToBuilder, onNavigateToActive }: Termin
             isAnalyzing={isAnalyzing}
             error={analysisError}
             onClose={() => setRightPanelMode(null)}
+          />
+        )}
+        {rightPanelMode === "findings" && (
+          <TerminalFindingsPanel
+            findings={activeFindings}
+            allFindings={allFindings}
+            onClose={() => setRightPanelMode(null)}
+            onRespond={handleFindingRespond}
+            onFix={handleFixFinding}
+            onGenerateWorkflow={handleGenerateFromFindings}
           />
         )}
       </div>

@@ -1,0 +1,456 @@
+//! Canvas Panel Manager for workflow execution intelligence.
+//!
+//! Emits structured canvas panels at workflow lifecycle events,
+//! providing a live execution dashboard in the Canvas widget.
+
+mod builders;
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
+
+use serde_json::Value;
+use tauri::Emitter;
+use tracing::{info, warn};
+
+use crate::database::CheckpointDb;
+use crate::event_system::AppEvent;
+use crate::mcp::canvas::{CanvasState, StoredPanel};
+use crate::orchestrator::types::Finding;
+use crate::step_executor::{StepExecutionResult, VerificationPhaseResult};
+use crate::unified_workflow_executor::types::{AgenticOutcome, LoopConfig, LoopResult};
+
+/// Snapshot of a single iteration's results (internal tracking).
+#[derive(Debug, Clone)]
+pub(crate) struct IterationSnapshot {
+    pub iteration: u32,
+    pub passed: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    pub total: usize,
+    pub failed_step_names: Vec<String>,
+    pub failed_step_errors: Vec<(String, String)>,
+    pub verify_duration_ms: u64,
+    pub agentic_duration_ms: Option<u64>,
+    pub agentic_outcome: Option<String>,
+    pub findings_count: usize,
+    pub injected_steps_count: usize,
+}
+
+/// Manages canvas panel emission during workflow execution.
+///
+/// Created once per workflow run, called at each lifecycle point.
+/// All emission is best-effort — failures are logged but never block execution.
+pub struct CanvasPanelManager {
+    canvas_state: Arc<tokio::sync::RwLock<CanvasState>>,
+    checkpoint_db: Arc<CheckpointDb>,
+    app_handle: tauri::AppHandle,
+    execution_id: String,
+    workflow_name: String,
+    stage_prefix: Option<String>,
+    iteration_snapshots: Vec<IterationSnapshot>,
+    accumulated_findings: Vec<Finding>,
+    workflow_start_time: Instant,
+    max_iterations: u32,
+    max_sessions: Option<u32>,
+}
+
+impl CanvasPanelManager {
+    /// Create a new canvas panel manager.
+    ///
+    /// The `execution_id` and `workflow_name` are set later via `on_workflow_start()`
+    /// since they come from LoopConfig which isn't available at construction time.
+    pub fn new(
+        canvas_state: Arc<tokio::sync::RwLock<CanvasState>>,
+        checkpoint_db: Arc<CheckpointDb>,
+        app_handle: tauri::AppHandle,
+    ) -> Self {
+        Self {
+            canvas_state,
+            checkpoint_db,
+            app_handle,
+            execution_id: String::new(),
+            workflow_name: String::new(),
+            stage_prefix: None,
+            iteration_snapshots: Vec::new(),
+            accumulated_findings: Vec::new(),
+            workflow_start_time: Instant::now(),
+            max_iterations: 5,
+            max_sessions: None,
+        }
+    }
+
+    // ─── Lifecycle Methods ───
+
+    /// Called at workflow start. Clears canvas and emits Mission Brief.
+    pub async fn on_workflow_start(&mut self, config: &LoopConfig) {
+        self.execution_id = config.execution_id.clone();
+        self.workflow_name = config.workflow_name.clone();
+        self.max_iterations = config.max_iterations;
+        self.max_sessions = config.max_sessions;
+        self.workflow_start_time = Instant::now();
+        self.iteration_snapshots.clear();
+        self.accumulated_findings.clear();
+        self.stage_prefix = None;
+
+        // Clear canvas for fresh run
+        {
+            let mut canvas = self.canvas_state.write().await;
+            canvas.clear();
+            canvas.set_task_run_id(Some(self.execution_id.clone()));
+        }
+
+        // Clear persisted panels
+        let db = self.checkpoint_db.clone();
+        let exec_id = self.execution_id.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = db.clear_canvas_panels_for_task_run(&exec_id);
+        });
+
+        // Emit Mission Brief
+        let data = builders::build_mission_brief(config);
+        self.emit_panel(
+            "overview",
+            "Markdown",
+            "Mission Brief",
+            data,
+            5,
+            "compact",
+            Some("Overview"),
+        )
+        .await;
+    }
+
+    /// Called when a stage begins (multi-stage workflows).
+    pub async fn on_stage_start(&mut self, stage_idx: u32, stage_name: &str, total_stages: usize) {
+        if total_stages > 1 {
+            self.stage_prefix = Some(format!("s{}", stage_idx));
+        } else {
+            self.stage_prefix = None;
+        }
+        // Reset per-stage tracking
+        self.iteration_snapshots.clear();
+
+        info!(
+            "Canvas: stage start {}/{} '{}'",
+            stage_idx + 1,
+            total_stages,
+            stage_name
+        );
+    }
+
+    /// Called after setup phase completes.
+    pub async fn on_setup_complete(&mut self, success: bool, results: &[StepExecutionResult]) {
+        let duration_ms: u64 = results.iter().map(|r| r.duration_ms).sum();
+        let data = builders::build_setup_report(success, results, duration_ms);
+        self.emit_panel(
+            "setup",
+            "KeyValue",
+            "Setup",
+            data,
+            6,
+            "compact",
+            Some("Overview"),
+        )
+        .await;
+    }
+
+    /// Called after verification phase completes.
+    pub async fn on_verification_complete(
+        &mut self,
+        iteration: u32,
+        result: &VerificationPhaseResult,
+        verification_history: &HashMap<String, Vec<bool>>,
+    ) {
+        let failed_step_names: Vec<String> = result
+            .step_results
+            .iter()
+            .filter(|r| !r.success)
+            .map(|r| r.step_name.clone())
+            .collect();
+
+        let failed_step_errors: Vec<(String, String)> = result
+            .step_results
+            .iter()
+            .filter(|r| !r.success)
+            .map(|r| {
+                (
+                    r.step_name.clone(),
+                    r.error
+                        .clone()
+                        .unwrap_or_else(|| "Unknown error".to_string()),
+                )
+            })
+            .collect();
+
+        let snapshot = IterationSnapshot {
+            iteration,
+            passed: result.passed_steps,
+            failed: result.failed_steps,
+            skipped: result.skipped_steps,
+            total: result.total_steps,
+            failed_step_names,
+            failed_step_errors,
+            verify_duration_ms: result.total_duration_ms,
+            agentic_duration_ms: None,
+            agentic_outcome: None,
+            findings_count: 0,
+            injected_steps_count: 0,
+        };
+
+        self.iteration_snapshots.push(snapshot.clone());
+
+        // Verification Matrix (update in-place each iteration)
+        let matrix_data =
+            builders::build_verification_matrix(&self.iteration_snapshots, verification_history);
+        self.emit_panel(
+            "matrix",
+            "Table",
+            "Verification Matrix",
+            matrix_data,
+            10,
+            "normal",
+            Some("Progress"),
+        )
+        .await;
+
+        // Convergence Tracker (after 2+ iterations)
+        if self.iteration_snapshots.len() >= 2 {
+            let conv_data = builders::build_convergence_tracker(&self.iteration_snapshots);
+            self.emit_panel(
+                "convergence",
+                "ProgressChart",
+                "Convergence",
+                conv_data,
+                11,
+                "compact",
+                Some("Progress"),
+            )
+            .await;
+        }
+
+        // Iteration Digest
+        let prev = if self.iteration_snapshots.len() >= 2 {
+            Some(&self.iteration_snapshots[self.iteration_snapshots.len() - 2])
+        } else {
+            None
+        };
+        let digest_data = builders::build_iteration_digest_verification(&snapshot, prev);
+        let priority = 20 + (self.max_iterations.saturating_sub(iteration)) as i32;
+        let group = if let Some(ref prefix) = self.stage_prefix {
+            format!("Stage {} · Iteration {}", prefix, iteration)
+        } else {
+            format!("Iteration {}", iteration)
+        };
+        self.emit_panel(
+            &format!("iter-{}", iteration),
+            "Markdown",
+            &format!("Iteration {}", iteration),
+            digest_data,
+            priority,
+            "compact",
+            Some(&group),
+        )
+        .await;
+
+        // Resource Dashboard
+        let sessions_count = self.get_sessions_count().await;
+        let resource_data = builders::build_resource_dashboard(
+            iteration,
+            self.max_iterations,
+            sessions_count,
+            self.max_sessions,
+            self.workflow_start_time.elapsed(),
+        );
+        self.emit_panel(
+            "resources",
+            "KeyValue",
+            "Resources",
+            resource_data,
+            50,
+            "compact",
+            Some("Resources"),
+        )
+        .await;
+    }
+
+    /// Called after agentic phase completes.
+    pub async fn on_agentic_complete(
+        &mut self,
+        iteration: u32,
+        outcome: &AgenticOutcome,
+        findings: &[Finding],
+        injected_count: usize,
+        agentic_duration_ms: u64,
+    ) {
+        // Update the latest snapshot with agentic results
+        if let Some(snapshot) = self.iteration_snapshots.last_mut() {
+            snapshot.agentic_duration_ms = Some(agentic_duration_ms);
+            snapshot.agentic_outcome = Some(match outcome {
+                AgenticOutcome::Success { .. } => "Completed".to_string(),
+                AgenticOutcome::Failed { .. } => "Failed".to_string(),
+                AgenticOutcome::Error { .. } => "Error".to_string(),
+                AgenticOutcome::Skipped => "Skipped".to_string(),
+            });
+            snapshot.findings_count = findings.len();
+            snapshot.injected_steps_count = injected_count;
+
+            // Update iteration digest with full info
+            let digest_data = builders::build_iteration_digest_full(snapshot);
+            let priority = 20 + (self.max_iterations.saturating_sub(iteration)) as i32;
+            let group = if let Some(ref prefix) = self.stage_prefix {
+                format!("Stage {} · Iteration {}", prefix, iteration)
+            } else {
+                format!("Iteration {}", iteration)
+            };
+            self.emit_panel(
+                &format!("iter-{}", iteration),
+                "Markdown",
+                &format!("Iteration {}", iteration),
+                digest_data,
+                priority,
+                "compact",
+                Some(&group),
+            )
+            .await;
+        }
+
+        // Accumulate findings
+        self.accumulated_findings.extend(findings.iter().cloned());
+
+        // Findings Board
+        if !self.accumulated_findings.is_empty() {
+            let findings_data = builders::build_findings_board(&self.accumulated_findings);
+            self.emit_panel(
+                "findings",
+                "FindingList",
+                "Findings",
+                findings_data,
+                40,
+                "normal",
+                Some("Intelligence"),
+            )
+            .await;
+        }
+    }
+
+    /// Called when the workflow completes (success or failure).
+    pub async fn on_workflow_complete(
+        &mut self,
+        result: &LoopResult,
+        duration: std::time::Duration,
+        sessions_count: u32,
+    ) {
+        let data = builders::build_outcome_alert(result, duration, sessions_count);
+        self.emit_panel(
+            "outcome",
+            "Alert",
+            "Outcome",
+            data,
+            1,
+            "normal",
+            Some("Overview"),
+        )
+        .await;
+    }
+
+    /// Called when the workflow fails on an early-return path (no LoopResult available).
+    pub async fn on_workflow_failed(&self, reason: &str) {
+        let elapsed = self.workflow_start_time.elapsed();
+        let data = serde_json::json!({
+            "severity": "error",
+            "message": reason,
+            "details": format!("Duration: {}", builders::format_duration_pub(elapsed)),
+        });
+        self.emit_panel(
+            "outcome",
+            "Alert",
+            "Outcome",
+            data,
+            1,
+            "normal",
+            Some("Overview"),
+        )
+        .await;
+    }
+
+    // ─── Internal Helpers ───
+
+    /// Emit a panel to canvas state, persist to SQLite, and broadcast event.
+    async fn emit_panel(
+        &self,
+        panel_suffix: &str,
+        component: &str,
+        title: &str,
+        data: Value,
+        priority: i32,
+        size: &str,
+        group: Option<&str>,
+    ) {
+        let panel_id = self.make_panel_id(panel_suffix);
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let panel = StoredPanel {
+            panel_id: panel_id.clone(),
+            component: component.to_string(),
+            title: title.to_string(),
+            data,
+            priority,
+            size: size.to_string(),
+            group: group.map(|g| g.to_string()),
+            task_run_id: self.execution_id.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+
+        // Insert into in-memory state
+        {
+            let mut canvas = self.canvas_state.write().await;
+            canvas.insert_panel(panel.clone());
+        }
+
+        // Persist to SQLite (background, non-blocking)
+        let db = self.checkpoint_db.clone();
+        let panel_for_db = panel.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = db.insert_or_update_canvas_panel(&panel_for_db) {
+                warn!("Canvas: failed to persist panel: {}", e);
+            }
+        });
+
+        // Emit event
+        let event = AppEvent::CanvasUpdate {
+            action: "update".to_string(),
+            panel_id: panel.panel_id.clone(),
+            panel: Some(serde_json::to_value(&panel).unwrap_or_default()),
+            task_run_id: Some(self.execution_id.clone()),
+        };
+        if let Err(e) = self.app_handle.emit(event.event_name(), &event) {
+            warn!("Canvas: failed to emit event: {}", e);
+        }
+    }
+
+    /// Build a panel ID with optional stage prefix.
+    fn make_panel_id(&self, suffix: &str) -> String {
+        if let Some(ref prefix) = self.stage_prefix {
+            format!("{}:{}:{}", self.execution_id, prefix, suffix)
+        } else {
+            format!("{}:{}", self.execution_id, suffix)
+        }
+    }
+
+    /// Get the current sessions count from the database.
+    pub async fn get_sessions_count(&self) -> u32 {
+        let db = self.checkpoint_db.clone();
+        let exec_id = self.execution_id.clone();
+        tokio::task::spawn_blocking(move || {
+            db.get_task_run(&exec_id)
+                .ok()
+                .flatten()
+                .map(|t| t.sessions_count)
+                .unwrap_or(0)
+        })
+        .await
+        .unwrap_or(0)
+    }
+}

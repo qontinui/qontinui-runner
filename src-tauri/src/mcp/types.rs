@@ -104,17 +104,6 @@ pub fn api_error(message: impl Into<String>) -> ApiResponse<()> {
     }
 }
 
-/// Status response
-#[derive(Debug, Serialize)]
-pub struct StatusResponse {
-    pub executor_running: bool,
-    pub executor_state: String,
-    pub config_loaded: bool,
-    pub config_path: Option<String>,
-    /// Whether an AI analysis is currently in progress
-    pub ai_analysis_running: bool,
-}
-
 /// Load config request
 #[derive(Debug, Deserialize)]
 pub struct LoadConfigRequest {

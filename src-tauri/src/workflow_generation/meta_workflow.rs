@@ -151,6 +151,9 @@ pub fn build_meta_workflow_template(
     // Strip markdown formatting and grab the first meaningful line.
     let name_suffix = extract_workflow_name_from_description(&request.description);
 
+    // Build the specification prompt (acceptance criteria)
+    let specification_prompt = build_specification_meta_prompt(&request.description);
+
     // Build the prompt strings for each agent
     let schema_context = build_schema_context_for_description(&request.description);
     let builder_prompt = build_builder_prompt(
@@ -175,10 +178,11 @@ pub fn build_meta_workflow_template(
         category: "meta".to_string(),
         tags: vec!["meta".to_string(), "generation".to_string()],
 
-        // Phase 1: Optional investigation + Builder agent generates initial workflow JSON
+        // Phase 1: Investigation → Specification → Builder
         setup_steps: {
             let mut steps = Vec::new();
 
+            // Step 1: Investigation (optional) — enriches task description with codebase context
             if request.investigate_codebase.unwrap_or(true) {
                 let investigation_prompt = build_investigation_setup_prompt(&request.description);
                 steps.push(json!({
@@ -192,37 +196,68 @@ pub fn build_meta_workflow_template(
                 }));
             }
 
+            // Step 2: Specification — generates acceptance criteria from task description
             {
-                let mut step = json!({
+                let mut spec_step = json!({
+                    "id": Uuid::new_v4().to_string(),
+                    "name": "Define acceptance criteria",
+                    "type": "prompt",
+                    "phase": "setup",
+                    "prompt_mode": "response",
+                    "content": specification_prompt,
+                    "output_path": "{{artifact_dir}}/criteria.json"
+                });
+                if request.investigate_codebase.unwrap_or(true) {
+                    spec_step["input_path"] = json!("{{artifact_dir}}/investigation.md");
+                }
+                steps.push(spec_step);
+            }
+
+            // Step 3: Builder — generates workflow JSON, informed by acceptance criteria
+            {
+                let builder_step = json!({
                     "id": Uuid::new_v4().to_string(),
                     "name": "Generate workflow from description",
                     "type": "prompt",
                     "phase": "setup",
                     "prompt_mode": "response",
                     "content": builder_prompt,
-                    "output_path": "{{artifact_dir}}/workflow.json"
+                    "output_path": "{{artifact_dir}}/workflow.json",
+                    "input_path": "{{artifact_dir}}/criteria.json"
                 });
-                if request.investigate_codebase.unwrap_or(true) {
-                    step["input_path"] = json!("{{artifact_dir}}/investigation.md");
-                }
-                steps.push(step);
+                // If investigation ran, the criteria already incorporate it.
+                // The builder still reads criteria.json which includes the enriched context.
+                steps.push(builder_step);
             }
 
             steps
         },
 
-        // Phase 2: AI semantic review of the generated workflow
-        verification_steps: vec![json!({
-            "id": Uuid::new_v4().to_string(),
-            "name": "AI semantic review",
-            "type": "command",
-            "phase": "verification",
-            "mode": "check",
-            "check_type": "ai_review",
-            "ai_review_prompt": verification_prompt,
-            "ai_review_input_path": "{{artifact_dir}}/workflow.json",
-            "ai_review_validate_as_workflow": true
-        })],
+        // Phase 2: Deterministic autofix → AI semantic review (with criteria cross-validation)
+        verification_steps: vec![
+            // Step 1: Deterministic autofix (UUID generation, phase assignment, command sanitization)
+            json!({
+                "id": Uuid::new_v4().to_string(),
+                "name": "Autofix workflow structure",
+                "type": "workflow_fixup",
+                "phase": "verification",
+                "fixup_input_path": "{{artifact_dir}}/workflow.json",
+                "fixup_mode": "autofix"
+            }),
+            // Step 2: AI semantic review with acceptance criteria cross-validation
+            json!({
+                "id": Uuid::new_v4().to_string(),
+                "name": "AI semantic review",
+                "type": "command",
+                "phase": "verification",
+                "mode": "check",
+                "check_type": "ai_review",
+                "ai_review_prompt": verification_prompt,
+                "ai_review_input_path": "{{artifact_dir}}/workflow.json",
+                "ai_review_validate_as_workflow": true,
+                "ai_review_criteria_path": "{{artifact_dir}}/criteria.json"
+            }),
+        ],
 
         // Phase 3: Fixer agent corrects issues found by verification
         agentic_steps: vec![json!({
@@ -236,8 +271,12 @@ pub fn build_meta_workflow_template(
             "output_path": "{{artifact_dir}}/workflow.json"
         })],
 
-        // Phase 4: Hardening + Self-analysis (dev only) + Save the generated workflow
+        // Phase 4: AI Hardener (prompt) → Deterministic harden + Save (automation)
+        // With completion_prompts_first=true, prompts run before automation, so:
+        //   1. AI hardener prompt runs first
+        //   2. Then automation: workflow_fixup (harden) → save_workflow_artifact
         completion_steps: vec![
+            // Prompt step: AI hardener (runs first due to completion_prompts_first)
             json!({
                 "id": Uuid::new_v4().to_string(),
                 "name": "Harden prompt verification steps",
@@ -248,6 +287,7 @@ pub fn build_meta_workflow_template(
                 "input_path": "{{artifact_dir}}/workflow.json",
                 "output_path": "{{artifact_dir}}/workflow.json"
             }),
+            // Prompt step: Self-analysis (dev only, runs with hardener)
             json!({
                 "id": Uuid::new_v4().to_string(),
                 "name": "Analyze generation quality (dev)",
@@ -258,12 +298,23 @@ pub fn build_meta_workflow_template(
                 "content": "Review the workflow generation that just completed. Compare the generated workflow with the original description. Identify: (1) aspects the builder got right, (2) issues the verifier caught, (3) issues the verifier missed, (4) patterns that could improve future generations. Output as [FINDING:...] markers.",
                 "input_path": "{{artifact_dir}}/workflow.json"
             }),
+            // Automation step: Deterministic hardening fixups (runs after AI hardener)
+            json!({
+                "id": Uuid::new_v4().to_string(),
+                "name": "Apply deterministic hardening",
+                "type": "workflow_fixup",
+                "phase": "completion",
+                "fixup_input_path": "{{artifact_dir}}/workflow.json",
+                "fixup_mode": "harden"
+            }),
+            // Automation step: Save to DB + capture PipelineArtifact (runs last)
             json!({
                 "id": Uuid::new_v4().to_string(),
                 "name": "Save generated workflow",
                 "type": "save_workflow_artifact",
                 "phase": "completion",
-                "artifact_input_path": "{{artifact_dir}}/workflow.json"
+                "artifact_input_path": "{{artifact_dir}}/workflow.json",
+                "artifact_capture_prompts": true
             }),
         ],
 
@@ -289,6 +340,7 @@ pub fn build_meta_workflow_template(
         stop_on_failure: false,
         approval_gate: false,
         reflection_mode: false,
+        completion_prompts_first: true, // AI hardener must run BEFORE save_workflow_artifact
         model_overrides: std::collections::HashMap::new(),
         created_at: now.clone(),
         updated_at: now,
@@ -355,6 +407,71 @@ fn extract_workflow_name_from_description(description: &str) -> String {
 // Prompt builders (private)
 // ============================================================================
 
+/// Build the prompt for the specification step in the meta-workflow.
+///
+/// Adapts the specification logic from `specification.rs` for the file-based
+/// meta-workflow pipeline. The AI generates `AcceptanceCriteria` as JSON,
+/// which is then read by the builder step.
+fn build_specification_meta_prompt(description: &str) -> String {
+    // Reuse the same prompt structure as the sync specification agent,
+    // but adapted for the meta-workflow context where investigation.md
+    // may be provided as input_path content.
+    format!(
+        r#"You are a specification agent for an automation platform. Your job is to define **acceptance criteria** — concrete, observable conditions that prove a task was completed successfully.
+
+You do NOT implement anything. You only define what "done" looks like.
+
+## Task Description
+
+{description}
+
+## Additional Context
+
+If additional context was provided (investigation results, project structure), use it to inform your criteria. Focus on what can be verified automatically.
+
+## Instructions
+
+Think about what observable success looks like for this task. Focus on outcomes, not implementation.
+
+For each criterion, consider:
+- **What can be checked automatically?** Prefer command-based checks (exit codes, grep, test runners) and UI Bridge assertions over manual review.
+- **What is the minimum bar?** Critical criteria are necessary conditions. Optional criteria are nice-to-have.
+- **What would a reviewer check?** If a human reviewed this work, what would they verify?
+
+Produce 3–8 structured criteria. Each criterion must have:
+- `id`: kebab-case identifier (e.g., "typecheck-passes", "button-renders-correctly")
+- `description`: one-sentence description of the success condition
+- `method`: how to verify it — one of "command", "ui_bridge", "test", "manual"
+- `priority`: one of "critical", "important", "optional"
+- `verification_hint`: a concrete suggestion for how to check it (e.g., "Run `npx tsc --noEmit`", "Assert element with data-ui-id='save-btn' is visible")
+- `category`: grouping label (e.g., "compilation", "ui-content", "behavior", "data-integrity", "style")
+
+Also provide:
+- `goal_summary`: one sentence summarizing what overall success looks like
+- `assumptions`: list of assumptions you're making (e.g., "Project uses TypeScript", "Frontend runs on localhost:3001")
+
+## Output Format
+
+Return ONLY valid JSON matching this structure. No markdown code blocks, no explanations.
+
+{{
+  "goal_summary": "...",
+  "criteria": [
+    {{
+      "id": "...",
+      "description": "...",
+      "method": "command|ui_bridge|test|manual",
+      "priority": "critical|important|optional",
+      "verification_hint": "...",
+      "category": "..."
+    }}
+  ],
+  "assumptions": ["...", "..."]
+}}"#,
+        description = description,
+    )
+}
+
 /// Build the prompt for the builder agent that generates the initial workflow JSON.
 fn build_builder_prompt(
     description: &str,
@@ -413,6 +530,24 @@ fn build_builder_prompt(
             prompt.push_str(&ctx.similar_section);
         }
     }
+
+    // Add criteria awareness instructions
+    prompt.push_str(
+        r#"
+## Acceptance Criteria (from input)
+
+The input to this step contains JSON acceptance criteria generated by the specification agent.
+These criteria define the observable success conditions for this workflow.
+
+**You MUST:**
+- Include a verification step for each automatable criterion (method ≠ "manual")
+- Tag each verification step with a `"criterion_id"` field matching the criterion's `id`
+- Match the step type to the criterion's method: `command` → command step, `ui_bridge` → ui_bridge step, `test` → command step with test_type
+- Ensure at least one verification step per automatable criterion
+- Use the `verification_hint` from each criterion to guide your step configuration
+
+"#,
+    );
 
     prompt.push_str(
         r#"

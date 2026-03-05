@@ -300,6 +300,7 @@ pub async fn sync_workflows_from_backend(
                     stop_on_failure: Some(workflow.stop_on_failure),
                     approval_gate: Some(workflow.approval_gate),
                     reflection_mode: Some(workflow.reflection_mode),
+                    completion_prompts_first: Some(workflow.completion_prompts_first),
                     model_overrides: Some(workflow.model_overrides.clone()),
                 };
                 if let Err(e) = db.update_unified_workflow(&workflow.id, &update_req) {
@@ -339,6 +340,7 @@ pub async fn sync_workflows_from_backend(
                     stop_on_failure: Some(workflow.stop_on_failure),
                     approval_gate: Some(workflow.approval_gate),
                     reflection_mode: Some(workflow.reflection_mode),
+                    completion_prompts_first: Some(workflow.completion_prompts_first),
                     model_overrides: Some(workflow.model_overrides.clone()),
                 };
                 if let Err(e) = db.create_unified_workflow(&create_req) {

@@ -1,5 +1,5 @@
 -- SQLite Schema for qontinui-runner
--- Version: 87
+-- Version: 90
 --
 -- This schema provides persistent storage for task runs, settings,
 -- prompts, and scheduler state.
@@ -881,6 +881,7 @@ CREATE TABLE IF NOT EXISTS unified_workflows (
     stop_on_failure INTEGER DEFAULT 0,  -- 0 = continue on failure (default), 1 = stop
     approval_gate INTEGER DEFAULT 0,  -- 0 = disabled (default), 1 = pause for human approval
     reflection_mode INTEGER DEFAULT 1,  -- 0 = disabled, 1 = enabled (default)
+    completion_prompts_first INTEGER NOT NULL DEFAULT 0,  -- 0 = automation first (default), 1 = prompts first
     model_overrides TEXT DEFAULT '{}',  -- JSON map of phase → {provider, model} overrides
 
     -- Generation tracking (for workflows created by meta-workflows)
@@ -2170,10 +2171,10 @@ CREATE TABLE IF NOT EXISTS reflection_fixes (
     applied_at TEXT NOT NULL,
     evaluated_at TEXT,
     created_at TEXT NOT NULL,
+    source_agent TEXT,                        -- Which generation agent caused this (specification, builder, verification, hardener)
     FOREIGN KEY (source_task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
     FOREIGN KEY (reflection_task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
     FOREIGN KEY (source_finding_id) REFERENCES task_run_findings(id) ON DELETE SET NULL,
-    source_agent TEXT,                        -- Which generation agent caused this (specification, builder, verification, hardener)
     FOREIGN KEY (source_knowledge_id) REFERENCES task_knowledge(id) ON DELETE SET NULL
 );
 

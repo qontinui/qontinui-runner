@@ -31,9 +31,7 @@ export const TraceViewerWidget: React.FC<TraceViewerWidgetProps> = ({
   height = 400,
 }) => {
   // Only fetch internally when no external spans are provided
-  const internalQuery = useTraceViewerData(
-    externalSpans !== undefined ? null : executionId
-  );
+  const internalQuery = useTraceViewerData(externalSpans !== undefined ? null : executionId);
 
   const spans = externalSpans ?? internalQuery.data ?? [];
   const isLoading = externalIsLoading ?? internalQuery.isLoading;

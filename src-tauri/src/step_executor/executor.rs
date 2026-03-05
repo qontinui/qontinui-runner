@@ -385,6 +385,14 @@ pub struct ExecutionStepConfig {
     )]
     pub ai_review_validate_as_workflow: Option<bool>,
 
+    /// Check (ai_review): Path to acceptance criteria JSON for cross-validation
+    #[serde(
+        alias = "aiReviewCriteriaPath",
+        alias = "ai_review_criteria_path",
+        default
+    )]
+    pub ai_review_criteria_path: Option<String>,
+
     /// Check (ci_cd): GitHub repository in owner/repo format
     #[serde(alias = "repository", alias = "ciCdRepository")]
     pub ci_cd_repository: Option<String>,
@@ -500,12 +508,41 @@ pub struct ExecutionStepConfig {
     )]
     pub ui_bridge_severity_threshold: Option<String>,
 
+    /// UI Bridge: Snapshot target — "control" (default), "sdk", or "proxy:PORT"
+    #[serde(alias = "uiBridgeSnapshotTarget", alias = "ui_bridge_snapshot_target")]
+    pub ui_bridge_snapshot_target: Option<String>,
+
     // ========================================================================
     // Artifact Step Fields
     // ========================================================================
     /// Path to a workflow JSON file to save (used by save_workflow_artifact)
     #[serde(alias = "artifactInputPath", alias = "artifact_input_path")]
     pub artifact_input_path: Option<String>,
+
+    /// Enable PipelineArtifact capture in save_workflow_artifact.
+    /// When true, reads investigation.md, criteria.json, and prompt data from
+    /// the artifact directory and creates a PipelineArtifact for training data.
+    #[serde(
+        alias = "artifactCapturePrompts",
+        alias = "artifact_capture_prompts",
+        default
+    )]
+    pub artifact_capture_prompts: Option<bool>,
+
+    // ========================================================================
+    // Workflow Fixup Step Fields
+    // ========================================================================
+    /// Path to workflow JSON file for fixup operations (supports {{artifact_dir}})
+    #[serde(alias = "fixupInputPath", alias = "fixup_input_path")]
+    pub fixup_input_path: Option<String>,
+
+    /// Fixup mode: "autofix", "harden", or "validate_criteria"
+    #[serde(alias = "fixupMode", alias = "fixup_mode")]
+    pub fixup_mode: Option<String>,
+
+    /// Path to criteria JSON file (used by validate_criteria mode)
+    #[serde(alias = "fixupCriteriaPath", alias = "fixup_criteria_path")]
+    pub fixup_criteria_path: Option<String>,
 
     // ========================================================================
     // Workflow Step Fields (for "workflow" step type — run a saved workflow inline)
@@ -605,7 +642,7 @@ impl ExecutionStepConfig {
         let command = if cfg!(target_os = "windows") {
             // Windows: Raw PowerShell script - DO NOT wrap with "powershell -Command"
             // The check handler will detect PowerShell syntax (Get-, $var) and run via PowerShell
-            r#"$d = Get-PSDrive -Name ((Get-Location).Drive.Name) -ErrorAction SilentlyContinue; $freeGB = [math]::Round($d.Free / 1GB, 1); Write-Host "Disk: $freeGB GB free"; if ($freeGB -lt 5) { Write-Host '[FAIL] Low disk space'; exit 1 }; $nodeVer = node --version 2>$null; if ($nodeVer) { Write-Host "[OK] Node.js: $nodeVer" } else { Write-Host '[WARN] Node.js not found' }; $gitVer = git --version 2>$null; if ($gitVer) { Write-Host "[OK] $gitVer" } else { Write-Host '[WARN] Git not found' }; exit 0"#
+            r#"$freeGB = 0; try { $d = Get-PSDrive -Name ((Get-Location).Drive.Name) -ErrorAction Stop; $freeGB = [math]::Round($d.Free / 1GB, 1) } catch { try { $disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction Stop; $freeGB = [math]::Round($disk.FreeSpace / 1GB, 1) } catch { $freeGB = -1 } }; if ($freeGB -lt 0) { Write-Host 'Disk: unknown (could not query)' } else { Write-Host "Disk: $freeGB GB free"; if ($freeGB -lt 5) { Write-Host '[FAIL] Low disk space'; exit 1 } }; $nodeVer = node --version 2>$null; if ($nodeVer) { Write-Host "[OK] Node.js: $nodeVer" } else { Write-Host '[WARN] Node.js not found' }; $gitVer = git --version 2>$null; if ($gitVer) { Write-Host "[OK] $gitVer" } else { Write-Host '[WARN] Git not found' }; exit 0"#
         } else {
             // Unix: bash commands
             r#"FREE_GB=$(($(df -k . | tail -1 | awk '{print $4}') / 1024 / 1024)); echo "Disk: ${FREE_GB}GB free"; if [ "$FREE_GB" -lt 5 ]; then echo "[FAIL] Low disk space"; exit 1; fi; node --version 2>/dev/null && echo "[OK] Node.js found" || echo "[WARN] Node.js not found"; git --version 2>/dev/null && echo "[OK] Git found" || echo "[WARN] Git not found"; exit 0"#

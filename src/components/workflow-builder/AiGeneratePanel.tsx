@@ -274,7 +274,9 @@ export function AiGeneratePanel({
 
     (async () => {
       try {
-        const resp = await tracedFetch(`${getApiBase()}/settings/ai`, { signal: controller.signal });
+        const resp = await tracedFetch(`${getApiBase()}/settings/ai`, {
+          signal: controller.signal,
+        });
         const json = await resp.json();
         if (!cancelled) setAiSettings(json.data ?? null);
       } catch {

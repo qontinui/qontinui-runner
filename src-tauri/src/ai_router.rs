@@ -406,7 +406,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = RoutingConfig::default();
-        assert!(!config.enabled);
+        assert!(config.enabled);
         assert_eq!(config.file_count_thresholds, (3, 10));
     }
 

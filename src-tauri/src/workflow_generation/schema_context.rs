@@ -461,12 +461,14 @@ After page navigation, the WebSocket connection needs ~15 seconds to reconnect. 
   "type": "command",
   "phase": "verification",
   "name": "Verify page loaded",
-  "command": "curl -sf http://localhost:9876/ui-bridge/sdk/snapshot | grep expected-element-id",
+  "command": "curl -s http://localhost:9876/ui-bridge/sdk/snapshot | python -c \"import sys,json; d=json.load(sys.stdin); assert d.get('success'), 'Snapshot failed: '+str(d.get('error','unknown'))\"",
   "retry_count": 5,
   "retry_delay_ms": 3000
 }}
 ```
 This retries up to 5 times with 3s delay between attempts — enough time for the WebSocket to reconnect after navigation.
+
+**IMPORTANT:** Never use `curl -sf` (with `-f` flag) when piping output to another command like `python -c` or `grep`. The `-f` flag makes curl suppress ALL output on HTTP errors, so the piped command receives empty input and fails with a confusing error. Use `curl -s` instead and validate the response in the piped command.
 
 ### SDK in Verification Steps
 Use `command` steps with curl to query SDK endpoints for verification:
@@ -475,7 +477,7 @@ Use `command` steps with curl to query SDK endpoints for verification:
   "type": "command",
   "phase": "verification",
   "name": "Check Page Content",
-  "command": "curl -sf http://localhost:9876/ui-bridge/sdk/elements?contentOnly=true"
+  "command": "curl -s http://localhost:9876/ui-bridge/sdk/elements?contentOnly=true | python -c \"import sys,json; d=json.load(sys.stdin); assert d.get('success'), 'Request failed: '+str(d.get('error','unknown')); assert len(d.get('data',[]))>0, 'No elements found'\""
 }}
 ```
 

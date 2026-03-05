@@ -59,6 +59,7 @@
 pub mod agentic_output;
 pub mod approval;
 pub(crate) mod auto_run;
+mod canvas_panels;
 pub mod conditional_routing;
 mod loop_controller;
 pub mod output_parser;

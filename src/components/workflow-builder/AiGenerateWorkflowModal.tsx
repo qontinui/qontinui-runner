@@ -17,6 +17,7 @@ import {
   Search,
 } from "lucide-react";
 import type { UnifiedWorkflow } from "../../types";
+import { getTotalStepCount } from "../../types/unified-workflow";
 import { getAccentColors } from "@/design-system";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
@@ -240,14 +241,7 @@ export function AiGenerateWorkflowModal({
 
   if (!isOpen) return null;
 
-  const getStepCount = (workflow: UnifiedWorkflow): number => {
-    return (
-      (workflow.setup_steps?.length || 0) +
-      (workflow.verification_steps?.length || 0) +
-      (workflow.agentic_steps?.length || 0) +
-      (workflow.completion_steps?.length || 0)
-    );
-  };
+  const getStepCount = getTotalStepCount;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
@@ -460,7 +454,10 @@ export function AiGenerateWorkflowModal({
                     />
                     <span className="text-muted-foreground">Auto-include Contexts</span>
                   </label>
-                  <label className="flex items-center gap-2 text-sm cursor-pointer" title="Run a specification agent before generating. Defines acceptance criteria that guide verification step generation.">
+                  <label
+                    className="flex items-center gap-2 text-sm cursor-pointer"
+                    title="Run a specification agent before generating. Defines acceptance criteria that guide verification step generation."
+                  >
                     <input
                       type="checkbox"
                       checked={generateSpecification}

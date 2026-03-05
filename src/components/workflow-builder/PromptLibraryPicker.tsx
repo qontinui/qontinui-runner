@@ -44,7 +44,9 @@ export function PromptLibraryPicker({
     const fetchPrompts = async () => {
       setIsLoading(true);
       try {
-        const response = await tracedFetch(`${getApiBase()}/prompts`, { signal: controller.signal });
+        const response = await tracedFetch(`${getApiBase()}/prompts`, {
+          signal: controller.signal,
+        });
         const data = await response.json();
         if (!cancelled && data.success && data.data) {
           setSavedPrompts(data.data);

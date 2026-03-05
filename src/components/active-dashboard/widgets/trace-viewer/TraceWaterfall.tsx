@@ -25,9 +25,7 @@ export const TraceWaterfall: React.FC<TraceWaterfallProps> = ({
     if (spans.length === 0) return { traceStartMs: 0, traceDurationMs: 0 };
 
     const starts = spans.map((s) => new Date(s.start_ts).getTime());
-    const ends = spans
-      .filter((s) => s.end_ts)
-      .map((s) => new Date(s.end_ts!).getTime());
+    const ends = spans.filter((s) => s.end_ts).map((s) => new Date(s.end_ts!).getTime());
 
     const start = starts.reduce((a, b) => Math.min(a, b), Infinity);
     const end = ends.length > 0 ? ends.reduce((a, b) => Math.max(a, b), -Infinity) : start + 1000;
@@ -52,7 +50,7 @@ export const TraceWaterfall: React.FC<TraceWaterfallProps> = ({
         </div>
       );
     },
-    [filteredNodes, traceStartMs, traceDurationMs, selectedSpanId, onSelectSpan]
+    [filteredNodes, traceStartMs, traceDurationMs, selectedSpanId, onSelectSpan],
   );
 
   if (filteredNodes.length === 0) {
@@ -70,9 +68,7 @@ export const TraceWaterfall: React.FC<TraceWaterfallProps> = ({
     <div className="flex-1 flex flex-col min-w-0">
       {/* Timeline header */}
       <div className="flex items-center h-6 border-b border-zinc-700 bg-zinc-900/50">
-        <div className="w-[240px] min-w-[240px] px-2 text-[10px] text-zinc-500">
-          Name
-        </div>
+        <div className="w-[240px] min-w-[240px] px-2 text-[10px] text-zinc-500">Name</div>
         <div className="flex-1 relative">
           {timeMarks.map((pct) => (
             <span

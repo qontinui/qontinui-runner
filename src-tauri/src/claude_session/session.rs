@@ -246,7 +246,6 @@ impl ClaudeSession {
         // Heartbeat thread
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         let app_handle_heartbeat = app_handle.clone();
-        let session_id_heartbeat = session_id.to_string();
         let session_ctx_heartbeat = session_ctx.clone();
         let has_output_heartbeat = has_output.clone();
         let start_time = Instant::now();
@@ -272,12 +271,9 @@ impl ClaudeSession {
                     let mins = elapsed_secs / 60;
                     let secs = elapsed_secs % 60;
                     let msg = if mins > 0 {
-                        format!(
-                            "Session {} processing... ({}m {}s)",
-                            session_id_heartbeat, mins, secs
-                        )
+                        format!("⏳ AI is working... ({}m {}s)", mins, secs)
                     } else {
-                        format!("Session {} processing... ({}s)", session_id_heartbeat, secs)
+                        format!("⏳ AI is working... ({}s)", secs)
                     };
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         emit_ai_output(

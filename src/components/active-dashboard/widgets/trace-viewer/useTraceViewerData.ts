@@ -6,7 +6,7 @@ import { computeInsights } from "./trace-utils";
 
 async function fetchExecutionSpans(executionId: string): Promise<TraceSpan[]> {
   const response = await tracedFetch(
-    `${getApiBase()}/execution-spans?execution_id=${encodeURIComponent(executionId)}&order=asc`
+    `${getApiBase()}/execution-spans?execution_id=${encodeURIComponent(executionId)}&order=asc`,
   );
   if (!response.ok) {
     throw new Error(`Failed to fetch spans: ${response.statusText}`);

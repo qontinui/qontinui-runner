@@ -23,7 +23,9 @@ function Write-Osc633 {
 # Save original Prompt function
 $__qontinui_original_prompt = $function:Prompt
 
-# Override Prompt to emit shell integration markers
+# Override Prompt to emit shell integration markers.
+# IMPORTANT: Return the actual prompt text so PSReadLine knows its width.
+# Writing it via [Console]::Write and returning "" breaks cursor positioning.
 function global:Prompt {
     # D;<exitcode> — command finished
     Write-Osc633 "D;$LASTEXITCODE"
@@ -37,11 +39,9 @@ function global:Prompt {
     } else {
         "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) "
     }
-    # Write the prompt text directly (return empty string to avoid double-write)
-    [Console]::Write($text)
-    # B — command input ready
+    # B — command input ready (emitted before returning prompt text)
     Write-Osc633 "B"
-    return ""
+    return $text
 }
 
 # Intercept PSReadLine to emit E;<command> and C before execution

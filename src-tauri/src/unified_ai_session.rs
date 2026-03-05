@@ -103,7 +103,7 @@ impl AiSessionConfig {
             iteration: None,
             step_name: step_name.into(),
             add_autonomous_context: true,
-            append_finding_instructions: false,
+            append_finding_instructions: true,
             strip_completion_markers: true,
             checkpoint_id: None,
             sub_step_metadata: None,
@@ -1022,7 +1022,7 @@ mod tests {
         assert_eq!(config.phase, WorkflowPhase::Setup);
         assert!(config.iteration.is_none());
         assert!(config.add_autonomous_context);
-        assert!(!config.append_finding_instructions);
+        assert!(config.append_finding_instructions);
         assert!(config.strip_completion_markers);
         assert!(config.checkpoint_id.is_none());
     }

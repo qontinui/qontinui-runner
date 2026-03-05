@@ -36,6 +36,8 @@ interface TerminalInstanceProps {
   onFirstInput?: (input: string) => void;
   /** Called when the shell emits an OSC 633 shell integration event. */
   onShellIntegration?: (event: ShellIntegrationEvent) => void;
+  /** Called with decoded text whenever PTY output is received. */
+  onOutput?: (text: string) => void;
 }
 
 interface ScrollbackBufferResponse {
@@ -78,6 +80,7 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
       onSelectionChange,
       onFirstInput,
       onShellIntegration,
+      onOutput,
     },
     ref,
   ) {
@@ -97,6 +100,9 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
     onReconnectedRef.current = onReconnected;
     const onShellIntegrationRef = useRef(onShellIntegration);
     onShellIntegrationRef.current = onShellIntegration;
+    const onOutputRef = useRef(onOutput);
+    onOutputRef.current = onOutput;
+    const outputDecoderRef = useRef(new TextDecoder());
     const firstInputReportedRef = useRef(false);
     const inputAccumulatorRef = useRef("");
     // Gate for reconnection: queues live events until scrollback is replayed
@@ -241,16 +247,38 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         onSelectionChangeRef.current?.(term.hasSelection());
       });
 
-      // Handle Ctrl+V paste — Tauri's webview doesn't fire the browser paste
-      // event that xterm.js relies on, so we intercept the key and read the
-      // clipboard manually.
+      // Handle Ctrl+C copy (when text is selected) and Ctrl+V paste.
+      // Tauri's webview doesn't fire the browser clipboard events that xterm.js
+      // relies on, so we intercept the keys and use the clipboard API manually.
       term.attachCustomKeyEventHandler((event) => {
-        if (event.type === "keydown" && event.key === "v" && (event.ctrlKey || event.metaKey) && !event.shiftKey) {
-          navigator.clipboard.readText().then((text) => {
-            if (text) {
-              term.paste(text);
-            }
-          }).catch(() => {});
+        // Ctrl+C: copy selected text, or pass through as SIGINT when nothing selected
+        if (event.type === "keydown" && event.key === "c" && event.ctrlKey && !event.shiftKey) {
+          if (term.hasSelection()) {
+            navigator.clipboard.writeText(term.getSelection()).catch(() => {});
+            return false; // prevent xterm from sending SIGINT
+          }
+          // No selection → let Ctrl+C pass through as SIGINT
+        }
+
+        if (
+          event.type === "keydown" &&
+          event.key === "v" &&
+          (event.ctrlKey || event.metaKey) &&
+          !event.shiftKey
+        ) {
+          navigator.clipboard
+            .readText()
+            .then((text) => {
+              if (text) {
+                // Write directly to PTY instead of term.paste() to avoid double
+                // paste when WebView2 also fires a native paste event.
+                const bytes = encoder.encode(text);
+                invoke("terminal_write", { terminalId, data: uint8ToBase64(bytes) }).catch(
+                  () => {},
+                );
+              }
+            })
+            .catch(() => {});
           return false; // prevent xterm default handling
         }
         return true;
@@ -316,6 +344,14 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
           term.write(bytes);
         } catch (e) {
           console.error(`[Terminal ${terminalId}] term.write error:`, e);
+        }
+        if (onOutputRef.current) {
+          try {
+            const text = outputDecoderRef.current.decode(bytes, { stream: true });
+            onOutputRef.current(text);
+          } catch {
+            /* ignore decode errors */
+          }
         }
         bytesReceivedRef.current += bytes.length;
       }).then((fn) => {

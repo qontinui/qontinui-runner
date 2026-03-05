@@ -138,6 +138,11 @@ pub struct StageConfig {
     /// When set, the stage is evaluated against this condition before running.
     /// If the condition is not met, the stage is skipped.
     pub condition: Option<crate::unified_workflows::StageCondition>,
+    /// When true, run completion prompt steps BEFORE automation steps.
+    /// Default (false) runs automation first, then prompts.
+    /// This is used by meta-workflows to ensure the AI hardener runs
+    /// before save_workflow_artifact persists the final result.
+    pub completion_prompts_first: bool,
 }
 
 /// Configuration for the verification-agentic loop.

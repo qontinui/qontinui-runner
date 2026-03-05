@@ -3023,6 +3023,7 @@ impl CompletionExecutor {
         stage_index: Option<u32>,
         model_override: Option<String>,
         provider_override: Option<String>,
+        completion_prompts_first: bool,
     ) -> (bool, Vec<StepExecutionResult>) {
         let mut all_results = Vec::new();
         let mut overall_success = true;
@@ -3048,7 +3049,102 @@ impl CompletionExecutor {
         // Create checkpoint manager for step-level checkpointing
         let checkpoint_mgr = CheckpointManager::new(self.checkpoint_db.clone(), "unified");
 
-        // Run automation completion steps
+        // When completion_prompts_first is set, run prompts before automation.
+        // This is used by meta-workflows where the AI hardener must run before
+        // save_workflow_artifact persists the final result.
+        if completion_prompts_first {
+            info!("COMPLETION-PHASE: Running prompts-first order (completion_prompts_first=true)");
+
+            // Run prompts first
+            let (prompt_ok, prompt_results) = self
+                .run_completion_prompts(
+                    prompt_steps,
+                    execution_id,
+                    workflow_name,
+                    iterations_run,
+                    logger,
+                    stage_index,
+                    model_override.clone(),
+                    provider_override.clone(),
+                    &checkpoint_mgr,
+                    0, // prompts run first, so prior_step_count is 0
+                )
+                .await;
+            overall_success = overall_success && prompt_ok;
+            let prompt_count = prompt_results.len();
+            all_results.extend(prompt_results);
+
+            // Then run automation
+            let (auto_ok, auto_results) = self
+                .run_completion_automation(
+                    automation_steps,
+                    execution_id,
+                    logger,
+                    stage_index,
+                    &checkpoint_mgr,
+                    prompt_count, // automation runs second
+                )
+                .await;
+            overall_success = overall_success && auto_ok;
+            all_results.extend(auto_results);
+
+            return (overall_success, all_results);
+        }
+
+        // Default order: automation first, then prompts
+        let (auto_ok, auto_results) = self
+            .run_completion_automation(
+                automation_steps,
+                execution_id,
+                logger,
+                stage_index,
+                &checkpoint_mgr,
+                0, // automation runs first
+            )
+            .await;
+        overall_success = overall_success && auto_ok;
+        let auto_count = auto_results.len();
+        all_results.extend(auto_results);
+
+        let (prompt_ok, prompt_results) = self
+            .run_completion_prompts(
+                prompt_steps,
+                execution_id,
+                workflow_name,
+                iterations_run,
+                logger,
+                stage_index,
+                model_override,
+                provider_override,
+                &checkpoint_mgr,
+                auto_count, // prompts run second
+            )
+            .await;
+        overall_success = overall_success && prompt_ok;
+        all_results.extend(prompt_results);
+
+        (overall_success, all_results)
+    }
+
+    /// Run completion automation steps with checkpointing.
+    ///
+    /// This is extracted from `run_completion` so both the default order
+    /// (automation-first) and the prompts-first order can share the same code.
+    ///
+    /// `step_index_offset` is used to offset checkpoint step indices when
+    /// another phase has already run (e.g., prompts ran first).
+    async fn run_completion_automation(
+        &self,
+        automation_steps: &[ExecutionStepConfig],
+        execution_id: &str,
+        _logger: &StepEventLogger,
+        stage_index: Option<u32>,
+        checkpoint_mgr: &CheckpointManager,
+        step_index_offset: usize,
+    ) -> (bool, Vec<StepExecutionResult>) {
+        let mut all_results = Vec::new();
+        let mut overall_success = true;
+
         if !automation_steps.is_empty() {
             info!(
                 "COMPLETION-PHASE: Running {} automation steps",
@@ -3068,7 +3164,7 @@ impl CompletionExecutor {
                     "unified",
                     "completion",
                     Some(0),
-                    idx,
+                    step_index_offset + idx,
                     step_type.as_str(),
                 )
                 .with_step_name(step_name)
@@ -3098,7 +3194,7 @@ impl CompletionExecutor {
                     "unified",
                     "completion",
                     Some(0),
-                    idx,
+                    step_index_offset + idx,
                     step_type.as_str(),
                 )
                 .with_step_name(step_name)
@@ -3130,7 +3226,33 @@ impl CompletionExecutor {
             }
         }
 
-        // Run prompt completion steps (AI summary)
+        (overall_success, all_results)
+    }
+
+    /// Run completion prompt steps (both response-mode and session-mode) with checkpointing.
+    ///
+    /// This is extracted from `run_completion` so both the default order
+    /// (automation-first) and the prompts-first order can share the same code.
+    ///
+    /// `step_index_offset` is the base offset for checkpoint step indices
+    /// (e.g., the number of automation steps that ran before prompts).
+    #[allow(clippy::too_many_arguments)]
+    async fn run_completion_prompts(
+        &self,
+        prompt_steps: &[ExecutionStepConfig],
+        execution_id: &str,
+        workflow_name: &str,
+        iterations_run: u32,
+        logger: &StepEventLogger,
+        stage_index: Option<u32>,
+        model_override: Option<String>,
+        provider_override: Option<String>,
+        checkpoint_mgr: &CheckpointManager,
+        step_index_offset: usize,
+    ) -> (bool, Vec<StepExecutionResult>) {
+        let mut all_results = Vec::new();
+        let mut overall_success = true;
+
         // Expand runtime variables in prompt step content before execution.
         // Variables set by automation steps (e.g., evaluation_results) need to be
         // substituted into {{variable_name}} patterns in prompt content.
@@ -3182,7 +3304,7 @@ impl CompletionExecutor {
                     );
 
                     // Checkpoint the response-mode prompt step as "running"
-                    let step_idx = automation_steps.len() + response_step_count;
+                    let step_idx = step_index_offset + response_step_count;
                     let mut resp_checkpoint = StepCheckpoint::new(
                         execution_id,
                         "unified",
@@ -3393,7 +3515,7 @@ impl CompletionExecutor {
             // Run remaining session-mode prompt steps via consolidated AI session
             if !session_prompt_steps.is_empty() {
                 // Checkpoint the AI step as a single step (after any response-mode steps)
-                let ai_step_idx = automation_steps.len() + response_step_count;
+                let ai_step_idx = step_index_offset + response_step_count;
                 let step_name = prompt_builder::consolidate_step_names_with_default(
                     &session_prompt_steps,
                     "Completion AI Task",
@@ -3564,6 +3686,7 @@ impl CompletionExecutor {
                 None,
                 config.model_override.clone(),
                 config.provider_override.clone(),
+                config.completion_prompts_first,
             )
             .await;
 
@@ -4010,6 +4133,7 @@ impl Executor for CompletionExecutor {
                 None,
                 config.model_override.clone(),
                 config.provider_override.clone(),
+                config.completion_prompts_first,
             )
             .await;
 

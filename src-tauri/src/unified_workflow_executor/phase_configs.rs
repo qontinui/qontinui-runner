@@ -201,6 +201,8 @@ pub struct CompletionConfig {
     pub model_override: Option<String>,
     /// Provider override for completion phase AI calls
     pub provider_override: Option<String>,
+    /// When true, run prompt steps before automation steps.
+    pub completion_prompts_first: bool,
 }
 
 impl CompletionConfig {
@@ -218,6 +220,7 @@ impl CompletionConfig {
             iterations_run,
             model_override: None,
             provider_override: None,
+            completion_prompts_first: false,
         }
     }
 

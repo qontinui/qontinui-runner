@@ -153,6 +153,65 @@ impl ProxyManager {
     }
 }
 
+// ============================================================================
+// Proxy Control State (bridges HTTP control API <-> injected script)
+// ============================================================================
+
+#[derive(Debug, Serialize, Clone)]
+struct PendingCommand {
+    id: String,
+    method: String,
+    args: Vec<serde_json::Value>,
+}
+
+struct ProxyControlState {
+    pending: Vec<PendingCommand>,
+    waiters: HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>,
+}
+
+impl ProxyControlState {
+    fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+            waiters: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ControlResult {
+    id: String,
+    success: bool,
+    #[serde(default)]
+    data: Option<serde_json::Value>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActionRequest {
+    action: String,
+    #[serde(default)]
+    params: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NavigateRequest {
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WaitForElementRequest {
+    selector: String,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuerySelectorRequest {
+    selector: String,
+}
+
 /// Module-level proxy manager (shared across all requests)
 static PROXY_MANAGER: OnceLock<Arc<Mutex<ProxyManager>>> = OnceLock::new();
 
@@ -525,15 +584,292 @@ async fn scan_for_pattern(
 
 const INJECT_SCRIPT: &str = include_str!("../../resources/ui-bridge-inject.js");
 
+/// Enqueue a command for the inject script and wait for its result (5s timeout).
+async fn enqueue_and_wait(
+    control_state: &Arc<Mutex<ProxyControlState>>,
+    method: &str,
+    args: Vec<serde_json::Value>,
+) -> Response<Body> {
+    let cmd_id = format!("cmd-{}", uuid::Uuid::new_v4());
+    let (tx, rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
+
+    {
+        let mut state = control_state.lock().await;
+        state.pending.push(PendingCommand {
+            id: cmd_id.clone(),
+            method: method.to_string(),
+            args,
+        });
+        state.waiters.insert(cmd_id.clone(), tx);
+    }
+
+    match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+        Ok(Ok(value)) => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&value).unwrap_or_default(),
+            ))
+            .unwrap(),
+        Ok(Err(_)) => Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"error":"Command channel closed unexpectedly"}"#,
+            ))
+            .unwrap(),
+        Err(_) => {
+            // Timeout — clean up the waiter
+            let mut state = control_state.lock().await;
+            state.waiters.remove(&cmd_id);
+            Response::builder()
+                .status(StatusCode::GATEWAY_TIMEOUT)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"error":"Timed out waiting for inject script response (5s). Is the proxied page open in a browser?"}"#,
+                ))
+                .unwrap()
+        }
+    }
+}
+
+/// Like `enqueue_and_wait` but with a configurable timeout (for long-running ops like waitForElement).
+async fn enqueue_and_wait_with_timeout(
+    control_state: &Arc<Mutex<ProxyControlState>>,
+    method: &str,
+    args: Vec<serde_json::Value>,
+    timeout_secs: u64,
+) -> Response<Body> {
+    let cmd_id = format!("cmd-{}", uuid::Uuid::new_v4());
+    let (tx, rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
+
+    {
+        let mut state = control_state.lock().await;
+        state.pending.push(PendingCommand {
+            id: cmd_id.clone(),
+            method: method.to_string(),
+            args,
+        });
+        state.waiters.insert(cmd_id.clone(), tx);
+    }
+
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
+        Ok(Ok(value)) => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&value).unwrap_or_default(),
+            ))
+            .unwrap(),
+        Ok(Err(_)) => Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"error":"Command channel closed unexpectedly"}"#,
+            ))
+            .unwrap(),
+        Err(_) => {
+            let mut state = control_state.lock().await;
+            state.waiters.remove(&cmd_id);
+            let msg = format!(
+                r#"{{"error":"Timed out waiting for inject script response ({}s). Is the proxied page open in a browser?"}}"#,
+                timeout_secs
+            );
+            Response::builder()
+                .status(StatusCode::GATEWAY_TIMEOUT)
+                .header("content-type", "application/json")
+                .body(Body::from(msg))
+                .unwrap()
+        }
+    }
+}
+
 async fn start_proxy(
     target_url: String,
     port: u16,
 ) -> Result<tokio::sync::oneshot::Sender<()>, String> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let client = Client::new();
+    let control_state = Arc::new(Mutex::new(ProxyControlState::new()));
 
     let ws_target = target_url.clone();
     let target = target_url.clone();
+
+    // Build control routes
+    let cs = control_state.clone();
+    let pending_handler = move || {
+        let cs = cs.clone();
+        async move {
+            let mut state = cs.lock().await;
+            let cmds: Vec<PendingCommand> = state.pending.drain(..).collect();
+            Json(cmds)
+        }
+    };
+
+    let cs = control_state.clone();
+    let results_handler = move |Json(results): Json<Vec<ControlResult>>| {
+        let cs = cs.clone();
+        async move {
+            let mut state = cs.lock().await;
+            for result in results {
+                if let Some(tx) = state.waiters.remove(&result.id) {
+                    let value = if result.success {
+                        result.data.unwrap_or(serde_json::Value::Null)
+                    } else {
+                        serde_json::json!({
+                            "error": result.error.unwrap_or_else(|| "Unknown error".to_string())
+                        })
+                    };
+                    let _ = tx.send(value);
+                }
+            }
+            Json(serde_json::json!({"ok": true}))
+        }
+    };
+
+    let cs = control_state.clone();
+    let snapshot_handler = move || {
+        let cs = cs.clone();
+        async move { enqueue_and_wait(&cs, "getSnapshot", vec![]).await }
+    };
+
+    let cs = control_state.clone();
+    let elements_handler = move || {
+        let cs = cs.clone();
+        async move { enqueue_and_wait(&cs, "getElements", vec![]).await }
+    };
+
+    let cs = control_state.clone();
+    let element_handler = move |Path(id): Path<String>| {
+        let cs = cs.clone();
+        async move { enqueue_and_wait(&cs, "getElement", vec![serde_json::Value::String(id)]).await }
+    };
+
+    let cs = control_state.clone();
+    let action_handler = move |Path(id): Path<String>, Json(body): Json<ActionRequest>| {
+        let cs = cs.clone();
+        async move {
+            let params = body.params.unwrap_or(serde_json::Value::Null);
+            enqueue_and_wait(
+                &cs,
+                "executeAction",
+                vec![
+                    serde_json::Value::String(id),
+                    serde_json::Value::String(body.action),
+                    params,
+                ],
+            )
+            .await
+        }
+    };
+
+    let cs = control_state.clone();
+    let discover_handler = move || {
+        let cs = cs.clone();
+        async move { enqueue_and_wait(&cs, "discover", vec![]).await }
+    };
+
+    let cs = control_state.clone();
+    let console_errors_handler = move || {
+        let cs = cs.clone();
+        async move { enqueue_and_wait(&cs, "getConsoleErrors", vec![]).await }
+    };
+
+    let cs = control_state.clone();
+    let clear_console_errors_handler = move || {
+        let cs = cs.clone();
+        async move { enqueue_and_wait(&cs, "clearConsoleErrors", vec![]).await }
+    };
+
+    let cs = control_state.clone();
+    let navigate_handler = move |Json(body): Json<NavigateRequest>| {
+        let cs = cs.clone();
+        async move { enqueue_and_wait(&cs, "navigate", vec![serde_json::Value::String(body.url)]).await }
+    };
+
+    let cs = control_state.clone();
+    let refresh_handler = move || {
+        let cs = cs.clone();
+        async move { enqueue_and_wait(&cs, "refresh", vec![]).await }
+    };
+
+    let cs = control_state.clone();
+    let back_handler = move || {
+        let cs = cs.clone();
+        async move { enqueue_and_wait(&cs, "back", vec![]).await }
+    };
+
+    let cs = control_state.clone();
+    let forward_handler = move || {
+        let cs = cs.clone();
+        async move { enqueue_and_wait(&cs, "forward", vec![]).await }
+    };
+
+    let cs = control_state.clone();
+    let styles_handler = move |Path(id): Path<String>| {
+        let cs = cs.clone();
+        async move {
+            enqueue_and_wait(
+                &cs,
+                "getComputedStyles",
+                vec![serde_json::Value::String(id)],
+            )
+            .await
+        }
+    };
+
+    let cs = control_state.clone();
+    let accessibility_handler = move |Path(id): Path<String>| {
+        let cs = cs.clone();
+        async move {
+            enqueue_and_wait(
+                &cs,
+                "getAccessibilityInfo",
+                vec![serde_json::Value::String(id)],
+            )
+            .await
+        }
+    };
+
+    let cs = control_state.clone();
+    let wait_for_element_handler = move |Json(body): Json<WaitForElementRequest>| {
+        let cs = cs.clone();
+        async move {
+            let timeout_ms = body.timeout_ms.unwrap_or(5000);
+            // HTTP timeout = inject timeout + 2s buffer
+            let http_timeout_secs = (timeout_ms / 1000) + 2;
+            enqueue_and_wait_with_timeout(
+                &cs,
+                "waitForElement",
+                vec![
+                    serde_json::Value::String(body.selector),
+                    serde_json::json!(timeout_ms),
+                ],
+                http_timeout_secs.max(5),
+            )
+            .await
+        }
+    };
+
+    let cs = control_state.clone();
+    let query_selector_handler = move |Json(body): Json<QuerySelectorRequest>| {
+        let cs = cs.clone();
+        async move {
+            enqueue_and_wait(
+                &cs,
+                "querySelectorAll",
+                vec![serde_json::Value::String(body.selector)],
+            )
+            .await
+        }
+    };
+
+    let cs = control_state.clone();
+    let design_snapshot_handler = move || {
+        let cs = cs.clone();
+        async move { enqueue_and_wait(&cs, "getDesignSnapshot", vec![]).await }
+    };
+
     let proxy_router = Router::new()
         .route(
             "/__ui-bridge/inject.js",
@@ -554,6 +890,51 @@ async fn start_proxy(
                     "version": "1.0.0"
                 }))
             }),
+        )
+        // Control API: polled by inject script
+        .route("/__ui-bridge/control/pending", get(pending_handler))
+        .route("/__ui-bridge/control/results", post(results_handler))
+        // Control API: called by external tools (MCP, workflows, CLI)
+        .route("/__ui-bridge/control/snapshot", get(snapshot_handler))
+        .route("/__ui-bridge/control/elements", get(elements_handler))
+        .route("/__ui-bridge/control/element/:id", get(element_handler))
+        .route(
+            "/__ui-bridge/control/element/:id/action",
+            post(action_handler),
+        )
+        .route("/__ui-bridge/control/discover", post(discover_handler))
+        .route(
+            "/__ui-bridge/control/console-errors",
+            get(console_errors_handler),
+        )
+        .route(
+            "/__ui-bridge/control/console-errors/clear",
+            post(clear_console_errors_handler),
+        )
+        .route("/__ui-bridge/control/page/navigate", post(navigate_handler))
+        .route("/__ui-bridge/control/page/refresh", post(refresh_handler))
+        .route("/__ui-bridge/control/page/back", post(back_handler))
+        .route("/__ui-bridge/control/page/forward", post(forward_handler))
+        // Enriched control routes
+        .route(
+            "/__ui-bridge/control/element/:id/styles",
+            get(styles_handler),
+        )
+        .route(
+            "/__ui-bridge/control/element/:id/accessibility",
+            get(accessibility_handler),
+        )
+        .route(
+            "/__ui-bridge/control/wait-for-element",
+            post(wait_for_element_handler),
+        )
+        .route(
+            "/__ui-bridge/control/query-selector",
+            post(query_selector_handler),
+        )
+        .route(
+            "/__ui-bridge/control/design-snapshot",
+            get(design_snapshot_handler),
         )
         .fallback(move |req: axum::http::Request<Body>| {
             let client = client.clone();
@@ -771,11 +1152,8 @@ async fn proxy_request(
             .split(';')
             .find_map(|part| {
                 let part = part.trim();
-                if let Some(charset) = part.strip_prefix("charset=") {
-                    Some(charset.trim().to_lowercase())
-                } else {
-                    None
-                }
+                part.strip_prefix("charset=")
+                    .map(|charset| charset.trim().to_lowercase())
             })
             .unwrap_or_else(|| "utf-8".to_string());
         charset == "utf-8" || charset == "us-ascii" || charset == "ascii" || charset == "iso-8859-1"
@@ -836,6 +1214,64 @@ async fn proxy_request(
 }
 
 // ============================================================================
+// Package Manager Execution
+// ============================================================================
+
+/// Run a package install command (npm install, yarn install, etc.) in the project directory.
+/// Returns the combined stdout/stderr on success, or an error message on failure.
+async fn run_package_install(project_path: &str, command: &str) -> Result<String, String> {
+    let parts: Vec<&str> = command.split_whitespace().collect();
+    if parts.is_empty() {
+        return Err("Empty install command".to_string());
+    }
+
+    let program = parts[0];
+    let args = &parts[1..];
+
+    let mut cmd = crate::process_helpers::tokio_no_window(program);
+    cmd.args(args).current_dir(project_path);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let child = cmd.spawn().map_err(|e| {
+        format!(
+            "Failed to start '{}': {}. Is {} installed and in PATH?",
+            command, e, program
+        )
+    })?;
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        child.wait_with_output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let combined = if stderr.is_empty() {
+                stdout
+            } else {
+                format!("{}\n{}", stdout, stderr)
+            };
+
+            if output.status.success() {
+                Ok(combined)
+            } else {
+                Err(format!(
+                    "'{}' exited with code {}:\n{}",
+                    command,
+                    output.status.code().unwrap_or(-1),
+                    combined.chars().take(2000).collect::<String>()
+                ))
+            }
+        }
+        Ok(Err(e)) => Err(format!("Failed to run '{}': {}", command, e)),
+        Err(_) => Err(format!("'{}' timed out after 5 minutes", command)),
+    }
+}
+
+// ============================================================================
 // Source Code Integrator
 // ============================================================================
 
@@ -889,30 +1325,7 @@ async fn integrate_source(
         }
     }
 
-    let install_output = if options.install_deps && analysis.framework != Framework::PlainHtml {
-        let pkg_modified = modifications
-            .iter()
-            .any(|m| m.file_path.ends_with("package.json"));
-        if pkg_modified {
-            let cmd = match analysis.package_manager {
-                PackageManager::Yarn => "yarn install",
-                PackageManager::Pnpm => "pnpm install",
-                PackageManager::Bun => "bun install",
-                _ => "npm install",
-            };
-            next_steps.insert(0, format!("Run `{}` in your project directory", cmd));
-            Some(format!(
-                "Package dependencies updated. Run `{}` to install.",
-                cmd
-            ))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    // Apply file modifications
+    // Apply file modifications first (so package.json is written before install)
     let mut success = true;
     for modification in &modifications {
         let file_path = project.join(&modification.file_path);
@@ -937,6 +1350,37 @@ async fn integrate_source(
             }
         }
     }
+
+    // Auto-run package install after files are written
+    let install_output =
+        if success && options.install_deps && analysis.framework != Framework::PlainHtml {
+            let pkg_modified = modifications
+                .iter()
+                .any(|m| m.file_path.ends_with("package.json"));
+            if pkg_modified {
+                let cmd = match analysis.package_manager {
+                    PackageManager::Yarn => "yarn install",
+                    PackageManager::Pnpm => "pnpm install",
+                    PackageManager::Bun => "bun install",
+                    _ => "npm install",
+                };
+                match run_package_install(project_path, cmd).await {
+                    Ok(output) => Some(format!("Successfully ran `{}`:\n{}", cmd, output)),
+                    Err(e) => {
+                        warnings.push(format!("Auto-install failed: {}", e));
+                        next_steps.insert(
+                            0,
+                            format!("Run `{}` manually in your project directory", cmd),
+                        );
+                        Some(format!("Auto-install failed. Run `{}` manually.", cmd))
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
     IntegrationResult {
         success,
@@ -1532,6 +1976,27 @@ async fn handle_inject(
             };
             let _ = save_integration(&state.app_state.checkpoint_db, &integration);
 
+            // Auto-connect SDK client to the new proxy
+            let proxy_url_for_sdk = format!("http://127.0.0.1:{}", port);
+            let sdk_conn = state.sdk_connection.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                match crate::mcp::sdk_client::connect_sdk_app(
+                    &sdk_conn,
+                    &proxy_url_for_sdk,
+                    Some(port),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                {
+                    Ok(_) => info!("Auto-connected SDK to proxy at {}", proxy_url_for_sdk),
+                    Err(e) => warn!("Auto-connect to proxy {} failed: {}", proxy_url_for_sdk, e),
+                }
+            });
+
             Json(ApiResponse::success(response))
         }
         Err(e) => Json(ApiResponse::error(e)),
@@ -1860,6 +2325,7 @@ async fn handle_update(
         }
     }
 
+    // Auto-run package install after updating package.json
     let install_cmd = match analysis.package_manager {
         PackageManager::Yarn => "yarn install",
         PackageManager::Pnpm => "pnpm install",
@@ -1867,15 +2333,40 @@ async fn handle_update(
         _ => "npm install",
     };
 
+    let mut next_steps = vec!["Restart your dev server".to_string()];
+    let pkg_modified = !modifications.is_empty();
+
+    let install_output = if success && pkg_modified {
+        match run_package_install(&req.project_path, install_cmd).await {
+            Ok(output) => Some(format!("Successfully ran `{}`:\n{}", install_cmd, output)),
+            Err(e) => {
+                warnings.push(format!("Auto-install failed: {}", e));
+                next_steps.insert(
+                    0,
+                    format!("Run `{}` manually in your project directory", install_cmd),
+                );
+                Some(format!(
+                    "Auto-install failed. Run `{}` manually.",
+                    install_cmd
+                ))
+            }
+        }
+    } else if pkg_modified {
+        next_steps.insert(
+            0,
+            format!("Run `{}` in your project directory", install_cmd),
+        );
+        Some(format!("Run `{}` to install updated packages", install_cmd))
+    } else {
+        None
+    };
+
     Json(ApiResponse::success(IntegrationResult {
         success,
         modifications,
-        install_output: Some(format!("Run `{}` to install updated packages", install_cmd)),
+        install_output,
         warnings,
-        next_steps: vec![
-            format!("Run `{}` in your project directory", install_cmd),
-            "Restart your dev server".to_string(),
-        ],
+        next_steps,
     }))
 }
 
@@ -1901,7 +2392,50 @@ pub fn routes() -> Router<Arc<ApiState>> {
             post(handle_health_check),
         )
         .route(
-            "/ui-bridge/integration/{id}",
+            "/ui-bridge/integration/:id",
             delete(handle_delete_integration),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_port_next_dev_with_port_flag() {
+        assert_eq!(extract_port_from_script("next dev --port 3001"), Some(3001));
+    }
+
+    #[test]
+    fn extract_port_vite_equals_syntax() {
+        assert_eq!(extract_port_from_script("vite --port=5174"), Some(5174));
+    }
+
+    #[test]
+    fn extract_port_env_var_style() {
+        assert_eq!(
+            extract_port_from_script("PORT=8080 node server.js"),
+            Some(8080)
+        );
+    }
+
+    #[test]
+    fn extract_port_short_flag() {
+        assert_eq!(extract_port_from_script("-p 4000"), Some(4000));
+    }
+
+    #[test]
+    fn extract_port_no_port_specified() {
+        assert_eq!(extract_port_from_script("next dev"), None);
+    }
+
+    #[test]
+    fn extract_port_empty_string() {
+        assert_eq!(extract_port_from_script(""), None);
+    }
+
+    #[test]
+    fn extract_port_short_flag_equals() {
+        assert_eq!(extract_port_from_script("-p=9000"), Some(9000));
+    }
 }

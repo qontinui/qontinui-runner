@@ -454,7 +454,24 @@ impl StepHandler for UiBridgeHandler {
                     client.post(&endpoint).json(&body).send().await
                 }
                 "snapshot" => {
-                    let endpoint = format!("{}/control/snapshot", base_url.trim_end_matches('/'));
+                    let endpoint = match step.ui_bridge_snapshot_target.as_deref() {
+                        None | Some("control") => {
+                            format!("{}/control/snapshot", base_url.trim_end_matches('/'))
+                        }
+                        Some("sdk") => {
+                            format!("{}/sdk/snapshot", base_url.trim_end_matches('/'))
+                        }
+                        Some(t) if t.starts_with("proxy:") => {
+                            let port = &t["proxy:".len()..];
+                            format!("http://127.0.0.1:{}/__ui-bridge/control/snapshot", port)
+                        }
+                        Some(other) => {
+                            return StepHandlerResult::failure(format!(
+                                "Unknown snapshot target: '{}'. Use 'control', 'sdk', or 'proxy:PORT'",
+                                other
+                            ));
+                        }
+                    };
                     client.get(&endpoint).send().await
                 }
                 other => {

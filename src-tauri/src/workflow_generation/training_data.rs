@@ -342,3 +342,321 @@ pub fn export_training_data(
 
     Ok(examples)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// Returns a ScoreFactors with all zeros/None — the neutral baseline.
+    fn default_factors() -> ScoreFactors {
+        ScoreFactors {
+            fixer_iterations: 0,
+            benchmark_score: None,
+            attributed_fix_count: 0,
+            effective_fix_count: 0,
+            user_edit_count: 0,
+            user_deleted: false,
+            user_rating: None,
+            eval_overall_score: None,
+            eval_dimension_scores: None,
+        }
+    }
+
+    // ========================================================================
+    // Pure scoring tests (no DB needed)
+    // ========================================================================
+
+    #[test]
+    fn test_score_specification_base() {
+        let factors = default_factors();
+        let score = score_specification(&factors);
+        assert!(
+            (score - 1.0).abs() < f64::EPSILON,
+            "Expected 1.0, got {}",
+            score
+        );
+    }
+
+    #[test]
+    fn test_score_specification_with_fixes() {
+        let factors = ScoreFactors {
+            attributed_fix_count: 2,
+            ..default_factors()
+        };
+        let score = score_specification(&factors);
+        assert!((score - 0.7).abs() < 1e-9, "Expected 0.7, got {}", score);
+    }
+
+    #[test]
+    fn test_score_specification_with_deletion() {
+        let factors = ScoreFactors {
+            user_deleted: true,
+            ..default_factors()
+        };
+        let score = score_specification(&factors);
+        assert!((score - 0.7).abs() < 1e-9, "Expected 0.7, got {}", score);
+    }
+
+    #[test]
+    fn test_score_builder_fixer_penalty() {
+        let factors = ScoreFactors {
+            fixer_iterations: 3,
+            ..default_factors()
+        };
+        let score = score_builder(&factors);
+        assert!((score - 0.7).abs() < 1e-9, "Expected 0.7, got {}", score);
+    }
+
+    #[test]
+    fn test_score_builder_with_rating() {
+        let factors = ScoreFactors {
+            user_rating: Some(5.0),
+            ..default_factors()
+        };
+        let score = score_builder(&factors);
+        // score starts at 1.0, then: 1.0 * 0.6 + (5.0/5.0) * 0.4 = 1.0
+        assert!((score - 1.0).abs() < 1e-9, "Expected 1.0, got {}", score);
+    }
+
+    #[test]
+    fn test_score_verification_effective_fixes() {
+        let factors = ScoreFactors {
+            effective_fix_count: 4,
+            ..default_factors()
+        };
+        let score = score_verification(&factors);
+        // 1.0 + 0.05*4 = 1.2, clamped to 1.0
+        assert!(
+            (score - 1.0).abs() < 1e-9,
+            "Expected 1.0 (clamped), got {}",
+            score
+        );
+    }
+
+    #[test]
+    fn test_score_verification_attributed_penalty() {
+        let factors = ScoreFactors {
+            attributed_fix_count: 3,
+            ..default_factors()
+        };
+        let score = score_verification(&factors);
+        // 1.0 - 0.2*3 = 0.4
+        assert!((score - 0.4).abs() < 1e-9, "Expected 0.4, got {}", score);
+    }
+
+    #[test]
+    fn test_score_hardener_edits() {
+        let factors = ScoreFactors {
+            user_edit_count: 5,
+            ..default_factors()
+        };
+        let score = score_hardener(&factors);
+        // user_edit_count > 2 => 1.0 - 0.15 = 0.85
+        assert!((score - 0.85).abs() < 1e-9, "Expected 0.85, got {}", score);
+    }
+
+    #[test]
+    fn test_score_hardener_deletion() {
+        let factors = ScoreFactors {
+            user_deleted: true,
+            ..default_factors()
+        };
+        let score = score_hardener(&factors);
+        // 1.0 - 0.3 = 0.7
+        assert!((score - 0.7).abs() < 1e-9, "Expected 0.7, got {}", score);
+    }
+
+    #[test]
+    fn test_score_agent_dispatch() {
+        let factors = default_factors();
+        assert!(
+            (score_agent("specification", &factors) - score_specification(&factors)).abs()
+                < f64::EPSILON,
+            "specification dispatch mismatch"
+        );
+        assert!(
+            (score_agent("builder", &factors) - score_builder(&factors)).abs() < f64::EPSILON,
+            "builder dispatch mismatch"
+        );
+        assert!(
+            (score_agent("verification", &factors) - score_verification(&factors)).abs()
+                < f64::EPSILON,
+            "verification dispatch mismatch"
+        );
+        assert!(
+            (score_agent("hardener", &factors) - score_hardener(&factors)).abs() < f64::EPSILON,
+            "hardener dispatch mismatch"
+        );
+    }
+
+    #[test]
+    fn test_score_agent_unknown() {
+        let factors = default_factors();
+        let score = score_agent("unknown", &factors);
+        assert!(
+            (score - 0.5).abs() < f64::EPSILON,
+            "Expected 0.5 for unknown agent, got {}",
+            score
+        );
+    }
+
+    #[test]
+    fn test_scores_clamp() {
+        let factors = ScoreFactors {
+            attributed_fix_count: 20,
+            ..default_factors()
+        };
+        assert!(
+            score_specification(&factors) >= 0.0,
+            "specification score should clamp to >= 0.0"
+        );
+        assert!(
+            (score_specification(&factors) - 0.0).abs() < f64::EPSILON,
+            "specification: expected 0.0, got {}",
+            score_specification(&factors)
+        );
+        assert!(
+            score_builder(&factors) >= 0.0,
+            "builder score should clamp to >= 0.0"
+        );
+        assert!(
+            (score_builder(&factors) - 0.0).abs() < f64::EPSILON,
+            "builder: expected 0.0, got {}",
+            score_builder(&factors)
+        );
+        assert!(
+            score_verification(&factors) >= 0.0,
+            "verification score should clamp to >= 0.0"
+        );
+        assert!(
+            (score_verification(&factors) - 0.0).abs() < f64::EPSILON,
+            "verification: expected 0.0, got {}",
+            score_verification(&factors)
+        );
+        assert!(
+            score_hardener(&factors) >= 0.0,
+            "hardener score should clamp to >= 0.0"
+        );
+        assert!(
+            (score_hardener(&factors) - 0.0).abs() < f64::EPSILON,
+            "hardener: expected 0.0, got {}",
+            score_hardener(&factors)
+        );
+    }
+
+    // ========================================================================
+    // DB-dependent tests (in-memory SQLite)
+    // ========================================================================
+
+    /// Create all required tables in an in-memory SQLite database.
+    fn setup_test_db() -> Connection {
+        let conn = Connection::open_in_memory().expect("Failed to open in-memory SQLite");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE generation_pipeline_artifacts (
+                id TEXT PRIMARY KEY,
+                workflow_id TEXT,
+                description TEXT NOT NULL,
+                fixer_snapshots TEXT,
+                builder_raw_output TEXT,
+                specification_prompt TEXT,
+                builder_prompt TEXT,
+                hardener_prompt TEXT,
+                specification_criteria TEXT,
+                success INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE reflection_fixes (
+                id TEXT PRIMARY KEY,
+                source_task_run_id TEXT NOT NULL,
+                reflection_task_run_id TEXT NOT NULL,
+                fix_type TEXT NOT NULL,
+                fix_description TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'applied',
+                effectiveness TEXT,
+                source_agent TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE unified_workflows (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL
+            );
+            CREATE TABLE task_runs (
+                id TEXT PRIMARY KEY,
+                workflow_name TEXT
+            );
+            CREATE TABLE workflow_generation_feedback (
+                id TEXT PRIMARY KEY,
+                workflow_id TEXT NOT NULL,
+                feedback_type TEXT NOT NULL,
+                edited_field TEXT,
+                feedback_data TEXT,
+                rating INTEGER,
+                created_at TEXT NOT NULL
+            );
+            "#,
+        )
+        .expect("Failed to create test tables");
+        conn
+    }
+
+    #[test]
+    fn test_collect_score_factors() {
+        let conn = setup_test_db();
+
+        // Insert an artifact with 2 fixer snapshots
+        conn.execute(
+            "INSERT INTO generation_pipeline_artifacts (id, description, fixer_snapshots, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params!["art-1", "test artifact", "[{}, {}]", "2026-01-01T00:00:00Z"],
+        )
+        .expect("Failed to insert artifact");
+
+        let factors = collect_score_factors(&conn, "art-1", None, "builder")
+            .expect("collect_score_factors failed");
+
+        assert_eq!(
+            factors.fixer_iterations, 2,
+            "Expected 2 fixer iterations from '[{{}}, {{}}]', got {}",
+            factors.fixer_iterations
+        );
+    }
+
+    #[test]
+    fn test_export_training_data() {
+        let conn = setup_test_db();
+
+        // Insert an artifact with builder prompt and output
+        conn.execute(
+            "INSERT INTO generation_pipeline_artifacts (id, description, builder_prompt, builder_raw_output, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "art-2",
+                "test artifact",
+                "test prompt",
+                "test output",
+                "2026-01-01T00:00:00Z"
+            ],
+        )
+        .expect("Failed to insert artifact");
+
+        let examples =
+            export_training_data(&conn, "builder", 0.0, 10).expect("export_training_data failed");
+
+        assert_eq!(
+            examples.len(),
+            1,
+            "Expected 1 training example, got {}",
+            examples.len()
+        );
+        assert_eq!(examples[0].prompt, "test prompt");
+        assert_eq!(examples[0].completion, "test output");
+        assert_eq!(examples[0].agent, "builder");
+        assert!(
+            examples[0].score >= 0.0,
+            "Score should be >= 0.0, got {}",
+            examples[0].score
+        );
+    }
+}

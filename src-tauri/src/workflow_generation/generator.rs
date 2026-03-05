@@ -482,6 +482,9 @@ pub fn generate_workflow(
 
     // ── Step 1: Builder Agent ──────────────────────────────────────────────
     let builder_start = Instant::now();
+    let builder_insights_section = self_improve_ctx
+        .as_ref()
+        .map(self_improve::format_builder_insights);
     let mut workflow = match run_builder_agent(
         &effective_request,
         &discovery_context,
@@ -491,6 +494,7 @@ pub fn generate_workflow(
         query_embedding,
         generation_model,
         generation_provider,
+        builder_insights_section.as_deref(),
     ) {
         Ok((w, prompt)) => {
             artifact_builder.builder_duration_ms = Some(builder_start.elapsed().as_millis() as u64);
@@ -789,6 +793,7 @@ fn run_builder_agent(
     query_embedding: Option<&[f32]>,
     model_override: Option<&str>,
     provider_override: Option<&str>,
+    builder_insights: Option<&str>,
 ) -> Result<(UnifiedWorkflow, String), Box<GenerateWorkflowResponse>> {
     let schema_context = if conn.is_some() || query_embedding.is_some() {
         build_schema_context_full(&request.description, conn, query_embedding)
@@ -866,6 +871,13 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
     let skills_section = format_skills_for_generator(&skill_registry);
     if !skills_section.is_empty() {
         sections.push(skills_section);
+    }
+
+    // Inject builder insights from self-improvement analysis
+    if let Some(insights) = builder_insights {
+        if !insights.is_empty() {
+            sections.push(insights.to_string());
+        }
     }
 
     // Inject acceptance criteria section (before user prompt so builder sees it)

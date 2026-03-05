@@ -204,6 +204,10 @@ pub struct WorkflowStage {
     /// If the condition is not met, the stage is skipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub condition: Option<StageCondition>,
+    /// When true, run completion prompt steps BEFORE automation steps.
+    /// Default (false) runs automation first, then prompts.
+    #[serde(default)]
+    pub completion_prompts_first: bool,
 }
 
 /// A unified workflow with steps organized by phase
@@ -361,6 +365,12 @@ pub struct UnifiedWorkflow {
     #[serde(default = "default_reflection_mode")]
     pub reflection_mode: bool,
 
+    /// When true, run completion prompt steps BEFORE automation steps.
+    /// Used by meta-workflows so AI hardener runs before save_workflow_artifact.
+    /// Default (false) runs automation first, then prompts.
+    #[serde(default)]
+    pub completion_prompts_first: bool,
+
     /// ISO 8601 timestamp of creation
     #[serde(default)]
     pub created_at: String,
@@ -404,6 +414,7 @@ impl UnifiedWorkflow {
             model_overrides: self.model_overrides.clone(),
             approval_gate: self.approval_gate,
             condition: None,
+            completion_prompts_first: self.completion_prompts_first,
         }]
     }
 }
@@ -519,6 +530,9 @@ pub struct CreateUnifiedWorkflowRequest {
     /// Whether to enable reflection mode during agentic iterations
     #[serde(default)]
     pub reflection_mode: Option<bool>,
+    /// When true, run completion prompt steps BEFORE automation steps
+    #[serde(default)]
+    pub completion_prompts_first: Option<bool>,
 }
 
 /// Request body for updating a unified workflow
@@ -568,6 +582,8 @@ pub struct UpdateUnifiedWorkflowRequest {
     pub approval_gate: Option<bool>,
     /// Whether to enable reflection mode during agentic iterations
     pub reflection_mode: Option<bool>,
+    /// When true, run completion prompt steps BEFORE automation steps
+    pub completion_prompts_first: Option<bool>,
 }
 
 /// Query parameters for searching unified workflows
@@ -778,6 +794,7 @@ pub fn workflow_to_stage_config(
         timeout_seconds: workflow.timeout_seconds,
         approval_gate: workflow.approval_gate,
         condition: None, // Top-level workflows have no stage condition
+        completion_prompts_first: workflow.completion_prompts_first,
     }
 }
 
@@ -834,5 +851,6 @@ pub fn stage_to_stage_config(
         timeout_seconds: stage.timeout_seconds,
         approval_gate: stage.approval_gate,
         condition: stage.condition.clone(),
+        completion_prompts_first: stage.completion_prompts_first,
     }
 }

@@ -243,6 +243,10 @@ fn step_name_from(step: &Value) -> Option<String> {
 }
 
 fn validate_steps(steps: &[Value], expected_phase: &str, errors: &mut Vec<ValidationError>) {
+    // For stages, expected_phase is "stages[N].phase_name" — extract the base phase
+    // name for comparison, since steps store plain phase values like "verification".
+    let base_phase = expected_phase.rsplit('.').next().unwrap_or(expected_phase);
+
     for (i, step) in steps.iter().enumerate() {
         let sname = step_name_from(step);
 
@@ -284,15 +288,15 @@ fn validate_steps(steps: &[Value], expected_phase: &str, errors: &mut Vec<Valida
             });
         }
 
-        // Validate phase matches array
+        // Validate phase matches array (compare against base phase, not prefixed path)
         if let Some(phase) = step.get("phase").and_then(|v| v.as_str()) {
-            if phase != expected_phase {
+            if phase != base_phase {
                 errors.push(ValidationError {
                     kind: ValidationErrorKind::Structural,
                     field: format!("{}_steps[{}].phase", expected_phase, i),
                     message: format!(
                         "Step phase '{}' doesn't match array '{}'. Phase field must match the array it's in.",
-                        phase, expected_phase
+                        phase, base_phase
                     ),
                     step_name: sname.clone(),
                 });
@@ -1115,6 +1119,7 @@ mod tests {
             stop_on_failure: false,
             approval_gate: false,
             reflection_mode: false,
+            completion_prompts_first: false,
             model_overrides: std::collections::HashMap::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
@@ -1230,6 +1235,7 @@ mod tests {
             stop_on_failure: false,
             approval_gate: false,
             reflection_mode: false,
+            completion_prompts_first: false,
             model_overrides: std::collections::HashMap::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
@@ -1356,6 +1362,7 @@ mod tests {
             stop_on_failure: false,
             approval_gate: false,
             reflection_mode: false,
+            completion_prompts_first: false,
             model_overrides: std::collections::HashMap::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
@@ -1428,6 +1435,7 @@ mod tests {
             stop_on_failure: false,
             approval_gate: false,
             reflection_mode: false,
+            completion_prompts_first: false,
             model_overrides: std::collections::HashMap::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
@@ -1772,6 +1780,7 @@ mod tests {
             stop_on_failure: false,
             approval_gate: false,
             reflection_mode: false,
+            completion_prompts_first: false,
             model_overrides: std::collections::HashMap::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),

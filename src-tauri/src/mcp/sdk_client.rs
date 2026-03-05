@@ -138,10 +138,10 @@ struct ConnectionHealthResult {
 /// Connect response
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ConnectResponse {
-    app: SdkAppInfo,
-    url: String,
-    base_path: String,
+pub struct ConnectResponse {
+    pub app: SdkAppInfo,
+    pub url: String,
+    pub base_path: String,
 }
 
 // =============================================================================
@@ -259,36 +259,55 @@ async fn handle_connect(
         }
     }
 
+    // Delegate to the shared connect_sdk_app function
+    match connect_sdk_app(
+        &state.sdk_connection,
+        &url,
+        req.port,
+        req.app_id,
+        req.app_name,
+        req.app_type,
+        req.framework,
+    )
+    .await
+    {
+        Ok(response) => Json(ApiResponse::success(response)),
+        Err(e) => Json(ApiResponse::error(e)),
+    }
+}
+
+/// Connect to an SDK app by URL. Shared logic used by both `handle_connect`
+/// (user-initiated) and auto-connect (proxy creation).
+///
+/// When called from auto-connect, the `app_*` / `framework` hints will be `None`
+/// and values are inferred from the health response.
+pub async fn connect_sdk_app(
+    sdk_connection: &tokio::sync::Mutex<SdkConnectionManager>,
+    url: &str,
+    port_hint: Option<u16>,
+    app_id: Option<String>,
+    app_name: Option<String>,
+    app_type: Option<String>,
+    framework: Option<String>,
+) -> Result<ConnectResponse, String> {
     // Create HTTP client with timeout
     // 30s request timeout matches the UI Bridge IPC timeout — the app's snapshot/elements
     // endpoints proxy through the IPC layer and can take >10s on cold pages.
-    let client = match reqwest::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .connect_timeout(std::time::Duration::from_secs(5))
         .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return Json(ApiResponse::error(format!(
-                "Failed to create HTTP client: {}",
-                e
-            )))
-        }
-    };
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
     // Try to hit the health endpoint to validate the app
-    // First try /ui-bridge/health, then /health
-    let (base_path, health_data) = match try_health_check(&client, &url).await {
-        Ok(result) => result,
-        Err(e) => return Json(ApiResponse::error(e)),
-    };
+    let (base_path, health_data) = try_health_check(&client, url).await?;
 
-    // Extract app info from health response or from request
+    // Extract app info from health response or from provided hints
     let ui_bridge_meta = health_data
         .get("uiBridge")
         .or_else(|| health_data.get("data").and_then(|d| d.get("uiBridge")));
 
-    let port = req.port.unwrap_or_else(|| {
+    let port = port_hint.unwrap_or_else(|| {
         url.split(':')
             .next_back()
             .and_then(|p| p.parse().ok())
@@ -296,25 +315,25 @@ async fn handle_connect(
     });
 
     let app_info = SdkAppInfo {
-        app_id: req.app_id.unwrap_or_else(|| {
+        app_id: app_id.unwrap_or_else(|| {
             ui_bridge_meta
                 .and_then(|m| m.get("appId").and_then(|v| v.as_str()))
                 .unwrap_or("unknown")
                 .to_string()
         }),
-        app_name: req.app_name.unwrap_or_else(|| {
+        app_name: app_name.unwrap_or_else(|| {
             ui_bridge_meta
                 .and_then(|m| m.get("appName").and_then(|v| v.as_str()))
                 .unwrap_or("Unknown App")
                 .to_string()
         }),
-        app_type: req.app_type.unwrap_or_else(|| {
+        app_type: app_type.unwrap_or_else(|| {
             ui_bridge_meta
                 .and_then(|m| m.get("appType").and_then(|v| v.as_str()))
                 .unwrap_or("web")
                 .to_string()
         }),
-        framework: req.framework.or_else(|| {
+        framework: framework.or_else(|| {
             ui_bridge_meta
                 .and_then(|m| m.get("framework").and_then(|v| v.as_str()))
                 .map(|s| s.to_string())
@@ -338,26 +357,26 @@ async fn handle_connect(
 
     let response = ConnectResponse {
         app: app_info.clone(),
-        url: url.clone(),
+        url: url.to_string(),
         base_path: base_path.clone(),
     };
 
     // Store connection in manager and set as active
-    let mut manager = state.sdk_connection.lock().await;
+    let mut manager = sdk_connection.lock().await;
     manager.connections.insert(
-        url.clone(),
+        url.to_string(),
         SdkConnection {
-            app_url: url.clone(),
+            app_url: url.to_string(),
             base_path,
             app_info,
             client,
             connected_at,
         },
     );
-    manager.active_url = Some(url);
+    manager.active_url = Some(url.to_string());
 
     info!("Connected to SDK app: {}", response.app.app_name);
-    Json(ApiResponse::success(response))
+    Ok(response)
 }
 
 /// Try health check on an SDK app, returning (base_path, health_json)
@@ -369,6 +388,7 @@ async fn try_health_check(
     let paths: &[(&str, &str)] = &[
         ("/api/ui-bridge/health", "/api/ui-bridge"),
         ("/ui-bridge/health", "/ui-bridge"),
+        ("/__ui-bridge/health", "/__ui-bridge"),
         ("/health", ""),
     ];
 
@@ -1531,4 +1551,53 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/ui-bridge/sdk/design/style-guide",
             get(handle_design_get_style_guide).delete(handle_design_clear_style_guide),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_localhost_with_port() {
+        assert_eq!(
+            normalize_localhost_url("http://localhost:3000/path"),
+            "http://127.0.0.1:3000/path"
+        );
+    }
+
+    #[test]
+    fn normalize_bare_localhost() {
+        assert_eq!(
+            normalize_localhost_url("http://localhost"),
+            "http://127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn normalize_localhost_with_trailing_slash() {
+        assert_eq!(
+            normalize_localhost_url("http://localhost/"),
+            "http://127.0.0.1/"
+        );
+    }
+
+    #[test]
+    fn normalize_non_localhost_unchanged() {
+        let url = "http://192.168.1.10:3000/api";
+        assert_eq!(normalize_localhost_url(url), url);
+    }
+
+    #[test]
+    fn normalize_already_ip_unchanged() {
+        let url = "http://127.0.0.1:5000";
+        assert_eq!(normalize_localhost_url(url), url);
+    }
+
+    #[test]
+    fn normalize_preserves_path_and_query() {
+        assert_eq!(
+            normalize_localhost_url("http://localhost:8080/api/v1?key=val"),
+            "http://127.0.0.1:8080/api/v1?key=val"
+        );
+    }
 }

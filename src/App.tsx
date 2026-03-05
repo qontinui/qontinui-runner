@@ -633,7 +633,9 @@ function AppContent() {
         // If not in the React ref, try fetching from the backend's last-inline store
         if (!inlinePayload || inlinePayload.name !== rawName) {
           try {
-            const inlineResponse = await tracedFetch(`${getApiBase()}/unified-workflows/last-inline`);
+            const inlineResponse = await tracedFetch(
+              `${getApiBase()}/unified-workflows/last-inline`,
+            );
             if (inlineResponse.ok) {
               const inlineResult = await inlineResponse.json();
               if (inlineResult.data?.name === rawName) {

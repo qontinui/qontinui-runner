@@ -138,10 +138,9 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
   const saveClaudeConfigDirs = useCallback(
     async (dirs: string[]) => {
       try {
-        const result = await invoke<TauriResult<ClaudeConfigDirsData>>(
-          "save_claude_config_dirs",
-          { dirs },
-        );
+        const result = await invoke<TauriResult<ClaudeConfigDirsData>>("save_claude_config_dirs", {
+          dirs,
+        });
         if (result?.success && result.data) {
           setClaudeConfigDirs(result.data.dirs);
           onLog("success", `Saved ${result.data.dirs.length} Claude config directories`);
@@ -304,10 +303,7 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
             </div>
           ) : (
             claudeConfigDirs.map((dir) => (
-              <div
-                key={dir}
-                className="flex items-center gap-2 p-2 rounded-lg bg-muted/30 group"
-              >
+              <div key={dir} className="flex items-center gap-2 p-2 rounded-lg bg-muted/30 group">
                 <span className="text-sm truncate flex-1">{dir}</span>
                 <button
                   onClick={() => handleRemoveClaudeDir(dir)}

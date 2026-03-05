@@ -195,9 +195,12 @@ export function KnowledgeTab({ taskRunId }: KnowledgeTabProps) {
       if (!taskRunId) return;
 
       try {
-        const response = await tracedFetch(`${getApiBase()}/task-runs/${taskRunId}/reflection-fixes`, {
-          signal: controller.signal,
-        });
+        const response = await tracedFetch(
+          `${getApiBase()}/task-runs/${taskRunId}/reflection-fixes`,
+          {
+            signal: controller.signal,
+          },
+        );
         if (response.ok) {
           const result = await response.json();
           if (!cancelled && result.success && result.data) {

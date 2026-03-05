@@ -113,9 +113,7 @@ function AppCard({ app, onInject }: { app: DiscoveredApp; onInject?: (url: strin
         </div>
         <div className="flex items-center gap-3 mt-1 text-xs text-muted-foreground">
           <span className="truncate">{app.url}</span>
-          {app.element_count != null && (
-            <span>{app.element_count} elements</span>
-          )}
+          {app.element_count != null && <span>{app.element_count} elements</span>}
           {app.version && <span>v{app.version}</span>}
         </div>
       </div>

@@ -54,6 +54,10 @@ pub fn path_to_name(path: &str) -> String {
 /// Status response
 #[derive(Debug, Serialize)]
 pub struct StatusResponse {
+    /// Name of this runner instance (None for the primary/default runner)
+    pub instance_name: Option<String>,
+    /// The HTTP API port this runner is listening on
+    pub api_port: u16,
     pub executor_running: bool,
     pub executor_state: String,
     pub config_loaded: bool,
@@ -945,13 +949,82 @@ pub async fn get_status(
     // Check AI analysis status using async version to avoid blocking
     let ai_running = has_running_ai_tasks_async(state.app_state.checkpoint_db.clone()).await;
 
+    let instance_name = std::env::var("QONTINUI_INSTANCE_NAME").ok();
+    let api_port = state
+        .app_state
+        .api_port
+        .load(std::sync::atomic::Ordering::Relaxed);
+
     Ok(Json(ApiResponse::success(StatusResponse {
+        instance_name,
+        api_port,
         executor_running: result.0,
         executor_state: result.1,
         config_loaded: result.2,
         config_path: result.3,
         ai_analysis_running: ai_running,
     })))
+}
+
+/// Response for a single runner instance in the discovery endpoint.
+#[derive(Debug, Serialize)]
+pub struct DiscoveredInstance {
+    /// Instance name (None for the primary/default runner)
+    name: Option<String>,
+    /// HTTP API port
+    port: u16,
+    /// Whether this is the runner handling the current request
+    is_self: bool,
+    /// Whether the instance's HTTP API is reachable
+    reachable: bool,
+}
+
+/// Discover all runner instances (this runner + configured secondary instances).
+///
+/// Returns the current runner plus all configured instances with reachability status.
+/// This allows callers to find a runner by name and resolve it to a port.
+pub async fn get_instances(
+    State(state): State<Arc<ApiState>>,
+) -> Json<ApiResponse<Vec<DiscoveredInstance>>> {
+    let self_port = state
+        .app_state
+        .api_port
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let self_name = std::env::var("QONTINUI_INSTANCE_NAME").ok();
+
+    let mut instances = vec![DiscoveredInstance {
+        name: self_name,
+        port: self_port,
+        is_self: true,
+        reachable: true,
+    }];
+
+    // Add configured secondary instances (skip any that match our own port)
+    let configs = crate::settings::get_runner_instances();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(1))
+        .build()
+        .ok();
+
+    for config in &configs {
+        if config.port == self_port {
+            continue;
+        }
+        let reachable = if let Some(ref client) = client {
+            let url = format!("http://localhost:{}/health", config.port);
+            client.get(&url).send().await.is_ok()
+        } else {
+            false
+        };
+        instances.push(DiscoveredInstance {
+            name: Some(config.name.clone()),
+            port: config.port,
+            is_self: false,
+            reachable,
+        });
+    }
+
+    Json(ApiResponse::success(instances))
 }
 
 /// Get tool version for MCP caching
@@ -5131,6 +5204,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/findings/summary", get(get_findings_summary))
         .route("/launch-debug-chrome", post(launch_debug_chrome))
         .route("/status", get(get_status))
+        .route("/instances", get(get_instances))
         .route("/tool-version", get(get_tool_version))
         .route("/load-config", post(load_config))
         .route("/load-last-config", post(load_last_config))

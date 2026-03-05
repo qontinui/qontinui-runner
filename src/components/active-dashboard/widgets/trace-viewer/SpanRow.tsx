@@ -43,9 +43,7 @@ export const SpanRow: React.FC<SpanRowProps> = React.memo(
           className="w-[240px] min-w-[240px] flex items-center gap-1.5 px-2 text-xs truncate"
           style={{ paddingLeft: `${depth * 20 + 8}px` }}
         >
-          {!span.success && (
-            <span className="w-1.5 h-1.5 rounded-full bg-red-500 flex-shrink-0" />
-          )}
+          {!span.success && <span className="w-1.5 h-1.5 rounded-full bg-red-500 flex-shrink-0" />}
           <span className={`truncate ${span.success ? "text-zinc-300" : "text-red-400"}`}>
             {displayName}
           </span>
@@ -76,7 +74,7 @@ export const SpanRow: React.FC<SpanRowProps> = React.memo(
         </div>
       </div>
     );
-  }
+  },
 );
 
 SpanRow.displayName = "SpanRow";

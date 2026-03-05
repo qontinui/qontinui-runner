@@ -8,6 +8,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { Search, X, Check as CheckIcon, Workflow, FolderOpen, Layers } from "lucide-react";
 import type { WorkflowPhase, UnifiedWorkflow } from "../../types/unified-workflow";
+import { getTotalStepCount } from "../../types/unified-workflow";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 
 interface WorkflowLibraryPickerProps {
@@ -101,16 +102,6 @@ export function WorkflowLibraryPicker({
   // Get unique categories for filter
   const categories = [...new Set(workflows.map((w) => w.category).filter(Boolean))];
 
-  // Get step count for a workflow
-  const getStepCount = (workflow: UnifiedWorkflow): number => {
-    return (
-      (workflow.setup_steps?.length || 0) +
-      (workflow.verification_steps?.length || 0) +
-      (workflow.agentic_steps?.length || 0) +
-      (workflow.completion_steps?.length || 0)
-    );
-  };
-
   const handleSelect = useCallback(() => {
     const selected = workflows.find((w) => w.id === selectedId);
     if (selected) {
@@ -199,7 +190,7 @@ export function WorkflowLibraryPicker({
             <div className="grid grid-cols-1 gap-2">
               {filteredWorkflows.map((workflow) => {
                 const isSelected = selectedId === workflow.id;
-                const stepCount = getStepCount(workflow);
+                const stepCount = getTotalStepCount(workflow);
 
                 return (
                   <button

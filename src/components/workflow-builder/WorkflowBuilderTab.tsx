@@ -56,6 +56,7 @@ import type {
   ModelOverrides,
 } from "../../types";
 import { generateStepId } from "../../types";
+import { getTotalStepCount } from "../../types/unified-workflow";
 import { useGlobalLogSources } from "../../hooks/useGlobalLogSources";
 import {
   type SettingDef,
@@ -1256,7 +1257,9 @@ function WorkflowBuilderContent({
 
     setIsExportingWorkflow(true);
     try {
-      const response = await tracedFetch(`${getApiBase()}/unified-workflows/${state.workflow.id}/export`);
+      const response = await tracedFetch(
+        `${getApiBase()}/unified-workflows/${state.workflow.id}/export`,
+      );
       const data = await response.json();
       if (data.success && data.data) {
         const exportData = data.data as WorkflowExport;
@@ -1998,15 +2001,7 @@ function WorkflowBuilderContent({
     [state.selectedStepId, moveStep, removeStep, selectStep],
   );
 
-  // Get step count for a workflow
-  const getStepCount = (workflow: UnifiedWorkflow): number => {
-    return (
-      (workflow.setup_steps?.length || 0) +
-      (workflow.verification_steps?.length || 0) +
-      (workflow.agentic_steps?.length || 0) +
-      (workflow.completion_steps?.length || 0)
-    );
-  };
+  const getStepCount = getTotalStepCount;
 
   return (
     <div className="h-full flex">

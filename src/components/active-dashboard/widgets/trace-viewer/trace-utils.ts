@@ -17,7 +17,7 @@ export function buildTraceTree(spans: TraceSpan[]): TraceTreeNode[] {
 
   // Sort by start timestamp
   const sorted = [...spans].sort(
-    (a, b) => new Date(a.start_ts).getTime() - new Date(b.start_ts).getTime()
+    (a, b) => new Date(a.start_ts).getTime() - new Date(b.start_ts).getTime(),
   );
 
   const traceStart = new Date(sorted[0].start_ts).getTime();
@@ -130,9 +130,7 @@ export function computeInsights(spans: TraceSpan[]): TraceInsights {
 
   // Total duration from first start to last end
   const starts = spans.map((s) => new Date(s.start_ts).getTime());
-  const ends = spans
-    .filter((s) => s.end_ts)
-    .map((s) => new Date(s.end_ts!).getTime());
+  const ends = spans.filter((s) => s.end_ts).map((s) => new Date(s.end_ts!).getTime());
 
   const totalDurationMs =
     ends.length > 0

@@ -47,17 +47,28 @@ pub fn should_launch_reflection(
     let source_id = source_task_run_id.to_string();
 
     db.with_conn(|conn| {
-        // Guard 0: Check if a reflection workflow is already running
+        // Guard 0: Check if a reflection for the SAME workflow is already running.
+        // Only block if the running reflection's source shares the same workflow_name
+        // as our source task run. Unrelated stale reflections must not block new ones.
         let has_running: bool = conn
             .query_row(
-                "SELECT COUNT(*) > 0 FROM task_runs WHERE status = 'running' AND is_reflection = 1 AND workflow_type = 'unified'",
-                [],
+                r#"SELECT COUNT(*) > 0 FROM task_runs r
+                   WHERE r.status = 'running'
+                     AND r.is_reflection = 1
+                     AND r.workflow_type = 'unified'
+                     AND r.reflection_source_task_run_id IN (
+                         SELECT s.id FROM task_runs s
+                         WHERE s.workflow_name = (
+                             SELECT workflow_name FROM task_runs WHERE id = ?1
+                         )
+                     )"#,
+                rusqlite::params![source_id],
                 |row| row.get(0),
             )
             .unwrap_or(false);
 
         if has_running {
-            debug!("Skipping reflection — another reflection workflow is already running");
+            debug!("Skipping reflection — a reflection for the same workflow is already running");
             return Ok(false);
         }
 
