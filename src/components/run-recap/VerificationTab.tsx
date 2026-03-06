@@ -18,12 +18,15 @@ import {
   ShieldCheck,
   FileText,
   AlertCircle,
+  Globe,
 } from "lucide-react";
 import { useTaskRunVerificationResults } from "../../hooks/useAiData";
 import type {
   ConsoleError,
   VerificationPhaseResult,
   VerificationStepResult,
+  SnapshotAssertOutputData,
+  SnapshotAssertionResult,
 } from "../../types/aiData";
 
 interface VerificationTabProps {
@@ -49,9 +52,78 @@ function StepTypeIcon({ stepType }: { stepType: string }) {
     case "command":
     case "shell_command": // Legacy
       return <FileText className="w-4 h-4" />;
+    case "ui_bridge":
+      return <Globe className="w-4 h-4" />;
+    case "prompt":
+      return <AlertCircle className="w-4 h-4" />;
     default:
       return <AlertCircle className="w-4 h-4" />;
   }
+}
+
+/**
+ * Check if output_data is a snapshot_assert result.
+ */
+function isSnapshotAssertOutput(data: Record<string, unknown> | null | undefined): boolean {
+  return data != null && data.action === "snapshot_assert" && Array.isArray(data.results);
+}
+
+/**
+ * Displays per-assertion results from a snapshot_assert UI Bridge step.
+ */
+function SnapshotAssertResults({
+  data,
+  dataUiPrefix,
+}: {
+  data: SnapshotAssertOutputData;
+  dataUiPrefix: string;
+}) {
+  return (
+    <div data-ui-id={`${dataUiPrefix}-snapshot-assertions`}>
+      <h4 className="text-sm font-medium mb-2 flex items-center gap-1.5">
+        <Globe className="w-3.5 h-3.5" />
+        Snapshot Assertions ({data.passed}/{data.total} passed)
+      </h4>
+      <div className="space-y-1">
+        {data.results.map((assertion: SnapshotAssertionResult) => (
+          <div
+            key={assertion.id}
+            className={`text-xs p-2 rounded flex items-start gap-2 ${
+              assertion.passed ? "bg-green-500/10 text-green-400" : "bg-red-500/10 text-red-400"
+            }`}
+          >
+            <span className="flex-shrink-0 mt-0.5">
+              {assertion.passed ? (
+                <CheckCircle2 className="w-3.5 h-3.5" />
+              ) : (
+                <XCircle className="w-3.5 h-3.5" />
+              )}
+            </span>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2 mb-0.5">
+                <span className="font-medium">{assertion.description}</span>
+                <span className="text-[10px] px-1.5 py-0.5 rounded bg-muted/50 text-muted-foreground font-mono">
+                  {assertion.assertionType}
+                </span>
+                <span
+                  className={`text-[10px] px-1.5 py-0.5 rounded ${
+                    assertion.severity === "critical"
+                      ? "bg-red-500/20 text-red-400"
+                      : assertion.severity === "warning"
+                        ? "bg-amber-500/20 text-amber-400"
+                        : "bg-muted/50 text-muted-foreground"
+                  }`}
+                >
+                  {assertion.severity}
+                </span>
+              </div>
+              <span className="text-muted-foreground">{assertion.detail}</span>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 function ConsoleErrorsList({
@@ -100,12 +172,22 @@ function StepResultCard({
 }) {
   const consoleErrors = step.verification_details?.console_errors;
   const hasConsoleErrors = consoleErrors && consoleErrors.length > 0;
+  const snapshotAssertData = isSnapshotAssertOutput(step.output_data)
+    ? (step.output_data as unknown as SnapshotAssertOutputData)
+    : null;
   const hasDetails =
     step.error ||
     step.verification_details?.stdout ||
     step.verification_details?.stderr ||
     step.verification_details?.console_output ||
-    hasConsoleErrors;
+    hasConsoleErrors ||
+    snapshotAssertData;
+
+  // Resolve assertion counts: prefer verification_details, fall back to snapshot_assert output_data
+  const assertionsPassed =
+    step.verification_details?.assertions_passed ?? snapshotAssertData?.passed ?? undefined;
+  const assertionsTotal =
+    step.verification_details?.assertions_total ?? snapshotAssertData?.total ?? undefined;
 
   return (
     <div
@@ -153,13 +235,11 @@ function StepResultCard({
           </span>
 
           {/* Assertions count if available */}
-          {step.verification_details?.assertions_total !== undefined &&
-            step.verification_details?.assertions_total !== null && (
-              <span className="text-xs text-muted-foreground">
-                {step.verification_details.assertions_passed ?? 0}/
-                {step.verification_details.assertions_total} assertions
-              </span>
-            )}
+          {assertionsTotal !== undefined && assertionsTotal !== null && (
+            <span className="text-xs text-muted-foreground">
+              {assertionsPassed ?? 0}/{assertionsTotal} assertions
+            </span>
+          )}
 
           {hasDetails &&
             (isExpanded ? (
@@ -172,6 +252,14 @@ function StepResultCard({
 
       {isExpanded && hasDetails && (
         <div className="border-t border-border p-4 space-y-3 bg-muted/20">
+          {/* Snapshot Assert per-assertion results */}
+          {snapshotAssertData && (
+            <SnapshotAssertResults
+              data={snapshotAssertData}
+              dataUiPrefix={`verification-step-${step.step_index}`}
+            />
+          )}
+
           {/* Error message */}
           {step.error && (
             <div data-ui-id={`verification-step-${step.step_index}-error`}>
@@ -182,8 +270,8 @@ function StepResultCard({
             </div>
           )}
 
-          {/* Stdout */}
-          {step.verification_details?.stdout && (
+          {/* Stdout (skip for snapshot_assert since we show per-assertion results) */}
+          {step.verification_details?.stdout && !snapshotAssertData && (
             <div data-ui-id={`verification-step-${step.step_index}-stdout`}>
               <h4 className="text-sm font-medium mb-1">Output</h4>
               <pre className="text-xs text-muted-foreground bg-muted p-2 rounded overflow-x-auto whitespace-pre-wrap max-h-48 overflow-y-auto">

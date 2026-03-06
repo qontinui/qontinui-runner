@@ -1,0 +1,231 @@
+{
+  "version": "1.0.0",
+  "description": "Specs for the Run AI Data page — a structured viewer for all data accessible to AI via MCP tools during a workflow run. Organized into grouped sidebar navigation (AI Session, Execution Logs, Captures, Processes, Configuration) with panels for prompts, output, contexts, events, API requests, DOM snapshots, and more.",
+  "groups": [
+    {
+      "id": "ai-data-sidebar-navigation",
+      "name": "Sidebar Navigation and Data Categories",
+      "description": "The AI Data page uses a grouped sidebar navigation to organize the many types of data that AI can access during execution. Categories include AI Session (prompt, output, contexts), Execution Logs (events, API requests, MCP calls, image recognition, Playwright tests, AWAS steps, execution spans), Captures (DOM snapshots), Processes (sessions, output), and Configuration (loaded config, dev logs). Users navigate between these categories to inspect exactly what data the AI received and produced, which is essential for understanding AI decision-making and debugging integration issues.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "ai-data-sidebar-present",
+          "description": "The user can see a sidebar with grouped navigation categories for browsing different types of AI-accessible data, providing organized access to the full spectrum of data that flows between the system and AI",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "AI Session|Execution Logs|Configuration" },
+            "label": "Sidebar navigation groups"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-data-category-switching",
+          "description": "The user can click on any category in the sidebar to load the corresponding data panel in the main content area, switching between different data types without page reloads",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Category navigation item"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-data-collapsible-groups",
+          "description": "The user can expand and collapse sidebar navigation groups to focus on specific areas of interest and reduce visual clutter in the navigation panel",
+          "category": "semantic",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "AI Session|Execution" },
+            "label": "Collapsible navigation group"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "ai-data-session-data",
+      "name": "AI Session Data Inspection",
+      "description": "The AI Session group provides access to the prompt that was sent to AI, the consolidated AI output, and the context objects that were available during the session. This is the most commonly inspected data group because it directly shows what the AI was told, what it produced, and what context it had available. Users inspect these to verify prompt quality, understand AI reasoning, and debug cases where AI made unexpected decisions due to missing or incorrect context.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "ai-data-prompt-viewable",
+          "description": "The user can view the exact prompt that was sent to AI for the selected run, including all system instructions and user content, enabling verification that the AI received the correct instructions",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Prompt|prompt" },
+            "label": "AI prompt viewer"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-data-output-viewable",
+          "description": "The user can view the consolidated AI output for the selected run, rendered with proper formatting, providing a complete record of all AI-generated content",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Output|output" },
+            "label": "AI output viewer"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-data-contexts-viewable",
+          "description": "The user can view the context objects that were available to AI during the session, including file contents, configuration data, and other contextual information that informed AI decisions",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Context|context" },
+            "label": "Context data viewer"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "ai-data-execution-logs",
+      "name": "Execution Logs and Events",
+      "description": "The Execution Logs group provides access to structured event data from the run: task run events, API request logs, MCP tool calls, image recognition results, Playwright test results, AWAS steps, and execution spans. Each data type is displayed as structured JSON or formatted tables. This group is primarily used for debugging integration issues — understanding what API calls were made, what MCP tools were invoked, and how different system components interacted during execution.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "ai-data-events-viewable",
+          "description": "The user can view structured event data from the run, displayed as formatted JSON or tables, showing the sequence of events that occurred during execution and their payloads",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Events|events" },
+            "label": "Events data viewer"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-data-api-requests-viewable",
+          "description": "The user can view API requests made during the run, including URLs, methods, payloads, and responses, which is essential for debugging network-related failures",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "API|request" },
+            "label": "API requests viewer"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-data-mcp-calls-viewable",
+          "description": "The user can view MCP tool calls that AI made during execution, showing which tools were invoked, with what arguments, and what results were returned, providing transparency into AI tool usage",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "MCP|tool" },
+            "label": "MCP calls viewer"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "ai-data-captures-and-config",
+      "name": "Captures and Configuration",
+      "description": "The remaining data categories cover DOM snapshots captured during execution (showing the page structure at specific points), process session data, and configuration information. DOM snapshots are particularly valuable for debugging verification failures — they show exactly what the page looked like from a structural perspective at the time a check was run. Configuration data helps verify that the correct config was loaded during execution.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "ai-data-dom-snapshots",
+          "description": "The user can view DOM snapshots captured during execution, showing the page structure and element tree at specific points in time, which is essential for diagnosing why element-based verifications passed or failed",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "DOM|Snapshot|snapshot" },
+            "label": "DOM snapshots panel"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-data-loaded-config",
+          "description": "The user can view the configuration that was loaded during execution, verifying that the correct workflow configuration was used and understanding the parameters that governed execution",
+          "category": "semantic",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Config|Configuration|config" },
+            "label": "Loaded config viewer"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-data-structured-json-display",
+          "description": "Data throughout the page is displayed as properly formatted, syntax-highlighted JSON with expand/collapse capabilities, making it easy to inspect complex nested data structures",
+          "category": "semantic",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "JSON|json" },
+            "label": "Structured JSON display"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "AiDataViewerTab",
+    "author": "Joshua Spinak",
+    "createdAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "pageUrl": "/runs/ai-data",
+    "elementSource": "sdk",
+    "tags": ["run-ai-data", "data-viewer", "mcp-tools", "debugging", "observe"]
+  }
+}

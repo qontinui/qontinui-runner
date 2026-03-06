@@ -1,0 +1,429 @@
+{
+  "version": "1.0.0",
+  "description": "Semantic specs for the Workflow Builder page -- the core authoring environment where users create, edit, and manage multi-phase AI automation workflows. Users can generate complete workflows from natural language prompts using AI, manually build workflows step-by-step across four phases (setup, verification, agentic, completion), manage a sidebar library of saved workflows, configure individual steps, run workflows directly, and export/import workflows as JSON. The default landing state shows the AI Generate panel with a prompt textarea and spec source section; selecting a workflow reveals the full phase editor with Run, Save, and Export controls.",
+  "groups": [
+    {
+      "id": "wf-ai-generation",
+      "name": "AI Workflow Generation",
+      "description": "The default landing experience centers on AI-powered workflow generation. When no workflow is selected, users see a prominent panel inviting them to describe what they want to automate in natural language. The system generates a complete multi-phase workflow from the description, optionally incorporating page specs for spec-driven verification, attached contexts for additional AI guidance, and generation templates for common patterns. Users can select the AI provider and model, configure advanced options like max iterations and discovery mode, and choose between Generate (create and review) or Generate & Run (create and immediately execute). The prompt text persists across sessions via localStorage so users can refine their description over time.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "wf-ai-prompt-entry",
+          "description": "Users can enter a natural language description of the automation they want in a prominent text area, which serves as the primary input for AI workflow generation",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Generate Workflow with AI" },
+            "label": "AI generation panel heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "wf-ai-generate-action",
+          "description": "Users can trigger AI workflow generation from their prompt, producing a complete multi-phase workflow that appears in the editor for review and refinement before execution",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Generate" },
+            "label": "Generate button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "wf-ai-generate-and-run",
+          "description": "Users can generate and immediately execute a workflow in a single action, bypassing the manual review step for rapid iteration on automation tasks",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Generate & Run" },
+            "label": "Generate & Run button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "wf-ai-spec-source",
+          "description": "Users can attach page specification files as a source for the AI to generate spec-driven verification steps, enabling automated UI validation based on existing page specs",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Spec" },
+            "label": "Spec source section"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "wf-ai-provider-model",
+          "description": "Users can select the AI provider (Claude CLI, Claude API, Gemini CLI, Gemini API) and model to use for workflow generation, allowing control over generation quality and cost",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Provider" },
+            "label": "Provider selection area"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "wf-sidebar-library",
+      "name": "Workflow Sidebar Library",
+      "description": "The sidebar provides a persistent library of all saved workflows, allowing users to browse, search, create, duplicate, and delete workflows. It serves as the primary navigation mechanism for switching between workflows in the editor. Users can search by name to quickly locate a specific workflow, create new blank workflows, and manage their collection. The sidebar shows workflow names and metadata, and selecting a workflow loads it into the main editor panel. The sidebar can be toggled to maximize editor space.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "wf-sidebar-search-workflows",
+          "description": "Users can search saved workflows by name to quickly find a specific workflow without scrolling through the full list",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "searchbox" },
+            "label": "Workflow search input"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "wf-sidebar-create-new",
+          "description": "Users can create a new blank workflow from the sidebar, which opens an empty editor with all four phases ready for manual step configuration",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "New" },
+            "label": "New Workflow button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "wf-sidebar-select-workflow",
+          "description": "Users can click a workflow in the sidebar to load it into the main editor, replacing the AI generation panel with the full phase editor showing the workflow's steps and configuration",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Workflows" },
+            "label": "Workflows sidebar heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "wf-sidebar-toggle-visibility",
+          "description": "Users can collapse and expand the sidebar panel to maximize the editor workspace when the workflow library is not needed",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Sidebar toggle button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "wf-phase-editor",
+      "name": "Multi-Phase Workflow Editor",
+      "description": "When a workflow is loaded, the main content area displays a structured editor organized into four execution phases: Setup (environment preparation commands), Verification (checks and tests run between AI iterations), Agentic (AI prompts and instructions that drive the automation), and Completion (cleanup and finalization steps). Each phase section supports adding, removing, reordering, and configuring individual steps with type-specific editors. Users can expand and collapse phase sections to focus on the phase they are editing. The phase structure ensures workflows follow a predictable execution pattern.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "wf-phase-setup-section",
+          "description": "Users can define setup steps that run before AI execution to prepare the environment -- installing dependencies, starting services, or configuring the workspace",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Setup" },
+            "label": "Setup phase heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "wf-phase-verification-section",
+          "description": "Users can define verification steps that run between AI iterations to validate progress -- including shell commands, check groups, playwright tests, and UI bridge assertions",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Verification" },
+            "label": "Verification phase heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "wf-phase-agentic-section",
+          "description": "Users can define agentic steps containing AI prompts and instructions that drive the core automation work, with the AI iterating until verification passes or max iterations are reached",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Agentic" },
+            "label": "Agentic phase heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "wf-phase-completion-section",
+          "description": "Users can define completion steps that run after the AI finishes to clean up resources, generate reports, or finalize the automation output",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Completion" },
+            "label": "Completion phase heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "wf-phase-add-steps",
+          "description": "Users can add new steps to any phase using an add button that presents available step types (command, prompt, check, check group, playwright test, etc.) appropriate for that phase",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Add" },
+            "label": "Add step button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "wf-execution-controls",
+      "name": "Workflow Execution and Persistence",
+      "description": "The editor toolbar provides essential workflow lifecycle controls. Users can run the currently loaded workflow directly from the editor, save changes back to the library, export the workflow as a JSON file for sharing or backup, and import previously exported workflows. The Run button launches workflow execution and transitions the view to show execution progress. Save persists all step configurations, settings, and metadata. Export produces a portable JSON file that can be imported into another runner instance.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "wf-exec-run",
+          "description": "Users can execute the currently loaded workflow directly from the editor, launching the multi-phase execution pipeline and transitioning to the execution monitoring view",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Run" },
+            "label": "Run button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "wf-exec-save",
+          "description": "Users can save the current workflow state including all steps, settings, and metadata back to the persistent library for future use",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Save" },
+            "label": "Save button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "wf-exec-export",
+          "description": "Users can export the workflow as a portable JSON file for sharing with others or backing up workflow definitions",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Export" },
+            "label": "Export button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "wf-settings-configuration",
+      "name": "Workflow Settings and Configuration",
+      "description": "Each workflow has configurable settings that control execution behavior. Users can name and describe the workflow, select the AI provider and model, set max iterations for the verification loop, enable or disable reflection mode for self-improving workflows, configure timeouts, enable health checks for target services, and toggle various execution options. Settings are organized into logical sections and use toggle switches, dropdowns, and number inputs appropriate for each setting type. The settings panel is accessible via a gear icon when a workflow is loaded.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "wf-settings-name-desc",
+          "description": "Users can set a descriptive name and description for the workflow to identify it in the library and understand its purpose at a glance",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Name" },
+            "label": "Workflow name field label"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "wf-settings-iterations",
+          "description": "Users can configure the maximum number of verification-agentic loop iterations, controlling how many times the AI retries before the workflow stops",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Max Iterations" },
+            "label": "Max iterations setting"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "wf-settings-reflection",
+          "description": "Users can enable reflection mode which allows the workflow to analyze its own failures and generate improved strategies for subsequent iterations",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Reflection" },
+            "label": "Reflection mode setting"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "wf-settings-access",
+          "description": "Users can open the settings panel via a gear icon button to access all workflow configuration options without cluttering the main editor view",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Settings gear button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "wf-step-configuration",
+      "name": "Step Configuration and Library Integration",
+      "description": "Individual workflow steps can be configured with type-specific settings. Command steps have shell commands, working directories, and timeouts. Prompt steps have AI instruction text and context attachments. Check and check group steps reference items from the check library. Playwright test steps reference saved test scripts. Users can also pick steps from library pickers that show saved prompts, shell commands, checks, check groups, tests, and MCP server tools. The step configuration panel opens when a step is selected, showing all relevant fields for that step type. This tight integration with the asset library enables reuse across workflows.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "wf-step-type-variety",
+          "description": "Users can add multiple step types to workflows including shell commands, AI prompts, verification checks, check groups, playwright tests, and MCP tool invocations, each with type-appropriate configuration",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Setup" },
+            "label": "Phase section with add step capability"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "wf-step-library-pickers",
+          "description": "Users can browse and select from their saved asset library when adding steps, pulling in reusable prompts, commands, checks, and tests rather than configuring from scratch",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Workflows" },
+            "label": "Workflow builder with library integration"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "wf-step-inline-config",
+          "description": "Users can configure step-specific settings inline within the editor, including command text, working directory, timeout values, prompt content, and assertion parameters",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Setup" },
+            "label": "Phase section containing configurable steps"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "WorkflowBuilderTab",
+    "author": "Joshua Spinak",
+    "createdAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "pageUrl": "/build/workflows",
+    "elementSource": "sdk",
+    "tags": ["workflow-builder", "ai-generation", "multi-phase", "editor", "tier-1"]
+  }
+}

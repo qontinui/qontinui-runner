@@ -108,18 +108,35 @@ export function useBackgroundActivities({
               return next;
             });
           } else {
-            // Session is active
-            setActiveAiSessions((prev) => {
-              if (!prev.has(sessionId)) {
-                const next = new Map(prev);
-                next.set(sessionId, {
-                  name: sessionName || "AI Analysis",
-                  startedAt: new Date(),
-                });
-                return next;
-              }
-              return prev;
-            });
+            // Only show workflow sessions in the status bar (not chats)
+            // Workflow sessions have phase suffixes like " - Setup", " - Verification", " - Iteration", " - Completion"
+            const name = sessionName || "";
+            const isWorkflowSession =
+              name.includes(" - Setup") ||
+              name.includes(" - Verification") ||
+              name.includes(" - Iteration") ||
+              name.includes(" - Completion");
+
+            if (isWorkflowSession) {
+              setActiveAiSessions((prev) => {
+                if (!prev.has(sessionId)) {
+                  // Extract just the workflow name (before the phase suffix)
+                  const shortName = name.replace(
+                    / - (Setup|Verification \d+|Iteration \d+|Completion)$/,
+                    "",
+                  );
+                  const truncated =
+                    shortName.length > 40 ? shortName.slice(0, 37) + "..." : shortName;
+                  const next = new Map(prev);
+                  next.set(sessionId, {
+                    name: truncated,
+                    startedAt: new Date(),
+                  });
+                  return next;
+                }
+                return prev;
+              });
+            }
           }
         }
       });

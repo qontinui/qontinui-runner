@@ -1,0 +1,231 @@
+{
+  "version": "1.0.0",
+  "description": "Specs for the Reflection Dashboard page — evaluates the effectiveness of AI self-healing fixes across workflow executions, providing aggregated metrics, run history, and individual fix analysis.",
+  "groups": [
+    {
+      "id": "reflection-overview",
+      "name": "Effectiveness Overview and Metrics",
+      "description": "The Reflection Dashboard provides users with a high-level view of how well the AI's self-healing capabilities are performing. Users need to see aggregate statistics including the total number of fixes applied, how many were effective vs ineffective, whether any caused regressions, and the overall effectiveness rate as a percentage. These summary cards give users confidence (or concern) about the reliability of the reflection system, helping them decide whether to continue relying on automated fixes or intervene with manual corrections. The data should be scoped to a specific workflow, since effectiveness patterns vary significantly between different automation tasks.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "refl-overview-heading",
+          "description": "Users can identify the Reflection Effectiveness dashboard and understand its purpose as a tool for evaluating how well AI self-healing fixes are performing across workflow executions",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Reflection Effectiveness" },
+            "label": "Reflection dashboard heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "refl-overview-total-fixes",
+          "description": "Users can see the total number of fixes that the reflection system has applied, providing a measure of how actively the self-healing system is working",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Total Fixes" },
+            "label": "Total fixes metric card"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "refl-overview-effective-count",
+          "description": "Users can see the count of fixes that were determined to be effective, giving them confidence in the proportion of self-healing attempts that actually improved workflow outcomes",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Effective" },
+            "label": "Effective fixes metric card"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "refl-overview-effectiveness-rate",
+          "description": "Users can see the overall effectiveness rate as a percentage, providing a single metric that summarizes how reliably the reflection system produces beneficial fixes",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Effectiveness Rate" },
+            "label": "Effectiveness rate metric card"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "reflection-workflow-scope",
+      "name": "Workflow-Scoped Analysis",
+      "description": "Since reflection effectiveness varies greatly between workflows, users need to scope their analysis to a specific workflow. The dashboard should provide a workflow selector populated with names from recent task runs, and automatically load data for the selected workflow. Users should be able to switch between workflows to compare effectiveness patterns and identify which automations benefit most from self-healing. When no reflection data exists for a selected workflow, a clear message should explain that fixes will appear after workflow executions occur.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "refl-scope-selector",
+          "description": "Users can select a specific workflow from a dropdown to scope the reflection analysis, allowing them to evaluate self-healing effectiveness for each workflow independently",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "combobox" },
+            "label": "Workflow name selector"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "refl-scope-empty",
+          "description": "When no reflection fixes exist for the selected workflow, users see an informative empty state explaining that reflection data will appear after workflow executions, rather than a confusing blank dashboard",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "No reflection fixes found" },
+            "label": "Empty state message"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "refl-scope-refresh",
+          "description": "Users can manually refresh the reflection data to pick up newly completed workflow runs without navigating away from the dashboard",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Refresh button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "reflection-run-history",
+      "name": "Reflection Run History",
+      "description": "Beyond aggregate metrics, users need to see the timeline of individual reflection runs. The history section shows recent reflection executions with their task run IDs, completion status (complete, running, failed), fix counts, and timestamps. This chronological view helps users understand the cadence of self-healing activity, identify runs that produced many fixes (potentially indicating systemic issues), and correlate reflection outcomes with specific workflow execution attempts.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "refl-history-section",
+          "description": "Users can see a list of recent reflection runs showing when each self-healing cycle occurred, how many fixes it produced, and whether it completed successfully",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Recent Reflection Runs" },
+            "label": "Reflection run history section"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "refl-history-status",
+          "description": "Each reflection run entry shows its completion status with color-coded badges so users can quickly distinguish successful, in-progress, and failed self-healing cycles",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "complete" },
+            "label": "Run status badge"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "reflection-fix-details",
+      "name": "Individual Fix Analysis",
+      "description": "For deeper investigation, users need to drill into individual fixes to understand exactly what the reflection system changed. Each fix entry shows the fix type (knowledge update, step rewrite, selector fix, tool config, context addition, instruction clarification), a description, confidence level, and effectiveness assessment. Expanding a fix reveals the file changed, old and new values, application timestamp, and effectiveness evidence. This level of detail is essential for users who want to audit the AI's self-healing decisions, validate that fixes are appropriate, or learn from the patterns of successful vs unsuccessful corrections.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "refl-fix-list",
+          "description": "Users can see a list of all individual fixes with their types, descriptions, confidence levels, and effectiveness assessments, enabling granular review of what the reflection system has changed",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "All Fixes" },
+            "label": "Fix list section heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "refl-fix-expand",
+          "description": "Users can expand individual fixes to see detailed before/after values, the specific file changed, and evidence supporting the effectiveness assessment, providing full auditability of AI self-healing decisions",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Old value" },
+            "label": "Expanded fix detail with old/new values"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "refl-fix-types",
+          "description": "Each fix displays its type category (Knowledge Update, Step Rewrite, Selector Fix, etc.) so users can identify patterns in what kinds of corrections the AI applies most frequently",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Knowledge Update" },
+            "label": "Fix type label"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "ReflectionDashboard",
+    "author": "Joshua Spinak",
+    "createdAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "pageUrl": "/reflection",
+    "elementSource": "sdk",
+    "tags": ["reflection", "self-healing", "effectiveness", "dev-only", "runner-only"]
+  }
+}

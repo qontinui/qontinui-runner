@@ -1,0 +1,270 @@
+{
+  "version": "1.0.0",
+  "description": "Semantic specs for the GUI Automation page -- a dev-only legacy execution interface for model-based GUI automation configs. Users load GUI automation configuration files that define visual states, transitions, and image recognition targets, then select workflows and monitors to execute. The page features a two-column layout with a workflow runner panel (2/3 width) and an automation toolkit sidebar (1/3 width) containing quick actions and macros. This page is hidden in production and serves as the original GUI automation executor before unified workflows were introduced.",
+  "groups": [
+    {
+      "id": "gui-config-loading",
+      "name": "Configuration Loading",
+      "description": "Before any GUI automation can run, users must load a configuration file that defines the visual automation environment: image targets, states, transitions, workflows, and monitors. The header area shows the current configuration status with an animated indicator when a config is loaded. Users can load a new configuration from a file picker or reload the last-used configuration. The configuration status indicator provides visual feedback (animated ping, active badge) so users immediately know whether a valid config is loaded and which one it is.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "gui-config-status",
+          "description": "Users can see the current configuration status in the header, with a clear visual indicator showing whether a GUI automation config is loaded and active",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Config" },
+            "label": "Configuration status indicator in header"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "gui-config-load-file",
+          "description": "Users can load a GUI automation configuration from a file, opening a file picker to select a JSON config that defines the visual automation environment",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Load" },
+            "label": "Load configuration button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "gui-config-load-last",
+          "description": "Users can quickly reload the last-used configuration without navigating the file picker, enabling rapid iteration during GUI automation development",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Last" },
+            "label": "Load last configuration button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "gui-workflow-runner",
+      "name": "Workflow Runner Panel",
+      "description": "The main panel (left 2/3) is the workflow runner where users select and start GUI automation workflows. It includes a searchable workflow dropdown populated from the loaded config, monitor selection controls for choosing which state monitors to activate, an auto-minimize toggle for the runner window during execution, state initialization overrides for testing specific starting states, and a large start/stop button for execution control. The panel is disabled when no configuration is loaded, and users must select at least one workflow and monitor combination before starting.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "gui-runner-workflow-select",
+          "description": "Users can select which GUI automation workflow to execute from a dropdown populated with workflows defined in the loaded configuration",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Workflow" },
+            "label": "Workflow selection area"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "gui-runner-monitor-select",
+          "description": "Users can select which state monitors to activate during execution, controlling which visual states the automation engine watches for",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Monitor" },
+            "label": "Monitor selection controls"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "gui-runner-start-stop",
+          "description": "Users can start and stop GUI automation execution with a prominent button that toggles between start and stop states based on whether execution is currently active",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Start" },
+            "label": "Start execution button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "gui-runner-auto-minimize",
+          "description": "Users can enable auto-minimize so the runner window gets out of the way during GUI automation, preventing it from interfering with the visual targets on screen",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "minimize" },
+            "label": "Auto-minimize toggle"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "gui-runner-initial-states",
+          "description": "Users can override the default initial states for testing specific starting conditions, bypassing the normal state detection to begin execution from a particular state",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Initial" },
+            "label": "Initial states override section"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "gui-toolkit-sidebar",
+      "name": "Automation Toolkit Sidebar",
+      "description": "The right sidebar (1/3 width) provides the automation toolkit with quick actions and saved macros. Quick actions are one-click convenience operations for common automation tasks. Macros are saved sequences of automation steps that can be executed independently of full workflows -- useful for repetitive setup tasks, quick verifications, or testing specific interaction sequences. Users can run macros directly from the sidebar, with loading states and result feedback shown inline. The sidebar also includes a refresh control for reloading the macro list from the runner backend.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "gui-toolkit-macros",
+          "description": "Users can browse and run saved macros from the automation toolkit sidebar, executing pre-defined automation sequences without configuring a full workflow",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Macro" },
+            "label": "Macros section in toolkit sidebar"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "gui-toolkit-quick-actions",
+          "description": "Users can access quick action buttons for common one-click automation operations without navigating through the full workflow setup",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Quick" },
+            "label": "Quick actions section"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "gui-toolkit-refresh",
+          "description": "Users can refresh the macro list to see newly created or modified macros without leaving the page",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Refresh" },
+            "label": "Refresh macros control"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "gui-two-column-layout",
+      "name": "Page Layout and Navigation",
+      "description": "The GUI Automation page uses a responsive two-column grid layout: the workflow runner occupies 2/3 of the width and the automation toolkit sidebar takes the remaining 1/3. A header bar at the top shows the configuration status and load controls. The page is a dev-only feature hidden in production, accessible through the runner's navigation system. A tutorial menu provides contextual help for new users. The page scrolls vertically when content exceeds viewport height, with the header remaining visible.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "gui-layout-header",
+          "description": "The page has a dedicated header area showing the GUI automation configuration status and controls, establishing context before users interact with the runner or toolkit",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "GUI Automation" },
+            "label": "GUI Automation header or title"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "gui-layout-tutorial",
+          "description": "Users can access a contextual tutorial menu for guidance on how to use the GUI automation page, helping new users understand the workflow of loading configs, selecting workflows, and starting execution",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Tutorial menu trigger"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "gui-layout-two-column",
+          "description": "The main content area is divided into a workflow runner panel (larger, left) and an automation toolkit sidebar (smaller, right), providing simultaneous access to execution controls and utility tools",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Toolkit" },
+            "label": "Toolkit sidebar heading or label"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "ExecuteTab",
+    "author": "Joshua Spinak",
+    "createdAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "pageUrl": "/gui-automation",
+    "hiddenInProd": true,
+    "elementSource": "sdk",
+    "tags": [
+      "gui-automation",
+      "legacy",
+      "dev-only",
+      "macros",
+      "visual-automation",
+      "run-group",
+      "tier-2"
+    ]
+  }
+}

@@ -269,6 +269,7 @@ export function useAiSession() {
 
     // Set the new session
     setTaskRunId(newTaskRunId);
+    taskRunIdRef.current = newTaskRunId; // Sync ref immediately
     try {
       localStorage.setItem(STORAGE_KEY, newTaskRunId);
     } catch {
@@ -314,7 +315,9 @@ export function useAiSession() {
       if (response.success && response.data) {
         const newId = response.data.task_run_id as string;
         setTaskRunId(newId);
+        taskRunIdRef.current = newId; // Sync ref immediately so sendMessage works right after
         setSessionState("initializing");
+        sessionStateRef.current = "initializing";
         setMessages([]);
         streamingBufferRef.current = "";
         setStreamingContent("");
@@ -332,35 +335,35 @@ export function useAiSession() {
     }
   }, []);
 
-  const sendMessage = useCallback(
-    async (content: string) => {
-      if (!taskRunId || sessionStateRef.current === "restoring") return;
+  const sendMessage = useCallback(async (content: string) => {
+    // Use ref to get the latest taskRunId — avoids stale closure when called
+    // immediately after createSession (React state update hasn't flushed yet)
+    const currentTaskRunId = taskRunIdRef.current;
+    if (!currentTaskRunId || sessionStateRef.current === "restoring") return;
 
-      // Add user message to local state immediately
-      setMessages((prev) => [
-        ...prev,
-        { role: "user", content, timestamp: new Date().toISOString() },
-      ]);
+    // Add user message to local state immediately
+    setMessages((prev) => [
+      ...prev,
+      { role: "user", content, timestamp: new Date().toISOString() },
+    ]);
 
-      // Reset streaming buffer for new AI response
-      streamingBufferRef.current = "";
-      setStreamingContent("");
+    // Reset streaming buffer for new AI response
+    streamingBufferRef.current = "";
+    setStreamingContent("");
 
-      try {
-        const response = await invoke<CommandResponse>("send_user_message", {
-          taskRunId,
-          message: content,
-        });
+    try {
+      const response = await invoke<CommandResponse>("send_user_message", {
+        taskRunId: currentTaskRunId,
+        message: content,
+      });
 
-        if (response.data?.state) {
-          setSessionState(response.data.state as AiSessionState);
-        }
-      } catch (e) {
-        console.error("[useAiSession] Failed to send message:", e);
+      if (response.data?.state) {
+        setSessionState(response.data.state as AiSessionState);
       }
-    },
-    [taskRunId],
-  );
+    } catch (e) {
+      console.error("[useAiSession] Failed to send message:", e);
+    }
+  }, []);
 
   const interrupt = useCallback(async () => {
     if (!taskRunId) return;

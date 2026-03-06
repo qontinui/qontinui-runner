@@ -20,7 +20,8 @@ export type VerificationTestType =
   | "playwright"
   | "gui_automation"
   | "command"
-  | "check_group";
+  | "check_group"
+  | "ui_bridge";
 
 /**
  * Evidence collected during verification.

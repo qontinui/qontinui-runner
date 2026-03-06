@@ -1,0 +1,276 @@
+{
+  "version": "1.0.0",
+  "description": "Specs for the Run Summary page — the primary post-run analysis view where users understand what happened during a workflow run. Combines AI-generated summaries, status banners, token usage, failure details, and tabbed deep-dive sections (Timeline, Verification, Knowledge, Context, Canvas, Errors).",
+  "groups": [
+    {
+      "id": "summary-run-outcome",
+      "name": "Run Outcome at a Glance",
+      "description": "When a user navigates to the Summary page after a workflow completes, they need to immediately understand the outcome. The page should communicate whether the run succeeded, failed, or was stopped, along with the AI-generated narrative of what was accomplished. This is the most critical information on the page because it determines whether the user needs to take further action or can move on to another task.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "summary-outcome-status-visible",
+          "description": "The user can immediately determine the overall run status (complete, failed, or stopped) from a prominent status indicator displayed near the top of the page, without needing to scroll or click into sub-sections",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "complete|failed|stopped", "role": "status" },
+            "label": "Run status indicator"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "summary-outcome-ai-summary",
+          "description": "The user can read an AI-generated narrative summary that explains what was accomplished during the run, providing a human-readable description of the work done rather than just raw status codes",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Summary" },
+            "label": "AI summary section"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "summary-outcome-goal-achievement",
+          "description": "The user can see whether the stated goal of the workflow was achieved or not, displayed as a clear indicator so they know if follow-up work is needed",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Goal" },
+            "label": "Goal achievement indicator"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "summary-outcome-duration-timing",
+          "description": "The user can see how long the run took, including start and end times, so they can assess execution performance and plan future workflow scheduling",
+          "category": "semantic",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "session" },
+            "label": "Session and timing stats"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "summary-failure-analysis",
+      "name": "Failure Analysis and Recovery",
+      "description": "When a workflow run fails, users need to understand what went wrong and have options for recovery. The Summary page should prominently display failure details for failed runs and offer a way to continue the run with additional iterations. This is essential for iterative development workflows where partial progress is common and users want to pick up where they left off rather than starting over.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "summary-failure-details-shown",
+          "description": "When a run has failed, the user sees a dedicated failure section that explains the error, its cause, and the phase where the failure occurred, so they can diagnose the problem without digging through logs",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Failure|Error|failed" },
+            "label": "Failure section"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "summary-failure-continue-run",
+          "description": "For finished runs (complete, failed, or stopped), the user can continue the run by specifying additional sessions, allowing iterative progress without losing context from previous iterations",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Continue" },
+            "label": "Continue run button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "summary-failure-token-usage",
+          "description": "The user can view token usage and cost information for the run, helping them understand resource consumption and optimize future workflow configurations",
+          "category": "semantic",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "usage|token|cost" },
+            "label": "Token usage section"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "summary-tabbed-deep-dives",
+      "name": "Tabbed Deep-Dive Sections",
+      "description": "Beyond the top-level summary, users need to drill into specific aspects of the run. The tabbed interface provides organized access to the execution timeline, verification results, knowledge entries, context variables, canvas artifacts, and error monitoring. Each tab serves a distinct analytical purpose, and users should be able to switch between them fluidly to build a complete picture of what happened.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "summary-tabs-timeline-available",
+          "description": "The user can switch to the Timeline tab to see a step-by-step execution history grouped by workflow phase (setup, verification, agentic, completion), giving them a chronological understanding of the run's progression",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Timeline" },
+            "label": "Timeline tab trigger"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "summary-tabs-verification-available",
+          "description": "The user can switch to the Verification tab to review the verification plan and its results, understanding which checks passed, which failed, and how verification outcomes influenced the workflow loop",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Verification" },
+            "label": "Verification tab trigger"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "summary-tabs-knowledge-available",
+          "description": "The user can switch to the Knowledge tab to see findings and knowledge entries that were generated during execution, helping them capture lessons learned and improve future workflows",
+          "category": "semantic",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Knowledge" },
+            "label": "Knowledge tab trigger"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "summary-tabs-context-available",
+          "description": "The user can switch to the Context tab to inspect variables, retry history, and other contextual data that was available during execution, aiding in debugging and workflow refinement",
+          "category": "semantic",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Context" },
+            "label": "Context tab trigger"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "summary-tabs-canvas-available",
+          "description": "The user can switch to the Canvas tab to view visual artifacts and canvas-based recap data generated during the run, providing a spatial or visual representation of execution results",
+          "category": "semantic",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Canvas" },
+            "label": "Canvas tab trigger"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "summary-empty-and-loading-states",
+      "name": "Empty and Loading States",
+      "description": "The Summary page must gracefully handle states where data is not yet available. When a run is loading, the user should see clear progress indication. When no run is selected or no recap data exists, the page should guide the user toward selecting a run or initiating one. These states prevent confusion and ensure the user always knows what to do next.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "summary-loading-feedback",
+          "description": "While recap data is being fetched, the user sees a clear loading indicator that confirms data retrieval is in progress, preventing them from thinking the page is broken",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Loading" },
+            "label": "Loading state indicator"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "summary-no-data-guidance",
+          "description": "When no recap data is available (no run selected or run has no data), the user sees a helpful message guiding them to select a run or execute a task first, rather than showing a blank page",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Select a run" },
+            "label": "No data guidance message"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "summary-error-state-recovery",
+          "description": "When recap data fails to load, the user sees a clear error message explaining what went wrong, allowing them to understand the issue and potentially retry",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Failed to load" },
+            "label": "Error state message"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "RunRecapTab",
+    "author": "Joshua Spinak",
+    "createdAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "pageUrl": "/runs/summary",
+    "elementSource": "sdk",
+    "tags": ["run-summary", "recap", "post-run-analysis", "observe"]
+  }
+}

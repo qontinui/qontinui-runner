@@ -904,6 +904,41 @@ export interface CheckIssueDetail {
 }
 
 /**
+ * A single assertion result from a snapshot_assert UI Bridge step.
+ */
+export interface SnapshotAssertionResult {
+  /** Unique assertion ID (e.g., "specs-heading-exists") */
+  id: string;
+  /** Human-readable description */
+  description: string;
+  /** Severity level: "critical", "warning", "minor", "info" */
+  severity: string;
+  /** Assertion type: "exists", "not_exists", "visible", "contains" */
+  assertionType: string;
+  /** Whether this assertion passed */
+  passed: boolean;
+  /** Detail message explaining the result */
+  detail: string;
+}
+
+/**
+ * Structured output_data from a snapshot_assert UI Bridge step.
+ */
+export interface SnapshotAssertOutputData {
+  action: "snapshot_assert";
+  /** Number of assertions that passed */
+  passed: number;
+  /** Number of assertions that failed */
+  failed: number;
+  /** Total number of assertions */
+  total: number;
+  /** Duration in milliseconds */
+  duration_ms: number;
+  /** Per-assertion results */
+  results: SnapshotAssertionResult[];
+}
+
+/**
  * Individual step execution result from the verification phase.
  * Matches StepExecutionResult from step_executor.rs
  */
@@ -919,6 +954,8 @@ export interface VerificationStepResult {
   config: StepExecutionConfig;
   /** Verification-specific fields (for test/check steps) */
   verification_details?: VerificationStepDetails | null;
+  /** Additional output data from the step handler (e.g., snapshot_assert results) */
+  output_data?: Record<string, unknown> | null;
 }
 
 /**

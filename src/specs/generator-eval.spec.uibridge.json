@@ -1,0 +1,199 @@
+{
+  "version": "1.0.0",
+  "description": "Specs for the Generator Evaluation page — a development tool for assessing workflow generation quality through pipeline inspection, edit analysis, benchmarks, example browsing, insights extraction, and training data export.",
+  "groups": [
+    {
+      "id": "geneval-navigation",
+      "name": "Evaluation Tool Navigation",
+      "description": "The Generator Evaluation page is a multi-tabbed development tool that provides seven distinct perspectives on workflow generation quality. Users need to navigate between the Dashboard (aggregate metrics), Pipeline Inspector (step-by-step generation analysis), Edit Analysis (gap between generated and human-edited workflows), Benchmarks (generation accuracy tests), Example Library (reference workflow browsing), Insights (pattern extraction), and Training Data (export for model improvement). The tab structure allows users to approach evaluation from whichever angle is most relevant to their current investigation. The page is clearly marked as a dev-only tool since it is intended for workflow generator development rather than end-user operation.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "geneval-nav-heading",
+          "description": "Users can identify the Generator Evaluation page with a clear heading and a dev badge indicating this is a development-only tool for assessing workflow generation quality",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Generator Evaluation" },
+            "label": "Generator Evaluation heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "geneval-nav-dashboard-tab",
+          "description": "Users can access the Dashboard tab to view aggregate generation quality metrics and overall performance summaries across all evaluated workflows",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Dashboard" },
+            "label": "Dashboard tab trigger"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "geneval-nav-inspector-tab",
+          "description": "Users can access the Pipeline Inspector tab to trace the workflow generation process step by step, understanding how inputs are transformed into the final generated workflow",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Pipeline Inspector" },
+            "label": "Pipeline Inspector tab trigger"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "geneval-nav-edits-tab",
+          "description": "Users can access the Edit Analysis tab to study the differences between AI-generated workflows and their human-edited versions, identifying systematic gaps in generation quality",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Edit Analysis" },
+            "label": "Edit Analysis tab trigger"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "geneval-quality-assessment",
+      "name": "Generation Quality Assessment",
+      "description": "The core purpose of this tool is enabling developers to assess how accurately and completely the workflow generator produces workflows. The Benchmarks tab lets users run standardized tests against the generator and measure pass/fail rates. The Edit Analysis tab reveals the gap between what the generator produces and what humans ultimately deploy by comparing generated vs edited workflow versions. Together, these tools answer the fundamental question: how much human intervention is needed after generation, and where does the generator fall short?",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "geneval-quality-benchmarks",
+          "description": "Users can run benchmark tests against the workflow generator to measure generation accuracy with standardized test cases and view pass/fail results",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Benchmarks" },
+            "label": "Benchmarks tab"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "geneval-quality-examples",
+          "description": "Users can browse a library of example workflows to understand reference patterns and compare generator output against known-good workflow structures",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Example Library" },
+            "label": "Example Library tab"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "geneval-quality-insights",
+          "description": "Users can extract insights about generation patterns, identifying recurring strengths and weaknesses in the generator to guide targeted improvement efforts",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Insights" },
+            "label": "Insights tab"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "geneval-training-improvement",
+      "name": "Model Improvement and Training Data",
+      "description": "Beyond evaluation, this tool supports a feedback loop for improving the generator itself. The Training Data tab allows developers to export curated pairs of inputs and desired outputs for fine-tuning or few-shot learning. Combined with the insights from edit analysis and benchmarks, this creates a complete workflow for iteratively improving generation quality: evaluate current performance, identify gaps, extract training examples from human corrections, and feed them back into model improvement. This closes the loop between evaluation and improvement.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "geneval-training-tab",
+          "description": "Users can access the Training Data tab to export generation examples and human corrections as training data, enabling iterative improvement of the workflow generation model",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Training Data" },
+            "label": "Training Data tab"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "geneval-training-dev-badge",
+          "description": "The page is clearly marked as a development-only tool so users understand it is intended for generator improvement rather than production workflow management",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "dev" },
+            "label": "Dev badge"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "geneval-training-pipeline",
+          "description": "Users can inspect the generation pipeline in detail, tracing how raw inputs are processed through each generation stage to produce the final workflow, enabling diagnosis of specific pipeline steps that introduce errors",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Pipeline Inspector" },
+            "label": "Pipeline Inspector tab for step-by-step tracing"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "GeneratorEvalPage",
+    "author": "Joshua Spinak",
+    "createdAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "pageUrl": "/generator-eval",
+    "elementSource": "sdk",
+    "tags": [
+      "generator-eval",
+      "workflow-generation",
+      "benchmarks",
+      "training",
+      "dev-only",
+      "runner-only"
+    ]
+  }
+}

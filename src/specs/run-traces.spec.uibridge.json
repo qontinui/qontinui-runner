@@ -1,0 +1,231 @@
+{
+  "version": "1.0.0",
+  "description": "Specs for the Run Traces page — displays an execution trace waterfall/timeline visualization showing parent-child span relationships, operation durations, phase groupings, and performance insights. Uses the TraceViewerWidget to render hierarchical execution spans.",
+  "groups": [
+    {
+      "id": "traces-waterfall-visualization",
+      "name": "Trace Waterfall Visualization",
+      "description": "The core of the Traces page is a waterfall chart that visualizes execution spans as horizontal bars arranged on a timeline. Each bar represents an operation (workflow phase, AI session, verification step, command execution, etc.) and its width indicates duration. Parent-child relationships between spans create a hierarchical tree structure, showing how operations nest within each other. This visualization gives users an immediate visual understanding of where time was spent, what ran in parallel, and how the execution flowed from start to finish.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "traces-waterfall-rendered",
+          "description": "The user can see a waterfall-style timeline visualization where execution spans are displayed as horizontal bars, with bar width proportional to duration and vertical position showing the span hierarchy, providing an intuitive visual map of the entire execution",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "trace|span|Trace" },
+            "label": "Trace waterfall chart"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-span-hierarchy",
+          "description": "The user can see parent-child relationships between spans, with child spans visually nested under their parents, showing how high-level operations decompose into sub-operations",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "row" },
+            "label": "Span hierarchy rows"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-span-duration-visible",
+          "description": "Each span in the waterfall shows its duration, either as text or through the visual width of the bar, allowing the user to quickly identify the longest-running operations",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "ms|sec|duration" },
+            "label": "Span duration display"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "traces-filtering-and-search",
+      "name": "Filtering and Search",
+      "description": "With potentially hundreds of spans in a complex workflow execution, users need filtering tools to focus on specific operations. The toolbar provides search by span name, minimum duration filter (to find slow operations), phase filter (setup, verification, agentic, completion), and status filter (success, error). These filters work together to narrow the visible spans, making it practical to analyze specific aspects of a large execution trace.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "traces-name-search",
+          "description": "The user can search for spans by name, filtering the waterfall to show only spans whose names match the search term, enabling quick navigation to specific operations in a large trace",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "searchbox" },
+            "label": "Span name search input"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-duration-filter",
+          "description": "The user can filter spans by minimum duration to focus on slow operations, which is the primary workflow for identifying performance bottlenecks in execution",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "duration|Duration|min" },
+            "label": "Duration filter control"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-phase-status-filters",
+          "description": "The user can filter spans by execution phase (setup, verification, agentic, completion) and status (success, error), allowing targeted analysis of specific workflow phases or error investigation",
+          "category": "semantic",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Phase|Status|phase|status" },
+            "label": "Phase and status filters"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "traces-span-details",
+      "name": "Span Detail Inspection",
+      "description": "When the user clicks on a span in the waterfall, a detail panel opens showing comprehensive information about that specific operation. Details include the span name, duration, start and end times, status, associated metadata, and any error information. This drill-down capability transforms the waterfall from a visual overview into a detailed diagnostic tool, allowing users to investigate any specific operation that catches their attention.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "traces-span-clickable",
+          "description": "The user can click on any span in the waterfall to select it and view its detailed information in a side panel, enabling investigation of specific operations",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "row" },
+            "label": "Clickable span row"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-detail-panel",
+          "description": "When a span is selected, a detail panel displays comprehensive information including the operation name, duration, timing, status, and any metadata or error details associated with that span",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Detail|detail|span" },
+            "label": "Span detail panel"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-performance-insights",
+          "description": "The user can view performance insights that summarize key metrics from the trace, such as the critical path, longest operations, and overall execution efficiency, providing actionable optimization guidance",
+          "category": "semantic",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Insight|insight|Performance|critical" },
+            "label": "Performance insights section"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "traces-empty-and-loading-states",
+      "name": "Empty and Loading States",
+      "description": "The Traces page must handle the case where no run is selected, where trace data is loading, where loading fails, and where no trace spans exist for the selected run. Each state should communicate clearly so the user understands what they need to do next.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "traces-no-run-selected",
+          "description": "When no task run is selected, the user sees a message prompting them to select a run to view its traces, providing a clear call to action",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Select a task run" },
+            "label": "No run selected message"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-loading-state",
+          "description": "While trace data is being fetched, the user sees a loading indicator confirming that trace data retrieval is in progress",
+          "category": "semantic",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Loading trace" },
+            "label": "Loading state message"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-error-state",
+          "description": "When trace data fails to load, the user sees an error message explaining what went wrong, so they can determine whether to retry or investigate the underlying issue",
+          "category": "semantic",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Failed to load" },
+            "label": "Error state message"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "TraceViewerPage",
+    "author": "Joshua Spinak",
+    "createdAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "pageUrl": "/runs/traces",
+    "elementSource": "sdk",
+    "tags": ["run-traces", "trace-viewer", "waterfall", "performance", "execution-spans", "observe"]
+  }
+}

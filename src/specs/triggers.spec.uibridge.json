@@ -1,0 +1,192 @@
+{
+  "version": "1.0.0",
+  "description": "Specs for the Triggers page — configures event-driven workflow triggers that automatically execute workflows in response to schedules, webhooks, filesystem changes, and other events.",
+  "groups": [
+    {
+      "id": "triggers-overview",
+      "name": "Trigger Inventory and System Status",
+      "description": "The Triggers page shows all configured event-driven workflow triggers along with the health status of the trigger system itself. Users need to see at a glance how many triggers exist, how many are enabled vs disabled, whether any are currently executing, and if any events have been dropped due to system overload. This status information is critical for understanding whether the event-driven automation layer is functioning correctly. The header provides system-wide status indicators and quick access to creating new triggers and refreshing the list.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "triggers-overview-heading",
+          "description": "Users can identify the Triggers page and see a clear heading that communicates this is where event-driven workflow automation is configured and managed",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Triggers" },
+            "label": "Triggers page heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "triggers-overview-status",
+          "description": "Users can see system-wide trigger status showing how many triggers are enabled out of the total, whether any are currently executing, and if any events have been dropped, providing a health pulse of the trigger system",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "enabled" },
+            "label": "Trigger system status indicators"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "triggers-overview-create",
+          "description": "Users can create new triggers by clicking a New Trigger button, which opens an editor for configuring the trigger type, associated workflow, and trigger-specific parameters",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "New Trigger" },
+            "label": "New Trigger button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "triggers-list-management",
+      "name": "Trigger List and Operations",
+      "description": "The trigger list shows each configured trigger with its name, type, associated workflow, and enabled state. Users need to perform common operations directly from the list: editing a trigger's configuration, deleting it (with confirmation), toggling it enabled/disabled, testing it to verify it would fire correctly, and viewing its execution history. The sub-tab navigation lets users switch between the trigger list view and the history view for a selected trigger. These operations must be responsive and provide clear feedback through toast notifications.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "triggers-list-tab",
+          "description": "Users can see the complete list of all configured triggers on the All Triggers sub-tab, with each trigger showing its configuration summary and available operations",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "All Triggers" },
+            "label": "All Triggers sub-tab"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "triggers-list-toggle",
+          "description": "Users can enable or disable individual triggers without deleting them, temporarily suspending automatic workflow execution while preserving the trigger configuration for future reactivation",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Trigger enable/disable toggle"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "triggers-list-test",
+          "description": "Users can test triggers to verify their configuration is correct by simulating the trigger event and seeing whether the trigger would execute, along with the action that would be taken and the target workflow",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Test Result" },
+            "label": "Test result modal"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "triggers-list-delete",
+          "description": "Users can delete triggers with a confirmation prompt to prevent accidental removal of important event-driven automation configurations",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Delete trigger action"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "triggers-history",
+      "name": "Trigger Execution History",
+      "description": "Users need to review the execution history of their triggers to understand whether they are firing as expected, how often they execute, and whether the associated workflow runs succeeded. The History sub-tab shows a filterable log of trigger executions for the selected trigger, including timestamps, execution outcomes, and any errors encountered. This historical view is essential for debugging triggers that fire too often, not often enough, or at the wrong times, and for correlating trigger executions with workflow outcomes.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "triggers-history-tab",
+          "description": "Users can switch to the History sub-tab to review past executions of a selected trigger, providing a timeline of when the trigger fired and what happened",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "History" },
+            "label": "History sub-tab"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "triggers-history-view-action",
+          "description": "Users can navigate from a trigger in the list directly to its execution history by clicking a view history action, which selects the trigger and switches to the History tab automatically",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "View history action"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "triggers-history-refresh",
+          "description": "Users can refresh the trigger list and history data to pick up newly fired triggers and updated execution outcomes without navigating away from the page",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Refresh" },
+            "label": "Refresh button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "TriggersTab",
+    "author": "Joshua Spinak",
+    "createdAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "pageUrl": "/triggers",
+    "elementSource": "sdk",
+    "tags": ["triggers", "event-driven", "automation", "webhooks", "dev-only", "runner-only"]
+  }
+}

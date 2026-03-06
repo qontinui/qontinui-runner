@@ -1,0 +1,169 @@
+{
+  "version": "1.0.0",
+  "description": "Mixed spec for Specs page — tests hybrid deterministic + AI verification. Contains both deterministic assertions (exists/contains with criteria) and AI-requiring assertions (behavior/semantic without criteria).",
+  "groups": [
+    {
+      "id": "deterministic-elements",
+      "name": "Core UI Elements (Deterministic)",
+      "description": "Verify that key UI elements exist on the Specs page using deterministic snapshot matching.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "specs-heading-exists",
+          "description": "The Specs page heading is visible",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Specs" },
+            "label": "Specs heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "specifications-panel-exists",
+          "description": "The Specifications panel heading is visible in the left sidebar",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Specifications" },
+            "label": "Specifications heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ai-chat-panel-exists",
+          "description": "The AI Chat panel heading is visible on the right side",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "AI Chat" },
+            "label": "AI Chat heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "build-workflow-button-exists",
+          "description": "The Build Workflow button is present",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Build Workflow" },
+            "label": "Build Workflow button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "ai-layout-review",
+      "name": "Layout Quality (AI Review)",
+      "description": "AI evaluates the overall layout quality and user experience of the Specs page.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "layout-three-panel",
+          "description": "The page uses a clear three-panel layout: left sidebar for spec navigation, center panel for detail viewing, and right panel for AI chat. The panels should be visually distinct and properly separated.",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "navigation-clarity",
+          "description": "The navigation sidebar clearly shows the current page context within the application. Users should be able to identify that they are on the Specs page and understand the navigation hierarchy.",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "mixed-group",
+      "name": "Interaction Elements (Mixed)",
+      "description": "A mix of deterministic element checks and AI-evaluated behavioral assertions for the Specs page interactive features.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "build-verification-btn",
+          "description": "Build verification workflow button exists",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Build verification workflow" },
+            "label": "Build verification workflow button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "review-spec-btn",
+          "description": "Review spec quality button exists",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Review spec quality" },
+            "label": "Review spec quality button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "chat-input-behavior",
+          "description": "The AI chat panel has a text input area where users can type messages. The input should be clearly visible, have appropriate placeholder text, and be ready to accept user input.",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sidebar-nav-contains",
+          "description": "The sidebar navigation contains the Specs menu item",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "contains",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Specs" },
+            "label": "Sidebar navigation"
+          },
+          "expected": "Specs",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ]
+    }
+  ],
+  "metadata": {
+    "elementSource": "control"
+  }
+}

@@ -1,0 +1,157 @@
+{
+  "version": "1.0.0",
+  "description": "Semantic specs for the Context Builder page — where users create reusable context configurations that provide background information and instructions to AI during workflow execution",
+  "groups": [
+    {
+      "id": "ctx-purpose",
+      "name": "Page Purpose",
+      "description": "The Context Builder allows users to create and manage reusable context configurations. Contexts provide structured background information, domain knowledge, and behavioral instructions that are injected into AI prompts during workflow execution. By defining contexts separately from workflows, users can share common knowledge across multiple workflows without duplication.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "ctx-purpose-create",
+          "description": "Users can create new context configurations that define background knowledge and instructions for AI-driven workflow steps",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Context" },
+            "label": "Context builder heading"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ctx-purpose-reuse",
+          "description": "Users can save contexts to the library and reuse them across multiple workflows, ensuring consistent AI behavior",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Save" },
+            "label": "Save button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ctx-purpose-browse",
+          "description": "Users can browse all saved contexts in a searchable list and select any context for editing or review",
+          "category": "semantic",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "role": "list" }, "label": "Context list" },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "ctx-editing",
+      "name": "Context Editing Goals",
+      "description": "Users need to define rich context configurations with names, descriptions, and structured content that will be injected into AI prompts. The editing experience should make it easy to craft precise instructions that guide AI behavior during workflow execution.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "ctx-edit-name",
+          "description": "Users can set a descriptive name for each context that identifies its purpose when selecting contexts for workflows",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "textbox" },
+            "label": "Context name input"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ctx-edit-content",
+          "description": "Users can write detailed context content including domain knowledge, coding standards, project conventions, and behavioral constraints for the AI",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "textbox" },
+            "label": "Context content editor"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ctx-edit-delete",
+          "description": "Users can delete contexts that are no longer needed, removing them from the library permanently",
+          "category": "semantic",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Delete" },
+            "label": "Delete button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "ctx-workflow-integration",
+      "name": "Workflow Integration Goals",
+      "description": "The primary value of contexts comes from their integration with workflows. Users create contexts so they can attach them to workflow steps, ensuring the AI has the right background information when executing automation tasks.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "ctx-wf-attach",
+          "description": "Contexts created here can be attached to workflow steps in the Workflow Builder, injecting their content into AI prompts during execution",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Context" },
+            "label": "Context reference"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "ctx-wf-consistency",
+          "description": "When a context is updated, all workflows referencing it automatically use the updated content on their next execution",
+          "category": "semantic",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Context" },
+            "label": "Context consistency"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "ContextsPage",
+    "author": "Joshua Spinak",
+    "createdAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "pageUrl": "/build/contexts",
+    "tags": ["context-builder", "contexts", "ai-configuration", "library-asset"]
+  }
+}

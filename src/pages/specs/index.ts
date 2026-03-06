@@ -1,0 +1,1 @@
+export { SpecsPage } from "./SpecsPage";

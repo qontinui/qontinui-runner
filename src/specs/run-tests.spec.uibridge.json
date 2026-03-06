@@ -1,0 +1,246 @@
+{
+  "version": "1.0.0",
+  "description": "Specs for the Run Tests page — displays Playwright test results and verification phase results for a workflow run. Shows pass/fail summaries, individual test cards with assertions, console output, failure screenshots, error messages, and iteration-grouped verification results.",
+  "groups": [
+    {
+      "id": "tests-summary-overview",
+      "name": "Test Results Summary",
+      "description": "The Tests page opens with an aggregate summary of all test results from the workflow run. Users need to immediately understand the overall test health: how many passed, how many failed, how many were skipped, and the total count. This summary drives the user's next action — if everything passed they can move on, if tests failed they need to drill into the failures. The summary also includes a loop result banner when the workflow used iterative verification, showing whether verification ultimately passed across all iterations.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "tests-summary-pass-fail-counts",
+          "description": "The user can see a clear summary showing the number of tests that passed, failed, and were skipped, along with the total test count, giving them an immediate understanding of overall test health",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "passed|failed|total" },
+            "label": "Test results summary"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "tests-summary-loop-result",
+          "description": "When the workflow used iterative verification, the user sees a loop result banner showing whether verification ultimately passed or failed, the number of iterations run, and a per-iteration quick summary with check counts",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Verification|iteration" },
+            "label": "Loop result summary"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "tests-summary-test-results-heading",
+          "description": "The user sees a clear 'Test Results' heading that establishes the purpose of the page and anchors the summary statistics",
+          "category": "semantic",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Test Results" },
+            "label": "Test results heading"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "tests-verification-results",
+      "name": "Verification Phase Results by Iteration",
+      "description": "Verification results are grouped by iteration, reflecting the workflow loop structure. Each iteration is collapsible and shows its own pass/fail status and duration. Within each iteration, individual verification steps are displayed as test cards. Users can drill into any step to see console output, page snapshots, assertion counts, and error details. This hierarchical organization (iteration > step > details) mirrors the execution structure and helps users trace failures to specific verification phases and iterations.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "tests-verification-iteration-groups",
+          "description": "Verification results are organized into collapsible iteration groups, each showing the iteration number, overall pass/fail status, check count, and total duration, allowing the user to quickly identify which iterations had problems",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Iteration" },
+            "label": "Iteration group header"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "tests-verification-step-cards",
+          "description": "Within each iteration, individual verification steps are shown as expandable cards with the step name, pass/fail status, duration, and test type, allowing the user to drill into specific verification checks",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Verification Step|step" },
+            "label": "Verification step card"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "tests-verification-error-details",
+          "description": "When a verification step fails, the user can expand it to see detailed error information including the error message, console output, and stack traces, providing the diagnostic information needed to fix the issue",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Error|Console Output" },
+            "label": "Error details section"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "tests-verification-assertions-count",
+          "description": "The user can see assertion counts (passed/total) for steps that include assertions, helping them understand the granularity of verification success or failure",
+          "category": "semantic",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "assertions" },
+            "label": "Assertions count"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "tests-playwright-results",
+      "name": "Playwright Test Results",
+      "description": "In addition to verification phase results, the page displays Playwright browser test results when the workflow included Playwright test execution. Playwright tests provide end-to-end browser verification and produce rich artifacts including failure screenshots, page snapshots (YAML), and console output. These results are displayed separately from verification results since they come from a different execution mechanism.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "tests-playwright-section",
+          "description": "When Playwright tests were executed during the run, the user sees a dedicated Playwright section with individual test result cards, clearly separated from the verification phase results",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Playwright" },
+            "label": "Playwright results section"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "tests-playwright-failure-screenshots",
+          "description": "For failed Playwright tests, the user can view failure screenshots showing the exact browser state at the time of failure, which is the most valuable debugging artifact for browser-based test failures",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Failure Screenshot" },
+            "label": "Failure screenshot section"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "tests-playwright-page-snapshots",
+          "description": "The user can view page snapshots (YAML representation of the page structure) captured during test execution, providing a structural view of the page state that complements visual screenshots",
+          "category": "semantic",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Page Snapshot" },
+            "label": "Page snapshot section"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "tests-empty-and-running-states",
+      "name": "Empty and Running States",
+      "description": "The Tests page handles several states gracefully. When no run is selected, it guides the user to select one. When the selected run is still executing, it informs the user that results will be available after completion. When no tests were executed during the run, it explains that tests appear when the workflow includes verification or test steps. These states prevent user confusion and set appropriate expectations.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "tests-no-run-selected",
+          "description": "When no run is selected, the user sees guidance to select a run to view test results, preventing a confusing blank state",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Select a run" },
+            "label": "No run selected message"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "tests-run-still-executing",
+          "description": "When the selected run is still in progress, the user sees a message explaining that test results will be available after the run completes, setting the correct expectation",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "after the run completes" },
+            "label": "Run in progress message"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "tests-no-results-available",
+          "description": "When the run completed without any tests or verification steps, the user sees an explanatory message that tests appear when the workflow includes verification or test execution steps",
+          "category": "semantic",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "No test results" },
+            "label": "No results message"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "TestResultsTab",
+    "author": "Joshua Spinak",
+    "createdAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "pageUrl": "/runs/test-results",
+    "elementSource": "sdk",
+    "tags": ["run-tests", "test-results", "verification", "playwright", "observe"]
+  }
+}

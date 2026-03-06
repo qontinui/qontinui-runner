@@ -1,0 +1,231 @@
+{
+  "version": "1.0.0",
+  "description": "Specs for the Run Statistics page — displays execution performance metrics for a workflow configuration. Provides two views: Overview (config health, flaky items, run history, error patterns) and Performance (action timing, success trends, transition reliability). Shows config-level automation statistics rather than individual task run statistics.",
+  "groups": [
+    {
+      "id": "statistics-overview-dashboard",
+      "name": "Overview Dashboard",
+      "description": "The Overview view provides a high-level health assessment of the workflow configuration. Users see a grid of panels showing config health metrics, a list of flaky items (elements or actions with inconsistent success rates), recent run history, and recurring error patterns. This view helps users understand whether their workflow configuration is reliable over time, identify items that need attention, and spot trends in execution quality.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "statistics-config-health-panel",
+          "description": "The user can see a config health panel summarizing the overall reliability of the workflow configuration, including success rates and quality indicators that help assess whether the configuration needs tuning",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Statistics|Health" },
+            "label": "Config health panel"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "statistics-flaky-items-list",
+          "description": "The user can see a list of flaky items (actions, elements, or transitions that have inconsistent success rates), helping them identify and fix unreliable parts of the automation configuration",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "flaky|Flaky|unreliable" },
+            "label": "Flaky items list"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "statistics-run-history-panel",
+          "description": "The user can see a history of recent runs with their outcomes, allowing them to identify patterns in success or failure over time and click individual runs for more detail",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "history|runs|recent" },
+            "label": "Run history panel"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "statistics-error-patterns-panel",
+          "description": "The user can see recurring error patterns extracted from multiple runs, helping them identify systemic issues that appear consistently rather than one-off failures",
+          "category": "semantic",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "error|pattern" },
+            "label": "Error patterns panel"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "statistics-performance-view",
+      "name": "Performance Dashboard",
+      "description": "The Performance view provides deeper metrics on execution timing and success rates. Users can analyze action timing distributions, success trends over time, and transition reliability between states. This view is valuable for optimizing workflow performance — identifying slow actions, understanding where time is spent, and measuring how improvements to the configuration translate into better execution metrics.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "statistics-view-toggle",
+          "description": "The user can switch between Overview and Performance views using a toggle control, allowing them to move between high-level health assessment and detailed performance analysis",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Overview|Performance" },
+            "label": "View mode toggle"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "statistics-performance-metrics",
+          "description": "In the Performance view, the user can see detailed timing metrics, success rate trends, and transition reliability data that help identify bottlenecks and optimization opportunities",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Performance|timing|duration" },
+            "label": "Performance metrics"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "statistics-refresh-action",
+          "description": "The user can refresh statistics to see the latest data, particularly useful after running new workflows to see updated success rates and timing information",
+          "category": "semantic",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Refresh|refresh" },
+            "label": "Refresh statistics button"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "statistics-run-details-drilldown",
+      "name": "Run Details Drill-Down",
+      "description": "From the run history panel, users can click on any individual run to see its details in a slide-out panel. This provides a quick way to inspect specific runs without leaving the statistics context. The drill-down shows run-level metrics and helps correlate specific executions with the aggregate statistics shown in the main panels.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "statistics-run-click-detail",
+          "description": "The user can click on a run in the history to see its details in a slide-out panel, providing quick access to run-specific information without losing the statistics context",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Run detail interaction"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "statistics-run-detail-close",
+          "description": "The user can close the run details panel to return to the full statistics view, maintaining their current analysis context",
+          "category": "semantic",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Close" },
+            "label": "Close detail panel"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "statistics-empty-and-loading-states",
+      "name": "Empty and Loading States",
+      "description": "The Statistics page requires a loaded configuration to display data. When no configuration is loaded, no run is selected, or statistics data is still loading, the page must communicate these states clearly. It also handles the case where no statistics have been collected yet, guiding the user to run workflows to generate data.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "statistics-no-config-loaded",
+          "description": "When no configuration is loaded, the user sees a message explaining that a configuration must be loaded to view statistics, guiding them toward the correct workflow",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Load a configuration|No Run Selected" },
+            "label": "No config loaded message"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "statistics-no-data-available",
+          "description": "When the configuration has no statistics yet, the user sees a message suggesting they run workflows to start collecting data, rather than a confusing empty grid",
+          "category": "semantic",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "No statistics|Run some workflows" },
+            "label": "No data available message"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "statistics-loading-spinner",
+          "description": "While statistics are being fetched, the user sees a loading indicator confirming that data retrieval is in progress",
+          "category": "semantic",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "status" },
+            "label": "Loading spinner"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "StatisticsTab",
+    "author": "Joshua Spinak",
+    "createdAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "pageUrl": "/runs/statistics",
+    "elementSource": "sdk",
+    "tags": ["run-statistics", "performance", "config-health", "analytics", "observe"]
+  }
+}

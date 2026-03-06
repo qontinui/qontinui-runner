@@ -76,6 +76,7 @@ function mapCheckType(stepType: string): VerificationTestType {
     playwright: "playwright",
     gui_automation: "gui_automation",
     repo_test: "repo_test",
+    ui_bridge: "ui_bridge",
   };
   return typeMap[stepType.toLowerCase()] || "command";
 }

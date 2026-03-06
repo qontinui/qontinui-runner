@@ -1,0 +1,207 @@
+{
+  "version": "1.0.0",
+  "description": "Semantic specs for the Library Dashboard page -- a unified cross-category asset browser that aggregates recently modified items from all automation library categories. Users can browse, search, and filter assets across tasks, prompt snippets, contexts, checks, check groups, shell commands, workflows, playwright tests, and more. Clicking any item navigates to the appropriate builder page for editing. The dashboard serves as the central hub for discovering and managing all reusable automation building blocks.",
+  "groups": [
+    {
+      "id": "lib-dashboard-overview",
+      "name": "Dashboard Overview and Navigation",
+      "description": "The Library Dashboard provides a bird's-eye view of all automation assets across every category. Users land here to quickly find recently modified items, understand what assets exist in their library, and navigate to the appropriate builder for editing. The page heading shows the total item count, and items are sorted by modification time with the most recently changed items appearing first. This makes the dashboard particularly useful for resuming work on recently edited assets.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "lib-dashboard-heading",
+          "description": "Users see the Library Dashboard heading with a total item count, providing immediate context about the size of their automation asset library",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Library Dashboard" },
+            "label": "Library Dashboard heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "lib-dashboard-total-count",
+          "description": "Users can see the total number of items across all categories, giving them a sense of library size and growth over time",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "total items" },
+            "label": "Total items count"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "lib-dashboard-recent-items",
+          "description": "Users see items sorted by modification time with the most recently changed items at the top, enabling quick access to work in progress",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Recently modified items across all categories" },
+            "label": "Recent items subtitle"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "lib-dashboard-item-navigation",
+          "description": "Users can click any item in the list to navigate directly to the appropriate builder page for that asset type, with the item pre-loaded for editing",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Library Dashboard" },
+            "label": "Dashboard with navigable items"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "lib-search-filter",
+      "name": "Cross-Category Search and Filtering",
+      "description": "The dashboard provides powerful search and filtering capabilities that work across all asset categories simultaneously. The search input matches against item names, descriptions, categories, and tags. Type filter pills let users narrow the view to a single asset type while showing per-type counts. The filter pills dynamically show only categories that have items, preventing confusion from empty categories. These tools let users efficiently locate specific assets in large libraries.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "lib-search-across-categories",
+          "description": "Users can search across all asset categories simultaneously using a text input that matches against names, descriptions, categories, and tags",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Search across all categories" },
+            "label": "Cross-category search input placeholder"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "lib-type-filters",
+          "description": "Users can filter items by asset type using filter pills that show per-type counts, quickly narrowing the view to only workflows, checks, commands, or any other specific category",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "All" },
+            "label": "All type filter pill"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "lib-filter-counts",
+          "description": "Each type filter pill displays the number of items in that category, helping users understand the distribution of assets across types",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Library Dashboard" },
+            "label": "Dashboard with filter counts"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "lib-empty-state",
+          "description": "When no items match the current search or filter, users see a helpful empty state message suggesting they adjust their search or create items using the Builders menu",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Library Dashboard" },
+            "label": "Dashboard with empty state handling"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "lib-item-presentation",
+      "name": "Item Display and Metadata",
+      "description": "Each item in the dashboard list shows rich metadata to help users identify and distinguish assets without navigating to the builder. Items display their name, type badge (color-coded to match the builder), description or content preview, category, tags, and relative modification time (e.g., '2h ago', '3d ago'). The type badge uses consistent colors across the application so users develop visual associations with asset types. Items show a navigation arrow on hover indicating clickability.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "lib-item-type-badges",
+          "description": "Each item displays a color-coded type badge (Task, Context, Workflow, Check, etc.) so users can visually distinguish asset types at a glance",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Library Dashboard" },
+            "label": "Dashboard with typed items"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "lib-item-relative-time",
+          "description": "Each item shows a human-readable relative modification time (e.g., 'just now', '5m ago', '2d ago') so users can identify recently active assets",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Library Dashboard" },
+            "label": "Dashboard with timestamped items"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "lib-item-descriptions",
+          "description": "Items show description or content previews to help users identify the right asset without opening each one in its builder",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Library Dashboard" },
+            "label": "Dashboard with item previews"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "LibraryDashboard",
+    "author": "Joshua Spinak",
+    "createdAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "pageUrl": "/library",
+    "elementSource": "sdk",
+    "tags": ["library", "dashboard", "cross-category", "search", "asset-management"]
+  }
+}

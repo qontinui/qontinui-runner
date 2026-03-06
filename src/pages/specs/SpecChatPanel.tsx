@@ -1,0 +1,549 @@
+/**
+ * SpecChatPanel — AI Chat for spec review, editing, creation, and workflow building
+ *
+ * Right panel in the Specs page. Creates a standalone AI session
+ * and prepends selected spec context into the conversation.
+ *
+ * Features:
+ * - Spec review and gap analysis (Step 2 — AI-driven spec modifications)
+ * - New spec creation via AI (Step 4 — spec creation from scratch)
+ * - Build workflow from specs (Step 5 — spec-to-workflow pipeline)
+ */
+
+import { useState, useRef, useEffect, useCallback } from "react";
+import {
+  Bot,
+  User,
+  Send,
+  Square,
+  Loader2,
+  Sparkles,
+  Hammer,
+  FilePlus,
+  Download,
+} from "lucide-react";
+import { useAiSession } from "@/hooks/useAiSession";
+import { MarkdownViewer } from "@/components/MarkdownViewer";
+import type { LoadedSpec, SpecKind } from "./types";
+
+// ============================================================================
+// Message bubble
+// ============================================================================
+
+function MessageBubble({
+  role,
+  content,
+  specActions,
+}: {
+  role: "user" | "ai" | "system";
+  content: string;
+  specActions?: Array<{ kind: FileSpecKind; label: string; onApply: () => void }>;
+}) {
+  if (role === "system") {
+    return (
+      <div className="flex justify-center py-1">
+        <span className="text-[10px] text-muted-foreground/50 italic px-2 py-0.5 bg-white/[0.02] rounded">
+          {content}
+        </span>
+      </div>
+    );
+  }
+
+  const isUser = role === "user";
+
+  return (
+    <div className={`flex gap-2 ${isUser ? "flex-row-reverse" : ""}`}>
+      <div className="shrink-0 mt-1">
+        {isUser ? (
+          <div className="w-5 h-5 rounded-full bg-cyan-500/20 flex items-center justify-center">
+            <User className="w-3 h-3 text-cyan-400" />
+          </div>
+        ) : (
+          <div className="w-5 h-5 rounded-full bg-purple-500/20 flex items-center justify-center">
+            <Bot className="w-3 h-3 text-purple-400" />
+          </div>
+        )}
+      </div>
+      <div
+        className={`flex-1 min-w-0 px-2.5 py-1.5 rounded-lg text-xs leading-relaxed ${
+          isUser
+            ? "bg-cyan-500/10 border border-cyan-500/20 text-foreground"
+            : "bg-white/[0.03] border border-white/5 text-foreground"
+        }`}
+      >
+        <MarkdownViewer content={content} />
+        {specActions && specActions.length > 0 && (
+          <div className="mt-2 pt-2 border-t border-white/5 space-y-1">
+            {specActions.map((action, i) => (
+              <button
+                key={i}
+                onClick={action.onApply}
+                className="w-full flex items-center gap-1.5 px-2 py-1 text-[10px] font-medium rounded
+                  bg-green-500/10 text-green-400 border border-green-500/20
+                  hover:bg-green-500/20 transition-colors"
+              >
+                <Download className="w-3 h-3" />
+                Apply as {action.kind.replace("-", " ")} spec: {action.label}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// Spec context builder
+// ============================================================================
+
+function buildSpecContext(spec: LoadedSpec): string {
+  if (spec.kind === "page-spec") {
+    const groups = spec.config.groups || [];
+    const groupSummary = groups
+      .map(
+        (g) =>
+          `  - ${g.name} (${g.category}): ${g.assertions.filter((a) => a.enabled).length} assertions`,
+      )
+      .join("\n");
+    return [
+      `# Selected Spec: ${spec.specId}`,
+      spec.config.description ? `Description: ${spec.config.description}` : "",
+      `Type: Page Spec`,
+      `Groups:\n${groupSummary}`,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  if (spec.kind === "architecture") {
+    return [
+      `# Selected Spec: ${spec.config.projectName}`,
+      spec.config.description ? `Description: ${spec.config.description}` : "",
+      `Type: Architecture Spec`,
+      `Tech stack: ${spec.config.techStack.map((t) => t.name).join(", ")}`,
+      `Features: ${spec.config.features.length}, Patterns: ${spec.config.patterns.length}, Constraints: ${spec.config.constraints.length}`,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  if (spec.kind === "api") {
+    return [
+      `# Selected Spec: ${spec.config.description || spec.config.basePath}`,
+      `Type: API Spec`,
+      `Base path: ${spec.config.basePath}`,
+      `Endpoints: ${spec.config.endpoints.length}, Models: ${spec.config.models.length}`,
+      spec.config.authType ? `Auth: ${spec.config.authType}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  if (spec.kind === "data") {
+    return [
+      `# Selected Spec: ${spec.config.description || "Data Schema"}`,
+      `Type: Data Spec`,
+      `Database: ${spec.config.database}`,
+      `Entities: ${spec.config.entities.length}, Relations: ${spec.config.relations.length}`,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  if (spec.kind === "dependency") {
+    return [
+      `# Selected Spec: ${spec.config.description || "Dependencies"}`,
+      `Type: Dependency Spec`,
+      `Modules: ${spec.config.modules.length}, Links: ${spec.config.links.length}`,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  // constraint
+  return [
+    `# Selected Spec: ${spec.config.description || "Constraints"}`,
+    `Type: Constraint Spec`,
+    `Performance budgets: ${spec.config.performance?.length || 0}`,
+    `Browser targets: ${spec.config.browsers?.length || 0}`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+// ============================================================================
+// Quick actions
+// ============================================================================
+
+const REVIEW_ACTIONS = [
+  {
+    label: "Review spec quality",
+    prompt:
+      "Review this spec for completeness, gaps, and potential improvements. Are there missing assertions or categories?",
+  },
+  {
+    label: "Find gaps",
+    prompt:
+      "Identify gaps in this specification. What scenarios, edge cases, or behaviors are not covered?",
+  },
+  {
+    label: "Suggest improvements",
+    prompt: "Suggest specific improvements to make this spec more comprehensive and maintainable.",
+  },
+  {
+    label: "Generate assertions",
+    prompt:
+      "Generate additional assertions that would strengthen this spec's coverage. Format each as a clear, testable statement.",
+  },
+];
+
+const CREATE_ACTIONS = [
+  {
+    label: "New Page Spec",
+    prompt:
+      "Help me create a new page specification. I'll describe the page, and you generate a complete SpecConfig JSON with groups and assertions. Ask me about the page first.",
+  },
+  {
+    label: "New Architecture Spec",
+    prompt:
+      "Help me create a new architecture specification. I'll describe the project, and you generate a complete ArchitectureConfig JSON. Ask me about the tech stack and patterns first.",
+  },
+  {
+    label: "New API Spec",
+    prompt:
+      "Help me create a new API specification. I'll describe the API, and you generate a complete ApiConfig JSON with endpoints and models. Ask me about the API first.",
+  },
+  {
+    label: "New Data Spec",
+    prompt:
+      "Help me create a new data specification. I'll describe the database schema, and you generate a complete DataConfig JSON. Ask me about the entities first.",
+  },
+];
+
+// ============================================================================
+// JSON spec extraction from AI messages
+// ============================================================================
+
+type FileSpecKind = Exclude<SpecKind, "style-guide">;
+
+/** Detect spec kind from parsed JSON content */
+function detectSpecKindFromContent(data: Record<string, unknown>): FileSpecKind | null {
+  if (data.groups && Array.isArray(data.groups)) return "page-spec";
+  if (data.techStack && data.patterns) return "architecture";
+  if (data.endpoints && data.basePath) return "api";
+  if (data.entities && data.relations && data.database) return "data";
+  if (data.modules && data.links) return "dependency";
+  if (data.performance || data.bundleBudgets || data.browsers) return "constraint";
+  return null;
+}
+
+/** Extract valid spec JSON blocks from a message */
+function extractSpecJsonFromMessage(
+  content: string,
+): Array<{ kind: FileSpecKind; config: Record<string, unknown>; label: string }> {
+  const results: Array<{ kind: FileSpecKind; config: Record<string, unknown>; label: string }> = [];
+  // Match ```json ... ``` code blocks
+  const codeBlockRegex = /```(?:json)?\s*\n([\s\S]*?)```/g;
+  let match;
+  while ((match = codeBlockRegex.exec(content)) !== null) {
+    try {
+      const parsed = JSON.parse(match[1]) as Record<string, unknown>;
+      const kind = detectSpecKindFromContent(parsed);
+      if (kind) {
+        const label =
+          (parsed.description as string) ||
+          (parsed.projectName as string) ||
+          (parsed.basePath as string) ||
+          kind.replace("-", " ");
+        results.push({ kind, config: parsed, label });
+      }
+    } catch {
+      // Not valid JSON, skip
+    }
+  }
+  return results;
+}
+
+// ============================================================================
+// SpecChatPanel
+// ============================================================================
+
+interface SpecChatPanelProps {
+  selectedSpec: LoadedSpec | null;
+  onAddSpec?: (spec: LoadedSpec) => void;
+  onBuildWorkflow?: (spec: LoadedSpec) => void;
+}
+
+export function SpecChatPanel({ selectedSpec, onAddSpec, onBuildWorkflow }: SpecChatPanelProps) {
+  const session = useAiSession();
+  const [input, setInput] = useState("");
+  const [showCreateActions, setShowCreateActions] = useState(false);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // Auto-resize textarea when input changes (e.g. from presets)
+  const resizeTextarea = useCallback(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    // 10 lines max: ~20px per line (12px font × 1.625 leading) + 12px padding
+    el.style.height = Math.min(el.scrollHeight, 212) + "px";
+    el.style.overflow = el.scrollHeight > 212 ? "auto" : "hidden";
+  }, []);
+
+  useEffect(() => {
+    resizeTextarea();
+  }, [input, resizeTextarea]);
+
+  // Auto-scroll on new messages
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [session.messages, session.streamingContent]);
+
+  // Send message with spec context prepended
+  const handleSend = useCallback(async () => {
+    const text = input.trim();
+    if (!text) return;
+    setInput("");
+
+    // Create session if needed
+    if (!session.taskRunId) {
+      const rawLabel = selectedSpec
+        ? selectedSpec.kind === "page-spec"
+          ? selectedSpec.config.description || selectedSpec.specId
+          : selectedSpec.specId
+        : "Spec Review";
+      const specLabel = rawLabel.length > 60 ? rawLabel.slice(0, 57) + "..." : rawLabel;
+      const id = await session.createSession(`Spec Chat: ${specLabel}`);
+      if (!id) return;
+
+      // First message: include spec context
+      if (selectedSpec) {
+        const context = buildSpecContext(selectedSpec);
+        await session.sendMessage(`${context}\n\n---\n\n${text}`);
+      } else {
+        await session.sendMessage(text);
+      }
+      return;
+    }
+
+    await session.sendMessage(text);
+  }, [input, session, selectedSpec]);
+
+  const handleQuickAction = useCallback((prompt: string) => {
+    setInput(prompt);
+    textareaRef.current?.focus();
+  }, []);
+
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        handleSend();
+      }
+    },
+    [handleSend],
+  );
+
+  // Build workflow from selected spec — delegates to parent (SpecsPage) which saves via API
+  const handleBuildWorkflow = useCallback(() => {
+    if (!selectedSpec || !onBuildWorkflow) return;
+    onBuildWorkflow(selectedSpec);
+  }, [selectedSpec, onBuildWorkflow]);
+
+  const isProcessing = session.sessionState === "processing";
+  const hasMessages = session.messages.length > 0;
+  const canSend = selectedSpec || session.taskRunId || showCreateActions;
+
+  return (
+    <div className="h-full flex flex-col">
+      {/* Header */}
+      <div className="px-3 py-2 border-b border-border flex items-center gap-2">
+        <h2 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground flex-1">
+          AI Chat
+        </h2>
+        {session.taskRunId && (
+          <>
+            <span
+              className={`w-1.5 h-1.5 rounded-full ${
+                session.sessionState === "ready"
+                  ? "bg-green-400"
+                  : session.sessionState === "processing"
+                    ? "bg-amber-400 animate-pulse"
+                    : "bg-muted-foreground/30"
+              }`}
+            />
+            <button
+              onClick={() => {
+                session.close();
+                session.resetSession();
+                setShowCreateActions(false);
+              }}
+              className="text-[10px] text-muted-foreground/50 hover:text-muted-foreground transition-colors"
+            >
+              New
+            </button>
+          </>
+        )}
+      </div>
+
+      {/* Messages area */}
+      <div className="flex-1 overflow-y-auto px-3 py-2 space-y-3">
+        {!hasMessages && !session.streamingContent && (
+          <div className="flex flex-col items-center justify-center h-full gap-3">
+            <Sparkles className="w-6 h-6 text-purple-400/30" />
+            <p className="text-[10px] text-muted-foreground/50 text-center leading-relaxed max-w-[200px]">
+              {selectedSpec
+                ? "Ask AI to review, analyze, or suggest improvements for the selected spec."
+                : "Select a spec from the sidebar, or create a new one."}
+            </p>
+
+            {/* Mode toggle: review vs create */}
+            <div className="flex items-center gap-1 text-[10px]">
+              <button
+                onClick={() => setShowCreateActions(false)}
+                className={`px-2 py-0.5 rounded ${!showCreateActions ? "bg-purple-500/20 text-purple-400" : "text-muted-foreground/50 hover:text-muted-foreground"}`}
+              >
+                Review
+              </button>
+              <button
+                onClick={() => setShowCreateActions(true)}
+                className={`px-2 py-0.5 rounded ${showCreateActions ? "bg-green-500/20 text-green-400" : "text-muted-foreground/50 hover:text-muted-foreground"}`}
+              >
+                Create
+              </button>
+            </div>
+
+            {/* Review quick actions */}
+            {!showCreateActions && selectedSpec && (
+              <div className="space-y-1 w-full">
+                {REVIEW_ACTIONS.map((action) => (
+                  <button
+                    key={action.label}
+                    onClick={() => handleQuickAction(action.prompt)}
+                    className="w-full text-left px-2 py-1.5 text-[10px] text-muted-foreground/70 rounded
+                      bg-white/[0.02] border border-white/5 hover:bg-white/[0.05] hover:text-muted-foreground
+                      transition-colors"
+                  >
+                    {action.label}
+                  </button>
+                ))}
+
+                {/* Build workflow button for page specs */}
+                {selectedSpec.kind === "page-spec" && (
+                  <button
+                    onClick={handleBuildWorkflow}
+                    className="w-full flex items-center gap-1.5 px-2 py-1.5 text-[10px] text-orange-400/70 rounded
+                      bg-orange-500/5 border border-orange-500/10 hover:bg-orange-500/10 hover:text-orange-400
+                      transition-colors"
+                  >
+                    <Hammer className="w-3 h-3" />
+                    Build verification workflow
+                  </button>
+                )}
+              </div>
+            )}
+
+            {/* Create quick actions */}
+            {showCreateActions && (
+              <div className="space-y-1 w-full">
+                {CREATE_ACTIONS.map((action) => (
+                  <button
+                    key={action.label}
+                    onClick={() => handleQuickAction(action.prompt)}
+                    className="w-full flex items-center gap-1.5 text-left px-2 py-1.5 text-[10px] text-muted-foreground/70 rounded
+                      bg-white/[0.02] border border-white/5 hover:bg-white/[0.05] hover:text-green-400
+                      transition-colors"
+                  >
+                    <FilePlus className="w-3 h-3 shrink-0" />
+                    {action.label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {session.messages.map((msg, i) => {
+          // For AI messages, detect spec JSON blocks and offer apply buttons
+          const specActions =
+            msg.role === "ai" && onAddSpec
+              ? extractSpecJsonFromMessage(msg.content).map((extracted) => ({
+                  kind: extracted.kind,
+                  label: extracted.label,
+                  onApply: () => {
+                    const specId = `ai-${extracted.kind}-${Date.now()}`;
+                    onAddSpec({
+                      specId,
+                      appName: "AI Generated",
+                      kind: extracted.kind,
+                      config: extracted.config as never,
+                      source: "file",
+                    });
+                  },
+                }))
+              : undefined;
+          return (
+            <MessageBubble
+              key={i}
+              role={msg.role}
+              content={msg.content}
+              specActions={specActions}
+            />
+          );
+        })}
+
+        {/* Streaming content */}
+        {session.streamingContent && <MessageBubble role="ai" content={session.streamingContent} />}
+
+        {/* Tool activity indicator */}
+        {session.toolActivity && (
+          <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground/50 pl-7">
+            <Loader2 className="w-3 h-3 animate-spin" />
+            <span className="truncate">{session.toolActivity}</span>
+          </div>
+        )}
+
+        <div ref={messagesEndRef} />
+      </div>
+
+      {/* Input area */}
+      <div className="px-3 py-2 border-t border-border">
+        <div className="flex gap-1.5">
+          <textarea
+            ref={textareaRef}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder={
+              selectedSpec
+                ? "Ask about this spec..."
+                : showCreateActions
+                  ? "Describe the spec you want to create..."
+                  : "Select a spec first..."
+            }
+            disabled={!canSend}
+            rows={1}
+            className="flex-1 min-h-[28px] px-2 py-1.5 text-xs leading-relaxed rounded resize-none
+              bg-white/5 border border-white/10 text-foreground
+              placeholder:text-muted-foreground/40
+              focus:outline-none focus:border-purple-500/50
+              disabled:opacity-40"
+            style={{ overflow: "hidden" }}
+            onInput={resizeTextarea}
+          />
+          <button
+            onClick={isProcessing ? session.interrupt : handleSend}
+            disabled={!isProcessing && (!input.trim() || !canSend)}
+            className="shrink-0 w-7 h-7 flex items-center justify-center rounded
+              bg-purple-500/10 text-purple-400 border border-purple-500/20
+              hover:bg-purple-500/20 disabled:opacity-30 transition-colors"
+          >
+            {isProcessing ? <Square className="w-3 h-3" /> : <Send className="w-3 h-3" />}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}

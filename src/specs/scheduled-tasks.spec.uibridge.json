@@ -1,0 +1,192 @@
+{
+  "version": "1.0.0",
+  "description": "Specs for the Scheduled Tasks page — manages recurring workflow execution through task scheduling with cron expressions, execution history, statistics, and settings configuration.",
+  "groups": [
+    {
+      "id": "scheduler-overview",
+      "name": "Scheduler Status and Task Inventory",
+      "description": "The Scheduled Tasks page provides users with a comprehensive view of all scheduled recurring workflow executions. The header displays the scheduler's overall status (running or paused) with a visual indicator and shows the count of currently running tasks. Users need this top-level awareness to know whether the scheduling system is active and functioning. Below the header, a statistics dashboard presents summary metrics about task execution history. The page is organized into three sub-tabs: Scheduled (task list), History (execution log), and Settings (scheduler configuration).",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "sched-overview-heading",
+          "description": "Users can identify the Scheduled Tasks page with a clear heading and see the scheduler's operational status (Running or Paused) along with the count of any currently executing tasks",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Scheduled Tasks" },
+            "label": "Scheduled Tasks heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sched-overview-status",
+          "description": "Users can see whether the scheduler is currently running or paused through a visual status indicator, understanding at a glance whether scheduled tasks will execute on their configured schedules",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Running" },
+            "label": "Scheduler status indicator"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sched-overview-stats",
+          "description": "Users can view summary statistics about scheduled task execution history, providing insight into execution patterns, success rates, and scheduling health",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Scheduled" },
+            "label": "Scheduled tasks sub-tab with count"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "scheduler-task-management",
+      "name": "Task Creation and Lifecycle",
+      "description": "Users need to create scheduled tasks that associate a workflow with a recurring schedule. The task creation form lets users define the task name, select a workflow, configure the schedule using cron expressions or frequency selectors, and set task-specific parameters. Existing tasks can be edited, deleted (with confirmation), and individually enabled or disabled. The task list shows each task with its schedule, associated workflow, next run time, and enabled state. Users can also trigger immediate execution of any scheduled task with a Run Now action, bypassing the schedule for ad-hoc needs.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "sched-task-create",
+          "description": "Users can create new scheduled tasks by clicking a New Task button, which opens a form for configuring the task name, associated workflow, schedule definition, and execution parameters",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "New Task" },
+            "label": "New Task button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sched-task-list",
+          "description": "Users can see all scheduled tasks in a list showing their names, schedules, associated workflows, next run times, and enabled/disabled states, providing a complete inventory of recurring automation",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Scheduled" },
+            "label": "Scheduled tasks tab content"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sched-task-toggle",
+          "description": "Users can enable or disable individual scheduled tasks without deleting them, temporarily pausing specific recurring executions while keeping their configuration for future reactivation",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Task enable/disable toggle"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sched-task-autofix",
+          "description": "Users can trigger the Auto-Fix mechanism immediately to run automated remediation outside the normal schedule, useful when errors are detected and immediate action is needed",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Auto-Fix" },
+            "label": "Auto-Fix trigger button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "scheduler-history-settings",
+      "name": "Execution History and Settings",
+      "description": "The History sub-tab provides a chronological log of all scheduled task executions, showing which tasks ran, when they ran, how long they took, and whether they succeeded or failed. Users can filter history by specific tasks to focus on the execution pattern of a single scheduled automation. The Settings sub-tab allows configuration of the scheduler itself, including global enable/disable, concurrency limits, retry policies, and other scheduling engine parameters. Together, these provide the observability and tunability needed to operate a reliable scheduled automation system.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "sched-history-tab",
+          "description": "Users can switch to the History sub-tab to review the chronological record of all scheduled task executions, understanding when tasks ran and whether they completed successfully",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "History" },
+            "label": "History sub-tab"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sched-settings-tab",
+          "description": "Users can switch to the Settings sub-tab to configure the scheduler engine parameters including global enable/disable, concurrency limits, and retry behavior",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Settings" },
+            "label": "Settings sub-tab"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "sched-refresh",
+          "description": "Users can refresh the scheduler data to see the latest task statuses, execution results, and updated next-run times without navigating away from the page",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Refresh button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "SchedulerTab",
+    "author": "Joshua Spinak",
+    "createdAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "pageUrl": "/scheduled-tasks",
+    "elementSource": "sdk",
+    "tags": ["scheduler", "scheduled-tasks", "cron", "recurring", "dev-only"]
+  }
+}

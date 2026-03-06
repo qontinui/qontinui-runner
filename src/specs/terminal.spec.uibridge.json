@@ -1,0 +1,424 @@
+{
+  "version": "1.0.0",
+  "description": "Semantic specs for the Terminal page -- an integrated multi-tab PTY terminal with workflow generation, session transcript browsing, terminal output analysis, and findings tracking. Users execute shell commands in multiple concurrent terminal sessions, generate workflows from Claude Code session transcripts or command history, analyze terminal output with AI-powered analysis tools, and track findings (errors, warnings, issues) detected in real-time from terminal output. The terminal supports shell integration for structured command history and keyboard shortcuts for efficient tab management.",
+  "groups": [
+    {
+      "id": "term-multi-tab",
+      "name": "Multi-Tab Terminal Sessions",
+      "description": "Users work with multiple concurrent terminal sessions organized as tabs. Each tab is an independent PTY session with its own shell, working directory, command history, and scrollback buffer. Users can create new tabs (Ctrl+Shift+T), close tabs (Ctrl+Shift+W), cycle between tabs (Ctrl+Tab), and rename tabs for better organization. Tabs auto-rename from the first command entered. On mount, the terminal attempts to reconnect to existing Rust PTY sessions from previous page visits, preserving shell state across navigation. When all tabs are closed, a helpful empty state guides users on how to create a new terminal.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "term-tab-bar",
+          "description": "Users can see and interact with a tab bar showing all open terminal sessions, with the active tab visually distinguished from inactive ones",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "tablist" },
+            "label": "Terminal tab bar"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "term-create-tab",
+          "description": "Users can create new terminal sessions either by clicking the + button in the tab bar or pressing Ctrl+Shift+T, immediately getting a fresh shell prompt",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "+" },
+            "label": "New terminal tab button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "term-empty-state",
+          "description": "When no terminal tabs are open, users see a helpful message explaining how to create a new terminal with the Ctrl+Shift+T shortcut or the + button",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "No terminals open" },
+            "label": "Empty terminal state message"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "term-keyboard-shortcuts",
+          "description": "Users can manage terminal tabs entirely via keyboard shortcuts: Ctrl+Shift+T to create, Ctrl+Shift+W to close, Ctrl+Tab to cycle forward, and Ctrl+Shift+Tab to cycle backward",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Ctrl+Shift+T" },
+            "label": "Keyboard shortcut reference"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "term-action-bar",
+      "name": "Terminal Action Bar",
+      "description": "Above the terminal area, an action bar provides quick access to terminal-augmented features: toggling the transcript session sidebar, triggering AI-powered analysis of terminal output, generating workflows from the latest Claude Code session, refreshing the plan file, and toggling the findings panel. The action bar adapts its button states based on context -- showing loading spinners during generation or analysis, indicating the active findings count, and highlighting the active panel mode. This bar transforms the terminal from a simple shell into an intelligent development workbench.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "term-action-sidebar-toggle",
+          "description": "Users can toggle the transcript session sidebar to browse and resume previous Claude Code sessions directly from the terminal page",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Sessions" },
+            "label": "Sessions sidebar toggle"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "term-action-generate",
+          "description": "Users can generate a workflow from the latest Claude Code session transcript, transforming ad-hoc terminal work into a repeatable automated workflow",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Generate" },
+            "label": "Generate workflow from session button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "term-action-analyze",
+          "description": "Users can run AI-powered analysis on terminal output with multiple analysis types: session summary, architecture review, change impact, progress tracking, and cross-tab analysis",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Analyze" },
+            "label": "Analysis menu trigger"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "term-action-findings",
+          "description": "Users can toggle the findings panel to see errors, warnings, and issues automatically detected from terminal output in real-time, with a badge showing the active findings count",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Findings" },
+            "label": "Findings panel toggle"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "term-transcript-sessions",
+      "name": "Claude Code Session Transcripts",
+      "description": "The left sidebar shows a list of Claude Code session transcripts from the local machine. Users can browse past sessions, view the full conversation transcript in a right-side content panel, and resume sessions in a new terminal tab. Session resumption creates a new tab, sets the working directory, and sends the 'claude --resume' command with the correct config directory. The transcript panel supports generating workflows from session content and generating-and-running workflows in a single action for rapid automation creation.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "term-transcript-list",
+          "description": "Users can browse a list of past Claude Code sessions in the sidebar, seeing session identifiers and project paths to find the session they want to review or resume",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Sessions" },
+            "label": "Session list in sidebar"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "term-transcript-view",
+          "description": "Users can click a session to view its full conversation transcript in a right-side panel, reading the complete AI conversation history including tool calls and responses",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Transcript" },
+            "label": "Transcript content panel header"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "term-transcript-resume",
+          "description": "Users can resume a previous Claude Code session in a new terminal tab, continuing the conversation exactly where it left off with the correct project context and config directory",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Resume" },
+            "label": "Resume session button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "term-transcript-generate-workflow",
+          "description": "Users can generate a reusable workflow from a session transcript, converting a one-off Claude Code conversation into an automated workflow that can be saved, edited, and re-run",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Generate" },
+            "label": "Generate workflow from transcript button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "term-workflow-preview",
+      "name": "Workflow Generation and Preview",
+      "description": "When a workflow is generated (from a session transcript, command history, or findings), a preview panel opens on the right side showing the full workflow structure. Users can review the generated workflow's phases and steps, then choose to execute it immediately, save it to the workflow library for later use, edit it in the Workflow Builder for refinement, or regenerate it with different parameters. The panel shows loading state during generation and error messages if generation fails. This workflow enables a rapid 'do it once in the terminal, then automate it' development pattern.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "term-wf-preview-panel",
+          "description": "After generating a workflow, users see a preview panel showing the complete workflow structure with all phases and steps before deciding what to do with it",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Workflow" },
+            "label": "Workflow preview panel"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "term-wf-execute",
+          "description": "Users can execute the generated workflow immediately from the preview panel, which sends it to the runner and navigates to the Active Dashboard for monitoring",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Execute" },
+            "label": "Execute generated workflow button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "term-wf-save",
+          "description": "Users can save the generated workflow to the library for later use, making it available on the Execute page and in the Workflow Builder",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Save" },
+            "label": "Save workflow to library button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "term-wf-edit-builder",
+          "description": "Users can open the generated workflow in the Workflow Builder for manual refinement of steps, phases, and settings before saving or executing",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Edit" },
+            "label": "Edit in builder button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "term-findings-tracking",
+      "name": "Real-Time Findings Detection",
+      "description": "The terminal automatically analyzes output in real time to detect errors, warnings, test failures, and other notable findings. These are tracked per-session and displayed in a dedicated findings panel on the right side. Users can respond to findings (sending text back to the terminal), fix findings by spawning a new Claude Code session with the finding context pre-loaded, or batch-generate a workflow from multiple unresolved findings. The findings count badge on the action bar updates live as new issues are detected, keeping users aware of problems without interrupting their terminal workflow.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "term-findings-panel",
+          "description": "Users can view all detected findings in a dedicated panel, seeing each finding's severity, category, title, description, and relevant code context",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Findings" },
+            "label": "Findings panel header"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "term-findings-fix",
+          "description": "Users can fix a finding by spawning a new terminal tab with Claude Code pre-loaded with the finding context, immediately beginning an AI-assisted fix session",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Fix" },
+            "label": "Fix finding button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "term-findings-generate-workflow",
+          "description": "Users can batch-generate a workflow from multiple unresolved findings, creating an automated fix pipeline that addresses all detected issues systematically",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Generate Workflow" },
+            "label": "Generate workflow from findings button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "term-findings-respond",
+          "description": "Users can respond to a finding by sending text directly to the active terminal, useful for answering questions or providing input that the terminal process is waiting for",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Respond" },
+            "label": "Respond to finding button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "term-analysis",
+      "name": "AI-Powered Terminal Analysis",
+      "description": "The terminal integrates AI analysis capabilities that process terminal scrollback, command history, and plan files to produce structured insights. Analysis types include: session summary (what happened in this terminal session), architecture review (system structure from plan files or terminal context), change impact (what files and systems were affected), progress tracking (how far along is the development plan), cross-tab analysis (correlating activity across multiple terminal sessions), and page architecture (analyzing the runner's own frontend). Analysis results appear in a dedicated panel with structured canvas-style panels. This transforms raw terminal output into actionable development intelligence.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "term-analysis-panel",
+          "description": "Users can view analysis results in a dedicated right-side panel showing structured AI-generated insights about their terminal activity",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Analysis" },
+            "label": "Analysis results panel"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "term-analysis-types",
+          "description": "Users can choose from multiple analysis types including session summary, architecture review, change impact, progress tracking, and cross-tab analysis to get the specific insight they need",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Summary" },
+            "label": "Session summary analysis option"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "term-analysis-loading",
+          "description": "During analysis, users see a loading indicator so they know the AI is processing their terminal output and can wait for results rather than re-triggering",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Analyzing" },
+            "label": "Analysis loading indicator"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "TerminalPage",
+    "author": "Joshua Spinak",
+    "createdAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "pageUrl": "/terminal",
+    "elementSource": "sdk",
+    "tags": [
+      "terminal",
+      "pty",
+      "multi-tab",
+      "workflow-generation",
+      "transcript",
+      "findings",
+      "analysis",
+      "run-group",
+      "tier-1"
+    ]
+  }
+}

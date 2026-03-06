@@ -30,10 +30,17 @@ import {
   StopCircle,
   FileWarning,
   Wrench,
+  Globe,
 } from "lucide-react";
 import { useTaskRunPlaywrightResults, useTaskRunVerificationResults } from "@/hooks/useAiData";
 import { formatDuration } from "@/lib/formatting";
-import type { LoopResult, IndividualCheckResult, CheckIssueDetail } from "@/types/aiData";
+import type {
+  LoopResult,
+  IndividualCheckResult,
+  CheckIssueDetail,
+  SnapshotAssertOutputData,
+  SnapshotAssertionResult,
+} from "@/types/aiData";
 
 interface TestsTabProps {
   taskRunId: string;
@@ -61,6 +68,8 @@ interface TestResult {
   test_type?: string;
   /** For command steps with check groups: individual check results with detailed issues */
   check_results?: IndividualCheckResult[];
+  /** For ui_bridge steps with snapshot_assert: per-assertion results */
+  snapshot_assert_results?: SnapshotAssertOutputData;
 }
 
 interface IterationResults {
@@ -139,6 +148,18 @@ export function TestsTab({ taskRunId, loopResult }: TestsTabProps) {
             consoleOutput = parts.join("\n\n");
           }
 
+          // Extract snapshot_assert results from output_data
+          const outputData = step.output_data as Record<string, unknown> | null | undefined;
+          const snapshotAssertResults =
+            outputData?.action === "snapshot_assert" && Array.isArray(outputData?.results)
+              ? (outputData as unknown as SnapshotAssertOutputData)
+              : undefined;
+
+          // Resolve assertion counts: prefer verification_details, fall back to snapshot_assert
+          const assertionsPassed =
+            vd?.assertions_passed ?? snapshotAssertResults?.passed ?? undefined;
+          const assertionsTotal = vd?.assertions_total ?? snapshotAssertResults?.total ?? undefined;
+
           return {
             id: `verification-${phase.iteration}-${i}`,
             name: step.step_name || `Verification Step ${i + 1}`,
@@ -149,14 +170,15 @@ export function TestsTab({ taskRunId, loopResult }: TestsTabProps) {
                 : "failed",
             duration_ms: step.duration_ms,
             error_message: step.error ?? undefined,
-            console_output: consoleOutput,
+            console_output: snapshotAssertResults ? undefined : consoleOutput,
             page_snapshot: vd?.page_snapshot ?? undefined,
-            assertions_passed: vd?.assertions_passed ?? undefined,
-            assertions_total: vd?.assertions_total ?? undefined,
+            assertions_passed: assertionsPassed,
+            assertions_total: assertionsTotal,
             source: "verification" as const,
             step_type: step.step_type,
             test_type: step.config?.test_type ?? undefined,
             check_results: vd?.check_results ?? undefined,
+            snapshot_assert_results: snapshotAssertResults,
           };
         }) || [];
 
@@ -446,6 +468,57 @@ function TestResultCard({ test, isExpanded, onToggle }: TestResultCardProps) {
 
       {isExpanded && (
         <div className="border-t border-border p-4 space-y-4">
+          {/* Snapshot Assert Results (for ui_bridge steps with snapshot_assert) */}
+          {test.snapshot_assert_results && (
+            <div data-ui-id="recap-test-snapshot-assert-results">
+              <h4 className="text-sm font-medium mb-3 flex items-center gap-2">
+                <Globe className="w-4 h-4" />
+                Snapshot Assertions ({test.snapshot_assert_results.passed}/
+                {test.snapshot_assert_results.total} passed)
+              </h4>
+              <div className="space-y-1">
+                {test.snapshot_assert_results.results.map((assertion: SnapshotAssertionResult) => (
+                  <div
+                    key={assertion.id}
+                    className={`text-xs p-2 rounded flex items-start gap-2 ${
+                      assertion.passed
+                        ? "bg-green-500/10 text-green-400"
+                        : "bg-red-500/10 text-red-400"
+                    }`}
+                  >
+                    <span className="flex-shrink-0 mt-0.5">
+                      {assertion.passed ? (
+                        <CheckCircle2 className="w-3.5 h-3.5" />
+                      ) : (
+                        <XCircle className="w-3.5 h-3.5" />
+                      )}
+                    </span>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 mb-0.5">
+                        <span className="font-medium">{assertion.description}</span>
+                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-muted/50 text-muted-foreground font-mono">
+                          {assertion.assertionType}
+                        </span>
+                        <span
+                          className={`text-[10px] px-1.5 py-0.5 rounded ${
+                            assertion.severity === "critical"
+                              ? "bg-red-500/20 text-red-400"
+                              : assertion.severity === "warning"
+                                ? "bg-amber-500/20 text-amber-400"
+                                : "bg-muted/50 text-muted-foreground"
+                          }`}
+                        >
+                          {assertion.severity}
+                        </span>
+                      </div>
+                      <span className="text-muted-foreground">{assertion.detail}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* Individual Check Results (for command steps with check groups) */}
           {test.check_results && test.check_results.length > 0 && (
             <div data-ui-id="recap-test-check-results">
@@ -528,7 +601,8 @@ function TestResultCard({ test, isExpanded, onToggle }: TestResultCardProps) {
             !test.page_snapshot &&
             !test.error_message &&
             !test.screenshot_path &&
-            (!test.check_results || test.check_results.length === 0) && (
+            (!test.check_results || test.check_results.length === 0) &&
+            !test.snapshot_assert_results && (
               <p className="text-sm text-muted-foreground">
                 No additional details available for this test.
               </p>

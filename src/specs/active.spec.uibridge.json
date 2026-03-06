@@ -1,0 +1,377 @@
+{
+  "version": "1.0.0",
+  "description": "Semantic specs for the Active Dashboard page -- the real-time monitoring hub for running workflows. Users observe live AI conversation output, verification results, iteration progress, phase transitions, and widget-based activity streams. The dashboard uses a dynamic widget layout where the active widget occupies 65% of screen space and summary widgets stack on the remaining 35%. It supports concurrent multi-run monitoring with a run switcher bar, keyboard shortcuts for fast navigation, and a completion summary overlay when workflows finish.",
+  "groups": [
+    {
+      "id": "active-control-bar",
+      "name": "Control Bar and Task Identity",
+      "description": "The top control bar is the user's primary orientation point on the dashboard. It shows the running task's name, current execution phase (setup, verification, agentic, completion), overall status (running, paused, completed, failed), and iteration progress for orchestrated workflows. Users can pause, resume, or stop execution directly from the control bar. When a composed workflow with multiple stages is running, the control bar also shows stage progress (e.g., stage 2 of 5). This bar is always visible regardless of scroll position.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "active-ctrl-task-identity",
+          "description": "Users can see the name of the currently running workflow in the control bar, providing immediate context about what is executing",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "heading" },
+            "label": "Task name heading in control bar"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "active-ctrl-stop",
+          "description": "Users can stop the running workflow from the control bar, immediately terminating the AI session, GUI automation, or flow execution as appropriate",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Stop" },
+            "label": "Stop execution button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "active-ctrl-phase-badge",
+          "description": "Users can see the current execution phase (setup, verification, agentic, or completion) as a badge, understanding where the workflow is in its lifecycle",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "agentic" },
+            "label": "Phase badge showing current phase"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "active-ctrl-play-pause",
+          "description": "Users can pause and resume workflow execution (for GUI automation and flow execution types) to temporarily halt activity without losing progress",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Play/pause toggle button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "active-widget-layout",
+      "name": "Dynamic Widget Layout",
+      "description": "The main content area uses a dynamic widget-based layout that shows only activities relevant to the currently running task. The active (focused) widget occupies approximately 65% of the screen with a highlighted border, while summary widgets for other activities stack in the remaining 35%. Users can click any summary widget to promote it to the active position. Widget types include AI Conversation (chat history and thinking indicator), Verification (test results), Findings (AI-detected issues), GUI Automation (screenshots and action stream), Playwright (test execution), and Flow Execution. The system automatically selects the most relevant widget based on the current execution phase.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "active-widget-ai-conversation",
+          "description": "Users can view the live AI conversation output showing what the AI is thinking, what tools it is calling, and what code changes it is making in real time",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "AI Conversation" },
+            "label": "AI Conversation widget"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "active-widget-verification",
+          "description": "Users can see verification results showing whether the AI's changes passed or failed the defined verification steps, with per-step status indicators",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Verification" },
+            "label": "Verification widget"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "active-widget-switchable",
+          "description": "Users can click on any summary widget to promote it to the active (large) position, allowing focus on whichever activity stream is most relevant at the moment",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "region" },
+            "label": "Widget layout container"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "active-widget-keyboard-switch",
+          "description": "Users can switch between widgets using Ctrl+1 through Ctrl+8 keyboard shortcuts for rapid navigation without mouse interaction",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "?" },
+            "label": "Keyboard shortcut help indicator"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "active-iteration-progress",
+      "name": "Iteration and Progress Tracking",
+      "description": "For orchestrated workflows that run in an iterative loop (AI makes changes, verification checks results, repeat), the dashboard tracks iteration progress. Users can see the current iteration number, the maximum iteration limit, and the bottom bar shows elapsed time and the currently active orchestrator agent. The phase badge updates in real time as the workflow transitions between setup, agentic, verification, and completion phases. Stage progress is shown for composed workflows running multiple sequential workflows.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "active-progress-bottom-bar",
+          "description": "The bottom bar provides persistent status information including the active activity type, whether the workflow is running, and elapsed time since the task started",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Running" },
+            "label": "Bottom bar running status"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "active-progress-orchestrator-agent",
+          "description": "Users can see which orchestrator agent is currently active, understanding the internal execution context of the workflow engine",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "agent" },
+            "label": "Current orchestrator agent indicator"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "active-progress-iteration-display",
+          "description": "For iterative workflows, users can see the current iteration count relative to the maximum, understanding how many fix-verify cycles have occurred and how many remain",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Iteration" },
+            "label": "Iteration counter display"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "active-multi-run",
+      "name": "Multi-Run Concurrent Monitoring",
+      "description": "When multiple workflows are running concurrently, an ActiveRunsBar appears at the bottom of the dashboard above the status bar. Users can switch between active runs to view different dashboards, each with its own widget layout and execution state. A 'New Run' button allows navigating to the Execute page to start additional concurrent runs. Each run maintains independent state tracking so switching between runs shows the correct phase, iteration, and widget content for that specific execution.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "active-multi-run-switcher",
+          "description": "When multiple workflows are running simultaneously, users can switch between them to monitor each run's progress independently without losing context on any run",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Active Runs" },
+            "label": "Active runs bar or heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "active-multi-run-new",
+          "description": "Users can navigate to start a new concurrent run from the active runs bar without having to manually navigate away from the dashboard",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "New Run" },
+            "label": "New Run button in active runs bar"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "active-multi-run-independent-state",
+          "description": "Each concurrent run displays its own independent execution state including task name, phase, and widget content, so switching between runs shows accurate per-run information",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Individual run selector buttons"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "active-completion",
+      "name": "Workflow Completion and Summary",
+      "description": "When a workflow finishes executing (either successfully or with failures), a completion summary overlay appears showing the final status, step statistics (total, successful, failed, pending), success rate percentage, and total execution duration. Users can dismiss the overlay to return to the dashboard state, navigate to the Recap page for detailed post-mortem analysis, or re-run the last workflow. The overlay provides immediate closure on whether the automation achieved its goals.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "active-completion-overlay",
+          "description": "When a workflow finishes, users see a completion summary overlay with the final pass/fail status, providing immediate feedback on whether the automation succeeded",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Completed" },
+            "label": "Completion status in summary overlay"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "active-completion-stats",
+          "description": "The completion summary shows step-level statistics including counts of successful, failed, and pending steps along with an overall success rate, helping users evaluate the quality of the run",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Success" },
+            "label": "Success rate or count in completion summary"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "active-completion-dismiss",
+          "description": "Users can dismiss the completion overlay to return to the dashboard view, or choose to navigate to the Recap page for detailed analysis of the completed run",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Dismiss" },
+            "label": "Dismiss completion overlay button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "active-approval-dialog",
+      "name": "Human Approval Workflow",
+      "description": "Some workflows are configured to pause at certain points and request human approval before continuing. When the workflow reaches such a point, an approval dialog overlay appears on the dashboard. Users can review the pending request and either approve or reject the proposed action. Once resolved, the workflow resumes execution. This enables human-in-the-loop oversight for high-stakes automation steps where blind AI execution would be inappropriate.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "active-approval-overlay",
+          "description": "When a workflow pauses for human review, an approval dialog overlays the dashboard presenting the pending decision to the user without navigating away from the monitoring view",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Approval" },
+            "label": "Approval dialog overlay"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "active-approval-resolve",
+          "description": "Users can approve or reject the pending workflow action, and upon resolution the workflow automatically resumes execution with the user's decision applied",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Approve" },
+            "label": "Approve button in approval dialog"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "active-approval-context",
+          "description": "The approval dialog provides sufficient context about what the AI wants to do so the user can make an informed approval or rejection decision",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "review" },
+            "label": "Approval context description"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "ActiveDashboardPage",
+    "author": "Joshua Spinak",
+    "createdAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "pageUrl": "/runs/active",
+    "elementSource": "sdk",
+    "tags": [
+      "active-dashboard",
+      "monitoring",
+      "real-time",
+      "widgets",
+      "multi-run",
+      "run-group",
+      "tier-1"
+    ]
+  }
+}

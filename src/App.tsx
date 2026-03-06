@@ -163,6 +163,7 @@ import { ErrorMonitorTab } from "./components/error-monitor";
 import { ProcessManagerTab } from "./components/process-manager";
 import { ReflectionDashboard } from "./components/reflection-dashboard/ReflectionDashboard";
 import { GeneratorEvalPage } from "./pages/GeneratorEvalPage";
+import { SpecsPage } from "./pages/specs/SpecsPage";
 import { UIBridgeIntegrationPage } from "./pages/ui-bridge-integration/UIBridgeIntegrationPage";
 import { TerminalPage } from "./components/terminal";
 
@@ -218,6 +219,7 @@ type MainTabId =
   | "context-builder"
   | "playwright-test-builder"
   | "unified-workflow-builder"
+  | "specs"
   | "capture"
   | "config-log-sources"
   | "config-findings"
@@ -286,6 +288,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "context-builder",
   "playwright-test-builder",
   "unified-workflow-builder",
+  "specs",
   "capture",
   "config-log-sources",
   "config-findings",
@@ -1248,6 +1251,18 @@ function AppContent() {
 
       case "library":
         return <LibraryDashboard onLog={addLog} />;
+
+      case "specs":
+        return (
+          <div className="h-full overflow-hidden">
+            <SpecsPage
+              onNavigateToWorkflowBuilder={(id) => {
+                setEditWorkflowId(id);
+                setActiveTab("unified-workflow-builder");
+              }}
+            />
+          </div>
+        );
 
       case "step-builders":
         return <StepBuildersPage onNavigate={(id) => setActiveTab(id as MainTabId)} />;

@@ -1,0 +1,276 @@
+{
+  "version": "1.0.0",
+  "description": "Specs for the Error Monitor page — centralized error tracking and management across automation runs, providing filtering, status management, and fix workflow generation capabilities.",
+  "groups": [
+    {
+      "id": "error-monitor-visibility",
+      "name": "Error Visibility and Awareness",
+      "description": "The Error Monitor page serves as a centralized hub where users gain immediate awareness of all errors detected across automation runs. Upon navigating to this page, users should quickly understand the overall error landscape through summary badges showing counts by severity level (critical, error, warning), an unresolved error count indicator, and an auto-refreshing list of error events. The page must convey the health of the automation system at a glance, so a user who just finished a batch of workflow runs can immediately see whether anything went wrong and how severe the issues are.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "errmon-vis-heading",
+          "description": "Users can identify they are on the Error Monitor page and see a heading that clearly communicates the purpose of this view as centralized error tracking",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Error Monitor" },
+            "label": "Error Monitor heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "errmon-vis-severity-summary",
+          "description": "Users can see at-a-glance severity breakdown badges showing how many critical, error, and warning level issues exist, allowing them to immediately gauge the urgency of unresolved problems",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "critical" },
+            "label": "Severity summary badges"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "errmon-vis-unresolved-count",
+          "description": "Users can see the total count of unresolved errors prominently displayed, giving them a single number that represents the backlog of issues requiring attention",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "unresolved" },
+            "label": "Unresolved error count badge"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "errmon-vis-auto-refresh",
+          "description": "Users benefit from automatic periodic refreshing of error data so they do not need to manually reload the page to see newly detected errors during active automation runs",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Auto-refresh" },
+            "label": "Auto-refresh indicator"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "error-monitor-filtering",
+      "name": "Error Filtering and Search",
+      "description": "Users need powerful filtering capabilities to narrow down the error list to the specific issues they care about. This includes text-based search across error messages, types, log sources, and workflow names, as well as structured filters for severity levels (critical, error, warning, info, debug) and status categories (new, acknowledged, in_progress, resolved, ignored, recurring). The filter system should support combining multiple criteria and provide clear feedback about how many filters are active, with the ability to clear all filters at once. Users dealing with dozens or hundreds of errors need to quickly isolate the subset relevant to their current investigation.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "errmon-filter-search",
+          "description": "Users can type free-text search queries to find errors matching specific patterns, error types, log source names, or workflow names, enabling rapid location of known issues",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Search errors" },
+            "label": "Error search input"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "errmon-filter-severity",
+          "description": "Users can filter the error list by severity level, selecting one or more of critical, error, warning, info, or debug to focus on errors at the appropriate urgency level",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Severity" },
+            "label": "Severity filter section"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "errmon-filter-status",
+          "description": "Users can filter errors by their triage status (new, acknowledged, in_progress, resolved, ignored, recurring) to separate actionable errors from those already being handled or dismissed",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Status" },
+            "label": "Status filter section"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "errmon-filter-toggle",
+          "description": "Users can toggle the filter panel open and closed, and see a visual indicator of how many filters are currently active so they know when results are being narrowed",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Filters" },
+            "label": "Filter toggle button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "error-monitor-triage",
+      "name": "Error Triage and Status Management",
+      "description": "Once users have identified relevant errors, they need to triage them by changing their status. The workflow involves expanding an error to see its full message and stack trace, then marking it as acknowledged (someone is aware), resolved (the issue is fixed), or ignored (not actionable). This triage workflow is essential for teams managing automation reliability, as it prevents the same errors from being re-investigated and provides a clear record of which issues have been addressed. Users should also be able to generate fix workflows from errors to automatically address recurring problems.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "errmon-triage-expand",
+          "description": "Users can expand individual error entries to reveal full error details including the complete message, stack trace, context lines, and resolution notes, providing the information needed to diagnose the root cause",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Full Message" },
+            "label": "Expanded error detail section"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "errmon-triage-acknowledge",
+          "description": "Users can mark new errors as acknowledged to signal that someone is aware of the issue and it does not need further immediate attention from the team",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Acknowledge" },
+            "label": "Acknowledge action button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "errmon-triage-resolve",
+          "description": "Users can mark errors as resolved when the underlying issue has been fixed, removing them from the active error queue and providing closure on investigated problems",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Mark Resolved" },
+            "label": "Resolve action button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "errmon-triage-fix-workflow",
+          "description": "Users can generate automated fix workflows from detected errors, leveraging the AI system to propose and execute remediation steps for recurring or complex error patterns",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Fix" },
+            "label": "Fix errors button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "error-monitor-context",
+      "name": "Error Context and Metadata",
+      "description": "Each error entry should provide rich contextual information beyond just the error message. Users need to see which log source produced the error, which workflow was running when it occurred, the file path and line number if available, the timestamp, the occurrence count for recurring errors, and the current triage status. This metadata helps users correlate errors with specific automation runs and prioritize based on frequency and recency.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "errmon-ctx-log-source",
+          "description": "Users can identify which log source produced each error, allowing them to trace issues back to specific applications or services being monitored",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "error" },
+            "label": "Error item with log source metadata"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "errmon-ctx-error-count",
+          "description": "Users can see the total count of displayed errors and whether filters are narrowing the view, providing orientation about what portion of the error landscape they are currently examining",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "error" },
+            "label": "Error count footer"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "errmon-ctx-empty-state",
+          "description": "When no errors match the current filters or no errors have been detected at all, users see a clear empty state message that distinguishes between no errors existing and no errors matching filters, with guidance on configuring log sources if needed",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "No Errors" },
+            "label": "Empty state message"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "ErrorMonitorTab",
+    "author": "Joshua Spinak",
+    "createdAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "pageUrl": "/tools/error-monitor",
+    "elementSource": "sdk",
+    "tags": ["error-monitor", "error-tracking", "triage", "observability"]
+  }
+}

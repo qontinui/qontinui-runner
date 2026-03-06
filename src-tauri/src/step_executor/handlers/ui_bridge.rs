@@ -48,6 +48,239 @@ fn compute_failing_count(
 }
 
 // ---------------------------------------------------------------------------
+// Snapshot assertion types and evaluation (deterministic spec checks)
+// ---------------------------------------------------------------------------
+
+/// A single assertion to evaluate against a UI Bridge snapshot.
+/// Deserialized from the JSON array packed into the `ui_bridge_target` field.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotAssertion {
+    id: String,
+    description: String,
+    severity: String,
+    #[serde(default = "default_assertion_type")]
+    assertion_type: String,
+    #[serde(default)]
+    criteria: serde_json::Map<String, serde_json::Value>,
+    expected: Option<String>,
+}
+
+fn default_assertion_type() -> String {
+    "exists".to_string()
+}
+
+/// Evaluate a single assertion against snapshot elements.
+/// Returns (passed: bool, detail: String).
+fn evaluate_snapshot_assertion(
+    assertion: &SnapshotAssertion,
+    elements: &[serde_json::Value],
+) -> (bool, String) {
+    // Find elements matching the criteria
+    let matching: Vec<&serde_json::Value> = elements
+        .iter()
+        .filter(|el| element_matches_criteria(el, &assertion.criteria))
+        .collect();
+
+    match assertion.assertion_type.as_str() {
+        "exists" => {
+            if matching.is_empty() {
+                (
+                    false,
+                    format!(
+                        "No element found matching criteria {:?}",
+                        criteria_summary(&assertion.criteria)
+                    ),
+                )
+            } else {
+                (
+                    true,
+                    format!("Found {} element(s) matching criteria", matching.len()),
+                )
+            }
+        }
+        "not_exists" => {
+            if matching.is_empty() {
+                (true, "No matching element found (as expected)".to_string())
+            } else {
+                (
+                    false,
+                    format!(
+                        "Expected no elements but found {} matching {:?}",
+                        matching.len(),
+                        criteria_summary(&assertion.criteria)
+                    ),
+                )
+            }
+        }
+        "visible" => {
+            let visible_matches: Vec<_> = matching
+                .iter()
+                .filter(|el| {
+                    el.get("state")
+                        .and_then(|s| s.get("visible"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                })
+                .collect();
+            if visible_matches.is_empty() {
+                if matching.is_empty() {
+                    (
+                        false,
+                        format!(
+                            "No element found matching criteria {:?}",
+                            criteria_summary(&assertion.criteria)
+                        ),
+                    )
+                } else {
+                    (
+                        false,
+                        format!("Found {} element(s) but none are visible", matching.len()),
+                    )
+                }
+            } else {
+                (
+                    true,
+                    format!("{} visible element(s) found", visible_matches.len()),
+                )
+            }
+        }
+        "contains" => {
+            let expected = assertion.expected.as_deref().unwrap_or("");
+            let has_match = matching.iter().any(|el| {
+                let text = el
+                    .get("state")
+                    .and_then(|s| s.get("textContent"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("");
+                text.contains(expected)
+            });
+            if has_match {
+                (true, format!("Found element containing '{}'", expected))
+            } else if matching.is_empty() {
+                (
+                    false,
+                    format!(
+                        "No element found matching criteria {:?}",
+                        criteria_summary(&assertion.criteria)
+                    ),
+                )
+            } else {
+                (
+                    false,
+                    format!(
+                        "Found {} element(s) but none contain '{}'",
+                        matching.len(),
+                        expected
+                    ),
+                )
+            }
+        }
+        other => (
+            false,
+            format!(
+                "Unknown assertion type '{}' — cannot evaluate deterministically",
+                other
+            ),
+        ),
+    }
+}
+
+/// Check if an element matches the given search criteria.
+///
+/// Criteria map keys:
+/// - "textContent": substring match against element.state.textContent or element.label
+/// - "id" / "elementId": exact match against element.id
+/// - "testId": exact match against element.identifier.testId
+/// - "htmlId": exact match against element.identifier.htmlId
+/// - "type": exact match against element.type
+/// - "label": substring match against element.label
+fn element_matches_criteria(
+    element: &serde_json::Value,
+    criteria: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    if criteria.is_empty() {
+        return false; // No criteria = no match (safety)
+    }
+
+    for (key, value) in criteria {
+        let expected = match value.as_str() {
+            Some(s) => s,
+            None => continue, // Skip non-string criteria values
+        };
+
+        let matches = match key.as_str() {
+            "textContent" => {
+                // Check state.textContent (substring, case-insensitive)
+                let text = element
+                    .get("state")
+                    .and_then(|s| s.get("textContent"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("");
+                let label = element.get("label").and_then(|l| l.as_str()).unwrap_or("");
+                text.to_lowercase().contains(&expected.to_lowercase())
+                    || label.to_lowercase().contains(&expected.to_lowercase())
+            }
+            "id" | "elementId" => {
+                let id = element.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                id == expected
+            }
+            "testId" => {
+                let test_id = element
+                    .get("identifier")
+                    .and_then(|i| i.get("testId"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("");
+                test_id == expected
+            }
+            "htmlId" => {
+                let html_id = element
+                    .get("identifier")
+                    .and_then(|i| i.get("htmlId"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("");
+                html_id == expected
+            }
+            "type" => {
+                let el_type = element.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                el_type == expected
+            }
+            "label" => {
+                let label = element.get("label").and_then(|l| l.as_str()).unwrap_or("");
+                label.to_lowercase().contains(&expected.to_lowercase())
+            }
+            _ => {
+                // Unknown criteria key — try state.<key> as fallback
+                let state_val = element
+                    .get("state")
+                    .and_then(|s| s.get(key))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                state_val.to_lowercase().contains(&expected.to_lowercase())
+            }
+        };
+
+        if !matches {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Create a human-readable summary of search criteria for error messages.
+fn criteria_summary(criteria: &serde_json::Map<String, serde_json::Value>) -> String {
+    criteria
+        .iter()
+        .map(|(k, v)| {
+            let val = v.as_str().unwrap_or("?");
+            format!("{}={}", k, val)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+// ---------------------------------------------------------------------------
 // Typed comparison result (#6 — replace dynamic JSON field access)
 // ---------------------------------------------------------------------------
 
@@ -409,6 +642,15 @@ impl StepHandler for UiBridgeHandler {
             return result;
         }
 
+        // Handle snapshot_assert: fetch snapshot once, evaluate all assertions locally
+        if action == "snapshot_assert" {
+            let result = self
+                .execute_snapshot_assert(step, base_url, timeout_ms)
+                .await;
+            self.track_result(context, base_url, &result).await;
+            return result;
+        }
+
         // (#1) Retry loop for transient failures — 3 attempts, exponential backoff
         let max_attempts: u32 = 3;
         let mut last_error: Option<String> = None;
@@ -701,6 +943,200 @@ impl UiBridgeHandler {
             Err(e) => {
                 warn!("AI diagnosis task panicked for {}: {}", base_url, e);
             }
+        }
+    }
+
+    /// Execute a "snapshot_assert" action (deterministic spec assertion):
+    /// 1. Fetch a UI Bridge snapshot (one HTTP call)
+    /// 2. Parse the assertion specs from `ui_bridge_target` (JSON array)
+    /// 3. For each assertion, search snapshot elements for matches
+    /// 4. Return per-assertion pass/fail results — no AI tokens used
+    async fn execute_snapshot_assert(
+        &self,
+        step: &ExecutionStepConfig,
+        base_url: &str,
+        timeout_ms: u64,
+    ) -> StepHandlerResult {
+        let start = std::time::Instant::now();
+
+        // Parse assertion specs from the target field
+        let assertions_json = step.ui_bridge_target.as_deref().unwrap_or("[]");
+        let assertions: Vec<SnapshotAssertion> = match serde_json::from_str(assertions_json) {
+            Ok(a) => a,
+            Err(e) => {
+                return StepHandlerResult::failure(format!(
+                    "Failed to parse snapshot_assert assertions: {}",
+                    e
+                ));
+            }
+        };
+
+        if assertions.is_empty() {
+            return StepHandlerResult {
+                success: true,
+                error: None,
+                output_data: Some(serde_json::json!({
+                    "action": "snapshot_assert",
+                    "passed": 0,
+                    "failed": 0,
+                    "total": 0,
+                    "results": [],
+                })),
+                screenshot_path: None,
+            };
+        }
+
+        // Fetch snapshot
+        let snapshot_target = step
+            .ui_bridge_snapshot_target
+            .as_deref()
+            .unwrap_or("control");
+        let snapshot_endpoint = match snapshot_target {
+            "sdk" => format!("{}/sdk/snapshot", base_url.trim_end_matches('/')),
+            "control" => format!("{}/control/snapshot", base_url.trim_end_matches('/')),
+            t if t.starts_with("proxy:") => {
+                let port = &t["proxy:".len()..];
+                format!("http://127.0.0.1:{}/__ui-bridge/control/snapshot", port)
+            }
+            other => {
+                return StepHandlerResult::failure(format!(
+                    "Unknown snapshot target: '{}'. Use 'control', 'sdk', or 'proxy:PORT'",
+                    other
+                ));
+            }
+        };
+
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(timeout_ms))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return StepHandlerResult::failure(format!("Failed to create HTTP client: {}", e));
+            }
+        };
+
+        let snapshot_response = match client.get(&snapshot_endpoint).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                return StepHandlerResult::failure(format!(
+                    "Failed to fetch snapshot from {}: {}",
+                    snapshot_endpoint, e
+                ));
+            }
+        };
+
+        if !snapshot_response.status().is_success() {
+            let status = snapshot_response.status();
+            let body = snapshot_response.text().await.unwrap_or_default();
+            return StepHandlerResult::failure(format!(
+                "Snapshot request returned {}: {}",
+                status, body
+            ));
+        }
+
+        let snapshot_text = match snapshot_response.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                return StepHandlerResult::failure(format!(
+                    "Failed to read snapshot response: {}",
+                    e
+                ));
+            }
+        };
+
+        let snapshot: serde_json::Value = match serde_json::from_str(&snapshot_text) {
+            Ok(v) => v,
+            Err(e) => {
+                return StepHandlerResult::failure(format!("Failed to parse snapshot JSON: {}", e));
+            }
+        };
+
+        // Extract elements array from snapshot
+        // The snapshot may be wrapped in { data: { elements: [...] } } or { elements: [...] }
+        let elements = snapshot
+            .get("data")
+            .and_then(|d| d.get("elements"))
+            .or_else(|| snapshot.get("elements"))
+            .and_then(|e| e.as_array());
+
+        let elements = match elements {
+            Some(e) => e,
+            None => {
+                return StepHandlerResult::failure(
+                    "Snapshot response does not contain an elements array",
+                );
+            }
+        };
+
+        // Evaluate each assertion against the snapshot elements
+        let mut results: Vec<serde_json::Value> = Vec::new();
+        let mut passed = 0u32;
+        let mut failed = 0u32;
+        let mut failure_descriptions: Vec<String> = Vec::new();
+
+        for assertion in &assertions {
+            let (pass, detail) = evaluate_snapshot_assertion(assertion, elements);
+
+            if pass {
+                passed += 1;
+            } else {
+                failed += 1;
+                failure_descriptions.push(format!(
+                    "[{}] {}: {}",
+                    assertion.severity, assertion.description, detail
+                ));
+            }
+
+            results.push(serde_json::json!({
+                "id": assertion.id,
+                "description": assertion.description,
+                "severity": assertion.severity,
+                "assertionType": assertion.assertion_type,
+                "passed": pass,
+                "detail": detail,
+            }));
+        }
+
+        let elapsed = start.elapsed();
+        let total = passed + failed;
+
+        // Determine overall success: fail if any critical/warning assertions failed
+        let has_critical_failure = assertions.iter().zip(results.iter()).any(|(a, r)| {
+            let is_failing = r.get("passed").and_then(|p| p.as_bool()) == Some(false);
+            is_failing && (a.severity == "critical" || a.severity == "warning")
+        });
+
+        let success = !has_critical_failure;
+
+        let error = if !success {
+            Some(format!(
+                "{} of {} assertions failed:\n{}",
+                failed,
+                total,
+                failure_descriptions.join("\n")
+            ))
+        } else {
+            None
+        };
+
+        info!(
+            "snapshot_assert completed in {:?}: {}/{} passed (success={})",
+            elapsed, passed, total, success
+        );
+
+        StepHandlerResult {
+            success,
+            error,
+            output_data: Some(serde_json::json!({
+                "action": "snapshot_assert",
+                "passed": passed,
+                "failed": failed,
+                "total": total,
+                "duration_ms": elapsed.as_millis() as u64,
+                "results": results,
+            })),
+            screenshot_path: None,
         }
     }
 

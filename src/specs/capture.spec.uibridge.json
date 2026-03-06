@@ -1,0 +1,192 @@
+{
+  "version": "1.0.0",
+  "description": "Semantic specs for the Capture page -- a dev-only interaction recording tool available exclusively in the runner application. Users record mouse and keyboard interactions along with screen video to create data for State Machine construction from desktop and mixed-environment workflows. The tool captures input events as timestamped JSONL data synchronized with video frames, enabling analysis of complex multi-step user interactions including drag operations and cross-application workflows.",
+  "groups": [
+    {
+      "id": "cap-recording-controls",
+      "name": "Recording Controls and Session Management",
+      "description": "The core recording workflow is straightforward: users click Start Recording to begin capturing, then Stop Recording to end the session. While recording, a live timer shows elapsed duration with a pulsing red indicator, and an event counter tracks the number of mouse and keyboard events captured. The recording captures three types of data simultaneously: mouse input, keyboard input, and screen video. Users configure the video FPS before starting. The start and stop buttons provide clear visual feedback about the current state and disable appropriately to prevent double-starts or premature stops.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "cap-start-recording",
+          "description": "Users can start an interaction recording session by clicking a prominently displayed Start Recording button, which begins capturing mouse, keyboard, and video data simultaneously",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Start Recording" },
+            "label": "Start Recording button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "cap-input-types-shown",
+          "description": "Users see indicators for the three captured input types -- Mouse, Keyboard, and Video -- so they understand the scope of data being recorded",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Mouse" },
+            "label": "Mouse input type indicator"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "cap-page-header",
+          "description": "Users see a clear header identifying this as the Interaction Recording tool, with a subtitle explaining it captures input for State Machine creation",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Interaction Recording" },
+            "label": "Interaction Recording header"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "cap-purpose-description",
+          "description": "Users see explanatory text describing the purpose of recording interactions -- to create State Machines from complex workflows, drags, and multi-step processes",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Record your interactions" },
+            "label": "Recording purpose text"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "cap-settings-configuration",
+      "name": "Recording Settings",
+      "description": "Before starting a recording, users can configure capture settings through a collapsible settings panel. The primary setting is video FPS, which controls the frame rate of screen recording and can be adjusted between 10 and 60 FPS using a slider. Higher FPS produces smoother video but larger files, with 30 FPS recommended as the default. Settings are disabled during an active recording to prevent mid-session configuration changes that could corrupt data.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "cap-settings-toggle",
+          "description": "Users can open and close a settings panel to configure recording parameters before starting a session, keeping the main interface uncluttered",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Interaction Recording" },
+            "label": "Recording page with settings gear"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "cap-fps-setting",
+          "description": "Users can adjust the video capture frame rate using an FPS slider, balancing between smoother video quality and smaller file sizes",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Video FPS" },
+            "label": "Video FPS setting label"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "cap-fps-recommendation",
+          "description": "Users see guidance that higher FPS gives smoother video but larger files, with 30 FPS recommended as the default, helping them make informed configuration choices",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "30 FPS is recommended" },
+            "label": "FPS recommendation text"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "cap-recording-output",
+      "name": "Recording Output and Results",
+      "description": "After stopping a recording, users see a summary of the captured session including duration and total event count. The last recording section persists until a new recording is started, allowing users to review and access the output files. Users can open the output folder containing the JSONL events file and video recording directly from the interface. This output data serves as input for creating State Machines that model complex user interaction patterns.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "cap-output-info",
+          "description": "The info section explains the purpose (State Machine creation), output format (JSONL events with timestamps), and use cases (drag operations, multi-step workflows, desktop app automation)",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Purpose" },
+            "label": "Purpose info section"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "cap-output-format",
+          "description": "Users understand that recordings produce input events in JSONL format with timestamps that can be correlated with video frames for analysis",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "JSONL" },
+            "label": "JSONL output format description"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "cap-use-cases",
+          "description": "Users see documented use cases for recordings including complex drag operations, multi-step workflows, and desktop app automation, helping them understand when to use this tool",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Use cases" },
+            "label": "Use cases section"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "CaptureTab",
+    "author": "Joshua Spinak",
+    "createdAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "pageUrl": "/capture",
+    "elementSource": "sdk",
+    "tags": ["capture", "recording", "interaction", "dev-only", "state-machine"]
+  }
+}

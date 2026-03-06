@@ -1,0 +1,177 @@
+{
+  "version": "1.0.0",
+  "description": "Specs for the Lifecycle Hooks configuration page — manages webhooks and actions triggered by execution events, with CRUD operations, enable/disable toggles, and hook testing capabilities.",
+  "groups": [
+    {
+      "id": "hooks-management-overview",
+      "name": "Hook Inventory and Status",
+      "description": "The Lifecycle Hooks page allows users to configure actions that execute automatically at specific points during workflow execution (e.g., on workflow start, completion, failure). Users need to see all configured hooks at a glance with their names, event triggers, enabled/disabled state, and any recent execution results. The page header shows the hook count and provides quick access to creating new hooks and refreshing the list. When no hooks exist, an informative empty state guides users to create their first hook rather than leaving them on a blank page.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "hooks-overview-heading",
+          "description": "Users can identify the Lifecycle Hooks page with a clear heading and subtitle explaining that hooks are actions configured to run at specific execution events",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Lifecycle Hooks" },
+            "label": "Lifecycle Hooks heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "hooks-overview-description",
+          "description": "Users understand the purpose of hooks through a descriptive subtitle that explains they configure actions to run at execution events, providing context for users encountering this feature for the first time",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Configure actions to run at specific execution events" },
+            "label": "Hooks description text"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "hooks-overview-empty",
+          "description": "When no hooks are configured, users see a helpful empty state with a clear call-to-action to create their first hook, explaining the value of lifecycle hooks rather than showing a blank list",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "No lifecycle hooks" },
+            "label": "Empty state message"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "hooks-crud",
+      "name": "Hook Creation and Configuration",
+      "description": "Users need to create new hooks by specifying a name, URL endpoint, event triggers, custom headers, and payload configuration. The hook editor should open as a modal or panel when creating a new hook or editing an existing one. The save operation should validate the hook configuration and provide clear feedback on success or failure. Editing an existing hook should pre-populate the form with current values. The system should support both creating new hooks and updating existing ones through the same editor interface.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "hooks-crud-create",
+          "description": "Users can create new lifecycle hooks by clicking a New Hook button, which opens an editor where they can configure the hook's name, URL, event triggers, headers, and payload format",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "New Hook" },
+            "label": "New Hook button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "hooks-crud-edit",
+          "description": "Users can edit existing hooks by clicking an edit action on a hook card, which opens the editor pre-populated with the hook's current configuration for modification",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Edit hook action"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "hooks-crud-delete",
+          "description": "Users can delete hooks they no longer need, with a confirmation dialog that clearly states the action is irreversible and shows the hook name being deleted",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Delete Hook" },
+            "label": "Delete hook confirmation dialog"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "hooks-operations",
+      "name": "Hook Testing and Toggle Controls",
+      "description": "Before relying on hooks in production workflows, users need to verify that their hook configurations work correctly. The test feature sends a sample payload to the configured URL and reports success/failure along with response details and execution duration. Additionally, hooks can be individually enabled or disabled without deletion, allowing users to temporarily suspend hook execution during maintenance or debugging without losing their configuration. These operational controls are essential for building confidence in the hook system and managing it in real development workflows.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "hooks-ops-test",
+          "description": "Users can test individual hooks to verify connectivity and correct configuration, receiving a result that shows whether the test passed or failed along with the response and duration in milliseconds",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Test" },
+            "label": "Test hook result display"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "hooks-ops-toggle",
+          "description": "Users can enable or disable individual hooks without deleting them, allowing temporary suspension of hook execution while preserving the configuration for future use",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Hook enable/disable toggle"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "hooks-ops-error-display",
+          "description": "When hook operations fail, users see clear error messages with enough detail to diagnose the issue, and can dismiss errors after reading them",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "alert" },
+            "label": "Error banner"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "HooksManagerPanel",
+    "author": "Joshua Spinak",
+    "createdAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "pageUrl": "/config/hooks",
+    "elementSource": "sdk",
+    "tags": ["hooks", "lifecycle", "webhooks", "configuration", "dev-only", "runner-only"]
+  }
+}

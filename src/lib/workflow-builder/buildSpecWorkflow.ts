@@ -4,24 +4,43 @@
  * Builds a complete UnifiedWorkflow from a SpecConfig. Extracted from
  * SpecWorkflowBuilder.tsx for reuse in both the spec workflow builder
  * and the live page generator's spec workflow mode.
+ *
+ * Generates a hybrid workflow:
+ *  - Assertions with deterministic types (exists, contains, visible, not_exists)
+ *    AND a target with search criteria become fast UiBridge "snapshot_assert" steps.
+ *  - Assertions requiring AI reasoning (behavior, source_review, semantic, or
+ *    those without a target) become prompt steps evaluated by Claude.
+ *
+ * Deterministic assertions within the same group are batched into a single
+ * UiBridge step that fetches one snapshot and evaluates all assertions locally
+ * in Rust — no AI tokens, completes in seconds.
  */
 
-import type { UnifiedWorkflow, PromptStep } from "../../types/unified-workflow";
+import type { UnifiedWorkflow, PromptStep, VerificationStep } from "../../types/unified-workflow";
 import { createSummaryStep } from "../../types/unified-workflow";
 
 // Re-export SpecConfig type shape for consumers that don't import ui-bridge directly
+export interface SpecAssertion {
+  id: string;
+  description: string;
+  severity: string;
+  enabled: boolean;
+  assertionType?: string;
+  target?: {
+    type?: string;
+    criteria?: Record<string, unknown>;
+    label?: string;
+  };
+  expected?: string;
+  [key: string]: unknown;
+}
+
 export interface SpecGroup {
   id: string;
   name: string;
   description: string;
   category: string;
-  assertions: Array<{
-    id: string;
-    description: string;
-    severity: string;
-    enabled: boolean;
-    [key: string]: unknown;
-  }>;
+  assertions: SpecAssertion[];
   [key: string]: unknown;
 }
 
@@ -49,12 +68,73 @@ export interface BuildSpecWorkflowInput {
   pageUrl?: string;
   /** Workflow name override */
   workflowName?: string;
+  /** Force all assertions to use prompt steps (disables deterministic optimization) */
+  forcePromptOnly?: boolean;
+}
+
+// Assertion types that can be evaluated deterministically against a UI snapshot
+const DETERMINISTIC_TYPES = new Set(["exists", "contains", "visible", "not_exists"]);
+
+/** Check if an assertion can be evaluated deterministically (no AI needed). */
+function isDeterministic(assertion: SpecAssertion): boolean {
+  const aType = assertion.assertionType || "exists";
+  return DETERMINISTIC_TYPES.has(aType) && assertion.target?.criteria != null;
+}
+
+/** Build a batched UiBridge snapshot_assert step from a list of deterministic assertions. */
+function buildSnapshotAssertStep(
+  groupName: string,
+  assertions: SpecAssertion[],
+  elementSource: string,
+): VerificationStep {
+  // Pack all assertions into a JSON array for the Rust handler to evaluate
+  const assertionSpecs = assertions.map((a) => ({
+    id: a.id,
+    description: a.description,
+    severity: a.severity,
+    assertionType: a.assertionType || "exists",
+    criteria: a.target?.criteria ?? {},
+    expected: a.expected,
+  }));
+
+  // Use the ui_bridge_* prefixed field names that the Rust ExecutionStepConfig
+  // deserializer expects (the bare "action"/"target" names aren't aliased)
+  return {
+    id: crypto.randomUUID(),
+    type: "ui_bridge",
+    phase: "verification",
+    name: groupName,
+    ui_bridge_action: "snapshot_assert",
+    ui_bridge_target: JSON.stringify(assertionSpecs),
+    ui_bridge_snapshot_target: elementSource === "external" ? "sdk" : "control",
+  } as unknown as VerificationStep;
+}
+
+/** Build a prompt step for assertions that need AI evaluation. */
+function buildPromptStep(
+  groupName: string,
+  groupDescription: string,
+  assertions: SpecAssertion[],
+  elementSource: string,
+  sourceExplanation: string,
+): PromptStep {
+  const assertionDescriptions = assertions
+    .map((a) => `- ${a.description} [${a.severity}]`)
+    .join("\n");
+
+  return {
+    id: crypto.randomUUID(),
+    type: "prompt",
+    phase: "verification",
+    name: groupName,
+    content: `${groupDescription}\n\nElement source: ${elementSource} — ${sourceExplanation}\n\nAssertions:\n${assertionDescriptions}`,
+  };
 }
 
 /**
  * Build a complete UnifiedWorkflow from a SpecConfig.
  *
- * Produces: setup (optional navigate) -> verification (prompt steps) -> agentic (prompt) -> completion (summary)
+ * Produces: setup -> verification (hybrid UiBridge + prompt steps) -> agentic -> completion
  */
 export function buildSpecWorkflow(input: BuildSpecWorkflowInput): UnifiedWorkflow {
   const {
@@ -64,6 +144,7 @@ export function buildSpecWorkflow(input: BuildSpecWorkflowInput): UnifiedWorkflo
     maxIterations = 3,
     pageUrl,
     workflowName,
+    forcePromptOnly = false,
   } = input;
 
   // Resolve element source: explicit param > spec metadata > "control"
@@ -77,32 +158,49 @@ export function buildSpecWorkflow(input: BuildSpecWorkflowInput): UnifiedWorkflo
     ? specConfig.groups.filter((g) => selectedGroupIds.has(g.id))
     : specConfig.groups;
 
-  // Setup steps: navigate to page URL if provided
+  // Setup steps
   const setupSteps: PromptStep[] = [];
-  // Note: We don't add a step for navigation in spec workflow mode
-  // because the page is already connected via the SDK or extension.
-  // The workflow assumes the page is already loaded.
 
-  // Verification steps: each selected group becomes a verification prompt
   const sourceExplanation =
     elementSource === "external"
       ? "Elements are fetched from an external SDK-connected app. The AI must fix the web application code so these assertions pass when checked against the live page."
       : "Elements are fetched from the runner's own webview (control mode).";
 
-  const verificationSteps: PromptStep[] = selectedGroups.map((group) => {
-    const enabledAssertions = group.assertions.filter((a) => a.enabled);
-    const assertionDescriptions = enabledAssertions
-      .map((a) => `- ${a.description} [${a.severity}]`)
-      .join("\n");
+  // Verification steps: split each group's assertions into deterministic vs AI-requiring
+  const verificationSteps: VerificationStep[] = [];
 
-    return {
-      id: crypto.randomUUID(),
-      type: "prompt",
-      phase: "verification",
-      name: group.name,
-      content: `${group.description}\n\nElement source: ${elementSource} — ${sourceExplanation}\n\nAssertions:\n${assertionDescriptions}`,
-    };
-  });
+  for (const group of selectedGroups) {
+    const enabledAssertions = group.assertions.filter((a) => a.enabled);
+    if (enabledAssertions.length === 0) continue;
+
+    if (forcePromptOnly) {
+      // Legacy mode: everything goes to AI
+      verificationSteps.push(
+        buildPromptStep(
+          group.name,
+          group.description,
+          enabledAssertions,
+          elementSource,
+          sourceExplanation,
+        ),
+      );
+      continue;
+    }
+
+    const deterministic = enabledAssertions.filter(isDeterministic);
+    const aiRequired = enabledAssertions.filter((a) => !isDeterministic(a));
+
+    if (deterministic.length > 0) {
+      verificationSteps.push(buildSnapshotAssertStep(group.name, deterministic, elementSource));
+    }
+
+    if (aiRequired.length > 0) {
+      const name = deterministic.length > 0 ? `${group.name} (AI)` : group.name;
+      verificationSteps.push(
+        buildPromptStep(name, group.description, aiRequired, elementSource, sourceExplanation),
+      );
+    }
+  }
 
   // Agentic steps
   const agenticSteps: PromptStep[] = [];
@@ -124,7 +222,7 @@ export function buildSpecWorkflow(input: BuildSpecWorkflowInput): UnifiedWorkflo
 
   // Count total enabled assertions
   const totalAssertions = selectedGroups.reduce(
-    (sum, g) => sum + g.assertions.filter((a) => a.enabled).length,
+    (sum, g) => sum + g.assertions.filter((a: SpecAssertion) => a.enabled).length,
     0,
   );
 

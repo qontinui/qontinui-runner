@@ -1,0 +1,192 @@
+{
+  "version": "1.0.0",
+  "description": "Specs for the UI Bridge Integration page — manages discovery, connection, injection, monitoring, and exploration of UI Bridge-enabled applications across five specialized tabs.",
+  "groups": [
+    {
+      "id": "uibridge-navigation",
+      "name": "Integration Hub Navigation",
+      "description": "The UI Bridge Integration page is the central hub for connecting the runner to external applications through the UI Bridge SDK. It provides five specialized tabs covering the full lifecycle of UI Bridge integration: Discovery (finding apps on the network), Runtime Injection (adding the SDK to running apps without code changes), Source Integration (embedding the SDK in app source code), Health Monitor (tracking connected app health metrics), and State Explorer (live inspection of connected app UI state). Users need to navigate between these tabs fluidly, and the page supports a flow where discovering an app in the Discovery tab can transition directly to the Injection tab with the app's URL pre-filled.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "uibridge-nav-heading",
+          "description": "Users can identify the UI Bridge integration page with a clear heading and an integration badge, understanding it as the central hub for connecting external applications to the runner",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "UI Bridge" },
+            "label": "UI Bridge heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "uibridge-nav-discovery-tab",
+          "description": "Users can access the Discovery tab to scan for and find UI Bridge-enabled applications running on the local network or at known URLs",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Discovery" },
+            "label": "Discovery tab trigger"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "uibridge-nav-injection-tab",
+          "description": "Users can access the Runtime Injection tab to inject the UI Bridge SDK into running applications without modifying their source code, enabling automation of apps that do not natively include the SDK",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Runtime Injection" },
+            "label": "Runtime Injection tab trigger"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "uibridge-nav-source-tab",
+          "description": "Users can access the Source Integration tab to get instructions and tools for permanently integrating the UI Bridge SDK into an application's source code",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Source Integration" },
+            "label": "Source Integration tab trigger"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "uibridge-monitoring",
+      "name": "Health Monitoring and Diagnostics",
+      "description": "Once applications are connected via UI Bridge, users need ongoing visibility into connection health. The Health Monitor tab tracks response times, error rates, and connection stability for each connected application. Users should be able to identify degraded connections before they cause workflow failures, spot patterns in connectivity issues (e.g., timeouts during heavy load), and understand the real-time state of all their UI Bridge integrations. This proactive monitoring transforms the UI Bridge from a fire-and-forget setup into a managed integration layer.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "uibridge-monitor-health-tab",
+          "description": "Users can access the Health Monitor tab to view real-time health metrics for all connected UI Bridge applications, including response times, error rates, and connection stability indicators",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Health Monitor" },
+            "label": "Health Monitor tab trigger"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "uibridge-monitor-state-explorer",
+          "description": "Users can access the State Explorer tab to inspect the live UI state of connected applications in real-time, browsing the element tree, reading component state, and verifying that the UI Bridge SDK is correctly reporting the application's UI structure",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "State Explorer" },
+            "label": "State Explorer tab trigger"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "uibridge-monitor-integration-badge",
+          "description": "The page displays an integration badge indicating this is a specialized configuration area for UI Bridge setup and monitoring, distinct from general application settings",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "integration" },
+            "label": "Integration badge"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "uibridge-integration-flow",
+      "name": "Discovery-to-Integration Workflow",
+      "description": "The UI Bridge page supports a cohesive workflow that takes users from discovering an app to fully integrating it. The Discovery tab finds apps, and users can click to inject the SDK, which automatically navigates to the Runtime Injection tab with the app's URL pre-populated. This seamless handoff between tabs reduces friction in the integration process. For permanent integration, the Source Integration tab provides code snippets and instructions. The five-tab architecture means each phase of integration (find, inject temporarily, embed permanently, monitor health, explore state) has a dedicated, focused interface.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "uibridge-flow-tab-count",
+          "description": "Users have access to all five integration tabs (Discovery, Runtime Injection, Source Integration, Health Monitor, State Explorer) covering the complete lifecycle from finding apps to monitoring their ongoing health",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Discovery" },
+            "label": "First tab in the five-tab navigation"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "uibridge-flow-tab-switching",
+          "description": "Users can freely switch between all five tabs to access different phases of the UI Bridge integration workflow, with each tab retaining its state when the user navigates away and returns",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "tablist" },
+            "label": "Tab navigation list"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "uibridge-flow-active-indicator",
+          "description": "The currently active tab is visually distinguished with a highlighted border or background so users always know which integration phase they are viewing",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "tab" },
+            "label": "Active tab indicator"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "UIBridgeIntegrationPage",
+    "author": "Joshua Spinak",
+    "createdAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "pageUrl": "/config/ui-bridge",
+    "elementSource": "sdk",
+    "tags": ["ui-bridge", "integration", "discovery", "health-monitoring", "runner-only"]
+  }
+}

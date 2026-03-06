@@ -1,0 +1,192 @@
+{
+  "version": "1.0.0",
+  "description": "Specs for the Finding Categories configuration page — defines and manages categories used to organize AI-detected findings, with support for custom categories, colors, icons, action types, visibility control, and ordering.",
+  "groups": [
+    {
+      "id": "findings-category-management",
+      "name": "Category Inventory and Organization",
+      "description": "The Finding Categories page is where users define the taxonomy used to organize AI-detected findings from automation runs. Users see a list of all categories (both built-in and custom) with their names, descriptions, icons, color coding, and default action types. Built-in categories are locked and cannot be edited or deleted, but custom categories are fully manageable. The ordering of categories matters because it determines the display order in findings views throughout the application. Users can reorder categories using up/down controls, hide categories they do not want to see in reports, and reset everything to defaults if their customizations become unwieldy.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "findings-cat-heading",
+          "description": "Users can identify the Finding Categories configuration page with a clear heading and subtitle explaining that this controls how findings are categorized and displayed across the application",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Finding Categories" },
+            "label": "Finding Categories heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "findings-cat-list",
+          "description": "Users can see all configured categories displayed in a list with their names, colored icons, descriptions, action type labels, and indicators showing whether each category is built-in or custom",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Built-in" },
+            "label": "Built-in category indicator"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "findings-cat-reorder",
+          "description": "Users can reorder categories using up and down controls to define the display sequence in which findings categories appear throughout the application",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Category reorder controls"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "findings-category-crud",
+      "name": "Category Creation and Editing",
+      "description": "Users who need categories beyond the built-in set can create custom ones. The creation form includes fields for an auto-generated ID, name, description, icon selection from a visual picker, color selection, and a default action type (auto fix, needs user input, manual, informational). A live preview shows how the category will look before saving. Existing custom categories can be edited with the same form, and deleted when no longer needed (with a warning that associated findings will become uncategorized). The form validates that name and ID are provided before allowing save.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "findings-crud-create",
+          "description": "Users can create new custom finding categories by clicking a New Category button, filling in a form with name, description, icon, color, and action type, and saving to add it to the category list",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "New Category" },
+            "label": "New Category button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "findings-crud-preview",
+          "description": "Users can see a live preview of how a new or edited category will appear before committing changes, including the selected icon rendered in the chosen color",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Category Name" },
+            "label": "Category form preview placeholder"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "findings-crud-action-types",
+          "description": "Users can set the default action type for a category, choosing from Auto Fix, Needs Input, Manual, or Informational, to define how the system should handle findings in that category by default",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Auto Fix" },
+            "label": "Action type selector"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "findings-crud-delete",
+          "description": "Users can delete custom categories that are no longer needed, with a confirmation dialog warning that findings using the deleted category will become uncategorized",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Delete category button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "findings-category-visibility",
+      "name": "Visibility and Reset Controls",
+      "description": "Categories can be hidden from reports and views without being deleted, which is useful for temporarily suppressing categories during focused investigations or when built-in categories are not relevant to the current project. The visibility toggle works independently of the category's existence. A reset button restores all categories to their default configuration, removing custom categories and restoring default ordering. The page footer provides legend information explaining built-in category restrictions and the effect of hiding categories.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "findings-vis-toggle",
+          "description": "Users can toggle individual categories between visible and hidden states, controlling which categories appear in findings reports without permanently deleting them",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Hidden categories are not shown in reports" },
+            "label": "Hidden category legend"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "findings-vis-reset",
+          "description": "Users can reset all categories to the default configuration, removing custom categories and restoring built-in ordering, with a confirmation prompt to prevent accidental data loss",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Reset" },
+            "label": "Reset to defaults button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "findings-vis-builtin-lock",
+          "description": "Users are informed that built-in categories cannot be edited or deleted through clear visual indicators (lock icon and label), preventing confusion about why certain categories lack edit controls",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Built-in categories cannot be edited or deleted" },
+            "label": "Built-in restriction legend"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "CategoryManager",
+    "author": "Joshua Spinak",
+    "createdAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "pageUrl": "/settings/finding-rules",
+    "elementSource": "sdk",
+    "tags": ["findings", "categories", "configuration", "settings"]
+  }
+}

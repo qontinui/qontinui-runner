@@ -1,0 +1,192 @@
+{
+  "version": "1.0.0",
+  "description": "Specs for the Process Manager page — manages spawned child processes with lifecycle controls, log viewing, project scanning, and AI-assisted error diagnosis.",
+  "groups": [
+    {
+      "id": "process-manager-overview",
+      "name": "Process Inventory and Status Awareness",
+      "description": "The Process Manager page provides users with a real-time inventory of all processes managed by the runner. Users need to immediately see how many processes are configured, how many are currently running, and the health status of each. The page displays a process list on the left with status indicators (stopped, starting, running, healthy, stopping, failed), PIDs, uptime counters, error counts, and category labels. This overview lets users quickly assess whether their development environment services are all healthy or if something needs attention. The running/total count in the header provides a quick pulse check without needing to scan every row.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "proc-overview-heading",
+          "description": "Users can identify the Process Manager page and see a clear heading along with a running/total process count summary that communicates the overall health of managed services at a glance",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Process Manager" },
+            "label": "Process Manager heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "proc-overview-list",
+          "description": "Users can see a list of all configured processes with their names, current status badges, PIDs for running processes, uptime duration, error counts, and category labels, allowing quick assessment of each service",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "running" },
+            "label": "Process list with status indicators"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "proc-overview-empty-state",
+          "description": "When no processes are configured, users see a helpful empty state that guides them to add their first process configuration rather than showing a blank screen",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "No processes configured" },
+            "label": "Empty state message"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "process-manager-lifecycle",
+      "name": "Process Lifecycle Controls",
+      "description": "Users need granular control over the lifecycle of each managed process. For stopped processes, they should be able to start them with a single click. For running processes, they need stop and restart capabilities. Processes that are stopped should also be deletable from the configuration. These controls must be immediately accessible in the process list row without requiring navigation to a detail view, enabling rapid response when a service crashes or needs cycling. The UI must prevent destructive actions on running processes (no delete while running) and provide confirmation for irreversible operations like deletion.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "proc-lifecycle-start",
+          "description": "Users can start a stopped process with a single click, bringing the service online without needing to open a terminal or navigate to another interface",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Start process button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "proc-lifecycle-stop-restart",
+          "description": "Users can stop or restart running processes directly from the process list, enabling quick service cycling when code changes need to be picked up or a process is misbehaving",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Stop/restart process buttons"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "proc-lifecycle-delete",
+          "description": "Users can delete process configurations that are no longer needed, with a confirmation prompt to prevent accidental removal of important service definitions",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Delete process button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "proc-lifecycle-add",
+          "description": "Users can add new process configurations manually by clicking an Add Process button, which opens a configuration editor for specifying command, arguments, working directory, and other settings",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Add Process" },
+            "label": "Add process button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "process-manager-output",
+      "name": "Process Output and Diagnostics",
+      "description": "When a user selects a process from the list, the right panel should display the process output (stdout and stderr) in real-time. This log viewer is the primary diagnostic tool for understanding why a process failed or what it is currently doing. Users need to see timestamped output lines with visual distinction between stdout and stderr streams. For processes that have errors, an AI-powered fix feature should be available that analyzes the error output and provides actionable remediation suggestions, turning the process manager from a passive viewer into an active troubleshooting tool.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "proc-output-viewer",
+          "description": "Users can select a process to view its real-time output in a dedicated panel, providing visibility into what the process is doing or why it failed without needing to open external log files",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Select a process to view its output" },
+            "label": "Output viewer placeholder"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "proc-output-ai-fix",
+          "description": "Users can invoke AI-powered error analysis on a failing process, which examines the stderr output and process configuration to suggest specific fixes, accelerating diagnosis of complex service failures",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Fix" },
+            "label": "Fix with AI button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "proc-output-scan",
+          "description": "Users can scan a workspace directory to automatically discover project processes and generate suggested configurations, eliminating the need to manually configure each service for a multi-project workspace",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Scan for Projects" },
+            "label": "Scan for projects button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "ProcessManagerTab",
+    "author": "Joshua Spinak",
+    "createdAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "pageUrl": "/processes",
+    "elementSource": "sdk",
+    "tags": ["process-manager", "lifecycle", "diagnostics", "runner-only"]
+  }
+}

@@ -1,0 +1,229 @@
+{
+  "version": "1.0.0",
+  "description": "Semantic specs for the Settings page",
+  "groups": [
+    {
+      "id": "settings-purpose",
+      "name": "Page Purpose",
+      "description": "The Settings page is the central configuration hub for the entire runner application.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "settings-purpose-hub",
+          "description": "Users can access all application configuration from a single organized settings hub with categorized sub-pages",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Settings"
+            },
+            "label": "Settings heading"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "settings-purpose-navigate",
+          "description": "Users can navigate between setting categories using a secondary sidebar",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "navigation"
+            },
+            "label": "Settings navigation"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "settings-ai-config",
+      "name": "AI Provider Configuration Goals",
+      "description": "Users need to configure which AI providers and models power their automation workflows.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "settings-ai-provider",
+          "description": "Users can configure AI providers with API keys and select models for workflow execution",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "AI"
+            },
+            "label": "AI settings"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "settings-ai-model",
+          "description": "Users can select default AI models and override per workflow",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Model"
+            },
+            "label": "Model selection"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "settings-agentic",
+      "name": "Agentic Behavior Goals",
+      "description": "Users fine-tune how the AI behaves during workflow execution.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "settings-agentic-iterations",
+          "description": "Users can set maximum iteration limits to control AI execution",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "iteration"
+            },
+            "label": "Iteration settings"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "settings-integrations",
+      "name": "Integration Configuration Goals",
+      "description": "Users configure external integrations like MCP servers, cloud relay, Playwright, and log sources.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "settings-mcp",
+          "description": "Users can add MCP servers that provide additional tools to AI",
+          "category": "semantic",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "MCP"
+            },
+            "label": "MCP settings"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "settings-log-sources",
+          "description": "Users can configure log file paths for error monitoring",
+          "category": "semantic",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Log Sources"
+            },
+            "label": "Log source settings"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "settings-playwright",
+          "description": "Users can configure Playwright browser testing settings",
+          "category": "semantic",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Playwright"
+            },
+            "label": "Playwright settings"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "settings-data-management",
+      "name": "Data Management Goals",
+      "description": "Users manage storage, backups, and updates.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "settings-backup",
+          "description": "Users can create backups of their runner configuration and workflows",
+          "category": "semantic",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Backup"
+            },
+            "label": "Backup settings"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "settings-updates",
+          "description": "Users can check for application updates",
+          "category": "semantic",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Updates"
+            },
+            "label": "Updates"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "Settings",
+    "author": "Joshua Spinak",
+    "createdAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "pageUrl": "/settings",
+    "tags": ["settings", "configuration", "ai-providers", "integrations", "system"]
+  }
+}

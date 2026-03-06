@@ -1,0 +1,170 @@
+{
+  "version": "1.0.0",
+  "description": "Semantic specs for the Help page",
+  "groups": [
+    {
+      "id": "help-purpose",
+      "name": "Page Purpose",
+      "description": "The Help page is the primary learning and support resource within the runner application.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "help-purpose-learn",
+          "description": "Users can access structured learning resources to understand how to use the runner features effectively",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Help"
+            },
+            "label": "Help page heading"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "help-purpose-sections",
+          "description": "Users can navigate between help sections (Tutorials, Shortcuts, Getting Started, Documentation, Troubleshooting, About)",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "tablist"
+            },
+            "label": "Help section tabs"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "help-tutorials",
+      "name": "Tutorial Goals",
+      "description": "Users need interactive guided tutorials that walk them through key workflows step by step.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "help-tutorials-browse",
+          "description": "Users can browse available tutorials with descriptions of what each tutorial teaches",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Tutorials"
+            },
+            "label": "Tutorials section"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "help-tutorials-start",
+          "description": "Users can start an interactive tutorial that guides them through the application",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Start"
+            },
+            "label": "Start tutorial"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "help-shortcuts",
+      "name": "Keyboard Shortcuts Goals",
+      "description": "Power users need quick reference to all keyboard shortcuts organized by feature area.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "help-shortcuts-list",
+          "description": "Users can view a comprehensive list of all keyboard shortcuts organized by feature area",
+          "category": "semantic",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Shortcuts"
+            },
+            "label": "Shortcuts section"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "help-troubleshooting",
+      "name": "Troubleshooting and Support Goals",
+      "description": "When users encounter problems they need quick access to common issue solutions and debugging guidance.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "help-troubleshoot-issues",
+          "description": "Users can find solutions to common issues and error messages",
+          "category": "semantic",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Troubleshooting"
+            },
+            "label": "Troubleshooting section"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "help-about-version",
+          "description": "Users can view the current application version, build information, and credits",
+          "category": "semantic",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "About"
+            },
+            "label": "About section"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "HelpTab",
+    "author": "Joshua Spinak",
+    "createdAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "pageUrl": "/help",
+    "tags": ["help", "tutorials", "documentation", "shortcuts", "troubleshooting"]
+  }
+}

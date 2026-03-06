@@ -55,6 +55,8 @@ function TestTypeIcon({
       return <Globe className={iconClass} />;
     case "gui_automation":
       return <Monitor className={iconClass} />;
+    case "ui_bridge":
+      return <Globe className={iconClass} />;
     case "command":
     case "check_group": // Legacy
       return <CheckCircle className={iconClass} />;
@@ -74,6 +76,8 @@ function getTestTypeLabel(type: VerificationTestType | null): string {
       return "Playwright Test";
     case "gui_automation":
       return "GUI Automation";
+    case "ui_bridge":
+      return "UI Bridge";
     case "command":
       return "Command";
     case "check_group": // Legacy

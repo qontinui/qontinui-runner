@@ -1,0 +1,207 @@
+{
+  "version": "1.0.0",
+  "description": "Semantic specs for the Task Builder page -- a specialized editor for creating and managing task definitions (also known as prompts internally). Tasks define automation work units with a name, content body containing AI instructions or prompt text, category, and tags. They serve as reusable prompt building blocks that can be referenced from workflow agentic steps, providing consistent AI instructions across multiple workflows without duplication.",
+  "groups": [
+    {
+      "id": "task-list-management",
+      "name": "Task Library Management",
+      "description": "The left panel displays all saved tasks in a searchable list following the standard library builder layout. Each task item shows its name, category badge, a content preview (first 60 characters of the prompt text), and tag count. Users can browse the list, search by name, create new tasks, and select a task to load into the editor. The UI labels this as 'Tasks' though the underlying API uses 'prompts' as the resource name.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "task-page-title",
+          "description": "Users see the Tasks page title within the standard library builder layout, identifying this as the task/prompt management interface",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Tasks" },
+            "label": "Tasks page title"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "task-create-new",
+          "description": "Users can create a new task definition, opening a blank editor with empty name, content, and category fields ready for input",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "New" },
+            "label": "New task button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "task-search-filter",
+          "description": "Users can search through saved tasks by name to quickly locate specific prompt definitions in their library",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "searchbox" },
+            "label": "Task search input"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "task-content-preview",
+          "description": "Each task in the list shows a content preview of the first 60 characters of the prompt text, helping users identify tasks without opening them in the editor",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Tasks" },
+            "label": "Task list with content previews"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "task-editor-config",
+      "name": "Task Editor and Content",
+      "description": "The right-panel editor provides fields for defining a task. The name field identifies the task in lists and pickers. The content field is a textarea for entering the full prompt text or AI instructions -- this is the most important field as it defines what the AI should do when this task is used in a workflow. An optional category field supports organizational grouping. Tags can be added for flexible labeling. The editor toolbar includes save and delete actions.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "task-name-field",
+          "description": "Users can set a descriptive name for the task that identifies it in library lists, dashboard results, and workflow step pickers",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Tasks" },
+            "label": "Task editor with name field"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "task-content-field",
+          "description": "Users can write the full prompt text or AI instructions in a content textarea, defining the automation work that this task represents when used in workflows",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Tasks" },
+            "label": "Task editor with content textarea"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "task-save",
+          "description": "Users can save the task definition to the library, making it available for reference in workflow agentic steps and discoverable through the library dashboard",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Save" },
+            "label": "Save task button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "task-category",
+          "description": "Users can assign a category to the task for organizational grouping (e.g., 'Generation', 'Debugging', 'Code Review'), aiding discovery across the library",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Tasks" },
+            "label": "Task editor with category field"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "task-organization",
+      "name": "Organization and Discovery",
+      "description": "Tasks support tags for flexible cross-cutting labeling that enhances discovery through the library dashboard and search. The tag input allows adding multiple tags using an enter-to-add pattern and individual tag removal. Combined with categories, tags create a rich organizational system that scales with library growth. The delete action allows users to remove outdated or unused task definitions.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "task-tagging",
+          "description": "Users can add and remove tags on tasks, providing flexible labels for cross-category discovery and filtering in the library dashboard",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Tasks" },
+            "label": "Task editor with tag management"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "task-delete",
+          "description": "Users can delete task definitions they no longer need, keeping their library clean and relevant",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Delete" },
+            "label": "Delete task button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "task-tag-count-display",
+          "description": "The task list shows the number of tags on each item, helping users identify well-organized tasks at a glance",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Tasks" },
+            "label": "Task list with tag counts"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "TasksPage",
+    "author": "Joshua Spinak",
+    "createdAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "pageUrl": "/build/tasks",
+    "elementSource": "sdk",
+    "tags": ["tasks", "prompts", "builder", "library", "ai-instructions"]
+  }
+}

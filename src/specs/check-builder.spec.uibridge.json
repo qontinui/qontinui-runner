@@ -1,0 +1,222 @@
+{
+  "version": "1.0.0",
+  "description": "Semantic specs for the Check Builder page -- a specialized editor for creating and managing reusable verification checks. Checks are individual validation rules that can detect code quality issues, run linters, formatters, type checkers, test runners, security scanners, and build tools. Each check defines a command, working directory, timeout, and behavioral flags like auto-fix and fail-on-warning. Checks serve as building blocks for check groups and can be used directly as verification steps in workflows.",
+  "groups": [
+    {
+      "id": "chk-list-management",
+      "name": "Check Library Management",
+      "description": "The left panel displays all saved checks in a searchable, scrollable list. Users can browse existing checks to find one to edit, create new checks, and delete checks they no longer need. Each list item shows the check name, type badge (linter, formatter, type checker, test runner, security, build, custom), and tool information. The split-panel layout follows the library builder pattern used across all builder pages, with the list on the left and the editor on the right. Users select a check from the list to load it into the editor, or click the create button to start a new one.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "chk-page-title",
+          "description": "Users see the Checks page title identifying this as the check builder, within the standard library builder layout",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Checks" },
+            "label": "Checks page title"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "chk-create-new",
+          "description": "Users can create a new check by clicking a create button, which clears the editor and presents a blank form with sensible defaults for the selected check type",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "New" },
+            "label": "New check button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "chk-search-filter",
+          "description": "Users can search through saved checks by name to quickly locate a specific check without scrolling through the full list",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "searchbox" },
+            "label": "Check search input"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "chk-type-badges",
+          "description": "Each check in the list displays a color-coded type badge (linter, formatter, type checker, test runner, security, build, custom) for quick visual identification",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Checks" },
+            "label": "Checks list with type badges"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "chk-editor-config",
+      "name": "Check Editor and Configuration",
+      "description": "The right-panel editor provides all fields needed to define a check. Users select the check type (linter, formatter, etc.) and tool (eslint, prettier, mypy, etc.), which auto-populates sensible defaults for the name and command. Users can customize the command, set a working directory, configure a timeout, and toggle behavioral flags: auto-fix (attempt automatic fixes before reporting), fail-on-warning (treat warnings as failures), and is-critical (mark as a blocking check). Tags can be added for organization. The editor includes save and delete actions in the toolbar.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "chk-type-selection",
+          "description": "Users can select from multiple check types (linter, formatter, type checker, test runner, security, build, custom), each with appropriate tool options and sensible defaults",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Checks" },
+            "label": "Check editor with type selection"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "chk-command-config",
+          "description": "Users can configure the shell command that the check executes, with auto-populated defaults based on the selected type and tool (e.g., 'npx eslint . --ext .ts,.tsx' for ESLint)",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Checks" },
+            "label": "Check editor with command field"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "chk-behavioral-flags",
+          "description": "Users can toggle behavioral flags including auto-fix (attempt fixes before reporting), fail-on-warning (treat warnings as errors), and is-critical (blocking check) to control check execution behavior",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Checks" },
+            "label": "Check editor with behavioral toggles"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "chk-save-check",
+          "description": "Users can save the current check configuration to the library, making it available for use in check groups and workflow verification steps",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Save" },
+            "label": "Save check button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "chk-workflow-integration",
+      "name": "Workflow Integration and Reuse",
+      "description": "Checks are designed as reusable building blocks that integrate into the broader workflow system. Once saved, checks can be referenced by check groups (which bundle multiple checks together) and used directly as verification steps in workflows. The check type and tool categorization system ensures users can find and select appropriate checks when building workflows. Tags further aid organization and discovery across the library dashboard.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "chk-tagging",
+          "description": "Users can add tags to checks for organization and discovery, making checks easier to find in the library dashboard and when selecting verification steps in the workflow builder",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Checks" },
+            "label": "Check editor with tag support"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "chk-working-directory",
+          "description": "Users can specify a working directory for check execution, ensuring commands run in the correct project context regardless of the runner's current directory",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Checks" },
+            "label": "Check editor with working directory field"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "chk-timeout-config",
+          "description": "Users can set a timeout for check execution in seconds, preventing long-running or hung checks from blocking workflow progress indefinitely",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Checks" },
+            "label": "Check editor with timeout configuration"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "chk-delete",
+          "description": "Users can delete checks they no longer need, removing them from the library and any check groups that reference them",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Delete" },
+            "label": "Delete check button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "ChecksPage",
+    "author": "Joshua Spinak",
+    "createdAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "pageUrl": "/build/checks",
+    "elementSource": "sdk",
+    "tags": ["checks", "verification", "builder", "library", "linter", "test-runner"]
+  }
+}

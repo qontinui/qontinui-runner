@@ -1,0 +1,162 @@
+{
+  "version": "1.0.0",
+  "description": "Specs for the Run State Explorer page (dev-only) — displays UI state exploration results captured during verification phases. Users can browse exploration history, view detailed reports of state snapshots, and compare application state at different points in execution.",
+  "groups": [
+    {
+      "id": "state-explorer-history-browsing",
+      "name": "Exploration History Browsing",
+      "description": "The State Explorer presents a history of past state exploration runs associated with the selected workflow run. Each exploration represents a point-in-time capture of the target application's UI state. Users browse this history to find specific exploration runs, understand the progression of state changes across the workflow, and select individual explorations for detailed review. The history view is the entry point for all state analysis.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "state-explorer-history-list",
+          "description": "The user can see a list of past state exploration runs, each showing when the exploration was performed and its key characteristics, enabling them to find the specific state capture they want to investigate",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "exploration|history|state" },
+            "label": "Exploration history list"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "state-explorer-select-exploration",
+          "description": "The user can select an individual exploration run to view its detailed report, transitioning from the history overview to a focused view of that specific state capture",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Exploration selection control"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "state-explorer-no-run-selected",
+          "description": "When no run is selected, the user sees a clear message directing them to select a run from the Run Dashboard, preventing confusion about why no explorations are displayed",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "No Run Selected|Select a run" },
+            "label": "No run selected message"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "state-explorer-report-viewing",
+      "name": "Exploration Report Viewing",
+      "description": "When the user selects a specific exploration from the history, they see a detailed report of the captured state. This report shows the UI elements that were discovered, their properties and values, and the overall structure of the application at that point in time. The report is the core analytical artifact that helps developers verify whether expected state changes occurred during workflow execution.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "state-explorer-report-displayed",
+          "description": "When an exploration is selected, the user sees a detailed report showing the captured UI state, including element properties, values, and structural information about the target application at the time of capture",
+          "category": "semantic",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "report|state|exploration" },
+            "label": "Exploration report"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "state-explorer-back-to-history",
+          "description": "The user can navigate back from a detailed exploration report to the history list, allowing fluid browsing between different exploration snapshots",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContent": "Back|History" },
+            "label": "Back to history navigation"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "state-explorer-ai-prompt-integration",
+          "description": "The user can trigger AI analysis of the exploration results, sending captured state data to AI for interpretation and debugging assistance when manual analysis is insufficient",
+          "category": "semantic",
+          "severity": "minor",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "AI|prompt|analyze" },
+            "label": "AI prompt integration"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "state-explorer-verification-support",
+      "name": "Verification and Debugging Support",
+      "description": "The State Explorer's primary purpose is to support verification debugging. When a verification phase reports unexpected results, developers use state explorations to understand why the application was in a particular state. By comparing state snapshots taken at different execution points, users can identify what changed (or did not change) and trace the root cause of verification failures back to specific automation actions or AI decisions.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "state-explorer-state-comparison",
+          "description": "The user can view state information from different points in execution, enabling comparison of before and after states to verify that expected changes occurred during automation",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "state|snapshot|capture" },
+            "label": "State comparison data"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "state-explorer-verification-context",
+          "description": "State exploration results provide enough context (element names, values, visibility, enabled state) for the user to diagnose why a verification check passed or failed against the captured application state",
+          "category": "semantic",
+          "severity": "major",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "element|value|property" },
+            "label": "Verification context data"
+          },
+          "assertionType": "exists",
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    }
+  ],
+  "metadata": {
+    "component": "StateExplorerTab",
+    "author": "Joshua Spinak",
+    "createdAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "pageUrl": "/runs/state-exploration",
+    "elementSource": "sdk",
+    "tags": ["run-state-explorer", "state-exploration", "dev-only", "verification", "observe"]
+  }
+}
